@@ -68,13 +68,14 @@ export class NativeHandler implements ModelHandler {
   private baseUrl: string;
   private advisorModels?: string[];
   private advisorCollector?: string | null;
+  private proxyKey?: string;
 
-  constructor(apiKey?: string, advisorModels?: string[], advisorCollector?: string | null) {
+  constructor(apiKey?: string, advisorModels?: string[], advisorCollector?: string | null, proxyKey?: string) {
     this.apiKey = apiKey;
-    // Always forward to real Anthropic API
     this.baseUrl = "https://api.anthropic.com";
     this.advisorModels = advisorModels;
     this.advisorCollector = advisorCollector;
+    this.proxyKey = proxyKey;
   }
 
   async handle(c: Context, payload: any): Promise<Response> {
@@ -199,6 +200,11 @@ export class NativeHandler implements ModelHandler {
     // (e.g. the --probe client, which doesn't replicate Claude Code's injected
     // key) fall back to the api key this handler was constructed with, so the
     // native passthrough can still authenticate against api.anthropic.com.
+    //
+    // OAuth tokens (sk-ant-oat01-) MUST be sent as authorization: Bearer,
+    // not as x-api-key — Anthropic rejects them in the latter header.
+    // Detect the prefix and route to the right header.
+    const isOAuthToken = this.apiKey?.startsWith("sk-ant-oat");
     if (originalHeaders.authorization) {
       headers.authorization = originalHeaders.authorization;
     }
@@ -215,7 +221,11 @@ export class NativeHandler implements ModelHandler {
         fallbackKey = auth.headers["x-api-key"];
       }
       if (fallbackKey) {
-        headers["x-api-key"] = fallbackKey;
+        if (isOAuthToken || fallbackKey.startsWith("sk-ant-oat")) {
+          headers["authorization"] = `Bearer ${fallbackKey}`;
+        } else {
+          headers["x-api-key"] = fallbackKey;
+        }
       }
     }
     if (originalHeaders["anthropic-beta"]) {
