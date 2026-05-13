@@ -7,6 +7,7 @@ import { resolveModelNameSync } from "./model-catalog-resolver.js";
 import { PROVIDER_SHORTCUTS } from "./model-parser.js";
 import { parseModelSpec } from "./model-parser.js";
 import { buildCredentialHint } from "./routing-hints.js";
+import { getRuntimeProviders } from "./runtime-providers.js";
 
 /**
  * Pure merge — defaults < global < local. Exposed for testability so callers

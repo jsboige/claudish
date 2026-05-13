@@ -440,7 +440,7 @@ export async function createProxyServer(
     const resolveTarget =
       resolution.wasAutoRouted && resolution.fullModelId ? resolution.fullModelId : targetModel;
 
-    // If resolver says use direct-api, resolve credentials via the authority.
+  // If resolver says use direct-api, resolve credentials via the authority.
     if (resolution.category === "direct-api") {
       const resolved = resolveRemoteProvider(resolveTarget);
       if (!resolved) return null;
@@ -748,7 +748,7 @@ export async function createProxyServer(
   const app = new Hono();
   app.use("*", cors());
 
-<<<<// Fork extensions: proxy auth + model discovery
+  // Fork extensions: proxy auth + model discovery
   registerForkExtensions(app, { proxyKey });
 
   app.get("/", (c) =>
@@ -760,7 +760,7 @@ export async function createProxyServer(
   );
   app.get("/health", (c) => c.json({ status: "ok" }));
 
-<<<<// Model discovery for Claude Desktop "third-party inference" mode.
+  // Model discovery for Claude Desktop "third-party inference" mode.
   // The app builds its model picker ONLY from a live GET /v1/models, and
   // silently drops any id it doesn't recognize — so `serve` advertises the
   // Claude-recognized SLOT ids here (supplied via options.servedSlotIds),
@@ -916,7 +916,7 @@ export async function createProxyServer(
     }
   });
 
-<<<<const server = serve({
+const server = serve({
     fetch(req, env, ctx) {
       if (!req.headers.get("x-forwarded-for") && !req.headers.get("x-real-ip")) {
         // @ts-expect-error — Bun injects remoteAddress on the server info object
