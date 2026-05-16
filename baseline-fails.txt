@@ -1,0 +1,33 @@
+(fail) (unnamed)
+(fail) Bug #1: TIMEOUT despite successful completion > REPRO: Bug #2 — byte counter tracks stdout accurately independent of filesystem [31.00ms]
+(fail) Bug #1: TIMEOUT despite successful completion > REPRO: actual timeout should still produce TIMEOUT state [31.00ms]
+(fail) Bug #1: TIMEOUT despite successful completion > REPRO: mixed fast/slow models — fast ones COMPLETED, slow one TIMEOUT [47.00ms]
+(fail) Bug #1: TIMEOUT despite successful completion > REPRO: process that completes before timeout should be COMPLETED, not TIMEOUT [63.00ms]
+(fail) Bug #1: TIMEOUT despite successful completion > REPRO: process that completes just before timeout fires should be COMPLETED [31.00ms]
+(fail) Channel notification wire format > session lifecycle ends with a terminal event (completed/failed/cancelled) [219.00ms]
+(fail) Group 2: Real Claude Code — MCP tool discovery > claude discovers channel tools (create_session, list_sessions) [4079.00ms]
+(fail) Group 2: Real Claude Code — MCP tool discovery > claude discovers claudish MCP tools and can call list_models [2015.00ms]
+(fail) Group D — Firebase slim catalog > D1b — aggregators[] contract (soft-skip if Phase 4 not deployed) [16.00ms]
+(fail) SessionManager > cancelSession returns false for completed session [31.00ms]
+(fail) SessionManager > cancelSession: status becomes 'cancelled' [5016.00ms]
+(fail) SessionManager > cancelled session appears in listSessions with includeCompleted=true [5016.00ms]
+(fail) SessionManager > getOutput returns output from process stdout [31.00ms]
+(fail) SessionManager > getOutput totalLines reflects number of lines produced [47.00ms]
+(fail) SessionManager > getOutput with tail_lines returns only the last N lines [31.00ms]
+(fail) SessionManager > getSession returns correct model/status/sessionId fields
+(fail) SessionManager > meta.json is written to ~/.claudish/sessions/{id}/ after completion [391.00ms]
+(fail) SessionManager > onStateChange callback fires with session_id and event [78.00ms]
+(fail) SessionManager > sendInput returns false for completed session [32.00ms]
+(fail) SessionManager > timeout kills long-running process and terminates it [31.00ms]
+(fail) SignalWatcher > quiet period + question mark triggers 'waiting_for_input' [15.00ms]
+(fail) all-models-cache helpers > reads v1 file and normalizes to v2
+(fail) all-models-cache helpers > reads v2 file unchanged
+(fail) all-models-cache helpers > writer creates parent directory if missing
+(fail) all-models-cache helpers > writer merges when new data has entries
+(fail) all-models-cache helpers > writer preserves existing entries when new data has no entries
+(fail) credential equivalence: openrouter (plain key) > no creds → false
+(fail) fetchLatestVersionOrThrow > gives up after exhausting retries, surfacing the real error [938.00ms]
+(fail) probe budget > a genuinely dead contentless stream keeps the plain message [5016.00ms]
+(fail) probe budget > contentless budget-truncated 200 reports 'no visible output within probe budget' [5015.00ms]
+(fail) route() > claude-opus-4-7 with no credentials → no-route, hint mentions both providers
+(fail) team-orchestrator > validateSessionPath > TEST-15: accepts a path that resolves within CWD and returns resolved path
