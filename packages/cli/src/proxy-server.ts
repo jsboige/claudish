@@ -217,6 +217,8 @@ delta: { type: "text_delta", text: combinedText },
   });
 }
 
+import { registerForkExtensions, stripBillingHeaderFromBody, logRequest, createHostnameConfig } from "./fork/index.js";
+
 export interface ProxyServerOptions {
   summarizeTools?: boolean; // Summarize tool descriptions for local models
   quiet?: boolean; // Suppress informational stderr output (e.g., [Auto-route])
@@ -237,6 +239,7 @@ export interface ProxyServerOptions {
    * Claude-recognized slot ids, not the real model ids. Defaults to [].
    */
   servedSlotIds?: string[];
+  hostname?: string; // Bind address (default: "127.0.0.1", use "0.0.0.0" for Docker) — fork extension
 }
 
 export async function createProxyServer(
@@ -739,8 +742,14 @@ export async function createProxyServer(
     return getOpenRouterHandler(target, invocationMode);
   };
 
+  // Fork extension: hostname binding + remote address tracking
+  const hostnameConfig = createHostnameConfig(options.hostname);
+
   const app = new Hono();
   app.use("*", cors());
+
+<<<<// Fork extensions: proxy auth + model discovery
+  registerForkExtensions(app, { proxyKey });
 
   app.get("/", (c) =>
     c.json({
@@ -751,7 +760,7 @@ export async function createProxyServer(
   );
   app.get("/health", (c) => c.json({ status: "ok" }));
 
-  // Model discovery for Claude Desktop "third-party inference" mode.
+<<<<// Model discovery for Claude Desktop "third-party inference" mode.
   // The app builds its model picker ONLY from a live GET /v1/models, and
   // silently drops any id it doesn't recognize — so `serve` advertises the
   // Claude-recognized SLOT ids here (supplied via options.servedSlotIds),
@@ -881,6 +890,9 @@ export async function createProxyServer(
         const toolUses = blocks.filter((b: any) => b.type === "tool_use");
         if (toolUses.length > 0) log(`[Proxy] Last msg tool_use: ${toolUses.map((t: any) => t.name).join(", ")}`);
       }
+      const handler = await getHandlerForRequest(body.model);
+      logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
+      stripBillingHeaderFromBody(body, handler instanceof NativeHandler);
 
       // Intercept WebSearch/WebFetch tool calls and execute via SearXNG
       try {
@@ -889,7 +901,6 @@ export async function createProxyServer(
       } catch (e: any) {
         log(`[WebTools] Intercept error (falling through to normal handler): ${e.message}`);
       }
-      const handler = await getHandlerForRequest(body.model);
 
       // Route
       return handler.handle(c, body);
@@ -905,7 +916,18 @@ export async function createProxyServer(
     }
   });
 
-  const server = serve({ fetch: app.fetch, port, hostname: "127.0.0.1" });
+<<<<const server = serve({
+    fetch(req, env, ctx) {
+      if (!req.headers.get("x-forwarded-for") && !req.headers.get("x-real-ip")) {
+        // @ts-expect-error — Bun injects remoteAddress on the server info object
+        const addr = ctx?.remoteAddress?.address as string | undefined;
+        if (addr) hostnameConfig.remoteAddrMap.set(req, addr);
+      }
+      return app.fetch(req, env, ctx);
+    },
+    port,
+    hostname: hostnameConfig.hostname,
+  });
 
   // Port resolution
   const addr = server.address();
@@ -928,7 +950,7 @@ export async function createProxyServer(
 
   return {
     port: resolvedPort,
-    url: `http://127.0.0.1:${resolvedPort}`,
+    url: `http://${hostnameConfig.hostname}:${resolvedPort}`,
     shutdown: async () => {
       return new Promise<void>((resolve) => server.close(() => resolve()));
     },

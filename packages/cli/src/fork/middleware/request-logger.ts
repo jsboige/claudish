@@ -3,8 +3,11 @@
  *
  * Logs remote IP + request metadata for cluster traffic analysis.
  * Resolves source IP from x-forwarded-for, x-real-ip, or direct connection map.
+<<<<<<< HEAD
  *
  * Leak investigation mode: dumps system prompt excerpt + first + last user message.
+=======
+>>>>>>> 985643d (refactor: isolate fork customizations into packages/cli/src/fork/)
  */
 
 export function resolveSourceIp(
@@ -17,6 +20,7 @@ export function resolveSourceIp(
   return xff || xrip || directIp || "direct";
 }
 
+<<<<<<< HEAD
 function excerpt(s: string, maxLen = 200): string {
   const flat = s.replace(/\n/g, "\\n").replace(/\r/g, "");
   if (flat.length <= maxLen) return flat;
@@ -36,12 +40,17 @@ function extractText(content: unknown): string {
 
 export function logRequest(
   body: Record<string, unknown>,
+=======
+export function logRequest(
+  body: { model?: string },
+>>>>>>> 985643d (refactor: isolate fork customizations into packages/cli/src/fork/)
   handlerName: string,
   req: Request,
   remoteAddrMap: WeakMap<Request, string>
 ): void {
   const src = resolveSourceIp(req, remoteAddrMap);
   const ua = req.headers.get("user-agent") || "";
+<<<<<<< HEAD
   const model = (body.model as string) ?? "(none)";
   // Cluster attribution header (set by each Claude Code via ANTHROPIC_CUSTOM_HEADERS).
   // Read once here so it lands in BOTH the captured JSON body and the stdout tag —
@@ -102,4 +111,9 @@ export function logRequest(
       process.stdout.write(`  [msg:${messages.length - 1}] ${excerpt(last, 300)}\n`);
     }
   }
+=======
+  console.log(
+    `[claudish] [Request] model=${body.model ?? "(none)"} handler=${handlerName} src=${src} ua=${ua.slice(0, 60)}`
+  );
+>>>>>>> 985643d (refactor: isolate fork customizations into packages/cli/src/fork/)
 }

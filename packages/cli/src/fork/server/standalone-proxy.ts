@@ -61,7 +61,11 @@ if (hostIdx !== -1 && args[hostIdx + 1]) {
 }
 
 import { createProxyServer } from "../../proxy-server.js";
+<<<<<<< HEAD
 import { loadConfig, getModelMapping } from "../../profile-config.js";
+=======
+import { loadConfig } from "../../profile-config.js";
+>>>>>>> 985643d (refactor: isolate fork customizations into packages/cli/src/fork/)
 
 // Role remapping from the active profile (2026-06-25). Without a modelMap, a
 // client that sends a literal Anthropic role name — e.g. `claude-sonnet-4-6`
