@@ -8,7 +8,9 @@
  */
 
 import type { Context } from "hono";
-import { log } from "../../../logger.js";
+import { log, logStderr } from "../../../logger.js";
+
+const SEARXNG_AVAILABLE = !!process.env.SEARXNG_URL;
 import {
   type ToolSchema,
   extractToolCallsFromText,
@@ -39,6 +41,7 @@ export interface ToolState {
   blockIndex: number;
   started: boolean; // Whether content_block_start has been sent
   closed: boolean;
+  suppressed: boolean; // Web search tools — drop from stream, replace with text
   arguments: string; // Accumulated JSON arguments string
   buffered: boolean; // Whether we're buffering args until tool call completes
 }
@@ -312,6 +315,23 @@ export function createStreamingResponseHandler(
             }
           }
 
+          // Inject SearXNG results if we intercepted GLM <searchWeb> tags.
+          // Sent as a separate text block after the (now-cleaned) model output.
+          if (searchWebResults) {
+            const srchIdx = state.curIdx++;
+            send("content_block_start", {
+              type: "content_block_start",
+              index: srchIdx,
+              content_block: { type: "text", text: "" },
+            });
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index: srchIdx,
+              delta: { type: "text_delta", text: searchWebResults },
+            });
+            send("content_block_stop", { type: "content_block_stop", index: srchIdx });
+          }
+
           // Handle buffered-but-unsent structured tool calls.
           // Some models (e.g., Gemini via LiteLLM) send tool calls with finish_reason="stop"
           // instead of "tool_calls", so the normal validation path (line ~695) is never reached.
@@ -508,7 +528,6 @@ export function createStreamingResponseHandler(
             }
 
             // Set stop_reason based on whether we sent ANY tool calls (text-based or structured)
-            const hasStructuredTools = Array.from(state.tools.values()).some((t) => t.started);
             const stopReason =
               textToolCalls.length > 0 || hasStructuredTools ? "tool_use" : "end_turn";
             send("message_delta", {
@@ -758,20 +777,24 @@ export function createStreamingResponseHandler(
                           // Restore truncated tool name to original if mapping exists
                           const rawName = tc.function.name;
                           const restoredName = toolNameMap?.get(rawName) || rawName;
+                          const isWebSearch = isWebSearchToolCall(restoredName);
+                          if (isWebSearch) {
+                            log(`[Stream] Web search tool call detected: "${restoredName}" — intercepting via SearXNG (available=${SEARXNG_AVAILABLE})`);
+                          }
                           t = {
                             id: tc.id || `tool_${Date.now()}_${idx}`,
                             name: restoredName,
                             blockIndex: state.curIdx++,
                             started: false,
                             closed: false,
+                            suppressed: isWebSearch,
                             arguments: "", // Initialize arguments accumulator
-                            buffered: !!toolSchemas && toolSchemas.length > 0, // Buffer if we have schemas to validate
+                            buffered: !!toolSchemas && toolSchemas.length > 0 && !isWebSearch,
                           };
                           state.tools.set(idx, t);
-                          if (isWebSearchToolCall(restoredName)) {
-                            warnWebSearchUnsupported(restoredName, target);
-                          }
                         }
+                        // Skip suppressed tools entirely
+                        if (t.suppressed) continue;
                         // Only send content_block_start immediately if NOT buffering
                         if (!t.started && !t.buffered) {
                           send("content_block_start", {
@@ -782,7 +805,7 @@ export function createStreamingResponseHandler(
                           t.started = true;
                         }
                       }
-                      if (tc.function?.arguments && t) {
+                      if (tc.function?.arguments && t && !t.suppressed) {
                         // Always accumulate arguments
                         t.arguments += tc.function.arguments;
                         // Only stream immediately if NOT buffering
@@ -803,6 +826,36 @@ export function createStreamingResponseHandler(
 
                 if (chunk.choices?.[0]?.finish_reason === "tool_calls") {
                   for (const t of Array.from(state.tools.values())) {
+                    if (t.suppressed) {
+                      // Execute web search via SearXNG and inject results
+                      if (!t.closed) {
+                        const query = extractSearchQuery(t.arguments);
+                        let resultText: string;
+                        if (query && SEARXNG_AVAILABLE) {
+                          resultText = await executeWebSearch(query);
+                        } else {
+                          resultText = query
+                            ? `[Web search for "${query}" could not be executed. The search service (SearXNG) is not configured. Set SEARXNG_URL env var to enable.]`
+                            : `[Web search was requested but no query was provided.]`;
+                        }
+                        send("content_block_start", {
+                          type: "content_block_start",
+                          index: t.blockIndex,
+                          content_block: { type: "text", text: "" },
+                        });
+                        send("content_block_delta", {
+                          type: "content_block_delta",
+                          index: t.blockIndex,
+                          delta: { type: "text_delta", text: resultText },
+                        });
+                        send("content_block_stop", {
+                          type: "content_block_stop",
+                          index: t.blockIndex,
+                        });
+                        t.closed = true;
+                      }
+                      continue;
+                    }
                     if (!t.closed) {
                       // Validate and potentially repair tool arguments
                       if (toolSchemas && toolSchemas.length > 0) {
