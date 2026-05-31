@@ -3,6 +3,8 @@ import { credentials } from "../auth/credentials/authority.js";
 import { hasOpSources, resolveOpKeyForEnvVars } from "../auth/credentials/op-source.js";
 import { log, maskCredential } from "../logger.js";
 import { getApiKey } from "../profile-config.js";
+import { wrapAnthropicError } from "./shared/anthropic-error.js";
+import { createResponseCapture } from "./shared/response-capture.js";
 import {
   fetchMultiModelAdvice,
   findPendingAdvisorToolResults,
@@ -14,7 +16,6 @@ import {
   stubAdvisorAdvice,
   swapAdvisorToolInBody,
 } from "./native-handler-advisor.js";
-import { wrapAnthropicError } from "./shared/anthropic-error.js";
 import type { ModelHandler } from "./types.js";
 
 /**
@@ -253,6 +254,7 @@ export class NativeHandler implements ModelHandler {
       // Handle streaming
       if (contentType.includes("text/event-stream")) {
         log("[Native] Streaming response detected");
+        const cap = createResponseCapture("native", target);
         return c.body(
           new ReadableStream({
             async start(controller) {
@@ -268,6 +270,7 @@ export class NativeHandler implements ModelHandler {
                   const { done, value } = await reader.read();
                   if (done) break;
 
+                  cap.tap(value);
                   controller.enqueue(value);
 
                   // Basic logging
@@ -281,9 +284,13 @@ export class NativeHandler implements ModelHandler {
                   for (const line of lines) if (line.trim()) eventLog += `${line}\n`;
                 }
                 if (eventLog) log(eventLog);
+                cap.note("reader done");
+                cap.done({ closed: true, reason: "done" });
                 controller.close();
               } catch (e) {
                 log(`[Native] Stream Error: ${e}`);
+                cap.note(`stream error: ${String(e)}`);
+                cap.done({ closed: true, reason: "error", err: String(e) });
                 controller.close();
               }
             },

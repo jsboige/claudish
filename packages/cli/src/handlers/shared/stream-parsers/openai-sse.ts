@@ -15,6 +15,8 @@ import {
   validateAndRepairToolCall,
 } from "../tool-call-recovery.js";
 import { isWebSearchToolCall, warnWebSearchUnsupported } from "../web-search-detector.js";
+import { executeWebSearch, extractSearchQuery } from "../web-search-executor.js";
+import { createResponseCapture } from "../response-capture.js";
 
 export interface StreamingState {
   usage: any;
@@ -115,9 +117,19 @@ export function createStreamingResponseHandler(
   const decoder = new TextDecoder();
   const streamMetadata = new Map<string, any>();
 
+  const cap = createResponseCapture("openai", target);
+
   return c.body(
     new ReadableStream({
       async start(controller) {
+        // Diagnostic tap (no-op unless CLAUDISH_CAPTURE_DIR set): mirror every
+        // outgoing byte to the response capture so a hung stream is visible offline.
+        const _origEnqueue = controller.enqueue.bind(controller);
+        controller.enqueue = ((chunk: any) => {
+          cap.tap(chunk);
+          return _origEnqueue(chunk);
+        }) as any;
+
         const send = (e: string, d: any) => {
           if (!isClosed) {
             controller.enqueue(encoder.encode(`event: ${e}\ndata: ${JSON.stringify(d)}\n\n`));
@@ -151,6 +163,9 @@ export function createStreamingResponseHandler(
         const finalize = async (reason: string, err?: string) => {
           if (state.finalized) return;
           state.finalized = true;
+          const toolCount = Array.from(state.tools.values()).filter(t => t.started && !t.suppressed).length;
+          log(`[Stream] reason=${reason} model=${target} text=${state.textStarted} tools=${toolCount} text_len=${state.accumulatedText.length} err=${err ?? "none"}`);
+          logStderr(`[Stream] ${target} ${reason} text_len=${state.accumulatedText.length} tools=${toolCount}`);
 
           // Debug: Log accumulated text for analysis
           if (state.accumulatedText.length > 0) {
@@ -285,6 +300,26 @@ export function createStreamingResponseHandler(
           if (reason === "error") {
             send("error", { type: "error", error: { type: "api_error", message: err } });
           } else {
+            // Ensure at least one content block exists — some providers (z.ai, GLM)
+            // return empty responses (finish_reason without content). The Anthropic
+            // SDK treats messages with content:[] as malformed.
+            const hasStructuredTools = Array.from(state.tools.values()).some((t) => t.started && !t.suppressed);
+            const hasContent = state.textStarted || state.reasoningStarted || hasStructuredTools || textToolCalls.length > 0;
+            if (!hasContent) {
+              // Send a proper Anthropic error event so the SDK triggers its retry logic.
+              // Injecting fake text would be silently accepted but not trigger recovery.
+              const emptyMsg = `The model returned an empty response. This usually happens when the conversation context is too large. Try compacting the conversation or reducing the context size.`;
+              send("error", {
+                type: "error",
+                error: {
+                  type: "api_error",
+                  message: emptyMsg,
+                },
+              });
+              logStderr(`[Stream] EMPTY RESPONSE from ${target} — sent api_error to client (context overflow?)`);
+              log(`[Stream] Empty response from provider (context overflow?) — sent api_error event`);
+            }
+
             // Set stop_reason based on whether we sent ANY tool calls (text-based or structured)
             const hasStructuredTools = Array.from(state.tools.values()).some((t) => t.started);
             const stopReason =
@@ -322,6 +357,8 @@ export function createStreamingResponseHandler(
             controller.close();
             isClosed = true;
             if (ping) clearInterval(ping);
+            cap.note(`close reason=${reason}`);
+            cap.done({ closed: true, reason, tools: toolCount, text_len: state.accumulatedText.length, err: err ?? null });
           }
         };
 
