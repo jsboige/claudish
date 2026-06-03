@@ -11,14 +11,23 @@ services:
         source: C:\Users\jsboi\.claudish
         target: /root/.claudish
         read_only: true
+      # Persistent diagnostic capture store (survives container recreate).
+      # Backed by D: (large free space) so captures accumulate for weeks
+      # without being flushed on `up -d`. Active only when capture is enabled
+      # via CLAUDISH_CAPTURE_DIR=/captures (set in a local .env); harmless
+      # no-op (empty mounted dir) when capture is off.
+      - type: bind
+        source: D:\claudish-captures
+        target: /captures
     environment:
       - NODE_ENV=production
       - CLAUDISH_PROXY_KEY=${CLAUDISH_PROXY_KEY:-}
       - SEARXNG_URL=http://search.myia.io
       # Diagnostic request/response body capture (forensics).
       # OFF by default (no-op when empty). Enable by setting CLAUDISH_CAPTURE_DIR
-      # — e.g. a local .env with CLAUDISH_CAPTURE_DIR=/tmp/captures — to capture
-      # request/response bodies for offline analysis.
+      # — e.g. a local .env with CLAUDISH_CAPTURE_DIR=/captures — to capture
+      # request/response bodies for offline analysis. /captures is bind-mounted
+      # to D:\claudish-captures (see volumes) so it persists across recreates.
       - CLAUDISH_CAPTURE_DIR=${CLAUDISH_CAPTURE_DIR:-}
     command: ["--port", "3000", "--host", "0.0.0.0"]
     healthcheck:
