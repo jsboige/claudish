@@ -15,6 +15,11 @@ services:
       - NODE_ENV=production
       - CLAUDISH_PROXY_KEY=${CLAUDISH_PROXY_KEY:-}
       - SEARXNG_URL=http://search.myia.io
+      # Diagnostic request/response body capture (forensics).
+      # OFF by default (no-op when empty). Enable by setting CLAUDISH_CAPTURE_DIR
+      # — e.g. a local .env with CLAUDISH_CAPTURE_DIR=/tmp/captures — to capture
+      # request/response bodies for offline analysis.
+      - CLAUDISH_CAPTURE_DIR=${CLAUDISH_CAPTURE_DIR:-}
     command: ["--port", "3000", "--host", "0.0.0.0"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://0.0.0.0:3000/health"]
