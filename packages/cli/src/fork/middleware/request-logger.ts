@@ -43,6 +43,10 @@ export function logRequest(
   const src = resolveSourceIp(req, remoteAddrMap);
   const ua = req.headers.get("user-agent") || "";
   const model = (body.model as string) ?? "(none)";
+  // Per-machine attribution: clients set `X-Claudish-Machine` via
+  // ANTHROPIC_CUSTOM_HEADERS in their Claude Code settings.json. Captured here
+  // (and logged below) so traffic can be tied back to its originating machine.
+  const machine = req.headers.get("x-claudish-machine") || "";
 
   // Full-body capture (temporary diagnostic — gated by CLAUDISH_CAPTURE_DIR env).
   // Disabled when the env var is unset, so this is a no-op in normal operation.
@@ -56,7 +60,7 @@ export function logRequest(
       const safeSrc = src.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40);
       const ts = new Date().toISOString().replace(/[:.]/g, "-");
       const file = `${captureDir}/req-${process.pid}-${String(n).padStart(4, "0")}-${ts}-${safeSrc}.json`;
-      fs.writeFileSync(file, JSON.stringify({ ts, src, model, pid: process.pid, body }));
+      fs.writeFileSync(file, JSON.stringify({ ts, src, model, machine, pid: process.pid, body }));
       process.stdout.write(`  [capture] ${file}\n`);
     } catch (e) {
       process.stdout.write(`  [capture] error: ${String(e)}\n`);
@@ -67,7 +71,6 @@ export function logRequest(
   const msgs = Array.isArray(body.messages) ? body.messages.length : 0;
   const stream = body.stream === true ? "stream" : "sync";
   const maxTokens = body.max_tokens ?? "-";
-  const machine = req.headers.get("x-claudish-machine") || "";
   const machineTag = machine ? ` machine=${machine}` : "";
   process.stdout.write(
     `[claudish] [Request] model=${model} handler=${handlerName} src=${src} ${stream} msgs=${msgs} max_tokens=${maxTokens}${machineTag} ua=${ua.slice(0, 80)}\n`
