@@ -219,13 +219,17 @@ When providers emit web search tool calls (WebSearch/WebFetch) or GLM's `<search
 
 ### Architecture
 
-Two interception paths, both in the stream parsers:
+Four interception paths across the stream parsers and proxy:
 
 1. **Structured tool_call** (`openai-sse.ts`): WebSearch/WebFetch tool calls are flagged as `suppressed` in `ToolState`. At finalize, SearXNG is called and results are injected as a text block replacing the tool call. The `suppressed` flag prevents the tool_use content_block from reaching the client.
 
 2. **GLM `<searchWeb>` tags** (`openai-sse.ts`): GLM models emit `<searchWeb><query>...</query></searchWeb>` in text content. At finalize, these tags are detected, SearXNG is called, tags are stripped from text, and results are appended as a separate text block.
 
 3. **Sub-agent requests** (`proxy-server.ts`): Claude Code sometimes sends web search/fetch as a single user message ("Perform a web search for the query: X"). These are intercepted at the proxy level before handler selection.
+
+4. **Z.AI webReader text blocks** (`anthropic-sse.ts`): Z.AI emits webReader as a text block containing "🌐 Z.ai Built-in Tool: webReader" with a URL. The parser detects this during streaming, suppresses the block (including server_tool_use/result), extracts the URL, and at finalize time fetches it locally via `executeWebFetch()`. Results are injected as a new text block before message_stop.
+
+5. **Anthropic tool_use WebSearch/WebFetch** (`proxy-server.ts`): When the last assistant message contains tool_use blocks for WebSearch/WebFetch, the proxy intercepts them, executes via SearXNG/executeWebFetch, and returns a tool_result response instead of forwarding to the provider.
 
 ### Configuration
 
@@ -235,9 +239,10 @@ Two interception paths, both in the stream parsers:
 
 ### Components
 
-- `handlers/shared/web-search-executor.ts` — SearXNG fetch, result formatting, query extraction
+- `handlers/shared/web-search-executor.ts` — SearXNG fetch, `executeWebFetch()` (URL fetch + HTML→text), result formatting, query extraction
 - `handlers/shared/stream-parsers/openai-sse.ts` — tool_call suppression + `<searchWeb>` tag detection
-- `proxy-server.ts` — sub-agent request interception
+- `handlers/shared/stream-parsers/anthropic-sse.ts` — Z.AI webReader text block detection + finalize-time injection
+- `proxy-server.ts` — sub-agent request interception + tool_use WebSearch/WebFetch interception
 
 ### Inline System Message Handling
 
