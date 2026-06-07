@@ -13,6 +13,7 @@ import type { Context } from "hono";
 import { log } from "../../../logger.js";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
 import { createResponseCapture } from "../response-capture.js";
+import { executeWebFetch } from "../web-search-executor.js";
 
 interface AnthropicPassthroughOpts {
   modelName: string;
@@ -80,6 +81,18 @@ export function createAnthropicPassthroughStream(
           let sawMessageStop = false;
           let sawMessageStart = false;
           let suppressedServerTools = 0;
+          /** Total server_tool blocks fully suppressed — used for index remapping. */
+          let serverToolBlocksSuppressed = 0;
+
+          // webReader interception state
+          // Z.AI emits webReader as a text block containing "🌐 Z.ai Built-in Tool: webReader"
+          // followed by a URL in JSON. We detect it during streaming, suppress the block,
+          // and at finalize time, fetch the URL ourselves and inject the result.
+          let webReaderUrl: string | null = null;
+          let webReaderBlockIndex: number = -1;  // upstream index of the webReader text block
+          let insideWebReaderBlock = false;       // currently inside the webReader text block
+          let webReaderTextChunks: string[] = []; // accumulate text to extract URL
+          let webReaderSuppressMessageStop = false; // suppress message_stop until we inject results
 
           // Thinking-block filtering state
           let insideThinkingBlock = false;
@@ -117,6 +130,19 @@ export function createAnthropicPassthroughStream(
               if (filterThinking && line.startsWith("data: ")) {
                 try {
                   const data = JSON.parse(line.slice(6));
+
+                  // ── Non-Anthropic event suppression ──
+                  // Z.AI sometimes injects proprietary SSE events that aren't valid
+                  // Anthropic wire format. Suppress unknown event types.
+                  const VALID_SSE_TYPES_FT = new Set([
+                    "message_start", "content_block_start", "content_block_delta",
+                    "content_block_stop", "message_delta", "message_stop", "ping",
+                    "error",
+                  ]);
+                  if (data.type && !VALID_SSE_TYPES_FT.has(data.type)) {
+                    log("[AnthropicSSE] Suppressing non-Anthropic SSE event type " + JSON.stringify(data.type) + " (filtered path, index=" + data.index + ")");
+                    continue;
+                  }
 
                   // ── In-stream error detection (GitHub #106) ──
                   // Some anthropic-compat providers (Z.AI, MiniMax, Kimi) return
@@ -167,10 +193,81 @@ export function createAnthropicPassthroughStream(
                     continue;
                   }
 
+                  // ── Suppress server_tool_use / server_tool_result blocks ──
+                  // Z.AI built-in tools (analyze_image, webReader) emit these blocks.
+                  // When they fail (local paths, unreachable URLs), Z.AI returns
+                  // "Content block not found". Suppress + remap indices.
+                  if (
+                    data.type === "content_block_start" &&
+                    (data.content_block?.type === "server_tool_use" || data.content_block?.type === "server_tool_result")
+                  ) {
+                    suppressedServerTools++;
+                    serverToolBlocksSuppressed++;
+                    log(`[AnthropicSSE] Suppressing ${data.content_block.type} block at index ${data.index} (total suppressed: ${serverToolBlocksSuppressed})`);
+                    continue;
+                  }
+                  if (suppressedServerTools > 0 && data.type === "content_block_delta") {
+                    continue;
+                  }
+                  if (data.type === "content_block_stop" && suppressedServerTools > 0) {
+                    suppressedServerTools--;
+                    continue;
+                  }
+
+                  // ── webReader text block detection (filtered path) ──
+                  // Z.AI emits webReader as a text block: "🌐 Z.ai Built-in Tool: webReader"
+                  // followed by URL in JSON. Detect, suppress, and intercept.
+                  if (data.type === "content_block_start" && data.content_block?.type === "text") {
+                    // Check if this might be a webReader block (initial text is empty, we check deltas)
+                  }
+                  if (data.type === "content_block_delta" && data.delta?.type === "text_delta" && !insideWebReaderBlock) {
+                    webReaderTextChunks.push(data.delta.text || "");
+                    const accumulated = webReaderTextChunks.join("");
+                    if (accumulated.includes("webReader") || accumulated.includes("Built-in Tool")) {
+                      // Extract URL from the accumulated text
+                      const urlMatch = accumulated.match(/"(https?:\/\/[^"]+)"/);
+                      if (urlMatch) {
+                        webReaderUrl = urlMatch[1];
+                        webReaderBlockIndex = data.index;
+                        insideWebReaderBlock = true;
+                        serverToolBlocksSuppressed++;
+                        log("[AnthropicSSE] webReader text block detected (filtered) — URL: " + webReaderUrl);
+                        continue; // suppress this delta
+                      }
+                    }
+                  }
+                  if (insideWebReaderBlock) {
+                    // Accumulate remaining text chunks to find URL if not yet found
+                    if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
+                      if (!webReaderUrl) {
+                        webReaderTextChunks.push(data.delta.text || "");
+                        const accumulated = webReaderTextChunks.join("");
+                        const urlMatch = accumulated.match(/"(https?:\/\/[^"]+)"/);
+                        if (urlMatch) {
+                          webReaderUrl = urlMatch[1];
+                          log("[AnthropicSSE] webReader URL extracted from delta (filtered): " + webReaderUrl);
+                        }
+                      }
+                      continue; // suppress all deltas inside webReader block
+                    }
+                    if (data.type === "content_block_stop") {
+                      insideWebReaderBlock = false;
+                      log("[AnthropicSSE] webReader text block ended (filtered)");
+                      continue; // suppress the stop event
+                    }
+                    continue; // suppress everything else inside webReader block
+                  }
+                  // Reset text chunks on new content block start (not webReader)
+                  if (data.type === "content_block_start") {
+                    webReaderTextChunks = [];
+                  }
+
                   // Re-index non-thinking content blocks
-                  // After suppressing N thinking blocks, subtract N from the index
-                  if (typeof data.index === "number" && thinkingBlocksSuppressed > 0) {
-                    const reindexed = data.index - thinkingBlocksSuppressed;
+                  // After suppressing N thinking blocks + M server_tool blocks,
+                  // subtract (N+M) from the index
+                  if (typeof data.index === "number" && (thinkingBlocksSuppressed > 0 || serverToolBlocksSuppressed > 0)) {
+                    const totalSuppressed = thinkingBlocksSuppressed + serverToolBlocksSuppressed;
+                    const reindexed = data.index - totalSuppressed;
                     const clamped = clampIndex(reindexed, `${data.type} (filtered, orig=${data.index})`);
                     trackIndex(clamped);
                     const modifiedLine =
@@ -199,6 +296,15 @@ export function createAnthropicPassthroughStream(
                         }
                       }
                     }
+                    // Suppress message_stop/message_delta if webReader was detected — we'll re-emit after injection
+                    if ((data.type === "message_stop" || data.type === "message_delta") && webReaderUrl) {
+                      if (data.type === "message_stop") {
+                        webReaderSuppressMessageStop = true;
+                        sawMessageStop = true;
+                        log("[AnthropicSSE] Suppressing message_stop (webReader intercept pending, filtered)");
+                      }
+                      continue;
+                    }
                     if (!isClosed) {
                       controller.enqueue(encoder.encode(line + "\n"));
                     }
@@ -215,6 +321,22 @@ export function createAnthropicPassthroughStream(
                   // Parse data lines BEFORE enqueuing to detect in-stream errors
                   try {
                     const data = JSON.parse(line.slice(6));
+
+                    // ── Non-Anthropic event suppression ──
+                    // Z.AI sometimes injects proprietary SSE events that aren't valid
+                    // Anthropic wire format. These have types like "tool_result" at the
+                    // top level (not inside content_block), or contain webReader output.
+                    // Valid Anthropic SSE event types: message_start, content_block_start,
+                    // content_block_delta, content_block_stop, message_delta, message_stop, ping.
+                    const VALID_SSE_TYPES = new Set([
+                      "message_start", "content_block_start", "content_block_delta",
+                      "content_block_stop", "message_delta", "message_stop", "ping",
+                      "error",
+                    ]);
+                    if (data.type && !VALID_SSE_TYPES.has(data.type)) {
+                      log(`[AnthropicSSE] Suppressing non-Anthropic SSE event type "${data.type}" (index=${data.index})`);
+                      continue;
+                    }
 
                     // ── In-stream error detection (GitHub #106) ──
                     if (data.error) {
@@ -237,6 +359,72 @@ export function createAnthropicPassthroughStream(
                         controller.close();
                       }
                       return; // stop processing further lines
+                    }
+
+                    // ── Suppress server_tool_use / server_tool_result blocks ──
+                    // Z.AI built-in tools (analyze_image, webReader) emit these blocks.
+                    // When they fail (local paths, unreachable URLs), Z.AI returns
+                    // "Content block not found". Suppress the entire block + remap indices.
+                    if (
+                      data.type === "content_block_start" &&
+                      (data.content_block?.type === "server_tool_use" || data.content_block?.type === "server_tool_result")
+                    ) {
+                      suppressedServerTools++;
+                      serverToolBlocksSuppressed++;
+                      log(`[AnthropicSSE] Suppressing ${data.content_block.type} block at index ${data.index} (total suppressed: ${serverToolBlocksSuppressed})`);
+                      continue;
+                    }
+                    // Suppress deltas while inside a suppressed server_tool block
+                    if (suppressedServerTools > 0 && data.type === "content_block_delta") {
+                      continue;
+                    }
+                    // Track end of suppressed server_tool block
+                    if (data.type === "content_block_stop" && suppressedServerTools > 0) {
+                      suppressedServerTools--;
+                      continue;
+                    }
+
+                    // ── webReader text block detection (passthrough path) ──
+                    // Z.AI emits webReader as a text block: "🌐 Z.ai Built-in Tool: webReader"
+                    // followed by URL in JSON. Detect, suppress, and intercept.
+                    if (data.type === "content_block_delta" && data.delta?.type === "text_delta" && !insideWebReaderBlock) {
+                      webReaderTextChunks.push(data.delta.text || "");
+                      const accumulated = webReaderTextChunks.join("");
+                      if (accumulated.includes("webReader") || accumulated.includes("Built-in Tool")) {
+                        const urlMatch = accumulated.match(/"(https?:\/\/[^"]+)"/);
+                        if (urlMatch) {
+                          webReaderUrl = urlMatch[1];
+                          webReaderBlockIndex = data.index;
+                          insideWebReaderBlock = true;
+                          serverToolBlocksSuppressed++;
+                          log("[AnthropicSSE] webReader text block detected (passthrough) — URL: " + webReaderUrl);
+                          continue;
+                        }
+                      }
+                    }
+                    if (insideWebReaderBlock) {
+                      if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
+                        if (!webReaderUrl) {
+                          webReaderTextChunks.push(data.delta.text || "");
+                          const accumulated = webReaderTextChunks.join("");
+                          const urlMatch = accumulated.match(/"(https?:\/\/[^"]+)"/);
+                          if (urlMatch) {
+                            webReaderUrl = urlMatch[1];
+                            log("[AnthropicSSE] webReader URL extracted from delta (passthrough): " + webReaderUrl);
+                          }
+                        }
+                        continue;
+                      }
+                      if (data.type === "content_block_stop") {
+                        insideWebReaderBlock = false;
+                        log("[AnthropicSSE] webReader text block ended (passthrough)");
+                        continue;
+                      }
+                      continue;
+                    }
+                    // Reset text chunks on new content block start
+                    if (data.type === "content_block_start") {
+                      webReaderTextChunks = [];
                     }
 
                     // No error — check index bounds before passing through
@@ -277,7 +465,15 @@ export function createAnthropicPassthroughStream(
                       }
                     } else {
                       // No index field — pass through as-is
-                      if (!isClosed) {
+                      // Suppress message_stop/message_delta if webReader was detected — we'll re-emit after injection
+                      if ((data.type === "message_stop" || data.type === "message_delta") && webReaderUrl) {
+                        if (data.type === "message_stop") {
+                          webReaderSuppressMessageStop = true;
+                          sawMessageStop = true;
+                          log("[AnthropicSSE] Suppressing message_stop (webReader intercept pending, passthrough)");
+                        }
+                        // fall through to usage tracking below
+                      } else if (!isClosed) {
                         controller.enqueue(encoder.encode(line + "\n"));
                       }
                     }
@@ -304,19 +500,6 @@ export function createAnthropicPassthroughStream(
                                         ) {
                                           toolUseBlocks++;
                                           log(`[AnthropicSSE] Tool use: ${data.content_block.name}`);
-                                        }
-                                        // Suppress server_tool_use blocks (Z.AI built-in tools)
-                                        if (
-                                          data.type === "content_block_start" &&
-                                          data.content_block?.type === "server_tool_use"
-                                        ) {
-                                          suppressedServerTools++;
-                                          log(`[AnthropicSSE] Suppressing server_tool_use block at index ${data.index}`);
-                                          continue;
-                                        }
-                                        if (data.type === "content_block_stop" && suppressedServerTools > 0) {
-                                          suppressedServerTools--;
-                                          continue;
                                         }
                                         if (data.type === "message_start") {
                                           sawMessageStart = true;
@@ -382,12 +565,68 @@ export function createAnthropicPassthroughStream(
 
           log(
             `[AnthropicSSE] Stream complete for ${opts.modelName}: ${totalLines} lines, ${textChunks} text chunks, ${toolUseBlocks} tool_use blocks, stop_reason=${stopReason}` +
-              (filterThinking ? `, filtered ${thinkingBlocksSuppressed} thinking blocks` : "")
+              (filterThinking ? `, filtered ${thinkingBlocksSuppressed} thinking blocks` : "") +
+              (webReaderUrl ? `, webReader intercepted: ${webReaderUrl}` : "")
           );
           cap.note(`upstream-done sawMessageStop=${sawMessageStop} stop_reason=${stopReason} toolUse=${toolUseBlocks}`);
 
           if (opts.onTokenUpdate) {
             opts.onTokenUpdate(inputTokens, outputTokens);
+          }
+
+          // ── webReader finalize injection ──
+          // If we detected a webReader text block during streaming, fetch the URL
+          // and inject results as a new text block before closing the stream.
+          if (webReaderUrl && !isClosed) {
+            log(`[AnthropicSSE] webReader finalize: fetching "${webReaderUrl}"`);
+            const fetchResults = await executeWebFetch(webReaderUrl);
+            log(`[AnthropicSSE] webReader fetch complete: ${fetchResults.length} chars`);
+
+            // Calculate the index for the injected block
+            // After suppressing webReader block, the next index is highestSeenIndex + 1
+            const injectIdx = highestSeenIndex + 1;
+
+            // Emit a new text block with the fetch results
+            controller.enqueue(encoder.encode(
+              "event: content_block_start\n" +
+              `data: ${JSON.stringify({
+                type: "content_block_start",
+                index: injectIdx,
+                content_block: { type: "text", text: "" },
+              })}\n\n`
+            ));
+            controller.enqueue(encoder.encode(
+              "event: content_block_delta\n" +
+              `data: ${JSON.stringify({
+                type: "content_block_delta",
+                index: injectIdx,
+                delta: { type: "text_delta", text: `[Web fetch results for "${webReaderUrl}"]\n\n${fetchResults}` },
+              })}\n\n`
+            ));
+            controller.enqueue(encoder.encode(
+              "event: content_block_stop\n" +
+              `data: ${JSON.stringify({ type: "content_block_stop", index: injectIdx })}\n\n`
+            ));
+
+            // If we suppressed message_stop, re-emit it now
+            if (webReaderSuppressMessageStop) {
+              if (!stopReason) stopReason = "end_turn";
+              controller.enqueue(encoder.encode(
+                "event: message_delta\n" +
+                `data: ${JSON.stringify({
+                  type: "message_delta",
+                  delta: { stop_reason: stopReason, stop_sequence: null },
+                  usage: { output_tokens: outputTokens },
+                })}\n\n`
+              ));
+              controller.enqueue(encoder.encode(
+                "event: message_stop\n" +
+                `data: ${JSON.stringify({ type: "message_stop" })}\n\n`
+              ));
+              log("[AnthropicSSE] webReader: re-emitted message_stop after injection");
+            }
+
+            cap.note("webReader-intercept");
           }
 
           // Finalization: if the upstream stream ended without sending

@@ -333,22 +333,46 @@ export class ComposedHandler implements ModelHandler {
       }
     }
 
-    // Strip thinking blocks from message history for non-native providers.
-    // ComposedHandler is never used for native Anthropic (that's NativeHandler),
-    // so every request here goes to a provider that doesn't understand Anthropic
-    // thinking signatures. Without this strip, Opus thinking blocks (with signatures)
-    // flow through to Z.AI/GLM/MiniMax/etc., which either ignore or corrupt them.
+    // Strip thinking blocks and server_tool blocks from message history for
+    // non-native providers. ComposedHandler is never used for native Anthropic
+    // (that's NativeHandler), so every request here goes to a provider that
+    // doesn't understand Anthropic thinking signatures or server-side tools.
+    //
+    // - thinking blocks: Opus thinking blocks with signatures corrupt Z.AI/GLM.
+    // - server_tool_use / server_tool_result: Z.AI built-in tools (analyze_image,
+    //   web search, etc.). When these appear in message history, Z.AI tries to
+    //   re-execute them, often failing with "Content block not found" because
+    //   local file paths (e.g. d:\Dev\...) can't be resolved server-side.
+    //   Stripping them from history prevents Z.AI from re-attempting the call.
     if (requestPayload.messages) {
-      let stripped = 0;
+      let strippedThinking = 0;
+      let strippedServerTools = 0;
       for (const msg of requestPayload.messages) {
-        if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        if (Array.isArray(msg.content)) {
           const before = msg.content.length;
-          msg.content = msg.content.filter((block: any) => block.type !== "thinking");
-          stripped += before - msg.content.length;
+          msg.content = msg.content.filter((block: any) => {
+            if (block.type === "thinking") { strippedThinking++; return false; }
+            if (block.type === "server_tool_use" || block.type === "server_tool_result") {
+              strippedServerTools++;
+              return false;
+            }
+            return true;
+          });
+        }
+        // Also strip server_tool_result from user messages (they appear as
+        // top-level content blocks in user turns after a server_tool_use).
+        if (msg.role === "user" && Array.isArray(msg.content)) {
+          msg.content = msg.content.filter((block: any) => {
+            if (block.type === "server_tool_result") { strippedServerTools++; return false; }
+            return true;
+          });
         }
       }
-      if (stripped > 0) {
-        log(`[ComposedHandler] Stripped ${stripped} thinking block(s) from message history for ${this.provider.displayName}`);
+      if (strippedThinking > 0) {
+        log(`[ComposedHandler] Stripped ${strippedThinking} thinking block(s) from message history for ${this.provider.displayName}`);
+      }
+      if (strippedServerTools > 0) {
+        log(`[ComposedHandler] Stripped ${strippedServerTools} server_tool block(s) from message history for ${this.provider.displayName}`);
       }
     }
 

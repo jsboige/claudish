@@ -97,6 +97,91 @@ export function formatSearchResults(query: string, results: SearchResult[]): str
 }
 
 /**
+ * Fetch a URL and convert HTML to readable text.
+ * Uses basic regex-based HTML stripping — no external dependencies.
+ * Follows the same approach as mcp-searxng's web_url_read (fetch + markdown).
+ */
+export async function executeWebFetch(url: string, deadlineMs = 5000): Promise<string> {
+  try {
+    log(`[WebFetch] Fetching: "${url}"`);
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(deadlineMs),
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; Claudish/1.0)",
+        Accept: "text/html,application/xhtml+xml,text/plain,*/*",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    const body = await response.text();
+
+    // If it's already plain text or JSON, return as-is (truncated)
+    if (contentType.includes("text/plain") || contentType.includes("application/json")) {
+      return truncateContent(body, 15000);
+    }
+
+    // HTML content — strip tags and decode entities
+    if (contentType.includes("text/html") || body.trimStart().startsWith("<")) {
+      const text = htmlToText(body);
+      log(`[WebFetch] Converted HTML to text: ${body.length} → ${text.length} chars`);
+      return truncateContent(text, 15000);
+    }
+
+    // Unknown content type — return truncated raw text
+    return truncateContent(body, 15000);
+  } catch (err: any) {
+    log(`[WebFetch] Error fetching "${url}": ${err.message}`);
+    return `[Web fetch for "${url}" failed: ${err.message}]`;
+  }
+}
+
+/**
+ * Basic HTML → plain text conversion.
+ * Strips tags, decodes common entities, normalizes whitespace.
+ */
+function htmlToText(html: string): string {
+  let text = html;
+
+  // Remove script and style blocks entirely
+  text = text.replace(/<script[\s\S]*?<\/script>/gi, "");
+  text = text.replace(/<style[\s\S]*?<\/style>/gi, "");
+
+  // Convert common block elements to newlines
+  text = text.replace(/<\/(p|div|h[1-6]|li|br|tr|blockquote)>/gi, "\n");
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+
+  // Remove all remaining HTML tags
+  text = text.replace(/<[^>]+>/g, "");
+
+  // Decode common HTML entities
+  text = text.replace(/&amp;/g, "&");
+  text = text.replace(/&lt;/g, "<");
+  text = text.replace(/&gt;/g, ">");
+  text = text.replace(/&quot;/g, '"');
+  text = text.replace(/&#39;/g, "'");
+  text = text.replace(/&nbsp;/g, " ");
+
+  // Collapse excessive whitespace (3+ newlines → 2)
+  text = text.replace(/\n{3,}/g, "\n\n");
+  // Collapse excessive spaces
+  text = text.replace(/[ \t]+/g, " ");
+
+  return text.trim();
+}
+
+/**
+ * Truncate content to a maximum length, adding an ellipsis if truncated.
+ */
+function truncateContent(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen) + `\n\n[... content truncated at ${maxLen} chars. Original length: ${text.length} chars]`;
+}
+
+/**
  * Extract the search query from a web_search tool call's arguments JSON.
  */
 export function extractSearchQuery(argsJson: string): string {

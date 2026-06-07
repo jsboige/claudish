@@ -36,7 +36,7 @@ import { loadCustomEndpoints } from "./providers/custom-endpoints-loader.js";
 import { getRuntimeProviders } from "./providers/runtime-providers.js";
 import { loadConfig } from "./profile-config.js";
 import { registerForkExtensions, stripBillingHeaderFromBody, logRequest, createHostnameConfig } from "./fork/index.js";
-import { executeWebSearch } from "./handlers/shared/web-search-executor.js";
+import { executeWebSearch, executeWebFetch } from "./handlers/shared/web-search-executor.js";
 
 /**
  * Intercept WebSearch/WebFetch tool calls and execute them via SearXNG instead
@@ -96,8 +96,33 @@ async function interceptWebTools(c: any, body: any): Promise<Response | null> {
     );
     if (webToolCalls.length > 0) {
       log(`[WebTools] Intercepting ${webToolCalls.length} tool_use WebSearch/WebFetch`);
-      // For now, let these fall through to the normal handler
-      // (they'll be handled by the stream parser's searchWeb detection)
+
+      // Execute each web tool call and build tool_result blocks
+      const toolResults: any[] = [];
+      for (const toolCall of webToolCalls) {
+        let resultText: string;
+        if (toolCall.name === "WebSearch") {
+          const query = toolCall.input?.query || "";
+          log(`[WebTools] Executing WebSearch: "${query}"`);
+          resultText = await executeWebSearch(query, 5000);
+        } else {
+          // WebFetch
+          const url = toolCall.input?.url || "";
+          log(`[WebTools] Executing WebFetch: "${url}"`);
+          resultText = await executeWebFetch(url);
+        }
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolCall.id,
+          content: resultText,
+        });
+      }
+
+      // Build a response message with the tool results
+      // The client expects a user message containing tool_result blocks
+      // that correspond to the assistant's tool_use blocks.
+      // We return an assistant-like response that includes the results.
+      return buildToolResultResponse(body.model || "unknown", toolResults, isStreaming);
     }
   }
 
@@ -161,6 +186,98 @@ function buildTextResponse(model: string, text: string, streaming: boolean): Res
         type: "content_block_stop",
         index: 0,
       }));
+
+      controller.enqueue(send("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { input_tokens: 0, output_tokens: 0 },
+      }));
+
+      controller.enqueue(send("message_stop", { type: "message_stop" }));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "anthropic-version": "2023-06-01",
+    },
+  });
+}
+
+/**
+ * Build a streaming or non-streaming Anthropic response containing tool_result blocks.
+ * Used when intercepting WebSearch/WebFetch tool_use calls at the proxy level.
+ */
+function buildToolResultResponse(model: string, toolResults: any[], streaming: boolean): Response {
+  const encoder = new TextEncoder();
+  const send = (event: string, data: any) =>
+    encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  // Build content blocks: one tool_result per intercepted tool_use
+  const contentBlocks = toolResults.map((tr, idx) => ({
+    type: "tool_result",
+    tool_use_id: tr.tool_use_id,
+    content: tr.content,
+  }));
+
+  if (!streaming) {
+    return new Response(JSON.stringify({
+      id: `msg_webtools_${Date.now()}`,
+      type: "message",
+      role: "assistant",
+      model,
+      content: contentBlocks,
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    }), {
+      headers: {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+      },
+    });
+  }
+
+  // Streaming SSE response — emit each tool_result as a content block
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(send("message_start", {
+        type: "message_start",
+        message: {
+          id: `msg_webtools_${Date.now()}`,
+          type: "message",
+          role: "assistant",
+          model,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      }));
+
+      for (let i = 0; i < contentBlocks.length; i++) {
+        const block = contentBlocks[i];
+        controller.enqueue(send("content_block_start", {
+          type: "content_block_start",
+          index: i,
+          content_block: { type: "tool_result", tool_use_id: block.tool_use_id, content: "" },
+        }));
+
+        controller.enqueue(send("content_block_delta", {
+          type: "content_block_delta",
+          index: i,
+          delta: { type: "input_json_delta", partial_json: JSON.stringify({ content: block.content }) },
+        }));
+
+        controller.enqueue(send("content_block_stop", {
+          type: "content_block_stop",
+          index: i,
+        }));
+      }
 
       controller.enqueue(send("message_delta", {
         type: "message_delta",
