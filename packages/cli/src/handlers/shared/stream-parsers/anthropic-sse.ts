@@ -686,6 +686,43 @@ export function createAnthropicPassthroughStream(
               clearInterval(pingInterval);
               pingInterval = null;
             }
+
+            // Emit synthetic finalization so the client gets a properly terminated
+            // stream instead of a hard close ("JSON Parse error: Unexpected EOF").
+            // Mirrors the normal-path finalization above (lines ~636-667).
+            try {
+              if (!sawMessageStart) {
+                const synthId = `msg_${Date.now()}`;
+                controller.enqueue(encoder.encode(
+                  "event: message_start\n" +
+                  `data: {"type":"message_start","message":{"id":"${synthId}","type":"message","role":"assistant","model":"${opts.modelName}","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":${inputTokens},"output_tokens":${outputTokens}}}}\n\n`
+                ));
+                controller.enqueue(encoder.encode(
+                  "event: content_block_start\n" +
+                  `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`
+                ));
+                controller.enqueue(encoder.encode(
+                  "event: content_block_delta\n" +
+                  `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"[Error: Stream interrupted. The upstream provider closed the connection prematurely.]"}}\n\n`
+                ));
+                controller.enqueue(encoder.encode(
+                  "event: content_block_stop\n" +
+                  `data: {"type":"content_block_stop","index":0}\n\n`
+                ));
+              }
+              if (!stopReason) stopReason = "end_turn";
+              controller.enqueue(encoder.encode(
+                "event: message_delta\n" +
+                `data: {"type":"message_delta","delta":{"stop_reason":"${stopReason}","stop_sequence":null},"usage":{"output_tokens":${outputTokens}}}\n\n`
+              ));
+              controller.enqueue(encoder.encode(
+                "event: message_stop\n" +
+                `data: {"type":"message_stop"}\n\n`
+              ));
+            } catch (enqueueErr) {
+              log(`[AnthropicSSE] Failed to emit synthetic finalization: ${enqueueErr}`);
+            }
+
             cap.done({ closed: true, stop_reason: "exception", path: "catch", error: String(e) });
             controller.close();
           } else {
