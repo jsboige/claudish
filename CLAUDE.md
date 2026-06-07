@@ -252,7 +252,44 @@ Claude Code v2.1.153+ injects `role: "system"` messages inline (e.g. system-remi
 
 ### Diagnostic Body Capture
 
-Set `CLAUDISH_CAPTURE_DIR` env var to enable full request body capture for offline reproduction of hangs or malformed responses. Disabled by default (no-op when unset). Files written as JSON with metadata (timestamp, source IP, model, PID).
+Set `CLAUDISH_CAPTURE_DIR` env var to enable full request body capture for offline reproduction of hangs or malformed responses. Disabled by default (no-op when unset). Files written as JSON with metadata (timestamp, source IP, model, PID, machine header).
+
+## Traffic Analysis
+
+Scripts in `scripts/` for analyzing captured proxy traffic:
+
+### Scripts
+
+| Script | Purpose | Usage |
+|--------|---------|-------|
+| `traffic-summary.ps1` | Overview: machines, models, workspaces, sessions | `.\scripts\traffic-summary.ps1 [-Hours N]` |
+| `traffic-sessions.ps1` | Detailed session list with timing, models, data volume | `.\scripts\traffic-sessions.ps1 [-Hours N] [-All]` |
+| `traffic-history.ps1` | Historical analysis from 7z archives | `.\scripts\traffic-history.ps1 [-Date yyyy-MM-dd] [-Days N]` |
+| `compress-captures.ps1` | Nightly 7z compaction (scheduled task) | Runs automatically at 04:17 |
+| `CaptureUtils.psm1` | Shared module (extraction functions, device mapping) | Imported by the scripts above |
+
+### Quick Commands
+
+```powershell
+# What's happening right now?
+.\scripts\traffic-summary.ps1 -Hours 1
+
+# All active sessions with detail
+.\scripts\traffic-sessions.ps1
+
+# Full day analysis from archives
+.\scripts\traffic-history.ps1 -Days 7
+```
+
+### Capture Format
+
+- **`req-*.json`** — Single-line JSON with full Anthropic request body (messages, system, tools, metadata). Extractable: machine (X-Claudish-Machine header), workspace (from system prompt), session_id (from metadata.user_id), CC version (from billing header).
+- **`resp-*.sse`** — Response SSE with metadata header (elapsed_ms, stop_reason, event count). Correlates with req via shared counter (req-1-0042 → resp-1-r0042).
+- **Archives** — `D:\claudish-captures\archive\captures-YYYY-MM-DD.7z` (LZMA2, ~30:1 ratio).
+
+### Machine Attribution
+
+Machines are identified by the `X-Claudish-Machine` header (set via `ANTHROPIC_CUSTOM_HEADERS` in Claude Code settings). When missing, `CaptureUtils.psm1` falls back to device_id fingerprinting. Currently known device IDs are hardcoded in the module.
 
 ## Debug Logging
 
