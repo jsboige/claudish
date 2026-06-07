@@ -150,18 +150,43 @@ export function createAnthropicPassthroughStream(
                   // Detect and surface as a proper error event.
                   if (data.error) {
                     const errMsg = data.error.message || JSON.stringify(data.error);
-                    log(`[AnthropicSSE] In-stream error detected: ${errMsg}`);
+                    log(`[AnthropicSSE] In-stream error detected (filterThinking path): ${errMsg}`);
                     if (!isClosed) {
-                      controller.enqueue(encoder.encode(
-                        `event: error\ndata: ${JSON.stringify({
-                          type: "error",
-                          error: { type: "api_error", message: errMsg },
-                        })}\n\n`
-                      ));
                       isClosed = true;
                       if (pingInterval) {
                         clearInterval(pingInterval);
                         pingInterval = null;
+                      }
+                      // Emit synthetic finalization so the client gets a properly
+                      // terminated stream instead of "empty or malformed response".
+                      try {
+                        const synthId = `msg_${Date.now()}`;
+                        controller.enqueue(encoder.encode(
+                          "event: message_start\n" +
+                          `data: {"type":"message_start","message":{"id":"${synthId}","type":"message","role":"assistant","model":"${opts.modelName}","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":${inputTokens},"output_tokens":${outputTokens}}}}\n\n`
+                        ));
+                        controller.enqueue(encoder.encode(
+                          "event: content_block_start\n" +
+                          `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`
+                        ));
+                        controller.enqueue(encoder.encode(
+                          "event: content_block_delta\n" +
+                          `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"[Error: ${errMsg}]"}}\n\n`
+                        ));
+                        controller.enqueue(encoder.encode(
+                          "event: content_block_stop\n" +
+                          `data: {"type":"content_block_stop","index":0}\n\n`
+                        ));
+                        controller.enqueue(encoder.encode(
+                          "event: message_delta\n" +
+                          `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":${outputTokens}}}\n\n`
+                        ));
+                        controller.enqueue(encoder.encode(
+                          "event: message_stop\n" +
+                          `data: {"type":"message_stop"}\n\n`
+                        ));
+                      } catch (enqueueErr) {
+                        log(`[AnthropicSSE] Failed to emit synthetic finalization (in-stream-error filtered): ${enqueueErr}`);
                       }
                       cap.note("in-stream-error(filtered)");
                       cap.done({ closed: true, stop_reason: "error", path: "in-stream-error-filtered" });
@@ -343,16 +368,41 @@ export function createAnthropicPassthroughStream(
                       const errMsg = data.error.message || JSON.stringify(data.error);
                       log(`[AnthropicSSE] In-stream error detected: ${errMsg}`);
                       if (!isClosed) {
-                        controller.enqueue(encoder.encode(
-                          `event: error\ndata: ${JSON.stringify({
-                            type: "error",
-                            error: { type: "api_error", message: errMsg },
-                          })}\n\n`
-                        ));
                         isClosed = true;
                         if (pingInterval) {
                           clearInterval(pingInterval);
                           pingInterval = null;
+                        }
+                        // Emit synthetic finalization so the client gets a properly
+                        // terminated stream instead of "empty or malformed response".
+                        try {
+                          const synthId = `msg_${Date.now()}`;
+                          controller.enqueue(encoder.encode(
+                            "event: message_start\n" +
+                            `data: {"type":"message_start","message":{"id":"${synthId}","type":"message","role":"assistant","model":"${opts.modelName}","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":${inputTokens},"output_tokens":${outputTokens}}}}\n\n`
+                          ));
+                          controller.enqueue(encoder.encode(
+                            "event: content_block_start\n" +
+                            `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`
+                          ));
+                          controller.enqueue(encoder.encode(
+                            "event: content_block_delta\n" +
+                            `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"[Error: ${errMsg}]"}}\n\n`
+                          ));
+                          controller.enqueue(encoder.encode(
+                            "event: content_block_stop\n" +
+                            `data: {"type":"content_block_stop","index":0}\n\n`
+                          ));
+                          controller.enqueue(encoder.encode(
+                            "event: message_delta\n" +
+                            `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":${outputTokens}}}\n\n`
+                          ));
+                          controller.enqueue(encoder.encode(
+                            "event: message_stop\n" +
+                            `data: {"type":"message_stop"}\n\n`
+                          ));
+                        } catch (enqueueErr) {
+                          log(`[AnthropicSSE] Failed to emit synthetic finalization (in-stream-error): ${enqueueErr}`);
                         }
                         cap.note("in-stream-error");
                         cap.done({ closed: true, stop_reason: "error", path: "in-stream-error" });
