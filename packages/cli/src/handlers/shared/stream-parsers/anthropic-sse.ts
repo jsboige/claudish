@@ -10,8 +10,8 @@
  */
 
 import type { Context } from "hono";
-import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
 import { log } from "../../../logger.js";
+import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
 import { createResponseCapture } from "../response-capture.js";
 
 interface AnthropicPassthroughOpts {
@@ -55,7 +55,7 @@ export function createAnthropicPassthroughStream(
         }) as typeof controller.enqueue;
         const sendPing = () => {
           if (!isClosed) {
-            controller.enqueue(encoder.encode('event: ping\ndata: {"type":"ping"}\n\n'));
+            controller.enqueue(encoder.encode("event: ping\ndata: {\"type\":\"ping\"}\n\n"));
           }
         };
 
@@ -77,11 +77,114 @@ export function createAnthropicPassthroughStream(
           let textChunks = 0;
           let toolUseBlocks = 0;
           let stopReason: string | null = null;
+          let sawMessageStop = false;
+          let sawMessageStart = false;
+          let suppressedServerTools = 0;
 
           // Thinking-block filtering state
           let insideThinkingBlock = false;
           /** How many thinking blocks have been suppressed so far. */
           let thinkingBlocksSuppressed = 0;
+
+          // Content block index tracking — detect out-of-range indices
+          // that would cause "Content block not found" on the client side.
+          let highestSeenIndex = -1;
+          const clampIndex = (idx: number, context: string): number => {
+            if (idx > highestSeenIndex + 1) {
+              log(
+                `[AnthropicSSE] Index jump detected: ${idx} but expected <=${highestSeenIndex + 1} (${context}) — clamping to ${highestSeenIndex + 1}`
+              );
+              return highestSeenIndex + 1;
+            }
+            return idx;
+          };
+          const trackIndex = (idx: number) => {
+            if (idx > highestSeenIndex) highestSeenIndex = idx;
+          };
+
+          // ── Graceful in-stream error finalization ─────────────────────
+          // Some anthropic-compat providers (Z.AI, MiniMax, Kimi) return HTTP 200
+          // and then inject an SSE error (e.g. Z.AI's [1302] rate limit) with NO
+          // valid message envelope. Forwarding a bare `event: error` makes Claude
+          // Code report "empty or malformed response (HTTP 200)" and crash the turn.
+          // Instead we ALWAYS emit a valid, terminal Claude message so the client
+          // ends the turn cleanly (no crash, no corruption):
+          //   - before any content → synthetic message_start + short notice + stop
+          //   - mid-stream         → close the open block + message_delta + stop
+          // ComposedHandler's peek/retry catches most start-of-stream rate limits
+          // before they reach here (it retries + falls back to a second provider);
+          // this is the last-resort safety net for whatever still slips through.
+          const finalizeWithError = (errMsg: string, path: string) => {
+            if (!isClosed) {
+              if (!sawMessageStart) {
+                const isRateLimit =
+                  /rate.?limit|\b1302\b|\b429\b|too many requests|overloaded/i.test(errMsg);
+                const notice = isRateLimit
+                  ? "[The model provider is rate limited right now. The proxy retried and exhausted fallback capacity — please try again in a moment.]"
+                  : `[Upstream provider error: ${errMsg}]`;
+                const synthId = `msg_${Date.now()}`;
+                controller.enqueue(
+                  encoder.encode(
+                    "event: message_start\n" +
+                      `data: {"type":"message_start","message":{"id":"${synthId}","type":"message","role":"assistant","model":"${opts.modelName}","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}\n\n`
+                  )
+                );
+                controller.enqueue(
+                  encoder.encode(
+                    "event: content_block_start\n" +
+                      `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`
+                  )
+                );
+                controller.enqueue(
+                  encoder.encode(
+                    "event: content_block_delta\n" +
+                      `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: notice } })}\n\n`
+                  )
+                );
+                controller.enqueue(
+                  encoder.encode(
+                    "event: content_block_stop\n" + `data: {"type":"content_block_stop","index":0}\n\n`
+                  )
+                );
+              } else if (highestSeenIndex >= 0) {
+                // Mid-stream: close whatever content block was open when the error hit,
+                // otherwise the client sees an unterminated block.
+                controller.enqueue(
+                  encoder.encode(
+                    "event: content_block_stop\n" +
+                      `data: {"type":"content_block_stop","index":${highestSeenIndex}}\n\n`
+                  )
+                );
+              }
+              controller.enqueue(
+                encoder.encode(
+                  "event: message_delta\n" +
+                    `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n`
+                )
+              );
+              controller.enqueue(
+                encoder.encode("event: message_stop\n" + `data: {"type":"message_stop"}\n\n`)
+              );
+            }
+            isClosed = true;
+            if (pingInterval) {
+              clearInterval(pingInterval);
+              pingInterval = null;
+            }
+            cap.note(`in-stream-error->graceful: ${errMsg.slice(0, 80)}`);
+            cap.done({ closed: true, stop_reason: "error-graceful", path });
+            // Surface to stdout (visible without --debug) so a mid-stream burst
+            // that bypassed the start-of-stream peek is still observable live.
+            log(
+              `[RateLimit] safety-net finalized stream gracefully (${path}): ${errMsg.slice(0, 120)}`,
+              true
+            );
+            try {
+              controller.close();
+            } catch {
+              // already closed
+            }
+          };
 
           while (true) {
             const { done, value } = await reader.read();
@@ -106,24 +209,7 @@ export function createAnthropicPassthroughStream(
                   if (data.error) {
                     const errMsg = data.error.message || JSON.stringify(data.error);
                     log(`[AnthropicSSE] In-stream error detected: ${errMsg}`);
-                    if (!isClosed) {
-                      controller.enqueue(
-                        encoder.encode(
-                          `event: error\ndata: ${JSON.stringify({
-                            type: "error",
-                            error: { type: "api_error", message: errMsg },
-                          })}\n\n`
-                        )
-                      );
-                      isClosed = true;
-                      if (pingInterval) {
-                        clearInterval(pingInterval);
-                        pingInterval = null;
-                      }
-                      cap.note("in-stream-error(filtered)");
-                      cap.done({ closed: true, stop_reason: "error", path: "in-stream-error-filtered" });
-                      controller.close();
-                    }
+                    finalizeWithError(errMsg, "in-stream-error-filtered");
                     return; // stop processing further lines
                   }
 
@@ -154,23 +240,42 @@ export function createAnthropicPassthroughStream(
                   // After suppressing N thinking blocks, subtract N from the index
                   if (typeof data.index === "number" && thinkingBlocksSuppressed > 0) {
                     const reindexed = data.index - thinkingBlocksSuppressed;
-                    const modifiedLine = `data: ${JSON.stringify({ ...data, index: reindexed })}`;
+                    const clamped = clampIndex(reindexed, `${data.type} (filtered, orig=${data.index})`);
+                    trackIndex(clamped);
+                    const modifiedLine =
+                      "data: " + JSON.stringify({ ...data, index: clamped });
 
                     if (!isClosed) {
-                      controller.enqueue(encoder.encode(`${modifiedLine}\n`));
+                      controller.enqueue(encoder.encode(modifiedLine + "\n"));
                     }
 
                     // Still do usage tracking below with the ORIGINAL data
                   } else {
-                    // No filtering needed — pass through as-is
+                    // No filtering needed — track and pass through
+                    if (typeof data.index === "number") {
+                      if (data.type === "content_block_start") {
+                        trackIndex(data.index);
+                      } else {
+                        const clamped = clampIndex(data.index, `${data.type} (unfiltered)`);
+                        if (clamped !== data.index) {
+                          const modifiedLine =
+                            "data: " + JSON.stringify({ ...data, index: clamped });
+                          if (!isClosed) {
+                            controller.enqueue(encoder.encode(modifiedLine + "\n"));
+                          }
+                          // Skip original enqueue below
+                          continue;
+                        }
+                      }
+                    }
                     if (!isClosed) {
-                      controller.enqueue(encoder.encode(`${line}\n`));
+                      controller.enqueue(encoder.encode(line + "\n"));
                     }
                   }
                 } catch {
                   // Unparseable — pass through
                   if (!isClosed) {
-                    controller.enqueue(encoder.encode(`${line}\n`));
+                    controller.enqueue(encoder.encode(line + "\n"));
                   }
                 }
               } else {
@@ -184,30 +289,51 @@ export function createAnthropicPassthroughStream(
                     if (data.error) {
                       const errMsg = data.error.message || JSON.stringify(data.error);
                       log(`[AnthropicSSE] In-stream error detected: ${errMsg}`);
-                      if (!isClosed) {
-                        controller.enqueue(
-                          encoder.encode(
-                            `event: error\ndata: ${JSON.stringify({
-                              type: "error",
-                              error: { type: "api_error", message: errMsg },
-                            })}\n\n`
-                          )
-                        );
-                        isClosed = true;
-                        if (pingInterval) {
-                          clearInterval(pingInterval);
-                          pingInterval = null;
-                        }
-                        cap.note("in-stream-error");
-                        cap.done({ closed: true, stop_reason: "error", path: "in-stream-error" });
-                        controller.close();
-                      }
+                      finalizeWithError(errMsg, "in-stream-error");
                       return; // stop processing further lines
                     }
 
-                    // No error — pass through the line
-                    if (!isClosed) {
-                      controller.enqueue(encoder.encode(`${line}\n`));
+                    // No error — check index bounds before passing through
+                    if (typeof data.index === "number") {
+                      if (data.type === "content_block_start") {
+                        // z.ai sometimes sends content_block_start with an index
+                        // that jumps (e.g., 0 → 2, skipping 1). This causes
+                        // "Content block not found" on the client. Remap to
+                        // sequential indices to keep the client happy.
+                        const expected = highestSeenIndex + 1;
+                        if (data.index !== expected) {
+                          log(
+                            `[AnthropicSSE] content_block_start index ${data.index} remapped to ${expected} (model=${opts.modelName})`
+                          );
+                          const remapped = { ...data, index: expected };
+                          if (!isClosed) {
+                            controller.enqueue(encoder.encode("data: " + JSON.stringify(remapped) + "\n"));
+                          }
+                        } else {
+                          if (!isClosed) {
+                            controller.enqueue(encoder.encode(line + "\n"));
+                          }
+                        }
+                        trackIndex(expected);
+                      } else {
+                        // delta / stop — clamp to highestSeenIndex
+                        const clamped = clampIndex(data.index, `${data.type} (passthrough)`);
+                        if (clamped !== data.index) {
+                          const modified = { ...data, index: clamped };
+                          if (!isClosed) {
+                            controller.enqueue(encoder.encode("data: " + JSON.stringify(modified) + "\n"));
+                          }
+                        } else {
+                          if (!isClosed) {
+                            controller.enqueue(encoder.encode(line + "\n"));
+                          }
+                        }
+                      }
+                    } else {
+                      // No index field — pass through as-is
+                      if (!isClosed) {
+                        controller.enqueue(encoder.encode(line + "\n"));
+                      }
                     }
 
                     // Usage/debug tracking
@@ -233,19 +359,46 @@ export function createAnthropicPassthroughStream(
                       toolUseBlocks++;
                       log(`[AnthropicSSE] Tool use: ${data.content_block.name}`);
                     }
+                    // Suppress server_tool_use blocks (Z.AI built-in tools)
+                    if (
+                      data.type === "content_block_start" &&
+                      data.content_block?.type === "server_tool_use"
+                    ) {
+                      suppressedServerTools++;
+                      log(`[AnthropicSSE] Suppressing server_tool_use block at index ${data.index}`);
+                      continue;
+                    }
+                    if (data.type === "content_block_stop" && suppressedServerTools > 0) {
+                      suppressedServerTools--;
+                      continue;
+                    }
+                    if (data.type === "message_start") {
+                      sawMessageStart = true;
+                    }
                     if (data.type === "message_delta" && data.delta?.stop_reason) {
                       stopReason = data.delta.stop_reason;
+                    }
+                    if (data.type === "message_stop") {
+                      sawMessageStop = true;
                     }
                   } catch {
                     // Unparseable data line — pass through
                     if (!isClosed) {
-                      controller.enqueue(encoder.encode(`${line}\n`));
+                      controller.enqueue(encoder.encode(line + "\n"));
                     }
                   }
                 } else {
-                  // Non-data lines (event: lines, blank lines) — pass through
+                  // Non-data lines (event: lines, blank lines).
+                  // Suppress a bare `event: error` line: the matching `data:` line
+                  // that follows carries the payload and triggers finalizeWithError().
+                  // Forwarding `event: error` verbatim is itself what makes Claude Code
+                  // report "empty or malformed response (HTTP 200)" and crash, and it
+                  // produced the double `event: error` seen in production captures.
+                  if (line.trimStart().startsWith("event: error")) {
+                    continue;
+                  }
                   if (!isClosed) {
-                    controller.enqueue(encoder.encode(`${line}\n`));
+                    controller.enqueue(encoder.encode(line + "\n"));
                   }
                 }
               }
@@ -277,18 +430,62 @@ export function createAnthropicPassthroughStream(
                   if (data.type === "message_delta" && data.delta?.stop_reason) {
                     stopReason = data.delta.stop_reason;
                   }
+                  if (data.type === "message_start") {
+                    sawMessageStart = true;
+                  }
+                  if (data.type === "message_stop") {
+                    sawMessageStop = true;
+                  }
                 } catch {}
               }
             }
           }
 
           log(
-            `[AnthropicSSE] Stream complete for ${opts.modelName}: ${totalLines} lines, ${textChunks} text chunks, ${toolUseBlocks} tool_use blocks, stop_reason=${stopReason}${filterThinking ? `, filtered ${thinkingBlocksSuppressed} thinking blocks` : ""}`
+            `[AnthropicSSE] Stream complete for ${opts.modelName}: ${totalLines} lines, ${textChunks} text chunks, ${toolUseBlocks} tool_use blocks, stop_reason=${stopReason}` +
+              (filterThinking ? `, filtered ${thinkingBlocksSuppressed} thinking blocks` : "")
           );
           cap.note(`upstream-done sawMessageStop=${sawMessageStop} stop_reason=${stopReason} toolUse=${toolUseBlocks}`);
 
           if (opts.onTokenUpdate) {
             opts.onTokenUpdate(inputTokens, outputTokens);
+          }
+
+          // Finalization: if the upstream stream ended without sending
+          // message_stop, emit it ourselves. Claude Code requires
+          // message_stop as the terminal event — without it, the client
+          // reports "API returned an empty or malformed response (HTTP 200)".
+          if (!isClosed && !sawMessageStop) {
+            log(`[AnthropicSSE] Stream ended without message_stop (stopReason=${stopReason}) — emitting synthetic finalization`);
+            if (!sawMessageStart) {
+              const synthId = `msg_${Date.now()}`;
+              controller.enqueue(encoder.encode(
+                "event: message_start\n" +
+                `data: {"type":"message_start","message":{"id":"${synthId}","type":"message","role":"assistant","model":"${opts.modelName}","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":${inputTokens},"output_tokens":${outputTokens}}}}\n\n`
+              ));
+              controller.enqueue(encoder.encode(
+                "event: content_block_start\n" +
+                `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`
+              ));
+              controller.enqueue(encoder.encode(
+                "event: content_block_delta\n" +
+                `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"[Error: The model returned an empty response. Try compacting the conversation or reducing the context size.]"}}\n\n`
+              ));
+              controller.enqueue(encoder.encode(
+                "event: content_block_stop\n" +
+                `data: {"type":"content_block_stop","index":0}\n\n`
+              ));
+            }
+            if (!stopReason) {
+              controller.enqueue(encoder.encode(
+                "event: message_delta\n" +
+                `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":${outputTokens}}}\n\n`
+              ));
+            }
+            controller.enqueue(encoder.encode(
+              "event: message_stop\n" +
+              `data: {"type":"message_stop"}\n\n`
+            ));
           }
 
           if (!isClosed) {
