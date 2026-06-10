@@ -42,8 +42,22 @@ export interface ToolState {
   started: boolean; // Whether content_block_start has been sent
   closed: boolean;
   suppressed: boolean; // Web search tools — drop from stream, replace with text
+  remapped: boolean; // Web search tools re-emitted as the client's WebSearch tool_use
   arguments: string; // Accumulated JSON arguments string
   buffered: boolean; // Whether we're buffering args until tool call completes
+}
+
+/**
+ * Whether the client declared a WebSearch tool in this request.
+ * When it did, provider-side web search calls (web_search tool calls or GLM
+ * <searchWeb> tags) are remapped to a synthetic WebSearch tool_use with
+ * stop_reason "tool_use" — the client then runs its own WebSearch, gets the
+ * results as a tool_result, and the agentic loop CONTINUES. Suppressing the
+ * call and injecting results as text ends the turn (stop_reason end_turn),
+ * which stalls the agent on raw search results (CoursIA incident 2026-06-10).
+ */
+function clientDeclaresWebSearch(toolSchemas?: any[]): boolean {
+  return !!toolSchemas?.some((s) => s?.name === "WebSearch");
 }
 
 /**
@@ -143,6 +157,45 @@ export function createStreamingResponseHandler(
 
         const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2)}`;
         const state = createStreamingState();
+
+        // Emit a synthetic WebSearch tool_use block. Used to remap provider
+        // web search calls (web_search tool calls, GLM <searchWeb> tags) to
+        // the client's own WebSearch tool so the agentic loop continues
+        // (stop_reason "tool_use") instead of ending the turn on raw results.
+        const emitWebSearchToolUse = (query: string, t?: ToolState) => {
+          const blockIndex = t?.blockIndex ?? state.curIdx++;
+          const id = t?.id ?? `tool_websearch_${Date.now()}_${blockIndex}`;
+          send("content_block_start", {
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "tool_use", id, name: "WebSearch" },
+          });
+          send("content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify({ query }) },
+          });
+          send("content_block_stop", { type: "content_block_stop", index: blockIndex });
+          if (t) {
+            t.started = true;
+            t.closed = true;
+          } else {
+            // Register so hasStructuredTools counts it → stop_reason "tool_use".
+            // Negative key avoids collisions with provider tool_call indices.
+            state.tools.set(-(blockIndex + 1), {
+              id,
+              name: "WebSearch",
+              blockIndex,
+              started: true,
+              closed: true,
+              suppressed: false,
+              remapped: true,
+              arguments: JSON.stringify({ query }),
+              buffered: false,
+            });
+          }
+          log(`[Stream] Remapped provider web search → WebSearch tool_use (query="${query}")`);
+        };
 
         send("message_start", {
           type: "message_start",
@@ -313,23 +366,6 @@ export function createStreamingResponseHandler(
                 t.closed = true;
               }
             }
-          }
-
-          // Inject SearXNG results if we intercepted GLM <searchWeb> tags.
-          // Sent as a separate text block after the (now-cleaned) model output.
-          if (searchWebResults) {
-            const srchIdx = state.curIdx++;
-            send("content_block_start", {
-              type: "content_block_start",
-              index: srchIdx,
-              content_block: { type: "text", text: "" },
-            });
-            send("content_block_delta", {
-              type: "content_block_delta",
-              index: srchIdx,
-              delta: { type: "text_delta", text: searchWebResults },
-            });
-            send("content_block_stop", { type: "content_block_stop", index: srchIdx });
           }
 
           // Handle buffered-but-unsent structured tool calls.
@@ -778,8 +814,9 @@ export function createStreamingResponseHandler(
                           const rawName = tc.function.name;
                           const restoredName = toolNameMap?.get(rawName) || rawName;
                           const isWebSearch = isWebSearchToolCall(restoredName);
+                          const remapToWebSearch = isWebSearch && clientDeclaresWebSearch(toolSchemas);
                           if (isWebSearch) {
-                            log(`[Stream] Web search tool call detected: "${restoredName}" — intercepting via SearXNG (available=${SEARXNG_AVAILABLE})`);
+                            log(`[Stream] Web search tool call detected: "${restoredName}" — ${remapToWebSearch ? "remapping to client WebSearch tool_use" : `intercepting via SearXNG (available=${SEARXNG_AVAILABLE})`}`);
                           }
                           t = {
                             id: tc.id || `tool_${Date.now()}_${idx}`,
@@ -787,16 +824,16 @@ export function createStreamingResponseHandler(
                             blockIndex: state.curIdx++,
                             started: false,
                             closed: false,
-                            suppressed: isWebSearch,
+                            suppressed: isWebSearch && !remapToWebSearch,
+                            remapped: remapToWebSearch,
                             arguments: "", // Initialize arguments accumulator
                             buffered: !!toolSchemas && toolSchemas.length > 0 && !isWebSearch,
                           };
                           state.tools.set(idx, t);
                         }
-                        // Skip suppressed tools entirely
-                        if (t.suppressed) continue;
-                        // Only send content_block_start immediately if NOT buffering
-                        if (!t.started && !t.buffered) {
+                        // Only send content_block_start immediately if NOT buffering.
+                        // Suppressed and remapped tools never stream their blocks live.
+                        if (!t.started && !t.buffered && !t.suppressed && !t.remapped) {
                           send("content_block_start", {
                             type: "content_block_start",
                             index: t.blockIndex,
@@ -805,11 +842,12 @@ export function createStreamingResponseHandler(
                           t.started = true;
                         }
                       }
-                      if (tc.function?.arguments && t && !t.suppressed) {
-                        // Always accumulate arguments
+                      if (tc.function?.arguments && t) {
+                        // Always accumulate arguments — suppressed/remapped tools
+                        // need them too (extractSearchQuery reads the query later).
                         t.arguments += tc.function.arguments;
-                        // Only stream immediately if NOT buffering
-                        if (!t.buffered) {
+                        // Only stream immediately if NOT buffering/suppressed/remapped
+                        if (!t.buffered && !t.suppressed && !t.remapped) {
                           send("content_block_delta", {
                             type: "content_block_delta",
                             index: t.blockIndex,
@@ -826,6 +864,20 @@ export function createStreamingResponseHandler(
 
                 if (chunk.choices?.[0]?.finish_reason === "tool_calls") {
                   for (const t of Array.from(state.tools.values())) {
+                    if (t.remapped) {
+                      if (!t.closed) {
+                        const query = extractSearchQuery(t.arguments);
+                        if (query) {
+                          emitWebSearchToolUse(query, t);
+                        } else {
+                          // No usable query — degrade to the suppression path
+                          // (text injection below) rather than emit a broken tool_use.
+                          t.remapped = false;
+                          t.suppressed = true;
+                        }
+                      }
+                      if (t.closed) continue;
+                    }
                     if (t.suppressed) {
                       // Execute web search via SearXNG and inject results
                       if (!t.closed) {

@@ -37,7 +37,7 @@ import { PoeProvider } from "./providers/transport/poe.js";
 import type { ProviderTransport } from "./providers/transport/types.js";
 import { warmPricingCache } from "./services/pricing-cache.js";
 import type { ProxyServer } from "./types.js";
-import { executeWebSearch } from "./handlers/shared/web-search-executor.js";
+import { executeWebSearch, executeWebFetch } from "./handlers/shared/web-search-executor.js";
 
 /**
  * Routing failures are TERMINAL — no provider can serve the request (missing
@@ -86,18 +86,9 @@ async function interceptWebTools(c: any, body: any): Promise<Response | null> {
     if (fetchMatch) {
       const url = fetchMatch[1].trim();
       log(`[WebTools] Intercepted sub-agent web fetch: "${url}"`);
-      let resultText: string;
-      try {
-        const fetchUrl = `${process.env.SEARXNG_URL || "http://search.myia.io"}/search?q=${encodeURIComponent(url)}&format=json&categories=general`;
-        const resp = await fetch(fetchUrl, { signal: AbortSignal.timeout(5000) });
-        const data = await resp.json() as any;
-        const results = (data.results || []).slice(0, 3);
-        resultText = results.length > 0
-          ? results.map((r: any) => `**${r.title}**\n${r.url}\n${r.content || ""}`).join("\n\n")
-          : `[No results found for URL: ${url}]`;
-      } catch (err: any) {
-        resultText = `[Web fetch for "${url}" failed: ${err.message}]`;
-      }
+      // Real fetch with graceful degradation:
+      // MCP web_url_read → MCP via r.jina.ai → direct HTTP → error text.
+      const resultText = await executeWebFetch(url, 10_000);
       return buildToolResultResponse(body.model || "unknown", [{ content: resultText }], isStreaming);
     }
   }
