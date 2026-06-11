@@ -175,6 +175,47 @@ export function createStreamingResponseHandler(
             );
           }
 
+          // Check for text-based web search tags (GLM emits <searchWeb><query>...</query></searchWeb>)
+          // These must be intercepted before text-based tool call extraction, since we want to
+          // execute SearXNG and replace the search tags with results, not pass them through.
+          let searchWebResults: string | null = null;
+          let pendingSearchRemap: string | null = null;
+          let cleanedText = state.accumulatedText;
+          const searchWebMatch = state.accumulatedText.match(/<searchWeb>\s*<query>([\s\S]*?)<\/query>\s*<\/searchWeb>/i);
+          if (searchWebMatch) {
+            const searchQuery = searchWebMatch[1].trim();
+            if (searchQuery && clientDeclaresWebSearch(toolSchemas)) {
+              // Remap to the client's WebSearch tool — emitted as a tool_use
+              // block after the text blocks close, keeping the agent loop alive.
+              log(`[Stream] GLM searchWeb detected: "${searchQuery}" — remapping to client WebSearch tool_use`);
+              pendingSearchRemap = searchQuery;
+            } else {
+              log(`[Stream] GLM searchWeb detected: "${searchQuery}" — intercepting via SearXNG`);
+              if (searchQuery && SEARXNG_AVAILABLE) {
+                searchWebResults = await executeWebSearch(searchQuery);
+              } else {
+                searchWebResults = searchQuery
+                  ? `[Web search for "${searchQuery}" could not be executed. SearXNG is not configured.]`
+                  : `[Web search was requested but no query was provided.]`;
+              }
+            }
+            // Remove the search tags from accumulated text so they don't appear in output
+            cleanedText = state.accumulatedText.replace(/<searchWeb>[\s\S]*?<\/searchWeb>/i, "").trim();
+            state.accumulatedText = cleanedText;
+          }
+
+          // Close any open reasoning/text blocks BEFORE emitting new blocks below.
+          // If we don't, new tool_use blocks (higher indices) get fully opened/closed
+          // before the reasoning block (lower index) is stopped — the Anthropic client
+          // rejects this out-of-order lifecycle as "Content block not found".
+          if (state.reasoningStarted) {
+            send("content_block_stop", { type: "content_block_stop", index: state.reasoningIdx });
+            state.reasoningStarted = false;
+          }
+          if (state.textStarted) {
+            send("content_block_stop", { type: "content_block_stop", index: state.textIdx });
+            state.textStarted = false;
+          }
           // Check for text-based tool calls before finalizing
           // Some models (like Qwen) output tool calls as text instead of structured tool_calls
           const textToolCalls = extractToolCallsFromText(state.accumulatedText);
@@ -183,12 +224,6 @@ export function createStreamingResponseHandler(
             log(
               `[Streaming] Found ${textToolCalls.length} text-based tool call(s), converting to structured format`
             );
-
-            // Close any open text block first
-            if (state.textStarted) {
-              send("content_block_stop", { type: "content_block_stop", index: state.textIdx });
-              state.textStarted = false;
-            }
 
             // Send each extracted tool call as a proper tool_use block
             for (const tc of textToolCalls) {
@@ -211,9 +246,48 @@ export function createStreamingResponseHandler(
 
           if (state.reasoningStarted) {
             send("content_block_stop", { type: "content_block_stop", index: state.reasoningIdx });
+            state.reasoningStarted = false;
           }
           if (state.textStarted) {
             send("content_block_stop", { type: "content_block_stop", index: state.textIdx });
+            state.textStarted = false;
+          }
+
+          // GLM <searchWeb> remapped to the client's WebSearch tool —
+          // emitted as a tool_use block so stop_reason becomes "tool_use".
+          if (pendingSearchRemap) {
+            emitWebSearchToolUse(pendingSearchRemap);
+          }
+
+          // Inject SearXNG results if we intercepted GLM <searchWeb> tags.
+          // Sent as a separate text block after the (now-cleaned) model output.
+          if (searchWebResults) {
+            const srchIdx = state.curIdx++;
+            send("content_block_start", {
+              type: "content_block_start",
+              index: srchIdx,
+              content_block: { type: "text", text: "" },
+            });
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index: srchIdx,
+              delta: { type: "text_delta", text: searchWebResults },
+            });
+            send("content_block_stop", { type: "content_block_stop", index: srchIdx });
+          }
+
+          // Remapped web search tools that never saw finish_reason="tool_calls"
+          // (e.g. the provider ended with "stop") — emit them now so the
+          // query isn't silently dropped and stop_reason becomes "tool_use".
+          for (const t of Array.from(state.tools.values())) {
+            if (t.remapped && !t.closed) {
+              const query = extractSearchQuery(t.arguments);
+              if (query) {
+                emitWebSearchToolUse(query, t);
+              } else {
+                t.closed = true;
+              }
+            }
           }
 
           // Handle buffered-but-unsent structured tool calls.
@@ -697,6 +771,29 @@ export function createStreamingResponseHandler(
                             t.closed = true;
                             continue;
                           }
+
+                          // Non-buffered and never started — emit repaired tool at a new index
+                          const fallbackIdx = state.curIdx++;
+                          const fallbackId = `tool_repaired_${Date.now()}_${fallbackIdx}`;
+                          log(
+                            `[Streaming] Emitting repaired tool ${t.name} (non-buffered, not started) at fallback index ${fallbackIdx}`
+                          );
+                          send("content_block_start", {
+                            type: "content_block_start",
+                            index: fallbackIdx,
+                            content_block: { type: "tool_use", id: fallbackId, name: t.name },
+                          });
+                          send("content_block_delta", {
+                            type: "content_block_delta",
+                            index: fallbackIdx,
+                            delta: { type: "input_json_delta", partial_json: repairedJson },
+                          });
+                          send("content_block_stop", {
+                            type: "content_block_stop",
+                            index: fallbackIdx,
+                          });
+                          t.closed = true;
+                          continue;
                         }
 
                         if (!validation.valid) {
@@ -704,6 +801,14 @@ export function createStreamingResponseHandler(
                           log(
                             `[Streaming] Tool call ${t.name} validation failed: ${validation.missingParams.join(", ")}`
                           );
+                          // Close the original tool block FIRST (lower index) so that
+                          // the error text block (higher index) doesn't open/close out of order.
+                          if (t.started && !t.buffered && !t.closed) {
+                            send("content_block_stop", {
+                              type: "content_block_stop",
+                              index: t.blockIndex,
+                            });
+                          }
                           const errorIdx = t.buffered ? t.blockIndex : state.curIdx++;
                           const errorMsg = `\n\n⚠️ Tool call "${t.name}" failed: missing required parameters: ${validation.missingParams.join(", ")}. Local models sometimes generate incomplete tool calls. Please try again or use a model with better tool support.`;
                           send("content_block_start", {
@@ -720,13 +825,6 @@ export function createStreamingResponseHandler(
                             type: "content_block_stop",
                             index: errorIdx,
                           });
-                          // Close the invalid tool if it was already started
-                          if (t.started && !t.buffered) {
-                            send("content_block_stop", {
-                              type: "content_block_stop",
-                              index: t.blockIndex,
-                            });
-                          }
                           t.closed = true;
                           continue;
                         }
