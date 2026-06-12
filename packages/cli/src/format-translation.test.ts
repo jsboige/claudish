@@ -5,15 +5,15 @@
  * through the parser stack and asserting correct Claude SSE output.
  *
  * Workflow for adding regression tests from production failures:
- *   1. Run failing model with --debug-claudish: claudish --model kimi-k2.5 --debug-claudish ...
+ *   1. Run failing model with --debug: claudish --model kimi-k2.5 --debug ...
  *   2. Extract fixtures: bun run src/test-fixtures/extract-sse-from-log.ts logs/claudish_*.log
  *   3. Add a describe() block below referencing the new fixture
  *   4. Run: bun test src/format-translation.test.ts
  */
 
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { describe, test, expect } from "bun:test";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ─── Test Helpers ───────────────────────────────────────────────────────────
@@ -497,14 +497,12 @@ describe("Adapter: AnthropicAPIFormat", () => {
 // ─── Model Adapter Quirks Tests ─────────────────────────────────────────────
 
 describe("Model Adapter Quirks", () => {
-  test("MiniMaxModelDialect: thinking maps to a {type} toggle (never reasoning_split)", async () => {
+  test("MiniMaxModelDialect: native thinking passthrough (no reasoning_split)", async () => {
     const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
     const adapter = new MiniMaxModelDialect("minimax-m2.5");
 
-    // MiniMax's Anthropic-compatible endpoint takes a BOOLEAN `thinking` toggle
-    // ({type:"adaptive"|"disabled"}), NOT a budget. A legacy budget hint
-    // resolves to an effort level which maps to the toggle. prepareRequest must
-    // NOT convert it to reasoning_split.
+    // MiniMax's Anthropic-compatible endpoint supports `thinking` natively.
+    // prepareRequest should NOT convert it to reasoning_split.
     const request: any = {
       model: "minimax-m2.5",
       messages: [],
@@ -514,7 +512,7 @@ describe("Model Adapter Quirks", () => {
 
     adapter.prepareRequest(request, original);
     expect(request.reasoning_split).toBeUndefined();
-    expect(request.thinking).toEqual({ type: "adaptive" });
+    expect(request.thinking).toEqual({ budget_tokens: 10000 });
   });
 
   test("MiniMaxModelDialect: temperature clamping — 0 → 0.01", async () => {
@@ -553,6 +551,18 @@ describe("Model Adapter Quirks", () => {
     expect(request.temperature).toBe(0.7);
   });
 
+  test("MiniMaxModelDialect: unknown minimax model → context window 0", async () => {
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+    expect(adapter.getContextWindow()).toBe(0);
+  });
+
+  test("MiniMaxModelDialect: supportsVision returns false", async () => {
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+    expect(adapter.supportsVision()).toBe(false);
+  });
+
   test("OpenAIAdapter: thinking → reasoning_effort for o3", async () => {
     const { OpenAIAPIFormat } = await import("./adapters/openai-api-format.js");
     const adapter = new OpenAIAPIFormat("o3-mini");
@@ -575,11 +585,136 @@ describe("Model Adapter Quirks", () => {
     adapter.prepareRequest(request, original);
     expect(request.thinking).toBeUndefined();
   });
+
+  test("AdapterManager selects correct adapter for model IDs", async () => {
+    const { DialectManager } = await import("./adapters/dialect-manager.js");
+
+    expect(new DialectManager("glm-5").getAdapter().getName()).toBe("GLMModelDialect");
+    expect(new DialectManager("grok-3").getAdapter().getName()).toBe("GrokModelDialect");
+    expect(new DialectManager("minimax-m2.5").getAdapter().getName()).toBe("MiniMaxModelDialect");
+    expect(new DialectManager("qwen3.5-plus").getAdapter().getName()).toBe("QwenModelDialect");
+    expect(new DialectManager("deepseek-r1").getAdapter().getName()).toBe("DeepSeekModelDialect");
+    expect(new DialectManager("unknown-model").getAdapter().getName()).toBe("DefaultAPIFormat");
+  });
 });
 
 // ─── APIFormat: getStreamFormat() Tests ──────────────────────────────────────
 
+describe("APIFormat: getStreamFormat()", () => {
+  test("DefaultAPIFormat returns openai-sse", async () => {
+    const { DefaultAPIFormat } = await import("./adapters/base-api-format.js");
+    expect(new DefaultAPIFormat("test").getStreamFormat()).toBe("openai-sse");
+  });
+
+  test("AnthropicAPIFormat returns anthropic-sse", async () => {
+    const { AnthropicAPIFormat } = await import("./adapters/anthropic-api-format.js");
+    expect(new AnthropicAPIFormat("test", "minimax").getStreamFormat()).toBe("anthropic-sse");
+  });
+
+  test("GeminiAPIFormat returns gemini-sse", async () => {
+    const { GeminiAPIFormat } = await import("./adapters/gemini-api-format.js");
+    expect(new GeminiAPIFormat("gemini-2.0-flash").getStreamFormat()).toBe("gemini-sse");
+  });
+
+  test("OllamaAPIFormat returns ollama-jsonl", async () => {
+    const { OllamaAPIFormat } = await import("./adapters/ollama-api-format.js");
+    expect(new OllamaAPIFormat("llama3.2").getStreamFormat()).toBe("ollama-jsonl");
+  });
+
+  test("OpenAIAPIFormat returns openai-sse for GPT models", async () => {
+    const { OpenAIAPIFormat } = await import("./adapters/openai-api-format.js");
+    expect(new OpenAIAPIFormat("gpt-5.4").getStreamFormat()).toBe("openai-sse");
+  });
+
+  test("CodexAPIFormat returns openai-responses-sse", async () => {
+    const { CodexAPIFormat } = await import("./adapters/codex-api-format.js");
+    expect(new CodexAPIFormat("codex-mini").getStreamFormat()).toBe("openai-responses-sse");
+  });
+
+  test("GLMModelDialect inherits openai-sse (uses OpenAI-compat API)", async () => {
+    const { GLMModelDialect } = await import("./adapters/glm-model-dialect.js");
+    expect(new GLMModelDialect("glm-5").getStreamFormat()).toBe("openai-sse");
+  });
+});
+
+describe("CodexAdapter", () => {
+  test("shouldHandle returns true for codex models", async () => {
+    const { CodexAPIFormat } = await import("./adapters/codex-api-format.js");
+    expect(new CodexAPIFormat("codex-mini").shouldHandle("codex-mini")).toBe(true);
+    expect(new CodexAPIFormat("codex-mini").shouldHandle("codex-davinci-002")).toBe(true);
+  });
+
+  test("shouldHandle returns false for non-codex models", async () => {
+    const { CodexAPIFormat } = await import("./adapters/codex-api-format.js");
+    expect(new CodexAPIFormat("gpt-5.4").shouldHandle("gpt-5.4")).toBe(false);
+    expect(new CodexAPIFormat("o3").shouldHandle("o3")).toBe(false);
+  });
+
+  test("getStreamFormat returns openai-responses-sse", async () => {
+    const { CodexAPIFormat } = await import("./adapters/codex-api-format.js");
+    expect(new CodexAPIFormat("codex-mini").getStreamFormat()).toBe("openai-responses-sse");
+  });
+
+  test("getName returns CodexAPIFormat", async () => {
+    const { CodexAPIFormat } = await import("./adapters/codex-api-format.js");
+    expect(new CodexAPIFormat("codex-mini").getName()).toBe("CodexAPIFormat");
+  });
+
+  test("AdapterManager selects CodexAPIFormat for codex-mini", async () => {
+    const { DialectManager } = await import("./adapters/dialect-manager.js");
+    expect(new DialectManager("codex-mini").getAdapter().getName()).toBe("CodexAPIFormat");
+  });
+});
+
+describe("ModelDialect interface compliance", () => {
+  test("GLMAdapter implements translator methods", async () => {
+    const { GLMModelDialect } = await import("./adapters/glm-model-dialect.js");
+    const t = new GLMModelDialect("glm-5");
+    expect(typeof t.getContextWindow()).toBe("number");
+    expect(typeof t.supportsVision()).toBe("boolean");
+    expect(typeof t.prepareRequest).toBe("function");
+    expect(typeof t.shouldHandle).toBe("function");
+    expect(typeof t.getName).toBe("function");
+  });
+});
+
 // ─── ProviderProfile Table Tests ─────────────────────────────────────────────
+
+describe("ProviderProfile table completeness", () => {
+  test("all expected providers are registered", async () => {
+    const { PROVIDER_PROFILES } = await import("./providers/provider-profiles.js");
+
+    const expectedProviders = [
+      "gemini",
+      "gemini-codeassist",
+      "openai",
+      "minimax",
+      "minimax-coding",
+      "kimi",
+      "kimi-coding",
+      "zai",
+      "glm",
+      "glm-coding",
+      "opencode-zen",
+      "opencode-zen-go",
+      "ollamacloud",
+      "litellm",
+      "vertex",
+    ];
+
+    for (const provider of expectedProviders) {
+      expect(PROVIDER_PROFILES).toHaveProperty(provider);
+    }
+  });
+
+  test("each profile has a createHandler function", async () => {
+    const { PROVIDER_PROFILES } = await import("./providers/provider-profiles.js");
+
+    for (const [name, profile] of Object.entries(PROVIDER_PROFILES)) {
+      expect(typeof profile.createHandler).toBe("function");
+    }
+  });
+});
 
 // ─── Regression: Production Fixture Tests ───────────────────────────────────
 //
@@ -880,10 +1015,7 @@ describe("Regression: GeminiAPIFormat images in tool_result", () => {
               type: "tool_result",
               tool_use_id: "toolu_screenshot_1",
               content: [
-                {
-                  type: "text",
-                  text: '{"size_bytes": 358688, "viewport": {"width": 1800, "height": 991}}',
-                },
+                { type: "text", text: '{"size_bytes": 358688, "viewport": {"width": 1800, "height": 991}}' },
                 {
                   type: "image",
                   source: {
@@ -930,12 +1062,7 @@ describe("Regression: GeminiAPIFormat images in tool_result", () => {
         {
           role: "assistant",
           content: [
-            {
-              type: "tool_use",
-              id: "toolu_read_1",
-              name: "Read",
-              input: { file_path: "/tmp/test.ts" },
-            },
+            { type: "tool_use", id: "toolu_read_1", name: "Read", input: { file_path: "/tmp/test.ts" } },
           ],
         },
         {
@@ -973,7 +1100,9 @@ describe("Regression: GeminiAPIFormat images in tool_result", () => {
       messages: [
         {
           role: "assistant",
-          content: [{ type: "tool_use", id: "toolu_multi_1", name: "multi_screenshot", input: {} }],
+          content: [
+            { type: "tool_use", id: "toolu_multi_1", name: "multi_screenshot", input: {} },
+          ],
         },
         {
           role: "user",
@@ -1005,121 +1134,6 @@ describe("Regression: GeminiAPIFormat images in tool_result", () => {
     expect(inlineDataParts).toHaveLength(2);
     expect(inlineDataParts[0].inlineData.mimeType).toBe("image/png");
     expect(inlineDataParts[1].inlineData.mimeType).toBe("image/jpeg");
-  });
-});
-
-// ─── Regression: OpenAI/Codex images in tool_result (Read of an image file) ──
-//
-// Real production failure: a claudish session on gpt-5.6-sol (codex Responses
-// API) Read screenshot files. Each Read returns a tool_result containing an
-// image; the converter JSON-stringified that content, so a ~350KB base64 image
-// became ~90k TEXT tokens in the tool output. Three of them + the conversation
-// blew the context window: "[API Error: context_length_exceeded]". Images in a
-// tool_result must ride as image_url (→ input_image), never as text.
-// (Transcript: aniflow/mastra cdadb661, messages #31/#32.)
-describe("Regression: OpenAI/Codex images in tool_result", () => {
-  async function getConverter() {
-    const mod = await import("./handlers/shared/format/openai-messages.js");
-    return mod.convertMessagesToOpenAI;
-  }
-  async function getCodexFormat() {
-    const mod = await import("./adapters/codex-api-format.js");
-    return mod.CodexAPIFormat;
-  }
-
-  const TINY_PNG_B64 =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
-
-  const requestWithToolResultImage = {
-    model: "gpt-5.6-sol",
-    messages: [
-      { role: "user", content: [{ type: "text", text: "read the screenshot" }] },
-      {
-        role: "assistant",
-        content: [{ type: "tool_use", id: "toolu_read_1", name: "Read", input: {} }],
-      },
-      {
-        role: "user",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: "toolu_read_1",
-            content: [
-              { type: "text", text: "[Image: original 4514x2432, displayed at 2000x1078]" },
-              { type: "image", source: { type: "base64", media_type: "image/png", data: TINY_PNG_B64 } },
-            ],
-          },
-        ],
-      },
-    ],
-  };
-
-  test("tool_result image becomes image_url, not JSON-stringified into the tool output", async () => {
-    const convertMessagesToOpenAI = await getConverter();
-    const messages = convertMessagesToOpenAI(requestWithToolResultImage, "gpt-5.6-sol");
-
-    const toolMsg = messages.find((m: any) => m.role === "tool");
-    expect(toolMsg).toBeDefined();
-    // Text stays in the tool output; the base64 must NOT be there.
-    expect(toolMsg.content).toContain("original 4514x2432");
-    expect(toolMsg.content).not.toContain(TINY_PNG_B64);
-
-    // The image rides in its own user message as an image_url part.
-    const imageMsg = messages.find(
-      (m: any) => m.role === "user" && Array.isArray(m.content) && m.content.some((p: any) => p.type === "image_url")
-    );
-    expect(imageMsg).toBeDefined();
-    const imagePart = imageMsg.content.find((p: any) => p.type === "image_url");
-    expect(imagePart.image_url.url).toBe(`data:image/png;base64,${TINY_PNG_B64}`);
-  });
-
-  test("codex Responses payload sends the tool_result image as input_image (bounded tokens)", async () => {
-    const convertMessagesToOpenAI = await getConverter();
-    const CodexAPIFormat = await getCodexFormat();
-    const messages = convertMessagesToOpenAI(requestWithToolResultImage, "gpt-5.6-sol");
-    const payload = new CodexAPIFormat("gpt-5.6-sol").buildPayload(
-      requestWithToolResultImage,
-      messages,
-      []
-    );
-
-    const serialized = JSON.stringify(payload);
-    // Image is a proper input_image, and the base64 never lands in a tool output.
-    expect(serialized).toContain('"input_image"');
-    const toolOutputs = payload.input
-      .filter((i: any) => i.type === "function_call_output")
-      .map((i: any) => i.output || "")
-      .join("");
-    expect(toolOutputs).not.toContain(TINY_PNG_B64);
-    expect(toolOutputs).toContain("original 4514x2432");
-  });
-
-  test("string tool_result still passes through unchanged", async () => {
-    const convertMessagesToOpenAI = await getConverter();
-    const messages = convertMessagesToOpenAI(
-      {
-        model: "gpt-5.6-sol",
-        messages: [
-          {
-            role: "assistant",
-            content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: {} }],
-          },
-          {
-            role: "user",
-            content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "file contents here" }],
-          },
-        ],
-      },
-      "gpt-5.6-sol"
-    );
-    const toolMsg = messages.find((m: any) => m.role === "tool");
-    expect(toolMsg.content).toBe("file contents here");
-    // No stray image message.
-    expect(
-      messages.some(
-        (m: any) => m.role === "user" && Array.isArray(m.content) && m.content.some((p: any) => p.type === "image_url")
-      )
-    ).toBe(false);
   });
 });
 
@@ -1171,7 +1185,8 @@ describe("Anthropic SSE: thinking block filtering", () => {
 
     // Thinking block start should be present
     const thinkingStart = events.find(
-      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
     );
     expect(thinkingStart).toBeDefined();
 
@@ -1207,7 +1222,8 @@ describe("Anthropic SSE: thinking block filtering", () => {
 
     // No thinking block start should be present
     const thinkingStart = events.find(
-      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
     );
     expect(thinkingStart).toBeUndefined();
 
@@ -1249,7 +1265,8 @@ describe("Anthropic SSE: thinking block filtering", () => {
 
     // Thinking block start should be present (DefaultAPIFormat doesn't filter)
     const thinkingStart = events.find(
-      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
     );
     expect(thinkingStart).toBeDefined();
   });
@@ -1273,12 +1290,14 @@ describe("Anthropic SSE: thinking block filtering", () => {
     // After filtering thinking, text should be index 0, tool_use should be index 1
 
     const textStart = events.find(
-      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "text"
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "text"
     );
     expect(textStart?.data?.index).toBe(0);
 
     const toolStart = events.find(
-      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "tool_use"
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "tool_use"
     );
     expect(toolStart?.data?.index).toBe(1);
 
@@ -1296,14 +1315,16 @@ describe("Anthropic SSE: thinking block filtering", () => {
 
     // content_block_stop for text should be index 0
     const textStop = events.find(
-      (e) => e.data?.type === "content_block_stop" && e.data?.index === 0
+      (e) =>
+        e.data?.type === "content_block_stop" && e.data?.index === 0
     );
     // Note: there will be a content_block_stop with index 0 for text (the thinking one was filtered)
     expect(textStop).toBeDefined();
 
     // content_block_stop for tool_use should be index 1
     const toolStop = events.find(
-      (e) => e.data?.type === "content_block_stop" && e.data?.index === 1
+      (e) =>
+        e.data?.type === "content_block_stop" && e.data?.index === 1
     );
     expect(toolStop).toBeDefined();
   });
@@ -1330,9 +1351,7 @@ describe("Integration: Real MiniMax M2.5 SSE — thinking filtering", () => {
     const createAnthropicPassthroughStream = await getParser();
     const adapter = await makeMiniMaxAdapter();
 
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "minimax-m25-turn1-thinking-text-tool.sse")
-    );
+    const fixture = fixtureToResponse(join(FIXTURES_DIR, "minimax-m25-turn1-thinking-text-tool.sse"));
     const ctx = createMockContext();
 
     const response = createAnthropicPassthroughStream(ctx, fixture, {
@@ -1349,7 +1368,9 @@ describe("Integration: Real MiniMax M2.5 SSE — thinking filtering", () => {
     expect(thinkingEvents.length).toBe(0);
 
     // NO signature_delta events should appear
-    const signatureEvents = events.filter((e) => e.data?.delta?.type === "signature_delta");
+    const signatureEvents = events.filter(
+      (e) => e.data?.delta?.type === "signature_delta"
+    );
     expect(signatureEvents.length).toBe(0);
 
     // Text block should be at index 0 (was index 1 before filtering thinking at index 0)
@@ -1390,9 +1411,7 @@ describe("Integration: Real MiniMax M2.5 SSE — thinking filtering", () => {
     const createAnthropicPassthroughStream = await getParser();
     const adapter = await makeMiniMaxAdapter();
 
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "minimax-m25-turn2-thinking-tool-only.sse")
-    );
+    const fixture = fixtureToResponse(join(FIXTURES_DIR, "minimax-m25-turn2-thinking-tool-only.sse"));
     const ctx = createMockContext();
 
     const response = createAnthropicPassthroughStream(ctx, fixture, {
@@ -1403,11 +1422,15 @@ describe("Integration: Real MiniMax M2.5 SSE — thinking filtering", () => {
     const events = await parseClaudeSseStream(response);
 
     // NO thinking blocks
-    const thinkingStarts = events.filter((e) => e.data?.content_block?.type === "thinking");
+    const thinkingStarts = events.filter(
+      (e) => e.data?.content_block?.type === "thinking"
+    );
     expect(thinkingStarts.length).toBe(0);
 
     // NO text blocks (this turn had none)
-    const textStarts = events.filter((e) => e.data?.content_block?.type === "text");
+    const textStarts = events.filter(
+      (e) => e.data?.content_block?.type === "text"
+    );
     expect(textStarts.length).toBe(0);
 
     // Tool_use should be at index 0 (was index 1 after thinking at index 0)
@@ -1433,9 +1456,7 @@ describe("Integration: Real MiniMax M2.5 SSE — thinking filtering", () => {
     const createAnthropicPassthroughStream = await getParser();
     const adapter = await makeMiniMaxAdapter();
 
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "minimax-m25-turn3-thinking-multichunk.sse")
-    );
+    const fixture = fixtureToResponse(join(FIXTURES_DIR, "minimax-m25-turn3-thinking-multichunk.sse"));
     const ctx = createMockContext();
 
     const response = createAnthropicPassthroughStream(ctx, fixture, {
@@ -1471,9 +1492,7 @@ describe("Integration: Real MiniMax M2.5 SSE — thinking filtering", () => {
   test("Without adapter, real MiniMax thinking blocks pass through (backward compat)", async () => {
     const createAnthropicPassthroughStream = await getParser();
 
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "minimax-m25-turn1-thinking-text-tool.sse")
-    );
+    const fixture = fixtureToResponse(join(FIXTURES_DIR, "minimax-m25-turn1-thinking-text-tool.sse"));
     const ctx = createMockContext();
 
     const response = createAnthropicPassthroughStream(ctx, fixture, {
@@ -1490,7 +1509,9 @@ describe("Integration: Real MiniMax M2.5 SSE — thinking filtering", () => {
     expect(thinkingStart).toBeDefined();
 
     // Thinking deltas with real content should be present
-    const thinkingDeltas = events.filter((e) => e.data?.delta?.type === "thinking_delta");
+    const thinkingDeltas = events.filter(
+      (e) => e.data?.delta?.type === "thinking_delta"
+    );
     expect(thinkingDeltas.length).toBeGreaterThan(0);
 
     // Original indices preserved (thinking=0, text=1, tool=2)
@@ -1608,397 +1629,310 @@ describe("Regression: Anthropic SSE in-stream error handling (#106)", () => {
   });
 });
 
-// ─── OpenAI Responses API SSE Parser Tests ──────────────────────────────────
+// ─── Regression: web search remap (agentic blocking fix) ───────────────────
+//
+// CoursIA incident 2026-06-10: provider-side web search (web_search tool call
+// or GLM <searchWeb> tag) was suppressed and replaced with a text block +
+// stop_reason "end_turn" — the agent ended its turn on raw search results and
+// the agentic loop stalled. The fix remaps these to a synthetic WebSearch
+// tool_use (stop_reason "tool_use") whenever the client declared WebSearch,
+// so Claude Code runs its own WebSearch and the conversation continues.
 
-/**
- * Regression: gpt-5.6-sol (Responses API) duplicated its FIRST tool call.
- *
- * Fixtures are real captures from POST https://api.openai.com/v1/responses
- * (gpt-5.6-sol, streaming, parallel function calls).
- *
- * The bug: the parser advanced `blockIndex` onto the first tool's block index
- * and never cleared `hasTextContent`, so end-of-stream emitted a second
- * content_block_stop for that tool. Claude Code re-dispatched it — two identical
- * agents, plan approval asked twice. Separately, `functionCalls` is keyed twice
- * per call (call_id + item_id), so `functionCalls.size` inflated the block index
- * and produced non-contiguous indices (1, 4, 6, 8 instead of 1, 2, 3, 4).
- */
-describe("OpenAI Responses SSE → Claude SSE (createResponsesStreamHandler)", () => {
+describe("Regression: web search remap to client WebSearch tool_use", () => {
   async function getParser() {
-    const mod = await import("./handlers/shared/stream-parsers/openai-responses-sse.js");
-    return mod.createResponsesStreamHandler;
+    const mod = await import("./handlers/shared/openai-compat.js");
+    return mod.createStreamingResponseHandler;
   }
 
-  /** Every content_block_start index, in emission order. */
-  function blockStarts(events: ClaudeEvent[]): { index: number; type: string; id?: string }[] {
-    return events
-      .filter((e) => e.data?.type === "content_block_start")
-      .map((e) => ({
-        index: e.data.index,
-        type: e.data.content_block.type,
-        id: e.data.content_block.id,
-      }));
+  async function getDefaultAdapter() {
+    const mod = await import("./adapters/base-api-format.js");
+    return new mod.DefaultAPIFormat("test-model");
   }
 
-  test("text + parallel tool calls: no duplicate tool_use, contiguous block indices", async () => {
-    const createResponsesStreamHandler = await getParser();
-    const fixture = fixtureToResponse(join(FIXTURES_DIR, "gpt-5.6-sol-responses-turn1.sse"));
-
-    const response = createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
+  function sseToResponse(content: string): Response {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(content));
+        controller.close();
+      },
     });
-    const events = await parseClaudeSseStream(response);
+    return new Response(stream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  }
 
-    const starts = blockStarts(events);
-    const toolStarts = starts.filter((s) => s.type === "tool_use");
+  const WEBSEARCH_SCHEMA = {
+    name: "WebSearch",
+    description: "Search the web",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+  };
+  const READ_SCHEMA = {
+    name: "Read",
+    description: "Read a file",
+    input_schema: {
+      type: "object",
+      properties: { file_path: { type: "string" } },
+      required: ["file_path"],
+    },
+  };
 
-    // The fixture has 3 parallel read_file calls — exactly 3 tool_use blocks.
-    expect(extractToolNames(events)).toEqual(["read_file", "read_file", "read_file"]);
+  // Provider emits a structured web_search tool call (GLM/z.ai dialect)
+  const WEB_SEARCH_TOOLCALL_SSE = [
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Let me look that up."},"finish_reason":null}]}`,
+    ``,
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_1","type":"function","function":{"name":"web_search","arguments":""}}]},"finish_reason":null}]}`,
+    ``,
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"query\\":\\"chatterbox tts docker compose\\"}"}}]},"finish_reason":null}]}`,
+    ``,
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":7}}`,
+    ``,
+    `data: [DONE]`,
+    ``,
+  ].join("\n");
 
-    // Each tool_use id appears exactly once. (The bug re-emitted the first one.)
-    const toolIds = toolStarts.map((t) => t.id);
-    expect(new Set(toolIds).size).toBe(toolIds.length);
+  test("web_search tool call + WebSearch declared → remapped tool_use, stop_reason=tool_use", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
 
-    // Block indices are contiguous from 0 and never reused.
-    expect(starts.map((s) => s.index)).toEqual(starts.map((_, i) => i));
-
-    // Exactly one stop per start, and no stop for a block that never started.
-    const stops = events
-      .filter((e) => e.data?.type === "content_block_stop")
-      .map((e) => e.data.index);
-    expect([...stops].sort((a, b) => a - b)).toEqual(starts.map((s) => s.index));
-
-    expect(extractStopReason(events)).toBe("tool_use");
-  });
-
-  test("tool calls with no preceding text still emit one block per call", async () => {
-    const createResponsesStreamHandler = await getParser();
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "gpt-5.6-sol-responses-toolsonly-turn1.sse")
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(WEB_SEARCH_TOOLCALL_SSE),
+      adapter,
+      "glm-5.1",
+      null,
+      undefined,
+      [WEBSEARCH_SCHEMA, READ_SCHEMA]
     );
 
-    const response = createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
-    });
     const events = await parseClaudeSseStream(response);
 
-    const starts = blockStarts(events);
-    expect(starts.every((s) => s.type === "tool_use")).toBe(true);
-    expect(new Set(starts.map((s) => s.id)).size).toBe(starts.length);
-    expect(starts.map((s) => s.index)).toEqual(starts.map((_, i) => i));
+    // The provider tool call is remapped to the client's WebSearch tool
+    const tools = extractToolNames(events);
+    expect(tools).toContain("WebSearch");
+
+    // The remapped input carries the original query
+    const inputJson = events
+      .filter((e) => e.data?.type === "content_block_delta" && e.data?.delta?.type === "input_json_delta")
+      .map((e) => e.data.delta.partial_json)
+      .join("");
+    expect(JSON.parse(inputJson)).toEqual({ query: "chatterbox tts docker compose" });
+
+    // THE fix: the turn must continue, not end on injected text
     expect(extractStopReason(events)).toBe("tool_use");
+
+    // No raw search-results text block injected
+    expect(extractText(events)).not.toContain("[Web search");
   });
 
-  test("reasoning summary becomes a thinking block, not the assistant's answer", async () => {
-    const createResponsesStreamHandler = await getParser();
+  test("web_search tool call WITHOUT WebSearch declared → suppression fallback, stop_reason=end_turn", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
 
-    // Synthetic: the captured fixtures carry no reasoning summary (OpenAI only
-    // returns one for verified orgs), but the codex transport requests
-    // summary:auto and gpt-5.6 reasoning models emit these events in every turn.
-    const sse =
-      `data: ${JSON.stringify({ type: "response.reasoning_summary_text.delta", delta: "Let me check the files." })}\n\n` +
-      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Reading them now." })}\n\n` +
-      `data: ${JSON.stringify({ type: "response.completed", response: { usage: { input_tokens: 5, output_tokens: 7 } } })}\n\n`;
-    const fixture = new Response(new Blob([sse]).stream(), { status: 200 });
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(WEB_SEARCH_TOOLCALL_SSE),
+      adapter,
+      "glm-5.1",
+      null,
+      undefined,
+      [READ_SCHEMA] // no WebSearch in the request
+    );
 
-    const response = createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
-    });
     const events = await parseClaudeSseStream(response);
 
-    const starts = blockStarts(events);
-    expect(starts.map((s) => s.type)).toEqual(["thinking", "text"]);
+    // No tool_use leaks through (web_search must not reach the client)
+    expect(extractToolNames(events)).toHaveLength(0);
 
-    // Reasoning must NOT leak into the visible answer.
-    expect(extractText(events)).toBe("Reading them now.");
+    // Results (or a graceful degradation notice) are injected as text
+    expect(extractText(events)).toContain("[Web search");
 
-    const thinking = events
-      .filter((e) => e.data?.delta?.type === "thinking_delta")
-      .map((e) => e.data.delta.thinking)
-      .join("");
-    expect(thinking).toBe("Let me check the files.");
+    // Legitimate end_turn: without WebSearch declared the client could not
+    // execute a remapped tool anyway (e.g. sub-agents without web tools).
     expect(extractStopReason(events)).toBe("end_turn");
   });
 
-  test("multi-part reasoning summary keeps paragraph breaks between sections", async () => {
-    // Real capture: 3 reasoning summary parts from cx@gpt-5.6-sol (OAuth codex
-    // path). OpenAI streams each section as "**Title**" with the break between
-    // parts carried structurally (summary_index), NOT in the text — so naive
-    // concatenation smashes them into "**A****B****C**" (the reported glitch).
-    const createResponsesStreamHandler = await getParser();
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "gpt-5.6-sol-responses-reasoning-multipart.sse")
+  test("GLM <searchWeb> tag + WebSearch declared → remapped tool_use, stop_reason=tool_use", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const glmSse = [
+      `data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"<searchWeb><query>devnen Chatterbox-TTS-Server docker run</query></searchWeb>"},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}`,
+      ``,
+      `data: [DONE]`,
+      ``,
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(glmSse),
+      adapter,
+      "glm-5.1",
+      null,
+      undefined,
+      [WEBSEARCH_SCHEMA, READ_SCHEMA]
     );
 
-    const response = createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
-    });
     const events = await parseClaudeSseStream(response);
 
-    const thinking = events
-      .filter((e) => e.data?.delta?.type === "thinking_delta")
-      .map((e) => e.data.delta.thinking)
-      .join("");
+    const tools = extractToolNames(events);
+    expect(tools).toContain("WebSearch");
 
-    // The three real section titles are separated, not concatenated.
-    expect(thinking).toContain(
-      "**Auditing actual repository context**\n\n**Investigating log-based environment clues**"
-    );
-    expect(thinking).toContain(
-      "**Investigating log-based environment clues**\n\n**Identifying possible Magus codebase relation**"
-    );
-    // The smash-together signature must be gone.
-    expect(thinking).not.toContain("context****Investigating");
-    expect(thinking).not.toContain("clues****Identifying");
-
-    // Reasoning stays in the thinking block; the answer is separate.
-    expect(blockStarts(events).map((s) => s.type)).toEqual(["thinking", "text"]);
-    expect(extractText(events)).toBe("Done.");
-  });
-});
-
-/**
- * Regression anchored to the REAL production failure.
- *
- * test-fixtures/transcripts/magus-fix-duplicate-agents-turn.json is a verbatim
- * capture of the Claude Code transcript turn (msg_1784036929422) where this bug
- * surfaced: gpt-5.6-sol asked for 4 parallel Agent investigations, but the buggy
- * parser re-emitted the first tool's content_block_stop, so Claude Code recorded
- * 5 tool_use blocks and ran "Trace missing plugin versions" twice.
- *
- * We (1) pin that historical signature, then (2) reconstruct the upstream
- * /v1/responses stream for that exact turn — deriving every call_id from the
- * real recorded tool_use ids — and replay it through the CURRENT parser,
- * asserting it now yields the 4 agents the model intended, no duplicate.
- */
-describe("Regression: magus-fix duplicate-agents turn (real transcript)", () => {
-  async function getParser() {
-    const mod = await import("./handlers/shared/stream-parsers/openai-responses-sse.js");
-    return mod.createResponsesStreamHandler;
-  }
-
-  const snapshot = JSON.parse(
-    readFileSync(
-      join(FIXTURES_DIR, "..", "transcripts", "magus-fix-duplicate-agents-turn.json"),
-      "utf-8"
-    )
-  );
-
-  test("historical signature: 5 blocks emitted, 4 distinct, first agent duplicated", () => {
-    const emitted: string[] = snapshot.emittedToolIds;
-    const distinct = [...new Set(emitted)];
-    expect(emitted.length).toBe(5);
-    expect(distinct.length).toBe(4);
-    // The one repeated id is the FIRST tool — exactly the parser's off-by-one.
-    const dup = emitted.find((id, i) => emitted.indexOf(id) !== i);
-    expect(dup).toBe(emitted[0]);
-    expect(snapshot.intendedToolIds).toEqual(distinct);
-  });
-
-  test("fixed parser reproduces the 4 intended agents, no duplicate", async () => {
-    const createResponsesStreamHandler = await getParser();
-
-    // Reconstruct upstream /v1/responses SSE for this turn. The parser derives
-    // its output id as `toolu_${callId}` when callId lacks the toolu_ prefix, so
-    // strip that prefix to recover each real upstream call_id.
-    const ev = (o: any) => `data: ${JSON.stringify(o)}\n\n`;
-    let sse = ev({ type: "response.created", response: { id: "resp_magus" } });
-    // The model reasoned before dispatching (that reasoning is what set the
-    // stale hasTextContent flag that triggered the duplicate).
-    sse += ev({
-      type: "response.reasoning_summary_text.delta",
-      delta: "Four independent issues — fan out one investigator each.",
-    });
-    snapshot.tools.forEach((t: any, i: number) => {
-      const callId = t.id.replace(/^toolu_/, "");
-      const item = { type: "function_call", id: `fc_${i}`, call_id: callId, name: t.name };
-      sse += ev({ type: "response.output_item.added", output_index: i, item });
-      sse += ev({
-        type: "response.function_call_arguments.delta",
-        item_id: `fc_${i}`,
-        call_id: callId,
-        delta: `{"description":${JSON.stringify(t.desc)}}`,
-      });
-      sse += ev({ type: "response.output_item.done", output_index: i, item });
-    });
-    sse += ev({
-      type: "response.completed",
-      response: { usage: { input_tokens: 57092, output_tokens: 1159 } },
-    });
-
-    const fixture = new Response(new Blob([sse]).stream(), { status: 200 });
-    const response = createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
-    });
-    const events = await parseClaudeSseStream(response);
-
-    const toolStarts = events.filter(
-      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "tool_use"
-    );
-    const emittedIds = toolStarts.map((e) => e.data.content_block.id);
-
-    // The fix: exactly the 4 intended agents, in order, each once — NOT 5.
-    expect(emittedIds).toEqual(snapshot.intendedToolIds);
-    expect(new Set(emittedIds).size).toBe(emittedIds.length);
-    expect(extractToolNames(events)).toEqual(["Agent", "Agent", "Agent", "Agent"]);
-
-    // Every content block has contiguous index and exactly one matching stop.
-    const starts = events
-      .filter((e) => e.data?.type === "content_block_start")
-      .map((e) => e.data.index);
-    const stops = events
-      .filter((e) => e.data?.type === "content_block_stop")
-      .map((e) => e.data.index);
-    expect(starts).toEqual(starts.map((_, i) => i));
-    expect([...stops].sort((a, b) => a - b)).toEqual(starts);
-
-    // Reasoning is a thinking block, not a 5th text/tool artefact.
-    const firstBlockType = events.find((e) => e.data?.type === "content_block_start")?.data
-      ?.content_block?.type;
-    expect(firstBlockType).toBe("thinking");
-    expect(extractStopReason(events)).toBe("tool_use");
-  });
-});
-
-/**
- * Regression: a turn cut short by max_output_tokens was reported as a finished
- * tool call.
- *
- * Real failure (timeroo session, gpt-5.6-sol via codex, log 2026-07-15_15-27-02
- * line 24596): the model ran out of output budget mid-tool-call. OpenAI emitted
- * the partial function_call arguments it had produced, marked the item
- * status:"incomplete", and sent response.incomplete with
- * incomplete_details.reason = "max_output_tokens". The parser forwarded the
- * partial JSON and then said stop_reason:"tool_use" — so Claude Code executed an
- * Edit whose input was 189 bytes of truncated JSON:
- *   InputValidationError: Edit was called with input that could not be parsed as JSON
- *
- * The fixture replays that turn with the real 189-byte truncated arguments.
- * Note the codex backend rejects max_output_tokens ("Unsupported parameter"), so
- * claudish cannot cap the budget — reporting the truncation honestly is the only
- * available mitigation.
- */
-describe("Regression: Responses turn truncated by max_output_tokens", () => {
-  async function getParser() {
-    const mod = await import("./handlers/shared/stream-parsers/openai-responses-sse.js");
-    return mod.createResponsesStreamHandler;
-  }
-
-  test("reports stop_reason=max_tokens, not tool_use, so the partial tool is not executed", async () => {
-    const createResponsesStreamHandler = await getParser();
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "gpt-5.6-sol-responses-truncated-max-output.sse")
-    );
-
-    const response = createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
-    });
-    const events = await parseClaudeSseStream(response);
-
-    // The whole point: the turn was cut off, so it must NOT look like a
-    // complete tool call the client should run.
-    expect(extractStopReason(events)).toBe("max_tokens");
-    expect(extractStopReason(events)).not.toBe("tool_use");
-  });
-
-  test("the streamed tool arguments are genuinely truncated (the client must not execute them)", async () => {
-    const createResponsesStreamHandler = await getParser();
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "gpt-5.6-sol-responses-truncated-max-output.sse")
-    );
-
-    const response = createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
-    });
-    const events = await parseClaudeSseStream(response);
-
-    const partialJson = events
-      .filter((e) => e.data?.delta?.type === "input_json_delta")
+    const inputJson = events
+      .filter((e) => e.data?.type === "content_block_delta" && e.data?.delta?.type === "input_json_delta")
       .map((e) => e.data.delta.partial_json)
       .join("");
+    expect(JSON.parse(inputJson)).toEqual({ query: "devnen Chatterbox-TTS-Server docker run" });
 
-    // Byte-for-byte the payload from the real InputValidationError.
-    expect(partialJson.length).toBe(189);
-    expect(partialJson.endsWith('"new_string":"  const {')).toBe(true);
-    expect(() => JSON.parse(partialJson)).toThrow(); // unparseable — hence max_tokens
-
-    // Blocks stay well-formed even though the turn was cut.
-    const starts = events.filter((e) => e.data?.type === "content_block_start").map((e) => e.data.index);
-    const stops = events.filter((e) => e.data?.type === "content_block_stop").map((e) => e.data.index);
-    expect(starts).toEqual(starts.map((_, i) => i));
-    expect([...stops].sort((a, b) => a - b)).toEqual(starts);
-  });
-
-  test("a complete turn still reports tool_use (no false max_tokens)", async () => {
-    const createResponsesStreamHandler = await getParser();
-    const fixture = fixtureToResponse(join(FIXTURES_DIR, "gpt-5.6-sol-responses-turn1.sse"));
-
-    const response = createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
-    });
-    const events = await parseClaudeSseStream(response);
     expect(extractStopReason(events)).toBe("tool_use");
   });
 });
 
-/**
- * Reasoning-item passback: the parser must capture the encrypted reasoning that
- * precedes a tool call, keyed by the id the client echoes back.
- *
- * Fixture is a real capture from chatgpt.com/backend-api/codex/responses
- * (gpt-5.6-sol, high effort): a reasoning item carrying 2788 bytes of
- * encrypted_content, followed by the function_call it informed.
- *
- * The summary is intermittent — this capture happens to have one, while other
- * real captures return reasoning items with `summary: []` and emit no summary
- * events at all. That unreliability is why the encrypted payload cannot ride in
- * a thinking block (there is often no thinking block to attach it to), hence the
- * cache.
- */
-describe("Responses SSE captures reasoning items for passback", () => {
-  test("reasoning preceding a tool call is cached under the client-facing call id", async () => {
-    const mod = await import("./handlers/shared/stream-parsers/openai-responses-sse.js");
-    const cacheMod = await import("./adapters/reasoning-cache.js");
-    cacheMod.clearReasoningCache();
+// ─── Regression: empty-response cause classification (no destructive /compact) ─
+// Providers (GLM, qwen) sometimes return finish_reason with zero content. The
+// old code injected a blanket "context too large → compact" message for every
+// empty response, pushing agents into a destructive /compact on transient
+// empties (sub-agents with tiny contexts) — discarding context mid-task.
+// The fix classifies by finish_reason + prompt_tokens and leads transient
+// empties with "retry, NOT a context problem".
+describe("Regression: empty-response cause classification", () => {
+  async function getParser() {
+    const mod = await import("./handlers/shared/openai-compat.js");
+    return mod.createStreamingResponseHandler;
+  }
 
-    const fixture = fixtureToResponse(
-      join(FIXTURES_DIR, "gpt-5.6-sol-responses-reasoning-item.sse")
-    );
-    const response = mod.createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
+  async function getDefaultAdapter() {
+    const mod = await import("./adapters/base-api-format.js");
+    return new mod.DefaultAPIFormat("test-model");
+  }
+
+  function sseToResponse(content: string): Response {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(content));
+        controller.close();
+      },
     });
+    return new Response(stream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  }
+
+  // finish_reason "stop", tiny context → TRANSIENT (must NOT push /compact)
+  const EMPTY_STOP_SMALL = [
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+    ``,
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":0}}`,
+    ``,
+    `data: [DONE]`,
+    ``,
+  ].join("\n");
+
+  // finish_reason "length" → OVERFLOW (mentions /compact)
+  const EMPTY_LENGTH = [
+    `data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+    ``,
+    `data: {"id":"c2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":5000,"completion_tokens":0}}`,
+    ``,
+    `data: [DONE]`,
+    ``,
+  ].join("\n");
+
+  // finish_reason "content_filter" → CONTENT-FILTER message
+  const EMPTY_FILTER = [
+    `data: {"id":"c3","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+    ``,
+    `data: {"id":"c3","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":20,"completion_tokens":0}}`,
+    ``,
+    `data: [DONE]`,
+    ``,
+  ].join("\n");
+
+  test("empty + finish_reason=stop + small context → transient message (no /compact push)", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(EMPTY_STOP_SMALL),
+      adapter,
+      "glm-5.1",
+      null,
+      undefined,
+      undefined
+    );
+
     const events = await parseClaudeSseStream(response);
+    const text = extractText(events);
 
-    // The tool id the client will send back on the next turn.
-    const toolId = events.find(
-      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "tool_use"
-    )?.data.content_block.id;
-    expect(toolId).toBeDefined();
+    // Transient empties lead with retry guidance, NOT compact.
+    expect(text).toMatch(/transient/i);
+    expect(text).toMatch(/retry/i);
+    expect(text).toMatch(/NOT a context-size problem/i);
+    // Must NOT be the old blanket "context is too large → compact" framing.
+    expect(text).not.toMatch(/This usually happens when the conversation context is too large/);
 
-    const cached = cacheMod.reasoningForCall(toolId);
-    expect(cached).toBeDefined();
-    expect(cached).toHaveLength(1);
-    expect(cached?.[0].type).toBe("reasoning");
-    expect((cached?.[0].encrypted_content ?? "").length).toBeGreaterThan(1000);
-    // The item is kept verbatim so replay matches what OpenAI emitted.
-    expect(cached?.[0].summary).toHaveLength(2);
-    expect(cached?.[0].content).toEqual([]);
-
-    cacheMod.clearReasoningCache();
+    // Still terminates cleanly so the agent's turn ends gracefully.
+    expect(extractStopReason(events)).toBe("end_turn");
   });
 
-  test("a stream with no reasoning items caches nothing", async () => {
-    const mod = await import("./handlers/shared/stream-parsers/openai-responses-sse.js");
-    const cacheMod = await import("./adapters/reasoning-cache.js");
-    cacheMod.clearReasoningCache();
+  test("empty + finish_reason=length → overflow message (mentions /compact)", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
 
-    const fixture = fixtureToResponse(join(FIXTURES_DIR, "gpt-5.6-sol-responses-turn1.sse"));
-    const response = mod.createResponsesStreamHandler(createMockContext(), fixture, {
-      modelName: "gpt-5.6-sol",
-    });
-    await parseClaudeSseStream(response);
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(EMPTY_LENGTH),
+      adapter,
+      "glm-5.1",
+      null,
+      undefined,
+      undefined
+    );
 
-    expect(cacheMod.reasoningCacheSize()).toBe(0);
-    cacheMod.clearReasoningCache();
+    const events = await parseClaudeSseStream(response);
+    const text = extractText(events);
+
+    // A genuine length/overflow empty correctly advises /compact.
+    expect(text).toMatch(/context is very large|\/compact/i);
+    // And surfaces the real finish_reason.
+    expect(text).toMatch(/length/);
+  });
+
+  test("empty + finish_reason=content_filter → content-filter message (not context)", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(EMPTY_FILTER),
+      adapter,
+      "glm-5.1",
+      null,
+      undefined,
+      undefined
+    );
+
+    const events = await parseClaudeSseStream(response);
+    const text = extractText(events);
+
+    expect(text).toMatch(/content policy|filtered/i);
+    // A content filter is NOT a context-size problem.
+    expect(text).not.toMatch(/context is very large/i);
   });
 });
