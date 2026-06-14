@@ -12,6 +12,7 @@
 import type { Context } from "hono";
 import { log } from "../../../logger.js";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
+import { executeWebFetch } from "../web-search-executor.js";
 import { createResponseCapture } from "../response-capture.js";
 
 interface AnthropicPassthroughOpts {
@@ -104,6 +105,48 @@ export function createAnthropicPassthroughStream(
           };
           const trackIndex = (idx: number) => {
             if (idx > highestSeenIndex) highestSeenIndex = idx;
+          };
+
+          // Execute a suppressed server_tool_use (webReader) and inject the result
+          // as a text block. Non-blocking — errors degrade to a short notice.
+          const handleServerToolResult = async (
+            toolName: string,
+            rawInput: string,
+            currentHighestIdx: number,
+          ) => {
+            const textIdx = currentHighestIdx + 1;
+            let resultText: string;
+            try {
+              const input = JSON.parse(rawInput || "{}");
+              const url = input.url;
+              if (url && (toolName === "webReader" || toolName === "web_search_preview")) {
+                log(`[AnthropicSSE] Executing suppressed server_tool_use webReader for ${url}`);
+                const result = await executeWebFetch(url);
+                resultText = result.ok
+                  ? result.text
+                  : `[Web fetch for ${url} failed: ${result.error}]`;
+              } else {
+                resultText = `[Server tool "${toolName}" was executed by the provider (result not available locally).]`;
+              }
+            } catch {
+              resultText = `[Server tool "${toolName}" was executed by the provider (result not available locally).]`;
+            }
+            // Truncate very long results to avoid blowing up the context
+            if (resultText.length > 8000) {
+              resultText = resultText.slice(0, 8000) + "\n[...truncated]";
+            }
+            if (!isClosed) {
+              controller.enqueue(encoder.encode(
+                `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: textIdx, content_block: { type: "text", text: "" } })}\n\n`
+              ));
+              controller.enqueue(encoder.encode(
+                `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: textIdx, delta: { type: "text_delta", text: resultText } })}\n\n`
+              ));
+              controller.enqueue(encoder.encode(
+                `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: textIdx })}\n\n`
+              ));
+              highestSeenIndex = textIdx;
+            }
           };
 
           // ── Graceful in-stream error finalization ─────────────────────
@@ -381,6 +424,13 @@ export function createAnthropicPassthroughStream(
                     ) {
                       suppressedServerTools++;
                       log(`[AnthropicSSE] Suppressing server_tool_use block at index ${data.index}`);
+                      // Capture the tool name + input for later execution when the block closes.
+                      const serverToolName = data.content_block?.name || "";
+                      const serverToolInput = data.content_block?.input || "{}";
+                      // Fire-and-forget: handleServerToolResult will inject the result
+                      // text block after this server_tool_use closes. We need to NOT
+                      // re-emit the original server_tool_use lifecycle events downstream.
+                      const callHandle = handleServerToolResult(serverToolName, serverToolInput, highestSeenIndex);
                       continue;
                     }
                     if (data.type === "content_block_stop" && suppressedServerTools > 0) {
