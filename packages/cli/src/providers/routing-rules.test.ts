@@ -12,12 +12,66 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-
 import { __resetSniffForTests } from "../auth/credentials/op-source.js";
 import type { RoutingRules } from "../profile-config.js";
-import { DISPLAY_NAMES } from "./auto-route.js";
+import { PROVIDER_TO_PREFIX, DISPLAY_NAMES } from "./auto-route.js";
 import { DEFAULT_ROUTING_RULES } from "./default-routing-rules.js";
-import { buildRoutingChain, matchRoutingRule, mergeRoutingRules, route } from "./routing-rules.js";
+import {
+  buildRoutingChain,
+  loadRoutingRules,
+  matchRoutingRule,
+  mergeRoutingRules,
+  normalizeGlmSlug,
+  route,
+} from "./routing-rules.js";
+import { PROVIDER_SHORTCUTS } from "./model-parser.js";
+
+// ---------------------------------------------------------------------------
+// normalizeGlmSlug — tolerate dash-slugified GLM version names
+// ---------------------------------------------------------------------------
+
+describe("normalizeGlmSlug", () => {
+  test("rewrites slugified glm versions to canonical dotted form", () => {
+    expect(normalizeGlmSlug("glm-5-2")).toBe("glm-5.2");
+    expect(normalizeGlmSlug("glm-4-6")).toBe("glm-4.6");
+    expect(normalizeGlmSlug("glm-4-5")).toBe("glm-4.5");
+  });
+
+  test("preserves a trailing suffix after the version", () => {
+    expect(normalizeGlmSlug("glm-4-5-air")).toBe("glm-4.5-air");
+    expect(normalizeGlmSlug("glm-4-5-airx")).toBe("glm-4.5-airx");
+  });
+
+  test("leaves already-dotted names untouched", () => {
+    expect(normalizeGlmSlug("glm-5.2")).toBe("glm-5.2");
+    expect(normalizeGlmSlug("glm-4.5-air")).toBe("glm-4.5-air");
+  });
+
+  test("does not touch non-GLM models or dash-native names", () => {
+    // dash-native open-model id (version dot would be wrong) — left as-is
+    expect(normalizeGlmSlug("glm-4-9b")).toBe("glm-4-9b");
+    expect(normalizeGlmSlug("glm-4-flash")).toBe("glm-4-flash");
+    // unrelated families must never be rewritten
+    expect(normalizeGlmSlug("claude-opus-4-8")).toBe("claude-opus-4-8");
+    expect(normalizeGlmSlug("qwen3.6-35b-a3b")).toBe("qwen3.6-35b-a3b");
+    expect(normalizeGlmSlug("gpt-4o")).toBe("gpt-4o");
+  });
+});
+
+describe("route — GLM slug tolerance", () => {
+  test("slugified glm-5-2 routes identically to canonical glm-5.2", async () => {
+    const rules: RoutingRules = { "glm-5.2": ["openrouter"] };
+    // route() is async on the upstream-rebased branch (CredentialAuthority
+    // refactor) — await both call sites so the relative equality holds
+    // regardless of which credentials the test env happens to have.
+    const slug = await route("glm-5-2", rules);
+    const canonical = await route("glm-5.2", rules);
+    // The dash form must resolve to the exact same plan as the dotted form —
+    // proving the slug no longer misses the canonical rule. (Relative assertion
+    // so it holds regardless of which credentials the test env happens to have.)
+    expect(slug).toEqual(canonical);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // matchRoutingRule — pattern matching
@@ -555,10 +609,10 @@ describe("route() with defaultProvider", () => {
     expect(plan.primary.provider).toBe("x-ai");
   });
 
-  test("defaultProvider undefined → identical behavior to omitted argument", () => {
+  test("defaultProvider undefined → identical behavior to omitted argument", async () => {
     process.env.OPENAI_API_KEY = "oai-test";
-    const planA = route("gpt-5", { "gpt-*": ["openai"] }, undefined);
-    const planB = route("gpt-5", { "gpt-*": ["openai"] });
+    const planA = await route("gpt-5", { "gpt-*": ["openai"] }, undefined);
+    const planB = await route("gpt-5", { "gpt-*": ["openai"] });
     expect(planA).toEqual(planB);
   });
 
