@@ -45,8 +45,6 @@ claudish --model ollama@llama3.2:3 "task"  # 3 concurrent requests
 - `kimi@`, `moon@` → Kimi
 - `glm@`, `zhipu@` → GLM
 - `gc@` → GLM Coding Plan
-- `sakana@`, `fugu@` → Sakana Fugu
-- `sc@` → Sakana Fugu Subscription
 - `llama@`, `oc@` → OllamaCloud
 - `litellm@`, `ll@` → LiteLLM (requires LITELLM_BASE_URL)
 - `ollama@` → Ollama (local)
@@ -171,54 +169,6 @@ Use as: `claudish --model my-vllm@llama3.1-70b "task"` or `claudish --model corp
 - **`models` field** (optional): When present, limits the endpoint to listed models. Omit to allow any model name.
 - **`modelPrefix` field** (optional): Prepended to the user-specified model name before sending to the API.
 
-## 1Password Integration (v7.6.0+)
-
-All 1Password logic lives in `packages/cli/src/providers/onepassword.ts` (dependency-light: imported by `index.ts` before heavy deps; uses only node built-ins at module load). Secret operations are **SDK-only** — the `@1password/sdk` is **dynamically imported** (`await import` inside `defaultSdkClientFactory`) only when SDK auth is present AND a secret/field/environment is actually needed — a normal run never loads the ~10MB WASM. **Requires the beta** `@1password/sdk@0.4.1-beta.1` (exact pin): the stable 0.4.0 has no `environments` API.
-
-### Resolution model: SDK-ONLY (no `op` CLI for secrets)
-- **All three operations** — resolving `op://` refs (`secrets.resolveAll`), glob field discovery (`vaults.list` → `items.list` → `items.get`), and Environments (`environments.getVariables`) — go through the SDK. There is **no `op` CLI fallback**.
-- Public async entry points: `resolveSecrets()`, `readEnvironment()`, `discoverItemFields()`/`resolveGlobImport()`. All accept `{ sdkFactory?, auth?, env? }`; `acquireSdkClient()` is the shared "resolve auth → build client → hard-fail if no auth" helper.
-- **Hard-fail** on any failure including no-auth (explicit opt-in via `op://` or `--op-env`); **zero cost** (no SDK/`op` touched) when no op:// source is present.
-- The **one** remaining `op` binary touch is an **optional, read-only `op account list --format=json`** (`defaultOpAccountLister`) used SOLELY for the multi-account picker — it never sees a secret and degrades to an actionable error when `op` is absent.
-
-### Auth resolution (DesktopAuth account selection)
-`detectSdkAuth(env)` is env-only: `OP_SERVICE_ACCOUNT_TOKEN` → token; else `OP_ACCOUNT` → DesktopAuth. The richer `resolveSdkAuth(opts)` (async, called once by `index.ts` and memoized via `getSdkAuth()`, so a multi-account user is prompted at most once per run) resolves in order: **token → `OP_ACCOUNT` → `onepasswordAccount` config (global `~/.claudish/config.json`, local `.claudish.json` wins) → single auto-detected account (`op account list`) → interactive picker (multiple accounts + TTY; the choice is saved to global config) → hard-fail** (multiple accounts non-interactive, or `op` absent). The account **URL** (e.g. `my-team.1password.com`) is the saved/`OP_ACCOUNT` value — it's unique even when two accounts share an email. The SDK cannot reuse an interactive `op signin` session, so an `op signin`-only setup must now set `OP_ACCOUNT` (DesktopAuth) or a service-account token.
-
-### Glob field import
-A top-level `onepassword: string[]` config array holds glob paths. `isGlobImport()` detects a `*` in the post-item path segment(s); `resolveGlobImport()` does three phases: **discover** field names via the SDK (`vaults.list` → `items.list` → `items.get`, matching by title; duplicate titles → first-match + stderr warn) → **filter** by section-glob + field-glob (`globToRegExp`) → **resolve** only survivors via `resolveSecrets` (batched, in-memory). The SDK's `ItemField` has no ready-made `reference`, so each field's `op://` ref is **synthesized** from the vault/item/section/field titles. The SDK decrypts every field value to list names — no different from `op item get`, which also decrypts everything in-process; we keep only a `hasValue` flag, never the value. Field labels are trimmed; invalid env-var names are skipped with a warning.
-
-### Custom-endpoint op:// apiKeys (pre-resolved at startup)
-Provider construction is **synchronous** and can't await the async SDK, so a custom endpoint's `op://` `apiKey` is **pre-resolved in `index.ts` `applyCustomEndpointOpKeys()`** into `CUSTOM_<sanitize(name)>_KEY` (UPPERCASE, non-alphanumerics → `_`). `custom-endpoints-loader.ts`'s `createHandler` reads `process.env[apiKeyEnvVar]` **first**, falling back to `resolveCustomEndpointApiKey()` (which now only expands `${VAR}`/literals — it no longer touches 1Password).
-
-### CLI surface (`onepassword-command.ts`)
-- `claudish --op "op://.../*" --list` → `opPreviewCommand(glob, { auth })`: lists matching field names via SDK `items.get`, **never values**.
-- `claudish --op "op://.../*" [...args]` → `applyOpImport()`: resolves glob → hydrates `process.env` → runs a normal session with the remaining args (inline mode is glob-only; single refs go in config).
-- `--op-env <id>` → 1Password Environments via the SDK `environments.getVariables` (beta-only). **Point-of-need since v7.16.0**: registered as a lazy op source (like config `onepasswordEnvironments[]`) and resolved by the credential authority ONLY when a routed provider's key misses env/config — no longer resolved eagerly at startup (which prompted on `--update`/`--version`/OAuth-only sessions and stormed across spawned children), no longer a highest-priority overwrite (env/config already set wins).
-
-### TUI surface — the "1Password" tab (`claudish config`, tab 5)
-The OpenTUI config interface (`packages/cli/src/tui/`) exposes a dedicated **1Password tab** managing, at both **global** (`~/.claudish/config.json`) and **project** (`./.claudish.json`) scope: the `onepasswordAccount`, per-item `op://` refs + glob imports (`onepassword[]`), and 1Password **Environments** (`onepasswordEnvironments[]`, a NEW persisted config field mirroring `--op-env`).
-
-- **Persistence**: `providers/onepassword-config.ts` — scope-aware, **config-only** (no SDK at module load), all SYNC with an injectable `OpConfigPaths` test seam. Both scopes use a **raw read-modify-write** (preserves unrelated keys; never routes global through profile-config's cached-`homedir()` `CONFIG_FILE`, so global is hermetically testable). `index.ts`'s `readConfiguredOnepasswordAccount`/`saveOnepasswordAccount` now delegate here. **Point-of-need (v7.16.0):** `applyOpEnvironment()` no longer resolves anything — it only **validates** the `--op-env` flag shape; both `onepasswordEnvironments[]` config and the `--op-env` flag are discovered + resolved LAZILY by `auth/credentials/op-source.ts` (`registeredEnvironmentIds` = seam-aware config env ids + argv `--op-env`; `resolveEnvironmentShared` = single-flight, whole-environment `getVariables` cached into `resolvedCache`) only when a routed provider key misses env/config. `onepasswordEnvironments` is added to `profile-config.ts`'s `loadConfig` allowlist so global round-trips preserve it, and to `op-source.ts`'s `SniffedConfig` so tests can inject it through the existing seam.
-- **TUI wiring**: tab/mode/types in `tui/types.ts` (`OpEntry`/`OpScope`/`OpKind`); `tui/components/OnepasswordContent.tsx` (auth card + merged scope-marked scrollable list — ▴ project / • global / · env), `OnepasswordDetail.tsx` (browse-only entry detail), and `OnepasswordModal.tsx` (the centered **absolute-overlay** add-wizard — `position="absolute"` + `zIndex`, painted as the topmost sibling of the root box, NOT crammed in the bottom strip). `App.tsx` owns state + the keyboard handler. Scope model mirrors Routing; pickers follow the Profiles `<select>` pattern (focused `<select>` owns ↑↓ via `onChange`; `useKeyboard` owns Enter/Esc).
-- **Add wizard flow** (`a` key) — **browse, don't type**: Step 1 **scope** (global/project) → Step 2 **account** picker (shown ONLY when `!detectSdkAuth()` AND `resolveDesktopAccount()` returns `needsPicker`, i.e. >1 account & not authed; auto-skipped otherwise) → Step 3 **kind** (intent-labeled `<select>` with descriptions ON: "API key from an item" / "Environment") → Step 4 **value**:
-  - **API key** → per-level pickers `pick_op_vault` → `pick_op_item` → `pick_op_field` (from `listVaults`/`listItems`/`discoverItemFields` — two tiny new engine exports `listVaults`/`listItems` mirror `discoverItemFields`' `acquireSdkClient`). The `op://Vault/Item/[Section/]Field-or-*` path is **built from the literal titles** (`buildFieldOptions` in the modal) — the user never types `op://`. Globs always target ONE concrete vault+item (the grammar forbids multi-vault/item globs). Each level shows a "◌ Loading…" state while the async SDK call runs; Esc steps back one level (field→item→vault→browse). **Inline fuzzy filter**: the vault/item/field (and account) pickers are MANUALLY rendered (not `<select>`) so App owns ↑↓ + a shared `opFilter` string — typing narrows the list via `fuzzyMatch` (case-insensitive subsequence, in `OnepasswordModal.tsx`), backspace widens, a "filter: … N matches" header + "no matches" empty state show state, and the filter resets on every level entry/exit. `*` is excluded from filter input (`isFilterChar`) — it'd match literally in the subsequence filter and exclude every concrete-field row.
-  - **Grouped field picker** (`buildFieldOptions` → `FieldPickerOption` with a `selectable` flag): rows are `★ Import everything (all N fields)`, then per-SECTION groups — a non-selectable **header** = the section title (often the user's key name, e.g. `GOOGLE_GEMINI_API_KEY`), then a nested `↳ import all N fields` glob, then each concrete field — then a `(no section)` group for top-level fields. This replaced the confusing flat `section 'X' — all fields (*)` rows (when a user keeps one key per section, the header now reads as the key group, not gibberish). The cursor SKIPS header rows (App's `nextSelectable`/`firstSelectable` + a `useEffect` cursor-snap; Enter guards on `chosen.selectable`). The selected option's full `op://` path renders on ONE fixed "saves: …" footer line, mid-truncated (`midTruncate`) so it never wraps/overlaps rows.
-  - **Environment** → typed ID (the SDK has **no** way to enumerate Environments — only `getVariables(id)`) with a **two-Enter NAME preview**: Enter#1 → `readEnvironment` → render variable names (no values); Enter#2 → persist.
-- **Importable-only, FLAT field list** (`buildFieldOptions`): only **importable** fields are shown — concealed (SDK `fieldType === "Concealed"`, case-insensitive) AND a valid env-var name; everything else (notes/username/`credential`) is hidden, and sections with zero importable fields are omitted. The list is **flat and uniform** (no headers/gaps — earlier grouped/collapsed layouts made single-key and multi-key sections look like different items): one selectable key row per field, rendered `ENVNAME  ·  section` (env-var name green, section a dim aligned tag). A MULTI-key section additionally gets one `↳ all of <section> (N, auto-updates)` glob row after its keys; the sectionless `★ All top-level keys (N, auto-updates)` glob is appended only when importable top-level keys exist. `renderFieldPicker` renders this in a bordered scroll region with `▲/▼ more` indicators; the selected option's full `op://` path shows on the fixed "saves: …" footer (`midTruncate`d, `dialogW - 16`, so it never wraps).
-- **SDK call SERIALIZATION (`-4` fix)**: the 1Password SDK's WASM↔desktop-app IPC bridge is **NOT safe for concurrent calls on a shared client** — two ops in flight at once corrupt the channel → `IPC operation failed: -4`. The config TUI fires overlapping calls (e.g. a post-save confirm AND the main-list glob-expansion at the same instant), which reliably triggered it. Fix in `onepassword.ts`: a process-wide `runSdkExclusive` queue chains every SDK op so **at most one runs at a time**, plus `withSdkRetry` (cache-reset + 150ms·attempt backoff, up to 3 attempts) for genuinely transient blips, plus the per-auth client cache (`defaultSdkClientFactory`, one desktop handshake reused). `isTransientSdkError` also matches **stale-desktop-session** errors (`invalid client id` / `invalid session` / `session expired` / `unauthorized` / `token expired`) — after an idle period 1Password expires the SDK session and the cached client's id goes invalid; these are retryable (reset cache → rebuild client = fresh DesktopAuth handshake → retry), so claudish self-heals after idle instead of surfacing `invalid client id`. (The desktop app's re-authorization prompt after idle is 1Password's own session-timeout behavior — claudish can't suppress it, but now auto-retries once approved.) ALL TUI SDK calls (`loadOpVaults/Items/Fields`, `runOpAdd` confirm, `testOpEntry`, `previewOpEnvironment`, the `opExpansions` effect) go through `withSdkRetry` → serialized. Serialization is the PRIMARY fix; the client cache + retry are secondary. Tests: `withSdkRetry` serialization (max-concurrency=1), retry-then-succeed, give-up-after-3, no-retry-on-genuine-error.
-- **Field-load speed**: the field picker uses `discoverItemFieldsById(vaultId, itemId, vaultTitle, itemTitle)` — ONE `items.get` SDK call instead of `discoverItemFields`' three (`vaults.list` → `items.list` → `items.get`), ~3× faster on the 1Password desktop-app IPC path. Results are **cached per `${vaultId}:${itemId}`** in `opFieldsCache` (a `useRef` Map), so re-entering an item is instant (no spinner). The latency is desktop-app IPC + WASM load + decrypt (not a network call), so caching + the single-call path are the real wins. `discoverItemFields` (title-based, 3 calls) is retained for `runOpAdd`'s confirm + the main-list glob expansion, which don't have the IDs handy.
-- **User-facing terms (no jargon)**: the main list + detail use **key** (single ref), **set** (a glob = many keys), **environment** — never "ref"/"glob". The KIND column color-codes them (key=blue, set=yellow, env=cyan); the auth card summarizes "N keys / M sets / K environments".
-- **Sets auto-expand in the main list**: each glob entry resolves its key names + a MASKED value tail lazily via a cached `opExpansions` effect (`discoverItemFields`+`filterGlobFields`, keyed by glob value) and renders them as dim `↳ NAME   ••••XXXX` sub-rows (with `◌ resolving…` / `✗ error` states). The tail is `DiscoveredField.valueTail` — the LAST 4 chars of the value, captured at discovery (where the SDK has already decrypted in-process) via the exported `valueTail()` helper; the full value is never stored/returned/logged. This is the standard "••••1234" identification pattern so the user can confirm WHICH credential is wired up. (The op keys themselves ARE applied to providers — they hydrate `process.env` at startup via `loadStoredApiKeys`, and the Providers tab reads `process.env[apiKeyEnvVar]`; an earlier "providers show not set" report was the `-4` concurrency bug, now fixed by SDK serialization.) Both the main list and the field picker render selected rows as a height-1 highlight box and **non-selected rows as bare `<text>`** (transparent → no dark/blue strips; the earlier `flexGrow` row box painted the whole panel). The field picker's list sits in a **bordered scroll region** with `▲ N above` / `▼ N below` indicators.
-- **Glob grammar (claudish-side only — 1Password rejects `*`/`**` outright, so it never sees them)**: `op://V/Item/*` = sectionless/top-level fields only; `op://V/Item/Section/*` (or `*/*`, `M*/*`, `*_KEY/*`) = fields in matching section(s) only; **`op://V/Item/**` = the WHOLE item — every importable field, sectioned AND sectionless** (the `matchAll` flag on `GlobImport`, added because no `*`/`*/*` form unions both axes). `parseGlobImport` maps a lone single-segment `**` → `{sectionGlob:null, fieldGlob:"*", matchAll:true}`; `filterGlobFields` short-circuits the section check when `matchAll`. `**` is purely additive — `*`'s sectionless-only meaning (and its pinned test) is unchanged.
-- **`★` rows in the field picker** (`buildFieldOptions`): **`★ All keys in this item (N)` → `op://V/Item/**`** is shown first whenever the item has ≥1 importable key — ONE config entry covers every item shape (no-sections / all-sectioned / mixed). A second **`★ All top-level keys → op://V/Item/*`** appears ONLY for a MIXED item (has sections AND top-level keys), as a narrower pick; it's suppressed for a no-sections item (where `**` already equals `*`). Both counts reflect importable fields only. This replaced an earlier `★ All top-level keys`-only design that couldn't express "the whole item" when keys live in sections.
-- **Startup glob failures are NON-FATAL** (`index.ts` `loadStoredApiKeys`): a saved glob that matches nothing (e.g. after a 1Password item edit) now warns + skips per-glob instead of `process.exit(1)` — a bad import must never lock the user out of claudish (especially `claudish config`, where they'd go to fix it). Genuine auth/token failures still hard-fail via the single-ref `resolveSecrets` path.
-- **Hydrate-on-add (keys apply WITHOUT a restart)**: after a successful add, `runOpAdd` resolves the new ref/set/environment and **gap-fills the values into the running process's `process.env`** (env already set wins, same rule as startup), then drops all probe handler caches (`invalidateProbeProxyHandlers()`) and `refreshConfig()`. The Providers tab reads `process.env[apiKeyEnvVar]`, so the imported keys light up **immediately** in the same session — previously they only appeared after relaunching claudish (the import only hydrated env at startup). Sets use `resolveGlobImport` (returns the `{envVar:value}` map directly — one resolution both confirms and hydrates); refs use `resolveSecrets` + `envNameFromOpRef`; environments use `readEnvironment`. The status line reports "N keys applied".
-- **`runOpAdd` is PERSIST-FIRST**: it writes the ref/glob/env to config **immediately** (the picked option is valid by construction — it came from an SDK-discovered list), then runs a **non-fatal** confirmation test (`resolveSecrets`/`discoverItemFields`+`filterGlobFields`/`readEnvironment`) that only annotates the status line (masked value / key count / var count) — a flaky second SDK round-trip can no longer silently lose the save. A genuine persist failure (or the confirm error) is logged to stderr and shown in the status line. (Earlier bug: re-validating before persist meant a thrown confirm left `onepassword[]` empty — "Imports: 0" despite a successful pick.) Auth still resolves via `resolveSdkAuth` (in-TUI multi-account picker via `pick_op_account` + deferred-promise `onNeedsPicker`); the heavy SDK/WASM stays lazy.
-
-### Tests
-`onepassword.test.ts` — hermetic via injectable `SdkClientFactory` (fake client answering `vaults`/`items`/`secrets`/`environments`) and `OpAccountLister` (fake account list) seams; neither the `op` binary nor the real SDK is ever invoked. The SDK-shaped item fixture is **derived** from the real-captured CLI item fixture (no hand-crafted secret-like data). Covers no-auth hard-fail and `resolveDesktopAccount`/`resolveSdkAuth` (env / config / single-auto / multi-picker / multi-error).
-`onepassword-config.test.ts` — hermetic via the `OpConfigPaths` seam pointing global/project at temp files (`homedir()` can't be re-pointed at runtime in Bun); covers scope-independent account/imports/environments read-write, project-then-global precedence, idempotent add, empty-list key deletion, `readAllOnepasswordEnvironments` dedup, raw-merge preservation of unrelated fields, and garbled-file tolerance.
-
 ## Three-Layer Adapter Architecture (v5.14.0+)
 
 The translation pipeline has three decoupled layers:
@@ -262,6 +212,143 @@ Located in `handlers/shared/stream-parsers/`:
 - `gemini-sse.ts` — Gemini SSE → Claude SSE
 - `ollama-jsonl.ts` — Ollama JSONL → Claude SSE
 - `openai-responses-sse.ts` — OpenAI Responses API → Claude SSE (Codex)
+
+### Non-Streaming (`stream: false`) Support
+
+Claude Code's agentic loop always sends `stream: true`, but **`/compact` (context condensation) and any non-streaming Anthropic API caller send `stream: false`** and expect a single JSON `message` body (`Content-Type: application/json`), NOT SSE. Returning SSE to such a client surfaces as `"API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request"` and **blocks the affected operation** (a session that can't compact eventually overflows and the agent stalls — a never-hang-priority violation).
+
+Every adapter's `buildPayload` hardcodes `stream: true` (the proxy always drives the upstream provider in streaming mode), and the whole translation pipeline emits Claude SSE. To serve non-streaming clients, `ComposedHandler.handle()` buffers the already-translated SSE back into one Anthropic message via `collectAnthropicSseToMessage()` (`handlers/shared/collect-sse-message.ts`):
+
+- The trigger mirrors `request-logger.ts`'s `stream` definition exactly: `wantsStreaming = payload?.stream === true`. Anything else → buffer to JSON.
+- `NativeHandler` (Anthropic-direct/Opus) already honored `stream: false` natively — that is why `/compact` worked on Opus but failed on every proxied/composed model. This closes the same gap for ComposedHandler (and therefore FallbackHandler, which delegates to it).
+- The collector **never throws** (never-hang-priority): a broken/empty stream degrades to a well-formed message with an empty text block. It reuses the full pipeline (all stream formats, web-tool interception, empty-response classification) verbatim — it just collapses the SSE into a message at the end.
+- Regression tests: `handlers/shared/collect-sse-message.test.ts` (text, tool_use, mixed thinking/text order, empty body, malformed lines, unparseable tool JSON).
+
+## Web Search Interception (v7.1+)
+
+When providers emit web search tool calls (`web_search`, `brave_web_search`, `tavily_search`) or GLM's `<searchWeb>` tags, claudish intercepts them instead of forwarding to the provider (which would fail for non-Anthropic providers).
+
+**HARD constraint**: a failed search/fetch must NEVER stop the agent. Every path degrades gracefully to well-formed text — no throws, no hung streams.
+
+### Architecture
+
+Three interception paths:
+
+1. **Structured tool_call** (`openai-sse.ts`): provider web search tool calls are detected via `web-search-detector.ts`. **If the client declared a `WebSearch` tool in the request** (checked against `toolSchemas`), the call is **remapped** to a synthetic `WebSearch` tool_use block with `stop_reason: "tool_use"` — Claude Code then executes its own WebSearch (which arrives as a sub-agent request, path 3) and the agentic loop continues. If WebSearch is NOT declared (e.g. sub-agents without web tools), the call is `suppressed` and results are injected as a text block with `end_turn` (legitimate there).
+
+2. **GLM `<searchWeb>` tags** (`openai-sse.ts`): GLM models emit `<searchWeb><query>...</query></searchWeb>` in text content. At finalize, same remap logic: WebSearch declared → synthetic tool_use; otherwise SearXNG is called and results are appended as a text block.
+
+3. **Sub-agent requests** (`proxy-server.ts`): Claude Code's own WebSearch/WebFetch tools send a single user message ("Perform a web search for the query: X" / "Perform a web fetch for the URL: X"). Intercepted at the proxy level before handler selection; results returned as text with `end_turn` (correct — the sub-agent's job is to return text).
+
+**Why the remap matters (CoursIA incident 2026-06-10)**: suppress + inject-text + `end_turn` ends the assistant turn on raw search results — the agent stalls instead of using them. Remapping to the client's WebSearch keeps `stop_reason: "tool_use"`, so results come back as a tool_result and the loop continues. Regression tests: `format-translation.test.ts` ("web search remap").
+
+### Execution backends (fallback chains)
+
+`web-search-executor.ts` resolves each search/fetch through a chain; the first usable result wins:
+
+- **Search**: MCP `searxng_web_search` (if `SEARXNG_MCP_URL` set, 5s deadline) → direct HTTP `{SEARXNG_URL}/search?format=json` (3s) → error text.
+- **Fetch**: MCP `web_url_read` (12s, real fetch + markdown) → MCP `web_url_read` with `https://r.jina.ai/<url>` prefix (bypasses 403 on bot-hostile hosts, e.g. npmjs) → direct streaming HTTP with 500KB byte cap → error text.
+
+The MCP client (`handlers/shared/mcp-searxng-client.ts`) is a minimal JSON-RPC streamable-http client (no SDK, no stdio): handles both `application/json` and `text/event-stream` response formats, lazy `initialize` handshake with `mcp-session-id` caching when the server demands a session, strict `AbortSignal.timeout` deadlines, and a non-throwing `{ ok, text|error }` contract. Per-call duration is logged as `[MCP-SearXNG] tools/call <name> <ms>ms ok=<bool>` for overhead measurement vs direct HTTP.
+
+### Configuration
+
+- **`SEARXNG_MCP_URL`** env var (optional): URL of the MCP searxng endpoint (e.g. `https://mcp-tools.myia.io/searxng/mcp`). When unset, the MCP layer is skipped entirely — zero behavior change for existing deployments.
+- **`MCP_AUTH`** or **`SEARXNG_MCP_TOKEN`** env var: bearer token for the MCP endpoint. Never hardcode; provisioned via RooSync.
+- **`SEARXNG_URL`** env var: URL of the SearXNG instance (e.g. `http://search.myia.io`) for the direct HTTP fallback. When unset, interception falls through gracefully with a fallback message.
+- **Deadlines**: MCP search 5s, MCP fetch 12s, direct HTTP search 3s (5s sub-agent path), direct fetch 10s. Non-blocking — every call races a timeout.
+
+### Components
+
+- `handlers/shared/mcp-searxng-client.ts` — MCP streamable-http JSON-RPC client (non-throwing)
+- `handlers/shared/web-search-executor.ts` — fallback chains, result formatting, query extraction
+- `handlers/shared/web-search-detector.ts` — provider web-search tool name detection
+- `handlers/shared/stream-parsers/openai-sse.ts` — remap/suppression + `<searchWeb>` tag detection
+- `proxy-server.ts` — sub-agent request interception
+
+### Inline System Message Handling
+
+Claude Code v2.1.153+ injects `role: "system"` messages inline (e.g. system-reminders). Anthropic-compatible providers (Z.AI, MiniMax, Kimi) reject these — only "user"/"assistant" accepted. The fix:
+- `composed-handler.ts`: strips inline system messages from `requestPayload.messages` for `anthropic-sse` transport, merges into top-level `system` field
+- `openai-messages.ts`: same strip for the OpenAI format path
+
+### Diagnostic Body Capture
+
+Set `CLAUDISH_CAPTURE_DIR` env var to enable full request body capture for offline reproduction of hangs or malformed responses. Disabled by default (no-op when unset). Files written as JSON with metadata (timestamp, source IP, model, PID, machine header).
+
+In the Docker deployment, `CLAUDISH_CAPTURE_DIR=/captures` is bind-mounted to `D:\claudish-captures` on the host, so captures persist across container recreates. Compacted nightly to 7z, then backed up to GDrive (see `capture-retention.md` memory).
+
+## Traffic Analysis
+
+**Use the scripts, not hand-rolled grep.** The proxy log format has traps that produce false positives when grepped naively (see `proxy-log-monitoring` memory: `bytes=NNNN` matching error codes, timestamp digits matching `429`, `[msg:N]` body previews matching keywords). The scripts below encode the precise filters.
+
+Three levels of analysis — pick by need:
+
+| Need | Script | Source | Speed |
+|------|--------|--------|-------|
+| **Live surveillance** (cron, quick health check) | `traffic-live.ps1` | `docker logs` stdout | fast |
+| **Rich detail** (workspace, session, CC version, tokens) | `traffic-summary.ps1` / `traffic-sessions.ps1` | `req-*.json` captures | slower |
+| **History** (past days from compressed archives) | `traffic-history.ps1` | `captures-*.7z` | slow |
+
+### Scripts
+
+| Script | Purpose | Usage |
+|--------|---------|-------|
+| `traffic-live.ps1` | **Live analysis from docker logs** — model/machine/handler distribution, precise error counts, never-hang check, Anthropic leak check, session-loop detection. This is what the 6h surveillance cron runs. | `.\scripts\traffic-live.ps1 [-Hours N] [-AnthropicMachines 'host1,host2']` |
+| `traffic-summary.ps1` | Overview from captures: machines, models, workspaces, sessions | `.\scripts\traffic-summary.ps1 [-Hours N]` |
+| `traffic-sessions.ps1` | Detailed session list with timing, models, data volume | `.\scripts\traffic-sessions.ps1 [-Hours N] [-All]` |
+| `traffic-history.ps1` | Historical analysis from 7z archives | `.\scripts\traffic-history.ps1 [-Date yyyy-MM-dd] [-Days N]` |
+| `compress-captures.ps1` | Nightly 7z compaction + GDrive backup + 30d local purge (scheduled task) | Runs automatically at 04:17 |
+| `claudish-watchdog.ps1` | Proxy health: tool-call stream test + proactive restart (uptime >11h) + auto-recovery on hang. Scheduled every 15min. | Runs automatically |
+| `CaptureUtils.psm1` | Shared module (capture parsing, device mapping, 7z extraction) | Imported by the scripts above |
+
+### Quick Commands
+
+```powershell
+# Live health check — what's happening right now?
+.\scripts\traffic-live.ps1 -Hours 1
+
+# Standard 6h surveillance window (cron default)
+.\scripts\traffic-live.ps1 -Hours 6
+
+# Rich detail: which workspace/session is active?
+.\scripts\traffic-summary.ps1 -Hours 2
+.\scripts\traffic-sessions.ps1
+
+# Historical analysis from compressed archives
+.\scripts\traffic-history.ps1 -Days 7
+```
+
+### Capture Format
+
+- **`req-*.json`** — Single-line JSON with full Anthropic request body (messages, system, tools, metadata). Extractable: machine (X-Claudish-Machine header), workspace (from system prompt), session_id (from metadata.user_id), CC version (from billing header). Written to `/captures` inside the container, bind-mounted to `D:\claudish-captures` (persists across container recreates).
+- **`resp-*.sse`** — Response SSE with metadata header (elapsed_ms, stop_reason, event count). Correlates with req via shared counter (req-1-0042 → resp-1-r0042).
+- **Archives** — `D:\claudish-captures\archive\captures-YYYY-MM-DD.7z` (LZMA2, ~100-130:1 ratio), mirrored to `G:\Mon Drive\MyIA\backups\claudish-captures\` via Google Drive Desktop (plain Windows file copy, no API). Local purge >30 days (only after confirming the GDrive copy).
+
+### Machine Attribution
+
+Machines are identified by the `X-Claudish-Machine` header (set via `ANTHROPIC_CUSTOM_HEADERS` in Claude Code settings). When missing, `CaptureUtils.psm1` falls back to device_id fingerprinting. Known device IDs are hardcoded in the module's `$DeviceMap` (currently partial — po-2023 + ai-01 only; update when new machines are seen without the header).
+
+### Anthropic Leak Diagnostics
+
+By cluster policy, **Anthropic-billed models (Opus, Fable, Sonnet) must come from `myia-ai-01` only**. `traffic-live.ps1` flags Anthropic traffic from other machines automatically:
+
+- **[OK]** — authorized machine (`-AnthropicMachines`, default `myia-ai-01`).
+- **[REVIEW]** — `myia-po-2025`: may run an authorized Safari workflow (agent-sdk / VS Code) under Anthropic. **Do not auto-flag as leak** — confirm with the user first (lesson 2026-06-21: 6 false WARNs raised on po-2025 before learning Safari was authorized).
+- **[LEAK]** — any other machine on Anthropic. Investigate.
+
+**Sub-agent leaks vs legitimate sessions** — the distinction that matters:
+- **Real sub-agent leak** = requests carry `cc_is_subagent=true` (in the billing header, *not* on the stdout `[Request]` line) + Anthropic model + non-authorized machine. The Agent tool spawns sub-agents that default to "best available" = Opus.
+- **Legitimate Anthropic session** = `agent-sdk/X` + entrypoint `claude-vscode` + same source IP across requests + `msgs=60+` (large context = main session, not sub-agent). No `cc_is_subagent`.
+
+`cc_is_subagent` lives in the request body, not stdout — so it's not visible via `docker logs` alone. To confirm a sub-agent leak, inspect a capture:
+```bash
+# Find the billing header in a suspect capture
+docker exec claudish-proxy sh -c "head -c 500 /captures/req-1-NNNN-*.json"
+# Look for: cc_is_subagent=true  → sub-agent. Absent → main session (not a leak).
+```
+
+**Fix for a confirmed leak:** add a global rule in `~/.claude/rules/` instructing the model to always specify `model: "sonnet"` (or equivalent) when spawning sub-agents, reserving Opus for genuinely complex tasks. This is client-side behavior — not fixable in the proxy.
 
 ## Debug Logging
 
