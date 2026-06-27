@@ -32,6 +32,7 @@ import { log, logStderr } from "../logger.js";
 import { formatProvenanceLog, resolveApiKeyProvenance } from "./api-key-provenance.js";
 import { getRegisteredRemoteProviders } from "./remote-provider-registry.js";
 import { getRuntimeProfiles } from "./runtime-providers.js";
+import { loadConfig } from "../profile-config.js";
 import { AnthropicProviderTransport } from "./transport/anthropic-compat.js";
 import { GeminiProviderTransport } from "./transport/gemini-apikey.js";
 import { GeminiCodeAssistProviderTransport } from "./transport/gemini-codeassist.js";
@@ -183,10 +184,14 @@ const anthropicCompatProfile: ProviderProfile = {
   },
 };
 
-/** GLM and GLM Coding Plan use the OpenAI-compatible API */
+/** GLM and GLM Coding Plan use the OpenAI-compatible API.
+ *  Honors an optional per-provider concurrency cap from config
+ *  (`providerConcurrency["glm-coding"]`, etc.) so a slow gc@ period can't pile up
+ *  unbounded slow streams and starve the proxy event loop. See ConcurrencyLimiter. */
 const glmProfile: ProviderProfile = {
   createHandler(ctx) {
-    const transport = new OpenAIProviderTransport(ctx.provider, ctx.modelName, ctx.apiKey);
+    const cap = loadConfig().providerConcurrency?.[ctx.provider.name];
+    const transport = new OpenAIProviderTransport(ctx.provider, ctx.modelName, ctx.apiKey, cap);
     const adapter = new OpenAIAPIFormat(ctx.modelName);
     const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
       adapter,
