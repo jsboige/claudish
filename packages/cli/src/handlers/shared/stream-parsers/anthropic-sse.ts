@@ -12,14 +12,20 @@
 import type { Context } from "hono";
 import { log } from "../../../logger.js";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
-import { executeWebFetch } from "../web-search-executor.js";
 import { createResponseCapture } from "../response-capture.js";
+import { executeWebFetch } from "../web-search-executor.js";
 
 interface AnthropicPassthroughOpts {
   modelName: string;
   onTokenUpdate?: (input: number, output: number) => void;
   /** Optional adapter — used to check shouldFilterThinking(). */
   adapter?: BaseAPIFormat;
+  /**
+   * When false, no resp-*.sse is written (default true). Used by the relay
+   * nominal forward: the hub captures centrally, so the sidecar must not
+   * double-capture nor emit an orphan response file.
+   */
+  capture?: boolean;
 }
 
 /**
@@ -43,7 +49,7 @@ export function createAnthropicPassthroughStream(
 
   const filterThinking = opts.adapter?.shouldFilterThinking() ?? false;
 
-  const cap = createResponseCapture("anthropic", opts.modelName);
+  const cap = createResponseCapture("anthropic", opts.modelName, opts.capture !== false);
 
   return c.body(
     new ReadableStream({
@@ -68,6 +74,71 @@ export function createAnthropicPassthroughStream(
           }
         }, 1000);
 
+        // ── Shared content-block index tracking state ──────────────────
+        // DECLARED HERE (in start() scope, not inside the inner try block) so that
+        // handleServerToolResult's closure and the read loop share the SAME binding.
+        // Previously highestSeenIndex was declared inside the inner try{} block while
+        // handleServerToolResult (which writes it at line ~109) lived in the outer scope —
+        // two different block scopes → ReferenceError: highestSeenIndex is not defined
+        // whenever a real server_tool_use block fired the handler, crashing the proxy
+        // (observed live: po-2025 "Content block not found" freeze).
+        let highestSeenIndex = -1;
+        let lastBlockOpen = false;
+        const clampIndex = (idx: number, context: string): number => {
+          if (idx > highestSeenIndex + 1) {
+            log(
+              `[AnthropicSSE] Index jump detected: ${idx} but expected <=${highestSeenIndex + 1} (${context}) — clamping to ${highestSeenIndex + 1}`
+            );
+            return highestSeenIndex + 1;
+          }
+          return idx;
+        };
+        const trackIndex = (idx: number) => {
+          if (idx > highestSeenIndex) highestSeenIndex = idx;
+        };
+
+        // Execute a suppressed server_tool_use (webReader) and inject the result
+        // as a text block. Non-blocking — errors degrade to a short notice.
+        const handleServerToolResult = async (
+          toolName: string,
+          rawInput: string,
+          currentHighestIdx: number,
+        ) => {
+          const textIdx = currentHighestIdx + 1;
+          let resultText: string;
+          try {
+            const input = JSON.parse(rawInput || "{}");
+            const url = input.url;
+            if (url && (toolName === "webReader" || toolName === "web_search_preview")) {
+              log(`[AnthropicSSE] Executing suppressed server_tool_use webReader for ${url}`);
+              const result = await executeWebFetch(url);
+              resultText = result.ok
+                ? result.text
+                : `[Web fetch for ${url} failed: ${result.error}]`;
+            } else {
+              resultText = `[Server tool "${toolName}" was executed by the provider (result not available locally).]`;
+            }
+          } catch {
+            resultText = `[Server tool "${toolName}" was executed by the provider (result not available locally).]`;
+          }
+          // Truncate very long results to avoid blowing up the context
+          if (resultText.length > 8000) {
+            resultText = resultText.slice(0, 8000) + "\n[...truncated]";
+          }
+          if (!isClosed) {
+            controller.enqueue(encoder.encode(
+              `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: textIdx, content_block: { type: "text", text: "" } })}\n\n`
+            ));
+            controller.enqueue(encoder.encode(
+              `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: textIdx, delta: { type: "text_delta", text: resultText } })}\n\n`
+            ));
+            controller.enqueue(encoder.encode(
+              `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: textIdx })}\n\n`
+            ));
+            highestSeenIndex = textIdx;
+          }
+        };
+
         try {
           const reader = response.body!.getReader();
           let buffer = "";
@@ -80,74 +151,24 @@ export function createAnthropicPassthroughStream(
           let stopReason: string | null = null;
           let sawMessageStop = false;
           let sawMessageStart = false;
-          let suppressedServerTools = 0;
 
           // Thinking-block filtering state
           let insideThinkingBlock = false;
           /** How many thinking blocks have been suppressed so far. */
           let thinkingBlocksSuppressed = 0;
 
-          // Content block index tracking — detect out-of-range indices
-          // that would cause "Content block not found" on the client side.
-          let highestSeenIndex = -1;
-          // Track whether the last content block is still open (started but not stopped).
-          // Without this, finalizeWithError() may emit a duplicate content_block_stop
-          // for a block that the provider already closed, causing "Content block not found".
-          let lastBlockOpen = false;
-          const clampIndex = (idx: number, context: string): number => {
-            if (idx > highestSeenIndex + 1) {
-              log(
-                `[AnthropicSSE] Index jump detected: ${idx} but expected <=${highestSeenIndex + 1} (${context}) — clamping to ${highestSeenIndex + 1}`
-              );
-              return highestSeenIndex + 1;
-            }
-            return idx;
-          };
-          const trackIndex = (idx: number) => {
-            if (idx > highestSeenIndex) highestSeenIndex = idx;
-          };
+          // server_tool_use suppression state.
+          // Z.AI built-in tools (webReader, web_search) emit server_tool_use blocks
+          // that Claude Code doesn't support — "Unsupported content type: server_tool_use"
+          // followed by "Content block not found" (index desync). Suppress them and
+          // execute web fetches ourselves, injecting results as text blocks.
+          let insideServerToolBlock = false;
+          let serverToolName = "";
+          let serverToolInput = "";
+          let serverToolsSuppressed = 0;
 
-          // Execute a suppressed server_tool_use (webReader) and inject the result
-          // as a text block. Non-blocking — errors degrade to a short notice.
-          const handleServerToolResult = async (
-            toolName: string,
-            rawInput: string,
-            currentHighestIdx: number,
-          ) => {
-            const textIdx = currentHighestIdx + 1;
-            let resultText: string;
-            try {
-              const input = JSON.parse(rawInput || "{}");
-              const url = input.url;
-              if (url && (toolName === "webReader" || toolName === "web_search_preview")) {
-                log(`[AnthropicSSE] Executing suppressed server_tool_use webReader for ${url}`);
-                const result = await executeWebFetch(url);
-                resultText = result.ok
-                  ? result.text
-                  : `[Web fetch for ${url} failed: ${result.error}]`;
-              } else {
-                resultText = `[Server tool "${toolName}" was executed by the provider (result not available locally).]`;
-              }
-            } catch {
-              resultText = `[Server tool "${toolName}" was executed by the provider (result not available locally).]`;
-            }
-            // Truncate very long results to avoid blowing up the context
-            if (resultText.length > 8000) {
-              resultText = resultText.slice(0, 8000) + "\n[...truncated]";
-            }
-            if (!isClosed) {
-              controller.enqueue(encoder.encode(
-                `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: textIdx, content_block: { type: "text", text: "" } })}\n\n`
-              ));
-              controller.enqueue(encoder.encode(
-                `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: textIdx, delta: { type: "text_delta", text: resultText } })}\n\n`
-              ));
-              controller.enqueue(encoder.encode(
-                `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: textIdx })}\n\n`
-              ));
-              highestSeenIndex = textIdx;
-            }
-          };
+          // (highestSeenIndex / lastBlockOpen / clampIndex / trackIndex declared
+          //  earlier in start() scope — shared with handleServerToolResult's closure.)
 
           // ── Graceful in-stream error finalization ─────────────────────
           // Some anthropic-compat providers (Z.AI, MiniMax, Kimi) return HTTP 200
@@ -295,9 +316,11 @@ export function createAnthropicPassthroughStream(
                   }
 
                   // Re-index non-thinking content blocks
-                  // After suppressing N thinking blocks, subtract N from the index
-                  if (typeof data.index === "number" && thinkingBlocksSuppressed > 0) {
-                    const reindexed = data.index - thinkingBlocksSuppressed;
+                  // After suppressing N thinking blocks + M server_tool_use blocks,
+                  // subtract N+M from the index to keep it sequential.
+                  const totalSuppressed = thinkingBlocksSuppressed + serverToolsSuppressed;
+                  if (typeof data.index === "number" && totalSuppressed > 0) {
+                    const reindexed = data.index - totalSuppressed;
                     const clamped = clampIndex(reindexed, `${data.type} (filtered, orig=${data.index})`);
                     trackIndex(clamped);
                     // Track block open/close state for finalizeWithError
@@ -356,29 +379,42 @@ export function createAnthropicPassthroughStream(
                       return; // stop processing further lines
                     }
 
-                    // ── server_tool_use suppression BEFORE passthrough ──
-                    // (Fix for recurring po-2025 freeze, 2026-06-14.)
-                    // The unsupported content type would otherwise leak past the
-                    // index-remap/passthrough pass below and reach the client,
-                    // which doesn't render server_tool_use blocks ("Unsupported
-                    // content type: server_tool_use" → "Content block not found").
-                    // Suppress here, capture name+input, fire-and-forget the
-                    // handleServerToolResult injection (writes its text block
-                    // after this server_tool_use closes).
+                    // ── server_tool_use suppression ──────────────────────────────
+                    // MUST run BEFORE the index-remap/passthrough logic below.
+                    // Z.AI built-in tools (webReader, web_search_preview) emit
+                    // server_tool_use blocks that Claude Code doesn't understand:
+                    //   "Unsupported content type: server_tool_use" + "Content block not found"
+                    // We suppress the entire block lifecycle (start → deltas → stop),
+                    // execute web fetches ourselves, and inject results as text.
+                    // (Ordering matters: without this guard first, the start event
+                    //  would already be enqueued by the passthrough below before the
+                    //  suppression flag is set — leaking the unsupported block type.)
                     if (
                       data.type === "content_block_start" &&
                       data.content_block?.type === "server_tool_use"
                     ) {
-                      suppressedServerTools++;
-                      log(`[AnthropicSSE] Suppressing server_tool_use block at index ${data.index}`);
-                      const serverToolName = data.content_block?.name || "";
-                      const serverToolInput = data.content_block?.input || "{}";
-                      const callHandle = handleServerToolResult(serverToolName, serverToolInput, highestSeenIndex);
-                      continue;
+                      insideServerToolBlock = true;
+                      serverToolName = data.content_block.name || "(unnamed)";
+                      serverToolInput = "";
+                      serverToolsSuppressed++;
+                      log(`[AnthropicSSE] Suppressing server_tool_use block at index ${data.index}: ${serverToolName}`);
+                      continue; // drop this start event
                     }
-                    if (data.type === "content_block_stop" && suppressedServerTools > 0) {
-                      suppressedServerTools--;
-                      continue;
+                    if (insideServerToolBlock) {
+                      // Accumulate input_json_delta inside the suppressed block
+                      if (data.type === "content_block_delta" && data.delta?.type === "input_json_delta") {
+                        serverToolInput += data.delta.partial_json || "";
+                      }
+                      // On stop: block is complete — execute and inject result
+                      if (data.type === "content_block_stop") {
+                        insideServerToolBlock = false;
+                        log(`[AnthropicSSE] server_tool_use "${serverToolName}" complete, input=${serverToolInput.length} chars`);
+                        // Fire-and-forget: execute the web fetch and inject as text
+                        handleServerToolResult(serverToolName, serverToolInput, highestSeenIndex);
+                        serverToolName = "";
+                        serverToolInput = "";
+                      }
+                      continue; // drop all events inside the suppressed block
                     }
 
                     // No error — check index bounds before passing through

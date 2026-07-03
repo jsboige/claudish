@@ -38,6 +38,7 @@ import type { ProviderTransport } from "./providers/transport/types.js";
 import { warmPricingCache } from "./services/pricing-cache.js";
 import type { ProxyServer } from "./types.js";
 import { executeWebSearch, executeWebFetch } from "./handlers/shared/web-search-executor.js";
+import { forwardToUpstream, readRequestBody, type RelayState } from "./fork/server/relay.js";
 
 /**
  * Routing failures are TERMINAL — no provider can serve the request (missing
@@ -240,6 +241,7 @@ export interface ProxyServerOptions {
    */
   servedSlotIds?: string[];
   hostname?: string; // Bind address (default: "127.0.0.1", use "0.0.0.0" for Docker) — fork extension
+  relay?: RelayState; // Sidecar relay state — fork extension. Undefined → this process is the hub (always local).
 }
 
 export async function createProxyServer(
@@ -544,7 +546,27 @@ export async function createProxyServer(
     return "auto-route";
   };
 
-  const getHandlerForRequest = async (requestedModel: string): Promise<ModelHandler> => {
+  // Fail-closed backstop for the CLAUDISH_NO_ANTHROPIC leak guard: when a native
+  // (real api.anthropic.com) route is forbidden and no safe budget reroute is
+  // available, refuse cleanly rather than leak. A clean 503 is NOT a never-hang
+  // violation — the client gets a terminal error, not a hung stream.
+  const anthropicRefusalHandler: ModelHandler = {
+    async handle(c) {
+      return c.json(
+        wrapAnthropicError(
+          503,
+          "This claudish sidecar has CLAUDISH_NO_ANTHROPIC set and no budget model mapping to reroute a native Anthropic request. Refusing to reach api.anthropic.com (leak-policy: Anthropic models are ai-01 only)."
+        ),
+        503
+      );
+    },
+    async shutdown() {},
+  };
+
+  const getHandlerForRequest = async (
+    requestedModel: string,
+    depth = 0
+  ): Promise<ModelHandler> => {
     // 1. Monitor Mode Override
     if (monitorMode) return nativeHandler;
 
@@ -708,6 +730,27 @@ export async function createProxyServer(
     const isNative = !target.includes("/") && !hasExplicitProvider;
 
     if (isNative) {
+      // Leak-policy backstop (defense in depth). On a non-ai-01 autonomous
+      // sidecar, CLAUDISH_NO_ANTHROPIC forbids ever touching real
+      // api.anthropic.com. An unmapped claude-* (or any bare native string that
+      // slipped through the modelMap) would otherwise leak. Reroute to the budget
+      // sonnet mapping — keeps the agent alive during an outage without leaking.
+      // This sits ABOVE the per-machine config (opus/sonnet/haiku already
+      // budget-mapped) because we have leaked on an undefined field before
+      // (memory: leak-policy-binary-by-machine).
+      if (process.env.CLAUDISH_NO_ANTHROPIC) {
+        if (depth === 0 && modelMap?.sonnet) {
+          log(
+            `[Proxy] NO_ANTHROPIC: rerouting native '${target}' → budget '${modelMap.sonnet}'`,
+            true
+          );
+          return getHandlerForRequest(modelMap.sonnet, depth + 1);
+        }
+        // depth > 0 (the budget mapping itself resolved native → misconfig) or no
+        // sonnet mapping: fail closed. Never leak.
+        log(`[Proxy] NO_ANTHROPIC: refusing native '${target}' (no safe budget reroute)`, true);
+        return anthropicRefusalHandler;
+      }
       // If we mapped to a native string (unlikely) or passed through
       return nativeHandler;
     }
@@ -894,7 +937,10 @@ export async function createProxyServer(
 
   app.post("/v1/messages", async (c) => {
     try {
-      const body = await c.req.json();
+      // readRequestBody inflates a gzipped body (WAN external sidecar → hub);
+      // identical to c.req.json() on the uncompressed LAN/direct path.
+      const body = await readRequestBody(c);
+
       // Request-metadata trace (debug log only — the [RequestMeta] prefix is
       // NOT structural-log-worthy, so it never reaches the always-on redacted
       // log). Captures the three fields claudish otherwise never reads, to
@@ -902,6 +948,19 @@ export async function createProxyServer(
       log(
         `[RequestMeta] model=${body.model} output_config=${JSON.stringify(body.output_config) ?? "(none)"} metadata=${JSON.stringify(body.metadata) ?? "(none)"} anthropic-beta=${c.req.header("anthropic-beta") ?? "(none)"}`
       );
+
+      // Sidecar relay (fork extension). In NOMINAL mode (upstream configured +
+      // alive) forward the raw request to the central hub and return its piped
+      // response. This branch sits BEFORE interceptWebTools / getHandlerForRequest
+      // / logRequest, so nominal forwards do NOT capture locally (the hub captures
+      // centrally) — mode-aware capture for free. A pre-stream forward failure
+      // returns null → fall through to the normal local path for this one request
+      // (and feeds the prober's hysteresis toward AUTONOMOUS).
+      const relay = options.relay;
+      if (relay?.upstream && relay.alive) {
+        const forwarded = await forwardToUpstream(c, body, relay);
+        if (forwarded) return forwarded;
+      }
 
       // Log tool names in request for debugging WebSearch/WebFetch
       const toolNames = (body.tools || []).map((t: any) => t.name);
