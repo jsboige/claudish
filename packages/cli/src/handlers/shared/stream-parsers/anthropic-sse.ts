@@ -111,10 +111,7 @@ export function createAnthropicPassthroughStream(
             const url = input.url;
             if (url && (toolName === "webReader" || toolName === "web_search_preview")) {
               log(`[AnthropicSSE] Executing suppressed server_tool_use webReader for ${url}`);
-              const result = await executeWebFetch(url);
-              resultText = result.ok
-                ? result.text
-                : `[Web fetch for ${url} failed: ${result.error}]`;
+              resultText = await executeWebFetch(url);
             } else {
               resultText = `[Server tool "${toolName}" was executed by the provider (result not available locally).]`;
             }

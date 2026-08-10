@@ -130,11 +130,11 @@ export async function forwardToUpstream(
   // point of the capture-machine-attribution foundation), then inject the
   // cluster proxy key so the hub's auth accepts the forward.
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  for (const [key, value] of c.req.raw.headers.entries()) {
-    if (HOP_BY_HOP.has(key.toLowerCase())) continue;
-    if (typeof value !== "string") continue;
+  c.req.raw.headers.forEach((value, key) => {
+    if (HOP_BY_HOP.has(key.toLowerCase())) return;
+    if (typeof value !== "string") return;
     headers[key] = value;
-  }
+  });
   if (state.proxyKey) {
     delete headers["authorization"];
     headers["x-api-key"] = state.proxyKey;
@@ -167,7 +167,7 @@ export async function forwardToUpstream(
     res = await fetch(`${state.upstream}/v1/messages`, {
       method: "POST",
       headers,
-      body: payload,
+      body: payload as BodyInit,
       signal: headerController.signal,
     });
     clearTimeout(headerTimer); // headers in → stop bounding; body is unbounded

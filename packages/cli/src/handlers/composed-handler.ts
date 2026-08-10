@@ -797,8 +797,7 @@ export class ComposedHandler implements ModelHandler {
         // (2026-06-25 patient-backoff.)
         if (isTransientOverload(response.status, errorText)) {
           logStderr(
-            `[Overload] [${this.provider.displayName}] HTTP ${response.status} transient overload → returning 529 overloaded_error (patient ~5min backoff exhausted)`,
-            true // forceConsole — operational event
+            `[Overload] [${this.provider.displayName}] HTTP ${response.status} transient overload → returning 529 overloaded_error (patient ~5min backoff exhausted)`
           );
           c.header("Retry-After", "5");
           return c.json(

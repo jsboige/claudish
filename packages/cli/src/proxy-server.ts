@@ -999,13 +999,15 @@ export async function createProxyServer(
   });
 
 const server = serve({
-    fetch(req, env, ctx) {
-      if (!req.headers.get("x-forwarded-for") && !req.headers.get("x-real-ip")) {
-        // @ts-expect-error — Bun injects remoteAddress on the server info object
-        const addr = ctx?.remoteAddress?.address as string | undefined;
-        if (addr) hostnameConfig.remoteAddrMap.set(req, addr);
-      }
-      return app.fetch(req, env, ctx);
+    fetch(req, env) {
+      // Hono's @hono/node-server wraps Bun.serve: the 2nd arg here is
+      // { incoming, outgoing }, NOT Bun's Server object — so `server.requestIP()`
+      // is NOT available in this code path. requestIP would only work if we
+      // wired `serve({ fetch: rawCallback })` directly without Hono.
+      // The proxy relied on x-forwarded-for / x-real-ip upstream of the Hono
+      // boundary anyway, so remoteAddrMap stays empty here — fine.
+      void env;
+      return app.fetch(req);
     },
     port,
     hostname: hostnameConfig.hostname,
