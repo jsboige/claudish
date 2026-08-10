@@ -356,6 +356,31 @@ export function createAnthropicPassthroughStream(
                       return; // stop processing further lines
                     }
 
+                    // ── server_tool_use suppression BEFORE passthrough ──
+                    // (Fix for recurring po-2025 freeze, 2026-06-14.)
+                    // The unsupported content type would otherwise leak past the
+                    // index-remap/passthrough pass below and reach the client,
+                    // which doesn't render server_tool_use blocks ("Unsupported
+                    // content type: server_tool_use" → "Content block not found").
+                    // Suppress here, capture name+input, fire-and-forget the
+                    // handleServerToolResult injection (writes its text block
+                    // after this server_tool_use closes).
+                    if (
+                      data.type === "content_block_start" &&
+                      data.content_block?.type === "server_tool_use"
+                    ) {
+                      suppressedServerTools++;
+                      log(`[AnthropicSSE] Suppressing server_tool_use block at index ${data.index}`);
+                      const serverToolName = data.content_block?.name || "";
+                      const serverToolInput = data.content_block?.input || "{}";
+                      const callHandle = handleServerToolResult(serverToolName, serverToolInput, highestSeenIndex);
+                      continue;
+                    }
+                    if (data.type === "content_block_stop" && suppressedServerTools > 0) {
+                      suppressedServerTools--;
+                      continue;
+                    }
+
                     // No error — check index bounds before passing through
                     if (typeof data.index === "number") {
                       if (data.type === "content_block_start") {
@@ -423,26 +448,6 @@ export function createAnthropicPassthroughStream(
                     ) {
                       toolUseBlocks++;
                       log(`[AnthropicSSE] Tool use: ${data.content_block.name}`);
-                    }
-                    // Suppress server_tool_use blocks (Z.AI built-in tools)
-                    if (
-                      data.type === "content_block_start" &&
-                      data.content_block?.type === "server_tool_use"
-                    ) {
-                      suppressedServerTools++;
-                      log(`[AnthropicSSE] Suppressing server_tool_use block at index ${data.index}`);
-                      // Capture the tool name + input for later execution when the block closes.
-                      const serverToolName = data.content_block?.name || "";
-                      const serverToolInput = data.content_block?.input || "{}";
-                      // Fire-and-forget: handleServerToolResult will inject the result
-                      // text block after this server_tool_use closes. We need to NOT
-                      // re-emit the original server_tool_use lifecycle events downstream.
-                      const callHandle = handleServerToolResult(serverToolName, serverToolInput, highestSeenIndex);
-                      continue;
-                    }
-                    if (data.type === "content_block_stop" && suppressedServerTools > 0) {
-                      suppressedServerTools--;
-                      continue;
                     }
                     if (data.type === "message_start") {
                       sawMessageStart = true;
