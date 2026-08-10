@@ -77,6 +77,20 @@ export interface ComposedHandlerOptions {
   invocationMode?: "profile" | "explicit-model" | "auto-route" | "env-var" | "model-map";
 }
 
+/**
+ * Models that trigger the conservative-mode fallback notice when reached via
+ * provider fallback (i.e. NOT on direct invocation). Generalize this set when
+ * adding more economy-tier models — keep it small, the notice is a safety net,
+ * not a per-model behavior.
+ *
+ * The fallback notice keeps the session alive when the primary model failed on
+ * every upstream provider: instruct the economy model to behave conservatively
+ * rather than attempt complex work the primary would have to redo.
+ */
+const FALLBACK_ECONOMY_MODELS: ReadonlySet<string> = new Set([
+  "qwen3.6-35b-a3b",
+]);
+
 export class ComposedHandler implements ModelHandler {
   private provider: ProviderTransport;
   private adapterManager: DialectManager;
@@ -351,7 +365,7 @@ export class ComposedHandler implements ModelHandler {
     if (
       fallbackMeta &&
       fallbackMeta.attempts > 0 &&
-      this.bareModelName === "qwen3.6-35b-a3b"
+      FALLBACK_ECONOMY_MODELS.has(this.bareModelName)
     ) {
       const FALLBACK_NOTICE =
         "You are operating in TEMPORARY FALLBACK mode because the primary model is temporarily unavailable (the proxy fell back to you after all upstream providers failed). Behave conservatively: avoid complex multi-step reasoning, risky operations, destructive commands, and large refactors. Prioritize keeping the session alive with a safe, simple response. Do NOT attempt ambitious work — the primary model will resume shortly and any complex work you start would need to be redone. If a task is too complex for conservative execution, say so briefly rather than attempting it.";
