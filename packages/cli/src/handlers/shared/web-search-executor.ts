@@ -15,12 +15,17 @@
  *
  * IMPORTANT: these executors must not block the SSE stream.
  * Every network call is bounded by a strict deadline.
+ *
+ * Configuration: SEARXNG_URL is REQUIRED. There is no built-in default — a
+ * missed config surfaces as a loud-fail at the call site (executor returns
+ * empty results), not as a silent ship-to-random-host. Fork deployments
+ * pass `SEARXNG_URL=http://search.myia.io` via .env.secrets (chmod 600).
  */
 
 import { log } from "../../logger.js";
 import { isMcpSearxngAvailable, mcpWebSearch, mcpUrlRead } from "./mcp-searxng-client.js";
 
-const SEARXNG_URL = process.env.SEARXNG_URL || "http://search.myia.io";
+const SEARXNG_URL = process.env.SEARXNG_URL;
 
 export interface SearchResult {
   title: string;
@@ -30,8 +35,13 @@ export interface SearchResult {
 
 /**
  * Execute a web search via SearXNG. Non-throwing.
+ * Returns [] if SEARXNG_URL is unset — caller falls through to error text.
  */
 async function fetchFromSearXNG(query: string, maxResults = 5): Promise<SearchResult[]> {
+  if (!SEARXNG_URL) {
+    log(`[WebSearch] SEARXNG_URL not configured — direct HTTP search disabled. Set SEARXNG_URL env var or use SEARXNG_MCP_URL for MCP-backed search.`);
+    return [];
+  }
   const url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
   log(`[WebSearch] Executing: "${query}" via ${SEARXNG_URL}`);
 
