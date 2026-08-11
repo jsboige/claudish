@@ -4,6 +4,7 @@ import {
   createRelayState,
   readRequestBody,
   forwardToUpstream,
+  FORWARD_HEADERS_TIMEOUT_MS,
   type RelayState,
 } from "./relay.js";
 
@@ -114,7 +115,7 @@ describe("readRequestBody", () => {
 });
 
 describe("forwardToUpstream — header building", () => {
-  it("preserves X-Claudish-Machine, injects x-api-key, strips hop-by-hop", async () => {
+  it("preserves X-Claudish-Machine, injects x-proxy-key (not x-api-key), strips hop-by-hop", async () => {
     fetchImpl = async () =>
       new Response(JSON.stringify({ ok: true }), {
         status: 200,
@@ -126,7 +127,7 @@ describe("forwardToUpstream — header building", () => {
       "content-length": "123",
       connection: "keep-alive",
       "transfer-encoding": "chunked",
-      authorization: "Bearer old",
+      authorization: "Bearer client-oauth",
     });
 
     await forwardToUpstream(c, { model: "glm-5.2" }, state);
@@ -134,11 +135,41 @@ describe("forwardToUpstream — header building", () => {
     expect(lastFetch?.url).toBe("http://hub:3000/v1/messages");
     const h = lastFetch!.init.headers as Record<string, string>;
     expect(h["x-claudish-machine"]).toBe("myia-po-2024"); // attribution survives the relay
-    expect(h["x-api-key"]).toBe("cluster-key"); // cluster auth injected
-    expect(h["authorization"]).toBeUndefined(); // old auth removed
+    expect(h["x-proxy-key"]).toBe("cluster-key"); // cluster auth injected on the gate header
+    expect(h["x-api-key"]).toBeUndefined(); // x-api-key MUST NOT carry the proxy key (would arm the hub native swap)
+    expect(h["authorization"]).toBe("Bearer client-oauth"); // client OAuth PRESERVED for native passthrough
     expect(h["content-length"]).toBeUndefined(); // hop-by-hop stripped
     expect(h["connection"]).toBeUndefined();
     expect(h["transfer-encoding"]).toBeUndefined();
+  });
+
+  it("regression: ai-01 Opus passthrough — client x-proxy-key + OAuth both survive, stale x-api-key dropped", async () => {
+    // The bug: the old relay did `delete authorization; x-api-key = proxyKey`, so a
+    // relayed native (Opus) request triggered the hub's swap to a (non-existent)
+    // stored Anthropic key → 401. The fix injects x-proxy-key and KEEPS auth.
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://hub:3000", proxyKey: "cluster-key" });
+    // ai-01 sends its OAuth bearer + x-proxy-key (post client-side fix), and may
+    // still carry a stale x-api-key from an older settings.json — the relay must
+    // drop the latter so the hub doesn't swap on it.
+    const c = mockForwardContext({
+      "x-claudish-machine": "myia-ai-01",
+      "x-proxy-key": "cluster-key",
+      "x-api-key": "cluster-key",
+      authorization: "Bearer sk-ant-oat-ai01-oauth",
+    });
+
+    await forwardToUpstream(c, { model: "claude-opus-4-8" }, state);
+
+    const h = lastFetch!.init.headers as Record<string, string>;
+    expect(h["x-claudish-machine"]).toBe("myia-ai-01");
+    expect(h["x-proxy-key"]).toBe("cluster-key"); // gate passes on this (NativeHandler ignores it → no swap)
+    expect(h["x-api-key"]).toBeUndefined(); // stale client x-api-key dropped so hub won't swap
+    expect(h["authorization"]).toBe("Bearer sk-ant-oat-ai01-oauth"); // OAuth traverses → Anthropic passthrough
   });
 
   it("compress=true → gzips the body and sets content-encoding: gzip", async () => {
@@ -232,6 +263,17 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     expect(r).not.toBeNull();
     expect(r!.status).toBe(400);
     expect(state.consecutiveFail).toBe(0); // 4xx is not a hub-health failure
+  });
+});
+
+describe("FORWARD_HEADERS_TIMEOUT_MS — must sit above real hub header latency", () => {
+  it("is generous enough that ordinary upstream latency never forces a local fallthrough", () => {
+    // Measured ai-01 → models.myia.io on 2026-08-10, plain glm-5.2 streaming POSTs:
+    // first byte at 2.5s / 3.1s / 3.4s / 8.3s. A 5s bound sat inside that spread and
+    // silently demoted routine requests to the local pipeline (no central capture,
+    // double provider spend, and budget-model reroute on CLAUDISH_NO_ANTHROPIC hosts).
+    // Liveness is the prober's job, not this bound's — keep it well clear of the tail.
+    expect(FORWARD_HEADERS_TIMEOUT_MS).toBeGreaterThanOrEqual(20_000);
   });
 });
 

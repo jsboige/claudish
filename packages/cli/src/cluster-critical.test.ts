@@ -13,7 +13,7 @@
  * - HTTP 429-overload → 529 + Retry-After → 67a5dd0 (isTransientOverload)
  * - GLM Coding saturation                → b1424ba (ConcurrencyLimiter)
  * - proxy-key gate bypass                → 985643d + 61d5726 (proxy-auth)
- * - relay/sidecar auth path              → 6952ce0 + d6c2060
+ * - relay/sidecar auth path              → 6952ce0 + d6c2060 + c3fb9d1 (PR #8)
  * - GLM slug normalization                → 5316c42 (normalizeGlmSlug)
  *
  * Each test cites the incident date and the cluster machine affected.
@@ -578,35 +578,72 @@ describe("proxy-key gate (985643d + 61d5726)", () => {
   });
 });
 
-// ─── Invariant 8: relay forwards via x-api-key + preserves X-Claudish-Machine
+// ─── Invariant 8: relay forwards via x-proxy-key + KEEPS the client authorization
 //
-// Cluster incident (planned rollout per relay-sidecar-deployment-state.md
-// memory): PR #8 (relay/sidecar) is in flight. The relay must:
-//  - inject state.proxyKey as x-api-key on the forward so the hub accepts it
+// Cluster incident 2026-08-10 (ai-01 total Opus outage, ~4h): the relay injected
+// the cluster key as `x-api-key` and deleted the client `authorization`. On the
+// hub that combination arms NativeHandler's proxyKey→Anthropic swap, which strips
+// auth and substitutes a stored Anthropic key — but the hub stores none (verified
+// firsthand on po-2023: apiKeys = ZAI/GLM/OPENROUTER/MINIMAX only). Result: every
+// relayed native (Opus) request 401'd. Non-native traffic was spared, because glm
+// authenticates with the hub's own provider key — which is why the outage looked
+// selective and took hours to characterize.
+//
+// The relay must therefore:
+//  - inject state.proxyKey as `x-proxy-key` (the gate accepts it; the swap ignores it)
+//  - NOT set `x-api-key`, and drop a stale client one that would re-arm the swap
+//  - PRESERVE the client `authorization` so ai-01's OAuth reaches Anthropic
 //  - preserve X-Claudish-Machine so central attribution survives the relay
-//  - never leak to native Anthropic on non-ai-01 (CLAUDISH_NO_ANTHROPIC guard)
-// Fix: 6952ce0 + d6c2060.
+// Fix: c3fb9d1 (PR #8), on top of 6952ce0 + d6c2060.
+//
+// NOTE: this asserts against the real `forwardToUpstream`. The previous version of
+// this test probed a `buildOutboundHeaders` export that never existed, so it took
+// the skip branch on every run and silently certified nothing — while asserting the
+// pre-#8 `x-api-key` contract, i.e. pinning the very bug above.
 
-describe("relay forward headers (6952ce0 + d6c2060)", () => {
-  test("forwardToUpstream injects x-api-key from state.proxyKey", async () => {
-    let buildOutboundHeaders: any = undefined;
+describe("relay forward headers (c3fb9d1 — PR #8)", () => {
+  test("forwardToUpstream injects x-proxy-key, drops x-api-key, keeps client OAuth", async () => {
+    const { createRelayState, forwardToUpstream } = await import("./fork/server/relay.js");
+
+    const realFetch = globalThis.fetch;
+    let sent: { url: string; init: any } | null = null;
+    globalThis.fetch = (async (url: any, init: any) => {
+      sent = { url: String(url), init };
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
     try {
-      const mod = await import("./fork/server/relay.js");
-      buildOutboundHeaders = (mod as any).buildOutboundHeaders;
-    } catch {}
-    if (typeof buildOutboundHeaders !== "function") {
-      console.warn("[skip] relay module not present yet (Tier 4)");
-      return;
+      const state = createRelayState({ upstream: "http://hub:3000", proxyKey: "relay-key-xyz" });
+      // ai-01 post-fix client: OAuth bearer + x-proxy-key, plus a stale x-api-key
+      // left over from an older settings.json.
+      const c: any = {
+        req: {
+          raw: {
+            headers: new Headers({
+              "x-claudish-machine": "myia-ai-01",
+              "content-type": "application/json",
+              "x-proxy-key": "relay-key-xyz",
+              "x-api-key": "relay-key-xyz",
+              authorization: "Bearer sk-ant-oat-user-oauth",
+            }),
+          },
+        },
+        body: (stream: any) => new Response(stream, { status: 200 }),
+      };
+
+      await forwardToUpstream(c, { model: "claude-opus-4-8" }, state);
+
+      const h = sent!.init.headers as Record<string, string>;
+      expect(h["x-proxy-key"]).toBe("relay-key-xyz"); // gate passes, swap not armed
+      expect(h["x-api-key"]).toBeUndefined(); // MUST NOT carry the key: this was the outage
+      expect(h["authorization"]).toBe("Bearer sk-ant-oat-user-oauth"); // OAuth survives → Anthropic
+      expect(h["x-claudish-machine"]).toBe("myia-ai-01"); // attribution survives the relay
+    } finally {
+      globalThis.fetch = realFetch;
     }
-    const inbound = new Headers({
-      "x-claudish-machine": "myia-po-2025",
-      "content-type": "application/json",
-      authorization: "Bearer user-oauth",
-    });
-    const outbound = buildOutboundHeaders(inbound, { proxyKey: "relay-key-xyz" });
-    expect(outbound.get("x-api-key")).toBe("relay-key-xyz");
-    expect(outbound.get("x-claudish-machine")).toBe("myia-po-2025");
-    expect(outbound.get("authorization")).toBe("Bearer user-oauth");
   });
 });
 
