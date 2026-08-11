@@ -42,6 +42,7 @@ let hubMsgHits = 0;
 
 const hub = Bun.serve({
   port: HUB_PORT,
+  hostname: "127.0.0.1", // same reason as the MCP test mock: never expose a test listener to the LAN
   async fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
