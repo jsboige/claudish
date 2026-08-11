@@ -670,6 +670,268 @@ describe("X-Claudish-Machine capture attribution (141d160)", () => {
   });
 });
 
+// ─── Invariant 10: Map<orig,emitted> index remap (anthropic-sse unification) ─
+//
+// Upstream review (PR #127 + #133): the fork maintained three separate index
+// mutation paths — (1) filtered path subtracting `totalSuppressed` from the
+// upstream index, (2) passthrough path clamping to `highestSeenIndex + 1`,
+// (3) the server_tool_use suppression's `currentHighestIdx + 1` for the
+// synthetic text block. A delta or stop for a block that was remapped at
+// start (e.g. upstream index 2 → emitted 1) would bypass the clamp because
+// `2 > highestSeenIndex + 1` and still carry the original upstream index —
+// so the client would receive deltas for a block it never opened, producing
+// "Content block not found" on the next request.
+//
+// Maintainer's prescription: a single `Map<upstreamIndex, emittedIndex>`
+// populated on `content_block_start` and read on every delta/stop. Delta/stop
+// for an unknown upstream index is dropped (with a log line) — the alternative
+// (clamp / invent) is what produced the broken frames. Replaces all three
+// mechanisms above with one lookup. See UPSTREAM_SYNC_DESIGN.md §3.2.
+
+describe("anthropic-sse Map<orig,emitted> index remap (PR #127 + #133, unifies #127/#133/8afe19d)", () => {
+  test("non-sequential upstream indices (0, 2, 3) are remapped to 0, 1, 2", async () => {
+    let createAnthropicPassthroughStream: any = undefined;
+    try {
+      const mod = await import("./handlers/shared/stream-parsers/anthropic-sse.js");
+      createAnthropicPassthroughStream = (mod as any).createAnthropicPassthroughStream;
+    } catch {
+      console.warn("[skip] anthropic-sse module not importable");
+      return;
+    }
+    if (typeof createAnthropicPassthroughStream !== "function") return;
+
+    const events = [
+      { type: "message_start", message: { id: "msg_map_skip", model: "zai-test", role: "assistant", usage: { input_tokens: 1, output_tokens: 0 } } },
+      // Block at upstream index 0
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "First " } },
+      { type: "content_block_stop", index: 0 },
+      // Block at upstream index 2 (skip 1)
+      { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "Third " } },
+      { type: "content_block_stop", index: 2 },
+      // Block at upstream index 3
+      { type: "content_block_start", index: 3, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 3, delta: { type: "text_delta", text: "Fourth" } },
+      { type: "content_block_stop", index: 3 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+      { type: "message_stop" },
+    ];
+
+    const ctx = createMockContext();
+    const response = createAnthropicPassthroughStream(ctx, sseResponse(events), {
+      modelName: "zai-test",
+    });
+    const parsed = await parseClaudeSseStream(response);
+
+    // Every content_block_start must have index 0, 1, or 2 in that order.
+    const starts = parsed.filter((e) => e.data?.type === "content_block_start");
+    expect(starts.length).toBe(3);
+    expect(starts.map((e) => e.data.index)).toEqual([0, 1, 2]);
+
+    // All deltas must reference the same sequential index as their start.
+    const deltas = parsed.filter((e) => e.data?.type === "content_block_delta");
+    expect(deltas.map((e) => e.data.index)).toEqual([0, 1, 2]);
+
+    // Stops must match starts.
+    const stops = parsed.filter((e) => e.data?.type === "content_block_stop");
+    expect(stops.map((e) => e.data.index)).toEqual([0, 1, 2]);
+
+    // The reconstructed text reads "First Third Fourth" — proves the index
+    // remap preserved content attribution.
+    const text = parsed
+      .filter((e) => e.data?.type === "content_block_delta")
+      .map((e) => e.data.delta.text)
+      .join("");
+    expect(text).toBe("First Third Fourth");
+  });
+
+  test("delta/stop for an unknown upstream index is dropped (no clamp, no invent)", async () => {
+    let createAnthropicPassthroughStream: any = undefined;
+    try {
+      const mod = await import("./handlers/shared/stream-parsers/anthropic-sse.js");
+      createAnthropicPassthroughStream = (mod as any).createAnthropicPassthroughStream;
+    } catch {
+      console.warn("[skip] anthropic-sse module not importable");
+      return;
+    }
+    if (typeof createAnthropicPassthroughStream !== "function") return;
+
+    const events = [
+      { type: "message_start", message: { id: "msg_drop", model: "zai-test", role: "assistant", usage: { input_tokens: 1, output_tokens: 0 } } },
+      // Block 0 — valid
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Known " } },
+      { type: "content_block_stop", index: 0 },
+      // Orphan delta + stop at index 5 — must be dropped (no upstream start)
+      { type: "content_block_delta", index: 5, delta: { type: "text_delta", text: "ORPHAN" } },
+      { type: "content_block_stop", index: 5 },
+      // Block at index 7 — must be remapped to emitted index 1
+      { type: "content_block_start", index: 7, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 7, delta: { type: "text_delta", text: "Last " } },
+      { type: "content_block_stop", index: 7 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+      { type: "message_stop" },
+    ];
+
+    const ctx = createMockContext();
+    const response = createAnthropicPassthroughStream(ctx, sseResponse(events), {
+      modelName: "zai-test",
+    });
+    const parsed = await parseClaudeSseStream(response);
+
+    // ORPHAN text must NOT appear in the output
+    const text = parsed
+      .filter((e) => e.data?.type === "content_block_delta")
+      .map((e) => e.data.delta.text)
+      .join("");
+    expect(text).not.toContain("ORPHAN");
+    expect(text).toBe("Known Last ");
+
+    // Only ONE emitted text block (index 0) and ONE emitted text block (index 1)
+    const starts = parsed.filter((e) => e.data?.type === "content_block_start");
+    expect(starts.map((e) => e.data.index)).toEqual([0, 1]);
+
+    // Stream must still terminate cleanly with message_stop (never hang)
+    const hasStop = parsed.some((e) => e.data?.type === "message_stop");
+    expect(hasStop).toBe(true);
+  });
+
+  test("filtered (thinking) + passthrough reuses the SAME Map (no separate paths)", async () => {
+    // This is the key invariant: there is ONE index-remap path, not two.
+    // With filterThinking active, a thinking block at upstream index 0 is
+    // dropped → no map entry. A text block at upstream index 1 → emitted 0.
+    // The test for the *single* path is the same as the remap test above,
+    // but with filterThinking enabled via adapter.shouldFilterThinking().
+    let createAnthropicPassthroughStream: any = undefined;
+    try {
+      const mod = await import("./handlers/shared/stream-parsers/anthropic-sse.js");
+      createAnthropicPassthroughStream = (mod as any).createAnthropicPassthroughStream;
+    } catch {
+      console.warn("[skip] anthropic-sse module not importable");
+      return;
+    }
+    if (typeof createAnthropicPassthroughStream !== "function") return;
+
+    const stubAdapter = {
+      shouldFilterThinking: () => true,
+    };
+
+    const events = [
+      { type: "message_start", message: { id: "msg_filter", model: "zai-test", role: "assistant", usage: { input_tokens: 1, output_tokens: 0 } } },
+      // Thinking block at upstream index 0 — must be dropped
+      { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "internal" } },
+      { type: "content_block_stop", index: 0 },
+      // Text block at upstream index 1 — must be remapped to emitted 0
+      { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Visible" } },
+      { type: "content_block_stop", index: 1 },
+      { type: "message_delta", delta: { stop_reason: "end_turn" } },
+      { type: "message_stop" },
+    ];
+
+    const ctx = createMockContext();
+    const response = createAnthropicPassthroughStream(ctx, sseResponse(events), {
+      modelName: "zai-test",
+      adapter: stubAdapter as any,
+    });
+    const parsed = await parseClaudeSseStream(response);
+
+    // No thinking block whatsoever in the output
+    const thinkingStarts = parsed.filter(
+      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
+    );
+    expect(thinkingStarts.length).toBe(0);
+
+    // The text block must be at emitted index 0 (proves the Map absorbed the
+    // subtracted thinking block without a separate code path)
+    const textStarts = parsed.filter(
+      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "text"
+    );
+    expect(textStarts.length).toBe(1);
+    expect(textStarts[0].data.index).toBe(0);
+  });
+
+  test("regression fixture: regression-anthropic-sse-index-skip-1.sse replays to 0,1,2", async () => {
+    // End-to-end replay against the on-disk fixture (the same one used by
+    // format-translation.test.ts's SSE replay harness). Guarantees the Map
+    // path works against real-world feed shapes, not just inline events.
+    const fixturePath = join(FIXTURES_DIR, "regression-anthropic-sse-index-skip-1.sse");
+    let createAnthropicPassthroughStream: any = undefined;
+    try {
+      const mod = await import("./handlers/shared/stream-parsers/anthropic-sse.js");
+      createAnthropicPassthroughStream = (mod as any).createAnthropicPassthroughStream;
+    } catch {
+      console.warn("[skip] anthropic-sse module not importable");
+      return;
+    }
+    if (typeof createAnthropicPassthroughStream !== "function") return;
+    let resp: Response;
+    try {
+      resp = fixtureToResponse(fixturePath);
+    } catch {
+      console.warn("[skip] fixture not found:", fixturePath);
+      return;
+    }
+
+    const ctx = createMockContext();
+    const response = createAnthropicPassthroughStream(ctx, resp, {
+      modelName: "zai-test",
+    });
+    const parsed = await parseClaudeSseStream(response);
+
+    const starts = parsed.filter((e) => e.data?.type === "content_block_start");
+    expect(starts.length).toBe(3);
+    expect(starts.map((e) => e.data.index)).toEqual([0, 1, 2]);
+
+    const text = parsed
+      .filter((e) => e.data?.type === "content_block_delta")
+      .map((e) => e.data.delta.text)
+      .join("");
+    expect(text).toBe("First Third Fourth");
+  });
+
+  test("regression fixture: regression-anthropic-sse-delta-unknown-index.sse drops the orphan", async () => {
+    const fixturePath = join(FIXTURES_DIR, "regression-anthropic-sse-delta-unknown-index.sse");
+    let createAnthropicPassthroughStream: any = undefined;
+    try {
+      const mod = await import("./handlers/shared/stream-parsers/anthropic-sse.js");
+      createAnthropicPassthroughStream = (mod as any).createAnthropicPassthroughStream;
+    } catch {
+      console.warn("[skip] anthropic-sse module not importable");
+      return;
+    }
+    if (typeof createAnthropicPassthroughStream !== "function") return;
+    let resp: Response;
+    try {
+      resp = fixtureToResponse(fixturePath);
+    } catch {
+      console.warn("[skip] fixture not found:", fixturePath);
+      return;
+    }
+
+    const ctx = createMockContext();
+    const response = createAnthropicPassthroughStream(ctx, resp, {
+      modelName: "zai-test",
+    });
+    const parsed = await parseClaudeSseStream(response);
+
+    const text = parsed
+      .filter((e) => e.data?.type === "content_block_delta")
+      .map((e) => e.data.delta.text)
+      .join("");
+    expect(text).not.toContain("ORPHAN");
+    expect(text).toBe("Known Last ");
+
+    const starts = parsed.filter((e) => e.data?.type === "content_block_start");
+    expect(starts.map((e) => e.data.index)).toEqual([0, 1]);
+
+    const hasStop = parsed.some((e) => e.data?.type === "message_stop");
+    expect(hasStop).toBe(true);
+  });
+});
+
 // ─── Done marker ───────────────────────────────────────────────────────────
 
 describe("Cluster-critical suite loaded", () => {
