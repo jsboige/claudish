@@ -35,9 +35,10 @@ const frame = (event: string, data: unknown) =>
 const stripPingFrames = (wire: string): string =>
   wire.replaceAll('event: ping\ndata: {"type":"ping"}\n\n', "");
 
-const run = (frames: string[]) =>
+const run = (frames: string[], adapter?: any) =>
   createAnthropicPassthroughStream(ctx, sseResponse(frames), {
     modelName: "test-model",
+    adapter,
   }).text();
 
 const messageStart = () =>
@@ -73,12 +74,12 @@ const messageDelta = () =>
 const messageStop = () => frame("message_stop", { type: "message_stop" });
 
 /** Replay a whole fixture file (stripping its `# ` metadata lines) through the parser. */
-const runFixture = async (name: string): Promise<string> => {
+const runFixture = async (name: string, adapter?: any): Promise<string> => {
   const text = readFileSync(join(FIXTURES_DIR, name), "utf-8")
     .split("\n")
     .filter((l) => !l.startsWith("# "))
     .join("\n");
-  return stripPingFrames(await run([text]));
+  return stripPingFrames(await run([text], adapter));
 };
 
 /** Parse a parser-emitted wire into its data payloads, in order. */
@@ -233,5 +234,42 @@ describe.each([
     const stopReason = events.find((e) => e.type === "message_delta")?.delta?.stop_reason;
     expect(stopReason).toBe("tool_use");
     expect(events.filter((e) => typeof e.index === "number" && e.index > 1)).toHaveLength(0);
+  });
+});
+
+// Every test above builds the parser WITHOUT an adapter, which silently
+// exercises the unfiltered branch and proves nothing about the path production
+// actually takes: `MiniMaxModelDialect.shouldFilterThinking()` returns true
+// unconditionally, and MiniMax is the provider these very captures came from.
+// Before the index layer was unified, this path opened [1, 2] and left the
+// implicit signature block's delta and stop as orphans at an index nothing had
+// opened — i.e. the turn still died, on the exact lane the fixtures were taken
+// from. Upstream MadAppGang/claudish#200.
+describe.each([
+  "minimax-m3-anthropic-implicit-signature-r10324.sse",
+  "minimax-m3-anthropic-implicit-signature-r10416.sse",
+])("index mapping applies on the thinking-filtered path too (%s)", (fixture) => {
+  it("only emits deltas and stops for sequentially opened blocks", async () => {
+    const adapter = { shouldFilterThinking: () => true } as any;
+    const events = parseEmitted(await runFixture(fixture, adapter));
+    const openedIndices = new Set<number>();
+    const violations: any[] = [];
+
+    for (const event of events) {
+      if (event.type === "content_block_start") {
+        openedIndices.add(event.index);
+      } else if (
+        (event.type === "content_block_delta" || event.type === "content_block_stop") &&
+        !openedIndices.has(event.index)
+      ) {
+        violations.push(event);
+      }
+    }
+
+    expect(
+      violations,
+      `Frames referenced unopened content block indices:\n${JSON.stringify(violations, null, 2)}`
+    ).toHaveLength(0);
+    expect([...openedIndices]).toEqual([0, 1]);
   });
 });
