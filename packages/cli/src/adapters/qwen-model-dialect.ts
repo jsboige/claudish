@@ -196,6 +196,25 @@ export class QwenModelDialect extends BaseAPIFormat {
       delete request.thinking;
     }
 
+    // …and remove `reasoning_effort` for the same reason, one knob over.
+    //
+    // DashScope does not merely ignore the pair, it REJECTS it:
+    //
+    //   400 [invalid_parameter_error] 'reasoning_effort' and 'thinking_budget'
+    //       cannot be set simultaneously
+    //
+    // Reported 2026-08-19 through Zen Go, which fronts Qwen and passes the
+    // upstream verdict back verbatim. `reasoning_effort` is OpenAI's spelling of
+    // the same intent this method has just expressed in DashScope's spelling, so
+    // leaving it is a contradiction on the wire regardless of who set it — and
+    // it costs the whole turn, not just the reasoning depth.
+    //
+    // GLMModelDialect already does this ("never leave a depth knob contradicting
+    // the off-switch"); Qwen cleaned up `thinking` but not this one. Unconditional
+    // rather than gated on `originalRequest`, because the field can arrive from
+    // the OpenAI-shaped base format as well as from the caller.
+    if (request.reasoning_effort !== undefined) delete request.reasoning_effort;
+
     return request;
   }
 
