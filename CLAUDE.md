@@ -251,6 +251,26 @@ Three interception paths:
 
 The MCP client (`handlers/shared/mcp-searxng-client.ts`) is a minimal JSON-RPC streamable-http client (no SDK, no stdio): handles both `application/json` and `text/event-stream` response formats, lazy `initialize` handshake with `mcp-session-id` caching when the server demands a session, strict `AbortSignal.timeout` deadlines, and a non-throwing `{ ok, text|error }` contract. Per-call duration is logged as `[MCP-SearXNG] tools/call <name> <ms>ms ok=<bool>` for overhead measurement vs direct HTTP.
 
+### Z.AI built-in tools (`anthropic-sse` path)
+
+Z.AI's Anthropic-compatible endpoint runs its own server-side tools and streams **two** block types Claude Code cannot render. Both are suppressed in `anthropic-sse.ts`; the shape below is a live capture (`api.z.ai/api/anthropic/v1/messages`, glm-5.2, 2026-08-11), not an inferred one:
+
+```
+idx0  text            "🌐 Z.ai Built-in Tool: web_search_prime" + input echo  (Z.AI's own banner)
+idx1  server_tool_use complete input INSIDE content_block_start, ZERO deltas → suppressed
+idx2  text            "**Output:** …result summary"
+idx3  tool_result     tool_use_id + full results JSON                        → suppressed
+idx4  text            the model's actual answer
+```
+
+Three things this shape breaks that a hand-written fixture will not reproduce:
+
+- **The input is not streamed.** It arrives whole inside `content_block_start` with no `input_json_delta`. Accumulating deltas alone yields `""`, so `handleServerToolResult` silently degrades to its "result not available locally" notice — including for a genuine `webReader` that should have been fetched.
+- **`tool_result` is emitted assistant-side.** That block type is USER-turn-only in the Anthropic wire format, so it lands on the client as the same "Unsupported content type" failure the `server_tool_use` suppression exists to prevent. Dropping it loses nothing — the same results arrive as the `idx2` text block.
+- **Suppressing two blocks shifts the rest down.** `clampIndex` only corrects *upward* index jumps, so a `content_block_start` remapped downward left its deltas/stop on the upstream index → "Content block not found". The parser now remembers the upstream→emitted pair for the open block and makes its deltas/stop follow it.
+
+**Testing these paths:** assert on parsed block types (`blockTypesOf(raw)`), never `raw.toContain('"type":"…"')` — Z.AI serializes with spaces, so substring assertions pass even when the block leaks verbatim. Fixtures: `regression-zai-server-tool-use.sse` (synthetic, delta-based input) and `regression-zai-server-tool-use-live.sse` (real capture).
+
 ### Configuration
 
 - **`SEARXNG_MCP_URL`** env var (optional): URL of the MCP searxng endpoint (e.g. `https://mcp-tools.myia.io/searxng/mcp`). When unset, the MCP layer is skipped entirely — zero behavior change for existing deployments.
