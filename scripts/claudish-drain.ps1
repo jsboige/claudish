@@ -10,14 +10,17 @@
 # message_stop), so a client-visible mid-response drop means the process went
 # away under it. Restarts are the main way that happens.
 #
-# Measured on the hub, 2026-08-23, 906 samples over 30 min: min 1, p50 5, p90 7,
-# max 10, mean 5.1. It never reached 0 — the hub is never idle. So a restart
-# always costs turns here; the only question is how many.
+# Measured on the hub over 3080 samples spanning day and night: p50 5, p90 8,
+# max 14, mean 4.9. The hub DOES fall idle, but rarely and briefly — five
+# distinct silent episodes, one per ~88 min of observation, lasting 2 to 39
+# seconds. So a restart usually costs turns; the question is how many.
 #
 # Since PR #37 the proxy reports the count:
 #     GET /health -> {"status":"ok","activeStreams":8,"uptimeSec":1132}
-# which lets a restart pick its moment instead of guessing. It cannot wait for
-# silence, because silence does not come.
+# which lets a restart pick its moment instead of guessing. Waiting for silence
+# alone is a bad bet — a 300s window catches an idle episode roughly 1 time in
+# 18 — but it is not the impossible bet an earlier version of this comment
+# claimed.
 #
 # TWO WAYS TO USE IT
 #
@@ -69,11 +72,12 @@ function Invoke-ClaudishDrainedRestart {
     <#
         Restarts the container at the quietest moment it can find.
 
-        NOT "waits for zero". Measured on the hub 2026-08-23, 906 samples over
-        30 min: activeStreams never once reached 0 (min 1, seen twice; p50 5,
-        p90 7, max 10; the longest lull at <=2 lasted 6 seconds). A drain that
-        waits for 0 on this hub can only time out and then restart at an
-        arbitrary moment — which is what the first version of this function did.
+        NOT "waits for zero" — though zero does happen. Measured over 3080
+        samples spanning day and night: p50 5, p90 8, max 14, mean 4.9, and
+        five distinct idle episodes, one per ~88 min of observation, each
+        lasting 2 to 39 seconds. A drain that waits only for 0 therefore times
+        out roughly 19 times out of 20 and then restarts at an arbitrary
+        moment — which is what the first version of this function did.
 
         So the target is relative, not absolute. We watch for $ObserveSec to
         learn what "quiet" means for this hub right now, then fire on the first
@@ -81,19 +85,21 @@ function Invoke-ClaudishDrainedRestart {
         the target by one, which bounds the wait without a timeout deciding for
         us: the restart lands at a below-average moment instead of a random one.
 
-        Replaying those 906 real samples through both versions, per restart:
+        Replaying all 3080 real samples through each version, per restart:
 
-            blind `docker restart`   mean 5.19   p90 7   worst 10
-            this function            mean 3.65   p90 5   worst  6
+                                  mean   p90   worst   restarts cutting nobody
+            blind restart         4.86     7      11              0.3%
+            wait-for-zero drain   4.76     7      14              5.2%
+            this function         3.03     5       7              6.6%
 
         The defaults are the knee of that curve. A longer cap buys nothing
         (600s scored identically to 300s), and relaxing the target faster
         undoes the whole gain — at one step per poll the target outruns the
         hub and the mean goes back to 4.67.
 
-        This shaves the cost; it does not remove it. On a hub that is never idle
-        every restart cuts several agent turns, so the real mitigation is
-        restarting less often, not draining better.
+        This shaves the cost; it does not remove it. Even at its best it cuts
+        three agent turns per restart, so the real mitigation is restarting
+        less often, not draining better.
     #>
     param(
         [string]$Reason = "unspecified",
