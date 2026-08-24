@@ -1919,6 +1919,71 @@ describe("Regression: web search remap to client WebSearch tool_use", () => {
 // empties (sub-agents with tiny contexts) — discarding context mid-task.
 // The fix classifies by finish_reason + prompt_tokens and leads transient
 // empties with "retry, NOT a context problem".
+describe("Regression: vLLM reasoning field (qwen3.6 lane)", () => {
+  // 2026-08-25: vLLM's reasoning parser emits thinking as delta.reasoning, not
+  // delta.reasoning_content. The parser only read reasoning_content, so ~98% of
+  // the lane's output tokens (the thinking) were silently dropped — billed
+  // engine-side, never reaching the client. Measured: 241 completion tokens on
+  // "Reponds exactement: ok" → 899 chars reasoning, 4 chars visible text.
+  async function getParser() {
+    const mod = await import("./handlers/shared/openai-compat.js");
+    return mod.createStreamingResponseHandler;
+  }
+
+  async function getDefaultAdapter() {
+    const mod = await import("./adapters/base-api-format.js");
+    return new mod.DefaultAPIFormat("test-model");
+  }
+
+  function extractThinking(events: any[]): string {
+    return events
+      .filter(
+        (e) => e.data?.type === "content_block_delta" && e.data?.delta?.type === "thinking_delta"
+      )
+      .map((e) => e.data.delta.thinking)
+      .join("");
+  }
+
+  test("delta.reasoning (vLLM field name) becomes a thinking block, not silence", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const fixture = fixtureToResponse(
+      join(FIXTURES_DIR, "regression-vllm-qwen36-reasoning-field.sse")
+    );
+    const ctx = createMockContext();
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      fixture,
+      adapter,
+      "qwen3.6-35b-a3b",
+      null,
+      undefined,
+      undefined
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    const thinking = extractThinking(events);
+    expect(thinking).toContain("Here is my thinking about this.");
+    expect(thinking).toContain(" More reasoning here.");
+
+    // The final answer is still plain text, separate from the thinking block.
+    const text = extractText(events);
+    expect(text).toContain("ok");
+
+    // Thinking block precedes the text block in the content order.
+    const thinkingStart = events.find(
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
+    );
+    const textStart = events.find(
+      (e) => e.data?.type === "content_block_start" && e.data?.content_block?.type === "text"
+    );
+    expect(events.indexOf(thinkingStart!)).toBeLessThan(events.indexOf(textStart!));
+  });
+});
+
 describe("Regression: empty-response cause classification", () => {
   async function getParser() {
     const mod = await import("./handlers/shared/openai-compat.js");
