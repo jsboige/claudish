@@ -15,6 +15,7 @@ import { LocalModelQueue } from "../../handlers/shared/local-queue.js";
 import { ConcurrencyLimiter } from "../../handlers/shared/concurrency-limiter.js";
 import { log } from "../../logger.js";
 import { KimiOAuth } from "../../auth/kimi-oauth.js";
+import { isQuotaWall } from "./quota-wall.js";
 
 export class AnthropicProviderTransport implements ProviderTransport {
   readonly name: string;
@@ -119,15 +120,25 @@ export class AnthropicProviderTransport implements ProviderTransport {
    * Response status alone.
    */
   async enqueueRequest(fetchFn: () => Promise<Response>): Promise<Response> {
+    // Gates the fetch, not the backoff sleep — see OpenAIProviderTransport for
+    // the full rationale. A slot held across a backoff blocks the lane while the
+    // backend is idle; here that matters most, because these providers share one
+    // cluster-wide key and therefore throttle in synchronized bursts.
+    const gate = (fn: () => Promise<Response>): Promise<Response> =>
+      this.limiter ? this.limiter.run(fn) : fn();
+
     const runWith429Retry = async (): Promise<Response> => {
       const maxRetries = 5;
       let lastResponse: Response | null = null;
 
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const response = await fetchFn();
+        const response = await gate(fetchFn);
 
         if (response.status === 429 && attempt < maxRetries) {
           lastResponse = response;
+          // A wall will still be a wall after the ladder — give up now so the
+          // caller's deadline is not spent asleep. Bursts still retry (narrow predicate).
+          if (await isQuotaWall(response, this.displayName)) return response;
           const retryAfter = response.headers.get("Retry-After");
           let delayMs: number;
           if (retryAfter && !Number.isNaN(Number(retryAfter))) {
@@ -155,11 +166,8 @@ export class AnthropicProviderTransport implements ProviderTransport {
 
     // Capacity-limited backend — per-instance cap so parallel large prefills can't
     // wedge the engine (and a slow remote provider can't pile up unbounded streams).
-    // Independent per provider. See OpenAIProviderTransport for the same pattern.
+    // Independent per provider. Gating is per attempt inside the loop above.
     // Unset maxConcurrency = unbounded (unchanged behavior).
-    if (this.limiter) {
-      return this.limiter.run(runWith429Retry);
-    }
     return runWith429Retry();
   }
 

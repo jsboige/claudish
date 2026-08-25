@@ -191,3 +191,113 @@ describe("AnthropicAPIFormat — tool_reference stripping", () => {
     expect(messages[0].content).toBe("plain string");
   });
 });
+
+describe("AnthropicProviderTransport 429 backoff releases the concurrency slot", () => {
+  // Same defect and same fix as OpenAIProviderTransport. It bites harder here:
+  // these providers (Z.AI, MiniMax, Kimi) share ONE key across the cluster, so
+  // they throttle in synchronized bursts — exactly when holding a slot through
+  // the backoff blocks the most traffic.
+  const provider: RemoteProvider = {
+    name: "glm",
+    displayName: "GLM",
+    baseUrl: "https://api.z.ai",
+    apiPath: "/api/anthropic/v1/messages",
+    transport: "anthropic",
+  };
+
+  test("a request in 429 backoff does not block another request to the same provider", async () => {
+    const transport = new AnthropicProviderTransport(provider, TEST_API_KEY, 1);
+    const order: string[] = [];
+
+    let aCalls = 0;
+    const a = transport
+      .enqueueRequest(() => {
+        aCalls++;
+        if (aCalls === 1) {
+          return Promise.resolve(
+            new Response('{"error":"rate limited"}', {
+              status: 429,
+              headers: { "Retry-After": "1" },
+            })
+          );
+        }
+        return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+      })
+      .then(() => order.push("A"));
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    const b = transport
+      .enqueueRequest(() => Promise.resolve(new Response('{"ok":true}', { status: 200 })))
+      .then(() => order.push("B"));
+
+    await Promise.all([a, b]);
+
+    expect(order).toEqual(["B", "A"]);
+    expect(aCalls).toBe(2);
+  }, 15000);
+
+  test("still caps concurrent fetches at maxConcurrency", async () => {
+    const transport = new AnthropicProviderTransport(provider, TEST_API_KEY, 2);
+    let inFlight = 0;
+    let peak = 0;
+
+    const fire = () =>
+      transport.enqueueRequest(async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 30));
+        inFlight--;
+        return new Response('{"ok":true}', { status: 200 });
+      });
+
+    await Promise.all([fire(), fire(), fire(), fire(), fire()]);
+
+    expect(peak).toBe(2);
+  });
+});
+
+describe("AnthropicProviderTransport 429 quota-wall short-circuit", () => {
+  const provider: RemoteProvider = {
+    name: "minimax-coding",
+    baseUrl: "https://api.minimaxi.com",
+    apiPath: "/anthropic/v1/messages",
+    transport: "anthropic",
+    authScheme: "bearer",
+  };
+  // MiniMax counts down to its reset; the word that arms the predicate is "quota".
+  const WALL = '{"error":{"message":"Your quota has been exhausted, resets in 3h"}}';
+  const BURST = '{"error":{"message":"too many requests, retry shortly"}}';
+
+  test("a quota wall skips the jittered ladder", async () => {
+    const transport = new AnthropicProviderTransport(provider, TEST_API_KEY);
+    let callCount = 0;
+    const startTime = Date.now();
+
+    const response = await transport.enqueueRequest(() => {
+      callCount++;
+      return Promise.resolve(new Response(WALL, { status: 429 }));
+    });
+
+    expect(response.status).toBe(429);
+    expect(callCount).toBe(1);
+    expect(Date.now() - startTime).toBeLessThan(1000);
+    expect(await response.text()).toBe(WALL); // body preserved for the caller
+  }, 10000);
+
+  test("a BURST still walks the ladder — jitter path unaffected", async () => {
+    const transport = new AnthropicProviderTransport(provider, TEST_API_KEY);
+    let callCount = 0;
+    const startTime = Date.now();
+
+    const response = await transport.enqueueRequest(() => {
+      callCount++;
+      if (callCount === 1) return Promise.resolve(new Response(BURST, { status: 429 }));
+      return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+    });
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(2);
+    expect(Date.now() - startTime).toBeGreaterThanOrEqual(1900); // 2s rung + jitter
+  }, 15000);
+});
