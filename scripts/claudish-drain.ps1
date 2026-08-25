@@ -87,6 +87,13 @@ function Invoke-ClaudishDrainedRestart {
         the target by one, which bounds the wait without a timeout deciding for
         us: the restart lands at a below-average moment instead of a random one.
 
+        Two real drained restarts have since been observed from outside
+        (08-24, 08-25, 04:00 local, 2s /health probe): 2 and 1 streams cut,
+        against 4.6 and 3.0 mean active in the preceding 60s. Across all 8
+        restarts in 36.6h the measured cost is 3.00 turns each. A graceful
+        docker stop finishes in-flight streams on its own, so this agrees
+        with the replay below without isolating this function's share.
+
         Replaying all 53,959 real samples through each version, per restart:
 
                                   mean   p90   worst   restarts cutting nobody
