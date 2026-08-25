@@ -18,11 +18,70 @@
  * being retried. Widening this predicate to "any 429" would turn every transient
  * rate limit into an instant hard failure.
  *
- * Never throws: an unreadable body degrades to the pre-existing ladder.
+ * Never throws, and never waits without a bound: an unreadable body — or one
+ * that simply does not arrive — degrades to the pre-existing ladder.
  */
 
 import { isQuotaExhaustion } from "../../fork/failover.js";
 import { log } from "../../logger.js";
+
+/**
+ * How long the wall check may spend reading a 429 error body.
+ *
+ * This exists because **nothing else bounds that read on the OpenAI transport
+ * path**: `OpenAIProviderTransport` implements no `getRequestInit`, so its
+ * `fetch` carries no `AbortSignal` (only `local.ts` and `vertex-oauth.ts`
+ * attach one). Its "Request timed out after 30s" log line has no timeout
+ * behind it on this path.
+ *
+ * Before the short-circuit landed, the ladder never touched the body at all —
+ * a 429 whose body never completes simply slept 2s and retried. Reading it
+ * turned that into an unbounded await: verified 2026-08-25 against a Response
+ * over a never-closing ReadableStream, `enqueueRequest` never returns. The
+ * proxy sits in an agentic loop, and whatever stalls a turn stalls the agent,
+ * so the read gets its own deadline rather than inheriting one that is absent.
+ *
+ * 2s is deliberately generous — an error body is small and normally already
+ * buffered, so this should never fire against a healthy provider.
+ */
+const BODY_READ_DEADLINE_MS = 2000;
+
+/**
+ * Read a body, giving up after `ms`. Returns `null` when the deadline wins.
+ *
+ * Reads through an explicit reader rather than `.text()` so the deadline can
+ * `cancel()` it: that resolves the pending read as done, the loop exits, and
+ * the underlying stream is released instead of being abandoned mid-flight.
+ */
+async function readBodyWithDeadline(response: Response, ms: number): Promise<string | null> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    void reader.cancel().catch(() => {});
+  }, ms);
+  try {
+    const chunks: Uint8Array[] = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+    if (timedOut) return null;
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const buf = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      buf.set(c, offset);
+      offset += c.length;
+    }
+    return new TextDecoder().decode(buf);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /**
  * True when this response is a wall worth giving up on immediately.
@@ -33,7 +92,15 @@ import { log } from "../../logger.js";
  */
 export async function isQuotaWall(response: Response, displayName: string): Promise<boolean> {
   try {
-    const body = await response.clone().text();
+    const body = await readBodyWithDeadline(response.clone(), BODY_READ_DEADLINE_MS);
+    if (body === null) {
+      log(
+        `[${displayName}] ${response.status} body did not arrive within ` +
+          `${BODY_READ_DEADLINE_MS}ms — treating it as a burst and retrying, ` +
+          `rather than waiting on a read nothing else bounds`
+      );
+      return false;
+    }
     if (!isQuotaExhaustion(response.status, body)) return false;
     log(
       `[${displayName}] ${response.status} names a quota/plan wall, not a burst — ` +

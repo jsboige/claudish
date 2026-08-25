@@ -202,6 +202,32 @@ describe("OpenAIProviderTransport 429 quota-wall short-circuit", () => {
     expect(Date.now() - startTime).toBeGreaterThanOrEqual(1900); // it slept the 2s rung
   }, 15000);
 
+  test("a body that never ARRIVES also degrades to the ladder — it must not hang", async () => {
+    // Regression, 2026-08-25. The short-circuit reads the 429 body; the ladder
+    // never touched it before. Nothing else bounds that read on this path:
+    // OpenAIProviderTransport implements no getRequestInit, so its fetch carries
+    // no AbortSignal (only local.ts and vertex-oauth.ts attach one). Against a
+    // Response over a never-closing stream, clone().text() awaited forever and
+    // enqueueRequest never returned — a hung turn for whatever agent made the
+    // request. The read now has its own 2s deadline and falls through here.
+    const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key");
+    let callCount = 0;
+    const startTime = Date.now();
+
+    const response = await transport.enqueueRequest(() => {
+      callCount++;
+      if (callCount === 1) {
+        const neverEnds = new ReadableStream({ start() { /* no enqueue, no close */ } });
+        return Promise.resolve(new Response(neverEnds, { status: 429 }));
+      }
+      return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+    });
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(2); // it retried instead of waiting on the body
+    expect(Date.now() - startTime).toBeLessThan(10000); // bounded, not forever
+  }, 20000);
+
   test("an unreadable body degrades to the ladder, never to a wrong short-circuit", async () => {
     const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key");
     let callCount = 0;
