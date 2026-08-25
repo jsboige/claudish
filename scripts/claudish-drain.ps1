@@ -10,14 +10,18 @@
 # message_stop), so a client-visible mid-response drop means the process went
 # away under it. Restarts are the main way that happens.
 #
-# Measured on the hub, 2026-08-23, 906 samples over 30 min: min 1, p50 5, p90 7,
-# max 10, mean 5.1. It never reached 0 — the hub is never idle. So a restart
-# always costs turns here; the only question is how many.
+# Measured on the hub over 53,959 samples spanning 33.8 continuous hours:
+# mean 3.6, p50 3, p90 6, max 15. The hub DOES fall idle — 4.6% of samples are
+# at zero, in 772 distinct episodes, one every ~2.6 min, median 2s and p90 11s
+# (longest 188s). So a restart usually costs turns; the question is how many.
 #
 # Since PR #37 the proxy reports the count:
 #     GET /health -> {"status":"ok","activeStreams":8,"uptimeSec":1132}
-# which lets a restart pick its moment instead of guessing. It cannot wait for
-# silence, because silence does not come.
+# which lets a restart pick its moment instead of guessing. Waiting for silence
+# is a far better bet than two earlier versions of this comment claimed: a 300s
+# window reaches a zero about half the time, not 1 time in 18, and not never.
+# The episodes are brief but frequent, and PollSec=2 is short enough to see
+# them — polling at the 2s cadence loses almost nothing (49.8% vs 50.5%).
 #
 # TWO WAYS TO USE IT
 #
@@ -69,11 +73,13 @@ function Invoke-ClaudishDrainedRestart {
     <#
         Restarts the container at the quietest moment it can find.
 
-        NOT "waits for zero". Measured on the hub 2026-08-23, 906 samples over
-        30 min: activeStreams never once reached 0 (min 1, seen twice; p50 5,
-        p90 7, max 10; the longest lull at <=2 lasted 6 seconds). A drain that
-        waits for 0 on this hub can only time out and then restart at an
-        arbitrary moment — which is what the first version of this function did.
+        NOT "waits for zero" — though zero happens far more often than the
+        first two versions of this docstring believed. Measured over 53,959
+        samples spanning 33.8 continuous hours: mean 3.6, p50 3, p90 6, max 15,
+        with 4.6% of samples at zero across 772 episodes (one every ~2.6 min,
+        median 2s, p90 11s). A drain that waits only for 0 reaches one about
+        half the time — but when it misses it times out and restarts at an
+        arbitrary moment, which is why its tail is the worst of the three.
 
         So the target is relative, not absolute. We watch for $ObserveSec to
         learn what "quiet" means for this hub right now, then fire on the first
@@ -81,19 +87,37 @@ function Invoke-ClaudishDrainedRestart {
         the target by one, which bounds the wait without a timeout deciding for
         us: the restart lands at a below-average moment instead of a random one.
 
-        Replaying those 906 real samples through both versions, per restart:
+        Two real drained restarts have since been observed from outside
+        (08-24, 08-25, 04:00 local, 2s /health probe): 2 and 1 streams cut,
+        against 4.6 and 3.0 mean active in the preceding 60s. Across all 8
+        restarts in 36.6h the measured cost is 3.00 turns each. A graceful
+        docker stop finishes in-flight streams on its own, so this agrees
+        with the replay below without isolating this function's share.
 
-            blind `docker restart`   mean 5.19   p90 7   worst 10
-            this function            mean 3.65   p90 5   worst  6
+        Replaying all 53,959 real samples through each version, per restart:
+
+                                  mean   p90   worst   restarts cutting nobody
+            blind restart         3.61     6      13              4.8%
+            wait-for-zero drain   2.36     6      15             49.1%
+            this function         2.00     4       8             23.9%
+
+        Read that table by the mean, not by the last column. Wait-for-zero
+        cuts nobody twice as often, and still loses MORE turns overall (2.36
+        vs 2.00) because its misses land at an arbitrary moment. A hybrid that
+        holds out for a zero and only falls back to the relative target in the
+        last 60s was tried on the same samples: 1.93 mean / 44.7% harmless but
+        worst 15 — and 2.00 vs 1.93 is inside the noise, since 300s windows
+        starting 5s apart share nearly all their samples (~405 independent
+        windows in 33.8h, not 9,610). Not a real improvement; not adopted.
 
         The defaults are the knee of that curve. A longer cap buys nothing
         (600s scored identically to 300s), and relaxing the target faster
         undoes the whole gain — at one step per poll the target outruns the
         hub and the mean goes back to 4.67.
 
-        This shaves the cost; it does not remove it. On a hub that is never idle
-        every restart cuts several agent turns, so the real mitigation is
-        restarting less often, not draining better.
+        This shaves the cost; it does not remove it. Even at its best it cuts
+        three agent turns per restart, so the real mitigation is restarting
+        less often, not draining better.
     #>
     param(
         [string]$Reason = "unspecified",
