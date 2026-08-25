@@ -62,7 +62,16 @@ services:
       - CLAUDISH_NO_ANTHROPIC=${CLAUDISH_NO_ANTHROPIC:-}
       # Budget failover (fork extension). All empty → inert: no routing change,
       # no notice, zero added bytes. Belongs on the machine that actually CALLS
-      # the models — i.e. the hub, since a NOMINAL sidecar only relays.
+      # the models. That is the hub most of the time, but a sidecar calls them
+      # too, in AUTONOMOUS mode, which is precisely when the hub cannot help.
+      # This comment used to end "i.e. the hub, since a NOMINAL sidecar only
+      # relays". On the ai-01 sidecar these are in fact all empty.
+      # Measured on ai-01 over 5 days: 124 requests served locally, 70 done,
+      # 54 lost to one walled lane with no cascade to fall to. Arm these here
+      # too. Arming alone is not enough: roleFromModelName() matches only
+      # opus|sonnet|haiku, so a bare provider id (glm-5.2) resolves to null
+      # and the cascade stays blind. Set CLAUDISH_FAILOVER_ROLE_MODELS, or
+      # have clients name roles neutrally.
       # See CLAUDE.md § "Budget Failover".
       - CLAUDISH_FAILOVER_OPUS=${CLAUDISH_FAILOVER_OPUS:-}
       - CLAUDISH_FAILOVER_OPUS_LABEL=${CLAUDISH_FAILOVER_OPUS_LABEL:-}
