@@ -221,3 +221,63 @@ describe("OpenAIProviderTransport 429 quota-wall short-circuit", () => {
     expect(callCount).toBe(2); // fell through to the retry, as before
   }, 15000);
 });
+
+// A burst that never clears walks the WHOLE ladder and then returns the last 429.
+// That exit had no log line of any kind: the per-retry lines are debug-level and
+// never reach stdout, so ~62s of sleeping left no trace anywhere. Diagnosing one
+// cost a timing-correlation study across 28.5h of traffic (2026-08-25).
+//
+// `Retry-After: 0.01` collapses each rung to 10ms, so the full ladder runs in
+// milliseconds instead of 62s — otherwise this path is untestable in a suite.
+describe("OpenAIProviderTransport 429 ladder exhaustion", () => {
+  test("walks every rung, then returns the last 429 rather than throwing", async () => {
+    const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key");
+    let callCount = 0;
+
+    const response = await transport.enqueueRequest(() => {
+      callCount++;
+      return Promise.resolve(
+        // No quota/plan wording: a burst, so the short-circuit must NOT fire and
+        // the ladder must run in full.
+        new Response('{"error":"rate limit: 10 requests per minute"}', {
+          status: 429,
+          headers: { "Retry-After": "0.01" },
+        })
+      );
+    });
+
+    expect(callCount).toBe(6); // maxRetries=5 → 6 attempts
+    expect(response.status).toBe(429); // the last response, not an exception
+  }, 15000);
+
+  // The exhaustion line sits just before `return response`, which is ALSO the
+  // success path — so it needs a status guard, and that guard needs a test.
+  // (The first version of this fix put the line after the loop instead, where
+  // it was dead code and never fired at all; the test above caught that.)
+  test("a request that succeeds after a retry logs no exhaustion line", async () => {
+    const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key");
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = (...a: unknown[]) => void lines.push(a.join(" "));
+    try {
+      let callCount = 0;
+      const response = await transport.enqueueRequest(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(
+            new Response('{"error":"rate limit: 10 requests per minute"}', {
+              status: 429,
+              headers: { "Retry-After": "0.01" },
+            })
+          );
+        }
+        return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+      });
+      expect(response.status).toBe(200);
+      expect(callCount).toBe(2);
+    } finally {
+      console.log = realLog;
+    }
+    expect(lines.filter((l) => l.includes("ladder exhausted"))).toEqual([]);
+  }, 15000);
+});
