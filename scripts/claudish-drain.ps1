@@ -31,6 +31,27 @@
 #      Invoke-ClaudishDrainedRestart -Reason "confirmed hang"
 #
 # Targets PowerShell 5.1: scheduled tasks run `powershell`, not `pwsh`.
+#
+# READING drain.log
+# - Timestamps are LOCAL time on the hub host (UTC+2 in summer), with no Z
+#   marker — Get-Date at line 43. A Z-less local time is not a UTC time:
+#   shift +2 before comparing against UTC-probe data.
+# - "restarting at N in flight" is a LOWER BOUND on the clients interrupted,
+#   not the cost. $active is a single 2s-poll sample, already stale when the
+#   `docker restart` command runs: any stream started in the gap, or any
+#   connection refused during the outage, is uncounted. Demonstrated live by
+#   the first graceful restart (2026-08-27 02:05Z): drain.log wrote
+#   "restarting at 2 in flight" while the probe measured 3 streams interrupted
+#   across the same 12s outage — N is a minimum, the true cost is higher.
+#
+# RUNNING IT UNDER A SCHEDULED TASK
+# The task's ExecutionTimeLimit must cover the drain budget, and the two move
+# together. Incident 2026-08-26: with ObserveSec=300 and a PT5M limit, the
+# scheduler killed the script exactly at the observe boundary — the adaptive
+# phase and the `docker restart` NEVER ran, and the 04:00 restart silently
+# did not happen (LastTaskResult=0, uptime 32h35). Raised to PT15M. Only the
+# budget and the limit together reach `docker restart`; changing either alone
+# recreates the silent non-restart.
 
 param(
     [string]$ContainerName = "claudish-proxy",
