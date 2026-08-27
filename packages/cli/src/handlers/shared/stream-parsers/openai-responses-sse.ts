@@ -51,6 +51,10 @@ export function createResponsesStreamHandler(
   let lastActivity = Date.now();
   let pingInterval: ReturnType<typeof setInterval> | null = null;
   let isClosed = false;
+  let completed = false;
+  let incompleteReason: string | null = null;
+  let dataEvents = 0;
+  let totalBytes = 0;
 
   // Track function calls being streamed
   const functionCalls: Map<
@@ -101,6 +105,8 @@ export function createResponsesStreamHandler(
             if (line.startsWith("event: ")) continue;
             if (!line.startsWith("data: ")) continue;
             const data = line.slice(6);
+            dataEvents++;
+            totalBytes += line.length;
             if (!ttftLogged) {
               ttftLogged = true;
               const firstEventMs = Math.round(performance.now() - tHeaders);
@@ -201,7 +207,12 @@ export function createResponsesStreamHandler(
                   }
                 }
               } else if (event.type === "response.incomplete") {
-                log(`[ResponsesSSE] Response incomplete: ${event.reason || "unknown"}`);
+                const reason = event.reason || "unknown";
+                incompleteReason = reason;
+                log(
+                  `[ResponsesSSE] INCOMPLETE model=${opts.modelName} reqN=${reqN} reason=${reason}`,
+                  true
+                );
                 if (event.response?.usage) {
                   inputTokens = event.response.usage.input_tokens || inputTokens;
                   outputTokens = event.response.usage.output_tokens || outputTokens;
@@ -214,11 +225,20 @@ export function createResponsesStreamHandler(
                   inputTokens = event.usage.input_tokens || 0;
                   outputTokens = event.usage.output_tokens || 0;
                 }
+                completed = true;
+                const elapsed = Math.round(performance.now() - tHeaders);
+                const stop = hasToolUse ? "tool_use" : "end_turn";
+                process.stdout.write(
+                  `  [resp] responses model=${opts.modelName} reqN=${reqN} events~=${dataEvents} bytes=${totalBytes} closed=true stop=${stop} ${elapsed}ms usage=${inputTokens}+${outputTokens}\n`
+                );
               } else if (event.type === "error" || event.type === "response.failed") {
                 const err = event.error || event.response?.error || {};
                 const errMsg = err.message || event.message || "Unknown API error";
                 const errCode = err.code || event.code || "";
-                log(`[ResponsesSSE] API error: ${errCode} - ${errMsg}`);
+                log(
+                  `[ResponsesSSE] API error model=${opts.modelName} reqN=${reqN} code=${errCode} msg=${errMsg}`,
+                  true
+                );
 
                 if (hasTextContent) {
                   send("content_block_stop", { type: "content_block_stop", index: blockIndex });
@@ -267,6 +287,18 @@ export function createResponsesStreamHandler(
           pingInterval = null;
         }
 
+        if (!completed && incompleteReason === null) {
+          // Early EOF: OpenAI closed the body WITHOUT a response.completed/done,
+          // response.incomplete, or error event. Previously this was silently
+          // treated as a normal completion (empty end_turn message) — the
+          // "Connection lost mid-response" class the client sees as a killed
+          // turn. Inventory it now: success vs. premature end must be visible.
+          log(
+            `[ResponsesSSE] EOF-WITHOUT-COMPLETION model=${opts.modelName} reqN=${reqN} events=${dataEvents} bytes=${totalBytes} input=${inputTokens} output=${outputTokens} text=${hasTextContent} tools=${hasToolUse}`,
+            true
+          );
+        }
+
         if (hasTextContent) {
           send("content_block_stop", { type: "content_block_stop", index: blockIndex });
         }
@@ -287,7 +319,10 @@ export function createResponsesStreamHandler(
           clearInterval(pingInterval);
           pingInterval = null;
         }
-        log(`[ResponsesSSE] Stream error: ${error}`);
+        log(
+          `[ResponsesSSE] Stream error model=${opts.modelName} reqN=${reqN}: ${error}`,
+          true
+        );
 
         if (!isClosed) {
           try {
