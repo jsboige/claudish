@@ -535,6 +535,43 @@ export function parseResetAtFromBody(body: string): Date | undefined {
     }
     return d;
   }
+  // Z.AI / GLM answers `"Usage limit reached for 5 hour. Your limit will reset at
+  // 2026-08-12 18:58:34"` — a four-digit year and, decisively, **no timezone marker**,
+  // so neither branch above matches (the one above requires `MM-DD` and a literal
+  // ` UTC`). Until now GLM's own lift time was discarded and the step fell back to the
+  // [10m, 30m, 1h, 4h, 24h] ladder against a wall that states when it opens.
+  //
+  // The timezone is the whole difficulty, and guessing it is not safe. `resetAt` makes
+  // `isStepSkipped` skip the step until that instant, so a value read 8h too late
+  // FORFEITS a working lane for 8h, while one read too early costs a single wasted
+  // probe. The two errors are not symmetric, so the branch must not rely on being right.
+  //
+  // It therefore does not guess — it lets the message check itself. The same body states
+  // the window ("for 5 hour"), and a reset can never be further off than the window is
+  // long. Read as UTC: if the provider means UTC the value lands inside the window and is
+  // used; under any other offset it lands outside, we decline it, and the caller keeps
+  // exactly today's backoff. Safe under both readings without anyone knowing Z.AI's
+  // server timezone.
+  const absYmd = /reset at (\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/i.exec(text);
+  if (absYmd) {
+    const d = new Date(
+      Date.UTC(
+        Number(absYmd[1]),
+        Number(absYmd[2]) - 1,
+        Number(absYmd[3]),
+        Number(absYmd[4]),
+        Number(absYmd[5]),
+        Number(absYmd[6])
+      )
+    );
+    const ahead = d.getTime() - Date.now();
+    const stated = /for (\d+)\s*hours?/i.exec(text);
+    // No stated window: bound it generously rather than trusting the value outright.
+    const maxAhead = stated ? Number(stated[1]) * 3600_000 : 7 * 24 * 3600_000;
+    // The small negative tolerance absorbs clock skew and a wall that just lifted.
+    if (ahead >= -5 * 60_000 && ahead <= maxAhead) return d;
+    // Implausible under a UTC reading — fall through instead of trusting it.
+  }
   const rel = /resets? in (\d+) days?(?:\s+(\d+)\s*h(?:rs?|ours?)?)?/i.exec(text);
   if (rel) {
     const days = Number(rel[1]);

@@ -312,6 +312,45 @@ describe("reset-time awareness", () => {
       expect(got?.getTime()).toBe(clock + 2 * 24 * 3600_000 + 13 * 3600_000);
     });
 
+    // Z.AI / GLM: four-digit year, and NO timezone marker. The branch reads it as
+    // UTC but refuses any value the message's own stated window cannot justify, so
+    // it is safe whichever offset Z.AI actually means. See parseResetAtFromBody.
+    it("parses the GLM 1308 form (YYYY-MM-DD HH:mm:ss, no timezone) inside its stated window", () => {
+      const got = parseResetAtFromBody(
+        '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 1970-01-01 03:16:40"}}'
+      );
+      expect(got?.getTime()).toBe(clock + 3 * 3600_000);
+    });
+
+    // NB: the two "declines" tests below also pass against the UN-fixed parser, which
+    // returns undefined simply by not recognising the format. They are not proof of
+    // this change — they pin the plausibility guard so a later, more permissive parse
+    // cannot quietly start trusting a timestamp whose offset it cannot justify. The
+    // two tests above are the ones that fail without the branch.
+    it("declines a GLM reset further off than the window it declares (a non-UTC reading)", () => {
+      // 12h ahead while the body says the window is 5h: unreachable under UTC, so the
+      // timestamp means some other offset. Declining costs one wasted probe; trusting
+      // it would skip a working lane for hours.
+      const got = parseResetAtFromBody(
+        '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 1970-01-01 12:16:40"}}'
+      );
+      expect(got).toBeUndefined();
+    });
+
+    it("declines a GLM reset well in the past (skew tolerance is minutes, not hours)", () => {
+      const got = parseResetAtFromBody(
+        '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 1969-12-31 23:46:40"}}'
+      );
+      expect(got).toBeUndefined();
+    });
+
+    it("bounds an unstated window at 7 days rather than trusting it outright", () => {
+      expect(parseResetAtFromBody("Your limit will reset at 1970-01-02 00:16:40")?.getTime()).toBe(
+        clock + 24 * 3600_000
+      );
+      expect(parseResetAtFromBody("Your limit will reset at 1970-01-10 00:16:40")).toBeUndefined();
+    });
+
     it("returns undefined for silent bodies (Mistral 402, Anthropic cap, plain 429)", () => {
       expect(parseResetAtFromBody('{"detail":"Check your subscription on https://admin.mistral.ai/subscription"}')).toBeUndefined();
       expect(parseResetAtFromBody('{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}')).toBeUndefined();
