@@ -185,6 +185,33 @@ foreach ($day in $daysToArchive) {
   }
 }
 
+# --- re-upload pass: retry any local archive whose GDrive copy is missing or
+# size-mismatched. Without this, a night where the Drive was unmounted strands
+# the archive locally forever: with KeepLocalDays=0 the compress loop above
+# never revisits an already-archived day, so nothing would ever retry the copy
+# and the purge would (correctly) refuse to delete it. Ported from PR #64,
+# which otherwise duplicated #63 but kept the pre-migration GDrive path.
+if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -LiteralPath $GDriveDir)) {
+  foreach ($arch in (Get-ChildItem -LiteralPath $ArchiveDir -Filter 'captures-*.7z' -File)) {
+    $dest = Join-Path $GDriveDir $arch.Name
+    $ok = (Test-Path -LiteralPath $dest) -and ((Get-Item -LiteralPath $dest).Length -eq $arch.Length)
+    if (-not $ok) {
+      try {
+        Copy-Item -LiteralPath $arch.FullName -Destination $GDriveDir -Force -ErrorAction Stop
+        if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -eq $arch.Length) {
+          Log ("GDRIVE {0}: re-uploaded ({1:N1} MB, was missing/mismatched)" -f $arch.BaseName, ($arch.Length/1MB))
+        } else {
+          $errors++
+          Log ("WARN  {0}: re-upload size mismatch -> kept local, retried next run" -f $arch.BaseName)
+        }
+      } catch {
+        $errors++
+        Log ("WARN  {0}: re-upload failed: {1} -> kept local, retried next run" -f $arch.BaseName, $_.Exception.Message)
+      }
+    }
+  }
+}
+
 # --- local retention purge: delete archives older than KeepLocalDays, ONLY if
 # confirmed present (and same size) on GDrive. This bounds local disk; GDrive
 # keeps the full history. With KeepLocalDays=0 the purge runs on every local
