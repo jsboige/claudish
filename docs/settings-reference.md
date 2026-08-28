@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Claudish is a proxy tool that wraps Claude Code with support for non-Anthropic AI providers. It intercepts Claude Code's API calls and reroutes them to providers like OpenRouter, Google Gemini, OpenAI, MiniMax, Kimi, GLM, and local models (Ollama, LM Studio, vLLM, MLX). Configuration is layered: CLI flags override environment variables, which override profile settings from config files. The routing syntax uses `provider@model[:concurrency]` (v4.0+, preferred) or the legacy `prefix/model` format (still supported, deprecated). Auto-routing selects a provider automatically based on available credentials. The priority chain is configurable via `defaultProvider` (v7.0.0+). The default chain (when no `defaultProvider` is set and only `OPENROUTER_API_KEY` is present) is: OpenCode Zen → provider subscription plan → native API → OpenRouter fallback. When `LITELLM_BASE_URL` + `LITELLM_API_KEY` are set without explicit `defaultProvider`, legacy auto-promotion puts LiteLLM first. Configuration files live at `~/.claudish/config.json` (global) and `.claudish.json` (local/project); local always takes precedence.
+Claudish is a proxy tool that wraps Claude Code with support for non-Anthropic AI providers. It intercepts Claude Code's API calls and reroutes them to providers like OpenRouter, Google Gemini, OpenAI, MiniMax, Kimi, GLM, and local models (Ollama, LM Studio, vLLM, MLX). Configuration is layered: CLI flags override environment variables, which override profile settings from config files. The routing syntax uses `provider@model[:concurrency]` (v4.0+, preferred) or the legacy `prefix/model` format (still supported, deprecated). Auto-routing selects a provider automatically based on available credentials. The priority chain is configurable via `defaultProvider` (v7.0.0+). The default chain (when no `defaultProvider` is set and only `OPENROUTER_API_KEY` is present) is: OpenCode Zen → provider subscription plan → native API → OpenRouter fallback. LiteLLM is never promoted into that chain automatically — it must be named through `defaultProvider` (see §6.3). Configuration files live at `~/.claudish/config.json` (global) and `.claudish.json` (local/project); local always takes precedence.
 
 ---
 
@@ -426,9 +426,8 @@ The fallback chain is **configurable** via the `defaultProvider` setting. Set it
 1. CLI flag `--default-provider`
 2. `CLAUDISH_DEFAULT_PROVIDER` env var
 3. `defaultProvider` in config file
-4. Legacy LITELLM auto-promotion (if `LITELLM_BASE_URL` + `LITELLM_API_KEY` set without explicit `defaultProvider`)
-5. `OPENROUTER_API_KEY` present → OpenRouter
-6. Hardcoded `"openrouter"`
+4. `OPENROUTER_API_KEY` present → OpenRouter
+5. Hardcoded `"openrouter"`
 
 Valid values: any built-in provider name (`"openrouter"`, `"litellm"`, `"openai"`, `"anthropic"`, `"google"`) or a custom endpoint name from `customEndpoints`.
 
@@ -445,9 +444,17 @@ When `defaultProvider` is absent and only `OPENROUTER_API_KEY` is present:
 3. **Native provider API** — if the detected native provider has an API key or OAuth credentials.
 4. **OpenRouter** — if `OPENROUTER_API_KEY` is set (universal fallback).
 
-### 6.3 Legacy LiteLLM auto-promotion
+### 6.3 LiteLLM is never promoted automatically
 
-When `LITELLM_BASE_URL` and `LITELLM_API_KEY` are set but `defaultProvider` is absent, LiteLLM is added to the chain first (before OpenCode Zen). Claudish emits a one-shot stderr hint recommending you set `defaultProvider: "litellm"` explicitly. This preserves backward compatibility with pre-v7.0.0 behavior.
+Setting `LITELLM_BASE_URL` + `LITELLM_API_KEY` does **not** make LiteLLM the default. It once did, and the stderr hint that used to suggest making it explicit is gone too — `buildLegacyHint()` is a stub returning `null`, and `resolveDefaultProvider()` has no LiteLLM branch at all (`default-provider.ts`). Both were removed in commit 5 of the model-catalog/routing redesign.
+
+To route through LiteLLM by default, say so explicitly:
+
+```jsonc
+{ "defaultProvider": "litellm" }      // ~/.claudish/config.json
+```
+
+or `CLAUDISH_DEFAULT_PROVIDER=litellm`. Explicit `litellm@model` targets are unaffected and always were.
 
 If none of the chain entries have valid credentials, Claudish returns an error with instructions on how to authenticate.
 
