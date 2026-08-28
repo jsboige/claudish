@@ -41,6 +41,12 @@ function rpcResult(id: any, text: string, isError = false) {
 
 const server = Bun.serve({
   port: 0,
+  // Loopback only. Bun.serve defaults to 0.0.0.0, which on Windows makes the
+  // firewall prompt for bun.exe on every `bun test` run — and a user who clicks
+  // through it grants inbound on * for Private AND Public profiles, machine-wide,
+  // for a binary that also runs the proxy holding the cluster key. The mock is
+  // only ever reached from this process.
+  hostname: "127.0.0.1",
   async fetch(req) {
     sawAuthHeader = req.headers.get("authorization");
     const body = (await req.json().catch(() => ({}))) as any;
