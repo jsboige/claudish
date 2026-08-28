@@ -4,7 +4,8 @@
   Live traffic analysis from claudish-proxy docker logs.
 
 .DESCRIPTION
-  Standardized analysis of `docker logs claudish-proxy --since Nh`. This is the
+  Standardized analysis of `docker logs claudish-proxy` (windowed by --tail; see
+  GOTCHA #2). This is the
   FAST path for surveillance (the 6h cron): it reads stdout logs directly,
   avoiding the cost of parsing thousands of req-*.json captures.
 
@@ -85,6 +86,43 @@ if ($lines.Count -eq 0) {
     exit 0
 }
 Write-Host ("(window approximated by --tail $tailLines lines; --since is unreliable on this host — see GOTCHA #2)") -ForegroundColor DarkGray
+
+# Report the span the lines ACTUALLY cover. The tail-depth heuristic above is
+# calibrated on hub traffic (~5-6k lines/hour at peak); a low-traffic container
+# produces far less. A NOMINAL relay sidecar logs nothing for relayed requests
+# (the relay branch returns before logRequest), so it emits on the order of
+# a hundred lines per DAY — and the same tail then reaches back to container
+# creation. Measured on myia-ai-01, 2026-08-28: `-Hours 12` pulled 8 days of
+# history (174 requests spanning 08-20..08-28) and labelled it "last 12h".
+# The over-pull is safe for surveillance, but the LABEL is not: it silently
+# mislabels the window, and a narrow `-Hours 1` re-check cannot show a recent
+# improvement because it still returns the whole log. Printing the observed
+# span makes that visible instead of leaving the header to assert a window
+# the data does not have.
+$span = $null
+$spanFirst = $null
+$spanLast = $null
+$lineArr = @($lines)
+if ($lineArr[0] -match '^(\S+)' ) { $spanFirst = $Matches[1] }
+if ($lineArr[-1] -match '^(\S+)') { $spanLast  = $Matches[1] }
+if ($spanFirst -and $spanLast) {
+    try {
+        $t0 = [datetime]::Parse($spanFirst, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        $t1 = [datetime]::Parse($spanLast,  [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        $span = ($t1 - $t0).TotalHours
+    } catch { $span = $null }
+}
+if ($null -ne $span) {
+    $spanTxt = ("(observed span: {0} -> {1} = {2:N1}h for a requested {3}h window)" -f $spanFirst, $spanLast, $span, $Hours)
+    if ($span -gt ($Hours * 1.5)) {
+        Write-Host $spanTxt -ForegroundColor Yellow
+        Write-Host ("  NOTE: the report below covers {0:N1}h, NOT {1}h. Counts are aggregates over the wider window." -f $span, $Hours) -ForegroundColor Yellow
+    } else {
+        Write-Host $spanTxt -ForegroundColor DarkGray
+    }
+} else {
+    Write-Host "(observed span: unavailable — timestamps unparseable)" -ForegroundColor DarkGray
+}
 
 $requests = $lines | Where-Object { $_ -match '\[Request\]' }
 $responses = $lines | Where-Object { $_ -match '\[resp\]' }
