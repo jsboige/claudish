@@ -28,6 +28,7 @@ import type { Context } from "hono";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { log } from "../../logger.js";
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
+import { isQuotaExhaustion } from "../failover.js";
 
 /** Headers we must not blindly forward to the upstream. */
 const HOP_BY_HOP = new Set([
@@ -318,8 +319,34 @@ async function heartbeat(state: RelayState): Promise<boolean> {
  * tool-call stream must complete with a terminal `message_stop`. Confirms the
  * WHOLE pipeline works — not just that /health answers — before returning to
  * relay. Only run during recovery, so its handful of budget tokens is negligible.
+ *
+ * **A quota wall is liveness, not death.** The probe asks the hub for one specific
+ * model (`glm-5.3`); when that model's plan is spent the hub answers 429/402 —
+ * which it can only do by being alive, authenticating the request, routing it and
+ * reaching the provider. Reading that as "hub down" holds the recovery gate shut
+ * for as long as the wall lasts, and AUTONOMOUS is the worse place to wait: the
+ * sidecar then serves the *same* walled model locally, where the failover cascade
+ * is usually not configured (measured on ai-01, 2026-08-24→25: 25 of 43
+ * locally-served requests died on that exact wall in 20.6h).
+ *
+ * `isQuotaExhaustion` is the same predicate the budget failover arms on, not a
+ * copy — 402 on status alone, 429 only when the body names a quota/credit/balance/
+ * weekly/plan wall. Its narrowness is the safety property: a per-minute burst
+ * still reads as "not proven alive", and 401/404 never qualify, so a bad proxy key
+ * or a bad model id can never be laundered into a health verdict.
+ *
+ * Bounded like the rest of the probe: the `fetch` carries
+ * `AbortSignal.timeout(DEEP_PROBE_TIMEOUT_MS)`, which covers the error-body read
+ * too, and any throw lands in the catch below as `false`.
+ *
+ * No evidence exists that this defect has fired. 24h of ai-01 sidecar logs show 5
+ * AUTONOMOUS switches and 5 returns to NOMINAL, every duration explained by a
+ * genuine hub absence. It is fixed on correctness and observability, not on a
+ * measured incident.
+ *
+ * Exported for the regression test only.
  */
-async function deepProbe(state: RelayState): Promise<boolean> {
+export async function deepProbe(state: RelayState): Promise<boolean> {
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (state.proxyKey) headers["x-proxy-key"] = state.proxyKey;
@@ -355,7 +382,23 @@ async function deepProbe(state: RelayState): Promise<boolean> {
       body,
       signal: AbortSignal.timeout(DEEP_PROBE_TIMEOUT_MS),
     });
-    if (!res.ok || !res.body) return false;
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      if (isQuotaExhaustion(res.status, errBody)) {
+        log(
+          `[Relay] deep probe: upstream answered ${res.status} naming a quota/plan wall — ` +
+            `that IS liveness (it routed the request to answer), returning to NOMINAL`,
+          true
+        );
+        return true;
+      }
+      log(`[Relay] deep probe failed: upstream HTTP ${res.status}`, true);
+      return false;
+    }
+    if (!res.body) {
+      log(`[Relay] deep probe failed: HTTP ${res.status} with no body`, true);
+      return false;
+    }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let acc = "";
@@ -373,8 +416,17 @@ async function deepProbe(state: RelayState): Promise<boolean> {
       }
       if (acc.length > 200_000) break; // bound memory
     }
-    return acc.includes("message_stop");
-  } catch {
+    // Reached only by a stream that ended (or overran) without a terminal frame.
+    log(
+      `[Relay] deep probe failed: stream ended after ${acc.length} bytes without message_stop`,
+      true
+    );
+    return false;
+  } catch (e) {
+    // Every other exit already logged its reason; this one carries the last.
+    // Without these lines a sidecar held in AUTONOMOUS behind a healthy hub gave
+    // no signal at all — the gate was invisible in the logs.
+    log(`[Relay] deep probe failed: ${String(e).slice(0, 200)}`, true);
     return false;
   }
 }
@@ -420,7 +472,8 @@ export function startUpstreamProber(state: RelayState): () => void {
               state.lastFlipAt = Date.now();
               log(`[Relay] upstream ${state.upstream} healthy again → NOMINAL (relay resumed)`, true);
             } else {
-              state.consecutiveOk = 0; // deep probe failed; keep waiting
+              // deepProbe logged the reason on every false path.
+              state.consecutiveOk = 0; // keep waiting
             }
           } finally {
             probing = false;

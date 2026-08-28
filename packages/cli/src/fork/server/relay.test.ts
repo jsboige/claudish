@@ -4,6 +4,7 @@ import {
   createRelayState,
   readRequestBody,
   forwardToUpstream,
+  deepProbe,
   FORWARD_HEADERS_TIMEOUT_MS,
   type RelayState,
 } from "./relay.js";
@@ -435,5 +436,71 @@ describe("forwardToUpstream — header timeout must NOT truncate the body (regre
     expect(out).toContain("early");
     expect(out).toContain("late"); // emitted AFTER the header timeout → not truncated
     expect(out).toContain("message_stop");
+  });
+});
+
+// ── deep probe: a quota wall is liveness, not death ────────────────
+//
+// The recovery gate asks the hub for one specific model. When that model's plan
+// is spent the hub answers 429/402 — which it can only do by being alive. Reading
+// that as "hub down" pins the sidecar in AUTONOMOUS, where it serves the SAME
+// walled model locally and usually without a failover cascade. These pin both
+// halves: the wall must open the gate, and the narrowness that keeps a burst,
+// a bad key and a bad model id OUT of that verdict must survive.
+describe("deep probe: quota wall vs hub death", () => {
+  const state = () => createRelayState({ upstream: "http://hub:3000", proxyKey: "k" });
+
+  it("treats a 429 naming a quota wall as proof the hub is alive", async () => {
+    fetchImpl = async () =>
+      new Response(
+        JSON.stringify({
+          error: { message: "Your weekly quota for this plan has been exhausted." },
+        }),
+        { status: 429 }
+      );
+    expect(await deepProbe(state())).toBe(true);
+  });
+
+  it("treats 402 Payment Required as liveness too", async () => {
+    fetchImpl = async () => new Response("insufficient balance", { status: 402 });
+    expect(await deepProbe(state())).toBe(true);
+  });
+
+  it("does NOT treat a plain per-minute 429 burst as liveness", async () => {
+    // No quota/plan wording: the hub may be flapping under load, and OK_THRESHOLD
+    // exists precisely to keep waiting in that case.
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ error: { message: "rate limit: 10 requests per minute" } }), {
+        status: 429,
+      });
+    expect(await deepProbe(state())).toBe(false);
+  });
+
+  it("never launders a 401 into a health verdict, whatever the body says", async () => {
+    // A bad proxy key is a wiring mistake. Returning to NOMINAL on it would relay
+    // every request into a 401 wall instead of serving them locally.
+    fetchImpl = async () => new Response("quota exhausted, weekly plan limit", { status: 401 });
+    expect(await deepProbe(state())).toBe(false);
+  });
+
+  it("still requires a terminal message_stop on a 200", async () => {
+    fetchImpl = async () =>
+      sseResponse(
+        'event: message_start\ndata: {"type":"message_start"}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      );
+    expect(await deepProbe(state())).toBe(true);
+
+    fetchImpl = async () =>
+      sseResponse('event: message_start\ndata: {"type":"message_start"}\n\n');
+    expect(await deepProbe(state())).toBe(false); // truncated stream is not recovery
+  });
+
+  it("sends the proxy key, not an api key (x-api-key arms the hub native swap)", async () => {
+    fetchImpl = async () => new Response("nope", { status: 500 });
+    await deepProbe(state());
+    expect(lastFetch!.url).toBe("http://hub:3000/v1/messages");
+    expect(lastFetch!.init.headers["x-proxy-key"]).toBe("k");
+    expect(lastFetch!.init.headers["x-api-key"]).toBeUndefined();
   });
 });
