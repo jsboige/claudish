@@ -46,18 +46,34 @@ export function convertMessagesToOpenAI(
       if (msg.role === "user") processUserMessage(msg, messages, simpleFormat);
       else if (msg.role === "assistant") processAssistantMessage(msg, messages, simpleFormat, reasoningRoundtrip);
       else if (msg.role === "system") {
-        // Inline system messages (Claude Code v2.1.153+): merge into the system prompt
-        // or prepend as a user message if no system prompt exists.
+        // Inline system messages (Claude Code v2.1.153+). One of them carries THE
+        // USER'S OWN MESSAGE, typed while the turn was still running: "The user
+        // sent a new message while you were working: ... Address the message above
+        // as you continue this turn." Their POSITION is the payload — CC places
+        // them alongside the tool result the model is about to read.
+        //
+        // This used to append them to messages[0], the system prompt. That both
+        // buried the steer at the head of a multi-hundred-KB body (measured on
+        // po-2024, 2026-08-28: one landing at message 114/141 went unaddressed for
+        // 52 messages until the user re-asked) and DESTROYED it outright on the
+        // Codex/Responses wire, where buildPayload skips role:"system" and rebuilds
+        // `instructions` from claudeRequest.system — which never saw the merge.
+        //
+        // Emit in place as role:"user" instead: it preserves the position CC chose,
+        // survives the Responses conversion, and satisfies the backends
+        // (Z.AI/MiniMax/Kimi) that accept no role but user/assistant. It is also
+        // exactly how Claude Code emits every other system-reminder natively.
         const content = typeof msg.content === "string"
           ? msg.content
           : Array.isArray(msg.content)
             ? msg.content.map((c: any) => c.text || "").join("\n")
             : "";
         if (content) {
-          if (messages.length > 0 && messages[0].role === "system") {
-            messages[0].content += "\n\n" + content;
+          const last = messages[messages.length - 1];
+          if (last && last.role === "user" && typeof last.content === "string") {
+            last.content += "\n\n" + content;
           } else {
-            messages.unshift({ role: "system", content });
+            messages.push({ role: "user", content });
           }
         }
       }

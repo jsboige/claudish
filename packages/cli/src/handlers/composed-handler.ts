@@ -28,6 +28,7 @@ import { TokenTracker } from "./shared/token-tracker.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { filterIdentity } from "./shared/openai-compat.js";
 import { stripReasoningContent } from "./shared/format/openai-messages.js";
+import { resolveInlineSystemMessages } from "./shared/format/inline-system.js";
 import { createStreamingResponseHandler } from "./shared/stream-parsers/openai-sse.js";
 import { createResponsesStreamHandler } from "./shared/stream-parsers/openai-responses-sse.js";
 import { createAnthropicPassthroughStream } from "./shared/stream-parsers/anthropic-sse.js";
@@ -393,35 +394,16 @@ export class ComposedHandler implements ModelHandler {
       );
     }
 
-    // 4b. Strip inline system messages from messages[] for Anthropic-transport providers.
-    // Claude Code v2.1.153+ injects system messages inline (e.g. system-reminders).
-    // Providers like Z.AI reject role:"system" in messages — only role:"user"/"assistant" accepted.
-    // Merge them into the top-level system field instead.
+    // 4b. Inline system messages in messages[], for Anthropic-transport providers.
+    // Mid-turn user steers must keep their position — see resolveInlineSystemMessages.
     if (this.provider.streamFormat === "anthropic-sse" && requestPayload.messages) {
-      const inlineSystemTexts: string[] = [];
-      requestPayload.messages = requestPayload.messages.filter((msg: any) => {
-        if (msg.role === "system") {
-          const text = typeof msg.content === "string"
-            ? msg.content
-            : Array.isArray(msg.content)
-              ? msg.content.map((c: any) => c.text || "").join("\n")
-              : "";
-          if (text) inlineSystemTexts.push(text);
-          return false;
-        }
-        return true;
-      });
-      if (inlineSystemTexts.length > 0) {
-        const merged = inlineSystemTexts.join("\n\n");
-        if (requestPayload.system) {
-          const existing = Array.isArray(requestPayload.system)
-            ? requestPayload.system.map((s: any) => s.text || s).join("\n\n")
-            : requestPayload.system;
-          requestPayload.system = existing + "\n\n" + merged;
-        } else {
-          requestPayload.system = merged;
-        }
-        log(`[ComposedHandler] Merged ${inlineSystemTexts.length} inline system message(s) into system prompt for ${this.provider.displayName}`);
+      const resolved = resolveInlineSystemMessages(requestPayload.messages, requestPayload.system);
+      requestPayload.messages = resolved.messages;
+      requestPayload.system = resolved.system;
+      if (resolved.inlined > 0) {
+        log(
+          `[ComposedHandler] Kept ${resolved.inlined} inline system message(s) in place as role:"user" for ${this.provider.displayName} (mid-turn user steers must not be hoisted)`
+        );
       }
     }
 
