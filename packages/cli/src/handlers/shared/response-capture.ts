@@ -82,7 +82,8 @@ const NOOP: ResponseCapture = {
 export function createResponseCapture(
   label: string,
   model: string,
-  enabled = true
+  enabled = true,
+  reqN?: number
 ): ResponseCapture {
   const captureDir = process.env.CLAUDISH_CAPTURE_DIR;
   // `enabled = false` lets the relay nominal forward reuse the passthrough stream
@@ -97,9 +98,13 @@ export function createResponseCapture(
   let finished = false;
   const startedAt = Date.now();
 
-  // Correlate with the request counter from request-logger (shared globalThis.__capN).
+  // Correlate with the request counter. Callers pass the number frozen at
+  // ingestion (requestNumberFor) — reading the global here instead would label
+  // this capture with whichever request is current at response time, breaking
+  // the req-*↔resp-* pairing under concurrency. Global stays as fallback for
+  // callers without a request object.
   const g = globalThis as Record<string, unknown>;
-  const reqN = (g.__capN as number) ?? 0;
+  const reqNumber = reqN ?? (g.__capN as number) ?? 0;
 
   return {
     tap(chunk: Uint8Array | string) {
@@ -122,10 +127,10 @@ export function createResponseCapture(
         if (!ensureCaptureDir(captureDir)) return;
         const ts = new Date().toISOString().replace(/[:.]/g, "-");
         const safeModel = String(model).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40);
-        const file = `${captureDir}/resp-${process.pid}-r${String(reqN).padStart(4, "0")}-${ts}-${label}-${safeModel}.sse`;
+        const file = `${captureDir}/resp-${process.pid}-r${String(reqNumber).padStart(4, "0")}-${ts}-${label}-${safeModel}.sse`;
         const header =
           `# claudish response capture\n` +
-          `# parser=${label} model=${model} reqN=${reqN} pid=${process.pid}\n` +
+          `# parser=${label} model=${model} reqN=${reqNumber} pid=${process.pid}\n` +
           `# elapsed_ms=${Date.now() - startedAt} events~=${events}\n` +
           `# notes=${notes.join(" | ")}\n` +
           (extra ? `# extra=${JSON.stringify(extra)}\n` : "") +
@@ -133,7 +138,7 @@ export function createResponseCapture(
         const stopReason = extra?.stop_reason ?? "?";
         const closed = extra?.closed ?? "?";
         process.stdout.write(
-          `  [resp] ${label} model=${model} reqN=${reqN} events~=${events} bytes=${sse.length} closed=${closed} stop=${stopReason} ${Date.now() - startedAt}ms -> ${file}\n`
+          `  [resp] ${label} model=${model} reqN=${reqNumber} events~=${events} bytes=${sse.length} closed=${closed} stop=${stopReason} ${Date.now() - startedAt}ms -> ${file}\n`
         );
         // Fire-and-forget: see the note at the top of this file.
         writeFile(file, header + sse).catch((e) => {

@@ -3,6 +3,7 @@ import type { ModelHandler } from "./types.js";
 import { log, maskCredential } from "../logger.js";
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
 import { createResponseCapture, appendUpstreamError } from "./shared/response-capture.js";
+import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import {
   fetchMultiModelAdvice,
   findPendingAdvisorToolResults,
@@ -250,7 +251,7 @@ export class NativeHandler implements ModelHandler {
       // Handle streaming
       if (contentType.includes("text/event-stream")) {
         log("[Native] Streaming response detected");
-        const cap = createResponseCapture("native", target);
+        const cap = createResponseCapture("native", target, true, requestNumberFor(c.req));
         return c.body(
           new ReadableStream({
             async start(controller) {

@@ -28,9 +28,17 @@ function buildOAuthHeaders(token: string, accountId?: string): Record<string, st
   };
   if (accountId) {
     headers["chatgpt-account-id"] = accountId;
-    // Add conversation/session headers for stateless operation
-    headers["x-conversation-id"] = "claudish-session";
-    headers["x-session-id"] = "claudish-session";
+    // Unique per request. These headers were previously the CONSTANT
+    // "claudish-session" for every request from every Claude Code session on
+    // the account — if the ChatGPT backend keys ANY server-side state,
+    // shaping, or rate policy on the conversation id, all hub traffic shared
+    // one drawer, and concurrent sessions could cross-contaminate each other
+    // ("split brain" reports on the gpt-5.6-sol lane, 2026-08-27). A per-call
+    // value makes sharing structurally impossible; store:false keeps the
+    // request stateless regardless.
+    const convId = `claudish-${crypto.randomUUID()}`;
+    headers["x-conversation-id"] = convId;
+    headers["x-session-id"] = convId;
   }
   return headers;
 }

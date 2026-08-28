@@ -32,6 +32,31 @@ function ensureCaptureDir(dir: string): boolean {
   }
 }
 
+// Per-request number, keyed by the raw Request object. The parsers create their
+// stream handlers when the upstream RESPONSE headers arrive — seconds after
+// ingestion — and reading the global counter at that point returns whichever
+// request number is current then, not this one. Under concurrency every handler
+// built in a window logs and names its capture with the same (latest) reqN,
+// which both mislabels the [ttft]/[resp] markers and breaks the req-*↔resp-*
+// capture pairing the traffic scripts join by. Handlers resolve their own
+// number through this map instead (see requestNumberFor).
+const reqNumberMap = new WeakMap<Request, number>();
+
+/**
+ * The request number assigned at ingestion for THIS request. Accepts a Hono
+ * Context ({ raw }) or a raw Request; falls back to the global counter when the
+ * request object is unkeyed (tests, non-HTTP entry points).
+ */
+export function requestNumberFor(reqLike: unknown): number {
+  const raw = (reqLike as any)?.raw ?? reqLike;
+  if (raw && typeof raw === "object") {
+    const n = reqNumberMap.get(raw as Request);
+    if (n !== undefined) return n;
+  }
+  const g = globalThis as Record<string, unknown>;
+  return (g.__capN as number) ?? 0;
+}
+
 export function resolveSourceIp(
   req: Request,
   remoteAddrMap: WeakMap<Request, string>
@@ -73,15 +98,18 @@ export function logRequest(
   // the capture side is what the traffic-*.ps1 analysis scripts attribute by.
   const machine = req.headers.get("x-claudish-machine") || "";
 
+  // Assign the request number at INGESTION, unconditionally: the parsers and
+  // response-capture resolve it through requestNumberFor/reqNumberMap, and the
+  // [ttft]/[resp] markers must label the request that spawned them even when
+  // capture is off.
+  const n = ++capN;
+  (globalThis as Record<string, unknown>).__capN = n;
+  reqNumberMap.set(req, n);
+
   // Full-body capture (temporary diagnostic — gated by CLAUDISH_CAPTURE_DIR env).
   // Disabled when the env var is unset, so this is a no-op in normal operation.
   const captureDir = process.env.CLAUDISH_CAPTURE_DIR;
   if (captureDir && ensureCaptureDir(captureDir)) {
-    const n = ++capN;
-    // Shared handoff for response-capture's resp-*.sse correlation (reqN= in its
-    // header). Module-local alone leaves it reading 0 — every resp file became
-    // r0000 after the async rewrite dropped this (pairing broke fleet-wide).
-    (globalThis as Record<string, unknown>).__capN = n;
     const safeSrc = src.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40);
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const file = `${captureDir}/req-${process.pid}-${String(n).padStart(4, "0")}-${ts}-${safeSrc}.json`;

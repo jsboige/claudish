@@ -12,7 +12,8 @@
 import type { Context } from "hono";
 import { log } from "../../../logger.js";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
-import { createResponseCapture, currentRequestNumber } from "../response-capture.js";
+import { createResponseCapture } from "../response-capture.js";
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import { executeWebFetch } from "../web-search-executor.js";
 
 interface AnthropicPassthroughOpts {
@@ -50,15 +51,16 @@ export function createAnthropicPassthroughStream(
   let pingInterval: ReturnType<typeof setInterval> | null = null;
   // TTFT anchors — headers arrived when this stream was built; the first
   // upstream `data:` line completes the measurement (see the marker below).
-  // reqN frozen at construction: reading the counter in the pump would label
-  // the line with a request that arrived during the first-token wait.
+  // reqN resolved from the request object (assigned at ingestion) — the
+  // global counter read here would return whichever request is current while
+  // this one waited for headers.
   const tHeaders = performance.now();
-  const reqN = currentRequestNumber();
+  const reqN = requestNumberFor(c.req);
   let ttftLogged = false;
 
   const filterThinking = opts.adapter?.shouldFilterThinking() ?? false;
 
-  const cap = createResponseCapture("anthropic", opts.modelName, opts.capture !== false);
+  const cap = createResponseCapture("anthropic", opts.modelName, opts.capture !== false, reqN);
 
   return c.body(
     new ReadableStream({
