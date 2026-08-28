@@ -40,12 +40,14 @@
 
 .NOTES
   Installed on this machine as the nightly Task Scheduler job
-  "ClaudishCaptureCompaction" (daily 04:17 local, runs as the interactive
-  user, StartWhenAvailable to catch up missed runs). Re-create it with:
+  "ClaudishCaptureCompaction" (daily 02:47 local — moved off 04:17 on
+  2026-08-20: the 60-70 min run collided with the 04:00 container restart —
+  runs as the interactive user, StartWhenAvailable to catch up missed runs).
+  Re-create it with:
 
     $action  = New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' `
                  -Argument '-NoProfile -ExecutionPolicy Bypass -File "d:\Dev\claudish\scripts\compress-captures.ps1"'
-    $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]'04:17')
+    $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]'02:47')
     $set     = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
                  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                  -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew
@@ -63,12 +65,18 @@ param(
   [int]   $KeepDays   = 1,
   # Off-site backup via Google Drive Desktop (mounted drive, no API/auth).
   # Empty = skip GDrive entirely (local compaction only). The path is the local
-  # mount point of the Drive, so this is just a Windows file copy.
-  [string]$GDriveDir  = "G:\Mon Drive\MyIA\backups\claudish-captures",
+  # mount point of the Drive, so this is just a Windows file copy. Files land
+  # online-only by default (DriveFS does not hydrate what it wrote) — never
+  # pin this folder for offline access, that would re-hydrate the whole
+  # history onto local disk.
+  [string]$GDriveDir  = "G:\Mon Drive\Backups-Cloud\claudish",
   # Local retention: archives older than this (in days) are purged from the
   # local ArchiveDir, BUT only after confirming the copy exists on GDrive.
   # GDrive keeps everything; this only bounds local disk usage.
-  [int]   $KeepLocalDays = 30
+  # 0 = GDrive is the only home: every local archive is deleted as soon as
+  # its GDrive copy is confirmed (same run, right after the upload).
+  # Negative = keep all local archives (escape hatch).
+  [int]   $KeepLocalDays = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -148,7 +156,7 @@ foreach ($day in $daysToArchive) {
       # Non-fatal: if the Drive isn't mounted (laptop offline, G: missing) or
       # the copy fails, we log a WARN and continue. The local archive already
       # exists (verified), so we never lose data — only the off-site copy is
-      # deferred. The purge-30d block below will NOT delete local archives that
+      # deferred. The retention purge block below will NOT delete local archives that
       # aren't confirmed on GDrive, so a missed upload retries the next night.
       if ($GDriveDir) {
         if (Test-Path -LiteralPath $GDriveDir) {
@@ -179,9 +187,12 @@ foreach ($day in $daysToArchive) {
 
 # --- local retention purge: delete archives older than KeepLocalDays, ONLY if
 # confirmed present (and same size) on GDrive. This bounds local disk; GDrive
-# keeps the full history. If GDriveDir is unset or not mounted, purge is
-# skipped entirely (safe default — never delete without an off-site copy).
-if ($KeepLocalDays -gt 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -LiteralPath $GDriveDir)) {
+# keeps the full history. With KeepLocalDays=0 the purge runs on every local
+# archive — including the one just uploaded this run — so GDrive (online-only)
+# is the single home of history. If GDriveDir is unset or not mounted, purge is
+# skipped entirely (safe default — never delete without an off-site copy;
+# a DriveFS outage just lets local archives accumulate until it returns).
+if ($KeepLocalDays -ge 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -LiteralPath $GDriveDir)) {
   $purgeCutoff = (Get-Date).ToUniversalTime().Date.AddDays(-$KeepLocalDays)
   $purged = 0; $purgeSkipped = 0
   foreach ($arch in (Get-ChildItem -LiteralPath $ArchiveDir -Filter 'captures-*.7z' -File)) {
@@ -191,7 +202,7 @@ if ($KeepLocalDays -gt 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDi
     $dest = Join-Path $GDriveDir $arch.Name
     # Require off-site copy to exist AND match local size before deleting.
     if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -eq $arch.Length) {
-      if ($PSCmdlet.ShouldProcess($arch.FullName, "purge local (>{0}d, confirmed on GDrive)" -f $KeepLocalDays)) {
+      if ($PSCmdlet.ShouldProcess($arch.FullName, "purge local (retention={0}d, confirmed on GDrive)" -f $KeepLocalDays)) {
         Remove-Item -LiteralPath $arch.FullName -Force
         $purged++
       }
@@ -200,7 +211,7 @@ if ($KeepLocalDays -gt 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDi
     }
   }
   if ($purged -gt 0 -or $purgeSkipped -gt 0) {
-    Log ("PURGE >{0}d: {1} local archive(s) deleted, {2} kept (not yet on GDrive)" -f $KeepLocalDays, $purged, $purgeSkipped)
+    Log ("PURGE retention={0}d: {1} local archive(s) deleted, {2} kept (not yet on GDrive)" -f $KeepLocalDays, $purged, $purgeSkipped)
   }
 }
 
