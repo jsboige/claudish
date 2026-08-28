@@ -1,0 +1,11 @@
+data: {"id":"chatcmpl-vllm","object":"chat.completion.chunk","created":1787610162,"model":"qwen3.6-35b-a3b","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm","object":"chat.completion.chunk","created":1787610162,"model":"qwen3.6-35b-a3b","choices":[{"index":0,"delta":{"reasoning":"Here is my thinking about this."},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm","object":"chat.completion.chunk","created":1787610162,"model":"qwen3.6-35b-a3b","choices":[{"index":0,"delta":{"reasoning":" More reasoning here."},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm","object":"chat.completion.chunk","created":1787610162,"model":"qwen3.6-35b-a3b","choices":[{"index":0,"delta":{"content":"ok"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"chatcmpl-vllm","object":"chat.completion.chunk","created":1787610162,"model":"qwen3.6-35b-a3b","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":16,"completion_tokens":241,"total_tokens":257}}
+
+data: [DONE]

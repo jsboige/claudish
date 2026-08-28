@@ -706,8 +706,15 @@ export function createStreamingResponseHandler(
                     });
                   }
 
-                  // Handle reasoning_content (Kimi, DeepSeek thinking models via LiteLLM)
-                  if (delta.reasoning_content) {
+                  // Handle reasoning_content (Kimi, DeepSeek thinking models via
+                  // LiteLLM) and `reasoning` — the same stream under a different
+                  // field name, emitted by vLLM's reasoning parser and OpenRouter.
+                  // Dropping it made the vllm qwen3.6 lane bill ~98% thinking
+                  // tokens that never reached the client (measured 2026-08-25:
+                  // 241 completion tokens on "Reponds exactement: ok", 899 chars
+                  // of reasoning, 4 chars of visible text).
+                  const reasoning = delta.reasoning_content ?? delta.reasoning;
+                  if (reasoning) {
                     state.lastActivity = Date.now();
                     if (!state.reasoningStarted) {
                       state.reasoningIdx = state.curIdx++;
@@ -721,7 +728,7 @@ export function createStreamingResponseHandler(
                     send("content_block_delta", {
                       type: "content_block_delta",
                       index: state.reasoningIdx,
-                      delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+                      delta: { type: "thinking_delta", thinking: reasoning },
                     });
                   }
 
