@@ -110,6 +110,7 @@ export class OpenAIProviderTransport implements ProviderTransport {
     const runWith429Retry = async (): Promise<Response> => {
       const maxRetries = 5;
       let lastResponse: Response | null = null;
+      let sleptMs = 0;
 
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
@@ -133,7 +134,26 @@ export class OpenAIProviderTransport implements ProviderTransport {
               `[${this.displayName}] 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${(delayMs / 1000).toFixed(1)}s`
             );
             await new Promise((resolve) => setTimeout(resolve, delayMs));
+            sleptMs += delayMs;
             continue;
+          }
+
+          // Out of retries. `attempt < maxRetries` above is what sends a 429 back
+          // round, so a 429 arriving HERE can only mean the ladder is spent — and
+          // this exit was completely silent. The per-retry lines are debug-level
+          // and never reach stdout, so `sleptMs` of sleeping against something
+          // that never moved left no trace anywhere in the log; diagnosing one
+          // cost a timing-correlation study across 28.5h of traffic (2026-08-25).
+          //
+          // At most one forced line per affected request, mutually exclusive with
+          // the quota-wall short-circuit above — so WHICH line appears is how you
+          // tell from outside whether that short-circuit fired.
+          if (response.status === 429) {
+            log(
+              `[${this.displayName}] 429 ladder exhausted after ${maxRetries} retries / ` +
+                `${(sleptMs / 1000).toFixed(1)}s asleep — returning the last 429`,
+              true
+            );
           }
 
           return response;
@@ -150,7 +170,13 @@ export class OpenAIProviderTransport implements ProviderTransport {
         }
       }
 
-      // All retries exhausted — return the last 429 response
+      // UNREACHABLE, and kept only to satisfy the return type. The loop's last
+      // iteration has `attempt === maxRetries`, so its 429 fails the retry guard
+      // and leaves through `return response` above — the loop never falls out of
+      // its own bottom. The old comment here said "All retries exhausted", which
+      // described a path that cannot execute; a log line placed here (the first
+      // attempt at this fix) never fired, and the exhaustion test below is what
+      // caught it.
       return lastResponse!;
     };
 

@@ -104,7 +104,8 @@ export async function isQuotaWall(response: Response, displayName: string): Prom
     if (!isQuotaExhaustion(response.status, body)) return false;
     log(
       `[${displayName}] ${response.status} names a quota/plan wall, not a burst — ` +
-        `skipping the retry ladder (it would sleep ~62s against a wall)`
+        `skipping the retry ladder (it would sleep ~62s against a wall)`,
+      true
     );
     return true;
   } catch {

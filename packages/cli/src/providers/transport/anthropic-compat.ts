@@ -130,6 +130,7 @@ export class AnthropicProviderTransport implements ProviderTransport {
     const runWith429Retry = async (): Promise<Response> => {
       const maxRetries = 5;
       let lastResponse: Response | null = null;
+      let sleptMs = 0;
 
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         const response = await gate(fetchFn);
@@ -154,13 +155,34 @@ export class AnthropicProviderTransport implements ProviderTransport {
             `[${this.displayName}] 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${(totalMs / 1000).toFixed(1)}s`
           );
           await new Promise((resolve) => setTimeout(resolve, totalMs));
+          sleptMs += totalMs;
           continue;
+        }
+
+        // Out of retries. `attempt < maxRetries` above is what sends a 429 back
+        // round, so a 429 arriving HERE can only mean the ladder is spent — and
+        // this exit was completely silent. The per-retry lines are debug-level
+        // and never reach stdout, so `sleptMs` of sleeping against something
+        // that never moved left no trace anywhere in the log; diagnosing one
+        // cost a timing-correlation study across 28.5h of traffic (2026-08-25).
+        //
+        // At most one forced line per affected request, mutually exclusive with
+        // the quota-wall short-circuit above — so WHICH line appears is how you
+        // tell from outside whether that short-circuit fired.
+        if (response.status === 429) {
+          log(
+            `[${this.displayName}] 429 ladder exhausted after ${maxRetries} retries / ` +
+              `${(sleptMs / 1000).toFixed(1)}s asleep — returning the last 429`,
+            true
+          );
         }
 
         return response;
       }
 
-      // All retries exhausted — return the last 429 response
+      // UNREACHABLE — see OpenAIProviderTransport for the full note. The loop's
+      // last iteration fails the retry guard and leaves through `return response`,
+      // so nothing ever falls out of the bottom. Kept for the return type only.
       return lastResponse!;
     };
 
