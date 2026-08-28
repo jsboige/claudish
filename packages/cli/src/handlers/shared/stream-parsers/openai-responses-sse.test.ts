@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { createResponsesStreamHandler } from "./openai-responses-sse.js";
+import { createResponsesStreamHandler, parseContextOverflow } from "./openai-responses-sse.js";
 
 const SSE_HEADERS: Record<string, string> = {
   "Content-Type": "text/event-stream",
@@ -153,5 +153,57 @@ describe("openai-responses-sse instrumentation", () => {
     expect(starts).toEqual(["0:text", "1:tool_use", "2:tool_use"]);
     const stops = [...output.matchAll(/event: content_block_stop\ndata: ([^\n]*)/g)].map((m) => JSON.parse(m[1]).index);
     expect(stops).toEqual([0, 1, 2]); // exactly one stop per block, in order
+  });
+});
+
+describe("context overflow must not report usage 0+0", () => {
+  // Regression 2026-08-28: on an error event no `response.completed` ever
+  // arrives, so the parser emitted `usage: {input_tokens: 0, output_tokens: 0}`
+  // with stop_reason end_turn. A zero tells Claude Code the conversation is
+  // EMPTY — its context gauge resets, auto-compact never fires, the session
+  // stays in overflow and every later turn fails identically, which the user
+  // experiences as "the agent ignores my messages" on the gpt-5.6-sol lane.
+  const REAL_MSG =
+    "This model's maximum context length is 272000 tokens. However, your messages resulted in 285000 tokens.";
+
+  function firstMessageDelta(output: string) {
+    const re = new RegExp("event: message_delta\ndata: ([^\n]*)");
+    const m = output.match(re);
+    return m ? JSON.parse(m[1]) : null;
+  }
+
+  test("parseContextOverflow extracts used and limit from the real backend wording", () => {
+    expect(parseContextOverflow(REAL_MSG, "context_length_exceeded")).toEqual({
+      used: 285000,
+      limit: 272000,
+    });
+  });
+
+  test("the limit is used as a lower bound when the used count is absent", () => {
+    const r = parseContextOverflow("Input exceeds the context window of 272000 tokens.", "");
+    expect(r?.used).toBe(272000);
+  });
+
+  test("a non-overflow error is left untouched", () => {
+    expect(parseContextOverflow("boom", "server_error")).toBeUndefined();
+    expect(parseContextOverflow("rate limited", "rate_limit_exceeded")).toBeUndefined();
+  });
+
+  test("the emitted message_delta carries the real input tokens, not 0", async () => {
+    const { output, lines } = await runStreamCollect([
+      { type: "error", error: { code: "context_length_exceeded", message: REAL_MSG } },
+    ]);
+    const delta = firstMessageDelta(output);
+    expect(delta.usage.input_tokens).toBe(285000);
+    expect(lines.some((l) => l.includes("CONTEXT-OVERFLOW") && l.includes("used=285000"))).toBe(
+      true
+    );
+  });
+
+  test("a generic error still reports zero usage (behavior unchanged)", async () => {
+    const { output } = await runStreamCollect([
+      { type: "error", error: { code: "server_error", message: "boom" } },
+    ]);
+    expect(firstMessageDelta(output).usage.input_tokens).toBe(0);
   });
 });

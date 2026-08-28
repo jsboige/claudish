@@ -16,6 +16,44 @@ import { log, getLogLevel } from "../../../logger.js";
 import { wrapAnthropicError } from "../anthropic-error.js";
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 
+/**
+ * Extract the token counts named by a context-overflow error.
+ *
+ * The Responses backend states both numbers in prose, e.g. "This model's
+ * maximum context length is 272000 tokens. However, your messages resulted in
+ * 285000 tokens." We need the used count because the error path reports
+ * `usage 0+0` (no `response.completed` ever arrives), and a zero tells Claude
+ * Code the conversation is EMPTY: its context gauge resets, auto-compact never
+ * fires, the session stays in overflow, and every later turn fails the same
+ * way — which reads to the user as "the agent ignores my messages"
+ * (gpt-5.6-sol lane report, 2026-08-27).
+ *
+ * When the used count is absent but the limit is stated, the limit is a valid
+ * lower bound — we overflowed it by definition — and is enough to trip
+ * auto-compact. Returns undefined for every other error, which keeps its
+ * existing behavior untouched.
+ */
+export function parseContextOverflow(
+  message: string,
+  code?: string
+): { used?: number; limit?: number } | undefined {
+  const msg = message || "";
+  const isOverflow =
+    code === "context_length_exceeded" ||
+    /context length|context window|maximum context|too many tokens/i.test(msg);
+  if (!isOverflow) return undefined;
+
+  const limitMatch =
+    msg.match(/maximum context length is (\d+)/i) || msg.match(/context window of (\d+)/i);
+  const usedMatch =
+    msg.match(/resulted in (\d+) tokens/i) ||
+    msg.match(/requested (\d+) tokens/i) ||
+    msg.match(/input of (\d+) tokens/i);
+  const limit = limitMatch ? Number(limitMatch[1]) : undefined;
+  const used = usedMatch ? Number(usedMatch[1]) : limit;
+  return { used, limit };
+}
+
 export function createResponsesStreamHandler(
   c: Context,
   response: Response,
@@ -255,6 +293,18 @@ export function createResponsesStreamHandler(
                   `[ResponsesSSE] API error model=${opts.modelName} reqN=${reqN} code=${errCode} msg=${errMsg}`,
                   true
                 );
+
+                // A context overflow must not be reported as `usage 0+0`: see
+                // parseContextOverflow above — a zero wedges the client's
+                // auto-compact and the session never recovers on its own.
+                const overflow = parseContextOverflow(errMsg, errCode);
+                if (overflow) {
+                  if (overflow.used) inputTokens = overflow.used;
+                  process.stdout.write(
+                    `  [resp] responses CONTEXT-OVERFLOW model=${opts.modelName} reqN=${reqN} used=${overflow.used ?? "?"} limit=${overflow.limit ?? "?"}
+`
+                  );
+                }
 
                 if (textBlockIndex !== null) {
                   send("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
