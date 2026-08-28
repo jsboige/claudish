@@ -88,7 +88,14 @@ export class CodexAPIFormat extends BaseAPIFormat {
     };
 
     if (claudeRequest.system) {
-      payload.instructions = claudeRequest.system;
+      // `instructions` is a string on the Responses API. Claude Code sends
+      // `system` as an ARRAY of text blocks, and assigning it raw shipped
+      // [object Object] upstream — silently ignored (no 4xx ever surfaced), so
+      // the lane ran without its system prompt. Every other adapter (Gemini,
+      // Ollama) already flattens; Codex was the one that did not.
+      payload.instructions = Array.isArray(claudeRequest.system)
+        ? claudeRequest.system.map((i: any) => i.text || i).join("\n\n")
+        : claudeRequest.system;
     }
 
     if (claudeRequest.max_tokens) {
