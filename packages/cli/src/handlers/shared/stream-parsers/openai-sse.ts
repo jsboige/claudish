@@ -19,7 +19,8 @@ import {
 } from "../tool-call-recovery.js";
 import { isWebSearchToolCall } from "../web-search-detector.js";
 import { executeWebSearch, extractSearchQuery } from "../web-search-executor.js";
-import { createResponseCapture, currentRequestNumber } from "../response-capture.js";
+import { createResponseCapture } from "../response-capture.js";
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 
 export interface StreamingState {
   usage: any;
@@ -138,16 +139,16 @@ export function createStreamingResponseHandler(
   const decoder = new TextDecoder();
   const streamMetadata = new Map<string, any>();
 
-  const cap = createResponseCapture("openai", target);
   // TTFT anchor: headers are in the moment this handler is built. The first
   // upstream `data:` line then closes the measurement. stdout like [resp] so
   // the two markers join in docker logs (this was the instrumentation gap of
   // the 2026-08-24 abort investigation: totals were logged, TTFT never was).
-  // reqN is FROZEN here, at construction — reading the counter later (in the
-  // pump) would label the line with whatever request arrived during the wait,
-  // and the bias grows with exactly the latency this marker exists to measure.
+  // reqN resolved from the request object (assigned at ingestion): the global
+  // counter read at this point returns whichever request is CURRENT while this
+  // one waited for headers — under concurrency handlers cross-label.
   const tHeaders = performance.now();
-  const reqN = currentRequestNumber();
+  const reqN = requestNumberFor(c.req);
+  const cap = createResponseCapture("openai", target, true, reqN);
   let ttftLogged = false;
 
   return c.body(

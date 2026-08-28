@@ -14,7 +14,7 @@
 import type { Context } from "hono";
 import { log, getLogLevel } from "../../../logger.js";
 import { wrapAnthropicError } from "../anthropic-error.js";
-import { currentRequestNumber } from "../response-capture.js";
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 
 export function createResponsesStreamHandler(
   c: Context,
@@ -35,15 +35,25 @@ export function createResponsesStreamHandler(
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   // TTFT anchors — headers arrived when this handler was built; the first
-  // upstream `data:` line completes the measurement. reqN frozen at
-  // construction: reading the counter in the pump would label the line with a
-  // request that arrived during the first-token wait.
+  // upstream `data:` line completes the measurement. reqN resolved from the
+  // request object itself (assigned at ingestion): the global counter read at
+  // this point returns whichever request is CURRENT while this one waited for
+  // headers — under concurrency every handler in a window would log the same
+  // latest number.
   const tHeaders = performance.now();
-  const reqN = currentRequestNumber();
+  const reqN = requestNumberFor(c.req);
   let ttftLogged = false;
 
   let buffer = "";
-  let blockIndex = 0;
+  // Block-index bookkeeping: one monotonic counter. Indices handed to the
+  // client MUST be sequential (0,1,2,…) per message — the Anthropic SSE
+  // contract keys content blocks by index and consumers rebuild them
+  // positionally. The previous arithmetic (blockIndex + functionCalls.size +
+  // (hasTextContent?1:0)) skipped an index on every parallel tool call after
+  // the first (text at 0, tools at 1, 3, 4…), firing on nearly every agentic
+  // turn of the Codex lane.
+  let nextBlockIndex = 0;
+  let textBlockIndex: number | null = null;
   let inputTokens = 0;
   let outputTokens = 0;
   let hasTextContent = false;
@@ -73,7 +83,9 @@ export function createResponsesStreamHandler(
       send("message_start", {
         type: "message_start",
         message: {
-          id: `msg_${Date.now()}`,
+          // Random suffix: Date.now() alone collides for handlers built in the
+          // same millisecond (common under the parallel sub-agent bursts).
+          id: `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
           type: "message",
           role: "assistant",
           content: [],
@@ -125,17 +137,18 @@ export function createResponsesStreamHandler(
               }
 
               if (event.type === "response.output_text.delta") {
-                if (!hasTextContent) {
+                if (textBlockIndex === null) {
+                  textBlockIndex = nextBlockIndex++;
                   send("content_block_start", {
                     type: "content_block_start",
-                    index: blockIndex,
+                    index: textBlockIndex,
                     content_block: { type: "text", text: "" },
                   });
                   hasTextContent = true;
                 }
                 send("content_block_delta", {
                   type: "content_block_delta",
-                  index: blockIndex,
+                  index: textBlockIndex,
                   delta: { type: "text_delta", text: event.delta || "" },
                 });
               } else if (event.type === "response.output_item.added") {
@@ -147,7 +160,14 @@ export function createResponsesStreamHandler(
                     : `toolu_${openaiCallId.replace(/^fc_/, "")}`;
                   const rawFnName = event.item.name || "";
                   const fnName = opts.toolNameMap?.get(rawFnName) || rawFnName;
-                  const fnIndex = blockIndex + functionCalls.size + (hasTextContent ? 1 : 0);
+                  // Close the text block (if open) BEFORE taking the next
+                  // index, so text+tools yields 0,1,2,… with no gap and the
+                  // text block is stopped exactly once.
+                  if (textBlockIndex !== null) {
+                    send("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+                    textBlockIndex = null;
+                  }
+                  const fnIndex = nextBlockIndex++;
 
                   const fnCallData = {
                     name: fnName,
@@ -161,11 +181,6 @@ export function createResponsesStreamHandler(
                     functionCalls.set(itemId, fnCallData);
                   }
 
-                  if (hasTextContent && !hasToolUse) {
-                    send("content_block_stop", { type: "content_block_stop", index: blockIndex });
-                    blockIndex++;
-                  }
-
                   send("content_block_start", {
                     type: "content_block_start",
                     index: fnIndex,
@@ -174,17 +189,18 @@ export function createResponsesStreamHandler(
                   hasToolUse = true;
                 }
               } else if (event.type === "response.reasoning_summary_text.delta") {
-                if (!hasTextContent) {
+                if (textBlockIndex === null) {
+                  textBlockIndex = nextBlockIndex++;
                   send("content_block_start", {
                     type: "content_block_start",
-                    index: blockIndex,
+                    index: textBlockIndex,
                     content_block: { type: "text", text: "" },
                   });
                   hasTextContent = true;
                 }
                 send("content_block_delta", {
                   type: "content_block_delta",
-                  index: blockIndex,
+                  index: textBlockIndex,
                   delta: { type: "text_delta", text: event.delta || "" },
                 });
               } else if (event.type === "response.function_call_arguments.delta") {
@@ -240,15 +256,15 @@ export function createResponsesStreamHandler(
                   true
                 );
 
-                if (hasTextContent) {
-                  send("content_block_stop", { type: "content_block_stop", index: blockIndex });
-                  hasTextContent = false;
+                if (textBlockIndex !== null) {
+                  send("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+                  textBlockIndex = null;
                 }
                 for (const [, fnCall] of functionCalls) {
                   send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
                 }
 
-                const errorIdx = blockIndex + functionCalls.size + (hasToolUse ? 1 : 0);
+                const errorIdx = nextBlockIndex++;
                 send("content_block_start", {
                   type: "content_block_start",
                   index: errorIdx,
@@ -299,8 +315,9 @@ export function createResponsesStreamHandler(
           );
         }
 
-        if (hasTextContent) {
-          send("content_block_stop", { type: "content_block_stop", index: blockIndex });
+        if (textBlockIndex !== null) {
+          send("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+          textBlockIndex = null;
         }
 
         const stopReason = hasToolUse ? "tool_use" : "end_turn";
@@ -326,14 +343,15 @@ export function createResponsesStreamHandler(
 
         if (!isClosed) {
           try {
-            if (hasTextContent) {
-              send("content_block_stop", { type: "content_block_stop", index: blockIndex });
+            if (textBlockIndex !== null) {
+              send("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+              textBlockIndex = null;
             }
             for (const [, fnCall] of functionCalls) {
               send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
             }
 
-            const errorIdx = blockIndex + functionCalls.size + (hasToolUse ? 1 : 0);
+            const errorIdx = nextBlockIndex++;
             send("content_block_start", {
               type: "content_block_start",
               index: errorIdx,
