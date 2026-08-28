@@ -5,8 +5,23 @@
  * this is a near-identity transform — the response is already in Claude SSE format.
  * Only light fixups are needed (e.g., ensuring message IDs, merging usage data).
  *
+ * INDEX MANAGEMENT — single source of truth, `origToEmitted` Map.
+ *
+ * Every content_block_start that the parser decides to emit gets an entry:
+ *   origToEmitted.set(data.index, origToEmitted.size)
+ * i.e. upstream index → the next sequential emitted index (0, 1, 2, ...). Suppressed
+ * blocks (thinking or server_tool_use) never enter the map, so they don't perturb
+ * the sequence; subsequent emitted blocks just take the next number.
+ *
+ * Every delta and stop looks the upstream index up in the map and re-emits the
+ * frame with the mapped index. A delta/stop for an index that's NOT in the map
+ * (a) was suppressed and its lifecycle was intentionally dropped — drop the
+ * frame too, or (b) references a block upstream never opened at all — also drop.
+ * Either way the alternative (clamp / invent) produces "Content block not found"
+ * on the client. See upstream PRs #127, #133 for the maintainer's prescription.
+ *
  * When `filterThinking` is enabled (via adapter.shouldFilterThinking()), thinking
- * blocks are stripped from the stream and content block indices are re-numbered.
+ * blocks are also dropped — same mechanism, the block never enters the map.
  */
 
 import type { Context } from "hono";
@@ -54,6 +69,17 @@ export function createAnthropicPassthroughStream(
   return c.body(
     new ReadableStream({
       async start(controller) {
+        // ── Index mapping state ────────────────────────────────────────
+        // Shared across the read loop and handleServerToolResult's closure.
+        // See header comment for the single-source-of-truth rationale.
+        let origToEmitted = new Map<number, number>();
+        /** Highest emitted content_block index so far. Used by finalizeWithError
+         *  to close any block that was open when the error hit. */
+        let highestEmittedIndex = -1;
+        /** True between the start and stop of a content block (any kind).
+         *  Lets finalizeWithError emit a single close frame when needed. */
+        let lastBlockOpen = false;
+
         // Diagnostic tap: mirror every outgoing byte into the response capture.
         const _origEnqueue = controller.enqueue.bind(controller);
         controller.enqueue = ((chunk: any) => {
@@ -74,37 +100,18 @@ export function createAnthropicPassthroughStream(
           }
         }, 1000);
 
-        // ── Shared content-block index tracking state ──────────────────
-        // DECLARED HERE (in start() scope, not inside the inner try block) so that
-        // handleServerToolResult's closure and the read loop share the SAME binding.
-        // Previously highestSeenIndex was declared inside the inner try{} block while
-        // handleServerToolResult (which writes it at line ~109) lived in the outer scope —
-        // two different block scopes → ReferenceError: highestSeenIndex is not defined
-        // whenever a real server_tool_use block fired the handler, crashing the proxy
-        // (observed live: po-2025 "Content block not found" freeze).
-        let highestSeenIndex = -1;
-        let lastBlockOpen = false;
-        const clampIndex = (idx: number, context: string): number => {
-          if (idx > highestSeenIndex + 1) {
-            log(
-              `[AnthropicSSE] Index jump detected: ${idx} but expected <=${highestSeenIndex + 1} (${context}) — clamping to ${highestSeenIndex + 1}`
-            );
-            return highestSeenIndex + 1;
-          }
-          return idx;
-        };
-        const trackIndex = (idx: number) => {
-          if (idx > highestSeenIndex) highestSeenIndex = idx;
-        };
-
         // Execute a suppressed server_tool_use (webReader) and inject the result
         // as a text block. Non-blocking — errors degrade to a short notice.
+        //
+        // We emit the synthetic block at `origToEmitted.size` so it slots into
+        // the next available sequence slot. The synthetic block is NOT added
+        // to the map (there's no upstream index for it). Subsequent upstream
+        // blocks just continue from the next number.
         const handleServerToolResult = async (
           toolName: string,
           rawInput: string,
-          currentHighestIdx: number,
         ) => {
-          const textIdx = currentHighestIdx + 1;
+          const textIdx = origToEmitted.size;
           let resultText: string;
           try {
             const input = JSON.parse(rawInput || "{}");
@@ -132,7 +139,7 @@ export function createAnthropicPassthroughStream(
             controller.enqueue(encoder.encode(
               `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: textIdx })}\n\n`
             ));
-            highestSeenIndex = textIdx;
+            highestEmittedIndex = textIdx;
           }
         };
 
@@ -151,8 +158,6 @@ export function createAnthropicPassthroughStream(
 
           // Thinking-block filtering state
           let insideThinkingBlock = false;
-          /** How many thinking blocks have been suppressed so far. */
-          let thinkingBlocksSuppressed = 0;
 
           // server_tool_use suppression state.
           // Z.AI built-in tools (webReader, web_search) emit server_tool_use blocks
@@ -162,10 +167,6 @@ export function createAnthropicPassthroughStream(
           let insideServerToolBlock = false;
           let serverToolName = "";
           let serverToolInput = "";
-          let serverToolsSuppressed = 0;
-
-          // (highestSeenIndex / lastBlockOpen / clampIndex / trackIndex declared
-          //  earlier in start() scope — shared with handleServerToolResult's closure.)
 
           // ── Graceful in-stream error finalization ─────────────────────
           // Some anthropic-compat providers (Z.AI, MiniMax, Kimi) return HTTP 200
@@ -211,7 +212,7 @@ export function createAnthropicPassthroughStream(
                     "event: content_block_stop\n" + `data: {"type":"content_block_stop","index":0}\n\n`
                   )
                 );
-              } else if (highestSeenIndex >= 0 && lastBlockOpen) {
+              } else if (highestEmittedIndex >= 0 && lastBlockOpen) {
                 // Mid-stream: close whatever content block was open when the error hit,
                 // otherwise the client sees an unterminated block.
                 // Only emit if the block is actually still open — if the provider
@@ -220,7 +221,7 @@ export function createAnthropicPassthroughStream(
                 controller.enqueue(
                   encoder.encode(
                     "event: content_block_stop\n" +
-                      `data: {"type":"content_block_stop","index":${highestSeenIndex}}\n\n`
+                      `data: {"type":"content_block_stop","index":${highestEmittedIndex}}\n\n`
                   )
                 );
               }
@@ -272,253 +273,133 @@ export function createAnthropicPassthroughStream(
             for (const line of lines) {
               totalLines++;
 
-              // ── Thinking-block filtering ──────────────────────────────
-              if (filterThinking && line.startsWith("data: ")) {
+              // ── Unified content-block processor ─────────────────────
+              //
+              // One code path for both filterThinking on and off — the only
+              // difference is whether `thinking` blocks are also dropped. The
+              // server_tool_use suppression is always on (Z.AI built-in tools).
+              // Index remapping funnels through `origToEmitted` regardless of
+              // which path we're on. See header for the single-source-of-truth
+              // rationale (upstream PRs #127, #133).
+              if (line.startsWith("data: ")) {
                 try {
                   const data = JSON.parse(line.slice(6));
 
                   // ── In-stream error detection (GitHub #106) ──
                   // Some anthropic-compat providers (Z.AI, MiniMax, Kimi) return
                   // HTTP 200 with {"error":{...}} embedded in the SSE payload.
-                  // Detect and surface as a proper error event.
                   if (data.error) {
                     const errMsg = data.error.message || JSON.stringify(data.error);
                     log(`[AnthropicSSE] In-stream error detected: ${errMsg}`);
-                    finalizeWithError(errMsg, "in-stream-error-filtered");
+                    finalizeWithError(errMsg, "in-stream-error");
                     return; // stop processing further lines
                   }
 
-                  // Track: entering a thinking block
+                  // ── Thinking-block suppression ──
+                  if (filterThinking) {
+                    if (
+                      data.type === "content_block_start" &&
+                      data.content_block?.type === "thinking"
+                    ) {
+                      insideThinkingBlock = true;
+                      log(`[AnthropicSSE] Filtering thinking block at upstream index ${data.index}`);
+                      continue;
+                    }
+                    if (insideThinkingBlock) {
+                      // Deltas and stop are dropped — the block never enters the
+                      // map, so any later data tying to this index maps to undefined.
+                      if (data.type === "content_block_stop") insideThinkingBlock = false;
+                      continue;
+                    }
+                  }
+
+                  // ── server_tool_use suppression ──
+                  // MUST run before any index remap logic. Z.AI built-in tools
+                  // (webReader, web_search_preview) emit server_tool_use blocks
+                  // that Claude Code can't render — drop the start, accumulate
+                  // input_json_delta, on stop fire handleServerToolResult. The
+                  // synthetic text block is emitted at the next sequential slot.
                   if (
                     data.type === "content_block_start" &&
-                    data.content_block?.type === "thinking"
+                    data.content_block?.type === "server_tool_use"
                   ) {
-                    insideThinkingBlock = true;
-                    thinkingBlocksSuppressed++;
-                    // Thinking blocks are suppressed — don't count them as open.
-                    log(`[AnthropicSSE] Filtering thinking block at index ${data.index}`);
-                    continue; // suppress this line
+                    insideServerToolBlock = true;
+                    serverToolName = data.content_block.name || "(unnamed)";
+                    serverToolInput = "";
+                    log(`[AnthropicSSE] Suppressing server_tool_use block at upstream index ${data.index}: ${serverToolName}`);
+                    continue;
                   }
-
-                  // Track: exiting a thinking block
-                  if (insideThinkingBlock && data.type === "content_block_stop") {
-                    insideThinkingBlock = false;
-                    continue; // suppress this line
-                  }
-
-                  // Suppress all deltas while inside a thinking block
-                  // (thinking_delta, signature_delta)
-                  if (insideThinkingBlock) {
+                  if (insideServerToolBlock) {
+                    if (data.type === "content_block_delta" && data.delta?.type === "input_json_delta") {
+                      serverToolInput += data.delta.partial_json || "";
+                    }
+                    if (data.type === "content_block_stop") {
+                      insideServerToolBlock = false;
+                      log(`[AnthropicSSE] server_tool_use "${serverToolName}" complete, input=${serverToolInput.length} chars`);
+                      // Fire-and-forget: execute the web fetch and inject as text
+                      handleServerToolResult(serverToolName, serverToolInput);
+                      serverToolName = "";
+                      serverToolInput = "";
+                    }
                     continue;
                   }
 
-                  // Re-index non-thinking content blocks
-                  // After suppressing N thinking blocks + M server_tool_use blocks,
-                  // subtract N+M from the index to keep it sequential.
-                  const totalSuppressed = thinkingBlocksSuppressed + serverToolsSuppressed;
-                  if (typeof data.index === "number" && totalSuppressed > 0) {
-                    const reindexed = data.index - totalSuppressed;
-                    const clamped = clampIndex(reindexed, `${data.type} (filtered, orig=${data.index})`);
-                    trackIndex(clamped);
-                    // Track block open/close state for finalizeWithError
-                    if (data.type === "content_block_start") lastBlockOpen = true;
-                    if (data.type === "content_block_stop") lastBlockOpen = false;
-                    const modifiedLine =
-                      "data: " + JSON.stringify({ ...data, index: clamped });
-
-                    if (!isClosed) {
-                      controller.enqueue(encoder.encode(modifiedLine + "\n"));
-                    }
-
-                    // Still do usage tracking below with the ORIGINAL data
-                  } else {
-                    // No filtering needed — track and pass through
-                    if (typeof data.index === "number") {
-                      if (data.type === "content_block_start") {
-                        trackIndex(data.index);
-                        lastBlockOpen = true;
-                      } else {
-                        const clamped = clampIndex(data.index, `${data.type} (unfiltered)`);
-                        if (data.type === "content_block_stop") lastBlockOpen = false;
-                        if (clamped !== data.index) {
-                          const modifiedLine =
-                            "data: " + JSON.stringify({ ...data, index: clamped });
-                          if (!isClosed) {
-                            controller.enqueue(encoder.encode(modifiedLine + "\n"));
-                          }
-                          // Skip original enqueue below
-                          continue;
-                        }
-                      }
-                    }
-                    if (!isClosed) {
-                      controller.enqueue(encoder.encode(line + "\n"));
-                    }
-                  }
-                } catch {
-                  // Unparseable — pass through
-                  if (!isClosed) {
-                    controller.enqueue(encoder.encode(line + "\n"));
-                  }
-                }
-              } else {
-                // Non-data lines (event: lines, blank lines) or no filtering
-                if (!filterThinking && line.startsWith("data: ")) {
-                  // Parse data lines BEFORE enqueuing to detect in-stream errors
-                  try {
-                    const data = JSON.parse(line.slice(6));
-
-                    // ── In-stream error detection (GitHub #106) ──
-                    if (data.error) {
-                      const errMsg = data.error.message || JSON.stringify(data.error);
-                      log(`[AnthropicSSE] In-stream error detected: ${errMsg}`);
-                      finalizeWithError(errMsg, "in-stream-error");
-                      return; // stop processing further lines
-                    }
-
-                    // ── server_tool_use suppression ──────────────────────────────
-                    // MUST run BEFORE the index-remap/passthrough logic below.
-                    // Z.AI built-in tools (webReader, web_search_preview) emit
-                    // server_tool_use blocks that Claude Code doesn't understand:
-                    //   "Unsupported content type: server_tool_use" + "Content block not found"
-                    // We suppress the entire block lifecycle (start → deltas → stop),
-                    // execute web fetches ourselves, and inject results as text.
-                    // (Ordering matters: without this guard first, the start event
-                    //  would already be enqueued by the passthrough below before the
-                    //  suppression flag is set — leaking the unsupported block type.)
-                    if (
-                      data.type === "content_block_start" &&
-                      data.content_block?.type === "server_tool_use"
-                    ) {
-                      insideServerToolBlock = true;
-                      serverToolName = data.content_block.name || "(unnamed)";
-                      serverToolInput = "";
-                      serverToolsSuppressed++;
-                      log(`[AnthropicSSE] Suppressing server_tool_use block at index ${data.index}: ${serverToolName}`);
-                      continue; // drop this start event
-                    }
-                    if (insideServerToolBlock) {
-                      // Accumulate input_json_delta inside the suppressed block
-                      if (data.type === "content_block_delta" && data.delta?.type === "input_json_delta") {
-                        serverToolInput += data.delta.partial_json || "";
-                      }
-                      // On stop: block is complete — execute and inject result
-                      if (data.type === "content_block_stop") {
-                        insideServerToolBlock = false;
-                        log(`[AnthropicSSE] server_tool_use "${serverToolName}" complete, input=${serverToolInput.length} chars`);
-                        // Fire-and-forget: execute the web fetch and inject as text
-                        handleServerToolResult(serverToolName, serverToolInput, highestSeenIndex);
-                        serverToolName = "";
-                        serverToolInput = "";
-                      }
-                      continue; // drop all events inside the suppressed block
-                    }
-
-                    // No error — check index bounds before passing through
-                    if (typeof data.index === "number") {
-                      if (data.type === "content_block_start") {
-                        lastBlockOpen = true;
-                        // z.ai sometimes sends content_block_start with an index
-                        // that jumps (e.g., 0 → 2, skipping 1). This causes
-                        // "Content block not found" on the client. Remap to
-                        // sequential indices to keep the client happy.
-                        const expected = highestSeenIndex + 1;
-                        if (data.index !== expected) {
-                          log(
-                            `[AnthropicSSE] content_block_start index ${data.index} remapped to ${expected} (model=${opts.modelName})`
-                          );
-                          const remapped = { ...data, index: expected };
-                          if (!isClosed) {
-                            controller.enqueue(encoder.encode("data: " + JSON.stringify(remapped) + "\n"));
-                          }
-                        } else {
-                          if (!isClosed) {
-                            controller.enqueue(encoder.encode(line + "\n"));
-                          }
-                        }
-                        trackIndex(expected);
-                      } else {
-                        // delta / stop — clamp to highestSeenIndex
-                        if (data.type === "content_block_stop") lastBlockOpen = false;
-                        const clamped = clampIndex(data.index, `${data.type} (passthrough)`);
-                        if (clamped !== data.index) {
-                          const modified = { ...data, index: clamped };
-                          if (!isClosed) {
-                            controller.enqueue(encoder.encode("data: " + JSON.stringify(modified) + "\n"));
-                          }
-                        } else {
-                          if (!isClosed) {
-                            controller.enqueue(encoder.encode(line + "\n"));
-                          }
-                        }
+                  // ── Index remap (single source of truth) ──
+                  //
+                  // A content_block_start that we haven't suppressed gets a new
+                  // entry mapping its upstream index → next sequential emitted.
+                  // Deltas and stops look the upstream index up in the map:
+                  //   - known  → re-emit with the mapped emitted index
+                  //   - unknown → drop + warn (was a suppressed block's orphan
+                  //     delta, or upstream sent a frame for a never-opened block)
+                  //
+                  // The two old mechanisms (filtered path subtraction, passthrough
+                  // path clamp) collapse into one lookup, eliminating the case
+                  // where a delta for a remapped start arrives with the upstream
+                  // index and bypasses the clamp (the upsteam-#127 critique).
+                  if (typeof data.index === "number") {
+                    if (data.type === "content_block_start") {
+                      const emittedIdx = origToEmitted.size;
+                      origToEmitted.set(data.index, emittedIdx);
+                      lastBlockOpen = true;
+                      if (emittedIdx > highestEmittedIndex) highestEmittedIndex = emittedIdx;
+                      const modified = JSON.stringify({ ...data, index: emittedIdx });
+                      if (!isClosed) {
+                        controller.enqueue(encoder.encode("data: " + modified + "\n"));
                       }
                     } else {
-                      // No index field — pass through as-is
-                      if (!isClosed) {
-                        controller.enqueue(encoder.encode(line + "\n"));
+                      const mapped = origToEmitted.get(data.index);
+                      if (mapped !== undefined) {
+                        if (data.type === "content_block_stop") lastBlockOpen = false;
+                        if (mapped === data.index) {
+                          if (!isClosed) {
+                            controller.enqueue(encoder.encode(line + "\n"));
+                          }
+                        } else {
+                          const modified = JSON.stringify({ ...data, index: mapped });
+                          if (!isClosed) {
+                            controller.enqueue(encoder.encode("data: " + modified + "\n"));
+                          }
+                        }
+                      } else {
+                        // Delta/stop for an unknown upstream index. Either a
+                        // suppressed block's orphan, or upstream did something
+                        // we haven't accounted for. Drop with a single log line
+                        // — the alternative produces "Content block not found".
+                        log(
+                          `[AnthropicSSE] Dropping frame with unknown index ${data.index}: ${data.type} (model=${opts.modelName})`
+                        );
                       }
                     }
-
-                    // Usage/debug tracking
-                    if (data.message?.usage) {
-                      inputTokens = data.message.usage.input_tokens || inputTokens;
-                      outputTokens = data.message.usage.output_tokens || outputTokens;
-                    }
-                    if (data.usage) {
-                      inputTokens = data.usage.input_tokens || inputTokens;
-                      outputTokens = data.usage.output_tokens || outputTokens;
-                    }
-                    if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
-                      const txt = data.delta.text || "";
-                      textChunks++;
-                      log(
-                        `[AnthropicSSE] Text chunk: "${txt.substring(0, 30).replace(/\n/g, "\\n")}" (${txt.length} chars)`
-                      );
-                    }
-                    if (
-                      data.type === "content_block_start" &&
-                      data.content_block?.type === "tool_use"
-                    ) {
-                      toolUseBlocks++;
-                      log(`[AnthropicSSE] Tool use: ${data.content_block.name}`);
-                    }
-                    if (data.type === "message_start") {
-                      sawMessageStart = true;
-                    }
-                    if (data.type === "message_delta" && data.delta?.stop_reason) {
-                      stopReason = data.delta.stop_reason;
-                    }
-                    if (data.type === "message_stop") {
-                      sawMessageStop = true;
-                    }
-                  } catch {
-                    // Unparseable data line — pass through
+                  } else {
+                    // No index field — pass through as-is (message_start,
+                    // message_delta, message_stop, ping, etc.)
                     if (!isClosed) {
                       controller.enqueue(encoder.encode(line + "\n"));
                     }
                   }
-                } else {
-                  // Non-data lines (event: lines, blank lines).
-                  // Suppress a bare `event: error` line: the matching `data:` line
-                  // that follows carries the payload and triggers finalizeWithError().
-                  // Forwarding `event: error` verbatim is itself what makes Claude Code
-                  // report "empty or malformed response (HTTP 200)" and crash, and it
-                  // produced the double `event: error` seen in production captures.
-                  if (line.trimStart().startsWith("event: error")) {
-                    continue;
-                  }
-                  if (!isClosed) {
-                    controller.enqueue(encoder.encode(line + "\n"));
-                  }
-                }
-              }
 
-              // ── Usage/debug tracking for filtered path ────────────────
-              // We need this even when filtering, but the data was already parsed
-              // above in the filterThinking branch. Re-parse for tracking only.
-              if (filterThinking && line.startsWith("data: ")) {
-                try {
-                  const data = JSON.parse(line.slice(6));
+                  // ── Usage/debug tracking ──
                   if (data.message?.usage) {
                     inputTokens = data.message.usage.input_tokens || inputTokens;
                     outputTokens = data.message.usage.output_tokens || outputTokens;
@@ -528,7 +409,11 @@ export function createAnthropicPassthroughStream(
                     outputTokens = data.usage.output_tokens || outputTokens;
                   }
                   if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
+                    const txt = data.delta.text || "";
                     textChunks++;
+                    log(
+                      `[AnthropicSSE] Text chunk: "${txt.substring(0, 30).replace(/\n/g, "\\n")}" (${txt.length} chars)`
+                    );
                   }
                   if (
                     data.type === "content_block_start" &&
@@ -537,16 +422,34 @@ export function createAnthropicPassthroughStream(
                     toolUseBlocks++;
                     log(`[AnthropicSSE] Tool use: ${data.content_block.name}`);
                   }
-                  if (data.type === "message_delta" && data.delta?.stop_reason) {
-                    stopReason = data.delta.stop_reason;
-                  }
                   if (data.type === "message_start") {
                     sawMessageStart = true;
+                  }
+                  if (data.type === "message_delta" && data.delta?.stop_reason) {
+                    stopReason = data.delta.stop_reason;
                   }
                   if (data.type === "message_stop") {
                     sawMessageStop = true;
                   }
-                } catch {}
+                } catch {
+                  // Unparseable data line — pass through
+                  if (!isClosed) {
+                    controller.enqueue(encoder.encode(line + "\n"));
+                  }
+                }
+              } else {
+                // Non-data lines (event: lines, blank lines).
+                // Suppress a bare `event: error` line: the matching `data:` line
+                // that follows carries the payload and triggers finalizeWithError().
+                // Forwarding `event: error` verbatim is itself what makes Claude Code
+                // report "empty or malformed response (HTTP 200)" and crash, and it
+                // produced the double `event: error` seen in production captures.
+                if (line.trimStart().startsWith("event: error")) {
+                  continue;
+                }
+                if (!isClosed) {
+                  controller.enqueue(encoder.encode(line + "\n"));
+                }
               }
             }
           }
@@ -565,7 +468,7 @@ export function createAnthropicPassthroughStream(
 
           log(
             `[AnthropicSSE] Stream complete for ${opts.modelName}: ${totalLines} lines, ${textChunks} text chunks, ${toolUseBlocks} tool_use blocks, stop_reason=${stopReason}` +
-              (filterThinking ? `, filtered ${thinkingBlocksSuppressed} thinking blocks` : "")
+              (filterThinking ? ` (filterThinking active)` : "")
           );
           cap.note(`upstream-done sawMessageStop=${sawMessageStop} stop_reason=${stopReason} toolUse=${toolUseBlocks}`);
 
