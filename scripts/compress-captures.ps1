@@ -66,9 +66,12 @@ param(
   # mount point of the Drive, so this is just a Windows file copy.
   [string]$GDriveDir  = "G:\Mon Drive\MyIA\backups\claudish-captures",
   # Local retention: archives older than this (in days) are purged from the
-  # local ArchiveDir, BUT only after confirming the copy exists on GDrive.
-  # GDrive keeps everything; this only bounds local disk usage.
-  [int]   $KeepLocalDays = 30
+  # local ArchiveDir, BUT only after confirming the copy exists on GDrive
+  # (same size). GDrive keeps everything; this only bounds local disk usage.
+  # 0 = delete the same night, right after the confirmed upload (user policy
+  # 2026-08-27: "tout ce qui est lourd vit dans GDrive" — heavy data lives on
+  # GDrive online-only, D: keeps nothing). A negative value disables the purge.
+  [int]   $KeepLocalDays = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -148,8 +151,9 @@ foreach ($day in $daysToArchive) {
       # Non-fatal: if the Drive isn't mounted (laptop offline, G: missing) or
       # the copy fails, we log a WARN and continue. The local archive already
       # exists (verified), so we never lose data — only the off-site copy is
-      # deferred. The purge-30d block below will NOT delete local archives that
-      # aren't confirmed on GDrive, so a missed upload retries the next night.
+      # deferred. The purge block below will NOT delete local archives that
+      # aren't confirmed on GDrive, and the re-upload pass retries missed
+      # copies, so nothing is ever dropped without an off-site copy.
       if ($GDriveDir) {
         if (Test-Path -LiteralPath $GDriveDir) {
           try {
@@ -177,11 +181,39 @@ foreach ($day in $daysToArchive) {
   }
 }
 
+# --- re-upload pass: retry any local archive whose GDrive copy is missing or
+# size-mismatched. Without this, a night where the Drive was unmounted strands
+# the archive locally forever — with KeepLocalDays=0 it would be the only
+# local archive, and the compress loop above never revisits an already-
+# archived day, so nothing would ever retry the copy.
+if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -LiteralPath $GDriveDir)) {
+  foreach ($arch in (Get-ChildItem -LiteralPath $ArchiveDir -Filter 'captures-*.7z' -File)) {
+    $dest = Join-Path $GDriveDir $arch.Name
+    $ok = (Test-Path -LiteralPath $dest) -and ((Get-Item -LiteralPath $dest).Length -eq $arch.Length)
+    if (-not $ok) {
+      try {
+        Copy-Item -LiteralPath $arch.FullName -Destination $GDriveDir -Force -ErrorAction Stop
+        if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -eq $arch.Length) {
+          Log ("GDRIVE {0}: re-uploaded ({1:N1} MB, was missing/mismatched)" -f $arch.BaseName, ($arch.Length/1MB))
+        } else {
+          $errors++
+          Log ("WARN  {0}: re-upload size mismatch -> kept local, retried next run" -f $arch.BaseName)
+        }
+      } catch {
+        $errors++
+        Log ("WARN  {0}: re-upload failed: {1} -> kept local, retried next run" -f $arch.BaseName, $_.Exception.Message)
+      }
+    }
+  }
+}
+
 # --- local retention purge: delete archives older than KeepLocalDays, ONLY if
 # confirmed present (and same size) on GDrive. This bounds local disk; GDrive
-# keeps the full history. If GDriveDir is unset or not mounted, purge is
-# skipped entirely (safe default — never delete without an off-site copy).
-if ($KeepLocalDays -gt 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -LiteralPath $GDriveDir)) {
+# keeps the full history. KeepLocalDays=0 (default) purges every archive the
+# same night, right after the confirmed upload. If GDriveDir is unset or not
+# mounted, purge is skipped entirely (safe default — never delete without an
+# off-site copy).
+if ($KeepLocalDays -ge 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -LiteralPath $GDriveDir)) {
   $purgeCutoff = (Get-Date).ToUniversalTime().Date.AddDays(-$KeepLocalDays)
   $purged = 0; $purgeSkipped = 0
   foreach ($arch in (Get-ChildItem -LiteralPath $ArchiveDir -Filter 'captures-*.7z' -File)) {
