@@ -4,7 +4,8 @@
   Live traffic analysis from claudish-proxy docker logs.
 
 .DESCRIPTION
-  Standardized analysis of `docker logs claudish-proxy --since Nh`. This is the
+  Standardized analysis of `docker logs claudish-proxy` (windowed by --since, with
+  a detected --tail fallback; see GOTCHA #2). This is the
   FAST path for surveillance (the 6h cron): it reads stdout logs directly,
   avoiding the cost of parsing thousands of req-*.json captures.
 
@@ -54,21 +55,30 @@ $ErrorActionPreference = 'Stop'
 # capture must run under 'Continue'; we restore 'Stop' right after for the rest
 # of the script. docker logs returns exit 0 for normal stderr output (that's
 # where logs live, not an error), so the exit-code check gates real failures.
-# GOTCHA #2 — `--since` is UNUSABLE on this Docker Desktop, in ANY form.
-# Empirically (2026-07-01, post power-outage): with the container up and serving,
-# `--since 6h`, `--since <absolute RFC3339 6h-ago>` BOTH return 0 lines, while
-# `--since 2026-01-01` returns everything and `--tail N` is correct. Root cause is
-# clock corruption in the container's json-log: physically-recent lines carry
-# timestamps ~2 days stale (the WSL2 VM clock jumped during the outage), so any
-# recent `--since` cutoff filters out live traffic. Timestamp-based windowing is
-# therefore ALSO unreliable — the only robust selector is `--tail N` by line count.
-# We approximate the -Hours window by tail depth (~5-6k log lines/hour at peak),
-# capped so we never pull an unbounded buffer. Over-pulling biases toward showing
-# MORE history (safe for surveillance: better a stale line than a missed hang);
-# it never hides recent traffic. Timestamps are still shown but may be skewed.
-$tailLines = [Math]::Min(200000, [Math]::Max(4000, $Hours * 8000))
+# GOTCHA #2 — `--since` WAS unusable on this Docker Desktop (2026-07-01 → 2026-08-29).
+# Root cause was clock corruption in the container's json-log after a power outage:
+# physically-recent lines carried timestamps ~2 days stale (the WSL2 VM clock jumped),
+# so any recent `--since` cutoff filtered out live traffic while `--tail N` stayed
+# correct. The workaround — approximating the window by tail depth — outlived its
+# cause by two months, and silently mislabelled its output the whole time: measured
+# on the myia-ai-01 sidecar 2026-08-30, `-Hours 12` pulled 9.25 DAYS of log under a
+# "last 12h" header, because the tail depth is calibrated on hub traffic (~5-6k
+# lines/hour) while a NOMINAL relay sidecar emits ~200 lines/day.
+#
+# Re-measured 2026-08-30 (Docker 29.7.2, myia-ai-01 sidecar): `--since 12h` -> 329
+# lines correctly bounded at T-12h, `--since 24h` -> 337, `--since 1h` -> 0 lines,
+# which is the RIGHT answer (the newest line was 4.5h old). The skew is gone.
+#
+# `--since` is therefore PRIMARY, and `--tail` survives as a detected fallback.
+# The discriminator matters: an empty `--since` result is ambiguous — it means either
+# "the container is genuinely idle" (correct, common on a NOMINAL sidecar) or
+# "--since is lying again". Only one signature separates them: `--since` returns
+# nothing WHILE the container's newest line falls inside the requested window.
+$tailLines  = [Math]::Min(200000, [Math]::Max(4000, $Hours * 8000))
+$windowMode = 'since'
+
 $ErrorActionPreference = 'Continue'
-$raw = docker logs --timestamps --tail $tailLines $Container 2>&1
+$raw = docker logs --timestamps --since ("{0}h" -f $Hours) $Container 2>&1
 $dockerExit = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 
@@ -80,11 +90,81 @@ if ($dockerExit -ne 0) {
 
 # Filter to actual log lines (docker injects some non-log output on stderr).
 $lines = $raw | Where-Object { $_ -match '^\d{4}-\d{2}-\d{2}T' }
-if ($lines.Count -eq 0) {
-    Write-Host "No log lines found (tail=$tailLines). Container may have just started, or is idle." -ForegroundColor Yellow
+
+if (@($lines).Count -eq 0) {
+    # Ambiguous: idle container, or a --since that filters out live traffic?
+    $ErrorActionPreference = 'Continue'
+    $probe = docker logs --timestamps --tail 1 $Container 2>&1
+    $ErrorActionPreference = 'Stop'
+    $probeLines = @($probe | Where-Object { $_ -match '^\d{4}-\d{2}-\d{2}T' })
+    $newest = $null
+    if ($probeLines.Count -gt 0 -and $probeLines[-1] -match '^(\S+)') {
+        try {
+            $newest = [datetime]::Parse($Matches[1], [cultureinfo]::InvariantCulture,
+                                        [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        } catch { $newest = $null }
+    }
+    $cutoff = (Get-Date).ToUniversalTime().AddHours(-$Hours)
+    if ($newest -and $newest -gt $cutoff) {
+        Write-Host ("NOTE: --since returned nothing while the newest log line ({0:yyyy-MM-ddTHH:mm:ss}Z) is INSIDE the {1}h window — this is the GOTCHA #2 signature. Falling back to --tail." -f $newest, $Hours) -ForegroundColor Yellow
+        $windowMode = 'tail'
+        $ErrorActionPreference = 'Continue'
+        $raw = docker logs --timestamps --tail $tailLines $Container 2>&1
+        $ErrorActionPreference = 'Stop'
+        $lines = $raw | Where-Object { $_ -match '^\d{4}-\d{2}-\d{2}T' }
+    }
+}
+
+if (@($lines).Count -eq 0) {
+    Write-Host "No log lines in the last ${Hours}h. Container may have just started, or is idle (normal for a NOMINAL relay sidecar)." -ForegroundColor Yellow
     exit 0
 }
-Write-Host ("(window approximated by --tail $tailLines lines; --since is unreliable on this host — see GOTCHA #2)") -ForegroundColor DarkGray
+
+if ($windowMode -eq 'since') {
+    Write-Host ("(window: docker logs --since {0}h)" -f $Hours) -ForegroundColor DarkGray
+} else {
+    Write-Host ("(window approximated by --tail $tailLines lines — --since fallback, see GOTCHA #2)") -ForegroundColor DarkGray
+}
+
+# Report the span the lines ACTUALLY cover. The tail-depth heuristic above is
+# calibrated on hub traffic (~5-6k lines/hour at peak); a low-traffic container
+# produces far less. A NOMINAL relay sidecar logs nothing for relayed requests
+# (the relay branch returns before logRequest), so it emits on the order of
+# a hundred lines per DAY — and the same tail then reaches back to container
+# creation. Measured on myia-ai-01, 2026-08-28: `-Hours 12` pulled 8 days of
+# history (174 requests spanning 08-20..08-28) and labelled it "last 12h".
+# The over-pull is safe for surveillance, but the LABEL is not: it silently
+# mislabels the window, and a narrow `-Hours 1` re-check cannot show a recent
+# improvement because it still returns the whole log. Printing the observed
+# span makes that visible instead of leaving the header to assert a window
+# the data does not have.
+$span = $null
+$spanFirst = $null
+$spanLast = $null
+$lineArr = @($lines)
+if ($lineArr[0] -match '^(\S+)' ) { $spanFirst = $Matches[1] }
+if ($lineArr[-1] -match '^(\S+)') { $spanLast  = $Matches[1] }
+if ($spanFirst -and $spanLast) {
+    try {
+        $t0 = [datetime]::Parse($spanFirst, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        $t1 = [datetime]::Parse($spanLast,  [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        $span = ($t1 - $t0).TotalHours
+    } catch { $span = $null }
+}
+if ($null -ne $span) {
+    $spanTxt = ("(observed span: {0} -> {1} = {2:N1}h for a requested {3}h window)" -f $spanFirst, $spanLast, $span, $Hours)
+    # In 'since' mode the span is bounded by construction and a SHORT span just
+    # means a quiet container — not a defect. Only the 'tail' fallback can
+    # over-pull, so only there does a wide span deserve a warning.
+    if ($windowMode -eq 'tail' -and $span -gt ($Hours * 1.5)) {
+        Write-Host $spanTxt -ForegroundColor Yellow
+        Write-Host ("  NOTE: the report below covers {0:N1}h, NOT {1}h. Counts are aggregates over the wider window." -f $span, $Hours) -ForegroundColor Yellow
+    } else {
+        Write-Host $spanTxt -ForegroundColor DarkGray
+    }
+} else {
+    Write-Host "(observed span: unavailable — timestamps unparseable)" -ForegroundColor DarkGray
+}
 
 $requests = $lines | Where-Object { $_ -match '\[Request\]' }
 $responses = $lines | Where-Object { $_ -match '\[resp\]' }
