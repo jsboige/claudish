@@ -12,7 +12,9 @@
 # Logs to: C:\Users\jsboi\.claudish\watchdog.log
 
 $ErrorActionPreference = "Stop"
-$LogPath = "$env:USERPROFILE\.claudish\watchdog.log"
+# Absolute paths: the scheduled task runs as SYSTEM, whose $env:USERPROFILE is
+# the system profile — the user's .claudish dir would not exist there.
+$LogPath = "C:\Users\jsboi\.claudish\watchdog.log"
 $ProxyUrl = "http://localhost:3000"
 $ContainerName = "claudish-proxy"
 $StreamTimeoutSec = 90
@@ -26,7 +28,7 @@ $ProactiveRestartHours = 11
 # outage.
 $DrainMaxWaitProactiveSec = 300
 $DrainMaxWaitHangSec = 120
-$StateFile = "$env:USERPROFILE\.claudish\watchdog-state.json"
+$StateFile = "C:\Users\jsboi\.claudish\watchdog-state.json"
 $QuietHourStart = 3             # local hour; proactive restarts only in [start,end)
 $QuietHourEnd = 6
 
@@ -79,10 +81,23 @@ function Test-ProxyWithTools {
         )
     } | ConvertTo-Json -Depth 10
 
+    # The hub authenticates /v1/messages with the cluster proxy key. Read it at
+    # runtime from the deployment .env — never hardcode it here (the script is
+    # committed). Absolute path: the scheduled task runs as SYSTEM, where
+    # $env:USERPROFILE points at the wrong profile.
+    $proxyKey = $null
+    try {
+        $envLine = Select-String -Path "D:\Dev\claudish\.env" -Pattern '^\s*CLAUDISH_PROXY_KEY\s*=\s*(.+)\s*$' | Select-Object -First 1
+        if ($envLine) { $proxyKey = $envLine.Matches[0].Groups[1].Value.Trim('"', "'") }
+    } catch {}
+    $headers = @{}
+    if ($proxyKey) { $headers["x-proxy-key"] = $proxyKey }
+
     try {
         $response = Invoke-WebRequest -Uri "$Url/v1/messages" `
             -Method POST `
             -ContentType "application/json" `
+            -Headers $headers `
             -Body $body `
             -TimeoutSec $TimeoutSec `
             -UseBasicParsing
@@ -132,6 +147,12 @@ function Test-ProxyWithTools {
 # copied here.
 . "$PSScriptRoot\claudish-drain.ps1"
 
+# Dot-sourcing executes drain.ps1's param() DEFAULTS in this scope, which
+# reassigns $LogPath to ...\.claudish\drain.log — silently misdirecting this
+# script's log when run as the user, and fatally (missing dir + Stop) when run
+# by the SYSTEM scheduled task (2026-08-30: exit 1, no log). Re-pin it.
+$LogPath = "C:\Users\jsboi\.claudish\watchdog.log"
+
 function Get-State {
     if (Test-Path $StateFile) {
         try { return Get-Content $StateFile -Raw | ConvertFrom-Json } catch {}
@@ -150,9 +171,52 @@ function Set-State {
 
 Write-Log "=== Watchdog check ==="
 
+# Step 0: Engine recovery. After a reboot the Docker Desktop backend can die
+# outright ("backend process exited") — docker CLI then fails with rc 28/125 and
+# `docker start` is useless. Observed 2026-08-29: the first reboot of the hub
+# machine came back with no container for exactly this reason, and a human had
+# to reboot a second time. Start the service, then launch Docker Desktop in the
+# interactive user session via a helper task (SYSTEM cannot own the GUI app),
+# then wait, bounded, for the engine to answer.
+function Test-DockerEngine {
+    docker version *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Start-DockerEngine {
+    if (Test-DockerEngine) { return $true }
+    Write-Log "ENGINE-DOWN: docker CLI cannot reach the engine — recovering"
+    try { Start-Service com.docker.service -ErrorAction SilentlyContinue } catch {}
+    if (-not (Get-Process "Docker Desktop" -ErrorAction SilentlyContinue)) {
+        try {
+            $helper = "ClaudishDockerDesktopStart"
+            $action = New-ScheduledTaskAction -Execute "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+            Register-ScheduledTask -TaskName $helper -Action $action `
+                -User "$env:COMPUTERNAME\jsboige" -LogonType Interactive -RunLevel Highest -Force | Out-Null
+            Start-ScheduledTask -TaskName $helper
+            Write-Log "ENGINE: Docker Desktop launch requested in user session"
+        } catch {
+            Write-Log "ENGINE: could not launch Docker Desktop ($($_.Exception.Message))"
+        }
+    }
+    for ($i = 1; $i -le 12; $i++) {
+        Start-Sleep -Seconds 10
+        if (Test-DockerEngine) {
+            Write-Log "ENGINE: recovered after $($i * 10)s"
+            return $true
+        }
+    }
+    Write-Log "ENGINE: still down after 120s — FATAL this cycle (next run retries)"
+    return $false
+}
+
 # Step 1: Container running?
 $containerStatus = docker inspect $ContainerName --format "{{.State.Status}}" 2>$null
 if ($LASTEXITCODE -ne 0 -or $containerStatus -ne "running") {
+    if ($LASTEXITCODE -ne 0) {
+        # CLI itself failed — engine down, not just the container.
+        if (-not (Start-DockerEngine)) { exit 1 }
+    }
     Write-Log "CRITICAL: Container not running (status=$containerStatus). Starting..."
     docker start $ContainerName 2>$null
     Start-Sleep -Seconds 15
