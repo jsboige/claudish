@@ -822,9 +822,15 @@ export class ComposedHandler implements ModelHandler {
     // ── In-stream rate-limit handling (temporize, then fall back) ──────────
     // Some anthropic-sse providers (notably Z.AI) deliver their burst / RPM
     // limit as HTTP 200 + an in-stream SSE error ([1302]) with no message
-    // envelope. That escapes `response.ok` above and FallbackHandler (both key
-    // off HTTP status), so it used to reach the client as a bare error and
-    // crash the turn. We peek the first bytes (the error arrives in 0-4ms, so a
+    // envelope. The OpenAI Responses lane (gpt-5.6-sol) delivers its
+    // server_is_overloaded the same way — the error event IS the first stream
+    // event, before any response.created. Both escape `response.ok` above and
+    // FallbackHandler (both key off HTTP status), so they used to reach the
+    // client as a bare error and stop the turn: on the Responses lane that
+    // surfaced as a clean HTTP 200 ending in "[API Error: server_is_overloaded
+    // …]" text, which Claude Code treats as a completed turn — an autonomous
+    // agent reads it as its own last word and stops (po-2025:CoursIA-2,
+    // 2026-09-01). We peek the first bytes (the error arrives in 0-4ms, so a
     // short window catches it without delaying slow-but-healthy big-context
     // responses), temporize with a jittered backoff + retry the SAME provider
     // (the sustained quota has headroom — only the instantaneous burst limit is
@@ -839,7 +845,7 @@ export class ComposedHandler implements ModelHandler {
     // straight through to handleStream() unchanged.
     {
       const peekFormat = this.resolveStreamFormat();
-      if (peekFormat === "anthropic-sse") {
+      if (peekFormat === "anthropic-sse" || peekFormat === "openai-responses-sse") {
         // Patient overload backoff (2026-06-25): GLM/Z.AI concurrency limits
         // surface as HTTP 200 + in-stream [130x]. Clients (Claude Code) have
         // generous request timeouts (API_TIMEOUT_MS=600000) and would rather

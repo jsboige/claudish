@@ -68,6 +68,16 @@ function extractErrMsg(sniff: string): string | undefined {
 
 const RATE_LIMIT_RE = /rate.?limit|\b1302\b|\b1305\b|\b429\b|too many requests|overloaded|quota/i;
 
+// OpenAI Responses wire signatures. A healthy request opens with
+// `response.created`; an admission failure (server_is_overloaded — the
+// gpt-5.6-sol lane's OpenAI overload) opens with the error event directly,
+// before any created. Whichever appears FIRST decides: created first means
+// real output is flowing and a later failure is mid-stream, which the peek
+// cannot retry usefully — hand it to the parser's finalizer instead.
+const RESPONSES_CREATED_RE = /(^|\n)event:\s*response\.created|"type"\s*:\s*"response\.created"/;
+const RESPONSES_ERROR_RE =
+  /(^|\n)event:\s*error|"type"\s*:\s*"error"|"type"\s*:\s*"response\.failed"/;
+
 /**
  * Classify what we've sniffed so far. Returns null when the bytes are still
  * ambiguous (need to read more), a concrete class once we can decide.
@@ -79,6 +89,17 @@ function classifyPartial(sniff: string): { cls: StreamStartClass; detail?: strin
   }
   // Any content delta before an error likewise means a real answer is flowing.
   if (/"type"\s*:\s*"content_block_start"/.test(sniff)) {
+    return { cls: "healthy" };
+  }
+  // OpenAI Responses wire: ordered created-vs-error (see regex docs above).
+  const createdIdx = sniff.search(RESPONSES_CREATED_RE);
+  const errorIdx = sniff.search(RESPONSES_ERROR_RE);
+  if (errorIdx !== -1 && (createdIdx === -1 || errorIdx < createdIdx)) {
+    const detail = extractErrMsg(sniff);
+    const isRateLimit = RATE_LIMIT_RE.test(sniff);
+    return { cls: isRateLimit ? "rate-limit" : "other-error", detail };
+  }
+  if (createdIdx !== -1) {
     return { cls: "healthy" };
   }
   // Error signatures: an `event: error`, a top-level error type, or an error object.

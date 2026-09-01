@@ -84,3 +84,72 @@ describe("peekStreamStart", () => {
     expect(peeked.response).toBe(res); // original, untouched
   });
 });
+
+// ── OpenAI Responses wire (gpt-5.6-sol lane) ─────────────────────────────────
+// Regression: server_is_overloaded arrives as HTTP 200 with the error event as
+// the FIRST stream event. Before the Responses signatures existed, a healthy
+// Responses stream matched no signature at all (peek stalled to timeout), and
+// the composed-handler gate never ran the peek for this lane — the error flowed
+// to the parser, which ends the turn as "[API Error: …]" text: Claude Code sees
+// a completed turn and an autonomous agent stops on it (po-2025:CoursIA-2,
+// 2026-09-01).
+const RESPONSES_CREATED =
+  'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1"}}\n\n';
+const RESPONSES_TEXT =
+  'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}\n\n';
+const RESPONSES_OVERLOAD =
+  'event: error\ndata: {"type":"error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}\n\n';
+
+describe("peekStreamStart — OpenAI Responses wire", () => {
+  test("classifies response.created as healthy immediately (no timeout stall) and hands the full stream downstream", async () => {
+    const res = sseResponse([RESPONSES_CREATED + RESPONSES_TEXT]);
+    const t0 = Date.now();
+    const peeked = await peekStreamStart(res);
+
+    expect(peeked.cls).toBe("healthy");
+    // The classification must come from the created signature, not from the
+    // 2s deadline: a healthy Responses request cannot pay a fixed 2s TTFT tax.
+    expect(Date.now() - t0).toBeLessThan(1000);
+    const body = await readAll(peeked.response);
+    expect(body).toContain("response.created");
+    expect(body).toContain("Hello");
+  });
+
+  test("classifies a first-event server_is_overloaded as rate-limit (the retriable class)", async () => {
+    const res = sseResponse([RESPONSES_OVERLOAD]);
+    const peeked = await peekStreamStart(res);
+
+    expect(peeked.cls).toBe("rate-limit");
+    expect(peeked.detail).toContain("overloaded");
+  });
+
+  test("classifies response.failed carrying an overloaded error as rate-limit", async () => {
+    const res = sseResponse([
+      'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}}\n\n',
+    ]);
+    const peeked = await peekStreamStart(res);
+
+    expect(peeked.cls).toBe("rate-limit");
+    expect(peeked.detail).toContain("overloaded");
+  });
+
+  test("an error AFTER response.created stays healthy — mid-stream failures are not peek-retriable", async () => {
+    const res = sseResponse([RESPONSES_CREATED + RESPONSES_OVERLOAD]);
+    const peeked = await peekStreamStart(res);
+
+    expect(peeked.cls).toBe("healthy");
+    const body = await readAll(peeked.response);
+    expect(body).toContain("server_is_overloaded"); // parser's finalizer owns it
+  });
+
+  test("a non-retryable Responses admission error is other-error and flows downstream", async () => {
+    const res = sseResponse([
+      'event: error\ndata: {"type":"error","code":"invalid_request_error","message":"Unknown parameter"}\n\n',
+    ]);
+    const peeked = await peekStreamStart(res);
+
+    expect(peeked.cls).toBe("other-error");
+    const body = await readAll(peeked.response);
+    expect(body).toContain("Unknown parameter");
+  });
+});
