@@ -431,6 +431,38 @@ describe("reset-time awareness", () => {
       resetStepSuccess("opus", 0);
       expect(resolveFailoverTarget("opus").stepIndex).toBe(0); // not held by the stale reset date
     });
+
+    // Production 2026-09-01: sonnet step0 (Mistral) reached count=96 in three hours
+    // the morning after its declared 09-01 reset. A past resetAt returned false
+    // outright, so the step was permanently EXEMPT from backoff: each wall re-marked
+    // it and the very next request re-selected it. handleWithCascade then burned all
+    // `steps.length + 1` attempts on the same dead step and surfaced its 402 to the
+    // client — every sonnet lane in the fleet down, with two healthy steps beneath.
+    it("re-probes ONCE after the reset, then backs off again when the wall is still up", () => {
+      initFailover({ ...OPUS_CASCADE, CLAUDISH_FAILOVER_ACTIVE: "opus" });
+      markStepFailed("opus", 0, "subscription wall", SEPT1);
+      clock = SEPT1.getTime() + 60_000;
+      expect(resolveFailoverTarget("opus").stepIndex).toBe(0); // the consume-on-reset probe
+
+      // The probe fails: the subscription was NOT renewed (or was spent same-day).
+      markStepFailed("opus", 0, "402 again, right after the declared reset", SEPT1);
+      // The stale date must NOT exempt the step from backoff any more.
+      expect(resolveFailoverTarget("opus").stepIndex).toBe(1);
+
+      // And it stays skipped for the ordinary backoff rung, not forever. This is the
+      // SECOND wall for this step, so the rung is BACKOFF_MS[1] = 30 min, not 10.
+      clock += 29 * 60_000;
+      expect(resolveFailoverTarget("opus").stepIndex).toBe(1);
+      clock += 2 * 60_000; // past the 30-min rung
+      expect(resolveFailoverTarget("opus").stepIndex).toBe(0);
+    });
+
+    it("a reset date already in the past never exempts a walled step from backoff", () => {
+      initFailover({ ...OPUS_CASCADE, CLAUDISH_FAILOVER_ACTIVE: "opus" });
+      const yesterday = new Date(clock - 24 * 3600_000);
+      markStepFailed("opus", 0, "wall whose declared reset already elapsed", yesterday);
+      expect(resolveFailoverTarget("opus").stepIndex).toBe(1); // backoff governs, not the stale date
+    });
   });
 });
 

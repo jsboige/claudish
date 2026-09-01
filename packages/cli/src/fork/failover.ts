@@ -316,9 +316,19 @@ function stepTtlMs(count: number): number {
 
 function isStepTtlFailed(f: StepFailure | undefined): boolean {
   if (!f || f.count === 0) return false;
-  // A known reset date dominates the backoff: the wall cannot lift before it, and a
-  // reset in the past means "probe now" so a recovered step is consumed, not avoided.
-  if (f.resetAt) return Date.now() < f.resetAt.getTime();
+  // A known reset date EXTENDS the backoff, it never replaces it. Before the reset
+  // instant the wall cannot lift, so the step stays failed however short the backoff
+  // rung is. After it, the step is merely probeable — and probeable means the ordinary
+  // exponential backoff decides, exactly as for a step that never had a reset date.
+  //
+  // Returning false outright once the date passed (the 21/08 shape of this function)
+  // made the step permanently exempt from backoff: each new wall re-marked it and the
+  // very next request re-selected it, so handleWithCascade burned all
+  // `steps.length + 1` attempts on one dead step and surfaced its 402 to the client
+  // instead of advancing. Production 2026-09-01: sonnet step0 (Mistral) hit count=96
+  // in three hours the morning after its declared reset, taking every sonnet lane in
+  // the fleet down with it.
+  if (f.resetAt && Date.now() < f.resetAt.getTime()) return true;
   return Date.now() - f.lastFailure.getTime() < stepTtlMs(f.count);
 }
 
