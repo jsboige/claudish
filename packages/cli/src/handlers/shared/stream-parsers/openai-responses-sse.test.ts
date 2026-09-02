@@ -207,3 +207,108 @@ describe("context overflow must not report usage 0+0", () => {
     expect(firstMessageDelta(output).usage.input_tokens).toBe(0);
   });
 });
+
+describe("transparent retry on early server_error (2026-09-02 Sol crashes)", () => {
+  // OpenAI server_error arrives 1-54s AFTER the first event — outside the peek
+  // window — and each surfaced one killed the agent turn, forcing a manual
+  // relaunch with a full ~100-190k-token context re-upload. When the error
+  // arrives while ZERO content blocks have been emitted, the retry is
+  // invisible to the client and safe.
+
+  function sseResponse(events: Array<Record<string, unknown>>): Response {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sseChunks(events)));
+        controller.close();
+      },
+    });
+    return new Response(stream, { headers: new Headers(SSE_HEADERS) });
+  }
+
+  async function runWithRetry(
+    events: Array<Record<string, unknown>>,
+    retryUpstream: () => Promise<Response | null>
+  ) {
+    let output = "";
+    const lines = await captureStdout(() => {
+      const result = createResponsesStreamHandler(mockContext(), sseResponse(events), {
+        modelName: "gpt-5.6-sol",
+        retryUpstream,
+        retryBackoffMs: [1, 1],
+      }) as Response;
+      return result.body?.pipeTo(
+        new WritableStream({
+          write(chunk: Uint8Array) {
+            output += new TextDecoder().decode(chunk, { stream: true });
+          },
+        })
+      );
+    });
+    return { lines, output };
+  }
+
+  test("server_error with zero blocks emitted is retried transparently", async () => {
+    let calls = 0;
+    const { lines, output } = await runWithRetry(
+      [{ type: "error", error: { code: "server_error", message: "boom once" } }],
+      async () => {
+        calls++;
+        return sseResponse([
+          { type: "response.output_text.delta", delta: "recovered" },
+          { type: "response.completed", response: { usage: { input_tokens: 9, output_tokens: 3 } } },
+        ]);
+      }
+    );
+    expect(calls).toBe(1);
+    expect(lines.some((l) => l.includes("transparent retry 1/2"))).toBe(true);
+    // The client saw the RETRIED stream, not the error.
+    expect(output).toContain("recovered");
+    expect(output).not.toContain("[API Error:");
+    expect(output).toContain("event: message_stop");
+  });
+
+  test("server_error AFTER client-visible content is never retried (would duplicate)", async () => {
+    let calls = 0;
+    const { output } = await runWithRetry(
+      [
+        { type: "response.output_text.delta", delta: "partial answer" },
+        { type: "error", error: { code: "server_error", message: "mid-stream boom" } },
+      ],
+      async () => {
+        calls++;
+        return sseResponse([{ type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1 } } }]);
+      }
+    );
+    expect(calls).toBe(0);
+    expect(output).toContain("[API Error: server_error mid-stream boom]");
+  });
+
+  test("retries are bounded at 2, then the error is surfaced", async () => {
+    let calls = 0;
+    const { lines, output } = await runWithRetry(
+      [{ type: "error", error: { code: "server_error", message: "persistent boom" } }],
+      async () => {
+        calls++;
+        // First retry: another server_error stream. Second: fetch failure (null).
+        if (calls === 1) return sseResponse([{ type: "error", error: { code: "server_error", message: "again" } }]);
+        return null;
+      }
+    );
+    expect(calls).toBe(2);
+    expect(lines.some((l) => l.includes("transparent retry 2/2"))).toBe(true);
+    expect(output).toContain("[API Error: server_error again]");
+  });
+
+  test("deterministic codes (context overflow) never retry", async () => {
+    let calls = 0;
+    const { output } = await runWithRetry(
+      [{ type: "error", error: { code: "context_length_exceeded", message: "too big" } }],
+      async () => {
+        calls++;
+        return sseResponse([]);
+      }
+    );
+    expect(calls).toBe(0);
+    expect(output).toContain("[API Error: context_length_exceeded too big]");
+  });
+});

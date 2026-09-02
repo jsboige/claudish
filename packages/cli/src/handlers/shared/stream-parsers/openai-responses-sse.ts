@@ -63,9 +63,19 @@ export function createResponsesStreamHandler(
     toolNameMap?: Map<string, string>;
     /** dispatch → upstream headers latency, from ComposedHandler (for [ttft]). */
     headerLatencyMs?: number;
+    /**
+     * Transparent in-stream retry (2026-09-02 Sol crashes): re-issues the SAME
+     * upstream request. Called ONLY when a retryable error event (server_error…)
+     * arrives while ZERO content blocks have been emitted to the client — from
+     * the client's perspective nothing happened (it saw only message_start +
+     * pings). Returns null / throws → the original error is surfaced as before.
+     */
+    retryUpstream?: () => Promise<Response | null>;
+    /** Backoff before each transparent-retry attempt (tests pass [1,1]). */
+    retryBackoffMs?: [number, number];
   }
 ): Response {
-  const reader = response.body?.getReader();
+  let reader = response.body?.getReader();
   if (!reader) {
     return c.json(wrapAnthropicError(500, "No response body"), 500) as any;
   }
@@ -103,6 +113,18 @@ export function createResponsesStreamHandler(
   let incompleteReason: string | null = null;
   let dataEvents = 0;
   let totalBytes = 0;
+  // Transparent-retry state: bounded, and only while nothing is client-visible.
+  let retryAttempts = 0;
+  const MAX_TRANSPARENT_RETRIES = 2;
+  // server_error = the observed OpenAI transient (2026-09-02: 10 hits in 3h,
+  // each one killing an agent turn). Deterministic codes are excluded — a
+  // retry would fail identically and just burn the attempt.
+  const RETRYABLE_ERROR_CODES = new Set([
+    "server_error",
+    "internal_error",
+    "temporarily_unavailable",
+    "overloaded_error",
+  ]);
 
   // Track function calls being streamed
   const functionCalls: Map<
@@ -142,7 +164,8 @@ export function createResponsesStreamHandler(
       }, 1000);
 
       try {
-        while (true) {
+        // readLoop: a transparent retry swaps the upstream reader and restarts here.
+        readLoop: while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           lastActivity = Date.now();
@@ -293,6 +316,49 @@ export function createResponsesStreamHandler(
                   `[ResponsesSSE] API error model=${opts.modelName} reqN=${reqN} code=${errCode} msg=${errMsg}`,
                   true
                 );
+
+                // Transient upstream failure with nothing client-visible yet:
+                // retry transparently. OpenAI server_error arrives 1-54s AFTER
+                // the first event (measured 2026-09-02) — far outside the peek
+                // window — and every surfaced one kills the agent turn, forcing
+                // a manual relaunch that re-uploads the full ~100-190k-token
+                // context. Safe ONLY while zero content blocks were emitted
+                // (nextBlockIndex === 0, no open text block, no tool calls):
+                // past that, a retry would duplicate client-visible content.
+                if (
+                  opts.retryUpstream &&
+                  retryAttempts < MAX_TRANSPARENT_RETRIES &&
+                  RETRYABLE_ERROR_CODES.has(errCode) &&
+                  nextBlockIndex === 0 &&
+                  textBlockIndex === null &&
+                  functionCalls.size === 0
+                ) {
+                  retryAttempts++;
+                  const backoffMs =
+                    opts.retryBackoffMs?.[retryAttempts - 1] ?? (retryAttempts === 1 ? 1_000 : 3_000);
+                  log(
+                    `[ResponsesSSE] ${errCode} before any client-visible block — transparent retry ${retryAttempts}/${MAX_TRANSPARENT_RETRIES} in ${backoffMs}ms (reqN=${reqN})`,
+                    true
+                  );
+                  await new Promise((r) => setTimeout(r, backoffMs));
+                  let retryResp: Response | null = null;
+                  try {
+                    retryResp = await opts.retryUpstream();
+                  } catch (e) {
+                    log(`[ResponsesSSE] retry fetch failed (reqN=${reqN}): ${(e as Error).message}`);
+                  }
+                  if (retryResp && retryResp.ok && retryResp.body) {
+                    try {
+                      await reader.cancel();
+                    } catch {
+                      // old upstream body — best-effort release
+                    }
+                    reader = retryResp.body.getReader();
+                    buffer = "";
+                    continue readLoop;
+                  }
+                  // Retry unavailable or failed → fall through, surface the error.
+                }
 
                 // A context overflow must not be reported as `usage 0+0`: see
                 // parseContextOverflow above — a zero wedges the client's

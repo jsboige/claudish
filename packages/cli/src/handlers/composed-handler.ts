@@ -987,7 +987,18 @@ export class ComposedHandler implements ModelHandler {
       claudeRequest,
       toolNameMap,
       onStreamComplete,
-      latencyMs
+      latencyMs,
+      // Transparent in-stream retry (openai-responses-sse, 2026-09-02 Sol
+      // crashes): re-issues the SAME upstream request via doFetch DIRECTLY —
+      // not enqueueRequest, same rationale as the rate-limit peek loop: the
+      // transport's own retry must not compound with this one.
+      async (): Promise<Response | null> => {
+        try {
+          return await doFetch();
+        } catch {
+          return null;
+        }
+      }
     );
 
     // Non-streaming clients (notably Claude Code's `/compact`, and any caller that
@@ -1017,7 +1028,8 @@ export class ComposedHandler implements ModelHandler {
     claudeRequest: any,
     toolNameMap?: Map<string, string>,
     onComplete?: () => void,
-    headerLatencyMs?: number // dispatch → upstream headers (for the [ttft] marker)
+    headerLatencyMs?: number, // dispatch → upstream headers (for the [ttft] marker)
+    retryUpstream?: () => Promise<Response | null> // transparent in-stream retry (openai-responses-sse)
   ): Response {
     const onTokenUpdate = (input: number, output: number) => {
       const strategy = this.options.tokenStrategy || "standard";
@@ -1076,6 +1088,7 @@ export class ComposedHandler implements ModelHandler {
           onTokenUpdate,
           toolNameMap: adapter.getToolNameMap(),
           headerLatencyMs,
+          retryUpstream,
         });
 
       case "anthropic-sse":
