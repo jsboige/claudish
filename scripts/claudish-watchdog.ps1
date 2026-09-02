@@ -93,16 +93,62 @@ function Test-ProxyWithTools {
     $headers = @{}
     if ($proxyKey) { $headers["x-proxy-key"] = $proxyKey }
 
+    # Wall-clock bound — and why this is NOT `Invoke-WebRequest -TimeoutSec`.
+    # That parameter bounds only *establishing* the response; it does not bound
+    # reading a streaming body. The proxy sends headers immediately and then
+    # streams, so against a wedged pipeline the cmdlet blocks in the body read
+    # with no timer running at all. On 2026-09-02 that is exactly what happened:
+    # ten consecutive 15-minute probes entered here and none ever returned, so
+    # the HANG SIGNAL 1/2 -> HANG CONFIRMED 2/2 -> restart path was never reached
+    # during a 2h27 fleet-wide outage. A watchdog that cannot conclude is not a
+    # watchdog.
+    #
+    # HttpClient.Timeout covers the whole operation, content read included
+    # (SendAsync defaults to HttpCompletionOption.ResponseContentRead), and the
+    # hard Wait() ceiling below guarantees this function returns even if that
+    # timer itself fails to fire.
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+    $client = $null
     try {
-        $response = Invoke-WebRequest -Uri "$Url/v1/messages" `
-            -Method POST `
-            -ContentType "application/json" `
-            -Headers $headers `
-            -Body $body `
-            -TimeoutSec $TimeoutSec `
-            -UseBasicParsing
+        $client = [System.Net.Http.HttpClient]::new()
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
 
-        $content = $response.Content
+        $req = [System.Net.Http.HttpRequestMessage]::new(
+            [System.Net.Http.HttpMethod]::Post, "$Url/v1/messages")
+        $req.Content = [System.Net.Http.StringContent]::new(
+            $body, [System.Text.Encoding]::UTF8, "application/json")
+        foreach ($k in $headers.Keys) {
+            [void]$req.Headers.TryAddWithoutValidation($k, $headers[$k])
+        }
+
+        $sendTask = $client.SendAsync($req)
+        if (-not $sendTask.Wait(($TimeoutSec + 15) * 1000)) {
+            # The ceiling fired, so the client's own timer did not. Reporting a
+            # hang beats blocking here forever, which is the failure being fixed.
+            return @{ Ok = $false; Hang = $true; Detail = "TIMEOUT after ${TimeoutSec}s (hard ceiling) - stream hung" }
+        }
+        $response = $sendTask.Result
+        $status = [int]$response.StatusCode
+
+        # HttpClient does not throw on a non-2xx (Invoke-WebRequest did), so the
+        # wall/wiring verdicts are decided inline instead of in a catch. Same
+        # verdicts, same reasoning: when every cascade step is walled the proxy
+        # correctly answers 429/402, and GLM walls ~2x/day (median 57 min).
+        # Restarting the container cannot lift an upstream quota wall - it only
+        # drops every agent mid-stream.
+        if ($status -ge 400) {
+            if ($status -eq 402 -or $status -eq 429 -or $status -eq 529) {
+                return @{ Ok = $false; Hang = $false; Detail = "upstream wall HTTP $status - not a hang, no restart" }
+            }
+            if ($status -lt 500) {
+                return @{ Ok = $false; Hang = $false; Detail = "client/wiring error HTTP $status - a restart would not fix it" }
+            }
+            return @{ Ok = $false; Hang = $true; Detail = "HTTP error $status" }
+        }
+
+        # Already fully buffered by ResponseContentRead, so this does not block.
+        $content = $response.Content.ReadAsStringAsync().Result
+        if ($null -eq $content) { $content = "" }
 
         # Stream must contain a terminal event
         if ($content -match "message_stop") {
@@ -110,35 +156,43 @@ function Test-ProxyWithTools {
             $type = if ($hasToolUse) { "tool_use+end" } else { "text+end" }
             return @{ Ok = $true; Hang = $false; Detail = "stream OK ($type, $($content.Length) bytes)" }
         } elseif ($content.Length -gt 100) {
-            # Got data but no message_stop — suspicious but not fatal
+            # Got data but no message_stop - suspicious but not fatal
             return @{ Ok = $false; Hang = $true; Detail = "stream incomplete ($($content.Length) bytes, no message_stop)" }
         } elseif ($content.Length -gt 0) {
             return @{ Ok = $false; Hang = $true; Detail = "short response ($($content.Length) bytes): $($content.Substring(0, [Math]::Min(200, $content.Length)))" }
         } else {
-            return @{ Ok = $false; Hang = $true; Detail = "EMPTY response — stream hung" }
+            return @{ Ok = $false; Hang = $true; Detail = "EMPTY response - stream hung" }
         }
-    }
-    catch [System.Net.WebException] {
-        # A non-2xx makes Invoke-WebRequest throw. Most of these are NOT hangs:
-        # when every cascade step is walled the proxy correctly answers 429/402,
-        # and GLM walls ~2x/day (median 57 min). Restarting the container cannot
-        # lift an upstream quota wall — it only drops every agent mid-stream.
-        $code = 0
-        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-        if ($code -eq 402 -or $code -eq 429 -or $code -eq 529) {
-            return @{ Ok = $false; Hang = $false; Detail = "upstream wall HTTP $code — not a hang, no restart" }
-        }
-        if ($code -ge 400 -and $code -lt 500) {
-            return @{ Ok = $false; Hang = $false; Detail = "client/wiring error HTTP $code — a restart would not fix it" }
-        }
-        return @{ Ok = $false; Hang = $true; Detail = "HTTP error ${code}: $($_.Exception.Message)" }
     }
     catch {
-        $msg = $_.Exception.Message
-        if ($msg -match "timed? ?out" -or $msg -match "timeout") {
-            return @{ Ok = $false; Hang = $true; Detail = "TIMEOUT after ${TimeoutSec}s — stream hung" }
+        # The real cause is buried: PS wraps a failing .Wait()/.Result in a
+        # MethodInvocationException, around an AggregateException, around the
+        # TaskCanceledException a timeout actually raises. So walk the whole
+        # chain, and decide on the TYPE - the message is localized (PS 5.1 on a
+        # French host says "Une ou plusieurs erreurs se sont produites") and
+        # would never match an English "timeout".
+        $chain = @()
+        $ex = $_.Exception
+        while ($ex -and $chain.Count -lt 10) {
+            $chain += $ex
+            if ($ex -is [System.AggregateException] -and $ex.InnerExceptions.Count -ge 1) {
+                $ex = $ex.InnerExceptions[0]
+            } else {
+                $ex = $ex.InnerException
+            }
         }
+        $timedOut = $false
+        foreach ($e in $chain) { if ($e -is [System.OperationCanceledException]) { $timedOut = $true } }
+        $msg = $chain[$chain.Count - 1].Message   # innermost: the informative one
+        if ($timedOut -or $msg -match "timed? ?out" -or $msg -match "timeout") {
+            return @{ Ok = $false; Hang = $true; Detail = "TIMEOUT after ${TimeoutSec}s - stream hung" }
+        }
+        # Connection refused / socket reset land here: the proxy is not answering
+        # at all, which a restart CAN fix.
         return @{ Ok = $false; Hang = $true; Detail = "error: $msg" }
+    }
+    finally {
+        if ($client) { $client.Dispose() }
     }
 }
 
