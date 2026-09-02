@@ -39,8 +39,10 @@ tmp/
 temp/
 all-models.json
 
-# Claude Code local files
-.claude/
+# Claude Code shared harness — tracked (rules/, agents/, skills/, settings) so the
+# fleet shares it through this repo. Machine-local state below stays untracked.
+.claude/worktrees/
+.claude/scheduled_tasks.lock
 .claudemem/
 
 # npm lockfile (we use bun.lock)

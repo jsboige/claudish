@@ -6,6 +6,12 @@
 #   2. Checks that the stream completes within timeout
 #   3. Also checks container uptime — proactive restart at 11h before degradation
 #
+# Every ambiguous stop logs one DIAG[...] line (Write-DiagLine): is the published
+# port actually bound, and does the host have commit headroom. The 02/09 outage
+# (host commit exhaustion — nothing listened on :3000, docker.exe would not
+# launch) had to be reconstructed from the Windows event log after the fact;
+# those two facts now self-classify the incident as it happens.
+#
 # Install (run as admin):
 #   schtasks /create /tn "ClaudishWatchdog" /tr "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File D:\Dev\claudish\scripts\claudish-watchdog.ps1" /sc minute /mo 15 /ru SYSTEM /rl HIGHEST /f
 #
@@ -281,11 +287,106 @@ function Invoke-DockerBounded {
         return @{ Ok = ($p.ExitCode -eq 0); TimedOut = $false; Code = $p.ExitCode; Out = $out.Trim() }
     }
     catch {
-        return @{ Ok = $false; TimedOut = $false; Code = -1; Out = ""; Error = $_.Exception.Message }
+        # Start-Process itself failed: docker.exe never launched. That is the
+        # 02/09 signature — under host commit exhaustion the CLI cannot start,
+        # which is how ten runs wrote a banner and nothing else.
+        return @{ Ok = $false; TimedOut = $false; Code = -1; Out = ""; Error = $_.Exception.Message; LaunchFail = $true }
     }
     finally {
         Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Test-PortListen {
+    param([string]$HostName = "localhost", [int]$Port = 3000, [int]$TimeoutMs = 3000)
+
+    # TcpClient + a bounded Wait, not Test-NetConnection: TNC takes seconds,
+    # writes progress records, and does its own allocations — all bad in a
+    # watchdog that must conclude, possibly on a starved host. Everything is
+    # guarded: with $ErrorActionPreference = Stop a throwing probe would kill
+    # the cycle, and a probe that cannot run on a sick host is worthless.
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $tcp.ConnectAsync($HostName, $Port)
+            try {
+                if (-not $connect.Wait($TimeoutMs)) {
+                    # No answer within budget: black-holed, not merely absent.
+                    return @{ Listening = $false; Detail = "no-answer ${TimeoutMs}ms" }
+                }
+            }
+            catch [System.AggregateException] {
+                # Task.Wait() rethrows the task's own fault. A fast refusal is
+                # the healthy "nothing is bound here" answer — SocketException
+                # in the chain means refused/reset, not a probe failure.
+                $refused = $false
+                $ex = $_.Exception
+                while ($ex) {
+                    if ($ex -is [System.Net.Sockets.SocketException]) { $refused = $true }
+                    if ($ex -is [System.AggregateException] -and $ex.InnerExceptions.Count -ge 1) { $ex = $ex.InnerExceptions[0] } else { $ex = $ex.InnerException }
+                }
+                if ($refused) { return @{ Listening = $false; Detail = "refused" } }
+                return @{ Listening = $false; Detail = "connect error: $($_.Exception.InnerException.Message)" }
+            }
+            if ($tcp.Connected) { return @{ Listening = $true } }
+            return @{ Listening = $false; Detail = "completed but not connected" }
+        }
+        finally { $tcp.Dispose() }
+    }
+    catch {
+        return @{ Listening = $false; Detail = "error: $($_.Exception.Message)" }
+    }
+}
+
+function Get-HostCommit {
+    # Commit charge vs commit limit — the Id 26 "insufficient virtual memory"
+    # early-warning, read in-process (no child process to launch; launching is
+    # exactly what dies under commit exhaustion). Win32_OperatingSystem's
+    # "virtual memory" IS the commit charge pair.
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem `
+            -Property @("TotalVirtualMemorySize", "FreeVirtualMemory") -ErrorAction Stop
+        $limitKB = [double]$os.TotalVirtualMemorySize
+        $freeKB = [double]$os.FreeVirtualMemory
+        if ($limitKB -gt 0) {
+            return @{
+                Ok      = $true
+                UsedPct = [Math]::Round((($limitKB - $freeKB) / $limitKB) * 100, 1)
+                UsedGB  = [Math]::Round(($limitKB - $freeKB) / 1MB, 1)
+                LimitGB = [Math]::Round($limitKB / 1MB, 1)
+            }
+        }
+    }
+    catch {}
+    return @{ Ok = $false }
+}
+
+function Write-DiagLine {
+    # One line at every ambiguous stop, naming both facts the 02/09 postmortem
+    # had to reconstruct after the fact: is the published port bound, and does
+    # the host have commit headroom. Together they self-classify the incident:
+    #   deaf + commit >= 95%  -> host commit exhaustion (container restart useless)
+    #   deaf + headroom       -> engine/port-forwarder, not the container
+    #   listening             -> wiring is fine; suspect the pipeline/upstream
+    param([string]$Tag)
+
+    $port = 3000
+    try { $port = ([uri]$ProxyUrl).Port } catch {}
+    $p = Test-PortListen -Port $port
+    $c = Get-HostCommit
+
+    $portTxt = if ($p.Listening) { "port ${port} LISTENING" } else { "port ${port} DEAF ($($p.Detail))" }
+    $commitTxt = if ($c.Ok) { "commit $($c.UsedPct)% ($($c.UsedGB)/$($c.LimitGB) GB)" } else { "commit n/a" }
+    $verdict = if (-not $p.Listening -and $c.Ok -and $c.UsedPct -ge 95) {
+        "-> host commit exhaustion signature: container restart is useless"
+    }
+    elseif (-not $p.Listening) {
+        "-> port deaf with commit headroom: engine/port-forwarder, not the container"
+    }
+    else {
+        "-> port answers: wiring fine, suspect pipeline/upstream"
+    }
+    Write-Log "DIAG[$Tag]: $portTxt, $commitTxt $verdict"
 }
 
 # --- Main ---
@@ -306,6 +407,7 @@ function Test-DockerEngine {
 function Start-DockerEngine {
     if (Test-DockerEngine) { return $true }
     Write-Log "ENGINE-DOWN: docker CLI cannot reach the engine — recovering"
+    Write-DiagLine "engine-down"
     try { Start-Service com.docker.service -ErrorAction SilentlyContinue } catch {}
     if (-not (Get-Process "Docker Desktop" -ErrorAction SilentlyContinue)) {
         try {
@@ -336,6 +438,7 @@ if ($inspect.TimedOut) {
     # The 2026-09-02 signature, now named instead of deduced from an absence.
     # No answer at all is an engine fault, which the recovery path can act on.
     Write-Log "DOCKER-TIMEOUT: inspect did not answer within ${DockerTimeoutSec}s — engine not responding"
+    Write-DiagLine "docker-timeout"
     if (-not (Start-DockerEngine)) { exit 1 }
     $inspect = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")
     if ($inspect.TimedOut) {
@@ -345,6 +448,12 @@ if ($inspect.TimedOut) {
 }
 $containerStatus = $inspect.Out
 if (-not $inspect.Ok -or $containerStatus -ne "running") {
+    if ($inspect.LaunchFail) {
+        # Distinguished from a CLI error: the process never started at all.
+        # On 02/09 this fired 3x (docker.exe) and 6x (cmd.exe) silently.
+        Write-Log "DOCKER-LAUNCH-FAIL: docker.exe would not start ($($inspect.Error)) — commit-exhaustion signature"
+        Write-DiagLine "docker-launch-fail"
+    }
     if (-not $inspect.Ok) {
         # CLI answered but failed — engine down, not just the container.
         if (-not (Start-DockerEngine)) { exit 1 }
@@ -419,11 +528,13 @@ if (-not $result.Hang) {
 $consecutive = $consecutive + 1
 if ($consecutive -lt 2) {
     Write-Log "HANG SIGNAL 1/2 (uptime=${uptimeHours}h): $($result.Detail) — waiting for confirmation next cycle, NO restart"
+    Write-DiagLine "hang-signal"
     Set-State -ConsecutiveHangs $consecutive
     exit 0
 }
 
 Write-Log "HANG CONFIRMED 2/2 (uptime=${uptimeHours}h): $($result.Detail)"
+Write-DiagLine "hang-confirmed"
 Invoke-ClaudishDrainedRestart -Reason "confirmed hang" -Container $ContainerName -Url $ProxyUrl -MaxWait $DrainMaxWaitHangSec
 Set-State -ConsecutiveHangs 0
 
@@ -432,5 +543,6 @@ if ($result2.Ok) {
     Write-Log "RECOVERED: $($result2.Detail)"
 } else {
     Write-Log "CRITICAL: Still broken after restart: $($result2.Detail)"
+    Write-DiagLine "post-restart-fail"
     exit 1
 }
