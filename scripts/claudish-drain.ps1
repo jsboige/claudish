@@ -30,6 +30,13 @@
 #      . "$PSScriptRoot\claudish-drain.ps1"
 #      Invoke-ClaudishDrainedRestart -Reason "confirmed hang"
 #
+# 3. Deploying — a RESTART reloads neither the image nor .env, so shipping a
+#    rebuilt image needs -Recreate (`docker compose up -d`) instead:
+#      . "$PSScriptRoot\claudish-drain.ps1"
+#      Invoke-ClaudishDrainedRestart -Reason "deploy vX.Y" -Recreate
+#    Same drain, different action. Plain `docker compose up -d` would deploy
+#    the image just as well, but at the cost of every in-flight agent turn.
+#
 # Targets PowerShell 5.1: scheduled tasks run `powershell`, not `pwsh`.
 #
 # READING drain.log
@@ -118,7 +125,14 @@ function Invoke-ClaudishDrainedRestart {
         [int]$MaxWait = $MaxWaitSec,
         [int]$ObserveSec = 300,
         [int]$RelaxSec = 30,
-        [int]$PollSec = 2
+        [int]$PollSec = 2,
+        # A restart reloads NEITHER the image NOR .env: Docker restarts the
+        # existing container, config and all. Deploying a rebuilt image or an
+        # edited .env therefore needs a RECREATE, and without this switch the
+        # only recreate available was an undrained `docker compose up -d` —
+        # so every deployment cost every in-flight agent turn.
+        [switch]$Recreate,
+        [string]$ComposeDir = (Split-Path -Parent $PSScriptRoot)
     )
 
     $active = Get-ClaudishActiveStreams -Url $Url
@@ -188,14 +202,28 @@ function Invoke-ClaudishDrainedRestart {
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
     # governs how long Docker waits between SIGTERM and SIGKILL, and without it
     # a docker-daemon default (10s) can truncate the graceful window #57 added.
-    docker restart -t 120 $Container 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-DrainLog "RESTART ($Reason): docker restart $Container FAILED (exit $LASTEXITCODE)"
-        return $false
+    if ($Recreate) {
+        Push-Location $ComposeDir
+        try {
+            docker compose up -d --timeout 120 2>&1 | ForEach-Object { Write-DrainLog "RECREATE ($Reason): $_" }
+            $code = $LASTEXITCODE
+        } finally { Pop-Location }
+        if ($code -ne 0) {
+            Write-DrainLog "RECREATE ($Reason): docker compose up -d FAILED (exit $code) in $ComposeDir"
+            return $false
+        }
+        $verb = "docker compose up -d"
+    } else {
+        docker restart -t 120 $Container 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-DrainLog "RESTART ($Reason): docker restart $Container FAILED (exit $LASTEXITCODE)"
+            return $false
+        }
+        $verb = "docker restart"
     }
     $restartDoneAt = Get-Date
     $restartSecs = [int](($restartDoneAt - $restartAt).TotalSeconds)
-    Write-DrainLog "RESTART ($Reason): docker restart returned in ${restartSecs}s — SIGTERM delivered within this window"
+    Write-DrainLog "RESTART ($Reason): $verb returned in ${restartSecs}s — SIGTERM delivered within this window"
     Start-Sleep -Seconds 20
 
     $after = Get-ClaudishActiveStreams -Url $Url
