@@ -1,6 +1,7 @@
 /**
  * Stream registry (fork extension) — counts in-flight SSE responses so an
- * operator can DRAIN before restarting the proxy.
+ * operator can DRAIN before restarting the proxy, and reports whether those
+ * streams are still MOVING so a wedged proxy can be told apart from a busy one.
  *
  * Why this exists. A `docker restart` kills every in-flight SSE stream
  * mid-body, and the client reports:
@@ -20,10 +21,58 @@
  * in-flight work. This registry is that missing signal — `/health` reports the
  * count, and the watchdog waits for it to reach zero.
  *
+ * LIVENESS (2026-09-02). Counting alone says how much work is in flight, never
+ * whether it is progressing, and `/health` used to report only the count plus an
+ * uptime — four lines that touch nothing in the request pipeline. On 2026-09-02
+ * the hub went silent at 03:20:45Z and served nothing until a manual reboot at
+ * 05:47Z: 2h27, fleet-wide. Every sidecar kept relaying into it, because the
+ * prober's whole notion of "hub alive" is a 200 from that endpoint, and a
+ * process that still answers a constant-time JSON handler answers it while
+ * serving nobody. `relay.ts` names this exact hole and calls it "never observed";
+ * it has now been observed once, and it cost every machine its morning.
+ *
+ * So the tracker also stamps the last moment anything PROGRESSED, and reports
+ * whether work is in flight. Work in flight with no progress for a long while is
+ * a wedged pipeline — a fact only this layer can see, and `/health` turns it into
+ * the 503 the sidecars already know how to act on.
+ *
+ * "Work in flight" deliberately spans BOTH sides of `await next()`. Counting only
+ * SSE bodies would miss the likelier shape of a wedge: a request that never gets
+ * as far as producing a response at all (a dead upstream socket with no timeout,
+ * a deadlock on a shared resource). Those requests are invisible to a body
+ * wrapper — the middleware is still sitting in `next()` — yet they are exactly
+ * the ones an operator would call "hung". So pending requests are counted from
+ * entry, and progress is stamped on every byte, every stream end, and every
+ * completed response.
+ *
+ * `/health` itself is excluded from both. Each sidecar polls it every 10s, so
+ * counting it as progress would refresh the stamp forever and leave the detector
+ * permanently blind — it would report a healthy hub precisely because it was
+ * being asked whether it was healthy.
+ *
+ * The byte stamp measures ARRIVAL from upstream: the wrapper pulls one chunk
+ * ahead, so it is refreshed when bytes land, not when the client consumes them.
+ * That is the right signal — a wedged upstream stops producing.
+ *
+ * Two known corners, both costing at most one demotion: a client that stops
+ * reading for longer than the threshold while holding a stream open, and a
+ * single long non-streaming request (a `stream:false` condensation) on an
+ * otherwise idle hub. Any other request completing refreshes the stamp, so on a
+ * hub with traffic neither fires.
+ *
+ * The asymmetry that sets the threshold: a false positive demotes the fleet to
+ * AUTONOMOUS for ~a minute, a false negative is the outage above. But a demotion
+ * is not free either (an unarmed sidecar cascade meets a provider wall), so the
+ * bound is deliberately far above any legitimate silence. Measured on this hub:
+ * upstream header waits reach ~23s (`[ttft] headers=22733ms`) and whole streams
+ * run 50s, while bytes inside a live stream arrive continuously. `activeStreams`
+ * is also required to be non-zero, so an idle hub is never called stalled.
+ *
  * NEVER-HANG: the wrapper is a pure passthrough. No parsing, no buffering, and
  * it never calls `controller.error()` — a counting wrapper must not become a new
  * way for a stream to break. On a read exception it closes cleanly (the parsers
- * have already emitted their terminal events by then).
+ * have already emitted their terminal events by then). The liveness stamp is a
+ * single assignment on a path that already runs per chunk.
  */
 
 import type { Context, MiddlewareHandler } from "hono";
@@ -33,15 +82,67 @@ export interface StreamTracker {
   middleware: MiddlewareHandler;
   /** Number of SSE responses currently streaming to clients. */
   getActiveStreams: () => number;
+  /** Requests inside the handler chain that have not yet produced a response. */
+  getPendingRequests: () => number;
+  /**
+   * Milliseconds since anything last progressed — a byte streamed, a stream
+   * ended, or a response completed. Seeded at process start, so it is never null
+   * and needs no special-casing by callers.
+   */
+  getMsSinceProgress: () => number;
+  /**
+   * True when work is in flight but nothing has progressed for `thresholdMs`.
+   * `thresholdMs <= 0` disables the verdict entirely (always false).
+   */
+  isStalled: (thresholdMs: number) => boolean;
 }
 
 const SSE_CONTENT_TYPE = "text/event-stream";
 
+/**
+ * Default silence budget before a busy proxy is called wedged. Generous on
+ * purpose — see the asymmetry note above. Override with
+ * `CLAUDISH_STALL_THRESHOLD_MS`; `0` disables the 503.
+ */
+export const DEFAULT_STALL_THRESHOLD_MS = 180_000;
+
+/** Read per call, never cached: this is the knob an operator turns mid-incident. */
+export function stallThresholdMs(): number {
+  const raw = process.env.CLAUDISH_STALL_THRESHOLD_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_STALL_THRESHOLD_MS;
+  const n = Number(raw);
+  // Garbage must not silently disable the detector, nor invent a tiny threshold
+  // that would flap the whole fleet: fall back to the documented default.
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_STALL_THRESHOLD_MS;
+  return n;
+}
+
+/**
+ * Paths that must not feed the detector. See the header: the prober's own poll
+ * would otherwise stand in for the work it is asking about.
+ */
+const LIVENESS_EXEMPT_PATHS = new Set(["/health"]);
+
 export function createStreamTracker(): StreamTracker {
   let activeStreams = 0;
+  let pendingRequests = 0;
+  let lastProgressAt = Date.now();
 
   const middleware: MiddlewareHandler = async (c: Context, next) => {
-    await next();
+    if (LIVENESS_EXEMPT_PATHS.has(c.req.path)) {
+      await next();
+      return;
+    }
+
+    pendingRequests++;
+    try {
+      await next();
+    } finally {
+      // `finally`, so a throwing handler cannot pin the counter above zero and
+      // wedge the detector into a permanent stall verdict.
+      pendingRequests--;
+      lastProgressAt = Date.now();
+    }
 
     const res = c.res;
     const body = res.body;
@@ -54,6 +155,9 @@ export function createStreamTracker(): StreamTracker {
       if (settled) return;
       settled = true;
       activeStreams--;
+      // A stream ending IS progress: without this, the last stream to finish
+      // would leave a stale stamp behind for the next one to be judged on.
+      lastProgressAt = Date.now();
     };
 
     const reader = body.getReader();
@@ -66,6 +170,7 @@ export function createStreamTracker(): StreamTracker {
             finish();
             return;
           }
+          lastProgressAt = Date.now();
           controller.enqueue(value);
         } catch {
           controller.close();
@@ -83,5 +188,14 @@ export function createStreamTracker(): StreamTracker {
     c.res = new Response(counted, { status: res.status, headers: res.headers });
   };
 
-  return { middleware, getActiveStreams: () => activeStreams };
+  return {
+    middleware,
+    getActiveStreams: () => activeStreams,
+    getPendingRequests: () => pendingRequests,
+    getMsSinceProgress: () => Date.now() - lastProgressAt,
+    isStalled: (thresholdMs: number) =>
+      thresholdMs > 0 &&
+      (activeStreams > 0 || pendingRequests > 0) &&
+      Date.now() - lastProgressAt > thresholdMs,
+  };
 }
