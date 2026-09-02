@@ -1004,7 +1004,8 @@ export async function createProxyServer(
       {
         status: stalled ? "stalled" : "ok",
         activeStreams: streamTracker.getActiveStreams(),
-        msSinceLastStreamByte: streamTracker.getMsSinceLastByte(),
+        pendingRequests: streamTracker.getPendingRequests(),
+        msSinceProgress: streamTracker.getMsSinceProgress(),
         stallThresholdMs: thresholdMs,
         uptimeSec: Math.round((Date.now() - startedAt) / 1000),
       },

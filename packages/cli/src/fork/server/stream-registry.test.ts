@@ -28,6 +28,12 @@ function appWithSse(bodyFactory: () => ReadableStream<Uint8Array>) {
   const app = new Hono();
   app.use("*", tracker.middleware);
   app.get("/health", (c) => c.json({ activeStreams: tracker.getActiveStreams() }));
+  app.post("/wedged", async () => {
+    // Never produces a response: the middleware stays inside next(), so this is
+    // invisible to a body wrapper and visible only to the pending counter.
+    await new Promise<void>(() => {});
+    return new Response("unreachable");
+  });
   app.get("/sse", () =>
     new Response(bodyFactory(), {
       status: 200,
@@ -222,7 +228,7 @@ describe("stream liveness (2026-09-02 outage)", () => {
 
     clock += 2_000; // 181s of silence with a stream open: wedged
     expect(tracker.isStalled(180_000)).toBe(true);
-    expect(tracker.getMsSinceLastByte()).toBe(181_000);
+    expect(tracker.getMsSinceProgress()).toBe(181_000);
   });
 
   test("a byte arriving from upstream clears the verdict", async () => {
@@ -242,7 +248,7 @@ describe("stream liveness (2026-09-02 outage)", () => {
     await reader.read();
     await new Promise((r) => setTimeout(r, 0)); // let the next upstream pull land
     expect(tracker.isStalled(180_000)).toBe(false);
-    expect(tracker.getMsSinceLastByte()).toBe(0);
+    expect(tracker.getMsSinceProgress()).toBe(0);
   });
 
   test("a stream ending counts as progress", async () => {
@@ -257,7 +263,7 @@ describe("stream liveness (2026-09-02 outage)", () => {
     clock += 500_000;
     await reader.cancel(); // the stream ends here, not 500s ago
     expect(tracker.getActiveStreams()).toBe(0);
-    expect(tracker.getMsSinceLastByte()).toBe(0);
+    expect(tracker.getMsSinceProgress()).toBe(0);
   });
 
   test("a client walking away does not leave a stalled verdict armed", async () => {
@@ -283,5 +289,77 @@ describe("stream liveness (2026-09-02 outage)", () => {
     expect(tracker.isStalled(0)).toBe(false);
     expect(tracker.isStalled(-1)).toBe(false);
     expect(tracker.isStalled(180_000)).toBe(true);
+  });
+});
+
+describe("pre-stream wedge (invisible to a body wrapper)", () => {
+  const realNow = Date.now;
+  afterEach(() => {
+    Date.now = realNow;
+  });
+
+  test("a request that never produces a response is counted and goes stalled", async () => {
+    // The likelier shape of a wedge, and the one the first cut of this fix would
+    // have missed: no SSE body ever exists, so activeStreams stays 0.
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    const { app, tracker } = appWithSse(() => sseBody(["a"]));
+
+    void app.request("/wedged", { method: "POST" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(tracker.getActiveStreams()).toBe(0);
+    expect(tracker.getPendingRequests()).toBe(1);
+
+    clock += 181_000;
+    expect(tracker.isStalled(180_000)).toBe(true);
+  });
+
+  test("/health polling does not refresh the stamp", async () => {
+    // Each sidecar polls /health every 10s. If that counted as progress the
+    // detector would report a healthy hub precisely because it was being asked.
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    const { app, tracker } = appWithSse(() => sseBody(["a"]));
+
+    void app.request("/wedged", { method: "POST" });
+    await new Promise((r) => setTimeout(r, 0));
+
+    for (let i = 0; i < 20; i++) {
+      clock += 10_000;
+      await app.request("/health");
+    }
+    expect(tracker.getPendingRequests()).toBe(1);
+    expect(tracker.isStalled(180_000)).toBe(true);
+  });
+
+  test("a completed request is progress, and clears a pending wedge verdict", async () => {
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    const { app, tracker } = appWithSse(() => sseBody(["a"]));
+
+    void app.request("/wedged", { method: "POST" });
+    await new Promise((r) => setTimeout(r, 0));
+    clock += 200_000;
+    expect(tracker.isStalled(180_000)).toBe(true);
+
+    await app.request("/json"); // real traffic still flowing
+    expect(tracker.isStalled(180_000)).toBe(false);
+    expect(tracker.getPendingRequests()).toBe(1); // the wedged one is still there
+  });
+
+  test("a throwing handler does not pin the counter", async () => {
+    // Otherwise one 500 would leave pendingRequests above zero forever and the
+    // proxy would report itself stalled from then on.
+    const tracker = createStreamTracker();
+    const app = new Hono();
+    app.use("*", tracker.middleware);
+    app.onError((_e, c) => c.text("boom", 500));
+    app.get("/throws", () => {
+      throw new Error("boom");
+    });
+
+    const res = await app.request("/throws");
+    expect(res.status).toBe(500);
+    expect(tracker.getPendingRequests()).toBe(0);
   });
 });
