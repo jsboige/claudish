@@ -23,13 +23,32 @@
  *
  * LIVENESS (2026-09-02). Counting alone says how much work is in flight, never
  * whether it is progressing, and `/health` used to report only the count plus an
- * uptime — four lines that touch nothing in the request pipeline. On 2026-09-02
- * the hub went silent at 03:20:45Z and served nothing until a manual reboot at
- * 05:47Z: 2h27, fleet-wide. Every sidecar kept relaying into it, because the
- * prober's whole notion of "hub alive" is a 200 from that endpoint, and a
- * process that still answers a constant-time JSON handler answers it while
- * serving nobody. `relay.ts` names this exact hole and calls it "never observed";
- * it has now been observed once, and it cost every machine its morning.
+ * uptime — four lines that touch nothing in the request pipeline. A process that
+ * still answers a constant-time JSON handler answers it while serving nobody, and
+ * `relay.ts` names that hole and calls it "never observed".
+ *
+ * It is STILL never observed, and this file was first written on the belief that
+ * the 2026-09-02 outage had observed it. That belief was wrong, twice over, and
+ * both corrections are worth keeping because each one looked convincing:
+ *
+ *   - The sidecars did NOT keep relaying into a hub that answered while serving
+ *     nobody. ai-01 measured 94 requests served locally across the whole window,
+ *     zero lost — its prober failed over correctly, because `/health` was not
+ *     answering either. What died were interactive sessions pointed straight at
+ *     the hub, which never consult a sidecar. That is topology, not liveness.
+ *   - The hub did not wedge. The Windows event log records, 25 seconds before its
+ *     last response, `Id 26: "Windows — insufficient virtual memory"`, then cmd.exe
+ *     failing to launch, then Google Drive unmounting G:, then IIS pools unable to
+ *     stop. The host ran out of commit charge; the proxy could not allocate, so
+ *     nothing listened on :3000 and ai-01 measured `Connection refused`. A refused
+ *     connection is not a blind health check.
+ *
+ * So this detector did not fix that outage and would not have caught it — no
+ * endpoint answers when the process cannot allocate. It is kept on its own merit:
+ * a wedged pipeline behind a live event loop is a real shape, cheap to detect
+ * here and nowhere else, and the 503 is one the sidecars already know how to act
+ * on. Claiming an incident it did not prevent would just make the next reader
+ * trust the wrong signal.
  *
  * So the tracker also stamps the last moment anything PROGRESSED, and reports
  * whether work is in flight. Work in flight with no progress for a long while is
