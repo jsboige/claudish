@@ -18,6 +18,9 @@ $LogPath = "C:\Users\jsboi\.claudish\watchdog.log"
 $ProxyUrl = "http://localhost:3000"
 $ContainerName = "claudish-proxy"
 $StreamTimeoutSec = 90
+# Every docker CLI call is bounded by this. Unbounded was the real failure on
+# 2026-09-02 (see Invoke-DockerBounded).
+$DockerTimeoutSec = 20
 $ProactiveRestartHours = 11
 # A restart kills every in-flight SSE stream mid-body; the client reports
 # "Connection lost mid-response" and the agent turn is lost. So: drain first,
@@ -221,6 +224,49 @@ function Set-State {
     @{ consecutiveHangs = $ConsecutiveHangs } | ConvertTo-Json | Set-Content -Path $StateFile -Encoding UTF8
 }
 
+function Invoke-DockerBounded {
+    # Runs a docker command with a hard wall-clock bound.
+    #
+    # Why. On 2026-09-02 ten consecutive runs wrote "=== Watchdog check ===" and
+    # then nothing at all - for 2h30, across the whole outage. Nothing else can
+    # produce that trace: the very next statement is Step 1's `docker inspect`,
+    # and every branch after it logs. So the CLI itself never answered, and the
+    # stream probe below - however carefully bounded - was never reached. A
+    # watchdog is only as bounded as its FIRST unbounded call.
+    #
+    # Output goes to files, not pipes: a redirected pipe that fills would block
+    # the child before it exits, reintroducing the same hang through the back
+    # door. The commands here emit a few bytes, but the failure being fixed is
+    # precisely the one nobody expected.
+    param([string[]]$DockerArgs, [int]$TimeoutSec = $DockerTimeoutSec)
+
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath "docker" -ArgumentList $DockerArgs -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        # Touching .Handle caches the process handle. Without it, -PassThru hands
+        # back an object whose .ExitCode stays $null after WaitForExit, so every
+        # successful call would read as a failure - and Step 1 would "recover" an
+        # engine that was fine, on every cycle. Caught only by running it.
+        $null = $p.Handle
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch {}
+            return @{ Ok = $false; TimedOut = $true; Code = -1; Out = "" }
+        }
+        $out = ""
+        try { $out = (Get-Content $outFile -Raw -ErrorAction SilentlyContinue) } catch {}
+        if ($null -eq $out) { $out = "" }
+        return @{ Ok = ($p.ExitCode -eq 0); TimedOut = $false; Code = $p.ExitCode; Out = $out.Trim() }
+    }
+    catch {
+        return @{ Ok = $false; TimedOut = $false; Code = -1; Out = ""; Error = $_.Exception.Message }
+    }
+    finally {
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # --- Main ---
 
 Write-Log "=== Watchdog check ==="
@@ -233,8 +279,7 @@ Write-Log "=== Watchdog check ==="
 # interactive user session via a helper task (SYSTEM cannot own the GUI app),
 # then wait, bounded, for the engine to answer.
 function Test-DockerEngine {
-    docker version *> $null
-    return ($LASTEXITCODE -eq 0)
+    return (Invoke-DockerBounded @("version")).Ok
 }
 
 function Start-DockerEngine {
@@ -265,16 +310,29 @@ function Start-DockerEngine {
 }
 
 # Step 1: Container running?
-$containerStatus = docker inspect $ContainerName --format "{{.State.Status}}" 2>$null
-if ($LASTEXITCODE -ne 0 -or $containerStatus -ne "running") {
-    if ($LASTEXITCODE -ne 0) {
-        # CLI itself failed — engine down, not just the container.
+$inspect = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")
+if ($inspect.TimedOut) {
+    # The 2026-09-02 signature, now named instead of deduced from an absence.
+    # No answer at all is an engine fault, which the recovery path can act on.
+    Write-Log "DOCKER-TIMEOUT: inspect did not answer within ${DockerTimeoutSec}s — engine not responding"
+    if (-not (Start-DockerEngine)) { exit 1 }
+    $inspect = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")
+    if ($inspect.TimedOut) {
+        Write-Log "FATAL: docker still not answering after engine recovery"
+        exit 1
+    }
+}
+$containerStatus = $inspect.Out
+if (-not $inspect.Ok -or $containerStatus -ne "running") {
+    if (-not $inspect.Ok) {
+        # CLI answered but failed — engine down, not just the container.
         if (-not (Start-DockerEngine)) { exit 1 }
     }
     Write-Log "CRITICAL: Container not running (status=$containerStatus). Starting..."
-    docker start $ContainerName 2>$null
+    # A start can legitimately take a while; bound it well above that, not at 20s.
+    [void](Invoke-DockerBounded @("start", $ContainerName) -TimeoutSec 120)
     Start-Sleep -Seconds 15
-    $recheck = docker inspect $ContainerName --format "{{.State.Status}}" 2>$null
+    $recheck = (Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")).Out
     if ($recheck -eq "running") {
         Write-Log "RECOVERED: Container started"
     } else {
@@ -285,7 +343,12 @@ if ($LASTEXITCODE -ne 0 -or $containerStatus -ne "running") {
 }
 
 # Step 2: Uptime check
-$startedAt = docker inspect $ContainerName --format "{{.State.StartedAt}}" 2>$null
+$startedAtRes = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.StartedAt}}")
+if (-not $startedAtRes.Ok) {
+    Write-Log "DOCKER: uptime unreadable (timedOut=$($startedAtRes.TimedOut) code=$($startedAtRes.Code)) — skipping the proactive branch this cycle"
+    $startedAtRes.Out = [DateTimeOffset]::UtcNow.ToString("o")
+}
+$startedAt = $startedAtRes.Out
 $startTime = [DateTimeOffset]::Parse($startedAt)
 $uptime = [DateTimeOffset]::UtcNow - $startTime
 $uptimeHours = [Math]::Round($uptime.TotalHours, 1)
