@@ -35,7 +35,7 @@ import { createHandlerForProvider } from "./providers/provider-profiles.js";
 import { loadCustomEndpoints } from "./providers/custom-endpoints-loader.js";
 import { getRuntimeProviders } from "./providers/runtime-providers.js";
 import { loadConfig } from "./profile-config.js";
-import { createStreamTracker } from "./fork/server/stream-registry";
+import { createStreamTracker, stallThresholdMs } from "./fork/server/stream-registry";
 import { registerForkExtensions, stripBillingHeaderFromBody, logRequest, createHostnameConfig } from "./fork/index.js";
 import { forwardToUpstream, readRequestBody, type RelayState } from "./fork/server/relay.js";
 import {
@@ -986,15 +986,31 @@ export async function createProxyServer(
   const startedAt = Date.now();
   app.use("*", streamTracker.middleware);
 
-  // `status` stays first and unchanged: the relay heartbeat and the watchdog
-  // only test res.ok, so the added fields are backward compatible.
-  app.get("/health", (c) =>
-    c.json({
-      status: "ok",
-      activeStreams: streamTracker.getActiveStreams(),
-      uptimeSec: Math.round((Date.now() - startedAt) / 1000),
-    })
-  );
+  // Liveness, not mere existence. This was a constant-time JSON handler that
+  // touched nothing in the request pipeline, so it answered 200 from a process
+  // serving nobody — which is exactly how the 2026-09-02 outage (hub silent
+  // 03:20:45Z → 05:47Z) stayed invisible to every sidecar prober for 2h27 while
+  // they kept relaying into it. `relay.ts` documents that hole and calls it
+  // "never observed"; it has been observed once now, fleet-wide.
+  //
+  // So: streams in flight and nothing moving → 503, which is the signal the
+  // probers already act on (2 failures, 10s apart → AUTONOMOUS). `status` stays
+  // first and the body keeps `activeStreams`, so the drain script and the
+  // watchdog are unaffected; the two new fields explain a demotion after the fact.
+  app.get("/health", (c) => {
+    const thresholdMs = stallThresholdMs();
+    const stalled = streamTracker.isStalled(thresholdMs);
+    return c.json(
+      {
+        status: stalled ? "stalled" : "ok",
+        activeStreams: streamTracker.getActiveStreams(),
+        msSinceLastStreamByte: streamTracker.getMsSinceLastByte(),
+        stallThresholdMs: thresholdMs,
+        uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+      },
+      stalled ? 503 : 200
+    );
+  });
 
   // Token counting
   app.post("/v1/messages/count_tokens", async (c) => {

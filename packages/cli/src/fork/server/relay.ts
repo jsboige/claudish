@@ -246,9 +246,15 @@ export async function forwardToUpstream(
     //
     // Trade-off, accepted knowingly: a hub that answered /health but black-holed
     // POSTs would no longer be demoted by this path, so every request would spend
-    // the full deadline before falling through. Never observed, and the prober still
-    // catches the ordinary black-hole (where /health hangs too). Building machinery
-    // for it now would re-add, in another form, the coupling this removes.
+    // the full deadline before falling through. That was justified with "Never
+    // observed" — and on 2026-09-02 it was observed, fleet-wide: the hub went
+    // silent at 03:20:45Z, kept answering /health from a wedged process, and no
+    // machine failed over until a manual reboot 2h27 later. The conclusion was
+    // still right (this path must not own liveness) but the gap was real, so it
+    // is now closed where it belongs: /health itself reports whether the request
+    // pipeline is MOVING (streams in flight with no byte for
+    // CLAUDISH_STALL_THRESHOLD_MS → 503), which the prober below already acts on.
+    // See fork/server/stream-registry.ts.
     //
     // The request itself still falls through, and every fallthrough is still logged.
     // Only the machine-wide contagion is removed.
