@@ -89,6 +89,10 @@ function attemptTimeoutMs(): number {
  */
 const LATENCY_WINDOW = 50;
 const searxngLatencies: number[] = [];
+// Monotonic sample counter: once the window saturates, `searxngLatencies.length`
+// stays pinned at LATENCY_WINDOW, so `% 10` on it would log on EVERY sample.
+// Counting total samples keeps the documented "every 10th sample" cadence.
+let latencySampleCount = 0;
 
 function percentile(sorted: number[], p: number): number {
   if (sorted.length === 0) return 0;
@@ -99,7 +103,8 @@ function percentile(sorted: number[], p: number): number {
 function recordLatency(ms: number): void {
   searxngLatencies.push(ms);
   if (searxngLatencies.length > LATENCY_WINDOW) searxngLatencies.shift();
-  if (searxngLatencies.length % 10 === 0) {
+  latencySampleCount++;
+  if (latencySampleCount % 10 === 0) {
     const stats = searxngLatencyStats();
     log(`[WebSearch] latency window: n=${stats?.n} p50=${stats?.p50}ms p95=${stats?.p95}ms`);
   }
@@ -119,6 +124,7 @@ export function searxngLatencyStats(): { n: number; p50: number; p95: number } |
 /** Test hook: clear the rolling latency window. */
 export function _resetSearxngTelemetry(): void {
   searxngLatencies.length = 0;
+  latencySampleCount = 0;
 }
 
 /**
