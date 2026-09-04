@@ -55,15 +55,94 @@ export interface SearchResult {
 }
 
 /**
- * Execute a web search via SearXNG. Non-throwing.
+ * Per-attempt SearXNG deadline, dimensioned 2026-09-03 (roo-extensions #3388):
+ * 20-sample measurement against the LAN endpoint (mixed warm/cold queries)
+ * gave p50 0.92s, p90 1.57s, p95 2.97s — the two ~3s outliers were unique
+ * (cold) queries hitting cold engines. 5s ≈ 1.7×p95 keeps headroom under
+ * load; a single attempt still loses p99 events, hence the one retry in
+ * executeWebSearch. SEARXNG_ATTEMPT_TIMEOUT_MS overrides it (tests, or a
+ * known-slower endpoint such as the Basic-auth public URL).
  */
-async function fetchFromSearXNG(query: string, maxResults = 5): Promise<SearchResult[]> {
+const DEFAULT_ATTEMPT_TIMEOUT_MS = 5000;
+
+/**
+ * Smallest remaining budget worth spending on a retry attempt. Below this we
+ * report failure instead of starting a call we already know will be cut short.
+ */
+const MIN_ATTEMPT_BUDGET_MS = 250;
+
+/**
+ * Maximum attempts per executeWebSearch call: 1 initial + 1 retry.
+ */
+const MAX_SEARCH_ATTEMPTS = 2;
+
+function attemptTimeoutMs(): number {
+  const raw = Number(process.env.SEARXNG_ATTEMPT_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 50 ? raw : DEFAULT_ATTEMPT_TIMEOUT_MS;
+}
+
+/**
+ * Rolling latency telemetry for the direct HTTP route (issue #3388: quantify
+ * real p50/p95 client-side and detect drift). Successful AND failed attempts
+ * are recorded — a timeout is the measurement that matters most. Kept in
+ * memory only; every 10th sample logs the window stats.
+ */
+const LATENCY_WINDOW = 50;
+const searxngLatencies: number[] = [];
+// Monotonic sample counter: once the window saturates, `searxngLatencies.length`
+// stays pinned at LATENCY_WINDOW, so `% 10` on it would log on EVERY sample.
+// Counting total samples keeps the documented "every 10th sample" cadence.
+let latencySampleCount = 0;
+
+function percentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
+  return sorted[idx];
+}
+
+function recordLatency(ms: number): void {
+  searxngLatencies.push(ms);
+  if (searxngLatencies.length > LATENCY_WINDOW) searxngLatencies.shift();
+  latencySampleCount++;
+  if (latencySampleCount % 10 === 0) {
+    const stats = searxngLatencyStats();
+    log(`[WebSearch] latency window: n=${stats?.n} p50=${stats?.p50}ms p95=${stats?.p95}ms`);
+  }
+}
+
+/** Current rolling latency stats for the direct HTTP route, or null if no samples. */
+export function searxngLatencyStats(): { n: number; p50: number; p95: number } | null {
+  if (searxngLatencies.length === 0) return null;
+  const sorted = [...searxngLatencies].sort((a, b) => a - b);
+  return {
+    n: sorted.length,
+    p50: percentile(sorted, 50),
+    p95: percentile(sorted, 95),
+  };
+}
+
+/** Test hook: clear the rolling latency window. */
+export function _resetSearxngTelemetry(): void {
+  searxngLatencies.length = 0;
+  latencySampleCount = 0;
+}
+
+/**
+ * Execute a web search via SearXNG. Throws on timeout/network error so the
+ * caller's retry loop can distinguish "attempt failed, retry" from
+ * "server answered" (HTTP non-ok returns [] like before).
+ */
+async function fetchFromSearXNG(
+  query: string,
+  maxResults = 5,
+  timeoutMs = DEFAULT_ATTEMPT_TIMEOUT_MS
+): Promise<SearchResult[]> {
   const { base, authHeaders } = searxngConfig();
   const url = `${base}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
-  log(`[WebSearch] Executing: "${query}" via ${base}`);
+  log(`[WebSearch] Executing: "${query}" via ${base} (attempt timeout ${timeoutMs}ms)`);
 
   const response = await fetch(url, {
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(timeoutMs),
     headers: { Accept: "application/json", ...authHeaders },
   });
 
@@ -87,10 +166,15 @@ async function fetchFromSearXNG(query: string, maxResults = 5): Promise<SearchRe
 
 /**
  * Stream-safe web search: MCP searxng_web_search first (when configured),
- * then the direct SearXNG HTTP API, each bounded by a deadline.
- * Returns formatted results text, never throws, never blocks > deadline.
+ * then the direct SearXNG HTTP API with one retry inside the budget.
+ * Returns formatted results text, never throws, never blocks > deadlineMs.
+ *
+ * deadlineMs is a TOTAL budget (default 8000ms = one 5s attempt + one retry
+ * floor, dimensioned from measured p95 ≈ 3s — see DEFAULT_ATTEMPT_TIMEOUT_MS).
  */
-export async function executeWebSearch(query: string, deadlineMs = 3000): Promise<string> {
+export async function executeWebSearch(query: string, deadlineMs = 8000): Promise<string> {
+  const deadlineAt = Date.now() + deadlineMs;
+
   if (isMcpSearxngAvailable()) {
     const mcp = await mcpWebSearch(query, Math.max(deadlineMs, 5000));
     if (mcp.ok) {
@@ -99,22 +183,32 @@ export async function executeWebSearch(query: string, deadlineMs = 3000): Promis
     log(`[WebSearch] MCP route failed (${mcp.error}), falling back to direct HTTP`);
   }
 
-  try {
-    const results = await Promise.race([
-      fetchFromSearXNG(query),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), deadlineMs)),
-    ]);
-
-    if (results === null) {
-      log(`[WebSearch] Timed out after ${deadlineMs}ms for "${query}"`);
-      return `[Web search for "${query}" timed out. SearXNG did not respond within ${deadlineMs / 1000}s.]`;
+  let lastError = "";
+  for (let attempt = 1; attempt <= MAX_SEARCH_ATTEMPTS; attempt++) {
+    const remaining = deadlineAt - Date.now();
+    if (remaining < MIN_ATTEMPT_BUDGET_MS) {
+      log(`[WebSearch] Budget exhausted before attempt ${attempt}/${MAX_SEARCH_ATTEMPTS} for "${query}"`);
+      break;
     }
 
-    return formatSearchResults(query, results);
-  } catch (err: any) {
-    log(`[WebSearch] Error: ${err.message}`);
-    return `[Web search for "${query}" failed: ${err.message}]`;
+    const timeoutMs = Math.min(attemptTimeoutMs(), remaining);
+    const startedAt = Date.now();
+    try {
+      const results = await fetchFromSearXNG(query, 5, timeoutMs);
+      const took = Date.now() - startedAt;
+      recordLatency(took);
+      log(`[WebSearch] attempt ${attempt}/${MAX_SEARCH_ATTEMPTS} ok in ${took}ms (${results.length} results)`);
+      return formatSearchResults(query, results);
+    } catch (err: any) {
+      const took = Date.now() - startedAt;
+      recordLatency(took);
+      lastError = err.message || String(err);
+      log(`[WebSearch] attempt ${attempt}/${MAX_SEARCH_ATTEMPTS} failed after ${took}ms: ${lastError}`);
+      // Loop continues: retry if budget remains, else exit and report failure.
+    }
   }
+
+  return `[Web search for "${query}" failed after ${MAX_SEARCH_ATTEMPTS} attempts within ${deadlineMs}ms budget. SearXNG did not respond in time (last error: ${lastError || "budget exhausted before start"}).]`;
 }
 
 /**

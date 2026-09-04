@@ -20,7 +20,7 @@ When providers emit web search tool calls (`web_search`, `brave_web_search`, `ta
 
 `web-search-executor.ts` resolves each search/fetch through a chain; the first usable result wins:
 
-- **Search**: MCP `searxng_web_search` (if `SEARXNG_MCP_URL` set, 5s deadline) → direct HTTP `{SEARXNG_URL}/search?format=json` (3s) → error text.
+- **Search**: MCP `searxng_web_search` (if `SEARXNG_MCP_URL` set, deadline ≥ 5s) → direct HTTP `{SEARXNG_URL}/search?format=json` (2 attempts inside the caller's budget, 5s/attempt) → error text.
 - **Fetch**: MCP `web_url_read` (12s, real fetch + markdown) → MCP `web_url_read` with `https://r.jina.ai/<url>` prefix (bypasses 403 on bot-hostile hosts, e.g. npmjs) → direct streaming HTTP with 500KB byte cap → error text.
 
 The MCP client (`handlers/shared/mcp-searxng-client.ts`) is a minimal JSON-RPC streamable-http client (no SDK, no stdio): handles both `application/json` and `text/event-stream` response formats, lazy `initialize` handshake with `mcp-session-id` caching when the server demands a session, strict `AbortSignal.timeout` deadlines, and a non-throwing `{ ok, text|error }` contract. Per-call duration is logged as `[MCP-SearXNG] tools/call <name> <ms>ms ok=<bool>` for overhead measurement vs direct HTTP.
@@ -30,7 +30,7 @@ The MCP client (`handlers/shared/mcp-searxng-client.ts`) is a minimal JSON-RPC s
 - **`SEARXNG_MCP_URL`** env var (optional): URL of the MCP searxng endpoint (e.g. `https://mcp-tools.myia.io/searxng/mcp`). When unset, the MCP layer is skipped entirely — zero behavior change for existing deployments.
 - **`MCP_AUTH`** or **`SEARXNG_MCP_TOKEN`** env var: bearer token for the MCP endpoint. Never hardcode; provisioned via RooSync.
 - **`SEARXNG_URL`** env var: URL of the SearXNG instance (e.g. `http://search.myia.io`) for the direct HTTP fallback. When unset, interception falls through gracefully with a fallback message.
-- **Deadlines**: MCP search 5s, MCP fetch 12s, direct HTTP search 3s (5s sub-agent path), direct fetch 10s. Non-blocking — every call races a timeout.
+- **Deadlines**: MCP search ≥ 5s, MCP fetch 12s, direct HTTP search 5s/attempt × 2 attempts inside an 8s total budget (both call paths; `SEARXNG_ATTEMPT_TIMEOUT_MS` overrides the per-attempt value), direct fetch 10s. Non-blocking — every call is bounded. Attempt durations are recorded in a rolling 50-sample window; p50/p95 are logged every 10th sample (`[WebSearch] latency window: n=… p50=…ms p95=…ms`) to quantify drift (roo-extensions #3388 — measured p50 0.92s / p95 2.97s on the LAN endpoint 2026-09-03, 20 samples mixed warm/cold).
 
 ## Components
 

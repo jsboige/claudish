@@ -85,7 +85,10 @@ async function interceptWebTools(c: any, body: any): Promise<Response | null> {
     if (searchMatch) {
       const query = searchMatch[1].trim();
       log(`[WebTools] Intercepted sub-agent web search: "${query}"`);
-      const results = await executeWebSearch(query, 5000);
+      // Total budget for 2 attempts (5s/attempt, dimensioned from measured
+      // p95 ≈ 3s — roo-extensions #3388). This is a sub-agent request, not a
+      // mid-stream call, so the extra retry budget is safe to spend.
+      const results = await executeWebSearch(query, 8000);
       log(`[WebTools] SearXNG results: ${results.slice(0, 100)}...`);
       return buildTextResponse(body.model || "unknown", results, isStreaming);
     }
