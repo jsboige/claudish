@@ -932,14 +932,14 @@ function buildStreamNoticeText(role: FailoverRole, step: FailoverStep, stepIndex
     return (
       prefix +
       remainder +
-      `The context you inherit was built under a stronger model. Adjust accordingly: be more conservative, verify assumptions before acting, prefer well-trodden solutions over speculative ones, and take fewer risks than you would under ${roleLabel}.`
+      `Capability note: ${step.label} is weaker than the nominal ${roleLabel} model; the inherited context may reflect the nominal's stronger output.`
     );
   }
   if (step.direction === "improved") {
     return (
       prefix +
       remainder +
-      `You are stronger than the nominal model here — use the extra capability to keep the work on track and clean up any loose ends in the inherited context.`
+      `Capability note: ${step.label} is stronger than the nominal ${roleLabel} model.`
     );
   }
   return prefix + remainder + `Capability is roughly equivalent; continue the work as normal.`;
@@ -951,11 +951,11 @@ function buildStreamRecoveryText(role: FailoverRole, st: RecoveryState): string 
   if (st.prevDirection === "improved") {
     return `[claudish] You are back on the nominal ${roleLabel} model after serving as ${st.prevLabel} (the ${ordinal(
       st.prevStepIndex
-    )} fallback), which was stronger than nominal. Scale back to your normal ${roleLabel} working scope.`;
+    )} fallback), which was stronger than nominal.`;
   }
   return `[claudish] You are back on the nominal ${roleLabel} model after serving as ${st.prevLabel} (the ${ordinal(
     st.prevStepIndex
-  )} fallback). The context you inherit was built under a weaker model. Resume your normal working scope: you can take on tasks you deferred under the substitute.`;
+  )} fallback). The context above may include work done under that substitute.`;
 }
 
 /**

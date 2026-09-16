@@ -960,6 +960,21 @@ describe("consumeStreamNotice — depth-aware", () => {
     expect(term).not.toContain("Remaining fallbacks");
   });
 
+  it("notices state capability only — no behavioral instructions (doctrine 2026-08-23)", () => {
+    initFailover({ ...OPUS_CASCADE, CLAUDISH_FAILOVER_ACTIVE: "opus" }); // directions: degraded>degraded>improved
+    markStepFailed("opus", 0, "qwen walled mid-session"); // serving step 1 (degraded)
+    const degraded = consumeStreamNotice("opus", "sess-doctrine-degraded");
+    expect(degraded).toContain("Capability note:");
+    expect(degraded).not.toMatch(
+      /be more conservative|fewer risks|Resume your normal|Scale back|take on tasks you deferred|clean up/i
+    );
+
+    markStepFailed("opus", 1, "glm walled mid-session"); // serving terminal step 2 (improved)
+    const improved = consumeStreamNotice("opus", "sess-doctrine-improved");
+    expect(improved).toContain("stronger than the nominal");
+    expect(improved).not.toMatch(/use the extra capability|loose ends/i);
+  });
+
   it("does not re-announce a depth already announced when the resolver drops back to it", () => {
     initFailover({ ...OPUS_CASCADE, CLAUDISH_FAILOVER_ACTIVE: "opus" });
     expect(consumeStreamNotice("opus", "sess-osc")).toContain("1st fallback");
