@@ -498,6 +498,12 @@ export function createResponsesStreamHandler(
                   inputTokens = event.usage.input_tokens || 0;
                   outputTokens = event.usage.output_tokens || 0;
                 }
+                const rawUsage = event.response?.usage ?? event.usage;
+                if (rawUsage) {
+                  process.stdout.write(
+                    `  [ResponsesSSE] usage model=${opts.modelName} reqN=${reqN} raw=${JSON.stringify(rawUsage)}\n`
+                  );
+                }
                 completed = true;
                 // No [resp] marker here. The marker is emitted once, at CLOSE, by
                 // the response capture: emitting one here as well would double
