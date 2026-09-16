@@ -948,6 +948,18 @@ describe("consumeStreamNotice — depth-aware", () => {
     expect(consumeStreamNotice("opus", "sess-A")).toBeNull(); // dedup at depth 1
   });
 
+  it("names the steps still downstream of the serving step, none on the terminal step", () => {
+    initFailover({ ...OPUS_CASCADE, CLAUDISH_FAILOVER_ACTIVE: "opus" });
+    markStepFailed("opus", 0, "qwen walled mid-session"); // serving step 1 (GLM-5.2)
+    const mid = consumeStreamNotice("opus", "sess-rem-mid");
+    expect(mid).toContain("Remaining fallbacks: DeepSeek PAYG");
+
+    markStepFailed("opus", 1, "glm walled mid-session"); // serving terminal step 2 (PAYG)
+    const term = consumeStreamNotice("opus", "sess-rem-term");
+    expect(term).toContain("3rd fallback");
+    expect(term).not.toContain("Remaining fallbacks");
+  });
+
   it("does not re-announce a depth already announced when the resolver drops back to it", () => {
     initFailover({ ...OPUS_CASCADE, CLAUDISH_FAILOVER_ACTIVE: "opus" });
     expect(consumeStreamNotice("opus", "sess-osc")).toContain("1st fallback");

@@ -923,19 +923,26 @@ function buildStreamNoticeText(role: FailoverRole, step: FailoverStep, stepIndex
   const prefix = `[claudish] You are serving this session as ${step.label} (\`${step.target}\`) — the ${ordinal(
     stepIndex
   )} fallback for the ${roleLabel} role, because the nominal ${roleLabel} model${ahead} temporarily exhausted. `;
+  // Name the steps still downstream — a serving step read alone looks like the
+  // rest of the cascade (e.g. Kimi) was dropped from the config.
+  const remaining = rules.get(role)!.steps.slice(stepIndex + 1);
+  const remainder =
+    remaining.length > 0 ? `Remaining fallbacks: ${remaining.map((s) => s.label).join(", ")}. ` : "";
   if (step.direction === "degraded") {
     return (
       prefix +
+      remainder +
       `The context you inherit was built under a stronger model. Adjust accordingly: be more conservative, verify assumptions before acting, prefer well-trodden solutions over speculative ones, and take fewer risks than you would under ${roleLabel}.`
     );
   }
   if (step.direction === "improved") {
     return (
       prefix +
+      remainder +
       `You are stronger than the nominal model here — use the extra capability to keep the work on track and clean up any loose ends in the inherited context.`
     );
   }
-  return prefix + `Capability is roughly equivalent; continue the work as normal.`;
+  return prefix + remainder + `Capability is roughly equivalent; continue the work as normal.`;
 }
 
 /** One-time stream notice for a RECOVERING role: the nominal is back. */
