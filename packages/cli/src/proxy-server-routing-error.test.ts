@@ -27,6 +27,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { createProxyServer } from "./proxy-server.js";
+import { parseModelSpec } from "./providers/model-parser.js";
 import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
 import type { ProxyServer } from "./types.js";
 
@@ -240,6 +241,64 @@ describe("S4-d lot A: unhandled-error backstop (218c3586)", () => {
     } finally {
       console.error = realConsoleError;
     }
+  });
+});
+
+// ---- a9112dce ruling pin (S4-d lot A review, 2026-09-21) ----------------------
+
+describe("S4-d lot A: a9112dce explicitness transition — ACCEPTED (option b), pinned", () => {
+  // The original S4-d classification rejected a9112dce with a grep proof
+  // ("no NATIVE_MODEL_PATTERNS entry auto-detects openrouter" — 0 hits in
+  // model-parser.ts). The instrument was blind, not the file: the patterns are
+  // DERIVED from BUILTIN_PROVIDERS (provider-definitions.ts, "Replaces
+  // NATIVE_MODEL_PATTERNS in model-parser.ts"), which carries
+  // /^openrouter\//i. Executed:
+  //   openrouter/qwen/qwen3-coder -> {provider:"openrouter", explicit:FALSE}
+  // 2b rewrites that form to openrouter@<resolvedId>, 2c then sees explicit and
+  // skips the provider-fallback chain. The ruling: ACCEPT the transition (the
+  // name names the aggregator — it routes directly), documented at 2b. This pin
+  // records the DECISION so the next grain cannot re-derive it from the refuted
+  // proof. A grep is a hypothesis; a derived constant invalidates the searched
+  // file — positive control required.
+  test("parseModelSpec: openrouter/ is the ONE form that flips explicit at 2b — accepted, not a bug", () => {
+    expect(parseModelSpec("openrouter/qwen/qwen3-coder").isExplicitProvider).toBe(false);
+    expect(parseModelSpec("openrouter/qwen/qwen3-coder").provider).toBe("openrouter");
+    // Already explicit before AND after 2b — no transition:
+    expect(parseModelSpec("or/qwen/qwen3-coder").isExplicitProvider).toBe(true);
+    expect(parseModelSpec("openrouter@qwen/qwen3-coder").isExplicitProvider).toBe(true);
+    // Bare vendor/model forms parse to their OWN provider → stay chain-eligible:
+    expect(parseModelSpec("qwen/qwen3-coder").provider).toBe("qwen");
+    expect(parseModelSpec("qwen/qwen3-coder").isExplicitProvider).toBe(false);
+  });
+});
+
+// ---- #65 composition pin (dispatch: pin by test, not by comment) --------------
+
+describe("S4-d lot A: RoutingError is PRE-STREAM — composes with the #65 mid-stream policy lane without interaction", () => {
+  test("the RoutingError 400 is a plain JSON response, never an SSE stream", async () => {
+    const port = await spin();
+    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "zai@gm-4.6",
+        max_tokens: 16,
+        stream: true, // even when the client asked to stream
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    const raw: any = await res.json();
+
+    // RoutingError fires at handler CONSTRUCTION (before any stream exists),
+    // which is what makes it a lane distinct from the #65 policy-refusal retry
+    // (mid-stream predicate !sawMessageStart && highestSeenIndex === -1 &&
+    // !lastBlockOpen in anthropic-sse.ts). Asserting content-type JSON — not
+    // text/event-stream — is the pin that the two lanes cannot meet.
+    expect(res.status).toBe(400);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(raw?.error?.type).toBe("invalid_request_error");
+    // And never the #65 surfacing marker:
+    expect(JSON.stringify(raw)).not.toContain("[Upstream policy refusal");
   });
 });
 

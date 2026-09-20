@@ -749,6 +749,18 @@ export async function createProxyServer(
     // resolveModelNameSync then reads from the in-memory cache synchronously.
     // (LiteLLM catalog resolution was removed in commit 5 — users type the
     // exact LiteLLM model_group name now; see plan §D.)
+    //
+    // ⚠ Explicitness transition, ACCEPTED (a9112dce ruling, S4-d lot A review
+    // 2026-09-21): the one form this rewrites from non-explicit to explicit is
+    // `openrouter/<vendor>/<model>` — parseModelSpec auto-detects it through
+    // NATIVE_MODEL_PATTERNS, which is DERIVED from BUILTIN_PROVIDERS in
+    // provider-definitions.ts (l. 728: "Replaces NATIVE_MODEL_PATTERNS in
+    // model-parser.ts"), so a name-grep in THIS file is blind to it. After the
+    // rewrite, 2c sees isExplicitProvider:true and skips the provider-fallback
+    // chain. Deliberate (option b of the ruling; option a was preserving chain
+    // eligibility): the name names the aggregator, so it routes directly.
+    // Bare `vendor/model` forms (e.g. `qwen/...`) parse to their OWN provider
+    // and remain chain-eligible. Pinned in proxy-server-routing-error.test.ts.
     {
       const parsedTarget = parseModelSpec(target);
       if (parsedTarget.provider === "openrouter") {
