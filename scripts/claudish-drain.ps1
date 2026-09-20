@@ -94,6 +94,29 @@ function Write-DrainLog {
     Write-Host $line
 }
 
+function Get-ClaudishBaseUrlOverride {
+    <#
+        2026-09-20, po-2025, twice in one morning: the Docker Desktop LOCALHOST
+        forwarder wedged BELOW the container — port 3000 LISTENING on loopback,
+        HTTP black-holed, while the published 0.0.0.0 binding kept serving (the
+        WAN/ARR path survived both episodes; every local client on
+        http://localhost:3000 died for hours). ~13 container restarts changed
+        nothing; only a host reboot rebuilt the forwarder. A machine that wants
+        its probes on the surviving binding writes the URL into
+        <drain-log-dir>\base-url.txt (e.g. http://192.168.0.50:3000 — this
+        host's own LAN address). Absent file = localhost = zero change, so the
+        override is opt-in per machine.
+    #>
+    try {
+        $f = Join-Path (Split-Path $LogPath -Parent) "base-url.txt"
+        if (Test-Path $f) {
+            $v = Get-Content $f -Raw -ErrorAction SilentlyContinue
+            if ($v) { return $v.Trim() }
+        }
+    } catch { }
+    return $null
+}
+
 function Get-ClaudishProbeUrl {
     <#
         Derives the probe URL from the container's published 3000/tcp mapping,
@@ -106,11 +129,19 @@ function Get-ClaudishProbeUrl {
         port, the health call answered nothing, Get-ClaudishActiveStreams
         returned $null ("no signal"), and the restart silently degraded to
         undrained. Measured on ai-01, 2026-09-14 and 2026-09-15.
+
+        Since 2026-09-20 the host part honors Get-ClaudishBaseUrlOverride: the
+        per-container PORT stays (#110), the host moves off the wedgeable
+        loopback forwarder when the machine opted in via base-url.txt.
     #>
     param([string]$Container)
     try {
         $published = (docker port $Container 3000/tcp 2>$null | Select-Object -First 1)
         if ($published -and $published -match ':(\d+)\s*$') {
+            $base = Get-ClaudishBaseUrlOverride
+            if ($base) {
+                try { return "http://$(([uri]$base).Host):$($Matches[1])" } catch { }
+            }
             return "http://localhost:$($Matches[1])"
         }
     } catch { }
