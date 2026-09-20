@@ -282,18 +282,15 @@ function Set-State {
     # confirmation counter that cannot survive a cycle never confirms anything.
     param(
         [Nullable[int]]$ConsecutiveHangs = $null,
-        [Nullable[int]]$ConsecutiveWedge = $null,
-        [string]$LastWedgeRecoveryUtc = $null
+        [Nullable[int]]$ConsecutiveWedge = $null
     )
     $cur = Get-State
     $obj = @{
         consecutiveHangs     = [int](Get-StateField $cur 'consecutiveHangs' 0)
         consecutiveWedge     = [int](Get-StateField $cur 'consecutiveWedge' 0)
-        lastWedgeRecoveryUtc = [string](Get-StateField $cur 'lastWedgeRecoveryUtc' '')
     }
     if ($null -ne $ConsecutiveHangs) { $obj.consecutiveHangs = [int]$ConsecutiveHangs }
     if ($null -ne $ConsecutiveWedge) { $obj.consecutiveWedge = [int]$ConsecutiveWedge }
-    if (-not [string]::IsNullOrEmpty($LastWedgeRecoveryUtc)) { $obj.lastWedgeRecoveryUtc = $LastWedgeRecoveryUtc }
 
     $dir = Split-Path $StateFile -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -460,58 +457,74 @@ function Test-HealthAnswers {
 
 function Invoke-LoopbackWedgeWatch {
     <#
-        Detects the Docker Desktop loopback-forwarder wedge and, ONLY under an
-        explicit opt-in with a proven rebuild path, recovers the engine.
+        Tells the Docker Desktop loopback-forwarder wedge apart from a hub hang,
+        and says so. DETECTION ONLY — there is no actuator here, by mandate
+        (jsboige/claudish#172 AC4) and because none would help.
 
-        The signature, confirmed three times on 2026-09-20: something is
-        LISTENING on [::1]:<port> but never answers HTTP, while the serving path
-        streams real tool calls. Container restarts do not fix it (13 tried);
-        only the engine/WSL layer does.
+        The wedge signature, confirmed three times on 2026-09-20: something is
+        LISTENING on [::1]:<port> but never answers HTTP, while 127.0.0.1 and
+        the LAN keep serving real tool-call streams. From an operator's seat
+        that is indistinguishable from a hub hang, which is exactly why the
+        container was restarted 13 times in 6h47 — every restart useless (the
+        process boots fine; the pipe does not), and every restart cutting live
+        SSE on every relaying machine. The fleet-wide turn loss that day came
+        from the remediation, not from the wedge.
 
-        Default outcome on every machine is ESCALATE — log it and leave the host
-        alone. Acting requires, in order: the opt-in file, a rebuild path proven
-        in this same process, and the rate limit. Each gate is named in the log
-        so an operator reads WHY nothing happened rather than guessing.
+        So the defect is a DETECTION defect, and the fix is three probes that
+        disagree in a diagnostic way:
+
+            [::1] dead + (127.0.0.1 or LAN) alive -> forwarder wedge
+            all three dead                        -> the hub; the hang path owns it
+            [::1] alive                           -> healthy
+
+        The terminal verdict is ESCALATE: log a greppable label and let a human
+        decide. Only a host reboot rebuilds the forwarder, and an engine
+        teardown is what turned a wedge into a host with no engine at 13:18.
 
         This function must never throw. It runs after a successful health check,
         and a watchdog that turns a healthy cycle into a crash is worse than one
         that misses a wedge.
     #>
-    # The three probes and the recovery action are injectable so every branch can
-    # be exercised from scripts/tests without a real wedge and without touching
-    # the host. Defaults are the live implementations, so production behaviour is
-    # unchanged by the seam.
+    # The probes are injectable so every branch can be exercised from
+    # scripts/tests without a real wedge and without touching the host. Defaults
+    # are the live implementations, so production behaviour is unchanged by the
+    # seam. There is deliberately no action parameter: nothing to inject, because
+    # nothing is actuated.
     param(
         [bool]$ServingHealthy,
         [scriptblock]$HealthProbe = $null,
-        [scriptblock]$ListenerProbe = $null,
-        [scriptblock]$RecoveryAction = $null
+        [scriptblock]$ListenerProbe = $null
     )
 
     # Test-HttpAlive, NOT Test-HealthAnswers: a wedge is "no HTTP answer at
     # all", and requiring a 200 made this fire on a healthy machine under the
     # production interpreter (5.1 gets HTTP 400 from [::1] where pwsh 7 gets
     # 200 — a formatting difference, not a health signal).
-    if (-not $HealthProbe)    { $HealthProbe    = { param($u) Test-HttpAlive -Url $u } }
-    if (-not $ListenerProbe)  { $ListenerProbe  = { param($p) Test-LoopbackListener -Port $p } }
-    if (-not $RecoveryAction) { $RecoveryAction = { Invoke-EngineWedgeRecovery } }
+    if (-not $HealthProbe)   { $HealthProbe   = { param($u) Test-HttpAlive -Url $u } }
+    if (-not $ListenerProbe) { $ListenerProbe = { param($p) Test-LoopbackListener -Port $p } }
 
     try {
-        $st = Get-State
-        $loopbackUrl = Get-LoopbackProbeUrl -Port $ProxyPort
+        # AC5: gated, off by default. Checked before any probe runs, so a machine
+        # that never opted in is not even measured.
+        $optIn = Test-WedgeWatchOptIn -ClaudishHome $ClaudishHome
+        if (-not $optIn) { return }
 
+        $st = Get-State
+        $loopbackV6 = Get-LoopbackProbeUrl -Port $ProxyPort
+        $loopbackV4 = "http://127.0.0.1:$ProxyPort"
+
+        # AC1: every probe names its address family explicitly. `localhost` may
+        # never appear here — .NET 5+ falls back IPv6->IPv4 fast enough to report
+        # healthy straight through the very outage this exists to catch.
         $decision = Get-WedgeDecision `
+            -LoopbackV6Healthy ([bool](& $HealthProbe $loopbackV6)) `
+            -LoopbackV4Healthy ([bool](& $HealthProbe $loopbackV4)) `
             -ServingHealthy    $ServingHealthy `
             -LoopbackListening ([bool](& $ListenerProbe $ProxyPort)) `
-            -LoopbackHealthy   ([bool](& $HealthProbe $loopbackUrl)) `
             -ConsecutiveWedge  ([int](Get-StateField $st 'consecutiveWedge' 0)) `
-            -OptIn             (Test-EngineRecoveryOptIn -ClaudishHome $ClaudishHome) `
-            -RelaunchReady     $false `
-            -LastRecoveryUtc   $(
-                $raw = [string](Get-StateField $st 'lastWedgeRecoveryUtc' '')
-                if ([string]::IsNullOrWhiteSpace($raw)) { $null }
-                else { try { [datetime]::Parse($raw, $null, [Globalization.DateTimeStyles]::RoundtripKind) } catch { $null } }
-            )
+            -OptIn             $optIn
+
+        $where = "[v6=$loopbackV6 v4=$loopbackV4 serving=$ProxyUrl]"
 
         switch ($decision.Action) {
             'none' {
@@ -521,39 +534,15 @@ function Invoke-LoopbackWedgeWatch {
                 Set-State -ConsecutiveWedge 0
             }
             'arm' {
-                Write-Log "LOOPBACK-WEDGE $($decision.Reason) [serving=$ProxyUrl loopback=$loopbackUrl]"
+                # AC2: one greppable label for the signature, countable over time.
+                Write-Log "FORWARDER-WEDGE $($decision.Reason) $where"
                 Set-State -ConsecutiveWedge $decision.Wedge
             }
             'escalate' {
-                Write-Log "LOOPBACK-WEDGE $($decision.Reason) [serving=$ProxyUrl loopback=$loopbackUrl]"
-                Write-DiagLine "loopback-wedge"
+                Write-Log "FORWARDER-WEDGE $($decision.Reason) $where"
+                Write-Log "FORWARDER-WEDGE ESCALATE: operator action required — do NOT restart the container; only a host reboot rebuilds the forwarder"
+                Write-DiagLine "forwarder-wedge"
                 Set-State -ConsecutiveWedge $decision.Wedge
-            }
-            'recover' {
-                # Re-ask the gate, this time actually proving the rebuild. The
-                # decision above is computed with RelaunchReady=$false on
-                # purpose: proving the path registers a scheduled task, which is
-                # a side effect, and side effects do not belong on the cycles
-                # where nothing is wrong. So the proof is paid for only once the
-                # wedge is confirmed and opted in — and if it fails, we escalate
-                # instead of acting, exactly as if the operator had never opted in.
-                $ready = Test-EngineRelaunchReady
-                $final = Get-WedgeDecision `
-                    -ServingHealthy $ServingHealthy -LoopbackListening $true -LoopbackHealthy $false `
-                    -ConsecutiveWedge ($decision.Wedge - 1) -OptIn $true -RelaunchReady $ready.Ready `
-                    -LastRecoveryUtc $null
-
-                Set-State -ConsecutiveWedge $decision.Wedge
-                if ($final.Action -ne 'recover') {
-                    Write-Log "LOOPBACK-WEDGE $($final.Reason) [preflight: $($ready.Reason); checks=$($ready.Checks -join ',')]"
-                    Write-DiagLine "loopback-wedge-unprovable"
-                    return
-                }
-
-                Write-Log "LOOPBACK-WEDGE RECOVERING: $($final.Reason) — rebuild path proven ($($ready.Checks -join ','))"
-                Write-DiagLine "loopback-wedge-recover"
-                & $RecoveryAction
-                Set-State -ConsecutiveWedge 0 -LastWedgeRecoveryUtc ([datetime]::UtcNow.ToString('o'))
             }
         }
     } catch {
@@ -562,53 +551,12 @@ function Invoke-LoopbackWedgeWatch {
     }
 }
 
-function Invoke-EngineWedgeRecovery {
-    <#
-        Tears the engine down and brings it back. Reachable only after
-        Test-EngineRelaunchReady has registered AND read back the relaunch task
-        in this same process — the ordering that was missing at 13:18 on
-        2026-09-20, when the teardown ran and the rebuild then threw on its
-        first statement, leaving the host with no engine at all.
-
-        Every step is bounded and logged. The final state is always stated,
-        because "recovery attempted" is not a result.
-    #>
-    try { docker stop $ContainerName --time 10 2>&1 | Out-Null } catch {}
-    try { Stop-Process -Name "Docker Desktop" -Force -ErrorAction SilentlyContinue } catch {}
-    try { Stop-Service com.docker.service -Force -ErrorAction SilentlyContinue } catch {}
-    try { & wsl.exe --shutdown 2>&1 | Out-Null } catch {}
-    Start-Sleep -Seconds 5
-
-    try { Start-Service com.docker.service -ErrorAction SilentlyContinue } catch {}
-    try {
-        Start-ScheduledTask -TaskName "ClaudishDockerDesktopStart"
-        Write-Log "ENGINE-RECOVERY: relaunch task started"
-    } catch {
-        Write-Log "ENGINE-RECOVERY: relaunch task would not start ($($_.Exception.Message)) — MANUAL INTERVENTION REQUIRED"
-        return
-    }
-
-    for ($i = 1; $i -le 18; $i++) {
-        Start-Sleep -Seconds 10
-        if (Test-DockerEngine) {
-            Write-Log "ENGINE-RECOVERY: engine answering after $($i * 10)s"
-            [void](Invoke-DockerBounded @("start", $ContainerName) -TimeoutSec 120)
-            Start-Sleep -Seconds 10
-            $serving  = Test-HealthAnswers -Url $ProxyUrl
-            $loopback = Test-HealthAnswers -Url (Get-LoopbackProbeUrl -Port $ProxyPort)
-            Write-Log "ENGINE-RECOVERY: result serving=$serving loopback=$loopback"
-            return
-        }
-    }
-    Write-Log "ENGINE-RECOVERY: engine still down after 180s — MANUAL INTERVENTION REQUIRED"
-}
-
 # --- Main ---
 
 # Dot-sourcing this file loads its functions without running a cycle, the same
 # idiom claudish-drain.ps1 already uses (its standalone block is guarded by the
 # same test). That is what lets scripts/tests exercise the wedge glue —
-# Invoke-LoopbackWedgeWatch's four branches — against injected probes instead of
+# Invoke-LoopbackWedgeWatch's branches — against injected probes instead of
 # against a real wedge on the production hub. The previous attempt at this
 # feature had no such seam: the only way to run its logic was to ship it.
 if ($MyInvocation.InvocationName -eq '.') { return }

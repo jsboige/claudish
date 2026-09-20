@@ -18,11 +18,17 @@
     Three rules are encoded here rather than written down, because a rule that
     lives only in a doc gets re-broken:
 
-      1. NO TEARDOWN WITHOUT A PROVEN REBUILD. Test-EngineRelaunchReady does not
-         inspect intentions — it registers the relaunch task and reads it back.
-         A teardown is permitted only after that proof succeeds IN THE SAME
-         PROCESS. The 13:18 failure is unreachable by construction: the
-         registration that blew up is now the thing that must succeed first.
+      1. NO TEARDOWN WITHOUT A PROVEN REBUILD — and here, no teardown at all.
+         The wedge path has NO actuator: its terminal verdict is 'escalate'
+         (jsboige/claudish#172 AC4, and a static test in scripts/tests pins it —
+         a reviewer can grep the wedge path and find no Restart-*, no Stop-*, no
+         -Verb RunAs). A container restart cannot fix a forwarder wedge; 13 were
+         tried on 2026-09-20 and only a host reboot rebuilt it. Where an engine
+         action does already exist — Start-DockerEngine, which predates all of
+         this — Test-EngineRelaunchReady now guards it by registering the
+         relaunch task and reading it back, so the 13:18 failure is unreachable
+         by construction: the registration that blew up is the thing that must
+         succeed first.
       2. A GUARD IS AN EXPLICIT FLAG, NEVER AN ACCIDENTAL EQUALITY. The previous
          attempt disarmed itself with `if ($loopbackUrl -ne $ProxyUrl)`, which
          held only because the two strings happened to be equal on a machine
@@ -36,7 +42,7 @@
 Set-StrictMode -Version Latest
 
 $script:DefaultRelaunchTaskName = 'ClaudishDockerDesktopStart'
-$script:OptInFileName           = 'engine-recovery.enabled'
+$script:OptInFileName           = 'wedge-watch.enabled'
 $script:OptInToken              = 'enabled'
 
 function Get-ClaudishOptInFileName { return $script:OptInFileName }
@@ -186,7 +192,7 @@ function Test-HttpAlive {
     }
 }
 
-function Test-EngineRecoveryOptIn {
+function Test-WedgeWatchOptIn {
     <#
         Engine recovery is opt-in, per machine, through a file that must exist
         AND carry the literal token 'enabled'.
@@ -436,86 +442,100 @@ function Get-WedgeDecision {
         the point. The previous attempt's logic could only be exercised by
         shipping it to the production hub and waiting for a real wedge.
 
-        Returns @{ Action = 'none'|'arm'|'escalate'|'recover'; Wedge = <int>;
+        DETECTION ONLY — there is no actuator, by construction and by mandate
+        (#172 AC4). The terminal verdict is 'escalate'. A container restart
+        cannot fix a forwarder wedge (13 were tried on 2026-09-20, all useless)
+        and an engine teardown is what turned a wedge into a host with no engine
+        at all. The only thing that rebuilds the forwarder is a host reboot,
+        which is a human's decision, so the correct output is a loud line.
+
+        Returns @{ Action = 'none'|'arm'|'escalate'; Wedge = <int>;
+                   Signature = 'disabled'|'healthy'|'hub-down'|'inconclusive'|'wedge';
                    Reason = <string> }
 
-          none      nothing to see, reset the counter
+          none      nothing to act on; reset the counter. `Signature` says why,
+                    because "nothing" has five different causes here and an
+                    operator needs to know which one.
           arm       first sighting; count it, log it, touch nothing (1 of 2)
-          escalate  confirmed wedge, but acting is not permitted or not proven —
-                    log loudly so a human sees it. THIS IS THE DEFAULT OUTCOME.
-          recover   confirmed wedge, opted in, rebuild path proven, not
-                    rate-limited. The only path that may touch the engine.
+          escalate  confirmed wedge. Log with a greppable label and escalate to
+                    a human. THIS IS THE TERMINAL STATE.
 
-        Note the ordering of the gates after confirmation: opt-in before
-        readiness, readiness before the rate limit, so the logged reason always
-        names the FIRST thing that would have to change. A verdict that does not
-        say which of its conditions failed is how "one probe of two is dead"
+        Every verdict names the condition that decided it. A verdict that does
+        not say which of its conditions failed is how "one probe of two is dead"
         became "everything is dead" on 2026-09-20.
     #>
     param(
+        [Parameter(Mandatory)][bool]$LoopbackV6Healthy,
+        [Parameter(Mandatory)][bool]$LoopbackV4Healthy,
         [Parameter(Mandatory)][bool]$ServingHealthy,
         [Parameter(Mandatory)][bool]$LoopbackListening,
-        [Parameter(Mandatory)][bool]$LoopbackHealthy,
         [int]$ConsecutiveWedge = 0,
         [bool]$OptIn = $false,
-        [bool]$RelaunchReady = $false,
-        [datetime]$Now = [datetime]::UtcNow,
-        [Nullable[datetime]]$LastRecoveryUtc = $null,
-        [int]$RateLimitHours = 6,
         [int]$ConfirmCycles = 2
     )
 
-    # The serving path is the premise. If it is down, this is an ordinary outage
-    # and the hang/restart logic owns it — a wedge is BY DEFINITION the case
-    # where the service is fine and only the loopback door is stuck.
-    if (-not $ServingHealthy) {
-        return [PSCustomObject]@{ Action = 'none'; Wedge = 0; Reason = 'serving path unhealthy — not a wedge, the hang path owns this' }
+    $none = {
+        param($Reason, $Signature)
+        [PSCustomObject]@{ Action = 'none'; Wedge = 0; Signature = $Signature; Reason = $Reason }
     }
 
-    # No [::1] listener: either this machine does not route localhost through a
-    # WSL relay, or the TCP table cannot see (mirrored networking). Both mean
-    # "do not conclude".
+    # AC5: the watch is gated on an explicit flag and is OFF by default, so a
+    # machine that never asked for it is untouched — including by the probes.
+    # This gate is FIRST on purpose: the 2026-09-20 arming happened because a
+    # probe change could reach machines that had not opted in.
+    if (-not $OptIn) {
+        return & $none "wedge watch not enabled on this machine (create <ClaudishHome>\$($script:OptInFileName) containing '$($script:OptInToken)')" 'disabled'
+    }
+
+    # Healthy: the door everything local goes through answers. Nothing else
+    # matters, so nothing else is consulted.
+    if ($LoopbackV6Healthy) {
+        return & $none 'loopback [::1] healthy' 'healthy'
+    }
+
+    # THE DISCRIMINANT (#172). v6 is dead. What the OTHER families say is what
+    # separates the two outages that look identical from an operator's seat:
+    #
+    #   v6 dead + v4/LAN alive  -> forwarder wedge. No container action helps;
+    #                              13 restarts proved it on 2026-09-20.
+    #   v6 dead + v4/LAN dead   -> the hub itself. The hang/restart path owns
+    #                              it, and claiming a wedge here would send an
+    #                              operator chasing the forwarder during an
+    #                              ordinary outage — the mirror image of the
+    #                              mistake this detector exists to prevent.
+    if (-not ($LoopbackV4Healthy -or $ServingHealthy)) {
+        return & $none 'all families dead ([::1], 127.0.0.1, serving) — the hub itself, not a forwarder wedge; the hang path owns this' 'hub-down'
+    }
+
+    # Fail-safe. No visible [::1] listener means either this machine does not
+    # route localhost through a WSL relay, or the TCP table cannot enumerate it
+    # (networkingMode=mirrored, where empty means "not visible", NEVER "not
+    # serving"). An instrument that cannot see does not get to conclude.
     if (-not $LoopbackListening) {
-        return [PSCustomObject]@{ Action = 'none'; Wedge = 0; Reason = 'no [::1] listener visible — nothing to wedge, or table not enumerable' }
-    }
-
-    if ($LoopbackHealthy) {
-        return [PSCustomObject]@{ Action = 'none'; Wedge = 0; Reason = 'loopback healthy' }
+        return & $none 'no [::1] listener visible — nothing to wedge, or the TCP table cannot enumerate it (mirrored)' 'inconclusive'
     }
 
     $wedge = $ConsecutiveWedge + 1
+    $alive = @()
+    if ($LoopbackV4Healthy) { $alive += '127.0.0.1' }
+    if ($ServingHealthy)    { $alive += 'serving' }
+    $detail = "[::1] listening but not answering while $($alive -join '+') answer"
+
     if ($wedge -lt $ConfirmCycles) {
         return [PSCustomObject]@{
-            Action = 'arm'; Wedge = $wedge
-            Reason = "loopback dead while serving path OK ($wedge/$ConfirmCycles) — counting, no action"
+            Action = 'arm'; Wedge = $wedge; Signature = 'wedge'
+            Reason = "$detail ($wedge/$ConfirmCycles) — counting, no action"
         }
     }
 
-    $confirmed = "confirmed ${wedge}/${ConfirmCycles}: [::1] listening but not answering while the serving path streams"
-
-    if (-not $OptIn) {
-        return [PSCustomObject]@{
-            Action = 'escalate'; Wedge = $wedge
-            Reason = "$confirmed — engine recovery NOT opted in on this machine (create <ClaudishHome>\$($script:OptInFileName) containing '$($script:OptInToken)'); logging only"
-        }
+    # The terminal verdict. There is deliberately nothing past this point:
+    # escalation IS the outcome, per #172 AC4. A container restart cannot fix a
+    # wedge and an engine teardown is what turned a wedge into a dead host at
+    # 13:18 on 2026-09-20, so the correct actuator is a human reading this line.
+    return [PSCustomObject]@{
+        Action = 'escalate'; Wedge = $wedge; Signature = 'wedge'
+        Reason = "confirmed ${wedge}/${ConfirmCycles}: $detail — container restarts CANNOT fix this (13 tried 2026-09-20); only a host reboot rebuilds the forwarder. Escalating, no action taken."
     }
-    if (-not $RelaunchReady) {
-        return [PSCustomObject]@{
-            Action = 'escalate'; Wedge = $wedge
-            Reason = "$confirmed — opted in, but the relaunch path is NOT proven; refusing to tear down an engine this process cannot rebuild"
-        }
-    }
-    if ($null -ne $LastRecoveryUtc) {
-        $elapsed = $Now - [datetime]$LastRecoveryUtc
-        if ($elapsed.TotalHours -lt $RateLimitHours) {
-            return [PSCustomObject]@{
-                Action = 'escalate'; Wedge = $wedge
-                Reason = ("$confirmed — rate-limited, last recovery {0:N1}h ago (< {1}h)" -f $elapsed.TotalHours, $RateLimitHours)
-            }
-        }
-    }
-
-    return [PSCustomObject]@{ Action = 'recover'; Wedge = $wedge; Reason = $confirmed }
 }
 
 Export-ModuleMember -Function @(
@@ -524,7 +544,7 @@ Export-ModuleMember -Function @(
     'Get-LoopbackProbeUrl'
     'Test-LoopbackListener'
     'Test-HttpAlive'
-    'Test-EngineRecoveryOptIn'
+    'Test-WedgeWatchOptIn'
     'New-EngineRelaunchRegistration'
     'Get-InteractiveUserId'
     'ConvertFrom-QuserOutput'

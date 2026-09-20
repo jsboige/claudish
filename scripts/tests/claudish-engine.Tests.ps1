@@ -143,9 +143,9 @@ Describe 'Test-HttpAlive' {
     }
 }
 
-Describe 'Test-EngineRecoveryOptIn' {
+Describe 'Test-WedgeWatchOptIn' {
     It 'is $false on a machine with no opt-in file (the default everywhere)' {
-        Test-EngineRecoveryOptIn -ClaudishHome $TestDrive | Should -BeFalse
+        Test-WedgeWatchOptIn -ClaudishHome $TestDrive | Should -BeFalse
     }
 
     It 'REGRESSION: an EMPTY opt-in file does not arm a teardown' {
@@ -153,17 +153,17 @@ Describe 'Test-EngineRecoveryOptIn' {
         # `New-Item` or stray redirect must not enable tearing down the host's
         # container engine.
         Set-Content -Path (Join-Path $TestDrive (Get-ClaudishOptInFileName)) -Value '' -NoNewline
-        Test-EngineRecoveryOptIn -ClaudishHome $TestDrive | Should -BeFalse
+        Test-WedgeWatchOptIn -ClaudishHome $TestDrive | Should -BeFalse
     }
 
     It 'is $false when the file exists with the wrong content' {
         Set-Content -Path (Join-Path $TestDrive (Get-ClaudishOptInFileName)) -Value 'yes please'
-        Test-EngineRecoveryOptIn -ClaudishHome $TestDrive | Should -BeFalse
+        Test-WedgeWatchOptIn -ClaudishHome $TestDrive | Should -BeFalse
     }
 
     It 'is $true only for the exact token, whitespace-tolerant' {
         Set-Content -Path (Join-Path $TestDrive (Get-ClaudishOptInFileName)) -Value "  $(Get-ClaudishOptInToken)  `n"
-        Test-EngineRecoveryOptIn -ClaudishHome $TestDrive | Should -BeTrue
+        Test-WedgeWatchOptIn -ClaudishHome $TestDrive | Should -BeTrue
     }
 }
 
@@ -299,80 +299,100 @@ Describe 'New-EngineRelaunchRegistration (cmdlet surface)' {
 }
 
 Describe 'Get-WedgeDecision (pure decision table)' {
-    It 'does nothing when the serving path itself is unhealthy' {
-        $d = Get-WedgeDecision -ServingHealthy $false -LoopbackListening $true -LoopbackHealthy $false -ConsecutiveWedge 5
-        $d.Action | Should -Be 'none'
-        $d.Reason | Should -Match 'hang path'
+    BeforeAll {
+        # Shorthand: a fully-armed, three-probe call with only the interesting
+        # inputs varying. Opt-in defaults to $true because the gate has its own
+        # dedicated tests — leaving it implicit everywhere would mean every
+        # other test passed for the same, uninteresting reason.
+        #
+        # It lives in BeforeAll, not directly in the Describe: Pester runs the
+        # Describe body in its DISCOVERY phase, and a function declared there is
+        # gone by the time an It runs.
+        function Invoke-Decision {
+            param($V6, $V4, $Serving, $Listening = $true, $Wedge = 0, $OptIn = $true)
+            Get-WedgeDecision -LoopbackV6Healthy $V6 -LoopbackV4Healthy $V4 `
+                -ServingHealthy $Serving -LoopbackListening $Listening `
+                -ConsecutiveWedge $Wedge -OptIn $OptIn
+        }
     }
 
-    It 'does nothing when no [::1] listener is visible (fail-safe under mirrored)' {
-        $d = Get-WedgeDecision -ServingHealthy $true -LoopbackListening $false -LoopbackHealthy $false -ConsecutiveWedge 5
+    It 'AC5: the gate is off by default — a machine that did not opt in is not measured' {
+        $d = Invoke-Decision -V6 $false -V4 $true -Serving $true -Wedge 5 -OptIn $false
         $d.Action | Should -Be 'none'
+        $d.Signature | Should -Be 'disabled'
+        $d.Reason | Should -Match 'not enabled'
     }
 
-    It 'does nothing and resets when the loopback is healthy' {
-        $d = Get-WedgeDecision -ServingHealthy $true -LoopbackListening $true -LoopbackHealthy $true -ConsecutiveWedge 1
+    It 'AC5: the gate is proven in the other direction too — opted in, the same inputs escalate' {
+        # A gate tested in one direction only proves the code can say no.
+        $d = Invoke-Decision -V6 $false -V4 $true -Serving $true -Wedge 5 -OptIn $true
+        $d.Action | Should -Be 'escalate'
+    }
+
+    It 'does nothing and resets when [::1] answers' {
+        $d = Invoke-Decision -V6 $true -V4 $true -Serving $true -Wedge 1
         $d.Action | Should -Be 'none'
+        $d.Signature | Should -Be 'healthy'
         $d.Wedge | Should -Be 0
     }
 
-    It 'arms on the first sighting without acting (1 of 2)' {
-        $d = Get-WedgeDecision -ServingHealthy $true -LoopbackListening $true -LoopbackHealthy $false -ConsecutiveWedge 0
+    It 'DISCRIMINANT: [::1] dead while 127.0.0.1 answers is a WEDGE' {
+        $d = Invoke-Decision -V6 $false -V4 $true -Serving $false -Wedge 1
+        $d.Signature | Should -Be 'wedge'
+        $d.Action | Should -Be 'escalate'
+    }
+
+    It 'DISCRIMINANT: [::1] dead while only the LAN answers is a WEDGE' {
+        $d = Invoke-Decision -V6 $false -V4 $false -Serving $true -Wedge 1
+        $d.Signature | Should -Be 'wedge'
+    }
+
+    It 'DISCRIMINANT: all three families dead is the HUB, not a wedge' {
+        # The mirror image of the 2026-09-20 mistake. Calling this a wedge would
+        # send an operator hunting the forwarder during an ordinary outage, and
+        # the hang/restart path — which CAN fix it — would never run.
+        $d = Invoke-Decision -V6 $false -V4 $false -Serving $false -Wedge 1
+        $d.Action | Should -Be 'none'
+        $d.Signature | Should -Be 'hub-down'
+        $d.Reason | Should -Match 'hang path'
+    }
+
+    It 'fails safe when no [::1] listener is visible (mirrored: "not visible" is not "not serving")' {
+        $d = Invoke-Decision -V6 $false -V4 $true -Serving $true -Listening $false -Wedge 5
+        $d.Action | Should -Be 'none'
+        $d.Signature | Should -Be 'inconclusive'
+    }
+
+    It 'arms on the first sighting without escalating (1 of 2)' {
+        $d = Invoke-Decision -V6 $false -V4 $true -Serving $true -Wedge 0
         $d.Action | Should -Be 'arm'
         $d.Wedge | Should -Be 1
     }
 
-    It 'DEFAULT: a confirmed wedge on a non-opted-in machine only escalates' {
-        # No machine acts on its engine merely because the code shipped there.
-        $d = Get-WedgeDecision -ServingHealthy $true -LoopbackListening $true -LoopbackHealthy $false -ConsecutiveWedge 1
-        $d.Action | Should -Be 'escalate'
-        $d.Reason | Should -Match 'NOT opted in'
-    }
-
-    It 'CORE GUARD: opted in but no proven rebuild path still refuses to act' {
-        $d = Get-WedgeDecision -ServingHealthy $true -LoopbackListening $true -LoopbackHealthy $false `
-            -ConsecutiveWedge 1 -OptIn $true -RelaunchReady $false
-        $d.Action | Should -Be 'escalate'
-        $d.Reason | Should -Match 'refusing to tear down'
-    }
-
-    It 'respects the rate limit once everything else is satisfied' {
-        $now = [datetime]'2026-09-20T13:00:00Z'
-        $d = Get-WedgeDecision -ServingHealthy $true -LoopbackListening $true -LoopbackHealthy $false `
-            -ConsecutiveWedge 1 -OptIn $true -RelaunchReady $true -Now $now -LastRecoveryUtc $now.AddHours(-1) -RateLimitHours 6
-        $d.Action | Should -Be 'escalate'
-        $d.Reason | Should -Match 'rate-limited'
-    }
-
-    It 'recovers only when confirmed AND opted in AND proven AND outside the rate limit' {
-        $now = [datetime]'2026-09-20T13:00:00Z'
-        $d = Get-WedgeDecision -ServingHealthy $true -LoopbackListening $true -LoopbackHealthy $false `
-            -ConsecutiveWedge 1 -OptIn $true -RelaunchReady $true -Now $now -LastRecoveryUtc $now.AddHours(-7) -RateLimitHours 6
-        $d.Action | Should -Be 'recover'
-    }
-
-    It 'recovers when there is no prior recovery on record' {
-        $d = Get-WedgeDecision -ServingHealthy $true -LoopbackListening $true -LoopbackHealthy $false `
-            -ConsecutiveWedge 1 -OptIn $true -RelaunchReady $true
-        $d.Action | Should -Be 'recover'
-    }
-
-    It 'REGRESSION: every verdict names which condition decided it' {
-        # "HEALTH FAILED" with no discriminant is how "one probe of two is
-        # dead" was published as "everything is dead".
-        foreach ($case in @(
-            @{ S = $false; L = $true;  H = $false; O = $false; R = $false }
-            @{ S = $true;  L = $false; H = $false; O = $false; R = $false }
-            @{ S = $true;  L = $true;  H = $true;  O = $false; R = $false }
-            @{ S = $true;  L = $true;  H = $false; O = $false; R = $false }
-            @{ S = $true;  L = $true;  H = $false; O = $true;  R = $false }
-            @{ S = $true;  L = $true;  H = $false; O = $true;  R = $true  }
-        )) {
-            $d = Get-WedgeDecision -ServingHealthy $case.S -LoopbackListening $case.L -LoopbackHealthy $case.H `
-                -ConsecutiveWedge 1 -OptIn $case.O -RelaunchReady $case.R
+    It 'CORE GUARD: the terminal verdict is escalate — no input produces an actuator' {
+        # Exhaustive over every boolean combination and a range of counters.
+        # There must be no reachable verdict past 'escalate': #172 AC4, and the
+        # reason 13:18 happened at all. This is the test that must fail if
+        # anyone ever adds a fifth action.
+        foreach ($v6 in @($true, $false)) {
+        foreach ($v4 in @($true, $false)) {
+        foreach ($sv in @($true, $false)) {
+        foreach ($li in @($true, $false)) {
+        foreach ($oi in @($true, $false)) {
+        foreach ($wc in @(0, 1, 2, 17)) {
+            $d = Invoke-Decision -V6 $v6 -V4 $v4 -Serving $sv -Listening $li -Wedge $wc -OptIn $oi
+            $d.Action | Should -BeIn @('none', 'arm', 'escalate')
             $d.Reason | Should -Not -BeNullOrEmpty
-            $d.Action | Should -BeIn @('none', 'arm', 'escalate', 'recover')
-        }
+            $d.Signature | Should -BeIn @('disabled', 'healthy', 'hub-down', 'inconclusive', 'wedge')
+        }}}}}}
+    }
+
+    It 'REGRESSION: a confirmed wedge says container restarts cannot fix it' {
+        # The operative fact. 13 restarts were attempted because nothing told
+        # the operator they were useless; the escalation must carry that.
+        $d = Invoke-Decision -V6 $false -V4 $true -Serving $true -Wedge 1
+        $d.Reason | Should -Match 'CANNOT fix'
+        $d.Reason | Should -Match 'host reboot'
     }
 }
 
@@ -425,11 +445,93 @@ Describe 'Static guardrails over scripts/' {
             ForEach-Object { $_.ParameterName }) | Should -Contain 'LogonType'
     }
 
-    It 'the watchdog gates engine recovery on the explicit opt-in helper, not on a string comparison' {
+    It 'AC4: the wedge detection path contains no actuator' {
+        # jsboige/claudish#172 AC4, made executable: "a reviewer must be able to
+        # grep the diff and find no Restart-*, no Stop-*, no -Verb RunAs".
+        #
+        # Scoped to the wedge functions rather than the whole file, because the
+        # watchdog legitimately restarts the CONTAINER on the hang path — that
+        # predates all of this and is the correct remedy for a hang. What must
+        # never appear is an actuator on the WEDGE path, where no restart helps.
+        # The scope is stated so the number cannot go stale silently.
+        $wdPath = Join-Path $script:ScriptsRoot 'claudish-watchdog.ps1'
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($wdPath, [ref]$tokens, [ref]$errs)
+
+        $wedgeFns = $ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -match 'Wedge'
+        }, $true)
+        $wedgeFns.Count | Should -BeGreaterThan 0 -Because 'the guard must have something to guard'
+
+        $offenders = @()
+        foreach ($fn in $wedgeFns) {
+            foreach ($call in $fn.FindAll({
+                param($n) $n -is [System.Management.Automation.Language.CommandAst]
+            }, $true)) {
+                $name = $call.GetCommandName()
+                if ($name -and ($name -match '^(Restart-|Stop-)' -or $name -eq 'wsl.exe' -or $name -eq 'wsl')) {
+                    $offenders += ('{0}:{1} {2}' -f $fn.Name, $call.Extent.StartLineNumber, $name)
+                }
+                $flags = $call.CommandElements |
+                    Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+                    ForEach-Object { $_.ParameterName }
+                if ($flags -contains 'Verb') { $offenders += ('{0}:{1} -Verb' -f $fn.Name, $call.Extent.StartLineNumber) }
+            }
+            # `docker stop` is not a Stop-* cmdlet — it is an external command
+            # whose actuator lives in its argument, which an AST command-name
+            # check walks straight past.
+            if ($fn.Extent.Text -match 'docker\s+(stop|restart|kill)') {
+                $offenders += ('{0}: docker stop/restart/kill' -f $fn.Name)
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
+
+    It 'AC4: the actuator detector actually detects (positive control)' {
+        # Without this, deleting the wedge functions would make the guard above
+        # pass for the wrong reason.
+        $tokens = $null; $errs = $null
+        $bad = [System.Management.Automation.Language.Parser]::ParseInput(
+            'function Invoke-WedgeThing { Stop-Service com.docker.service -Force; docker stop c }',
+            [ref]$tokens, [ref]$errs)
+        $fn = $bad.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true)[0]
+
+        $hits = @($fn.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst]
+        }, $true) | Where-Object { $_.GetCommandName() -match '^(Restart-|Stop-)' })
+        $hits.Count | Should -BeGreaterThan 0
+        $fn.Extent.Text | Should -Match 'docker\s+(stop|restart|kill)'
+    }
+
+    It 'AC1: no probe path names localhost' {
+        # pwsh 7 falls back IPv6->IPv4 fast enough that a `localhost` probe
+        # reports healthy straight through the wedge it exists to catch. The
+        # probe and the client must see the same network.
+        $wdPath = Join-Path $script:ScriptsRoot 'claudish-watchdog.ps1'
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($wdPath, [ref]$tokens, [ref]$errs)
+        $fn = $ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -eq 'Invoke-LoopbackWedgeWatch'
+        }, $true)
+        $fn.Count | Should -Be 1
+        # Strip comments: the prose explains WHY localhost is forbidden, and an
+        # instrument that cannot tell a call from a comment about a call is the
+        # exact failure this suite already has a scar from.
+        $code = ($fn[0].Extent.Text -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+        $code | Should -Not -Match 'localhost'
+    }
+
+    It 'the watchdog gates the wedge watch on the explicit opt-in helper, not on a string comparison' {
         $wd = Get-Content -LiteralPath (Join-Path $script:ScriptsRoot 'claudish-watchdog.ps1') -Raw
         if ($wd -match 'Get-WedgeDecision') {
-            $wd | Should -Match 'Test-EngineRecoveryOptIn'
-            $wd | Should -Match 'Test-EngineRelaunchReady'
+            $wd | Should -Match 'Test-WedgeWatchOptIn'
+            $wd | Should -Not -Match 'Invoke-EngineWedgeRecovery'
         }
     }
 
