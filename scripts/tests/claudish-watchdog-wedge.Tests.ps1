@@ -29,94 +29,121 @@ Describe 'Invoke-LoopbackWedgeWatch (wiring)' {
         # this purpose makes the load a no-op beyond defining functions.
         . $script:WatchdogPath -ClaudishHome $script:SandboxHome
 
-        $script:Recovered = $false
-        $script:RecoverStub = { $script:Recovered = $true }
-        $script:DeadLoopback = { param($u) $false }
-        $script:LiveLoopback = { param($u) $true }
-        $script:Listening = { param($p) $true }
+        # A probe answers per ADDRESS now, not per call: the discriminant is
+        # the disagreement between families, so a stub that returns one boolean
+        # for every address could not express a wedge at all.
+        $script:WedgeProbe  = { param($u) $u -notmatch '\[::1\]' }   # v6 dead, v4/LAN alive
+        $script:AllAlive    = { param($u) $true }
+        $script:AllDead     = { param($u) $false }
+        $script:Listening    = { param($p) $true }
         $script:NotListening = { param($p) $false }
+
+        # AC5: every case below needs the watch enabled, since off-by-default is
+        # the whole point of the gate. The gate's own test opts OUT explicitly.
+        Set-Content -Path (Join-Path $script:SandboxHome (Get-ClaudishOptInFileName)) -Value 'enabled'
     }
 
     It 'stays silent and resets when the loopback is healthy' {
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $LiveLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $AllAlive `
+            -ListenerProbe $Listening
 
         (Get-State).consecutiveWedge | Should -Be 0
-        $Recovered | Should -BeFalse
         (Get-Content (Join-Path $SandboxHome 'watchdog.log') -Raw -ErrorAction SilentlyContinue) |
-            Should -Not -Match 'LOOPBACK-WEDGE'
+            Should -Not -Match 'FORWARDER-WEDGE'
     }
 
     It 'arms on the first sighting, persists the counter, and does not act' {
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $DeadLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $WedgeProbe `
+            -ListenerProbe $Listening
 
         (Get-State).consecutiveWedge | Should -Be 1
-        $Recovered | Should -BeFalse
-        (Get-Content (Join-Path $SandboxHome 'watchdog.log') -Raw) | Should -Match '1/2'
+        $log = Get-Content (Join-Path $SandboxHome 'watchdog.log') -Raw
+        $log | Should -Match 'FORWARDER-WEDGE'
+        $log | Should -Match '1/2'
     }
 
-    It 'escalates on the second sighting and still does not act (no opt-in)' {
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $DeadLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $DeadLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
+    It 'CORE GUARD: a confirmed wedge escalates and tells the operator NOT to restart' {
+        # This is the 13:18 scenario end to end, and the terminal state is a
+        # log line. 13 container restarts were attempted that day because
+        # nothing told the operator they could not work; the escalation must.
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $WedgeProbe `
+            -ListenerProbe $Listening
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $WedgeProbe `
+            -ListenerProbe $Listening
 
         (Get-State).consecutiveWedge | Should -Be 2
-        $Recovered | Should -BeFalse
         $log = Get-Content (Join-Path $SandboxHome 'watchdog.log') -Raw
-        $log | Should -Match 'NOT opted in'
+        $log | Should -Match 'FORWARDER-WEDGE ESCALATE'
+        $log | Should -Match 'do NOT restart the container'
+        $log | Should -Match 'host reboot'
     }
 
-    It 'CORE GUARD: opted in, wedge confirmed, but the preflight fails -> no teardown' {
-        # This is the 13:18 scenario end to end. The machine has opted in, the
-        # wedge is real and confirmed, and the rebuild path cannot be proven
-        # (unelevated here, exactly as it was for the shell that ran it). The
-        # only correct outcome is a loud log and an untouched host.
-        Set-Content -Path (Join-Path $SandboxHome (Get-ClaudishOptInFileName)) -Value 'enabled'
+    It 'DISCRIMINANT: all families dead is reported as the hub, never as a wedge' {
+        # The mirror-image failure. Calling this a wedge would tell the operator
+        # not to restart during an ordinary outage, where a restart is the fix.
+        Invoke-LoopbackWedgeWatch -ServingHealthy $false -HealthProbe $AllDead `
+            -ListenerProbe $Listening
+        Invoke-LoopbackWedgeWatch -ServingHealthy $false -HealthProbe $AllDead `
+            -ListenerProbe $Listening
 
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $DeadLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $DeadLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
+        (Get-State).consecutiveWedge | Should -Be 0
+        (Get-Content (Join-Path $SandboxHome 'watchdog.log') -Raw -ErrorAction SilentlyContinue) |
+            Should -Not -Match 'FORWARDER-WEDGE'
+    }
 
-        $Recovered | Should -BeFalse
-        (Get-Content (Join-Path $SandboxHome 'watchdog.log') -Raw) | Should -Match 'refusing to tear down|relaunch path'
+    It 'AC5: a machine that has not opted in is not probed at all' {
+        # Not merely "takes no action": the gate is checked BEFORE the probes
+        # run, so an opted-out machine is not even measured. The witness is the
+        # probe itself — asserting only on the counter would pass just as well
+        # with the gate moved after the probes.
+        Remove-Item (Join-Path $SandboxHome (Get-ClaudishOptInFileName)) -Force
+        $script:Probed = $false
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true `
+            -HealthProbe { $script:Probed = $true; $false } `
+            -ListenerProbe $Listening
+
+        $script:Probed | Should -BeFalse
+
+        # No state file is written at all on this path, so Get-State is $null —
+        # reading the field through the accessor is what the watchdog itself
+        # does, and asserting `(Get-State).consecutiveWedge -eq 0` would fail on
+        # $null for the most correct possible behaviour.
+        [int](Get-StateField (Get-State) 'consecutiveWedge' 0) | Should -Be 0
+        (Get-Content (Join-Path $SandboxHome 'watchdog.log') -Raw -ErrorAction SilentlyContinue) |
+            Should -Not -Match 'FORWARDER-WEDGE'
     }
 
     It 'clears the counter once the loopback comes back' {
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $DeadLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $WedgeProbe `
+            -ListenerProbe $Listening
         (Get-State).consecutiveWedge | Should -Be 1
 
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $LiveLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $AllAlive `
+            -ListenerProbe $Listening
         (Get-State).consecutiveWedge | Should -Be 0
         (Get-Content (Join-Path $SandboxHome 'watchdog.log') -Raw) | Should -Match 'cleared'
     }
 
     It 'does nothing when no [::1] listener is visible (mirrored fail-safe)' {
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $DeadLoopback `
-            -ListenerProbe $NotListening -RecoveryAction $RecoverStub
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $WedgeProbe `
+            -ListenerProbe $NotListening
 
         (Get-State).consecutiveWedge | Should -Be 0
-        $Recovered | Should -BeFalse
     }
 
     It 'never throws, even when a probe does' {
         # It runs on the success path of a healthy cycle. A watchdog that turns
         # a healthy cycle into a crash is worse than one that misses a wedge.
         { Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe { throw 'boom' } `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub } | Should -Not -Throw
-        $Recovered | Should -BeFalse
+            -ListenerProbe $Listening } | Should -Not -Throw
     }
 
     It 'REGRESSION: the wedge counter survives a hang-counter write' {
         # Set-State used to replace the whole state object with a single field,
         # so writing one counter erased the other and a confirmation counter
         # could never reach 2.
-        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $DeadLoopback `
-            -ListenerProbe $Listening -RecoveryAction $RecoverStub
+        Invoke-LoopbackWedgeWatch -ServingHealthy $true -HealthProbe $WedgeProbe `
+            -ListenerProbe $Listening
         Set-State -ConsecutiveHangs 0
         (Get-State).consecutiveWedge | Should -Be 1
     }
