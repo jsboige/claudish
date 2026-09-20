@@ -537,7 +537,36 @@ export function createStreamingResponseHandler(
             );
           }
           log(`[Streaming] Text-based tool calls found: ${textToolCalls.length}`);
-          if (textToolCalls.length > 0) {
+
+          // ── Ending classification (S4-b c1b907f) ──────────────────────────
+          // `finish_reason` is the ONLY completion signal — neither `[DONE]`
+          // nor a final usage frame counts; both are transport punctuation. A
+          // turn that ends with NO finish_reason while tool content is in
+          // flight (structured fragments or a text-recovered call — recovery
+          // runs above and counts as content AND as a tool) was CUT mid-call:
+          // dispatching the call would ship an action the model never finished
+          // specifying. That is a FAILURE ending. Plain text on a
+          // finish_reason-less turn degrades to max_tokens below (silent
+          // truncation — visible, labeled by its stop_reason, never an error).
+          const toolsInFlight = state.tools.size > 0 || textToolCalls.length > 0;
+          const failedEnding =
+            reason === "error" ||
+            (state.lastFinishReason == null && toolsInFlight);
+          if (failedEnding && state.lastFinishReason == null) {
+            log(
+              `[Stream] Unexplained ending: finish_reason never arrived with ${state.tools.size} structured tool(s) and ${textToolCalls.length} recovered call(s) in flight — suppressing dispatch, labeling the turn`
+            );
+            logStderr(
+              `[Stream] UNEXPLAINED ENDING from ${target} — no finish_reason with tool content in flight; failure lane`
+            );
+          }
+          if (failedEnding && textToolCalls.length > 0) {
+            log(
+              `[Streaming] Suppressing ${textToolCalls.length} text-recovered tool call(s): the turn failed before completion`
+            );
+          }
+
+          if (textToolCalls.length > 0 && !failedEnding) {
             log(
               `[Streaming] Found ${textToolCalls.length} text-based tool call(s), converting to structured format`
             );
@@ -556,7 +585,9 @@ export function createStreamingResponseHandler(
 
           // GLM <searchWeb> remapped to the client's WebSearch tool —
           // emitted as a tool_use block so stop_reason becomes "tool_use".
-          if (pendingSearchRemap) {
+          // Suppressed on a failure ending: no NEW tool block leaves a failed
+          // turn (S4-b c1b907f).
+          if (pendingSearchRemap && !failedEnding) {
             emitWebSearchToolUse(pendingSearchRemap);
           }
 
@@ -591,8 +622,21 @@ export function createStreamingResponseHandler(
           // Some models (e.g., Gemini via LiteLLM) send tool calls with finish_reason="stop"
           // instead of "tool_calls", so the normal validation path (line ~695) is never reached.
           // We must send these buffered tools here so Claude Code can execute them.
+          // Suppressed on a failure ending: no completed tool call ships with a
+          // failed turn (S4-b c1b907f).
+          if (failedEnding) {
+            const unsent = Array.from(state.tools.values()).filter(
+              (t) => !t.closed && t.buffered && !t.started
+            );
+            if (unsent.length > 0) {
+              log(
+                `[Streaming] Suppressing buffered flush of ${unsent.length} tool call(s): the turn failed before completion`
+              );
+              for (const t of unsent) t.closed = true;
+            }
+          }
           for (const t of Array.from(state.tools.values())) {
-            if (!t.closed && t.buffered && !t.started) {
+            if (!t.closed && t.buffered && !t.started && !failedEnding) {
               if (toolSchemas && toolSchemas.length > 0) {
                 const validation = validateToolArguments(
                   t.name,
@@ -668,12 +712,20 @@ export function createStreamingResponseHandler(
             hasSuppressedWebText ||
             searchWebResults !== null;
 
-          if (reason === "error") {
-            // Socket close, network error, or other fetch failure mid-stream.
+          if (reason === "error" || failedEnding) {
+            // Socket close, network error, other fetch failure mid-stream — or
+            // an unexplained ending: finish_reason never arrived while tool
+            // content was in flight (S4-b c1b907f).
             // Previously we sent event: error, but Claude Code surfaces raw SSE error
             // events as "API Error: <message>" without closing the turn cleanly.
             // Instead, close any open blocks and inject the error as a text block
             // so the turn ends gracefully with end_turn.
+            // INTENDED DIVERGENCE FROM UPSTREAM (ai-01 arbitration, corpus-settled):
+            // upstream's failure ending emits a bare SSE `error` event. This fork
+            // delivers the failure through this labeled text-block lane instead —
+            // 1017 resp-*.sse captures on our wire carry ZERO `event: error`
+            // frames, and the never-hang invariant is "every terminating path
+            // ends with message_stop after a well-formed turn".
             log(`[Stream] Stream error from ${target}: ${err}`);
             logStderr(`[Stream] Stream error from ${target}: ${err?.substring(0, 120)}`);
 
@@ -681,9 +733,12 @@ export function createStreamingResponseHandler(
             // `openText` closes whatever block is still open — thinking, text, or
             // a tool — which is where the hand-written close pair used to live.
             const isSocketClose = /socket.*closed|connection was closed|ECONNRESET/i.test(err || "");
-            const errorNotice = isSocketClose
-              ? `[The connection to the model provider was interrupted. This is usually temporary — please retry.]`
-              : `[Upstream stream error: ${(err || "unknown").substring(0, 200)}]`;
+            const errorNotice =
+              reason !== "error"
+                ? `[Upstream stream ended without a finish_reason while a tool call was in flight — the turn was cut and no tool was dispatched. This is usually temporary — please retry.]`
+                : isSocketClose
+                  ? `[The connection to the model provider was interrupted. This is usually temporary — please retry.]`
+                  : `[Upstream stream error: ${(err || "unknown").substring(0, 200)}]`;
             const errorRef = writer.openText();
             writer.append(errorRef, errorNotice);
             writer.close(errorRef);
@@ -746,7 +801,16 @@ export function createStreamingResponseHandler(
             // `content_filter` is the same class: the provider refused, which
             // is Anthropic's "refusal". Both OUTRANK tool_use — a truncated
             // tool call must not be dispatched as a complete one.
-            const truncated = state.lastFinishReason === "length";
+            // A finish_reason-less turn that DID produce text is the same
+            // silent truncation (S4-b c1b907f): [DONE] and the final usage
+            // frame are transport punctuation, not completion. Tool content on
+            // such a turn never reaches here — it took the failure lane above.
+            // A turn that produced NOTHING and ended with nothing is a plain
+            // success: the empty-response notice above already covers the
+            // empty content array.
+            const truncated =
+              state.lastFinishReason === "length" ||
+              (state.lastFinishReason == null && hasContent);
             const refused = state.lastFinishReason === "content_filter";
             const stopReason = refused
               ? "refusal"
