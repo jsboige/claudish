@@ -42,20 +42,7 @@ if (-not (Test-Path $ClaudishHome)) {
 }
 
 $LogPath = "$ClaudishHome\watchdog.log"
-# Probe URL: localhost unless this machine opts out via base-url.txt. On
-# 2026-09-20 (po-2025, twice in one morning) the Docker Desktop localhost
-# forwarder wedged BELOW the container — port 3000 LISTENING, HTTP dead on
-# loopback, published 0.0.0.0 binding serving — and this watchdog then
-# restarted a healthy container 13 times while local clients stayed dead;
-# only a host reboot rebuilt the forwarder. A base-url.txt carrying e.g.
-# http://192.168.0.50:3000 moves every probe onto the binding that survives
-# that wedge, which is also what lets the loopback-watch below SEE it die.
 $ProxyUrl = "http://localhost:3000"
-$BaseUrlFile = "$ClaudishHome\base-url.txt"
-if (Test-Path $BaseUrlFile) {
-    $v = Get-Content $BaseUrlFile -Raw -ErrorAction SilentlyContinue
-    if ($v) { $ProxyUrl = $v.Trim() }
-}
 $ContainerName = "claudish-proxy"
 $StreamTimeoutSec = 90
 # Every docker CLI call is bounded by this. Unbounded was the real failure on
@@ -254,24 +241,14 @@ function Get-State {
     if (Test-Path $StateFile) {
         try { return Get-Content $StateFile -Raw | ConvertFrom-Json } catch {}
     }
-    return [PSCustomObject]@{ consecutiveHangs = 0; consecutiveWedge = 0 }
+    return [PSCustomObject]@{ consecutiveHangs = 0 }
 }
 
 function Set-State {
-    # consecutiveWedge / lastEngineRecoveryAt exist since the 2026-09-20
-    # forwarder-wedge work; older state files simply lack them and every
-    # reader treats a missing property as 0 / empty.
-    param(
-        [int]$ConsecutiveHangs,
-        [int]$ConsecutiveWedge = 0,
-        [string]$LastEngineRecoveryAt = ""
-    )
+    param([int]$ConsecutiveHangs)
     $dir = Split-Path $StateFile -Parent
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    @{ consecutiveHangs = $ConsecutiveHangs
-       consecutiveWedge = $ConsecutiveWedge
-       lastEngineRecoveryAt = $LastEngineRecoveryAt } |
-        ConvertTo-Json | Set-Content -Path $StateFile -Encoding UTF8
+    @{ consecutiveHangs = $ConsecutiveHangs } | ConvertTo-Json | Set-Content -Path $StateFile -Encoding UTF8
 }
 
 function Invoke-DockerBounded {
@@ -455,80 +432,6 @@ function Start-DockerEngine {
     return $false
 }
 
-function Test-HealthAnswers {
-    # Lightweight /health reachability (NOT a stream test). Used by the
-    # forwarder-wedge watch to compare the serving path against loopback.
-    param([string]$Url, [int]$TimeoutSec = 5)
-    try {
-        $r = Invoke-WebRequest -Uri "$Url/health" -TimeoutSec $TimeoutSec -UseBasicParsing
-        return ($r.StatusCode -eq 200)
-    } catch { return $false }
-}
-
-function Restart-DockerEngine {
-    <#
-        Rebuilds the Docker Desktop backend + WSL VM WITHOUT rebooting the host.
-
-        2026-09-20, po-2025, twice in one morning: the localhost forwarder
-        wedged (port LISTENING, HTTP dead on loopback, published binding
-        serving, commit headroom fine, zero Docker/Hyper-V events). Thirteen
-        container restarts over 6h47 changed nothing — the wedge lives BELOW
-        the container, in the engine's forwarding layer. Only a host reboot
-        rebuilt it; this is the automated, ~2-minute version of that reboot:
-        kill the backend and the VM, relaunch via the same interactive helper
-        task Start-DockerEngine uses, then wait for engine and container.
-
-        Cost, announced: every container on the host restarts, so every
-        in-flight stream (WAN included) is cut once, and sidecars flip
-        AUTONOMOUS until the hub answers /health again (~1-2 min).
-    #>
-    param([string]$Reason)
-    Write-Log "ENGINE-RECOVERY ($Reason): killing Docker backend + WSL VM (containers will restart)"
-    try { Stop-Process -Name "com.docker.backend" -Force -ErrorAction SilentlyContinue } catch {}
-    try { Stop-Process -Name "Docker Desktop" -Force -ErrorAction SilentlyContinue } catch {}
-    try { & wsl.exe --shutdown 2>$null } catch {}
-    Start-Sleep -Seconds 5
-    if (-not (Start-DockerEngine)) {
-        Write-Log "ENGINE-RECOVERY: engine did not come back — CRITICAL, host reboot needed"
-        return $false
-    }
-    $status = (Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")).Out
-    if ($status -ne "running") {
-        Write-Log "ENGINE-RECOVERY: container not running (status=$status) — starting"
-        [void](Invoke-DockerBounded @("start", $ContainerName) -TimeoutSec 120)
-    }
-    for ($i = 1; $i -le 12; $i++) {
-        Start-Sleep -Seconds 10
-        if (Test-HealthAnswers -Url $ProxyUrl) {
-            Write-Log "ENGINE-RECOVERY: /health answered after ~$($i * 10)s — recovered"
-            return $true
-        }
-    }
-    Write-Log "ENGINE-RECOVERY: engine up but /health still dead after 120s — CRITICAL, host reboot needed"
-    return $false
-}
-
-function Invoke-EngineRecoveryIfNeeded {
-    # Rate-limited front door: an engine restart cuts the whole fleet's
-    # streams, so it fires at most once per 6h. If it already ran and the
-    # condition persists, the host needs a human reboot — say so and stop.
-    param([string]$Reason)
-    $st = Get-State
-    $last = ""
-    try { $last = [string]$st.lastEngineRecoveryAt } catch {}
-    if ($last) {
-        try {
-            $sinceH = ([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse($last)).TotalHours
-            if ($sinceH -lt 6) {
-                Write-Log "ENGINE-RECOVERY deferred: last attempt $([Math]::Round($sinceH, 1))h ago (<6h) — CRITICAL: condition persists past an engine restart, host reboot is the remaining lever"
-                return $false
-            }
-        } catch { }
-    }
-    Set-State -ConsecutiveHangs 0 -ConsecutiveWedge 0 -LastEngineRecoveryAt ([DateTimeOffset]::UtcNow.ToString("o"))
-    return (Restart-DockerEngine -Reason $Reason)
-}
-
 # Step 1: Container running?
 $inspect = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")
 if ($inspect.TimedOut) {
@@ -628,51 +531,14 @@ $consecutive = [int]$state.consecutiveHangs
 
 if ($result.Ok) {
     Write-Log "OK (uptime=${uptimeHours}h). $($result.Detail)"
-
-    # Loopback-watch (2026-09-20): only armed when $ProxyUrl is NOT localhost
-    # (i.e. this machine opted in via base-url.txt). $ProxyUrl passing while
-    # loopback /health is dead is the exact forwarder-wedge signature: the
-    # container is fine, the localhost forwarder is not, and a container
-    # restart is the wrong lever. Two consecutive cycles (~15 min apart, same
-    # hysteresis as the hang detector) trigger an ENGINE restart instead.
-    # Probe [::1] EXPLICITLY, never "localhost". The wedge is wslrelay, and
-    # wslrelay owns [::1]:3000 specifically — com.docker.backend's [::]:3000
-    # wildcard keeps serving 127.0.0.1 and the LAN throughout. "localhost"
-    # cannot see that: .NET 5+ (pwsh 7) connects dual-mode with a fast
-    # IPv6->IPv4 fallback, so a dead ::1 silently succeeds over 127.0.0.1 and
-    # this watch reports healthy during the very outage it exists to catch.
-    # Clients do NOT get that mercy uniformly: a client naming localhost and
-    # resolving ::1 first takes an immediate RST (ConnectionRefused), which is
-    # exactly what every workspace on this host reported on 2026-09-20.
-    # Proven by manipulation the same day: networkingMode=mirrored removes
-    # wslrelay, and with it [::1]:3000 — LAN kept serving real tool-call
-    # streams while localhost-naming clients died outright.
-    $watchPort = 3000
-    try { $watchPort = ([uri]$ProxyUrl).Port } catch {}
-    $loopbackUrl = "http://[::1]:$watchPort"
-    if ($loopbackUrl -ne $ProxyUrl.TrimEnd('/')) {
-        if (-not (Test-HealthAnswers -Url $loopbackUrl)) {
-            $wedge = [int]$state.consecutiveWedge + 1
-            if ($wedge -ge 2) {
-                Write-Log "FORWARDER-WEDGE CONFIRMED 2/2: $loopbackUrl dead while $ProxyUrl serves — Docker Desktop loopback forwarder wedged, escalating to engine recovery"
-                Write-DiagLine "forwarder-wedge"
-                [void](Invoke-EngineRecoveryIfNeeded -Reason "forwarder wedge: loopback dead, $ProxyUrl serving")
-                exit 0
-            }
-            Write-Log "FORWARDER-WEDGE SIGNAL 1/2: $loopbackUrl dead while $ProxyUrl serves — engine recovery if confirmed next cycle, NO container restart"
-            Write-DiagLine "forwarder-wedge-signal"
-            Set-State -ConsecutiveHangs 0 -ConsecutiveWedge $wedge
-            exit 0
-        }
-    }
-    Set-State -ConsecutiveHangs 0 -ConsecutiveWedge 0
+    Set-State -ConsecutiveHangs 0
     exit 0
 }
 
 if (-not $result.Hang) {
     # Real failure, wrong remedy. Log it loudly and leave the container alone.
     Write-Log "DEGRADED (uptime=${uptimeHours}h): $($result.Detail) — NO restart (a restart cannot fix this)"
-    Set-State -ConsecutiveHangs 0 -ConsecutiveWedge ([int]$state.consecutiveWedge)
+    Set-State -ConsecutiveHangs 0
     exit 0
 }
 
@@ -683,7 +549,7 @@ $consecutive = $consecutive + 1
 if ($consecutive -lt 2) {
     Write-Log "HANG SIGNAL 1/2 (uptime=${uptimeHours}h): $($result.Detail) — waiting for confirmation next cycle, NO restart"
     Write-DiagLine "hang-signal"
-    Set-State -ConsecutiveHangs $consecutive -ConsecutiveWedge ([int]$state.consecutiveWedge)
+    Set-State -ConsecutiveHangs $consecutive
     exit 0
 }
 
@@ -696,23 +562,7 @@ $result2 = Test-ProxyWithTools -Url $ProxyUrl -TimeoutSec 60
 if ($result2.Ok) {
     Write-Log "RECOVERED: $($result2.Detail)"
 } else {
-    # One slow retest before escalating: a cold container walking a walled
-    # cascade legitimately exceeds a 60s first-stream budget (hub canaries
-    # >90s under quota walls, measured po-203 15/09), and an engine restart
-    # cuts the whole fleet's streams — it must not fire on that.
-    Start-Sleep -Seconds 60
-    $result3 = Test-ProxyWithTools -Url $ProxyUrl -TimeoutSec 120
-    if ($result3.Ok) {
-        Write-Log "RECOVERED (slow first stream after restart): $($result3.Detail)"
-        exit 0
-    }
-    Write-Log "CRITICAL: Still broken after restart: $($result3.Detail)"
+    Write-Log "CRITICAL: Still broken after restart: $($result2.Detail)"
     Write-DiagLine "post-restart-fail"
-    # 2026-09-20: a restart that fixes nothing, twice confirmed by the stream
-    # test, is the engine/forwarder signature (13 such restarts over 6h47
-    # changed nothing that morning). Escalate to engine recovery instead of
-    # looping container restarts every ~30 min. Rate-limited to 1 per 6h
-    # inside; if it already ran, the host needs a human reboot.
-    [void](Invoke-EngineRecoveryIfNeeded -Reason "container restart ineffective: $($result3.Detail)")
     exit 1
 }
