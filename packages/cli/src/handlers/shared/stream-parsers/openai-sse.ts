@@ -824,6 +824,27 @@ export function createStreamingResponseHandler(
                 `[Streaming] Upstream finish_reason=${state.lastFinishReason} → stop_reason=${stopReason} (${state.accumulatedText.length} chars produced)`
               );
             }
+
+            // A successful turn is never contentless (S4-b edd4ce9):
+            // `end_turn` with an empty content array is not a shape
+            // Anthropic's API produces. The guard fires only on end_turn —
+            // the one value that excludes every case where emptiness is
+            // MEANINGFUL (max_tokens, refusal, tool_use). An EMPTY text
+            // block, not placeholder prose and not an error: prose would
+            // enter history as the assistant's words, an error would trip
+            // the client's retry on a deterministic outcome. In this fork
+            // the gap it closes is specific: text held back pending a
+            // structured tool pattern that never completed counts as
+            // "content" for the empty-response notice above
+            // (accumulatedText > 0) but emitted no block.
+            if (stopReason === "end_turn" && !writer.anyBlockEmitted) {
+              const guardRef = writer.openText();
+              writer.close(guardRef);
+              log(
+                `[Stream] Contentless end_turn — emitting an empty text block (${state.accumulatedText.length} chars were accumulated but never emitted)`
+              );
+            }
+
             send("message_delta", {
               type: "message_delta",
               delta: { stop_reason: stopReason, stop_sequence: null },
