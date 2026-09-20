@@ -635,9 +635,21 @@ if ($result.Ok) {
     # container is fine, the localhost forwarder is not, and a container
     # restart is the wrong lever. Two consecutive cycles (~15 min apart, same
     # hysteresis as the hang detector) trigger an ENGINE restart instead.
+    # Probe [::1] EXPLICITLY, never "localhost". The wedge is wslrelay, and
+    # wslrelay owns [::1]:3000 specifically — com.docker.backend's [::]:3000
+    # wildcard keeps serving 127.0.0.1 and the LAN throughout. "localhost"
+    # cannot see that: .NET 5+ (pwsh 7) connects dual-mode with a fast
+    # IPv6->IPv4 fallback, so a dead ::1 silently succeeds over 127.0.0.1 and
+    # this watch reports healthy during the very outage it exists to catch.
+    # Clients do NOT get that mercy uniformly: a client naming localhost and
+    # resolving ::1 first takes an immediate RST (ConnectionRefused), which is
+    # exactly what every workspace on this host reported on 2026-09-20.
+    # Proven by manipulation the same day: networkingMode=mirrored removes
+    # wslrelay, and with it [::1]:3000 — LAN kept serving real tool-call
+    # streams while localhost-naming clients died outright.
     $watchPort = 3000
     try { $watchPort = ([uri]$ProxyUrl).Port } catch {}
-    $loopbackUrl = "http://localhost:$watchPort"
+    $loopbackUrl = "http://[::1]:$watchPort"
     if ($loopbackUrl -ne $ProxyUrl.TrimEnd('/')) {
         if (-not (Test-HealthAnswers -Url $loopbackUrl)) {
             $wedge = [int]$state.consecutiveWedge + 1
