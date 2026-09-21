@@ -151,18 +151,25 @@ That is not hypothetical. Measured on po-2024, 2026-09-21: the launcher invoked 
 
 ```powershell
 $logPath = Join-Path $env:USERPROFILE ".claudish\sidecar-stdout.log"
-if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 8MB)) {
-    Move-Item -LiteralPath $logPath -Destination "$logPath.1" -Force
+$errPath = Join-Path $env:USERPROFILE ".claudish\sidecar-stderr.log"
+foreach ($p in @($logPath, $errPath)) {   # rotation happens at LAUNCH only — see the third trap
+    if ((Test-Path -LiteralPath $p) -and ((Get-Item -LiteralPath $p).Length -gt 8MB)) {
+        Move-Item -LiteralPath $p -Destination "$p.1" -Force
+    }
 }
 $bunExe = Join-Path $env:APPDATA "npm\node_modules\bun\bin\bun.exe"
+if (-not (Test-Path -LiteralPath $bunExe)) { $bunExe = (Get-Command bun.exe -ErrorAction Stop).Source }
 Start-Process -FilePath $bunExe -ArgumentList 'packages/cli/src/fork/server/standalone-proxy.ts','--port','3914','--host','127.0.0.1' `
     -RedirectStandardOutput $logPath -RedirectStandardError $errPath -WindowStyle Hidden -Wait
 ```
 
-Two traps found while making that change, both worth keeping:
+**Redirect both streams or the fix is half a fix.** `-RedirectStandardError` is not optional here: claudish writes a large share of its operational markers to stderr, so a launcher that captures stdout alone reproduces the same blindness on the other half — and `Start-Process` *refuses* a null path (`Impossible de valider l'argument … L'argument est nul ou vide` / `Cannot validate argument … null or empty`), so an undefined `$errPath` is a hard binding failure at launch, not a silent degradation. That refusal is the good case: the launcher dies loudly instead of starting a blind sidecar.
 
-- **`Start-Process -FilePath 'bun'` fails** with *"%1 n'est pas une application Win32 valide"* — the name resolves to a shim, not the exe. Resolve it (`Join-Path $env:APPDATA "npm\node_modules\bun\bin\bun.exe"`, falling back to `(Get-Command bun.exe).Source`); the same command line works fine when the shell resolves it, which is why the defect hides.
+Three traps found while making that change, all worth keeping:
+
+- **`Start-Process -FilePath 'bun'` fails** with *"%1 is not a valid Win32 application"* (localized, e.g. *"%1 n'est pas une application Win32 valide"*) — the name resolves to a shim, not the exe. Resolve it (`Join-Path $env:APPDATA "npm\node_modules\bun\bin\bun.exe"`, falling back to `(Get-Command bun.exe).Source`); the same command line works fine when the shell resolves it, which is why the defect hides.
 - **The instrument has to be proven while the process is ALIVE**, not after it exits: a redirect that only flushes at exit passes every post-mortem check and still leaves you blind in production. The check is a real turn followed by reading the file *before* stopping the sidecar — po-2024: `200` + `message_stop`, then `1` `[ttft]` line readable at 315 bytes with `0` `[Request]` (the correct NOMINAL signature).
+- **The rotation above runs at launch, so it bounds nothing while the sidecar is up.** These launchers are `HKCU\...\Run` entries: they fire once per logon, and a relay that stays up for weeks writes one unbounded file the whole time (`uptimeSec` past 200 000 is ordinary on these machines). The 8 MB check is a floor against accumulation *across* logons, not a size cap — if the log has to stay bounded in production, that is a separate rotation, not this line.
 
 ## Troubleshooting — Docker cannot reach the LAN hub
 
