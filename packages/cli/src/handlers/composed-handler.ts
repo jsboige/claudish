@@ -65,6 +65,7 @@ import {
 import { reportError, classifyError } from "../telemetry.js";
 import { recordStats } from "../stats.js";
 import { wrapAnthropicError, ensureAnthropicErrorFormat } from "./shared/anthropic-error.js";
+import { buildConnectionErrorMessage, classifyConnectionError } from "./shared/connection-error.js";
 import { peekStreamStart } from "./shared/stream-peek.js";
 
 function extractAuthHeaders(c: Context): VisionProxyAuthHeaders {
@@ -505,7 +506,7 @@ export class ComposedHandler implements ModelHandler {
         // moves to the next provider in the chain. 503 (connection error) would stop
         // the fallback chain since it is not retryable by design.
         return c.json(
-          { error: { type: "authentication_error", message: err.message } },
+          wrapAnthropicError(401, err.message, "authentication_error"),
           401 as any
         );
       }
@@ -571,11 +572,16 @@ export class ComposedHandler implements ModelHandler {
         ? await this.provider.enqueueRequest(doFetch)
         : await doFetch();
     } catch (error: any) {
-      // Connection refused — server is down or not reachable
-      if (error.code === "ECONNREFUSED" || error.cause?.code === "ECONNREFUSED") {
-        const msg = `Cannot connect to ${this.provider.displayName} at ${endpoint}. Make sure the server is running.`;
-        log(`[${this.provider.displayName}] ${msg}`);
-        logStderr(`Error: ${msg} Check the server is running.`);
+      // A failure to even REACH the provider (DNS can't resolve, connection
+      // refused, host unreachable) is a LOCAL network problem, not an upstream
+      // server error. Surface it as a 400 connection_error with an honest,
+      // actionable message so Claude Code shows "can't reach host — check your
+      // network/DNS" instead of a mystifying 500.
+      const conn = classifyConnectionError(error);
+      if (conn) {
+        const msg = buildConnectionErrorMessage(conn.kind, this.provider.displayName, endpoint);
+        log(`[${this.provider.displayName}] ${msg} (code=${conn.code})`);
+        logStderr(`Error: ${msg}`);
         reportError({
           error,
           providerName: this.provider.name,
@@ -609,7 +615,15 @@ export class ComposedHandler implements ModelHandler {
         } catch {
           // Stats must never crash claudish
         }
-        return c.json(wrapAnthropicError(503, msg, "connection_error"), 503 as any);
+        // Status 400, NOT 503. Both stop claudish's own fallback chain
+        // (isRetryableError treats each as terminal), but Claude Code retries a
+        // 503 as overloaded_error — ten rounds of "API error · Retrying ·
+        // attempt N/10" with the real reason buried behind the banner. A 400 is
+        // rendered verbatim and inline by Claude Code's native error UI, so the
+        // user reads "check your network/DNS" in the transcript instead of
+        // watching a retry counter. The `connection_error` TYPE is what carries
+        // the meaning.
+        return c.json(wrapAnthropicError(400, msg, "connection_error"), 400 as any);
       }
       throw error;
     }
