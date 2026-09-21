@@ -1143,6 +1143,15 @@ export async function createProxyServer(
   app.onError((err, c) => {
     logStderr(`[Proxy] Unhandled error on ${c.req.method} ${c.req.path}: ${err?.message ?? err}`);
     log(`[Proxy] Unhandled error stack: ${err?.stack ?? "(no stack)"}`);
+    // A routing failure stays TERMINAL even when it arrives here. Every
+    // route that can raise one maps it already, so this is not a live gap —
+    // it is the place a FUTURE route lands, and a 500 there would hand back
+    // the retryable status this whole change exists to remove. The `return
+    // await` above is the proof the path is real: it fixed a rejection that
+    // escaped its try/catch and would have surfaced exactly here.
+    if (err instanceof RoutingError) {
+      return c.json(wrapAnthropicError(400, err.message, "invalid_request_error"), 400);
+    }
     return c.json(wrapAnthropicError(500, `Proxy error: ${err?.message ?? String(err)}`), 500);
   });
 

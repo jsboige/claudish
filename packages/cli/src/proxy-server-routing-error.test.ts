@@ -59,6 +59,15 @@ const PROVIDER_ENV_KEYS = [
   "MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY", "LITELLM_API_KEY", "POE_API_KEY",
   "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
   "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
+  // Proxy AUTH, not a provider credential — and the reason every HTTP
+  // assertion below was inert on any provisioned machine: `bun` auto-loads
+  // the repo `.env` (bash does not), that file carries CLAUDISH_PROXY_KEY on
+  // every deployed host, so `proxyKeys` came back non-empty
+  // (proxy-server.ts:393-396) and the requests took a 401 "invalid proxy
+  // authentication" BEFORE reaching guard 6b or any RoutingError mapping.
+  // 4 of 12 red on ai-01, green on a machine with no such `.env` — which is
+  // exactly the "dev box must behave like a bare CI runner" goal above.
+  "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -339,5 +348,24 @@ describe("S4-d lot A: structural invariant pins on proxy-server.ts source", () =
     );
     expect(guardAt).toBeGreaterThan(-1);
     expect(step7At).toBeGreaterThan(guardAt);
+  });
+
+  // Review addition (ai-01, 2026-09-21). The onError backstop returned 500 for
+  // EVERY error, RoutingError included. Not a live defect — all three routes
+  // that can raise one map it first — but it is where a FUTURE route lands, and
+  // a 500 there hands back the retryable status this change exists to remove.
+  // Structural rather than behavioural on purpose: making a RoutingError escape
+  // to onError requires a route that does not exist yet, so a behavioural test
+  // would have to invent one and would then pin the invention, not the backstop.
+  test("the onError backstop keeps a RoutingError terminal (400, not a retryable 500)", () => {
+    const onErrorAt = source.indexOf("app.onError((err, c) =>");
+    expect(onErrorAt).toBeGreaterThan(-1);
+    // Scope to the handler body, so a mapping elsewhere in the file cannot
+    // satisfy this by accident — the whole point is WHERE the check sits.
+    const body = source.slice(onErrorAt, onErrorAt + 1200);
+    expect(body).toContain("err instanceof RoutingError");
+    const mapAt = body.indexOf("err instanceof RoutingError");
+    const fallbackAt = body.indexOf("wrapAnthropicError(500");
+    expect(fallbackAt).toBeGreaterThan(mapAt); // the 400 must be reached first
   });
 });
