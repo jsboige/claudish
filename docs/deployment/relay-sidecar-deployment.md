@@ -141,6 +141,29 @@ Keep the selected authentication contract intact: an empty `ANTHROPIC_AUTH_TOKEN
 3. **Failover**: stop the hub (`docker stop claudish-proxy` **on po-2023**) → within ~20s this sidecar flips AUTONOMOUS → a glm/minimax request still succeeds (served locally). Restart the hub → after hysteresis the sidecar returns to NOMINAL. (Coordinate the hub-stop with the cluster — it briefly interrupts every direct-to-hub client too.)
 4. **Attribution survives**: `traffic-live.ps1` / captures still show `machine=<MACHINE>` on this machine's requests — the relay preserves `X-Claudish-Machine` by design.
 
+### Validation when the sidecar is a bun PROCESS, not a container
+
+Some machines run the relay as a bare `bun packages/cli/src/fork/server/standalone-proxy.ts --port <P> --host 127.0.0.1` launched from `HKCU\...\Run`, because port 3000 is taken or Docker's egress cannot reach the LAN. `docker logs` does not exist there, so **the launcher has to create the log** — and if it does not, G2 silently becomes unverifiable.
+
+That is not hypothetical. Measured on po-2024, 2026-09-21: the launcher invoked bun directly under a hidden `pwsh`, so the sidecar's **stdout was discarded entirely** — the process was healthy, relaying, and carried no log at all. From outside, "no `[ttft]` line" is indistinguishable from "the relay never forwarded anything", and `[ttft]` is the *only* instrument that sees forwarded volume on a sidecar (a relayed request writes no capture and emits no `[Request]`).
+
+**Redirect with the child's file handle, never with a PowerShell pipe.** `*>>` is implemented through `Out-File` and buffers, so the line that proves forwarding can stay invisible for as long as the buffer holds — an instrument that reports late reads exactly like an instrument that reports nothing:
+
+```powershell
+$logPath = Join-Path $env:USERPROFILE ".claudish\sidecar-stdout.log"
+if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 8MB)) {
+    Move-Item -LiteralPath $logPath -Destination "$logPath.1" -Force
+}
+$bunExe = Join-Path $env:APPDATA "npm\node_modules\bun\bin\bun.exe"
+Start-Process -FilePath $bunExe -ArgumentList 'packages/cli/src/fork/server/standalone-proxy.ts','--port','3914','--host','127.0.0.1' `
+    -RedirectStandardOutput $logPath -RedirectStandardError $errPath -WindowStyle Hidden -Wait
+```
+
+Two traps found while making that change, both worth keeping:
+
+- **`Start-Process -FilePath 'bun'` fails** with *"%1 n'est pas une application Win32 valide"* — the name resolves to a shim, not the exe. Resolve it (`Join-Path $env:APPDATA "npm\node_modules\bun\bin\bun.exe"`, falling back to `(Get-Command bun.exe).Source`); the same command line works fine when the shell resolves it, which is why the defect hides.
+- **The instrument has to be proven while the process is ALIVE**, not after it exits: a redirect that only flushes at exit passes every post-mortem check and still leaves you blind in production. The check is a real turn followed by reading the file *before* stopping the sidecar — po-2024: `200` + `message_stop`, then `1` `[ttft]` line readable at 315 bytes with `0` `[Request]` (the correct NOMINAL signature).
+
 ## Troubleshooting — Docker cannot reach the LAN hub
 
 **Symptom**: the installer's probe returns 200 with `message_stop`, but the sidecar logs `[Relay] upstream … DOWN → AUTONOMOUS`, and every request shows a local `[claudish] [Request]` line plus a fresh capture file. The sidecar looks healthy while silently bypassing the hub.
