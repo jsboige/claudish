@@ -5,6 +5,7 @@ import {
   ComposedHandler,
   STRIPPED_IMAGE_PLACEHOLDER,
   stripImageBlocksFromMessages,
+  strippedMediaNotice,
   getRecoveryHint,
 } from "./composed-handler.js";
 import {
@@ -227,21 +228,54 @@ describe("stripImageBlocksFromMessages — empty-content regression", () => {
     expect((messages[0].content as string).length).toBeGreaterThan(0);
   });
 
-  test("single remaining text block collapses to a plain string", () => {
+  test("single remaining text block with NOTHING stripped still collapses to a plain string", () => {
     const messages = [
       {
         role: "user",
-        content: [
-          { type: "text", text: "hello" },
-          { type: "image", source: {} },
-        ],
+        content: [{ type: "text", text: "hello" }],
       },
     ];
     stripImageBlocksFromMessages(messages, ["image_url", "image", "document"]);
     expect(messages[0].content).toBe("hello");
   });
 
-  test("text + multiple text blocks stay an array", () => {
+  test("#222 mixed [text, image] keeps the text AND announces the removal — never silent", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What color is this image?" },
+          { type: "image", source: { type: "base64" } },
+        ],
+      },
+    ];
+    stripImageBlocksFromMessages(messages, ["image_url", "image", "document"]);
+    expect(messages[0].content).toEqual([
+      { type: "text", text: "What color is this image?" },
+      { type: "text", text: strippedMediaNotice(1) },
+    ]);
+  });
+
+  test("#222 multiple stripped parts produce ONE notice carrying the count", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "a" },
+          { type: "image", source: {} },
+          { type: "image", source: {} },
+          { type: "document", source: {} },
+        ],
+      },
+    ];
+    stripImageBlocksFromMessages(messages, ["image", "document"]);
+    expect(messages[0].content).toEqual([
+      { type: "text", text: "a" },
+      { type: "text", text: strippedMediaNotice(3) },
+    ]);
+  });
+
+  test("text + multiple text blocks stay an array, with the removal announced (#222)", () => {
     const messages = [
       {
         role: "user",
@@ -256,6 +290,7 @@ describe("stripImageBlocksFromMessages — empty-content regression", () => {
     expect(messages[0].content).toEqual([
       { type: "text", text: "a" },
       { type: "text", text: "b" },
+      { type: "text", text: strippedMediaNotice(1) },
     ]);
   });
 
