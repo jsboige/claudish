@@ -8,13 +8,16 @@ describe("classifyConnectionError", () => {
       ["ENOTFOUND", "dns"],
       ["EAI_AGAIN", "dns"],
       ["ETIMEDOUT", "unreachable"],
-      ["ECONNRESET", "unreachable"],
       ["ENETUNREACH", "unreachable"],
       ["EHOSTUNREACH", "unreachable"],
       ["ConnectionRefused", "refused"],
-      ["ConnectionClosed", "unreachable"],
       ["FailedToOpenSocket", "unreachable"],
-      ["ERR_SOCKET_CLOSED", "unreachable"],
+      // Reached, then dropped by the peer — never the user's network.
+      ["ECONNRESET", "closed"],
+      ["EPIPE", "closed"],
+      ["UND_ERR_SOCKET", "closed"],
+      ["ConnectionClosed", "closed"],
+      ["ERR_SOCKET_CLOSED", "closed"],
     ] as const;
 
     for (const [code, kind] of cases) {
@@ -122,6 +125,18 @@ describe("buildConnectionErrorMessage", () => {
     );
 
     expect(message).toContain("Check your network connection");
+  });
+
+  test("does NOT blame the user's network when the peer closed the connection", () => {
+    const message = buildConnectionErrorMessage(
+      "closed",
+      "Remote provider",
+      "https://api.example.com/v1/messages"
+    );
+
+    expect(message).toContain("closed before a response");
+    expect(message).toContain("not your network");
+    expect(message).not.toContain("Check your network connection");
   });
 
   test("uses a non-URL endpoint verbatim", () => {

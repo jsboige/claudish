@@ -9,7 +9,7 @@
  * "can't reach host — check your network/DNS" instead.
  */
 
-export type ConnectionErrorKind = "dns" | "refused" | "unreachable";
+export type ConnectionErrorKind = "dns" | "refused" | "unreachable" | "closed";
 
 /** Node/undici syscall codes we treat as a failure to REACH the host. */
 const CODE_KIND: Record<string, ConnectionErrorKind> = {
@@ -17,12 +17,19 @@ const CODE_KIND: Record<string, ConnectionErrorKind> = {
   EAI_AGAIN: "dns", // getaddrinfo: temporary DNS failure
   ECONNREFUSED: "refused", // nothing listening at the endpoint
   ETIMEDOUT: "unreachable", // connect timed out
-  ECONNRESET: "unreachable", // connection reset before response
   ENETUNREACH: "unreachable", // network unreachable
   EHOSTUNREACH: "unreachable", // host unreachable
-  EPIPE: "unreachable", // broken pipe during connect
   UND_ERR_CONNECT_TIMEOUT: "unreachable", // undici connect timeout
-  UND_ERR_SOCKET: "unreachable", // undici socket closed
+
+  // Reached, then the connection died before a response: the peer (or a proxy
+  // in between) closed it — a TLS reject, an upstream that cuts. Kept separate
+  // from "unreachable" because blaming the user's network for a peer-side reset
+  // is a misdiagnosis; retry semantics are identical either way.
+  ECONNRESET: "closed", // connection reset before response
+  EPIPE: "closed", // broken pipe
+  UND_ERR_SOCKET: "closed", // undici socket closed
+  ConnectionClosed: "closed", // Bun: peer closed mid-connect
+  ERR_SOCKET_CLOSED: "closed", // Bun: socket closed before response
 
   // --- Bun runtime codes ---------------------------------------------------
   // claudish RUNS on Bun, and Bun's fetch does NOT use Node's errno names and
@@ -32,9 +39,7 @@ const CODE_KIND: Record<string, ConnectionErrorKind> = {
   // reports a DNS failure as ConnectionRefused too — see
   // buildConnectionErrorMessage for how that ambiguity is resolved.
   ConnectionRefused: "refused", // Bun: refused OR unresolvable host
-  ConnectionClosed: "unreachable", // Bun: peer closed mid-connect
   FailedToOpenSocket: "unreachable", // Bun: could not open the socket
-  ERR_SOCKET_CLOSED: "unreachable", // Bun: socket closed before response
 };
 
 /**
@@ -117,5 +122,9 @@ export function buildConnectionErrorMessage(
       return `Cannot reach ${host} for ${displayName}. This is a network problem on your machine — check your internet connection, VPN, or DNS resolver (e.g. Tailscale MagicDNS) — not ${displayName}.`;
     case "unreachable":
       return `Cannot reach ${displayName} at ${endpoint}. Check your network connection.`;
+    case "closed":
+      // The host was reached and then dropped the connection — that points at
+      // the provider or a proxy in between, not at the user's network.
+      return `The connection to ${displayName} at ${endpoint} was closed before a response arrived. This is usually the provider or a proxy in between, not your network.`;
   }
 }

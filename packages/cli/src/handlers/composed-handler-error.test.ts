@@ -14,9 +14,13 @@ import { wrapAnthropicError } from "./shared/anthropic-error.js";
  *
  *   (i)   the `connection_error` TYPE survives the status remap — the body
  *         carries the meaning, the status only decides retry semantics;
- *   (ii)  the surfaced 400 is TERMINAL for the FallbackHandler chain (a
- *         connect failure would fail identically on any other provider of the
- *         same endpoint), while a 401 keeps the chain moving;
+ *   (ii)  the surfaced 400 ADVANCES the FallbackHandler chain — its candidates
+ *         are different providers, hence different hosts, and a connect failure
+ *         on one says nothing about another. When every host is unreachable the
+ *         surfaced error stays a 400 connection_error (never a 502 that Claude
+ *         Code would retry as overloaded_error), and in mono-candidate routing
+ *         no FallbackHandler exists so that same 400 reaches the client
+ *         verbatim;
  *   (iii) ONLY connect failures are remapped — any other thrown error
  *         propagates untouched, so no status the budget-failover cascade keys
  *         on (402 / 429-quota, which arrive as HTTP responses, not throws)
@@ -183,14 +187,14 @@ describe("ComposedHandler.handle — connection-error surfacing (lot E1)", () =>
   });
 });
 
-describe("FallbackHandler chain — terminal vs retryable asymmetry (lot E1, invariant ii)", () => {
-  function connectionErrorResponse(): Response {
-    // Exactly the body ComposedHandler now returns on a connect failure.
+describe("FallbackHandler chain — a connect failure advances, all-hosts-down stays 400 (lot E1, invariant ii)", () => {
+  function connectionErrorResponse(host = "localhost:19999"): Response {
+    // Exactly the body ComposedHandler returns on a connect failure.
     return new Response(
       JSON.stringify(
         wrapAnthropicError(
           400,
-          "Cannot connect to Sakana Fugu at http://localhost:19999/v1/chat/completions. Make sure the server is running.",
+          `Cannot connect to Sakana Fugu at http://${host}/v1/chat/completions. Make sure the server is running.`,
           "connection_error"
         )
       ),
@@ -198,11 +202,12 @@ describe("FallbackHandler chain — terminal vs retryable asymmetry (lot E1, inv
     );
   }
 
-  test("the 400 connection_error stops the fallback chain (terminal by design)", async () => {
+  test("a connect failure on one host ADVANCES the chain — candidates are different hosts by construction", async () => {
+    // The premise that a connect failure is terminal held only for a chain of
+    // candidates sharing an endpoint, which is the exception. FallbackHandler
+    // exists precisely to try a different host.
     let secondCalled = false;
-    const first = {
-      handle: async () => connectionErrorResponse(),
-    };
+    const first = { handle: async () => connectionErrorResponse("unreachable-host-a.example") };
     const second = {
       handle: async () => {
         secondCalled = true;
@@ -216,8 +221,41 @@ describe("FallbackHandler chain — terminal vs retryable asymmetry (lot E1, inv
     const { c } = makeContext();
     const res = await fb.handle(c, PAYLOAD);
 
+    expect(secondCalled).toBe(true);
+    expect(res.ok).toBe(true);
+  });
+
+  test("when EVERY host is unreachable the surfaced error is a 400 connection_error, never a 502", async () => {
+    // All hosts down is the user's network, and the case where the actionable
+    // sentence matters most. A 502 would be retried by Claude Code as
+    // overloaded_error and bury it behind the retry banner.
+    const first = { handle: async () => connectionErrorResponse("unreachable-host-a.example") };
+    const second = { handle: async () => connectionErrorResponse("unreachable-host-b.example") };
+    const fb = new FallbackHandler([
+      { name: "first", handler: first as any },
+      { name: "second", handler: second as any },
+    ]);
+    const { c } = makeContext();
+    const res = await fb.handle(c, PAYLOAD);
+    const body = (await res.json()) as { type?: string; error?: { type?: string; message?: string } };
+
     expect(res.status).toBe(400);
-    expect(secondCalled).toBe(false);
+    expect(res.status).not.toBe(502);
+    expect(body.type).toBe("error");
+    expect(body.error?.type).toBe("connection_error");
+    expect(body.error?.message).toContain("Cannot reach any of the 2 provider hosts");
+    expect(body.error?.message).toContain("Make sure the server is running");
+  });
+
+  test("mono-candidate routing returns the honest 400 verbatim (no FallbackHandler is built)", async () => {
+    // proxy-server.ts: candidates.length > 1 ? new FallbackHandler(...) : candidates[0].handler
+    const only = { handle: async (_c: unknown, _payload: unknown) => connectionErrorResponse() };
+    const { c } = makeContext();
+    const res = await only.handle(c, PAYLOAD);
+    const body = (await res.json()) as { error?: { type?: string } };
+
+    expect(res.status).toBe(400);
+    expect(body.error?.type).toBe("connection_error");
   });
 
   test("a 401 keeps the chain moving (retryable by design)", async () => {

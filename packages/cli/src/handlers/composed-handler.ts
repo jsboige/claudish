@@ -615,14 +615,16 @@ export class ComposedHandler implements ModelHandler {
         } catch {
           // Stats must never crash claudish
         }
-        // Status 400, NOT 503. Both stop claudish's own fallback chain
-        // (isRetryableError treats each as terminal), but Claude Code retries a
-        // 503 as overloaded_error — ten rounds of "API error · Retrying ·
-        // attempt N/10" with the real reason buried behind the banner. A 400 is
-        // rendered verbatim and inline by Claude Code's native error UI, so the
-        // user reads "check your network/DNS" in the transcript instead of
-        // watching a retry counter. The `connection_error` TYPE is what carries
-        // the meaning.
+        // Status 400, NOT 503: Claude Code retries a 503 as overloaded_error —
+        // ten rounds of "API error · Retrying · attempt N/10" with the real
+        // reason buried behind the banner — while a 400 is rendered verbatim and
+        // inline. The `connection_error` TYPE still carries the meaning, and it
+        // is what keeps the 400 retryable ACROSS providers: isRetryableError's
+        // 400 branch recognises the type and advances the chain, since
+        // FallbackHandler's candidates are different hosts by construction and a
+        // connect failure on one says nothing about another. In mono-candidate
+        // routing no FallbackHandler exists, so this 400 reaches Claude Code
+        // directly — which is where the UX gain lives.
         return c.json(wrapAnthropicError(400, msg, "connection_error"), 400 as any);
       }
       throw error;
