@@ -82,18 +82,24 @@ function extractAuthHeaders(c: Context): VisionProxyAuthHeaders {
  * "The prompt parameter was not received normally", which the client then
  * retries into the same wall. The placeholder keeps the turn structure and
  * tells the model an image existed.
+ *
+ * Both texts name the PROXY's decision, not a property of the model: the
+ * verdict comes from the catalog's `supportsVision` flag, which #222 measured
+ * wrong for a vision model (glm-4.6v stripped on the hub). "This model does not
+ * support image input" would state that verdict as a fact about the model —
+ * exactly the claim #222 refutes. No instruction either (doctrine 2026-08-23).
  */
 export const STRIPPED_IMAGE_PLACEHOLDER =
-  "[An image was present in the original request but was removed: this model does not support image input. Ask the user to use a vision-capable model for visual tasks.]";
+  "[An image was present in the original request but was removed by the proxy: this model is not flagged as accepting image input.]";
 
 /**
  * Factual removal notice appended when stripped parts had surviving siblings.
- * States the fact (count, direction) — never instructions (doctrine 2026-08-23).
+ * States the fact (count, actor, reason) — never instructions (doctrine 2026-08-23).
  */
 export function strippedMediaNotice(count: number): string {
   const subject =
     count === 1 ? "1 image/document part was" : `${count} image/document parts were`;
-  return `[${subject} present in this message but removed: this model does not support image input.]`;
+  return `[${subject} present in this message but removed by the proxy: this model is not flagged as accepting image input.]`;
 }
 
 /**

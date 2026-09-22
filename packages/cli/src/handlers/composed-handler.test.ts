@@ -294,6 +294,18 @@ describe("stripImageBlocksFromMessages — empty-content regression", () => {
     ]);
   });
 
+  test("#222 both removal texts name the proxy's decision and carry no instruction", () => {
+    // The strip decision is the catalog's supportsVision flag, which #222 measured
+    // wrong for a vision model — so the text must not assert it as a model fact,
+    // and must not tell the agent what to do (doctrine 2026-08-23).
+    for (const text of [STRIPPED_IMAGE_PLACEHOLDER, strippedMediaNotice(1), strippedMediaNotice(3)]) {
+      expect(text).toContain("removed by the proxy");
+      expect(text).toContain("not flagged as accepting image input");
+      expect(text).not.toContain("does not support");
+      expect(text).not.toMatch(/\bask\b|\bplease\b|\buse a\b/i);
+    }
+  });
+
   test("PDF-read shape (tool result already extracted, images-only user msg) never yields empty content", () => {
     // Shape seen in the wild: conversion turns [tool_result, image×5] into a
     // role:tool message plus a user message holding only image_url parts.
