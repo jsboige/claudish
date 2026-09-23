@@ -118,6 +118,10 @@ services:
       # GLM thinking is binary on the coding wire. passthrough (default) |
       # disabled. Re-read per request: flip without a restart.
       - CLAUDISH_GLM_THINKING=${CLAUDISH_GLM_THINKING:-}
+      # MiniMax honors the client's thinking value exactly (CC sends disabled
+      # for haiku/subagents). passthrough (default) | disabled | forced[:<n>].
+      # Re-read per request: flip without a restart.
+      - CLAUDISH_MINIMAX_THINKING=${CLAUDISH_MINIMAX_THINKING:-}
     command: ["--port", "3000", "--host", "0.0.0.0"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://0.0.0.0:3000/health"]
