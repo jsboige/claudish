@@ -71,6 +71,7 @@ import { convertOpenAIRequestToAnthropic } from "./handlers/shared/format/openai
 import { anthropicMessageToChatCompletion, createOpenAIChatStreamFromAnthropic } from "./handlers/shared/anthropic-to-openai.js";
 import {
   applyFailoverNotices,
+  carryNoticeHeader,
   noticePolicyForIngress,
 } from "./handlers/shared/failover-stream-notice.js";
 
@@ -1454,12 +1455,21 @@ export async function createProxyServer(
       }
 
       if (wantsStream) {
-        return createOpenAIChatStreamFromAnthropic(response, anthropicBody.model);
+        // #229 review: both translations below rebuild their headers from
+        // scratch, which is where the notice header set above used to die —
+        // consumed (dedup + recovery-budget side effects) then never delivered.
+        return carryNoticeHeader(
+          response,
+          createOpenAIChatStreamFromAnthropic(response, anthropicBody.model)
+        );
       }
       const message = await response.json();
-      return c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return carryNoticeHeader(
+        response,
+        c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
+          headers: { "Content-Type": "application/json" },
+        })
+      );
     } catch (e) {
       log(`[Proxy] /v1/chat/completions error: ${e}`);
       // Same RoutingError doctrine as /v1/messages (bbb448f6), on the OpenAI

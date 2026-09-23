@@ -29,6 +29,7 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import { log } from "../../logger.js";
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
 import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
+import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
 import { isQuotaExhaustion } from "../failover.js";
 
 /** Headers we must not blindly forward to the upstream. */
@@ -397,11 +398,16 @@ export async function forwardToUpstream(
   const contentType = res.headers.get("content-type") || "";
   if (!contentType.includes("text/event-stream")) {
     // Non-streaming (e.g. /compact stream:false, or a 4xx JSON error) — buffer + return.
+    // #229: the hub may set the failover-notice header on this branch too (an
+    // OpenAI client's non-streamed answer); this rebuild must not be where it dies.
     const text = await res.text().catch(() => "");
-    return new Response(text, {
-      status: res.status,
-      headers: { "Content-Type": contentType || "application/json" },
-    });
+    return carryNoticeHeader(
+      res,
+      new Response(text, {
+        status: res.status,
+        headers: { "Content-Type": contentType || "application/json" },
+      })
+    );
   }
 
   // Streaming — reuse the battle-tested passthrough (ping keepalive +
@@ -435,15 +441,22 @@ export async function forwardToUpstream(
       clearTimeout(reforwardTimer);
     }
   }, String(model));
-  return createAnthropicPassthroughStream(c, res, {
-    modelName: String(model),
-    capture: false,
-    retryUpstream: reforward,
-    // Relay-side TTFT: fetch dispatch → hub headers. The [ttft] marker this
-    // feeds is the measurement that splits "upstream slow to first byte"
-    // from "long generation" — the exact question the header deadline raises.
-    headerLatencyMs: Math.round(performance.now() - fetchStartedAt),
-  });
+  // #229: the passthrough rebuilds its response headers from a fresh literal,
+  // so the hub's failover-notice header (set by the hub's own /v1/chat/completions
+  // translation) is carried across explicitly — a sidecar-relayed OpenAI client
+  // must see the same notice signal a direct-to-hub client sees.
+  return carryNoticeHeader(
+    res,
+    createAnthropicPassthroughStream(c, res, {
+      modelName: String(model),
+      capture: false,
+      retryUpstream: reforward,
+      // Relay-side TTFT: fetch dispatch → hub headers. The [ttft] marker this
+      // feeds is the measurement that splits "upstream slow to first byte"
+      // from "long generation" — the exact question the header deadline raises.
+      headerLatencyMs: Math.round(performance.now() - fetchStartedAt),
+    })
+  );
 }
 
 /** Cheap liveness heartbeat: the hub's unauthenticated /health endpoint. */

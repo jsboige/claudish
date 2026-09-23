@@ -198,6 +198,30 @@ function responseWithNoticeHeader(response: Response, text: string): Response {
 }
 
 /**
+ * Copy NOTICE_HEADER, if present, from the post-notice response onto the
+ * response the route actually returns (#229 review, 2026-09-23).
+ *
+ * The OpenAI ingress translates the Anthropic-shape response AFTER the notice
+ * was applied, and every translation rebuilds its headers from scratch —
+ * `createOpenAIChatStreamFromAnthropic` starts from a 3-key literal,
+ * `c.json()` from nothing. Without this copy the notice is consumed (per-session
+ * dedup + recovery-budget side effects fire) and then dropped before any client
+ * sees it: a header the route set but never delivered. No-op when `from` carries
+ * no notice header.
+ */
+export function carryNoticeHeader(from: Response, to: Response): Response {
+  const value = from.headers.get(NOTICE_HEADER);
+  if (!value) return to;
+  const headers = new Headers(to.headers);
+  headers.set(NOTICE_HEADER, value);
+  return new Response(to.body, {
+    status: to.status,
+    statusText: to.statusText,
+    headers,
+  });
+}
+
+/**
  * Inject failover/recovery notices into a successful Anthropic-shape response,
  * per the route's NoticeIngressPolicy.
  *

@@ -11,6 +11,10 @@ import {
   FORWARD_HEADERS_TIMEOUT_MS,
   type RelayState,
 } from "./relay.js";
+import {
+  NOTICE_HEADER,
+  noticeToHeaderValue,
+} from "../../handlers/shared/failover-stream-notice.js";
 
 // ── fetch mock ─────────────────────────────────────────────────────
 const realFetch = globalThis.fetch;
@@ -34,9 +38,14 @@ afterEach(() => {
 function mockForwardContext(inboundHeaders: Record<string, string> = {}): any {
   return {
     req: { raw: { headers: new Headers(inboundHeaders) } },
-    // c.body(stream) → wrap it in a Response, as Hono does for streaming.
-    body: (stream: any) =>
-      new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    // c.body(stream, init) → wrap it in a Response, as Hono does. Hono honors
+    // init.headers (the passthrough's SSE header set); without this the stub
+    // silently dropped every response header the code under test sets (#229).
+    body: (stream: any, init?: any) =>
+      new Response(stream, {
+        status: 200,
+        headers: init?.headers ?? { "content-type": "text/event-stream" },
+      }),
   };
 }
 
@@ -860,5 +869,62 @@ describe("forwardToUpstream — pre-visible re-forward (#170)", () => {
     } finally {
       delete process.env.CLAUDISH_PREVISIBLE_REFORWARD_MAX;
     }
+  });
+});
+
+// ── #229 review: the relay must not be where the hub's notice header dies ────
+// Both relay branches rebuild their client-facing response headers (the
+// non-stream branch from a 1-key literal, the stream branch through the
+// passthrough's own header set). A sidecar-relayed OpenAI client must see the
+// same notice signal a direct-to-hub client sees.
+
+describe("#229 — relay carries the failover-notice header across both branches", () => {
+  const NOTICE = "[claudish] You are a budget substitute.";
+
+  function openAIContext(): any {
+    const c = mockForwardContext({ "x-claudish-machine": "myia-po-2024" });
+    (c.req as any).path = "/v1/chat/completions";
+    return c;
+  }
+
+  it("non-stream branch: the buffered rebuild keeps the hub-set notice header", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ id: "x", choices: [{ message: { role: "assistant", content: "hi" } }] }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          [NOTICE_HEADER]: noticeToHeaderValue(NOTICE),
+        },
+      });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const out = await forwardToUpstream(openAIContext(), { model: "glm-5.2", stream: false, messages: [] }, state);
+
+    expect(out).not.toBeNull();
+    expect(out!.headers.get(NOTICE_HEADER)).toBe(noticeToHeaderValue(NOTICE));
+    const body: any = await out!.json();
+    expect(body.choices[0].message.content).toBe("hi"); // body intact under the header
+  });
+
+  it("stream branch: the passthrough rebuild keeps the hub-set notice header", async () => {
+    const sse = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { content: [] } })}\n\n`,
+      `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } })}\n\n`,
+      `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const hub = sseResponse(sse);
+    const headers = new Headers(hub.headers);
+    headers.set(NOTICE_HEADER, noticeToHeaderValue(NOTICE));
+    fetchImpl = async () => new Response(hub.body, { status: hub.status, headers });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const out = await forwardToUpstream(openAIContext(), { model: "glm-5.2", stream: true, messages: [] }, state);
+
+    expect(out).not.toBeNull();
+    expect(out!.headers.get(NOTICE_HEADER)).toBe(noticeToHeaderValue(NOTICE));
+    const text = await out!.text();
+    expect(text).toContain("message_stop"); // stream passthrough intact under the header
   });
 });

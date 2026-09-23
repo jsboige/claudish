@@ -371,6 +371,29 @@ describe("#229 — notice ingress policy", () => {
     expect(await out.text()).toBe(TEXT_STREAM);
     expect(out.headers.get(NOTICE_HEADER)).toBeNull();
   });
+
+  test("carryNoticeHeader: copies the header onto a rebuilt response, keeps body+status; no-op without one", async () => {
+    const { carryNoticeHeader } = await import("./failover-stream-notice.js");
+    // The shape the route produces: `from` is the post-notice response (header
+    // set, body already handed to the translator), `to` is the translation's
+    // fresh response whose header literal never included the notice.
+    const from = new Response("irrelevant", {
+      headers: { [NOTICE_HEADER]: noticeToHeaderValue("notice text") },
+    });
+    await from.text(); // body consumed — only headers may be read now
+    const to = new Response("translated body", {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+    const carried = carryNoticeHeader(from, to);
+    expect(carried.headers.get(NOTICE_HEADER)).toBe(noticeToHeaderValue("notice text"));
+    expect(await carried.text()).toBe("translated body");
+    expect(carried.status).toBe(200);
+
+    // No notice on `from` → `to` returned as is (identity when possible).
+    const bare = new Response("plain");
+    expect(carryNoticeHeader(new Response("src"), bare)).toBe(bare);
+  });
 });
 
 resetFailoverForTests();
