@@ -40,6 +40,23 @@ changing `base_url` alone.
 **Never-hang holds on this path**: a malformed stream degrades to a single terminal chunk plus
 `[DONE]` rather than stalling the consumer.
 
+## Failover notices (#229)
+
+On this route a failover notice is **never** written into the
+content. It is set as the `x-claudish-failover-notice` response header, whose value is base64 of the
+UTF-8 notice text (header values are single-line ASCII; the notice is multi-line markdown). It is
+present on both the streaming and the non-streaming response, and a relay passes it through from the hub.
+
+Why: the notices exist for an agent in the loop, which recalibrates when told its model changed
+(#126). A programmatic consumer cannot, and for it a notice in the content IS the answer. Measured
+on 2026-09-23: a code-review step whose entire content was the recovery notice over an empty model
+output, so an empty-output guard never fired. The discriminator is the route
+(`noticePolicyForIngress` in `handlers/shared/failover-stream-notice.ts`) and deliberately not the
+user-agent, which drifts with client versions. `/v1/messages` keeps the in-content notice.
+
+Route-level pin: `proxy-server-openai-notice.test.ts` (header present, content byte-clean, inert
+when nothing is armed).
+
 ## Relay behavior
 
 `relay.ts` is **path-aware**: a sidecar forwards to the SAME route the client hit, so an OpenAI
