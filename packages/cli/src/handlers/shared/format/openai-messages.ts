@@ -446,6 +446,7 @@ function processUserMessage(
           const others: any[] = [];
           let forwardedImages = 0;
           let droppedImages = 0;
+          let droppedDocuments = 0;
           for (const inner of block.content) {
             if (inner.type === "text") {
               texts.push(inner.text);
@@ -461,7 +462,21 @@ function processUserMessage(
                 } else {
                   droppedImages++;
                 }
+              } else {
+                // A text-only wire (simpleFormat) has no part for an image.
+                // Count it as dropped so the marker names the omission: an
+                // uncounted one contributed nothing and the tool result came
+                // out EMPTY — a silent drop (#222 class).
+                droppedImages++;
               }
+            } else if (inner.type === "image" || inner.type === "document") {
+              // Media this wire has no part for: an image without a usable
+              // source, a document (PDF base64). Counted, NEVER serialized —
+              // stringifying the block ships its base64 as text inside the
+              // tool message on every later turn of the session (#224, the
+              // same mechanism the hoist above closes for forwardable images).
+              if (inner.type === "document") droppedDocuments++;
+              else droppedImages++;
             } else {
               others.push(inner);
             }
@@ -477,7 +492,16 @@ function processUserMessage(
             if (forwardedImages) resultText = "[image returned; see following message]";
             else if (droppedImages)
               resultText = "[image returned, but its source could not be forwarded]";
+            else if (droppedDocuments)
+              resultText = "[document returned, but this wire cannot forward it]";
             else resultText = "";
+          } else if (droppedImages || droppedDocuments) {
+            // Media beside text: the text rides in the tool message and the
+            // omission is named beside it — never silently dropped.
+            if (droppedImages)
+              resultText += "\n[image returned, but its source could not be forwarded]";
+            if (droppedDocuments)
+              resultText += "\n[document returned, but this wire cannot forward it]";
           }
         } else {
           resultText = JSON.stringify(block.content);
