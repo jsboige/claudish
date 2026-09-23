@@ -51,9 +51,11 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 
 | Item | Value | Status |
 | --- | --- | --- |
-| Sidecar | `localhost:3002`, upstream **`http://192.168.0.50:3000`** (direct to hub — double-hop removed) | VERIFIED 07/09 23:12Z (startup line + container env + egress from container) |
+| Sidecar | `localhost:3002` (+ NanoClaw portproxy `0.0.0.0:13000` → `127.0.0.1:3002`), upstream **`http://192.168.0.50:3000`** (direct to hub — double-hop removed); image `01454736`, built from `main` `61c3d2d` (carries the #218 native pin, predates #225/#226) | VERIFIED 23/09 04:16Z (drained recreate; `/health` `relay-nominal` on :3002 **and** :13000) |
+| Deploy | compose in `D:\claudish` + override (SearXNG URL), env file `D:\claudish\.env`; recreate = `claudish-drain.ps1 -ContainerName claudish-sidecar -Recreate -EnvFile D:\claudish\.env`. ⚠ that `.env` is now armed: never run `bun test` from `D:\claudish` (Bun auto-loads it) | VERIFIED 23/09 |
 | Client `ANTHROPIC_BASE_URL` | `http://192.168.0.50:3000` (direct) — `settings.json`; profile template `settings.claudish.json` realigned 22:12Z | VERIFIED 07/09 22:12Z |
-| Cascade | **NOT ARMED** (`.env` `CLAUDISH_FAILOVER_*` empty, no `[Failover]` startup line) — standing P1, awaits user GO. The "recreate cuts own traffic" objection is **void since 07/09**: the client no longer transits the sidecar | VERIFIED 07/09 23:12Z |
+| Cascade | **ARMED 23/09** — SONNET `qwen-token-plan@deepseek-v4-flash-0731 > kc@k3 > ds@deepseek-flash`, `ROLE_MODELS=glm-5.2:sonnet` (clients name `glm-5.2` bare, which `roleFromModelName()` cannot map), `AUTO=1`; **3 armed by value**; startup `[Failover] configured=1 armed=[none] auto=on`. Each step measured to resolve **on ai-01** before the gesture (throwaway HUB container on `127.0.0.1:3999`, 3/3 `message_stop`, removed after) | VERIFIED 23/09 04:16Z |
+| Role map | profile `default`: opus `claude-opus-5-5` (was `claude-opus-4-8`), sonnet `glm-5.2`, haiku `mmc@MiniMax-M3`; native pin read in-container: `claude-opus-5` and `claude-opus-4-8` → `claude-opus-5-5`, `claude-opus-5-5` and `glm-5.2` unchanged | VERIFIED 23/09 |
 | customEndpoints | `vllm-myia` (key rotated 06/09, fp only), `qwen-token-plan` | VERIFIED (config.json) |
 | Capture | on (outage trail) | VERIFIED |
 
@@ -79,6 +81,7 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 
 | Date (Z) | Machine | Change | Proof |
 | --- | --- | --- | --- |
+| 2026-09-23 04:16 | ai-01 | drained recreate under po-2025's `[ACK]` (single-ACK rule), plan posted 04:12Z: image rebuilt from `61c3d2d`, opus map → `claude-opus-5-5`, sonnet cascade armed (3 steps) + `ROLE_MODELS=glm-5.2:sonnet`. Drain: 0 in flight | precondition 3/3 on a throwaway container; `/health` :3002 + :13000; real tool-call turn to `message_stop` with local capture count unchanged (NOMINAL); in-container pin; armed by value = 3 |
 | 2026-09-23 | po-2026 | state audited on-boarding (no change applied): sidecar still on pre-migration upstream `.46` (file + container), 0 cascades armed, client bypasses it direct to `.50`; runbook's 13/09 repoint claim corrected — it never landed; compose dir is a second clone (`C:\dev\claudish`) | section above (all items VERIFIED 23/09) |
 | 2026-09-07 23:12 | ai-01 | sidecar recreated: `CLAUDISH_RELAY_UPSTREAM` `.46` → `.50`. Double-hop removed. Under the user's fleet-wide rollout GO (07/09 ~22:10Z) | startup `[Relay] sidecar mode: upstream=http://192.168.0.50:3000` + `docker inspect` env + `/health` + egress `curl` **from inside the container** to `.50` |
 | 2026-09-07 22:16 | ai-01 | sidecar auto-restarted by the Docker daemon coming back up — **kept the OLD `.46` env**: a start does not reload `.env`, only a recreate does | `docker inspect` env vs on-disk `.env` (2 h of divergence, 17 header-timeout local fallbacks in the window) |
