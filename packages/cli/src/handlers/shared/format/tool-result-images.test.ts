@@ -154,6 +154,39 @@ describe("#224 — media the hoist cannot express", () => {
     expect(JSON.stringify(tool)).not.toContain('"type":"image"'); // not the serialized block
   });
 
+  test("one forwarded and one unforwardable image: both are named, the drop is not silent", () => {
+    const out = convertMessagesToOpenAI(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "t1", name: "shots", input: {} }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "t1",
+                content: [
+                  { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+                  { type: "image" },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      "glm-5.3"
+    );
+    const tool = out.find((m: any) => m.role === "tool");
+    expect(tool?.content).toBe(
+      "[image returned; see following message]\n[image returned, but its source could not be forwarded]"
+    );
+    const hoisted = out.filter((m: any) => m.role === "user" && Array.isArray(m.content));
+    expect(hoisted.at(-1)?.content.filter((p: any) => p.type === "image_url")).toHaveLength(1);
+  });
+
   test("the simpleFormat wire names the omission instead of emitting an empty tool result", () => {
     // simpleFormat has no part for ANY image: before the fix the image branch
     // contributed nothing and the result came out "[Tool Result]: " — empty.
@@ -164,9 +197,9 @@ describe("#224 — media the hoist cannot express", () => {
       true
     );
     const user = out.find((m: any) => m.role === "user");
-    expect(user?.content).toBe(
-      "[Tool Result]: [image returned, but its source could not be forwarded]"
-    );
+    // The source is fine here; the WIRE has no part for it, and the marker
+    // says so rather than blaming the source.
+    expect(user?.content).toBe("[Tool Result]: [image returned, but this wire cannot forward it]");
     expect(JSON.stringify(out)).not.toContain("AAAA");
   });
 });
