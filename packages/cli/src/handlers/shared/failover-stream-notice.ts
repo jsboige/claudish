@@ -20,6 +20,13 @@
  * a thrown error here would corrupt a working stream for 4 live agents.
  */
 
+import {
+  appendFailoverNoticeToMessage,
+  buildFailoverNotice,
+  consumeStreamNotice,
+  type FailoverRole,
+} from "../../fork/failover.js";
+
 export function prependNoticeToAnthropicStream(
   source: ReadableStream<Uint8Array>,
   notice: string
@@ -132,4 +139,127 @@ function noticeFrames(notice: string): string {
     `event: content_block_delta\ndata: ${delta}\n\n` +
     `event: content_block_stop\ndata: ${stop}\n\n`
   );
+}
+
+// ─── #229: which ingress carries the notice in content ─────────────────────
+
+/** Response header carrying the notice on the programmatic ingress (#229). */
+export const NOTICE_HEADER = "x-claudish-failover-notice";
+
+/**
+ * How a route's consumers receive a failover notice (#229, option A amended).
+ *
+ * The notices are written for the Claude Code agent loop: an agent that knows its
+ * model changed recalibrates (doctrine 2026-08-23 / #126). A programmatic
+ * consumer cannot — for it a notice riding the content IS the answer, measured on
+ * 2026-09-23 02:02Z: a sk-agent code-review step whose whole content was the
+ * "[claudish] Nominal model restored." notice over an empty model output, so the
+ * review "passed" while saying nothing about the code, and an empty-output guard
+ * never fired because the content was not empty.
+ *
+ * The ingress route is the stable discriminator between the two consumer classes
+ * — it is OUR contract, not a client-supplied string (a user-agent gate drifts
+ * with client versions and is spoofable). Claude Code speaks `/v1/messages`
+ * only; sk-agent-class consumers (any AsyncOpenAI client) speak
+ * `/v1/chat/completions` only.
+ */
+export interface NoticeIngressPolicy {
+  /** true: the notice rides the content (block 0 / appended text). */
+  inContent: boolean;
+}
+
+/** The per-route notice policy. Data-driven so the wiring is testable. */
+export function noticePolicyForIngress(path: string): NoticeIngressPolicy {
+  return { inContent: path !== "/v1/chat/completions" };
+}
+
+/**
+ * Header-safe encoding of a notice: base64 of the UTF-8 bytes. Header values are
+ * single-line ASCII; the notice is multi-line markdown with non-ASCII punctuation
+ * (—, ’). Consumers decode with base64 → UTF-8.
+ */
+export function noticeToHeaderValue(text: string): string {
+  return Buffer.from(text, "utf-8").toString("base64");
+}
+
+/** The inverse of noticeToHeaderValue, for consumers and tests. */
+export function noticeFromHeaderValue(value: string): string {
+  return Buffer.from(value, "base64").toString("utf-8");
+}
+
+function responseWithNoticeHeader(response: Response, text: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set(NOTICE_HEADER, noticeToHeaderValue(text));
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/**
+ * Inject failover/recovery notices into a successful Anthropic-shape response,
+ * per the route's NoticeIngressPolicy.
+ *
+ * Streaming (`inContent: true`): a one-time-per-session (per resolved depth)
+ * notice prepended as block 0, so the substitute/back-to-nominal model reads it
+ * from its own prior turn next time. Non-streaming: the condensation notice
+ * appended to the collected message (fires every /compact while armed,
+ * RECOVERY_CONDENSATIONS times while recovering).
+ *
+ * `inContent: false` (the OpenAI-compatible ingress, #229): the content is left
+ * EXACTLY the model's own — the notice rides the NOTICE_HEADER response header
+ * instead, so an empty model output stays visibly empty for a programmatic
+ * consumer instead of being masked by the notice-as-answer.
+ *
+ * Centralized here (not in ComposedHandler) so it also covers NativeHandler
+ * responses — the recovery case, where the nominal (Opus) is back, must be
+ * announced even though NativeHandler is a thin passthrough. Never throws — a
+ * malformed body passes through.
+ */
+export async function applyFailoverNotices(
+  response: Response,
+  role: FailoverRole | null,
+  sessionKey: string | null,
+  wantsStreaming: boolean,
+  policy: NoticeIngressPolicy = { inContent: true }
+): Promise<Response> {
+  if (!role) return response;
+  if (wantsStreaming) {
+    const text = consumeStreamNotice(role, sessionKey);
+    if (!text) return response;
+    if (!policy.inContent) {
+      return responseWithNoticeHeader(response, text);
+    }
+    if (response.body) {
+      try {
+        const wrapped = prependNoticeToAnthropicStream(response.body, text);
+        const headers = new Headers(response.headers);
+        return new Response(wrapped as any, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      } catch {
+        // Never hang: fall through to the unmodified stream.
+      }
+    }
+    return response;
+  }
+  if (!policy.inContent) {
+    // Same notice text and side effects (recovery-budget decrement) as the
+    // content path — only the channel differs.
+    const text = buildFailoverNotice(role);
+    if (text) return responseWithNoticeHeader(response, text);
+    return response;
+  }
+  try {
+    const message = await response.clone().json();
+    appendFailoverNoticeToMessage(message, role);
+    const headers = new Headers(response.headers);
+    headers.set("Content-Type", "application/json");
+    return new Response(JSON.stringify(message), { status: response.status, headers });
+  } catch {
+    return response;
+  }
 }

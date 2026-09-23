@@ -59,10 +59,7 @@ import {
   onNominalSuccess,
   onNominalRefusal,
   getArmGraceMs,
-  consumeStreamNotice,
-  appendFailoverNoticeToMessage,
   extractSessionKey,
-  type FailoverRole,
 } from "./fork/failover.js";
 import {
   appendCapabilityQueryToMessage,
@@ -72,7 +69,10 @@ import {
 import { executeWebSearch, executeWebFetch, isLowQualityWebContent, extractUrlFromWebContent, cleanRawWebContent } from "./handlers/shared/web-search-executor.js";
 import { convertOpenAIRequestToAnthropic } from "./handlers/shared/format/openai-request-to-anthropic.js";
 import { anthropicMessageToChatCompletion, createOpenAIChatStreamFromAnthropic } from "./handlers/shared/anthropic-to-openai.js";
-import { prependNoticeToAnthropicStream } from "./handlers/shared/failover-stream-notice.js";
+import {
+  applyFailoverNotices,
+  noticePolicyForIngress,
+} from "./handlers/shared/failover-stream-notice.js";
 
 /**
  * Routing failures are TERMINAL — no provider can serve the request (missing
@@ -1114,52 +1114,9 @@ export async function createProxyServer(
     return response as Response;
   };
 
-  /**
-   * Inject failover/recovery notices into a successful Anthropic-shape response.
-   * Streaming: a one-time-per-session (per resolved depth) notice prepended as
-   * block 0, so the substitute/back-to-nominal model reads it from its own prior
-   * turn next time. Non-streaming: the condensation notice appended to the
-   * collected message (fires every /compact while armed, RECOVERY_CONDENSATIONS
-   * times while recovering). Never throws — a malformed body passes through.
-   *
-   * Centralized here (not in ComposedHandler) so it also covers NativeHandler
-   * responses — the recovery case, where the nominal (Opus) is back, must be
-   * announced even though NativeHandler is a thin passthrough.
-   */
-  const applyFailoverNotices = async (
-    response: Response,
-    role: FailoverRole | null,
-    sessionKey: string | null,
-    wantsStreaming: boolean
-  ): Promise<Response> => {
-    if (!role) return response;
-    if (wantsStreaming) {
-      const text = consumeStreamNotice(role, sessionKey);
-      if (text && response.body) {
-        try {
-          const wrapped = prependNoticeToAnthropicStream(response.body, text);
-          const headers = new Headers(response.headers);
-          return new Response(wrapped as any, {
-            status: response.status,
-            statusText: response.statusText,
-            headers,
-          });
-        } catch {
-          // Never hang: fall through to the unmodified stream.
-        }
-      }
-      return response;
-    }
-    try {
-      const message = await response.clone().json();
-      appendFailoverNoticeToMessage(message, role);
-      const headers = new Headers(response.headers);
-      headers.set("Content-Type", "application/json");
-      return new Response(JSON.stringify(message), { status: response.status, headers });
-    } catch {
-      return response;
-    }
-  };
+  // Failover/recovery notices: applyFailoverNotices() in
+  // failover-stream-notice.ts, applied per route through noticePolicyForIngress —
+  // content on /v1/messages, response header on /v1/chat/completions (#229).
 
   // Fork extension: hostname binding + remote address tracking
   const hostnameConfig = createHostnameConfig(options.hostname);
@@ -1400,7 +1357,8 @@ export async function createProxyServer(
         response,
         roleFromModelName(body.model),
         sessionKey,
-        body.stream === true
+        body.stream === true,
+        noticePolicyForIngress(c.req.path)
       );
       // The `await` is load-bearing (218c3586): `return promise` hands it back
       // BEFORE it settles, so a rejection escapes this try/catch entirely and
@@ -1460,14 +1418,18 @@ export async function createProxyServer(
       stripBillingHeaderFromBody(anthropicBody, handler instanceof NativeHandler);
 
       // Route through the cascade, then inject onset/recovery notices on the
-      // Anthropic-shape response BEFORE translation to OpenAI wire shape (the
-      // notice becomes ordinary content the OpenAI client sees).
+      // Anthropic-shape response BEFORE translation to OpenAI wire shape. #229:
+      // this ingress's consumers are programmatic (sk-agent, any AsyncOpenAI
+      // client) — the notice rides the response header, NOT the content, so an
+      // empty model output stays visibly empty instead of being masked by the
+      // notice-as-answer.
       let response = await handleWithCascade(c, anthropicBody, anthropicBody.model);
       response = await applyFailoverNotices(
         response,
         roleFromModelName(anthropicBody.model),
         extractSessionKey(anthropicBody),
-        wantsStream
+        wantsStream,
+        noticePolicyForIngress(c.req.path)
       );
 
       // Translate the final Anthropic response to OpenAI shape.

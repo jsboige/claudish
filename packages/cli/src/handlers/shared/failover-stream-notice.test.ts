@@ -1,5 +1,12 @@
 import { describe, test, expect } from "bun:test";
-import { prependNoticeToAnthropicStream } from "./failover-stream-notice.js";
+import {
+  prependNoticeToAnthropicStream,
+  applyFailoverNotices,
+  noticePolicyForIngress,
+  noticeToHeaderValue,
+  noticeFromHeaderValue,
+  NOTICE_HEADER,
+} from "./failover-stream-notice.js";
 import { resetFailoverForTests, consumeStreamNotice } from "../../fork/failover.js";
 
 const NOTICE = "[claudish] You are a budget substitute.";
@@ -238,6 +245,131 @@ describe("consumeStreamNotice", () => {
     });
     expect(armFailover("sonnet", "test wall 2")).toBe(true);
     expect(consumeStreamNotice("sonnet", sid)).toBeTruthy();
+  });
+});
+
+// ─── #229: which ingress carries the notice in content ────────────────────
+
+function armedResponse(wantsStreaming: boolean, body: string): Response {
+  return new Response(streamFrom(body), {
+    status: 200,
+    headers: { "content-type": wantsStreaming ? "text/event-stream" : "application/json" },
+  });
+}
+
+describe("#229 — notice ingress policy", () => {
+  test("the native ingress carries the notice in content; the OpenAI ingress does not", () => {
+    expect(noticePolicyForIngress("/v1/messages").inContent).toBe(true);
+    expect(noticePolicyForIngress("/v1/chat/completions").inContent).toBe(false);
+  });
+
+  test("header encoding round-trips multi-line UTF-8 (headers are single-line ASCII)", () => {
+    const text =
+      "---\n\n**[claudish] Nominal model restored.** — l’apostrophe et l’em-dash\n\n- `sonnet` is back";
+    expect(noticeFromHeaderValue(noticeToHeaderValue(text))).toBe(text);
+    expect(noticeToHeaderValue(text)).not.toMatch(/[\s—’]/); // header-safe
+  });
+
+  test("streaming on the OpenAI ingress: body byte-identical, notice rides the header", async () => {
+    resetFailoverForTests({
+      CLAUDISH_FAILOVER_SONNET: "ds@deepseek-v4-flash",
+      CLAUDISH_FAILOVER_ACTIVE: "sonnet",
+    });
+    const out = await applyFailoverNotices(
+      armedResponse(true, TEXT_STREAM),
+      "sonnet",
+      "sess-oai-stream",
+      true,
+      noticePolicyForIngress("/v1/chat/completions")
+    );
+    // The content is EXACTLY the model's own — no block-0 prepend, so an empty
+    // model output stays visibly empty for the programmatic consumer.
+    expect(await out.text()).toBe(TEXT_STREAM);
+    const header = out.headers.get(NOTICE_HEADER);
+    expect(header).toBeTruthy();
+    expect(noticeFromHeaderValue(header!)).toContain("[claudish]");
+    // Dedup still consumed the notice: a second response gets neither.
+    const again = await applyFailoverNotices(
+      armedResponse(true, TEXT_STREAM),
+      "sonnet",
+      "sess-oai-stream",
+      true,
+      noticePolicyForIngress("/v1/chat/completions")
+    );
+    expect(again.headers.get(NOTICE_HEADER)).toBeNull();
+  });
+
+  test("streaming on the native ingress still prepends block 0 and sets no header", async () => {
+    resetFailoverForTests({
+      CLAUDISH_FAILOVER_SONNET: "ds@deepseek-v4-flash",
+      CLAUDISH_FAILOVER_ACTIVE: "sonnet",
+    });
+    const out = await applyFailoverNotices(
+      armedResponse(true, TOOL_STREAM),
+      "sonnet",
+      "sess-cc-stream",
+      true,
+      noticePolicyForIngress("/v1/messages")
+    );
+    const body = await out.text();
+    expect(body).not.toBe(TOOL_STREAM); // content changed — the notice is in it
+    expect(body).toContain("[claudish]");
+    expect(out.headers.get(NOTICE_HEADER)).toBeNull();
+  });
+
+  test("non-streaming on the OpenAI ingress: JSON body untouched, header present", async () => {
+    resetFailoverForTests({
+      CLAUDISH_FAILOVER_SONNET: "ds@deepseek-v4-flash",
+      CLAUDISH_FAILOVER_ACTIVE: "sonnet",
+    });
+    const message = { id: "msg_1", content: [{ type: "text", text: "answer" }] };
+    const out = await applyFailoverNotices(
+      new Response(JSON.stringify(message), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      "sonnet",
+      null,
+      false,
+      noticePolicyForIngress("/v1/chat/completions")
+    );
+    expect(await out.json()).toEqual(message); // nothing appended
+    const header = out.headers.get(NOTICE_HEADER);
+    expect(header).toBeTruthy();
+    expect(noticeFromHeaderValue(header!)).toContain("[claudish]");
+  });
+
+  test("non-streaming on the native ingress keeps appending to the message, no header", async () => {
+    resetFailoverForTests({
+      CLAUDISH_FAILOVER_SONNET: "ds@deepseek-v4-flash",
+      CLAUDISH_FAILOVER_ACTIVE: "sonnet",
+    });
+    const message = { id: "msg_2", content: [{ type: "text", text: "answer" }] };
+    const out = await applyFailoverNotices(
+      new Response(JSON.stringify(message), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      "sonnet",
+      null,
+      false // default policy = inContent (the pre-#229 contract)
+    );
+    const msg: any = await out.json();
+    expect(msg.content.at(-1).text).toContain("answer");
+    expect(msg.content.at(-1).text).toContain("[claudish]");
+    expect(out.headers.get(NOTICE_HEADER)).toBeNull();
+  });
+
+  test("no failover role: both ingresses pass through untouched", async () => {
+    const out = await applyFailoverNotices(
+      armedResponse(true, TEXT_STREAM),
+      null,
+      "sess-x",
+      true,
+      noticePolicyForIngress("/v1/messages")
+    );
+    expect(await out.text()).toBe(TEXT_STREAM);
+    expect(out.headers.get(NOTICE_HEADER)).toBeNull();
   });
 });
 
