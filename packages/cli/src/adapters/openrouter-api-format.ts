@@ -13,6 +13,7 @@
 import type { PrepareRequestContext } from "./model-dialect.js";
 import { BaseAPIFormat, type AdapterResult } from "./base-api-format.js";
 import { DialectManager } from "./dialect-manager.js";
+import { mapToolChoiceToOpenAI } from "../handlers/shared/format/openai-tools.js";
 import { removeUriFormat } from "../transform.js";
 import { log } from "../logger.js";
 
@@ -135,14 +136,9 @@ export class OpenRouterAPIFormat extends BaseAPIFormat {
       payload.thinking = claudeRequest.thinking;
     }
 
-    // Tool choice mapping from Claude format
-    if (claudeRequest.tool_choice) {
-      const { type, name } = claudeRequest.tool_choice;
-      if (type === "tool" && name) {
-        payload.tool_choice = { type: "function", function: { name } };
-      } else if (type === "auto" || type === "none") {
-        payload.tool_choice = type;
-      }
+    const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
+    if (toolChoice !== undefined) {
+      payload.tool_choice = toolChoice;
     }
 
     return payload;

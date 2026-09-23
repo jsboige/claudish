@@ -12,6 +12,7 @@
  */
 
 import { BaseAPIFormat, type AdapterResult } from "./base-api-format.js";
+import { mapToolChoiceToOpenAI } from "../handlers/shared/format/openai-tools.js";
 import { log } from "../logger.js";
 import type { StreamFormat } from "../providers/transport/types.js";
 
@@ -106,13 +107,9 @@ export class OpenAIAPIFormat extends BaseAPIFormat {
       payload.tools = tools;
     }
 
-    if (claudeRequest.tool_choice) {
-      const { type, name } = claudeRequest.tool_choice;
-      if (type === "tool" && name) {
-        payload.tool_choice = { type: "function", function: { name } };
-      } else if (type === "auto" || type === "none") {
-        payload.tool_choice = type;
-      }
+    const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
+    if (toolChoice !== undefined) {
+      payload.tool_choice = toolChoice;
     }
 
     // Reasoning params handled in prepareRequest instead

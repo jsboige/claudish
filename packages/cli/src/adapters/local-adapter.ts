@@ -14,6 +14,7 @@
 import type { PrepareRequestContext } from "./model-dialect.js";
 import { BaseAPIFormat, type AdapterResult } from "./base-api-format.js";
 import { DialectManager } from "./dialect-manager.js";
+import { mapToolChoiceToOpenAI } from "../handlers/shared/format/openai-tools.js";
 import { log } from "../logger.js";
 
 interface SamplingParams {
@@ -119,13 +120,12 @@ export class LocalModelAdapter extends BaseAPIFormat {
       stream_options: { include_usage: true },
     };
 
-    // Tool choice mapping from Claude format
-    if (claudeRequest.tool_choice && tools.length > 0) {
-      const { type, name } = claudeRequest.tool_choice;
-      if (type === "tool" && name) {
-        payload.tool_choice = { type: "function", function: { name } };
-      } else if (type === "auto" || type === "none") {
-        payload.tool_choice = type;
+    // The tools.length guard is this adapter's own: a local relay handed a
+    // tool_choice with no tools to choose from rejects the whole request.
+    if (tools.length > 0) {
+      const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
+      if (toolChoice !== undefined) {
+        payload.tool_choice = toolChoice;
       }
     }
 
