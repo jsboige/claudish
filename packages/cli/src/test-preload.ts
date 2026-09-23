@@ -44,9 +44,8 @@ if (homedir() !== sandbox) {
   );
 }
 
-// A run cannot always remove its own sandbox: a killed run never gets the
-// chance, and a finished one was measured on Windows still leaving a proxy's
-// tokens-<port>.json or Bun's own cache files (which follow HOME) behind.
+// A killed run never reaches its afterAll, so its sandbox stays behind (with
+// whatever the tests wrote, and Bun's own cache files, which follow HOME).
 // Sweep earlier runs' leftovers here — one older than a day cannot belong to a
 // run still in flight.
 const STALE_MS = 24 * 60 * 60 * 1000;
