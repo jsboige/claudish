@@ -79,7 +79,7 @@ On po-2026 the sidecar's compose project lives in **`C:\dev\claudish`**, while t
 docker inspect claudish-proxy --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
 ```
 
-Then verify the change the same way the change is consumed: `docker inspect <container> --format '{{range .Config.Env}}{{println .}}{{end}}'` on `CLAUDISH_RELAY_UPSTREAM` — the **container env**, never the file alone, is the live path (a start does not reload `.env`; only a recreate does).
+Then verify the change the same way the change is consumed: `docker inspect <container> --format '{{range .Config.Env}}{{println .}}{{end}}' | Select-String '^CLAUDISH_RELAY_UPSTREAM='` — **filter before anything is printed**: the unfiltered env carries `CLAUDISH_PROXY_KEY` in clear, and a console output tends to end up in a transcript, a capture or a dashboard. The **container env**, never the file alone, is the live path (a start does not reload `.env`; only a recreate does).
 
 **Why a per-consumer verification misses it**: `ANTHROPIC_BASE_URL` on po-2024 reads `http://192.168.0.50:3000` — correct. The drift lives in a **second, independent consumer** (an auto-start process), not in the settings file. Verifying "where each client lands" therefore means **enumerating processes**, not reading `~/.claude/settings.json`:
 
