@@ -57,18 +57,29 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 | customEndpoints | `vllm-myia` (key rotated 06/09, fp only), `qwen-token-plan` | VERIFIED (config.json) |
 | Capture | on (outage trail) | VERIFIED |
 
+## po-2026 — SIDECAR (bypassed by its own client)
+
+| Item | Value | Status |
+| --- | --- | --- |
+| Sidecar | `claudish-proxy`, `0.0.0.0:3000`, healthy, image pre-#159 (`role` absent from `/health`) | VERIFIED 23/09 (docker inspect + `/health`) |
+| Compose dir | **`C:\dev\claudish` — a second clone, not the dev tree `D:\Dev\claudish`**; the `.env` that governs the container lives there | VERIFIED 23/09 (container label `com.docker.compose.project.working_dir`) |
+| Upstream | `CLAUDISH_RELAY_UPSTREAM=http://192.168.0.46:3000` (po-2023, the pre-migration hub) in **both** the compose `.env` (mtime 26/07) **and** the live container env — the runbook's "repointed `.46`→`.50` by hand on 2026-09-13" never landed on this machine | VERIFIED 23/09 (file read + `docker inspect` env) |
+| Cascades | **0 armed by value** (`grep -cE 'CLAUDISH_FAILOVER_[A-Z0-9_]+=.+'` on container env = 0); `ROLE_MODELS` empty | VERIFIED 23/09 |
+| Client | `ANTHROPIC_BASE_URL=http://192.168.0.50:3000` **direct to hub** (settings.json + live process env) — the sidecar serves zero streams; the stale upstream is latent, not load-bearing | VERIFIED 23/09 (process env + `activeStreams=0`) |
+| Plan | repoint `.46`→`.50` at the next **planned drained recreate**, via `[PROPOSAL]` + single ACK (coordinator arbitration 22/09 23:36Z) — never as an isolated gesture on an unused container | DECLARED (coordinator dispatch) |
+
 ## Other machines
 
 | Machine | State | Status |
 | --- | --- | --- |
 | po-2024 | nominal, traffic on new hub | DECLARED |
-| po-2026 | sidecar active (rebuilt 04/09) | DECLARED |
 | po-2027 | traffic captured on new hub | DECLARED |
 
 ## Change log
 
 | Date (Z) | Machine | Change | Proof |
 | --- | --- | --- | --- |
+| 2026-09-23 | po-2026 | state audited on-boarding (no change applied): sidecar still on pre-migration upstream `.46` (file + container), 0 cascades armed, client bypasses it direct to `.50`; runbook's 13/09 repoint claim corrected — it never landed; compose dir is a second clone (`C:\dev\claudish`) | section above (all items VERIFIED 23/09) |
 | 2026-09-07 23:12 | ai-01 | sidecar recreated: `CLAUDISH_RELAY_UPSTREAM` `.46` → `.50`. Double-hop removed. Under the user's fleet-wide rollout GO (07/09 ~22:10Z) | startup `[Relay] sidecar mode: upstream=http://192.168.0.50:3000` + `docker inspect` env + `/health` + egress `curl` **from inside the container** to `.50` |
 | 2026-09-07 22:16 | ai-01 | sidecar auto-restarted by the Docker daemon coming back up — **kept the OLD `.46` env**: a start does not reload `.env`, only a recreate does | `docker inspect` env vs on-disk `.env` (2 h of divergence, 17 header-timeout local fallbacks in the window) |
 | 2026-09-07 21:33 | ai-01 | Docker Desktop back up after the deliberate stop (CoursIA runners) — 47 containers with `StartedAt` inside 0.4 s = host/daemon event, not a targeted gesture | `docker inspect .State.StartedAt` across all containers |
