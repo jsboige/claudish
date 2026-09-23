@@ -55,6 +55,15 @@ interface AnthropicPassthroughOpts {
   onTokenUpdate?: (input: number, output: number) => void;
   /** Optional adapter — used to check shouldFilterThinking(). */
   adapter?: BaseAPIFormat;
+  /**
+   * True when the CLIENT's original request asked for thinking
+   * (`thinking.type === "enabled"`). A thinking filter declared by the adapter
+   * (MiniMax: unrequested thinking blocks leak to the user) must not strip the
+   * blocks of a client that explicitly asked for them — including the forced-
+   * thinking policy lanes, where the operator enables reasoning the client
+   * never requested (blocks are then stripped, by design).
+   */
+  clientRequestedThinking?: boolean;
   /** dispatch → upstream headers latency, from ComposedHandler (for [ttft]). */
   headerLatencyMs?: number;
   /**
@@ -100,7 +109,8 @@ export function createAnthropicPassthroughStream(
   const reqN = requestNumberFor(c.req);
   let ttftLogged = false;
 
-  const filterThinking = opts.adapter?.shouldFilterThinking() ?? false;
+  const filterThinking =
+    (opts.adapter?.shouldFilterThinking() ?? false) && opts.clientRequestedThinking !== true;
 
   const cap = createResponseCapture("anthropic", opts.modelName, opts.capture !== false, reqN);
 

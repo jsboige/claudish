@@ -1514,6 +1514,74 @@ describe("Anthropic SSE: thinking block filtering", () => {
     expect(thinkingStart).toBeDefined();
   });
 
+  test("filtering adapter + clientRequestedThinking=true keeps the thinking blocks", async () => {
+    // A client that explicitly asked for thinking (`thinking.type=enabled`)
+    // must receive its blocks even from a filtering dialect (MiniMax). The
+    // filter exists for UNREQUESTED thinking leaking to the user — not to
+    // strip what was asked for.
+    const createAnthropicPassthroughStream = await getParser();
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+
+    const fixture = fixtureToResponse(join(FIXTURES_DIR, "SEED-anthropic-thinking.sse"));
+    const ctx = createMockContext();
+
+    const response = createAnthropicPassthroughStream(ctx, fixture, {
+      modelName: "minimax-m2.5",
+      adapter,
+      clientRequestedThinking: true,
+    });
+
+    const events = await parseClaudeSseStream(response);
+
+    const thinkingStart = events.find(
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
+    );
+    expect(thinkingStart).toBeDefined();
+
+    const thinkingDelta = events.find(
+      (e) => e.data?.type === "content_block_delta" && e.data?.delta?.type === "thinking_delta"
+    );
+    expect(thinkingDelta).toBeDefined();
+
+    // Indices are NOT renumbered when nothing is filtered: the fixture's
+    // thinking stays at 0, text at 1.
+    const textStart = events.find(
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "text"
+    );
+    expect(textStart?.data?.index).toBe(1);
+  });
+
+  test("filtering adapter + clientRequestedThinking=false (explicit) strips thinking", async () => {
+    // The forced-thinking policy lane: the client asked disabled, the operator
+    // forced reasoning upstream — the blocks must NOT reach this client.
+    const createAnthropicPassthroughStream = await getParser();
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+
+    const fixture = fixtureToResponse(join(FIXTURES_DIR, "SEED-anthropic-thinking.sse"));
+    const ctx = createMockContext();
+
+    const response = createAnthropicPassthroughStream(ctx, fixture, {
+      modelName: "minimax-m2.5",
+      adapter,
+      clientRequestedThinking: false,
+    });
+
+    const events = await parseClaudeSseStream(response);
+
+    const thinkingStart = events.find(
+      (e) =>
+        e.data?.type === "content_block_start" && e.data?.content_block?.type === "thinking"
+    );
+    expect(thinkingStart).toBeUndefined();
+
+    const text = extractText(events);
+    expect(text).toContain("Visible response");
+  });
+
   test("content block indices are re-indexed after filtering", async () => {
     const createAnthropicPassthroughStream = await getParser();
     const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");

@@ -1361,7 +1361,17 @@ export class ComposedHandler implements ModelHandler {
         return createAnthropicPassthroughStream(c, response, {
           modelName: this.bareModelName,
           onTokenUpdate,
-          adapter: adapter as BaseAPIFormat,
+          // Thinking-filter consultation must reach the MODEL dialect
+          // (MiniMaxModelDialect.shouldFilterThinking()=true), not stop at the
+          // explicit wire adapter (AnthropicAPIFormat, base default false) that
+          // shadows it on this lane — until 2026-09-23 the documented MiniMax
+          // thinking filter never actually fired on the mmc@ lane for exactly
+          // this reason. The dialect is the semantic owner of "this model's
+          // unrequested thinking blocks leak"; the wire adapter answers a
+          // different question.
+          adapter: (this.modelAdapter ?? adapter) as BaseAPIFormat,
+          // Filter only what the client did not ask for (see parser opts).
+          clientRequestedThinking: claudeRequest?.thinking?.type === "enabled",
           headerLatencyMs,
           retryUpstream: retryUpstreamBounded,
           providerName: this.provider.name,
