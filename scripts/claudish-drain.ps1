@@ -176,7 +176,7 @@ function Invoke-DrainRollback {
             Write-DrainLog "ROLLBACK ($Reason): container '$Container' still running — compose failed before stopping it, nothing to roll back"
             return 'already-running'
         }
-        docker start $Container 2>$null
+        $null = docker start $Container 2>$null   # echoes the name; keep the verdict a single string
         if ($LASTEXITCODE -ne 0) {
             Write-DrainLog "ROLLBACK ($Reason): docker start $Container FAILED (exit $LASTEXITCODE) — container left stopped, start it by hand"
             return 'start-failed'
@@ -361,7 +361,12 @@ function Invoke-ClaudishDrainedRestartImpl {
         try {
             $psLines = docker ps -a --filter "name=$Container" --format '{{.Names}} {{.State}}' 2>$null
             if ($LASTEXITCODE -eq 0 -and $psLines) {
-                $twinLines = @($psLines | Where-Object { $_ -and (($_.Trim() -split '\s+')[0]) -ne $Container })
+                # Only compose's own temporary shape is a twin: `<ID[:12]>_<name>`.
+                # The name filter is a substring match, so a container that
+                # merely CONTAINS the target name must not be reported — the
+                # refusal below prints `docker rm <it>` as the fix.
+                $twinRe = '^[0-9a-f]{12}_' + [regex]::Escape($Container) + '$'
+                $twinLines = @($psLines | Where-Object { $_ -and ((($_.Trim() -split '\s+')[0]) -match $twinRe) })
             }
         } finally { $ErrorActionPreference = $prevEap2 }
         if ($twinLines.Count -gt 0) {
@@ -370,7 +375,16 @@ function Invoke-ClaudishDrainedRestartImpl {
             if ($RemoveCreatedTwins -and $nonCreatedTwins.Count -eq 0) {
                 foreach ($t in $createdTwins) {
                     $tname = ($t.Trim() -split '\s+')[0]
-                    docker rm $tname 2>$null
+                    # `$null =`: docker rm echoes the name on stdout. Uncaptured,
+                    # it joins this function's output and a later `return $false`
+                    # reaches the caller as @('<twin>', $false) — truthy, so the
+                    # standalone form exited 0 on a failed deploy.
+                    $null = docker rm $tname 2>$null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-DrainLog "RECREATE REFUSED ($Reason): could not remove twin '$tname' (docker rm exit $LASTEXITCODE) — nothing stopped"
+                        Write-DrainOutcome "refused" "${Reason}: twin removal failed — nothing stopped"
+                        return $false
+                    }
                     Write-DrainLog "RECREATE ($Reason): removed Created-state twin '$tname' (-RemoveCreatedTwins — never ran, holds no state)"
                 }
             } else {
@@ -497,7 +511,7 @@ function Invoke-ClaudishDrainedRestartImpl {
         }
         $verb = "docker compose up -d"
     } else {
-        docker restart -t 120 $Container 2>$null
+        $null = docker restart -t 120 $Container 2>$null   # echoes the name; keep the result a single bool
         if ($LASTEXITCODE -ne 0) {
             Write-DrainLog "RESTART ($Reason): docker restart $Container FAILED (exit $LASTEXITCODE)"
             Write-DrainOutcome "failed" "${Reason}: docker restart exit $LASTEXITCODE"

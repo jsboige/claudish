@@ -30,6 +30,12 @@
                         rollback State.Running probe — the tests choose values
                         that keep the two uses consistent)
       compose_exit.txt  exit code for `docker compose` (absent = 0)
+      rm_exit.txt       exit code for `docker rm` (absent = 0)
+    Like docker.exe, `start`, `rm` and `restart` echo the container name on
+    stdout when they succeed. The first version of this shim stayed silent,
+    and so could not see that an uncaptured `docker rm` put the twin's name
+    into the function's return value: a failed deploy came back as
+    @('<twin>', $false), which is truthy.
     The batch file uses labels instead of parenthesized blocks: `exit /b %CE%`
     inside an `if (...)` block would expand %CE% BEFORE `set /p` runs (classic
     delayed-expansion trap).
@@ -56,6 +62,7 @@ if "%1"=="ps" goto :ps
 if "%1"=="inspect" goto :inspect
 if "%1"=="start" goto :start
 if "%1"=="rm" goto :rm
+if "%1"=="restart" goto :restart
 if "%1"=="compose" goto :compose
 exit /b 0
 
@@ -68,11 +75,23 @@ if exist "%SHIM_DIR%\inspect_out.txt" (type "%SHIM_DIR%\inspect_out.txt") else (
 exit /b 0
 
 :start
-if not exist "%SHIM_DIR%\start_exit.txt" exit /b 0
+if not exist "%SHIM_DIR%\start_exit.txt" goto :start_ok
 set /p SE=<"%SHIM_DIR%\start_exit.txt"
 exit /b %SE%
+:start_ok
+echo %2
+exit /b 0
 
 :rm
+if not exist "%SHIM_DIR%\rm_exit.txt" goto :rm_ok
+set /p RE=<"%SHIM_DIR%\rm_exit.txt"
+exit /b %RE%
+:rm_ok
+echo %2
+exit /b 0
+
+:restart
+echo %4
 exit /b 0
 
 :compose
@@ -97,7 +116,7 @@ exit /b %CE%
 
     function Reset-DrainFixture {
         Remove-Item -LiteralPath $script:CallsLog -Force -ErrorAction SilentlyContinue
-        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'compose_exit.txt', 'start_exit.txt') {
+        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'compose_exit.txt', 'start_exit.txt', 'rm_exit.txt') {
             Remove-Item -LiteralPath (Join-Path $script:ShimDir $f) -Force -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $script:TestLog -Force -ErrorAction SilentlyContinue
@@ -133,14 +152,14 @@ Describe 'Invoke-ClaudishDrainedRestart — -Recreate guards (#233)' {
         Reset-DrainFixture
         # Target running + one Created twin. inspect answers PATH only, so the
         # armed-cascade guard sees 0 armed in the container and passes.
-        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`nabc123_claudish-proxy created", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`nabc123def456_claudish-proxy created", (New-Object System.Text.ASCIIEncoding))
         [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin", (New-Object System.Text.ASCIIEncoding))
 
         $r = Invoke-ClaudishDrainedRestart -Reason 'twin-refuse' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
         $r | Should -BeFalse
         $log = Get-DrainLogText
-        $log | Should -Match "leftover twin 'abc123_claudish-proxy' \(state=created\)"
-        $log | Should -Match 'docker rm abc123_claudish-proxy'
+        $log | Should -Match "leftover twin 'abc123def456_claudish-proxy' \(state=created\)"
+        $log | Should -Match 'docker rm abc123def456_claudish-proxy'
         $log | Should -Match 'OUTCOME refused'
         # AC2: refuse BEFORE stopping anything. compose is where the stop
         # happens; it must never have been invoked.
@@ -157,21 +176,21 @@ Describe 'Invoke-ClaudishDrainedRestart — -Recreate guards (#233)' {
 
     It '-RemoveCreatedTwins removes Created twins and proceeds to the recreate' {
         Reset-DrainFixture
-        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`nabc123_claudish-proxy created", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`nabc123def456_claudish-proxy created", (New-Object System.Text.ASCIIEncoding))
         [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin", (New-Object System.Text.ASCIIEncoding))
 
         $r = Invoke-ClaudishDrainedRestart -Reason 'twin-autorm' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile -RemoveCreatedTwins
         $r | Should -BeTrue
         $calls = Get-CallsText
-        $calls | Should -Match '(?m)^rm abc123_claudish-proxy'
+        $calls | Should -Match '(?m)^rm abc123def456_claudish-proxy'
         $calls | Should -Match '(?m)^compose'
-        (Get-DrainLogText) | Should -Match "removed Created-state twin 'abc123_claudish-proxy'"
+        (Get-DrainLogText) | Should -Match "removed Created-state twin 'abc123def456_claudish-proxy'"
         (Get-DrainLogText) | Should -Match 'OUTCOME success'
     }
 
     It '-RemoveCreatedTwins still refuses when a non-Created twin is present' {
         Reset-DrainFixture
-        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`nx1_claudish-proxy created`nx2_claudish-proxy exited", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`n0123456789ab_claudish-proxy created`nba9876543210_claudish-proxy exited", (New-Object System.Text.ASCIIEncoding))
         [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin", (New-Object System.Text.ASCIIEncoding))
 
         $r = Invoke-ClaudishDrainedRestart -Reason 'twin-mixed' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile -RemoveCreatedTwins
@@ -180,6 +199,68 @@ Describe 'Invoke-ClaudishDrainedRestart — -Recreate guards (#233)' {
         $calls | Should -Not -Match '(?m)^rm'
         $calls | Should -Not -Match '(?m)^compose'
         (Get-DrainLogText) | Should -Match 'only covers Created-state twins'
+    }
+}
+
+Describe 'Invoke-ClaudishDrainedRestart — twin shape and return value (#233 review)' {
+    It 'a container whose name merely CONTAINS the target is not a twin — never told to remove it' {
+        Reset-DrainFixture
+        # `docker ps --filter name=` is a substring match. Only compose's own
+        # temporary shape, <12-hex id>_<name>, is a leftover twin; anything
+        # else is somebody's container, and the refusal would print
+        # `docker rm <it>` as the fix.
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`nclaudish-proxy-e2e running", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'substring' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeTrue
+        (Get-DrainLogText) | Should -Not -Match 'docker rm claudish-proxy-e2e'
+        Get-CallsText | Should -Match '(?m)^compose'
+    }
+
+    It '-RemoveCreatedTwins refuses when docker rm fails — compose never runs on a twin still present' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`nabc123def456_claudish-proxy created", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'rm_exit.txt'), "1", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'rm-fails' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile -RemoveCreatedTwins
+        $r | Should -BeFalse
+        Get-CallsText | Should -Not -Match '(?m)^compose'
+        $log = Get-DrainLogText
+        $log | Should -Match "could not remove twin 'abc123def456_claudish-proxy'"
+        $log | Should -Not -Match 'removed Created-state twin'
+        $log | Should -Match 'OUTCOME refused'
+    }
+
+    It '-RemoveCreatedTwins then a failed compose returns exactly one $false — the twin name must not leak into the result' {
+        Reset-DrainFixture
+        # The standalone form turns this value into the exit code, and AC4
+        # sends agent callers down exactly that detached path.
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running`nabc123def456_claudish-proxy created", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "false", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'compose_exit.txt'), "1", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'rm-then-fail' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile -RemoveCreatedTwins
+        @($r).Count | Should -Be 1
+        $r | Should -BeFalse
+        (Get-DrainLogText) | Should -Match 'OUTCOME failed'
+    }
+
+    It 'the rollback verdict is a single string even though docker start echoes the name' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "false", (New-Object System.Text.ASCIIEncoding))
+        $v = Invoke-DrainRollback -Reason 'shape' -Container 'claudish-proxy' -Url 'http://127.0.0.1:1'
+        @($v).Count | Should -Be 1
+        $v | Should -Be 'started'
+    }
+
+    It 'a plain (non-recreate) restart returns exactly one $true — docker restart echoes the name too' {
+        Reset-DrainFixture
+        $r = Invoke-ClaudishDrainedRestart -Reason 'plain' -Url 'http://127.0.0.1:1'
+        @($r).Count | Should -Be 1
+        $r | Should -BeTrue
+        Get-CallsText | Should -Match '(?m)^restart -t 120 claudish-proxy'
     }
 }
 
