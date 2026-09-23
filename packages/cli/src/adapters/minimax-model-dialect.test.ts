@@ -68,6 +68,13 @@ describe("MiniMaxModelDialect — thinking policy (anthropic wire)", () => {
     expect(payload.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
   });
 
+  it("forced leaves an ADAPTIVE client untouched (a request, not an opt-out)", () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced";
+    const payload: any = { max_tokens: 32000, thinking: { type: "adaptive" } };
+    dialect().prepareRequest(payload, { thinking: { type: "adaptive" } }, ANTHROPIC);
+    expect(payload.thinking).toEqual({ type: "adaptive" });
+  });
+
   it("forced skips when the budget would not fit under max_tokens", () => {
     // Mirrors the Qwen constraint: an endpoint rejecting
     // max_tokens <= budget_tokens must not see the forced value — the request

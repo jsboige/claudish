@@ -11,6 +11,7 @@
 
 import { BaseAPIFormat, AdapterResult, matchesModelFamily } from "./base-api-format.js";
 import type { PrepareRequestContext } from "./model-dialect.js";
+import { clientRequestedThinking } from "../handlers/shared/client-thinking.js";
 import { log } from "../logger.js";
 import { lookupModel } from "./model-catalog.js";
 
@@ -65,20 +66,26 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    * natively by MiniMax's Anthropic-compatible endpoint.
    *
    * Unlike Qwen/GLM/DeepSeek (which think BY DEFAULT and need an off switch),
-   * MiniMax honors the client's `thinking` value exactly — measured 2026-09-23
-   * on mmc@MiniMax-M3: Claude Code sends `{"type":"disabled"}` for every
-   * subagent/haiku-role request, the value is forwarded verbatim, and 388/388
-   * captured responses contain zero `thinking_delta`. The other lanes look
-   * like they think "at xhigh" because CC asks them to; on the haiku lane CC
-   * explicitly opts out, so MiniMax never reasons. CLAUDISH_MINIMAX_THINKING
-   * makes that a policy rather than a silent client-side accident:
+   * MiniMax does not reason without a `thinking` request: absent or disabled
+   * gives `[text]`; enabled (any budget) or adaptive gives `[thinking, text]`
+   * on a small prompt (live probes through the hub, 2026-09-23).
+   *
+   * ⚠ This switch does NOT make the production haiku lane reason. Hub corpus,
+   * every MiniMax-M3 response 2026-09-23 11:38Z→19:49Z (887, all paired):
+   * 679 requests ALREADY carry `{"type":"enabled","budget_tokens":31999}`
+   * (claude-vscode) and only 6 of them produced a `thinking_delta`; the other
+   * 208 are absent/disabled, almost all sdk-cli one-shots. `forced` leaves
+   * the 679 untouched and rewrites the 208 — why enabled long-context
+   * requests mostly don't reason is an open question (#237 review), not
+   * something this policy addresses. CLAUDISH_MINIMAX_THINKING:
    *
    *   passthrough (default) — send exactly what the client asked for
    *   disabled              — force `thinking: {"type":"disabled"}`
    *   forced[:<n>]          — force `{"type":"enabled","budget_tokens":<n>}`
    *                           (default n=16000) when the client did not itself
-   *                           ask for thinking; a client-enabled request keeps
-   *                           its own budget untouched
+   *                           ask for thinking; a client that asked (enabled OR
+   *                           adaptive — `clientRequestedThinking`) keeps its
+   *                           own setting untouched
    *
    * Rewrites apply on the anthropic wire only (`ctx.wireFormat ===
    * "anthropic-sse"`): on OpenAI-shaped routings the `thinking` object is not
@@ -104,7 +111,8 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
 
     const policy = readThinkingPolicy();
     if (ctx?.wireFormat === "anthropic-sse" && policy.kind !== "passthrough") {
-      const clientEnabled = originalRequest?.thinking?.type === "enabled";
+      // `adaptive` is a request too — an `=== "enabled"` test overwrote it.
+      const clientEnabled = clientRequestedThinking(originalRequest?.thinking);
       const maxTokensRaw = Number(request.max_tokens ?? 0);
       const maxTokensKnown = maxTokensRaw > 0;
       const budgetFits =
