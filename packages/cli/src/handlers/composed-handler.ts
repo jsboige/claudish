@@ -25,6 +25,7 @@ type BaseModelAdapter = BaseAPIFormat;
 import { DialectManager } from "../adapters/dialect-manager.js";
 import { MiddlewareManager, GeminiThoughtSignatureMiddleware } from "../middleware/index.js";
 import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
+import { clientRequestedThinking } from "./shared/client-thinking.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { filterIdentity } from "./shared/openai-compat.js";
 import { stripReasoningContent } from "./shared/format/openai-messages.js";
@@ -1370,8 +1371,9 @@ export class ComposedHandler implements ModelHandler {
           // unrequested thinking blocks leak"; the wire adapter answers a
           // different question.
           adapter: (this.modelAdapter ?? adapter) as BaseAPIFormat,
-          // Filter only what the client did not ask for (see parser opts).
-          clientRequestedThinking: claudeRequest?.thinking?.type === "enabled",
+          // Filter only what the client did not ask for (see parser opts) —
+          // `adaptive` is a request too, not just `enabled`.
+          clientRequestedThinking: clientRequestedThinking(claudeRequest?.thinking),
           headerLatencyMs,
           retryUpstream: retryUpstreamBounded,
           providerName: this.provider.name,
