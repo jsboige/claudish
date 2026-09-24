@@ -64,6 +64,7 @@ import { createProxyServer } from "../../proxy-server.js";
 import { deferSignalExitToHost } from "../../stats-buffer.js";
 import { loadConfig, getModelMapping } from "../../profile-config.js";
 import { createRelayState, startUpstreamProber, type RelayState } from "./relay.js";
+import { emitShutdownDieLine } from "./shutdown-die-log.js";
 
 // Role remapping from the active profile (2026-06-25). Without a modelMap, a
 // client that sends a literal Anthropic role name — e.g. `claude-sonnet-4-6`
@@ -135,12 +136,14 @@ let shuttingDown = false;
 const gracefulExit = async (signal: string): Promise<void> => {
   if (shuttingDown) {
     console.log(`\n[claudish-proxy] ${signal} again — exiting now, in-flight streams will be cut.`);
+    emitShutdownDieLine("forced", server.getActiveStreams());
     process.exit(0);
   }
   shuttingDown = true;
   console.log(`\n[claudish-proxy] ${signal} — letting in-flight responses finish (send again to exit now)...`);
   stopProber?.();
   await server.shutdown();
+  emitShutdownDieLine("graceful", server.getActiveStreams());
   process.exit(0);
 };
 

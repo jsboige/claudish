@@ -1524,6 +1524,9 @@ export async function createProxyServer(
   return {
     port,
     url: `http://${hostnameConfig.hostname}:${port}`,
+    // #255: the SIGTERM path logs this at the die — the tracker lives inside
+    // this closure, and /health stops answering once close() drops the socket.
+    getActiveStreams: () => streamTracker.getActiveStreams(),
     shutdown: async () => {
       return new Promise<void>((resolve) => server.close(() => resolve()));
     },
