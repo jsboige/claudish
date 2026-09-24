@@ -18,21 +18,24 @@ Method (user-calibrated, two points — no month-start archaeology needed):
      steps + drained restart — an operator gesture, never automatic here).
 
 Meter corpus (include-list, from config.json routing + cascade steps):
-  deepseek-v4-flash, deepseek-v4.1-flash  (cascade steps via qwen-token-plan;
-    the @-target deepseek-v4.1-flash surfaces as deepseek-v4-flash in capture
-    filenames — outbound id is rewritten before the wire)
-  qwen3.6-flash, qwen3.7-plus, qwen3.7-max, qwen3.8-max  (explicit routing)
-EXCLUDED on purpose: qwen3.6-35b-a3b — routed to vllm-myia (LOCAL lane, not
-the Qwen meter) even though the name starts with "qwen".
-KNOWN BIAS (accepted, upper-bound direction): bare client requests for
-deepseek-v4-flash ride the DeepSeek-first FallbackHandler chain and may be
-served by DeepSeek PAYG while still landing in our corpus. Measured 2026-09-24
-that population is drain-probes only (~15 output tokens each); if real bare
-traffic appears, tighten with [Failover] log correlation.
+  deepseek-v4.1-flash   — cascade step via qwen-token-plan. The DOTTED id is
+    the pure meter signal: cascade-served requests capture with the @-target
+    verbatim (5767 files on 2026-09-23), while the UNdotted deepseek-v4-flash
+    is the bare-name FallbackHandler chain (DeepSeek PAYG first — 3393 files
+    same day, 0 [Fallback] walks in 26h, population = drain probes). One
+    dotted resp file = one actual subscription call.
+  qwen3.8-max, qwen3.8-flash — explicit agent routing (user rule 2026-09-24:
+    latest version only). 3.8-flash added ahead of its routing entry.
+  qwen3.6-flash, qwen3.7-plus, qwen3.7-max — STALE routing entries that still
+    bill the meter if requested; remove from here when removed from routing.
+EXCLUDED on purpose: deepseek-v4-flash (undotted — bare chain, DeepSeek-first
+PAYG) and qwen3.6-35b-a3b (routed to vllm-myia, LOCAL lane).
 
-Units: output_tokens (the Token Plan bills on OUTPUT — docs/reference/
-budget-failover.md). input_tokens tracked alongside for recalibration if the
-47% cross-check disagrees.
+Units: output_tokens primary (docs say the Token Plan bills on OUTPUT) — but
+the billing unit is UNCONFIRMED against the console, so input is tracked in
+full: input_tokens (uncached), cache_read_input_tokens,
+cache_creation_input_tokens. The 47% calibration reports all of them;
+whichever correlates with the console's own math wins.
 
 Usage:
   python qwen_monthly_guard.py baseline --percent 71.4
@@ -56,12 +59,12 @@ DEFAULT_ARCHIVES = r"G:\Mon Drive\Backups-Cloud\claudish"
 DEFAULT_7Z = r"D:\PortableApps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe"
 
 METER_MODELS = {
-    "deepseek-v4-flash",
     "deepseek-v4.1-flash",
     "qwen3.6-flash",
     "qwen3.7-plus",
     "qwen3.7-max",
     "qwen3.8-max",
+    "qwen3.8-flash",
 }
 
 # resp-1-r0731-2026-09-24T04-56-52-709Z-openai-deepseek-v4-flash.sse
@@ -70,6 +73,8 @@ RESP_RE = re.compile(
 )
 OUT_RE = re.compile(r'"output_tokens":(\d+)')
 IN_RE = re.compile(r'"input_tokens":(\d+)')
+CACHE_READ_RE = re.compile(r'"cache_read_input_tokens":(\d+)')
+CACHE_CREATE_RE = re.compile(r'"cache_creation_input_tokens":(\d+)')
 
 
 def utc_today() -> str:
@@ -77,10 +82,14 @@ def utc_today() -> str:
 
 
 def parse_sse_usage(path: str):
-    """MAX output/input per file — wire-openai emits a zero block first
-    (same lesson as compaction-trend.py: never sum, take the max)."""
+    """MAX per field per file — wire-openai emits a zero block first
+    (same lesson as compaction-trend.py: never sum, take the max). The three
+    input fields are DISJOINT components post-split (input + cache_read +
+    cache_creation = the upstream prompt_tokens)."""
     out_max = 0
     in_max = 0
+    cr_max = 0
+    cc_max = 0
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             body = f.read()
@@ -88,22 +97,26 @@ def parse_sse_usage(path: str):
             out_max = max(out_max, int(m.group(1)))
         for m in IN_RE.finditer(body):
             in_max = max(in_max, int(m.group(1)))
+        for m in CACHE_READ_RE.finditer(body):
+            cr_max = max(cr_max, int(m.group(1)))
+        for m in CACHE_CREATE_RE.finditer(body):
+            cc_max = max(cc_max, int(m.group(1)))
     except OSError:
         return None
-    return out_max, in_max
+    return out_max, in_max, cr_max, cc_max
 
 
 def scan_dir_for_day(captures_dir: str, day: str):
     """Sum usage over the loose-capture dir for one UTC day. Returns
-    (n_files, out_sum, in_sum) — recomputed fresh each call since the loose
-    day only grows (files for a past day can still appear pre-purge)."""
+    (n, out, in, cache_read, cache_creation) — recomputed fresh each call
+    since the loose day only grows (files for a past day can still appear
+    pre-purge)."""
     n = 0
-    out_sum = 0
-    in_sum = 0
+    sums = [0, 0, 0, 0]
     try:
         names = os.listdir(captures_dir)
     except OSError:
-        return 0, 0, 0
+        return 0, 0, 0, 0
     for name in names:
         m = RESP_RE.match(name)
         if not m or m.group(1) != day or m.group(2) not in METER_MODELS:
@@ -111,9 +124,9 @@ def scan_dir_for_day(captures_dir: str, day: str):
         got = parse_sse_usage(os.path.join(captures_dir, name))
         if got:
             n += 1
-            out_sum += got[0]
-            in_sum += got[1]
-    return n, out_sum, in_sum
+            for i in range(4):
+                sums[i] += got[i]
+    return (n,) + tuple(sums)
 
 
 def archive_path(archives_dir: str, day: str) -> str:
@@ -123,10 +136,11 @@ def archive_path(archives_dir: str, day: str) -> str:
 def scan_archive_for_day(seven_zip: str, archives_dir: str, day: str):
     """One-pass 7z extraction of the meter models only (per-file `-e -so` on a
     Google-Drive mount re-scans the whole archive each call — measured
-    2026-09-24, timeout-class slow). Multiple -ir! masks are an OR."""
+    2026-09-24, timeout-class slow). Multiple -ir! masks are an OR.
+    Returns (n, out, in, cache_read, cache_creation)."""
     arc = archive_path(archives_dir, day)
     if not os.path.exists(arc):
-        return 0, 0, 0
+        return 0, 0, 0, 0
     masks = []
     for model in sorted(METER_MODELS):
         masks += ["-ir!*-" + model + ".sse"]
@@ -138,17 +152,16 @@ def scan_archive_for_day(seven_zip: str, archives_dir: str, day: str):
             )
         except (subprocess.SubprocessError, OSError) as e:
             print(f"WARN: 7z extraction failed for {day}: {e}", file=sys.stderr)
-            return 0, 0, 0
+            return 0, 0, 0, 0
         n = 0
-        out_sum = 0
-        in_sum = 0
+        sums = [0, 0, 0, 0]
         for name in os.listdir(tmp):
             got = parse_sse_usage(os.path.join(tmp, name))
             if got:
                 n += 1
-                out_sum += got[0]
-                in_sum += got[1]
-    return n, out_sum, in_sum
+                for i in range(4):
+                    sums[i] += got[i]
+    return (n,) + tuple(sums)
 
 
 def iter_days(start_day: str, end_day: str):
@@ -184,29 +197,40 @@ def refresh_days(state: dict, args) -> None:
         cached = days.get(day)
         if cached and cached.get("source") == "archive":
             continue
-        n, out_sum, in_sum = scan_dir_for_day(args.captures_dir, day)
+        got = scan_dir_for_day(args.captures_dir, day)
+        n, out_sum, in_sum, cr_sum, cc_sum = got
         has_archive = os.path.exists(archive_path(args.archive_dir, day))
         if n == 0 and has_archive:
             # Either the day was quiet in loose AND archived, or (the trap)
             # the loose files were purged into the archive — the archive is
             # authoritative and must never lose an already-counted day.
-            n, out_sum, in_sum = scan_archive_for_day(
+            n, out_sum, in_sum, cr_sum, cc_sum = scan_archive_for_day(
                 args.seven_zip, args.archive_dir, day
             )
-            days[day] = {
-                "source": "archive",
-                "files": n,
-                "out": out_sum,
-                "in": in_sum,
-            }
+            days[day] = day_entry("archive", n, out_sum, in_sum, cr_sum, cc_sum)
         elif n > 0 or cached is None:
-            days[day] = {"source": "loose", "files": n, "out": out_sum, "in": in_sum}
+            days[day] = day_entry("loose", n, out_sum, in_sum, cr_sum, cc_sum)
         # else: n == 0, no archive, cached from loose with data — keep the
         # cache (a same-day re-scan racing the nightly purge).
 
 
+def day_entry(source, n, out_sum, in_sum, cr_sum, cc_sum) -> dict:
+    return {
+        "source": source,
+        "files": n,
+        "out": out_sum,
+        "in": in_sum,
+        "cache_read": cr_sum,
+        "cache_creation": cc_sum,
+    }
+
+
 def cumulative_out(state: dict) -> int:
     return sum(d.get("out", 0) for d in state.get("days", {}).values())
+
+
+def cumulative_field(state: dict, field: str) -> int:
+    return sum(d.get(field, 0) for d in state.get("days", {}).values())
 
 
 def burned_since_baseline(state: dict) -> int:
@@ -221,7 +245,7 @@ def cmd_baseline(args, state: dict) -> None:
             f"refusing: state phase is '{state['phase']}' — use --force to restart"
         )
     day = utc_today()
-    n, out_sum, in_sum = scan_dir_for_day(args.captures_dir, day)
+    n, out_sum, in_sum, cr_sum, cc_sum = scan_dir_for_day(args.captures_dir, day)
     state.update(
         {
             "phase": "awaiting-p1",
@@ -230,21 +254,17 @@ def cmd_baseline(args, state: dict) -> None:
             "percent0": args.percent,
             "t0_partial_out": out_sum,
             "t0_partial_in": in_sum,
+            "t0_partial_cache_read": cr_sum,
+            "t0_partial_cache_creation": cc_sum,
             "t0_files": n,
-            "days": {
-                day: {
-                    "source": "loose",
-                    "files": n,
-                    "out": out_sum,
-                    "in": in_sum,
-                }
-            },
+            "days": {day: day_entry("loose", n, out_sum, in_sum, cr_sum, cc_sum)},
         }
     )
     save_state(args.state, state)
     print(
         f"BASELINE set: {args.percent}% remaining read at {state['t0_utc']}.\n"
-        f"  baseline day {day}: {n} meter files, out={out_sum} in={in_sum} tokens.\n"
+        f"  baseline day {day}: {n} meter files, out={out_sum} "
+        f"in={in_sum} (cache_read={cr_sum}, cache_creation={cc_sum}) tokens.\n"
         f"  Next: when the Qwen console reads the calibration target, run "
         f"`report --percent <reading>`."
     )
@@ -258,10 +278,18 @@ def cmd_tick(args, state: dict) -> None:
     burned = burned_since_baseline(state)
     total_out = cumulative_out(state)
     files = sum(d.get("files", 0) for d in state["days"].values())
+    b_in = cumulative_field(state, "in") - state.get("t0_partial_in", 0)
+    b_cr = cumulative_field(state, "cache_read") - state.get(
+        "t0_partial_cache_read", 0
+    )
+    b_cc = cumulative_field(state, "cache_creation") - state.get(
+        "t0_partial_cache_creation", 0
+    )
     print(
         f"TICK {state['phase']}: days {state['baseline_day']}..{utc_today()} "
         f"({files} meter files, cumulative out={total_out})\n"
-        f"  burned since baseline (P0={state['percent0']}%): {burned} output tokens"
+        f"  burned since baseline (P0={state['percent0']}%): out={burned} "
+        f"in={b_in} (cache_read={b_cr}, cache_creation={b_cc}) tokens"
     )
     if state["phase"] == "enforcing":
         print_status_body(state)
@@ -277,10 +305,22 @@ def cmd_report(args, state: dict) -> None:
         )
     refresh_days(state, args)
     burned = burned_since_baseline(state)
+    b_in = cumulative_field(state, "in") - state.get("t0_partial_in", 0)
+    b_cr = cumulative_field(state, "cache_read") - state.get(
+        "t0_partial_cache_read", 0
+    )
+    b_cc = cumulative_field(state, "cache_creation") - state.get(
+        "t0_partial_cache_creation", 0
+    )
     span_pts = state["percent0"] - args.percent
-    implied_total = round(burned / (span_pts / 100.0))
+    frac = span_pts / 100.0
+
+    def implied(burned_value):
+        return round(burned_value / frac) if frac else None
+
+    implied_total = implied(burned)
     cap_weekly = burned
-    even_spread = round(implied_total / 4)
+    even_spread = round(implied_total / 4) if implied_total else None
     drift = (
         round(100.0 * (cap_weekly - even_spread) / even_spread, 1)
         if even_spread
@@ -292,7 +332,14 @@ def cmd_report(args, state: dict) -> None:
             "p1_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "percent1": args.percent,
             "cap_weekly_out": cap_weekly,
+            "cap_weekly_in": b_in,
+            "cap_weekly_cache_read": b_cr,
+            "cap_weekly_cache_creation": b_cc,
             "implied_monthly_total_out": implied_total,
+            "implied_monthly_total_in": implied(b_in),
+            "implied_monthly_total_cache_read": implied(b_cr),
+            "implied_monthly_total_in_all": implied(b_in + b_cr + b_cc),
+            "implied_monthly_total_in_plus_out": implied(b_in + b_cr + b_cc + burned),
             "even_spread_out": even_spread,
             "spread_drift_pct": drift,
         }
@@ -300,10 +347,18 @@ def cmd_report(args, state: dict) -> None:
     save_state(args.state, state)
     print(
         f"CALIBRATED: P0={state['percent0']}% -> P1={args.percent}% "
-        f"({span_pts} pts) burned {burned} output tokens.\n"
-        f"  WEEKLY CAP = {cap_weekly} output tokens\n"
-        f"  implied monthly total = {implied_total}; even 4-week spread = "
-        f"{even_spread} (cap drift {drift}%)\n"
+        f"({span_pts} pts).\n"
+        f"  burned: out={burned} in={b_in} (cache_read={b_cr}, "
+        f"cache_creation={b_cc})\n"
+        f"  WEEKLY CAP (out) = {cap_weekly} output tokens\n"
+        f"  implied monthly totals, per candidate billing unit — compare "
+        f"against the console's own numbers to pick the real one:\n"
+        f"    out only           : {implied_total}\n"
+        f"    in only (uncached) : {implied(b_in)}\n"
+        f"    cache_read only    : {implied(b_cr)}\n"
+        f"    all in (in+cr+cc)  : {implied(b_in + b_cr + b_cc)}\n"
+        f"    in+out             : {implied(b_in + b_cr + b_cc + burned)}\n"
+        f"  even 4-week spread (out) = {even_spread} (cap drift {drift}%)\n"
         f"  From now on `status` watches the rolling 7-day burn against the cap."
     )
 
