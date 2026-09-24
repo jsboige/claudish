@@ -137,7 +137,7 @@ export class OpenRouterAPIFormat extends BaseAPIFormat {
     }
 
     const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
-    if (toolChoice !== undefined) {
+    if (toolChoice !== undefined && tools.length > 0) {
       payload.tool_choice = toolChoice;
     }
 

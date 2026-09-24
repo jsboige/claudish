@@ -79,27 +79,21 @@ test("the other three Claude tool_choice types are unchanged", () => {
   }
 });
 
-test("the two gated chat builders send no tool_choice without tools (#241 follow-up)", () => {
-  // BaseAPIFormat's mapping (reached via DefaultAPIFormat) and
-  // LocalModelAdapter's are both gated on tools present: an OpenAI-compatible
-  // server answers a tool_choice with nothing to choose with a request-level
-  // 400. This is the case the coordinator's mutation showed was unpinned —
-  // removing the gate left the suite green. (OpenAIAPIFormat, LiteLLMAPIFormat
-  // and OpenRouterAPIFormat do NOT gate; that predates #241 and awaits an
-  // explicit coordinator decision, so it is left as is.)
-  const base = new DefaultAPIFormat("some-model").buildPayload(
-    { max_tokens: 100, tool_choice: { type: "any" } },
-    MESSAGES,
-    []
-  );
-  expect(base.tool_choice).toBeUndefined();
-
-  const local = new LocalModelAdapter("qwen2.5-coder", "ollama").buildPayload(
-    { max_tokens: 100, tool_choice: { type: "any" } },
-    MESSAGES,
-    []
-  );
-  expect(local.tool_choice).toBeUndefined();
+test("every chat builder sends no tool_choice without tools (#241 follow-up, #249)", () => {
+  // All five builders gate on tools present: an OpenAI-compatible server
+  // answers a tool_choice with nothing to choose from with a request-level
+  // 400, so a turn reaching a builder with tool_choice set and an empty tools
+  // list fails completely. Base and Local gated since #241; the other three
+  // waited on the coordinator decision that became #249. The gate was first
+  // shown unpinned by a mutation — removing it left the suite green.
+  for (const [name, make] of CHAT_BUILDERS) {
+    const payload = make().buildPayload(
+      { max_tokens: 100, tool_choice: { type: "any" } },
+      MESSAGES,
+      []
+    );
+    expect(`${name}: ${payload.tool_choice}`).toBe(`${name}: undefined`);
+  }
 });
 
 test("Gemini gets a toolConfig, which it had no handling for at all", () => {
