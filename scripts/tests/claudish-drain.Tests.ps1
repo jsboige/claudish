@@ -100,12 +100,28 @@ if not exist "%SHIM_DIR%\compose_exit.txt" exit /b 0
 set /p CE=<"%SHIM_DIR%\compose_exit.txt"
 exit /b %CE%
 '@
+    # A .cmd batch file MUST carry CRLF: cmd.exe's `goto :label` search fails
+    # on LF-only files ("Le système ne trouve pas le nom de fichier de
+    # commandes", exit 1) — measured 2026-09-24 on an `autocrlf=input` checkout
+    # where the here-string's endings leak straight into docker.cmd and the
+    # plain-restart test fails 1/15 while an `autocrlf=true` clone (po-2026)
+    # passes 15/15. Normalizing here makes the suite independent of each
+    # machine's git config.
+    $shim = $shim -replace "`r?`n", "`r`n"
     [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'docker.cmd'), $shim, (New-Object System.Text.ASCIIEncoding))
 
     $env:SHIM_DIR = $script:ShimDir
     $env:SHIM_LOG = $script:CallsLog
     $script:OldPath = $env:Path
     $env:Path = "$script:ShimDir;$env:Path"
+
+    # Prove the suite cannot reach the real docker CLI. If this assert fires,
+    # every "zero docker calls" assertion below is testing the wrong binary —
+    # and the suite may be mutating a live container.
+    $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
+    if (-not $dockerCmd -or $dockerCmd.Source -notlike "$script:ShimDir*") {
+        throw "docker resolves to '$($dockerCmd.Source)' — expected the suite's shim in $script:ShimDir. Aborting before any test can touch a real container."
+    }
 
     # Dot-source defines the functions only (standalone guard sees '.').
     # The script's param() then runs here with defaults — reassign the ones
