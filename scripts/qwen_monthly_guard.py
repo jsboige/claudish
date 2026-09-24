@@ -29,7 +29,11 @@ Meter corpus (include-list, from config.json routing + cascade steps):
   qwen3.6-flash, qwen3.7-plus, qwen3.7-max — STALE routing entries that still
     bill the meter if requested; remove from here when removed from routing.
 EXCLUDED on purpose: deepseek-v4-flash (undotted — bare chain, DeepSeek-first
-PAYG) and qwen3.6-35b-a3b (routed to vllm-myia, LOCAL lane).
+PAYG), qwen3.6-35b-a3b (routed to vllm-myia, LOCAL lane), and the Kimi
+  lanes (captured as k3 / kimi-for-coding — a DIFFERENT subscription, and one
+  that sits BEFORE Qwen in every cascade: its 5h wall alternates traffic away
+  from Qwen, so counting k3 files would overstate the Qwen burn — user rule
+  2026-09-24).
 
 Units: output_tokens primary (docs say the Token Plan bills on OUTPUT) — but
 the billing unit is UNCONFIRMED against the console, so input is tracked in
@@ -58,6 +62,8 @@ DEFAULT_CAPTURES = r"D:\claudish-captures"
 DEFAULT_ARCHIVES = r"G:\Mon Drive\Backups-Cloud\claudish"
 DEFAULT_7Z = r"D:\PortableApps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe"
 
+# Kimi steps (kc@k3, kc@kimi-for-coding) are deliberately absent — different
+# subscription, and their wall diverts traffic away from Qwen (user 24/09).
 METER_MODELS = {
     "deepseek-v4.1-flash",
     "qwen3.6-flash",
