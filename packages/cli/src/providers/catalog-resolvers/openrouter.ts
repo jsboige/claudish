@@ -1,4 +1,5 @@
 import type { ModelCatalogResolver, RefreshOutcome } from "../model-catalog-resolver.js";
+import type { AggregatorEntry } from "../../model-loader.js";
 import {
   readAllModelsCache,
   writeAllModelsCache,
@@ -22,6 +23,72 @@ const FIREBASE_CATALOG_URL =
 
 // Re-export so existing imports of DiskCache type from this module continue to work.
 export type DiskCache = DiskCacheV2;
+
+/**
+ * Catalog contract v3 content negotiation (#222). The models-index endpoint
+ * went v3-only on 2026-09-23: a bare GET answers HTTP 426
+ * (`catalog_client_upgrade_required`) and the model list moved from a
+ * top-level `models` array to a `data.models` envelope. We declare v3 via
+ * Accept but still parse the legacy envelope, so an endpoint rollback cannot
+ * leave the resolver dead.
+ */
+const CATALOG_ACCEPT_V3 = "application/vnd.models-index.catalog+json; version=3";
+
+/** Wire shape of a contract-v3 catalog entry (measured live 2026-09-24). */
+interface V3CatalogEntry {
+  contractVersion: number;
+  modelId: string;
+  aliases?: unknown;
+  releaseDate?: unknown;
+  contextWindow?: unknown;
+  inputModalities?: unknown;
+  aggregators?: Array<{
+    sourceProviderId?: unknown;
+    sourceCollectorId?: unknown;
+    externalModelId?: unknown;
+    confidence?: unknown;
+  }>;
+}
+
+/**
+ * Map a v3 entry onto the SlimModelEntry the resolver consumes. The v3-native
+ * `aggregators[]` index replaces the legacy `sources` record: each entry's
+ * `sourceCollectorId` is the same key the old record used (e.g.
+ * "openrouter-api"), so resolution steps 1-4 and the backward-compat `{id}`
+ * array keep working unchanged.
+ */
+function mapV3Entry(raw: V3CatalogEntry): SlimModelEntry {
+  const sources: SlimModelEntry["sources"] = {};
+  const aggregators: AggregatorEntry[] = [];
+  for (const agg of raw.aggregators ?? []) {
+    const collectorId = typeof agg.sourceCollectorId === "string" ? agg.sourceCollectorId : null;
+    const externalId = typeof agg.externalModelId === "string" ? agg.externalModelId : null;
+    if (!collectorId || !externalId) continue;
+    sources[collectorId] = { externalId };
+    if (typeof agg.sourceProviderId === "string") {
+      aggregators.push({
+        provider: agg.sourceProviderId,
+        externalId,
+        confidence: agg.confidence as AggregatorEntry["confidence"],
+      });
+    }
+  }
+  return {
+    modelId: raw.modelId,
+    aliases: Array.isArray(raw.aliases)
+      ? raw.aliases.filter((a): a is string => typeof a === "string")
+      : [],
+    sources,
+    ...(aggregators.length ? { aggregators } : {}),
+    ...(typeof raw.releaseDate === "string" ? { releaseDate: raw.releaseDate } : {}),
+    ...(typeof raw.contextWindow === "number" ? { contextWindow: raw.contextWindow } : {}),
+    // Absent modality data stays undefined, not false — the fail-closed
+    // decision at the dialect layer (`?? false`) belongs to the data.
+    ...(Array.isArray(raw.inputModalities)
+      ? { supportsVision: raw.inputModalities.includes("image") }
+      : {}),
+  };
+}
 
 /**
  * Module-level memory cache of slim catalog entries.
@@ -169,6 +236,7 @@ export class OpenRouterCatalogResolver implements ModelCatalogResolver {
     try {
       response = await fetch(FIREBASE_CATALOG_URL, {
         signal: AbortSignal.timeout(timeoutMs),
+        headers: { Accept: CATALOG_ACCEPT_V3 },
       });
     } catch (err) {
       // AbortSignal.timeout fires a DOMException (or AbortError) named "TimeoutError"
@@ -184,24 +252,45 @@ export class OpenRouterCatalogResolver implements ModelCatalogResolver {
       return { kind: "fetch_failed", reason: "http_error" };
     }
 
-    let data: { models: SlimModelEntry[]; total?: number };
+    let payload: unknown;
     try {
-      data = (await response.json()) as { models: SlimModelEntry[]; total?: number };
+      payload = await response.json();
     } catch {
       // Body unparseable — treat as network-class failure (we got a response but
       // couldn't read it). Distinct from "empty" which is a parseable but empty body.
       return { kind: "fetch_failed", reason: "network" };
     }
 
-    if (!Array.isArray(data.models) || data.models.length === 0) {
+    // v3 answers `{data: {models: [...]}}`; legacy answered `{models: [...]}`.
+    const envelope = payload as { data?: { models?: unknown }; models?: unknown };
+    const rawModels = (
+      Array.isArray(envelope.data?.models) ? envelope.data.models : envelope.models
+    ) as unknown[];
+    if (!Array.isArray(rawModels) || rawModels.length === 0) {
       return { kind: "fetch_failed", reason: "empty" };
     }
+
+    const models: SlimModelEntry[] = rawModels.map((raw) => {
+      if ((raw as V3CatalogEntry)?.contractVersion === 3) {
+        return mapV3Entry(raw as V3CatalogEntry);
+      }
+      // Legacy slim entry. Normalize only the fields resolveSync dereferences
+      // (`sources` in steps 3/_getOpenRouterExternalId, `aliases` in step 2): an
+      // entry from an unknown future contract would otherwise throw there.
+      const legacy = raw as SlimModelEntry;
+      if (legacy.sources && Array.isArray(legacy.aliases)) return legacy;
+      return {
+        ...legacy,
+        sources: legacy.sources ?? {},
+        aliases: Array.isArray(legacy.aliases) ? legacy.aliases : [],
+      };
+    });
 
     // Build the disk-cache backward-compat models array locally before mutating
     // any shared state. If anything below were to throw, _memCache and the disk
     // file are still untouched (R5 in architecture.md).
     const backwardCompatModels: Array<{ id: string }> = [];
-    for (const entry of data.models) {
+    for (const entry of models) {
       const orSource = entry.sources["openrouter-api"];
       if (orSource?.externalId) {
         backwardCompatModels.push({ id: orSource.externalId });
@@ -209,11 +298,11 @@ export class OpenRouterCatalogResolver implements ModelCatalogResolver {
     }
 
     // Atomic swap: only after we've successfully parsed and built the new payload.
-    _memCache = data.models;
+    _memCache = models;
 
     // Persist to disk for cold-start fallback paths.
     writeAllModelsCache({
-      entries: data.models,
+      entries: models,
       models: backwardCompatModels,
     });
 
@@ -222,7 +311,7 @@ export class OpenRouterCatalogResolver implements ModelCatalogResolver {
     // those methods see "already warmed" and return immediately without re-fetching.
     _warmPromise = Promise.resolve();
 
-    return { kind: "refreshed", modelCount: data.models.length };
+    return { kind: "refreshed", modelCount: models.length };
   }
 
   /**

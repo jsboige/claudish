@@ -8,7 +8,8 @@ import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
 
 // We need to test the resolver's resolveSync logic with controlled cache state.
 // The resolver uses module-level _memCache, so we import the class and inject test data.
-import { OpenRouterCatalogResolver } from "./openrouter.js";
+import { OpenRouterCatalogResolver, setMemCatalogForTests } from "./openrouter.js";
+import type { SlimModelEntry } from "../all-models-cache.js";
 
 // Helper: create a slim catalog entry
 function entry(
@@ -351,5 +352,190 @@ describe("OpenRouterCatalogResolver.refreshCatalog", () => {
     // No `models` array → !Array.isArray short-circuits the same branch as empty.
     expect(outcome).toEqual({ kind: "fetch_failed", reason: "empty" });
     expect(mockWrite).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Catalog contract v3 (#222) — the endpoint went v3-only on 2026-09-23: bare
+// GET answers 426 and the model list moved under `data.models`. The resolver
+// must negotiate via Accept, parse both envelopes, and map v3 entries (which
+// carry `aggregators[]` instead of a `sources` record) onto SlimModelEntry.
+// ---------------------------------------------------------------------------
+
+describe("OpenRouterCatalogResolver.refreshCatalog — catalog contract v3 (#222)", () => {
+  let resolver: OpenRouterCatalogResolver;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    mockWrite.mockClear();
+    mockRead.mockClear();
+    setMemCatalogForTests(null);
+    resolver = new OpenRouterCatalogResolver();
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  function writeArg(): { entries: SlimModelEntry[]; models: Array<{ id: string }> } {
+    return mockWrite.mock.calls[0]?.[0] as {
+      entries: SlimModelEntry[];
+      models: Array<{ id: string }>;
+    };
+  }
+
+  test("negotiates v3 on the wire — fetch carries the Accept header", async () => {
+    let seenAccept: string | undefined;
+    globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+      seenAccept = (init?.headers as Record<string, string> | undefined)?.Accept;
+      return jsonResponse({
+        models: [entry("x", [], { "openrouter-api": { externalId: "v/x" } })],
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    await resolver.refreshCatalog(8000);
+
+    expect(seenAccept).toContain("version=3");
+  });
+
+  test("v3 envelope maps data.models — vision, contextWindow, sources from aggregators, backward-compat ids", async () => {
+    const v3Vision = {
+      contractVersion: 3,
+      modelId: "glm-4.6v",
+      aliases: ["GLM-4.6V"],
+      releaseDate: "2026-05-01",
+      contextWindow: 131072,
+      inputModalities: ["image", "text"],
+      aggregators: [
+        {
+          sourceProviderId: "openrouter",
+          sourceCollectorId: "openrouter-api",
+          externalModelId: "z-ai/glm-4.6v",
+          confidence: "aggregator_reported",
+        },
+        {
+          sourceProviderId: "fireworks",
+          sourceCollectorId: "fireworks-api",
+          externalModelId: "accounts/fireworks/models/glm-4p6v",
+        },
+      ],
+    };
+    const v3Text = {
+      contractVersion: 3,
+      modelId: "glm-5.3",
+      inputModalities: ["text"],
+      aggregators: [
+        {
+          sourceProviderId: "openrouter",
+          sourceCollectorId: "openrouter-api",
+          externalModelId: "z-ai/glm-5.3",
+          confidence: "aggregator_reported",
+        },
+      ],
+    };
+    globalThis.fetch = mock(async () =>
+      jsonResponse({
+        contractVersion: 3,
+        generationId: "g-test",
+        data: { mode: "slim", models: [v3Vision, v3Text], total: 2 },
+      })
+    ) as unknown as typeof globalThis.fetch;
+
+    const outcome = await resolver.refreshCatalog(8000);
+
+    expect(outcome).toEqual({ kind: "refreshed", modelCount: 2 });
+    const [vision, text] = writeArg().entries;
+    expect(vision.modelId).toBe("glm-4.6v");
+    // The strip gate reads exactly these two fields (#222: fail-closed on absent data).
+    expect(vision.supportsVision).toBe(true);
+    expect(vision.contextWindow).toBe(131072);
+    expect(vision.releaseDate).toBe("2026-05-01");
+    // sources keyed by sourceCollectorId — "openrouter-api" keeps steps 1-4 alive.
+    expect(vision.sources["openrouter-api"]).toEqual({ externalId: "z-ai/glm-4.6v" });
+    expect(vision.sources["fireworks-api"]).toEqual({
+      externalId: "accounts/fireworks/models/glm-4p6v",
+    });
+    // v3-native aggregator index feeds pricing-cache's provider === "openrouter" lookup.
+    expect(vision.aggregators?.[0]).toMatchObject({
+      provider: "openrouter",
+      externalId: "z-ai/glm-4.6v",
+    });
+    expect(text.supportsVision).toBe(false);
+    expect(writeArg().models).toEqual([{ id: "z-ai/glm-4.6v" }, { id: "z-ai/glm-5.3" }]);
+    // Resolution runs off the mapped memory catalog.
+    expect(resolver.resolveSync("glm-4.6v")).toBe("z-ai/glm-4.6v");
+    expect(resolver.resolveSync("GLM-4.6V")).toBe("z-ai/glm-4.6v");
+  });
+
+  test("v3 entry without inputModalities leaves supportsVision undefined — fail-closed stays a data decision", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({
+        contractVersion: 3,
+        data: {
+          models: [
+            { contractVersion: 3, modelId: "mystery", aggregators: [] },
+          ],
+        },
+      })
+    ) as unknown as typeof globalThis.fetch;
+
+    await resolver.refreshCatalog(8000);
+
+    expect(writeArg().entries[0].supportsVision).toBeUndefined();
+    expect(writeArg().entries[0].sources).toEqual({});
+  });
+
+  test("HTTP 426 upgrade_required → fetch_failed:http_error (the incident shape, 2026-09-23)", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse(
+        {
+          contractVersion: 3,
+          error: { code: "catalog_client_upgrade_required" },
+        },
+        426
+      )
+    ) as unknown as typeof globalThis.fetch;
+
+    const outcome = await resolver.refreshCatalog(8000);
+
+    expect(outcome).toEqual({ kind: "fetch_failed", reason: "http_error" });
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  test("v3 envelope with empty data.models → fetch_failed:empty", async () => {
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ contractVersion: 3, data: { models: [], total: 0 } })
+    ) as unknown as typeof globalThis.fetch;
+
+    const outcome = await resolver.refreshCatalog(8000);
+
+    expect(outcome).toEqual({ kind: "fetch_failed", reason: "empty" });
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  test("entries without contractVersion pass through byte-identical; a sources-less entry cannot throw in resolveSync", async () => {
+    const legacy = entry("legacy-1", ["l1"], { "openrouter-api": { externalId: "v/legacy-1" } });
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ models: [legacy, { modelId: "future-contract" }] })
+    ) as unknown as typeof globalThis.fetch;
+
+    const outcome = await resolver.refreshCatalog(8000);
+
+    expect(outcome).toEqual({ kind: "refreshed", modelCount: 2 });
+    const entries = writeArg().entries;
+    expect(entries[0]).toEqual(legacy);
+    // Unknown future contract: sources normalized to {} so resolveSync's
+    // Object.values(entry.sources) cannot throw; the entry simply never matches.
+    expect(entries[1].sources).toEqual({});
+    expect(() => resolver.resolveSync("future-contract")).not.toThrow();
+    expect(resolver.resolveSync("legacy-1")).toBe("v/legacy-1");
   });
 });
