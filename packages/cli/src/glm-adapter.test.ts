@@ -131,10 +131,83 @@ describe("GLMModelDialect — prepareRequest (OpenAI wire, gc@ Coding Plan)", ()
 
   test("with no wire hint at all, behaves like the OpenAI wire (historical default)", () => {
     // Callers that predate PrepareRequestContext must not change behavior.
+    // ({type:"enabled", budget_tokens} — a real client shape; a type-less
+    // {budget} object is not a form the API can produce and stopped counting
+    // as an ask with #245's shared predicate.)
     delete process.env.CLAUDISH_GLM_THINKING;
-    const request: any = { thinking: { budget: 10000 } };
-    new GLMModelDialect("glm-5.3").prepareRequest(request, { thinking: { budget: 10000 } });
+    const request: any = { thinking: { type: "enabled", budget_tokens: 10000 } };
+    new GLMModelDialect("glm-5.3").prepareRequest(request, {
+      thinking: { type: "enabled", budget_tokens: 10000 },
+    });
     expect(request.thinking).toEqual({ type: "enabled" });
+  });
+});
+
+describe("GLMModelDialect — prepareRequest (#245: the client's disabled is not inverted)", () => {
+  // The defect: `if (originalRequest.thinking)` counted ANY truthy thinking as
+  // an ask, so {"type":"disabled"} reached the wire as {"type":"enabled"} —
+  // the exact reverse of the client's instruction, on a lane where thinking
+  // costs output tokens. Same class as the #237 premise; #239 built the shared
+  // predicate for MiniMax, this pins the GLM half.
+  test('client {"type":"disabled"} reaches the wire as disabled, not enabled', () => {
+    delete process.env.CLAUDISH_GLM_THINKING;
+    const request: any = {};
+    new GLMModelDialect("glm-5.3").prepareRequest(
+      request,
+      { thinking: { type: "disabled" } },
+      OPENAI
+    );
+    expect(request.thinking).toEqual({ type: "disabled" });
+  });
+
+  test('client {"type":"adaptive"} is an ask (the dominant sonnet-lane shape)', () => {
+    delete process.env.CLAUDISH_GLM_THINKING;
+    const request: any = {};
+    new GLMModelDialect("glm-5.3").prepareRequest(request, { thinking: { type: "adaptive" } }, OPENAI);
+    expect(request.thinking).toEqual({ type: "enabled" });
+  });
+
+  test('client {"type":"enabled"} stays enabled (already covered above, pinned here for the trio)', () => {
+    delete process.env.CLAUDISH_GLM_THINKING;
+    const request: any = {};
+    new GLMModelDialect("glm-5.3").prepareRequest(
+      request,
+      { thinking: { type: "enabled", budget_tokens: 8000 } },
+      OPENAI
+    );
+    expect(request.thinking).toEqual({ type: "enabled" });
+  });
+
+  test("no client thinking still sends no field (GLM thinks by default)", () => {
+    delete process.env.CLAUDISH_GLM_THINKING;
+    const request: any = {};
+    new GLMModelDialect("glm-5.3").prepareRequest(request, {}, OPENAI);
+    expect(request.thinking).toBeUndefined();
+  });
+
+  test("a type-less thinking object is not an ask (no real client form — the API requires type)", () => {
+    // Pins the #245 decision: the shared predicate needs a string type. The
+    // pre-#245 truthy check counted {budget:10000} as enabled; that form never
+    // appears on the wire (the Anthropic API rejects it), so "not an ask" is
+    // the honest reading of an untyped object.
+    delete process.env.CLAUDISH_GLM_THINKING;
+    const request: any = {};
+    new GLMModelDialect("glm-5.3").prepareRequest(request, { thinking: { budget: 10000 } }, OPENAI);
+    expect(request.thinking).toBeUndefined();
+  });
+
+  test("the disabled policy still wins over any client ask (AC3)", () => {
+    process.env.CLAUDISH_GLM_THINKING = "disabled";
+    const request: any = {};
+    new GLMModelDialect("glm-5.3").prepareRequest(
+      request,
+      { thinking: { type: "enabled", budget_tokens: 8000 } },
+      OPENAI
+    );
+    expect(request.thinking).toEqual({ type: "disabled" });
+    const request2: any = {};
+    new GLMModelDialect("glm-5.3").prepareRequest(request2, { thinking: { type: "disabled" } }, OPENAI);
+    expect(request2.thinking).toEqual({ type: "disabled" });
   });
 });
 
@@ -249,13 +322,13 @@ describe("Three-layer adapter — model dialect overrides format adapter", () =>
     const modelAdapter = adapterManager.getAdapter();
 
     // Format adapter does not touch thinking (no override)
-    const request1 = { model: "glm-5", thinking: { budget: 10000 }, messages: [] };
-    litellmAdapter.prepareRequest(request1, { thinking: { budget: 10000 } });
+    const request1 = { model: "glm-5", thinking: { type: "enabled", budget_tokens: 10000 }, messages: [] };
+    litellmAdapter.prepareRequest(request1, { thinking: { type: "enabled", budget_tokens: 10000 } });
     expect(request1.thinking).toBeDefined(); // LiteLLMAPIFormat doesn't touch thinking
 
     // Model dialect translates it to the documented GLM shape (no ctx → OpenAI wire)
-    const request2: any = { model: "glm-5", thinking: { budget: 10000 }, messages: [] };
-    modelAdapter.prepareRequest(request2, { thinking: { budget: 10000 } });
+    const request2: any = { model: "glm-5", thinking: { type: "enabled", budget_tokens: 10000 }, messages: [] };
+    modelAdapter.prepareRequest(request2, { thinking: { type: "enabled", budget_tokens: 10000 } });
     expect(request2.thinking).toEqual({ type: "enabled" }); // GLMModelDialect translates it
   });
 });

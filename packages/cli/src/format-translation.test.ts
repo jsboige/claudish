@@ -744,13 +744,15 @@ describe("Model Adapter Quirks", () => {
     const { GLMModelDialect } = await import("./adapters/glm-model-dialect.js");
     const adapter = new GLMModelDialect("glm-5");
 
-    const request: any = { model: "glm-5", messages: [], thinking: { budget_tokens: 10000 } };
-    const original = { thinking: { budget_tokens: 10000 } };
+    const request: any = { model: "glm-5", messages: [], thinking: { type: "enabled", budget_tokens: 10000 } };
+    const original = { thinking: { type: "enabled", budget_tokens: 10000 } };
 
     adapter.prepareRequest(request, original);
     // No ctx → OpenAI wire: client ask becomes {"type":"enabled"}; the budget
     // is dropped (tolerated but ignored upstream — GLM is binary). See
-    // CLAUDISH_GLM_THINKING in CLAUDE.md.
+    // CLAUDISH_GLM_THINKING in CLAUDE.md. ({type:"enabled",budget_tokens} — a
+    // real client shape; a type-less {budget_tokens} stopped counting as an
+    // ask with #245's shared predicate.)
     expect(request.thinking).toEqual({ type: "enabled" });
   });
 
