@@ -230,8 +230,12 @@ Write-Host ""
 # --- never-hang (priority #1) ------------------------------------------------
 Write-Host "--- Never-Hang (priority #1) ---" -ForegroundColor Yellow
 $closedTrue = ($responses | Select-String -Pattern 'closed=true').Count
-$notClosed  = $responses | Where-Object { $_ -notmatch 'closed=true' }
-Write-Host ("  [resp] total: {0}  |  closed=true: {1}  |  NOT closed: {2}" -f $responses.Count, $closedTrue, $notClosed.Count)
+# A client that disconnects mid-stream is logged closed=false stop=client-cancel
+# (anthropic and Codex lanes, and the OpenAI lane since #220). The client left;
+# the proxy did not hang, so it is counted apart, never as a hang suspect.
+$clientCancel = @($responses | Where-Object { $_ -match 'stop=client-cancel' })
+$notClosed  = @($responses | Where-Object { $_ -notmatch 'closed=true' -and $_ -notmatch 'stop=client-cancel' })
+Write-Host ("  [resp] total: {0}  |  closed=true: {1}  |  client-cancel: {2}  |  NOT closed: {3}" -f $responses.Count, $closedTrue, $clientCancel.Count, $notClosed.Count)
 if ($notClosed.Count -gt 0) {
     Write-Host "  !!! HANG SUSPECTS — investigate these responses:" -ForegroundColor Red
     $notClosed | Select-Object -First 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
