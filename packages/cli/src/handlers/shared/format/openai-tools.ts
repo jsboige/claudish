@@ -53,8 +53,20 @@ const SCHEMA_KEYWORDS = new Set([
  * compiles, and `\p{Cc}` raises "bad escape \p". The Unicode property escape is
  * the whole cause, so this list is the letters Python's `re` knows —
  * `\A \b \B \d \D \s \S \w \W \Z`, the character escapes, and `\x \u \U \N`.
- * Every non-letter escape (`\.`, `\\`, `\[`) and every digit backreference is
- * portable and is not listed. (Upstream 0997da5, S3 lot 1.)
+ * Every non-letter, non-digit escape (`\.`, `\\`, `\[`) is portable and is not
+ * listed. (Upstream 0997da5, S3 lot 1.)
+ *
+ * A DIGIT escape is not portable, although Python compiles it: Claude Code's
+ * `Artifact` tool also carries `^[^\0]*$` (its `file_paths` items), and
+ * DeepSeek answers every request that declares it with HTTP 400 "Invalid
+ * schema for function 'Artifact': {…"pattern":"^[^\\0]*$"} is not valid under
+ * any of the schemas listed in the 'anyOf' keyword". Probed through the hub on
+ * ds@deepseek-flash, 2026-09-25, one schema node varied at a time: `^[^\0]*$`
+ * → 400; no pattern, `^[a-z]*$`, `^[^\x00]*$` → 200. When DeepSeek is the last
+ * cascade step this killed every Claude Code session routed to it (66 rejects
+ * in upstream-errors.log). A digit escape is an octal or a backreference, and
+ * neither exists in RE2-class engines, so drop it — `\x00` is the portable
+ * spelling of the same character.
  */
 const PORTABLE_ESCAPE_LETTERS = new Set([
   "A", "b", "B", "d", "D", "s", "S", "w", "W", "Z",
@@ -83,6 +95,7 @@ export function isPortablePattern(pattern: string): boolean {
       if (escaped && /[A-Za-z]/.test(escaped) && !PORTABLE_ESCAPE_LETTERS.has(escaped)) {
         return false;
       }
+      if (escaped && /[0-9]/.test(escaped)) return false; // octal / backreference
       continue;
     }
 
