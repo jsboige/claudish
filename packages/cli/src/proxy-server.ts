@@ -39,6 +39,7 @@ import {
   route,
 } from "./providers/routing-rules.js";
 import { createHandlerForProvider } from "./providers/provider-profiles.js";
+import { applyNativePinOverride } from "./providers/native-pin-auto.js";
 import { loadCustomEndpoints } from "./providers/custom-endpoints-loader.js";
 import { getRuntimeProviders } from "./providers/runtime-providers.js";
 import { loadConfig } from "./profile-config.js";
@@ -413,7 +414,10 @@ export function resolveNativeModelPin(
   const roleTarget = resolveRoleMappedModel(requestedModel.toLowerCase(), modelMap);
   if (!roleTarget || roleTarget === requestedModel) return undefined;
   if (!roleTarget.startsWith("claude-")) return undefined;
-  return roleTarget;
+  // #219: an adopted catalog override (CLAUDISH_NATIVE_PIN_AUTO=on) replaces
+  // the version within the same family. Inert — byte-identical pass-through —
+  // unless the watch resolved and adopted a newer id.
+  return applyNativePinOverride(roleTarget);
 }
 
 export interface ProxyServerOptions {
