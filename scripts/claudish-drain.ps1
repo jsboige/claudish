@@ -487,8 +487,16 @@ function Invoke-ClaudishDrainedRestartImpl {
         try {
             $envArgs = @()
             if ($EnvFile) { $envArgs = @("--env-file", $EnvFile) }
-            docker compose @envArgs up -d --timeout 120 2>&1 | ForEach-Object { Write-DrainLog "RECREATE ($Reason): $_" }
-            $code = $LASTEXITCODE
+            # #257 — under PS 5.1 with EAP 'Stop' in the caller's scope, compose
+            # stderr lines become ErrorRecords and the 2>&1 pipeline terminates
+            # with a RemoteException AFTER a successful recreate (hub, twice on
+            # 2026-09-25): the post-restart /health attestation is skipped.
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                docker compose @envArgs up -d --timeout 120 2>&1 | ForEach-Object { Write-DrainLog "RECREATE ($Reason): $_" }
+                $code = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $prevEap }
         } finally { Pop-Location }
         if ($code -ne 0) {
             Write-DrainLog "RECREATE ($Reason): docker compose up -d FAILED (exit $code) in $ComposeDir"
@@ -509,6 +517,20 @@ function Invoke-ClaudishDrainedRestartImpl {
             }
             return $false
         }
+        # #257 — `-Recreate` never builds: compose deploys whatever image it
+        # already has, and a stale image deployed silently (2026-09-25, first
+        # pass recreated on a 24 h-old image). Recording the deployed image's
+        # build timestamp makes that visible in drain.log at attest time.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $imgSha = [string](docker inspect --format '{{.Image}}' $Container 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -eq 0 -and $imgSha) {
+                $imgCreated = [string](docker image inspect --format '{{.Created}}' $imgSha 2>$null | Select-Object -First 1)
+                if ($imgSha.Length -ge 19) { $imgSha = $imgSha.Substring(7, 12) }
+                Write-DrainLog "RECREATE ($Reason): deployed image ${imgSha} created ${imgCreated}"
+            }
+        } finally { $ErrorActionPreference = $prevEap }
         $verb = "docker compose up -d"
     } else {
         $null = docker restart -t 120 $Container 2>$null   # echoes the name; keep the result a single bool

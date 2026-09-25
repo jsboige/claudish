@@ -60,6 +60,7 @@ if "%SHIM_LOG%"=="" exit /b 1
 echo %* >> "%SHIM_LOG%"
 if "%1"=="ps" goto :ps
 if "%1"=="inspect" goto :inspect
+if "%1"=="image" goto :image
 if "%1"=="start" goto :start
 if "%1"=="rm" goto :rm
 if "%1"=="restart" goto :restart
@@ -72,6 +73,10 @@ exit /b 0
 
 :inspect
 if exist "%SHIM_DIR%\inspect_out.txt" (type "%SHIM_DIR%\inspect_out.txt") else (echo true)
+exit /b 0
+
+:image
+if exist "%SHIM_DIR%\image_out.txt" (type "%SHIM_DIR%\image_out.txt") else (echo 2026-09-24T22:47:44.000000000Z)
 exit /b 0
 
 :start
@@ -96,6 +101,7 @@ exit /b 0
 
 :compose
 echo compose-stopping-old-container >> "%SHIM_LOG%"
+if exist "%SHIM_DIR%\compose_stderr.txt" type "%SHIM_DIR%\compose_stderr.txt" 1>&2
 if not exist "%SHIM_DIR%\compose_exit.txt" exit /b 0
 set /p CE=<"%SHIM_DIR%\compose_exit.txt"
 exit /b %CE%
@@ -132,7 +138,7 @@ exit /b %CE%
 
     function Reset-DrainFixture {
         Remove-Item -LiteralPath $script:CallsLog -Force -ErrorAction SilentlyContinue
-        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'compose_exit.txt', 'start_exit.txt', 'rm_exit.txt') {
+        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'compose_exit.txt', 'compose_stderr.txt', 'image_out.txt', 'start_exit.txt', 'rm_exit.txt') {
             Remove-Item -LiteralPath (Join-Path $script:ShimDir $f) -Force -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $script:TestLog -Force -ErrorAction SilentlyContinue
@@ -339,5 +345,36 @@ Describe 'Invoke-ClaudishDrainedRestart — terminal OUTCOME lines (#233 AC3)' {
         $r = Invoke-ClaudishDrainedRestart -Reason 'after-clean' -Url 'http://127.0.0.1:1' -Recreate
         $r | Should -BeFalse
         (Get-DrainLogText) | Should -Not -Match 'PREVIOUS RUN INTERRUPTED'
+    }
+}
+
+Describe 'Invoke-ClaudishDrainedRestart — compose stderr and deployed-image attestation (#257)' {
+    It 'compose stderr under EAP Stop completes with OUTCOME success — no terminating RemoteException' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'compose_stderr.txt'), "level=warning msg=a line compose writes to stderr", (New-Object System.Text.ASCIIEncoding))
+
+        # Hub, twice on 2026-09-25: with EAP 'Stop' in scope, PS 5.1 turns the
+        # 2>&1-redirected compose stderr into a terminating RemoteException
+        # after a successful recreate — OUTCOME exception, /health attestation
+        # lost. EAP here is the caller's scope, exactly as in production.
+        $ErrorActionPreference = 'Stop'
+        $r = Invoke-ClaudishDrainedRestart -Reason 'eap-stop' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match 'OUTCOME success'
+        $log | Should -Not -Match 'OUTCOME exception'
+        $log | Should -Match 'level=warning'   # logged as data, not swallowed
+    }
+
+    It 'the RECREATE log names the deployed image and its build timestamp' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "sha256:aaaabbbbccccdddd000011112222333344445555666677778888999aaabbbcccdd", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'image_out.txt'), "2026-09-24T22:47:44.000000000Z", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'image-log' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeTrue
+        (Get-DrainLogText) | Should -Match 'deployed image aaaabbbbcccc created 2026-09-24T22:47:44'
     }
 }
