@@ -14,8 +14,12 @@ Method (user-calibrated, two points — no month-start archaeology needed):
      71.4 - 47 = 24.4 pts ~= 100/4, one week of current burn rate IS an
      even 4-week spread — the method lands within a few % of Total/4.
   3. `status` (enforcing) — rolling 7-day burn vs cap; EXCEEDED names the
-     deroute lever (position-preserving `..._RESET` on the qwen cascade
-     steps + drained restart — an operator gesture, never automatic here).
+     deroute lever: REMOVE the qwen steps from the cascade lines (realigning
+     the positional _LABEL/_DIRECTION/_NOTE/_RESET fields) + drained restart
+     — an operator gesture, never automatic here. NOT `..._RESET`: measured
+     2026-09-25, a reset date only extends the backoff of a step that has
+     already walled, never skips a healthy one (865 qwen responses served
+     after a RESET-only recreate — #261).
 
 Meter corpus (include-list, from config.json routing + cascade steps):
   deepseek-v4.1-flash   — cascade step via qwen-token-plan. The DOTTED id is
@@ -388,7 +392,7 @@ def print_status_body(state: dict) -> None:
     verdict = "OK"
     if pct is not None:
         if roll >= cap:
-            verdict = "EXCEEDED — deroute lever: set the qwen steps' ..._RESET position to next Monday, drained restart (operator gesture)"
+            verdict = "EXCEEDED — deroute lever: remove the qwen steps from the cascade lines (+ realign _LABEL/_DIRECTION/_NOTE/_RESET), drained restart (operator gesture; _RESET alone is inert, #261)"
         elif pct >= 90:
             verdict = "NEAR (>90%)"
         elif pct >= 70:
