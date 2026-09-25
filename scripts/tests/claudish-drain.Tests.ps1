@@ -377,4 +377,24 @@ Describe 'Invoke-ClaudishDrainedRestart — compose stderr and deployed-image at
         $r | Should -BeTrue
         (Get-DrainLogText) | Should -Match 'deployed image aaaabbbbcccc created 2026-09-24T22:47:44'
     }
+
+    It 'never reads $LASTEXITCODE right after piping docker into Select-Object -First' {
+        # Hub, 2026-09-25: under 5.1, `docker inspect … | Select-Object -First 1`
+        # stops the pipeline early and kills the process, so $LASTEXITCODE reads
+        # -1 (measured live: original -1, capture-then-select 0; pwsh 7 reports 0
+        # for both). The exit-code guard therefore dropped the attestation on
+        # every recreate. A .cmd shim exits before PS reads its line and cannot
+        # reproduce the kill (a slow-shim variant passed on the mutant), so the
+        # pin is structural. Mutation-proven: restoring the original two lines
+        # makes this fail on them.
+        $lines = Get-Content -LiteralPath $script:DrainScript
+        $offenders = @()
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match 'docker\b.*\|\s*Select-Object\s+-First') {
+                $next = ($lines[($i + 1)..([Math]::Min($i + 2, $lines.Count - 1))] -join "`n")
+                if ($next -match '\$LASTEXITCODE') { $offenders += "line $($i + 1): $($lines[$i].Trim())" }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
 }
