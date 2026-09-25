@@ -524,9 +524,16 @@ function Invoke-ClaudishDrainedRestartImpl {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            $imgSha = [string](docker inspect --format '{{.Image}}' $Container 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0 -and $imgSha) {
-                $imgCreated = [string](docker image inspect --format '{{.Created}}' $imgSha 2>$null | Select-Object -First 1)
+            # Capture BEFORE selecting: piping a native command into
+            # `Select-Object -First` stops the pipeline early and kills the
+            # process, and 5.1 then reports $LASTEXITCODE = -1 — the guard below
+            # swallowed every attestation on the hub (measured 2026-09-25: two
+            # recreates, zero 'deployed image' lines).
+            $inspectOut = @(docker inspect --format '{{.Image}}' $Container 2>$null)
+            $inspectCode = $LASTEXITCODE
+            $imgSha = [string]($inspectOut | Select-Object -First 1)
+            if ($inspectCode -eq 0 -and $imgSha) {
+                $imgCreated = [string](@(docker image inspect --format '{{.Created}}' $imgSha 2>$null) | Select-Object -First 1)
                 if ($imgSha.Length -ge 19) { $imgSha = $imgSha.Substring(7, 12) }
                 Write-DrainLog "RECREATE ($Reason): deployed image ${imgSha} created ${imgCreated}"
             }
