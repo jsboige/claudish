@@ -126,7 +126,11 @@ def scan_dir_for_day(captures_dir: str, day: str):
     try:
         names = os.listdir(captures_dir)
     except OSError:
-        return 0, 0, 0, 0
+        # Five fields, like every return of this contract: the caller unpacks
+        # five, and a short tuple raises ValueError there. Treating an
+        # unlistable dir as "no loose data" is intended — the caller then
+        # falls back to the archive for that day.
+        return 0, 0, 0, 0, 0
     for name in names:
         m = RESP_RE.match(name)
         if not m or m.group(1) != day or m.group(2) not in METER_MODELS:
@@ -147,10 +151,17 @@ def scan_archive_for_day(seven_zip: str, archives_dir: str, day: str):
     """One-pass 7z extraction of the meter models only (per-file `-e -so` on a
     Google-Drive mount re-scans the whole archive each call — measured
     2026-09-24, timeout-class slow). Multiple -ir! masks are an OR.
-    Returns (n, out, in, cache_read, cache_creation)."""
+    Returns (n, out, in, cache_read, cache_creation) when the archive WAS read
+    — possibly all zeros, which is a real measurement — or None when it could
+    not be read at all: absent, 7z error, timeout, missing binary. An unread
+    archive is not a zero: the caller must never cache it as one."""
     arc = archive_path(archives_dir, day)
     if not os.path.exists(arc):
-        return 0, 0, 0, 0
+        # The caller only asks when it believes an archive exists, so a miss
+        # here means the mount (or a purge) moved under it. Same contract as an
+        # extraction failure: unmeasurable, hence None — never a zero, which
+        # the caller would cache permanently.
+        return None
     masks = []
     for model in sorted(METER_MODELS):
         masks += ["-ir!*-" + model + ".sse"]
@@ -162,7 +173,7 @@ def scan_archive_for_day(seven_zip: str, archives_dir: str, day: str):
             )
         except (subprocess.SubprocessError, OSError) as e:
             print(f"WARN: 7z extraction failed for {day}: {e}", file=sys.stderr)
-            return 0, 0, 0, 0
+            return None
         n = 0
         sums = [0, 0, 0, 0]
         for name in os.listdir(tmp):
@@ -199,7 +210,10 @@ def refresh_days(state: dict, args) -> None:
     """Bring state['days'] up to date, each UTC day counted exactly once.
     Loose files win while present (they cover the growing day and survive
     until the nightly purge); a day cached from an archive is never
-    recomputed; a day cached from loose is recomputed (same-day growth)."""
+    recomputed; a day cached from loose is recomputed (same-day growth).
+    A day whose archive read FAILS stays uncached, so the next tick retries
+    it — caching the failure would freeze a permanent zero, and an
+    under-counted burn is the failure mode that points the wrong way."""
     baseline_day = state["baseline_day"]
     days = state.setdefault("days", {})
     today = utc_today()
@@ -214,9 +228,14 @@ def refresh_days(state: dict, args) -> None:
             # Either the day was quiet in loose AND archived, or (the trap)
             # the loose files were purged into the archive — the archive is
             # authoritative and must never lose an already-counted day.
-            n, out_sum, in_sum, cr_sum, cc_sum = scan_archive_for_day(
-                args.seven_zip, args.archive_dir, day
-            )
+            got = scan_archive_for_day(args.seven_zip, args.archive_dir, day)
+            if got is None:
+                # Extraction failed — a GDrive-mount hiccup reaches here. Do NOT
+                # cache it: an archive-sourced day is never recomputed, so the
+                # zero written now would be permanent and silently under-count
+                # the burn. Leave the day unwritten; the next tick retries.
+                continue
+            n, out_sum, in_sum, cr_sum, cc_sum = got
             days[day] = day_entry("archive", n, out_sum, in_sum, cr_sum, cc_sum)
         elif n > 0 or cached is None:
             days[day] = day_entry("loose", n, out_sum, in_sum, cr_sum, cc_sum)
