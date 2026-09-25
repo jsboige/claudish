@@ -55,6 +55,32 @@ describe("pattern portability (0997da5)", () => {
     expect(isPortablePattern("[^\\p{Cc}]")).toBe(false); // the Artifact-tool killer
     expect(isPortablePattern("\\p{L}+")).toBe(false); // Unicode property escape
     expect(isPortablePattern("(?<name>x)")).toBe(false); // bare named group
+    expect(isPortablePattern("^[^\\0]*$")).toBe(false); // DeepSeek killer (Artifact file_paths)
+    expect(isPortablePattern("(a)\\1")).toBe(false); // backreference
+    expect(isPortablePattern("^[^\\x00]*$")).toBe(true); // portable spelling of the same char
+  });
+
+  test("the live Artifact file_paths node loses its \\0 pattern and keeps its bounds", () => {
+    // Verbatim node from the 2026-09-25 DeepSeek 400 (upstream-errors.log).
+    const tools = convertToolsToOpenAI({
+      tools: [
+        {
+          name: "Artifact",
+          input_schema: {
+            type: "object",
+            properties: {
+              file_paths: {
+                type: "array",
+                items: { type: "string", minLength: 1, maxLength: 1024, pattern: "^[^\\0]*$" },
+              },
+            },
+          },
+        },
+      ],
+    });
+    const items = tools[0].function.parameters.properties.file_paths.items;
+    expect(items.pattern).toBeUndefined();
+    expect(items).toEqual({ type: "string", minLength: 1, maxLength: 1024 });
   });
 
   test("a portable `pattern` survives conversion; an unportable one is dropped", () => {
