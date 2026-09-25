@@ -1013,10 +1013,27 @@ export async function createProxyServer(
     const armGraceMs = getArmGraceMs();
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
     let graceRetried = false; // #91: one wait-and-retry on the nominal per request
+    // #263: steps this request already saw fail. A concurrent nominal success
+    // (onNominalSuccess → resetAllStepFailures) can clear their marks mid-request —
+    // routine once ROLE_MODELS folds several nominals into one role — and the next
+    // resolution then re-selects a step this request just watched wall. Re-paying
+    // it burned the attempt budget and surfaced its raw error (hub 2026-09-25:
+    // Sol → Mistral 402 twice, never reaching the healthy last step). Re-mark and
+    // re-resolve instead, without calling the handler or consuming an attempt;
+    // `revisits` is capped at the step count, so the loop stays bounded.
+    const triedSteps = new Set<number>();
+    let revisits = 0;
     let response: Response | undefined;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const handler = await getHandlerForRequest(requestedModel, 0, sessionKey);
       const { stepIndex } = role ? resolveFailoverTargetForSession(role, sessionKey) : { stepIndex: -1 };
+      if (role && stepIndex >= 0 && triedSteps.has(stepIndex) && revisits < (rule?.steps.length ?? 0)) {
+        revisits++;
+        markStepFailed(role, stepIndex, `re-selected after a concurrent clear — already failed in this request`);
+        attempt--;
+        continue;
+      }
+      if (stepIndex >= 0) triedSteps.add(stepIndex);
       // Native-lane version pin. Applied HERE rather than at the route, because the
       // cascade re-resolves the handler every attempt: only the attempt that actually
       // lands on NativeHandler may carry a bare Anthropic id, and a later attempt is a
