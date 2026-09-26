@@ -17,7 +17,7 @@
 
 | Script | Purpose | Usage |
 |--------|---------|-------|
-| `traffic-live.ps1` | **Live analysis from docker logs** — model/machine/handler distribution, precise error counts, never-hang check, Anthropic leak check, session-loop detection. This is what the 6h surveillance cron runs. **`-Container` defaults to `claudish-proxy` (the hub name) — on a sidecar machine you MUST pass `-Container claudish-sidecar`, otherwise the script exits 1 with `No such container`.** | `.\scripts\traffic-live.ps1 [-Hours N] [-Container name] [-AnthropicMachines 'host1,host2']` |
+| `traffic-live.ps1` | **Live analysis from docker logs** — model/machine/handler distribution, precise error counts, never-hang check, client-named Anthropic overview (descriptive only), session-loop detection. This is what the 6h surveillance cron runs. **`-Container` defaults to `claudish-proxy` (the hub name) — on a sidecar machine you MUST pass `-Container claudish-sidecar`, otherwise the script exits 1 with `No such container`.** | `.\scripts\traffic-live.ps1 [-Hours N] [-Container name]` |
 | `traffic-summary.ps1` | Overview from captures: machines, models, workspaces, sessions | `.\scripts\traffic-summary.ps1 [-Hours N]` |
 | `traffic-sessions.ps1` | Detailed session list with timing, models, data volume | `.\scripts\traffic-sessions.ps1 [-Hours N] [-All]` |
 | `traffic-anthropic.ps1` | **Answers "where does the Anthropic traffic come from?"** — attributes every Anthropic-native (opus/fable) request by **machine + workspace** (workspace = proof, from the system prompt; not stdout). Per-request verdict: `[OK]` ai-01 · `[REVIEW]` po-2025 · `[INFO]` fable during a `-FableOverrideActive` window · `[LEAK-SUBAGENT]` rogue Opus sub-agent (`cc_is_subagent=true`, **exit 1**) · `[REVIEW-INTERACTIVE]` user-driven non-ai-01 session (exit 0). sonnet-4-6 shown separately (remapped to glm → not Anthropic). | `.\scripts\traffic-anthropic.ps1 [-Hours N] [-FableOverrideActive]` |
@@ -65,11 +65,7 @@ By cluster policy, **Anthropic-billed models (Opus, Fable, Sonnet) must come fro
 
 **For the recurring "where is the Anthropic traffic coming from (machine + workspace)?" question, use `traffic-anthropic.ps1`** — it attributes each Anthropic-native request to its machine AND workspace (the workspace is the proof, read from the system prompt in the capture, not stdout), and — crucially — it splits a non-ai-01 hit into `[LEAK-SUBAGENT]` (a rogue Opus sub-agent, `cc_is_subagent=true`, the dangerous kind → exit 1) vs `[REVIEW-INTERACTIVE]` (a user driving their own interactive session on their own machine → exit 0, not alarmed). That split is what stops the tool from crying wolf on legitimate dev sessions.
 
-`traffic-live.ps1` gives the faster stdout-only pass and flags Anthropic traffic from other machines automatically:
-
-- **[OK]** — authorized machine (`-AnthropicMachines`, default `myia-ai-01`).
-- **[REVIEW]** — `myia-po-2025`: may run an authorized Safari workflow (agent-sdk / VS Code) under Anthropic. **Do not auto-flag as leak** — confirm with the user first (lesson 2026-06-21: 6 false WARNs raised on po-2025 before learning Safari was authorized).
-- **[LEAK]** — any other machine on Anthropic. Investigate.
+`traffic-live.ps1` prints only a **descriptive** client-named Anthropic overview (which machines named `claude-*` ids this window). It emits **no verdicts**: a client-named model id is remapped by the cascade and is not a billing attribution, so the old OK/REVIEW/LEAK tags were false positives by construction in relay topology (measured 2026-09-25 — the stdout `[Request]` line carries the client's requested id, and the proxy holds no Anthropic credential to bill anything). Verdicts live in the capture-based tools above, never in the stdout pass.
 
 **Sub-agent leaks vs legitimate sessions** — the distinction that matters:
 - **Real sub-agent leak** = requests carry `cc_is_subagent=true` (in the billing header, *not* on the stdout `[Request]` line) + Anthropic model + non-authorized machine. The Agent tool spawns sub-agents that default to "best available" = Opus.
