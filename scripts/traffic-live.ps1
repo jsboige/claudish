@@ -24,22 +24,14 @@
 .PARAMETER Container
   Docker container name (default: claudish-proxy).
 
-.PARAMETER AnthropicMachines
-  Comma-separated machine names authorized for Anthropic models
-  (Opus/Fable/Sonnet). Requests from other machines are flagged for review.
-  Default: 'myia-ai-01'. (po-2025 may run an authorized Safari workflow —
-  review, do not auto-flag.)
-
 .EXAMPLE
   .\scripts\traffic-live.ps1
   .\scripts\traffic-live.ps1 -Hours 1
-  .\scripts\traffic-live.ps1 -Hours 24 -AnthropicMachines 'myia-ai-01,myia-po-2025'
 #>
 [CmdletBinding()]
 param(
     [int]$Hours = 6,
-    [string]$Container = 'claudish-proxy',
-    [string]$AnthropicMachines = 'myia-ai-01'
+    [string]$Container = 'claudish-proxy'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -244,30 +236,31 @@ if ($notClosed.Count -gt 0) {
 }
 Write-Host ""
 
-# --- Anthropic leak check ----------------------------------------------------
-# Opus + Fable + Sonnet are the Anthropic-billed models. By cluster policy
-# these must come from the authorized machine(s). po-2025 may have an
-# authorized Safari workflow — flagged REVIEW, not LEAK (lesson 2026-06-21).
-Write-Host "--- Anthropic Distribution (Opus/Fable/Sonnet) ---" -ForegroundColor Yellow
-$authorized = $AnthropicMachines.Split(',') | ForEach-Object { $_.Trim() }
+# --- client-named Anthropic models (descriptive only) ------------------------
+# Counts requests whose client NAMED a claude-* model, by originating machine.
+# This is NOT a billing attribution: a client-named id is remapped by the hub's
+# cascade (modelMap / budget steps), and the proxy holds no Anthropic
+# credential on this class of machines, so nothing here is billed natively.
+# OK/REVIEW/LEAK verdicts were removed 2026-09-26 after measured false
+# positives in relay topology — the organ for "who burns the Anthropic-native
+# budget" is native-consumption.py (capture pairing + billing header +
+# cc_is_subagent read from the request body), or traffic-anthropic.ps1 for the
+# per-request pass over captures.
+Write-Host "--- Client-named Anthropic models (descriptive; attribution: native-consumption.py) ---" -ForegroundColor Yellow
 
 $anthropicReqs = $requests | Where-Object { $_ -match 'claude-opus|claude-fable|claude-sonnet' }
 if ($anthropicReqs.Count -eq 0) {
-    Write-Host "  No Anthropic-model traffic this window." -ForegroundColor Green
+    Write-Host "  No client-named Anthropic-model traffic this window." -ForegroundColor Green
 } else {
     $byMachine = $anthropicReqs | Select-String -Pattern 'machine=([^\s]+)' -AllMatches |
         ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value } |
         Group-Object | Sort-Object Count -Descending
     foreach ($g in $byMachine) {
-        $tag = if ($authorized -contains $g.Name) { 'OK (authorized)' }
-               elseif ($g.Name -eq 'myia-po-2025') { 'REVIEW (Safari workflow may be authorized)' }
-               else { 'LEAK (not authorized for Anthropic)' }
-        $color = if ($tag -like 'OK*') { 'Green' } elseif ($tag -like 'REVIEW*') { 'Yellow' } else { 'Red' }
-        Write-Host ("  {0,-22} {1,5}  [{2}]" -f $g.Name, $g.Count, $tag) -ForegroundColor $color
+        Write-Host ("  {0,-22} {1,5}" -f $g.Name, $g.Count)
 
         # Sub-breakdown by model for this machine
         $modelBreakdown = ($anthropicReqs | Where-Object { $_ -match "machine=$($g.Name)" } |
-            Select-String -Pattern 'model=(claude-opus-4-8|claude-fable\S*|claude-sonnet-4-6)' -AllMatches |
+            Select-String -Pattern 'model=(claude-[a-z0-9.\-]+)' -AllMatches |
             ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value } |
             Group-Object | Sort-Object Count -Descending |
             ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
