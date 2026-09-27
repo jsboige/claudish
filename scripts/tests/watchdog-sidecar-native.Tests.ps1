@@ -171,22 +171,58 @@ Describe 'Invoke-NativeWatchdogCycle (wiring)' {
     }
 }
 
-Describe 'Get-SidecarProcesses (command-line match)' {
+Describe 'Get-SidecarProcesses (identity: bun.exe + live pid + pattern)' {
     BeforeAll {
         . $script:WatchdogPath -ClaudishHome $env:TEMP
     }
 
-    It 'matches standalone-proxy on the exact port, not any bun' {
-        # Exercises the real pattern against synthetic rows by filtering the same
-        # way the function filters Win32_Process rows.
+    It 'returns the real sidecar row (bun.exe, pid, pattern, port)' {
         $rows = @(
-            @{ ProcessId = 1; CommandLine = "bun packages/cli/src/fork/server/standalone-proxy.ts --port 3914 --host 127.0.0.1" },
-            @{ ProcessId = 2; CommandLine = "bun packages/cli/src/fork/server/standalone-proxy.ts --port 3915 --host 127.0.0.1" },
-            @{ ProcessId = 3; CommandLine = "bun run dev" },
-            @{ ProcessId = 4; CommandLine = $null }
+            [PSCustomObject]@{ ProcessId = 7; Name = 'bun.exe'; CommandLine = "bun packages/cli/src/fork/server/standalone-proxy.ts --port 3914 --host 127.0.0.1" }
         )
-        $pattern = "standalone-proxy\.ts.*--port\s*3914"
-        $hit = @($rows | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine -match $pattern })
+        $hit = @(Get-SidecarProcesses -Port 3914 -Processes $rows)
+        $hit.Count | Should -Be 1
+        $hit[0].ProcessId | Should -Be 7
+    }
+
+    It 'REGRESSION (kill-test 27/09): an EMPTY result is 0 processes, not one phantom' {
+        # `return ,@()` emits the empty array AS AN OBJECT: the caller's @(...)
+        # then counts 1 "process" with a $null ProcessId and the watchdog
+        # believes the sidecar is alive while it is dead. This is the measured
+        # cause of the kill-test FAIL (log line "(pid=)").
+        @(Get-SidecarProcesses -Port 3914 -Processes @()).Count | Should -Be 0
+    }
+
+    It 'REGRESSION (kill-test 27/09): a non-bun process carrying the pattern in its command line is NOT the sidecar' {
+        # The production failure: a transient process (git show / diagnostic
+        # one-liner) matched the command-line pattern while the sidecar lay
+        # dead — the watchdog read "alive" and never started the launcher.
+        $rows = @(
+            [PSCustomObject]@{ ProcessId = 11; Name = 'git.exe'; CommandLine = "git show origin/main:scripts/standalone-proxy.ts --port 3914" },
+            [PSCustomObject]@{ ProcessId = 12; Name = 'powershell.exe'; CommandLine = "powershell -Command Get-CimInstance ... -match 'standalone-proxy.ts.*--port 3914'" }
+        )
+        @(Get-SidecarProcesses -Port 3914 -Processes $rows).Count | Should -Be 0
+    }
+
+    It 'a row with an unreadable ProcessId is rejected even if it is a bun with the pattern' {
+        # The kill-test log showed "(pid=)" — a matched row whose ProcessId
+        # would not read back. An unreadable pid cannot be killed, reported or
+        # trusted; it must not make the sidecar look alive.
+        $rows = @(
+            [PSCustomObject]@{ ProcessId = $null; Name = 'bun.exe'; CommandLine = "bun standalone-proxy.ts --port 3914" },
+            [PSCustomObject]@{ ProcessId = 0; Name = 'bun.exe'; CommandLine = "bun standalone-proxy.ts --port 3914" }
+        )
+        @(Get-SidecarProcesses -Port 3914 -Processes $rows).Count | Should -Be 0
+    }
+
+    It 'matches standalone-proxy on the exact port, not any bun' {
+        $rows = @(
+            [PSCustomObject]@{ ProcessId = 1; Name = 'bun.exe'; CommandLine = "bun packages/cli/src/fork/server/standalone-proxy.ts --port 3914 --host 127.0.0.1" },
+            [PSCustomObject]@{ ProcessId = 2; Name = 'bun.exe'; CommandLine = "bun packages/cli/src/fork/server/standalone-proxy.ts --port 3915 --host 127.0.0.1" },
+            [PSCustomObject]@{ ProcessId = 3; Name = 'bun.exe'; CommandLine = "bun run dev" },
+            [PSCustomObject]@{ ProcessId = 4; Name = 'bun.exe'; CommandLine = $null }
+        )
+        $hit = @(Get-SidecarProcesses -Port 3914 -Processes $rows)
         $hit.Count | Should -Be 1
         $hit[0].ProcessId | Should -Be 1
     }
