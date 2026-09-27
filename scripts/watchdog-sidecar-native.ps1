@@ -86,22 +86,43 @@ function Set-WatchdogState {
 }
 
 function Get-SidecarProcesses {
-    # Match on the COMMAND LINE (standalone-proxy + --port N), never the exe name:
-    # bun's install path varies and any process name can host the proxy. Enumerating
-    # ALL Win32_Process rows and filtering in PowerShell is deliberate — the WMI
-    # filter itself cannot express a regex on CommandLine portably across 5.1/7.
-    param([int]$Port)
+    # Match on the COMMAND LINE (standalone-proxy + --port N) AND on identity:
+    # bun.exe with a live ProcessId. The command line alone is not identity — the
+    # 27/09 kill-test caught a transient process whose command line matched the
+    # pattern (ProcessId unreadable) while the real sidecar lay dead: the
+    # watchdog read "alive but unhealthy" for three ticks and never started the
+    # launcher. Any process can carry the string (a `git show`, a diagnostic
+    # one-liner); only bun.exe with a ProcessId IS the sidecar.
+    # Enumerating ALL Win32_Process rows and filtering in PowerShell is
+    # deliberate — the WMI filter itself cannot express a regex on CommandLine
+    # portably across 5.1/7. $Processes is injectable for the tests.
     # NOT named $matches: that is an AUTOMATIC variable PowerShell fills on every
     # -match — accumulating into it throws "can only add a hashtable to another
     # hashtable" the moment a row matches (caught by the first live tick, which
     # the probe-injected test suite could never see).
-    $pattern = "standalone-proxy\.ts.*--port\s*$Port"
-    $all = Get-CimInstance -ClassName Win32_Process -Property @("ProcessId", "CommandLine")
-    $hits = @()
-    foreach ($p in $all) {
-        if ($null -ne $p.CommandLine -and $p.CommandLine -match $pattern) { $hits += $p }
+    param(
+        [int]$Port,
+        [object[]]$Processes = $null
+    )
+    if ($null -eq $Processes) {
+        $Processes = Get-CimInstance -ClassName Win32_Process -Property @("ProcessId", "Name", "CommandLine")
     }
-    return ,$hits
+    $pattern = "standalone-proxy\.ts.*--port\s*$Port"
+    $hits = @()
+    foreach ($p in $Processes) {
+        if ($p.Name -eq 'bun.exe' `
+            -and $null -ne $p.ProcessId -and $p.ProcessId -gt 0 `
+            -and $null -ne $p.CommandLine -and $p.CommandLine -match $pattern) {
+            $hits += $p
+        }
+    }
+    # NOT `return ,$hits`: wrapping an EMPTY array emits the array itself as one
+    # output object, so the caller's @(...) counts 1 "process" whose ProcessId
+    # reads $null — the watchdog then believes a sidecar is alive while it is
+    # dead and never starts the launcher. This is the measured cause of the
+    # 27/09 kill-test FAIL ((pid=) in the log). The caller already array-ifies
+    # with @(), which is what guarantees the array shape here.
+    return $hits
 }
 
 function Test-SidecarHealth {
