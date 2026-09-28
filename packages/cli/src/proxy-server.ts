@@ -53,6 +53,7 @@ import {
   isWiringError,
   roleFromModelName,
   getFailoverRule,
+  classifyNominalBucket,
   providerBucketOf,
   resolveFailoverTargetForSession,
   markStepFailed,
@@ -765,21 +766,26 @@ export async function createProxyServer(
 
   /**
    * The provider bucket a requested model's NOMINAL draws on (#275) — the meter a
-   * quota refusal walls. Uses the same routing primitives as the real resolution:
-   * an already-qualified target buckets on its prefix; a bare name's provider is
-   * the routing chain's decision (step 2c below), so the same `route()` answers.
-   * This is the request-side half of the per-bucket failover: the wall itself is
-   * recorded by the cascade loop against the refusing request's bucket.
+   * quota refusal walls. The decision core is `classifyNominalBucket`
+   * (fork/failover.ts), which mirrors step 2c's guard exactly; this wrapper adds
+   * the two pieces that need proxy state: the modelMap-resolved nominal target
+   * and, only when the routing chain owns the decision, the catalog warmup +
+   * `route()` call. This is the request-side half of the per-bucket failover:
+   * the wall itself is recorded by the cascade loop against the refusing
+   * request's bucket.
    */
   const nominalBucketOfModel = async (requestedModel: string): Promise<string> => {
     const { target } = resolveNominalTarget(requestedModel);
-    if (target.includes("@") || target.includes("/")) return providerBucketOf(target);
+    const decision = classifyNominalBucket(target, (m) =>
+      matchUserRoutingOverride(m, userRoutingRules)
+    );
+    if ("bucket" in decision) return decision.bucket;
     await ensureCatalogReady("openrouter", 5000);
-    const plan = route(parseModelSpec(target).model, effectiveRoutingRules);
-    // plan.primary is the nominal's primary provider. If its credential is
-    // missing the serving candidate is the first fallback — accepted v1
+    const plan = route(decision.routeModel, effectiveRoutingRules);
+    // plan.primary is the credential-filtered primary — if the natural primary
+    // lacks its key the serving candidate is the first fallback (accepted v1
     // approximation: a mis-credentialed primary is a config error, and the
-    // refusal that eventually surfaces re-walls the bucket it names.
+    // refusal that eventually surfaces re-walls the bucket it names).
     if (plan.kind === "ok" && plan.primary) return plan.primary.provider;
     // No chain: a bare name with no routable provider is the native lane
     // (matches the isNative predicate of step 6 below).

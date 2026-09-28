@@ -37,8 +37,12 @@ import {
   consumeStreamNotice,
   extractSessionKey,
   providerBucketOf,
+  classifyNominalBucket,
+  nativeBucketFor,
   NATIVE_BUCKET,
 } from "./failover.js";
+import { route } from "../providers/routing-rules.js";
+import { DEFAULT_ROUTING_RULES } from "../providers/default-routing-rules.js";
 
 // 1-step config (backward-compatible: no ">" separator).
 const OPUS_TO_QWEN = {
@@ -1609,12 +1613,12 @@ describe("#275 — per-bucket walls, provider-scoped contagion", () => {
   afterEach(() => {
     Date.now = realNow;
   });
-  it("providerBucketOf: prefix before @, before /, bare name = native meter", () => {
-    expect(providerBucketOf("gc@glm-5.3")).toBe("gc");
+  it("providerBucketOf (last resort, route() empty): canonical provider, per-model native, vendor prefix for unknown slash forms", () => {
+    expect(providerBucketOf("gc@glm-5.3")).toBe("glm-coding");
     expect(providerBucketOf("qwen-token-plan@deepseek-v4.1-flash")).toBe("qwen-token-plan");
     expect(providerBucketOf("openrouter/qwen/qwen3-coder")).toBe("openrouter");
-    expect(providerBucketOf("claude-sonnet-4-6")).toBe(NATIVE_BUCKET);
-    expect(providerBucketOf("glm-5.3")).toBe(NATIVE_BUCKET);
+    expect(providerBucketOf("claude-sonnet-4-6")).toBe(`${NATIVE_BUCKET}/claude-sonnet-4-6`);
+    expect(providerBucketOf("some-unknown-vendor/model-x")).toBe("some-unknown-vendor");
   });
 
   it("a wall on bucket cx does not divert a request whose nominal is gc (the incident)", () => {
@@ -1646,11 +1650,12 @@ describe("#275 — per-bucket walls, provider-scoped contagion", () => {
     expect(resolveFailoverTargetForSession("opus", "s-o2", "gc").step).toBeNull();
   });
 
-  it("a native (anthropic-native) wall never diverts gc-nominal requests — the live 28/09 specimen", () => {
+  it("a native wall never diverts glm-coding-nominal requests — the live 28/09 specimen", () => {
     initFailover({ ...S275_AUTO, ...SONNET_CASCADE });
-    expect(armFailover("sonnet", "HTTP 429 from claude-sonnet-4-6", NATIVE_BUCKET)).toBe(true);
-    expect(resolveFailoverTargetForSession("sonnet", "s1", "gc").step).toBeNull();
-    expect(resolveFailoverTargetForSession("sonnet", "s2", NATIVE_BUCKET).stepIndex).toBe(0);
+    const nativeSonnet = nativeBucketFor("claude-sonnet-4-6");
+    expect(armFailover("sonnet", "HTTP 429 from claude-sonnet-4-6", nativeSonnet)).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "s1", "glm-coding").step).toBeNull();
+    expect(resolveFailoverTargetForSession("sonnet", "s2", nativeSonnet).stepIndex).toBe(0);
   });
 
   it("config-arm (CLAUDISH_FAILOVER_ACTIVE) diverts every bucket of the role", () => {
@@ -1718,5 +1723,91 @@ describe("#275 — per-bucket walls, provider-scoped contagion", () => {
     expect(v.outcome).toBe("armed");
     clock += 21 * 60 * 1000;
     expect(isFailoverActive("sonnet", "gc")).toBe(false); // its 10-min TTL elapsed
+  });
+});
+
+// ── #275 request-side half: classifyNominalBucket (PR #277 review) ─────────────
+// The wall tests above inject bucket strings by hand; these pin what PRODUCTION
+// derives per request, under a hub-like env (no Anthropic credential, the
+// subscription meters credentialed) — the exact profile where the v1
+// implementation mis-bucketed every bare claude-* as `openrouter` and created a
+// NEW cross-role native contagion.
+describe("#275 — classifyNominalBucket (request-side bucket derivation)", () => {
+  const noOverride = (_model: string) => false;
+  // Hub profile: OpenRouter + the two subscription meters credentialed, NO
+  // Anthropic key (native passthrough bills the CLIENT's credential).
+  const HUB_LIKE = {
+    OPENROUTER_API_KEY: "or-test",
+    GLM_CODING_API_KEY: "gc-test",
+    OPENAI_CODEX_API_KEY: "cx-test",
+  };
+  const ENV_KEYS = [...Object.keys(HUB_LIKE), "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+  let saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    for (const k of ENV_KEYS) saved[k] = process.env[k];
+    Object.assign(process.env, HUB_LIKE);
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_AUTH_TOKEN;
+  });
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    saved = {};
+  });
+
+  it("bare claude-* never buckets openrouter: per-model native buckets, so two native models never share a wall", () => {
+    const sonnet = classifyNominalBucket("claude-sonnet-4-6", noOverride);
+    const opus = classifyNominalBucket("claude-opus-5-5", noOverride);
+    expect(sonnet).toEqual({ bucket: `${NATIVE_BUCKET}/claude-sonnet-4-6` });
+    expect(opus).toEqual({ bucket: `${NATIVE_BUCKET}/claude-opus-5-5` });
+    // the blocker this pins: without the 2c-native guard, route() under this
+    // exact env answers `openrouter` for every bare claude-* (credential
+    // filtering drops native-anthropic), walling ALL native roles together.
+    expect((sonnet as { bucket: string }).bucket).not.toBe("openrouter");
+    expect((sonnet as { bucket: string }).bucket).not.toBe(
+      (opus as { bucket: string }).bucket
+    );
+    // with an Anthropic key present the guard holds identically — route() is
+    // never consulted for the native lane, whatever the credentials:
+    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
+    expect(classifyNominalBucket("claude-fable-5-1", noOverride)).toEqual({
+      bucket: `${NATIVE_BUCKET}/claude-fable-5-1`,
+    });
+  });
+
+  it("a user routing override beats the native heuristic (mirrors 2c / #3401): the chain decides", () => {
+    const decision = classifyNominalBucket("claude-sonnet-4-6", (m) => m === "claude-sonnet-4-6");
+    expect(decision).toEqual({ routeModel: "claude-sonnet-4-6" });
+  });
+
+  it("one meter, one bucket, whatever the spelling: gc@ ≡ bare glm-*, cx@ ≡ bare gpt-6-*", () => {
+    // Explicit spellings canonicalize through parseModelSpec:
+    expect(classifyNominalBucket("gc@glm-5.3", noOverride)).toEqual({ bucket: "glm-coding" });
+    expect(classifyNominalBucket("cx@gpt-6-sol", noOverride)).toEqual({ bucket: "openai-codex" });
+    expect(classifyNominalBucket("or@deepseek/deepseek-r1", noOverride)).toEqual({
+      bucket: "openrouter",
+    });
+    // Bare spellings hand the decision to route(); under the hub-like env its
+    // primary is the SAME canonical provider — the two spellings of one meter
+    // converge on one bucket:
+    expect(classifyNominalBucket("glm-5.3", noOverride)).toEqual({ routeModel: "glm-5.3" });
+    const bareGlm = route("glm-5.3", DEFAULT_ROUTING_RULES);
+    expect(bareGlm.kind).toBe("ok");
+    expect((bareGlm as { primary: { provider: string } }).primary.provider).toBe("glm-coding");
+    expect(classifyNominalBucket("gpt-6-astra", noOverride)).toEqual({ routeModel: "gpt-6-astra" });
+    const bareAstra = route("gpt-6-astra", DEFAULT_ROUTING_RULES);
+    expect(bareAstra.kind).toBe("ok");
+    expect((bareAstra as { primary: { provider: string } }).primary.provider).toBe("openai-codex");
+  });
+
+  it("bare non-claude names hand the decision to the routing chain (routeModel)", () => {
+    expect(classifyNominalBucket("deepseek-v4.1-flash", noOverride)).toEqual({
+      routeModel: "deepseek-v4.1-flash",
+    });
+    expect(classifyNominalBucket("qwen/qwen3-coder", noOverride)).toEqual({
+      routeModel: "qwen3-coder", // the vendor prefix is stripped by parseModelSpec
+    });
   });
 });

@@ -48,6 +48,7 @@
  */
 
 import { logStderr } from "../logger.js";
+import { parseModelSpec } from "../providers/model-parser.js";
 
 export type FailoverRole = "opus" | "sonnet" | "haiku" | "fable";
 
@@ -136,29 +137,69 @@ let autoArmEnabled = false;
 // meter — and NOTHING else. A qualifying refusal while serving model M walls
 // bucket(M); only requests whose own resolved nominal sits in a walled bucket
 // divert to THEIR role's cascade (marche 1, never the nominal — see #274). The
-// OpenAI Pro plan exhausting walls `cx` (Sol AND astra divert, across roles); the
-// z.ai 5h window walls `gc`; it never reaches a healthy `gc`-nominal request
-// through the sonnet role.
+// OpenAI Pro plan exhausting walls `openai-codex` (Sol AND astra divert, across
+// roles); the GLM Coding 5h window walls `glm-coding`; it never reaches a healthy
+// `glm-coding`-nominal request through the sonnet role.
 
-/** The bucket a bare Claude id (or any unmapped bare name) draws on: the
- * Anthropic-native meter. */
+/** Prefix of the bucket a native-lane target draws on. The native meter is the
+ * CLIENT's Anthropic credential (the proxy holds none), so native buckets are
+ * PER MODEL — `anthropic-native/<model>` — never one shared native bucket: a
+ * native sonnet 429 bills a different client credential than native opus. */
 export const NATIVE_BUCKET = "anthropic-native";
 /** Legacy/test bucket: a wall on `*` diverts the role regardless of nominal
  * (the pre-#275 role-wide arm, still what `armFailover(role, reason)` creates). */
 export const LEGACY_ROLE_WIDE_BUCKET = "*";
 
-/** The provider bucket a target string belongs to — i.e. which meter its quota
- * draws on. `provider@model` and `provider/model` bucket on the prefix; a bare
- * name buckets native (the isNative predicate of the routing step). Bucklets are
- * compared against the ROUTING-resolved provider of a request's nominal, which
- * uses the same prefix vocabulary (gc, cx, ds, kc, mistral, mmc, …). */
+/** The per-model bucket of a native-lane target (see NATIVE_BUCKET). */
+export function nativeBucketFor(model: string): string {
+  return `${NATIVE_BUCKET}/${model}`;
+}
+
+/** The request-side half of #275: which meter does this nominal target draw on?
+ * Pure decision core of proxy-server's `nominalBucketOfModel`, extracted so the
+ * derivation is testable without booting the proxy (PR #277 review). Mirrors
+ * step 2c of `getHandlerForRequest` EXACTLY — the two must not drift, or a wall
+ * arms on a bucket no request ever resolves to:
+ *  - an explicit target (`provider@model`, legacy prefix, URL) buckets on its
+ *    CANONICAL provider name — parseModelSpec resolves shortcuts (`gc@` →
+ *    `glm-coding`, `cx@` → `openai-codex`, `or@` → `openrouter`), the same
+ *    vocabulary `route()` emits for bare names: one meter, one bucket, whatever
+ *    the spelling;
+ *  - a bare name that parseModelSpec classifies native-anthropic (`claude-*`,
+ *    any unmapped bare name) stays on the native lane UNLESS a user-authored
+ *    routing override claims it (#3401) — `route()` is never consulted, so a
+ *    hub without an Anthropic key cannot mis-bucket it `openrouter`;
+ *  - anything else is the routing chain's decision: `route()` (credential-
+ *    filtered) names the primary provider, and that is the bucket.
+ */
+export type NominalBucketDecision = { bucket: string } | { routeModel: string };
+
+export function classifyNominalBucket(
+  target: string,
+  userRoutingOverride: (model: string) => boolean
+): NominalBucketDecision {
+  const parsed = parseModelSpec((target || "").trim());
+  if (parsed.isExplicitProvider) return { bucket: parsed.provider };
+  if (parsed.provider === "native-anthropic" && !userRoutingOverride(parsed.model)) {
+    return { bucket: nativeBucketFor(parsed.model) };
+  }
+  return { routeModel: parsed.model };
+}
+
+/** Last-resort bucket for a target the routing chain could not resolve (route()
+ * returned no plan). Canonicalized through parseModelSpec like
+ * classifyNominalBucket, with the vendor prefix as the only signal left for the
+ * unknown `vendor/model` form. */
 export function providerBucketOf(target: string): string {
   const t = (target || "").trim();
-  const at = t.indexOf("@");
-  if (at > 0) return t.slice(0, at);
-  const slash = t.indexOf("/");
-  if (slash > 0) return t.slice(0, slash);
-  return NATIVE_BUCKET;
+  const parsed = parseModelSpec(t);
+  if (parsed.isExplicitProvider) return parsed.provider;
+  if (parsed.provider === "native-anthropic") return nativeBucketFor(parsed.model);
+  if (parsed.provider === "unknown") {
+    const slash = t.indexOf("/");
+    return slash > 0 ? t.slice(0, slash) : nativeBucketFor(parsed.model);
+  }
+  return parsed.provider;
 }
 
 /** Walled provider buckets (auto-arms; TTL-expiring). Config-arms live separately
@@ -1062,6 +1103,10 @@ export function onNominalSuccess(role: FailoverRole, bucket: string = LEGACY_ROL
     }
     wallsRemain = live > 0;
   }
+  // Withholding the step-backoff reset while ANY bucket is walled is deliberate:
+  // a long-lived sibling wall (a Kimi weekly, 7 days) holds it off, but the
+  // steps still expire on their own ladder — this is only a loss of EARLY
+  // reset, never a leak.
   if (!wallsRemain) resetAllStepFailures(role);
 }
 
