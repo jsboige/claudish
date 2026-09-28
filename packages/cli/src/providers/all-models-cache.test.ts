@@ -10,12 +10,28 @@ import { describe, test, expect, afterEach } from "bun:test";
 import { writeFileSync, existsSync, rmSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import {
-  readAllModelsCache,
-  writeAllModelsCache,
-  type DiskCacheV2,
-  type SlimModelEntry,
-} from "./all-models-cache.js";
+import * as maybeMocked from "./all-models-cache.js";
+
+// #272: bun's mock.module is process-global with no unregister API. When
+// launcher/catalog-warm.test.ts (which replaces this whole module) is loaded
+// in the same run, our static bindings silently point at its mock and every
+// tmp-file test fails confusingly. Detect the mock via the canary path every
+// mock installs, then re-import the real file through a query-suffixed
+// specifier — a distinct registry key the mock does not cover.
+const realModuleSpecifier = "./all-models-cache.js?real";
+const cache =
+  maybeMocked.ALL_MODELS_CACHE_PATH === "/tmp/test-all-models.json"
+    ? await import(realModuleSpecifier)
+    : maybeMocked;
+if (cache.ALL_MODELS_CACHE_PATH === "/tmp/test-all-models.json") {
+  throw new Error(
+    "#272 bypass failed: query-suffixed import still serves the mock — update the bypass"
+  );
+}
+const readAllModelsCache = cache.readAllModelsCache.bind(cache);
+const writeAllModelsCache = cache.writeAllModelsCache.bind(cache);
+type DiskCacheV2 = maybeMocked.DiskCacheV2;
+type SlimModelEntry = maybeMocked.SlimModelEntry;
 
 /**
  * Create a unique tmp directory for a single test. Returns (path, cleanup).
