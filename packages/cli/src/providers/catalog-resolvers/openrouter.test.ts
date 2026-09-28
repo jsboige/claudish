@@ -234,6 +234,26 @@ describe("OpenRouterCatalogResolver.refreshCatalog", () => {
     expect(writeArg.models).toEqual([{ id: "vendor-a/alpha" }, { id: "vendor-b/beta" }]);
   });
 
+  test("disk write throws (EROFS read-only fs) → refresh still succeeds, memory serves (#270)", async () => {
+    const fakeModels = [
+      entry("erofs-model", [], { "openrouter-api": { externalId: "vendor-e/erofs-model" } }),
+    ];
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ models: fakeModels, total: 1 })
+    ) as unknown as typeof globalThis.fetch;
+    // Hub container: homedir=/root on a read-only rootfs — the very first
+    // catalog-resolving request paid a 500 for this throw before the fix.
+    mockWrite.mockImplementationOnce(() => {
+      throw new Error("EROFS: read-only file system, open '/root/.claudish/all-models.json'");
+    });
+
+    const outcome = await resolver.refreshCatalog(8000);
+
+    expect(outcome).toEqual({ kind: "refreshed", modelCount: 1 });
+    expect(resolver.isCacheWarm()).toBe(true);
+    expect(resolver.resolveSync("erofs-model")).toBe("vendor-e/erofs-model");
+  });
+
   test("success → in-memory cache reflects fetched models via resolveSync", async () => {
     const fakeModels = [
       entry("gamma", ["g"], { "openrouter-api": { externalId: "vendor-g/gamma" } }),

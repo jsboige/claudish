@@ -6,6 +6,7 @@ import {
   type SlimModelEntry,
   type DiskCacheV2,
 } from "../all-models-cache.js";
+import { logStderr } from "../../logger.js";
 
 /**
  * Firebase slim catalog endpoint. Override via:
@@ -300,11 +301,17 @@ export class OpenRouterCatalogResolver implements ModelCatalogResolver {
     // Atomic swap: only after we've successfully parsed and built the new payload.
     _memCache = models;
 
-    // Persist to disk for cold-start fallback paths.
-    writeAllModelsCache({
-      entries: models,
-      models: backwardCompatModels,
-    });
+    // Persist to disk for cold-start fallback paths. Best-effort: on an
+    // unwritable home (container read-only rootfs) this throws EROFS, and the
+    // fallback must never fail the refresh that already succeeded in memory (#270).
+    try {
+      writeAllModelsCache({
+        entries: models,
+        models: backwardCompatModels,
+      });
+    } catch (err) {
+      logStderr(`[Catalog] cache write skipped (unwritable path): ${(err as Error).message}`);
+    }
 
     // Short-circuit the proxy-server bg warm at proxy-server.ts:535. Resolves F2.
     // _warmPromise is read by warmCache()/ensureReady() — setting it here means
