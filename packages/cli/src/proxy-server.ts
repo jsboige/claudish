@@ -53,6 +53,7 @@ import {
   isWiringError,
   roleFromModelName,
   getFailoverRule,
+  providerBucketOf,
   resolveFailoverTargetForSession,
   markStepFailed,
   parseResetAtFromBody,
@@ -738,20 +739,67 @@ export async function createProxyServer(
     async shutdown() {},
   };
 
+  /** Steps 1-2 of getHandlerForRequest's target resolution, extracted so the
+   * cascade loop can derive the SAME pre-failover nominal target without
+   * re-implementing the mapping priority (drift between the two would mis-bucket
+   * a nominal and with it the whole #275 diversion test). */
+  const resolveNominalTarget = (requestedModel: string): { target: string; mapped: boolean } => {
+    let target = requestedModel;
+    let mapped = false;
+    if (modelMap) {
+      // Role-specific mappings take highest priority. Family matching is
+      // version-independent, so a future claude-fable-* keeps the same role.
+      const roleTarget = resolveRoleMappedModel(requestedModel.toLowerCase(), modelMap);
+      if (roleTarget) {
+        target = roleTarget;
+        mapped = true;
+      }
+      // Default model (--model) is fallback for all roles
+      else if (model) target = model;
+    } else if (model) {
+      // No role mappings at all - use default model
+      target = model;
+    }
+    return { target, mapped };
+  };
+
+  /**
+   * The provider bucket a requested model's NOMINAL draws on (#275) — the meter a
+   * quota refusal walls. Uses the same routing primitives as the real resolution:
+   * an already-qualified target buckets on its prefix; a bare name's provider is
+   * the routing chain's decision (step 2c below), so the same `route()` answers.
+   * This is the request-side half of the per-bucket failover: the wall itself is
+   * recorded by the cascade loop against the refusing request's bucket.
+   */
+  const nominalBucketOfModel = async (requestedModel: string): Promise<string> => {
+    const { target } = resolveNominalTarget(requestedModel);
+    if (target.includes("@") || target.includes("/")) return providerBucketOf(target);
+    await ensureCatalogReady("openrouter", 5000);
+    const plan = route(parseModelSpec(target).model, effectiveRoutingRules);
+    // plan.primary is the nominal's primary provider. If its credential is
+    // missing the serving candidate is the first fallback — accepted v1
+    // approximation: a mis-credentialed primary is a config error, and the
+    // refusal that eventually surfaces re-walls the bucket it names.
+    if (plan.kind === "ok" && plan.primary) return plan.primary.provider;
+    // No chain: a bare name with no routable provider is the native lane
+    // (matches the isNative predicate of step 6 below).
+    return providerBucketOf(target);
+  };
+
   const getHandlerForRequest = async (
     requestedModel: string,
     depth = 0,
-    sessionKey: string | null = null
+    sessionKey: string | null = null,
+    nominalBucket?: string
   ): Promise<ModelHandler> => {
     // 1. Monitor Mode Override
     if (monitorMode) return nativeHandler;
 
     // 2. Resolve target model based on mappings or defaults
     // Priority: role mappings > default model (--model) > requested model (native)
-    let target = requestedModel;
-    let wasFromModelMap = false;
-
-    const req = requestedModel.toLowerCase();
+    const { target: mappedTarget, mapped } = resolveNominalTarget(requestedModel);
+    let target = mappedTarget;
+    let wasFromModelMap = mapped;
 
     // The role is derived from what the CLIENT asked for, independently of
     // whether modelMap has an entry for it — a failover must be able to divert
@@ -761,21 +809,6 @@ export async function createProxyServer(
     // can never drift.
     const role = roleFromModelName(requestedModel);
 
-    if (modelMap) {
-      // Role-specific mappings take highest priority. Family matching is
-      // version-independent, so a future claude-fable-* keeps the same role.
-      const roleTarget = resolveRoleMappedModel(req, modelMap);
-      if (roleTarget) {
-        target = roleTarget;
-        wasFromModelMap = true;
-      }
-      // Default model (--model) is fallback for all roles
-      else if (model) target = model;
-    } else if (model) {
-      // No role mappings at all - use default model
-      target = model;
-    }
-
     // 2a. Budget failover — a whole role is served from a cascade of substitute
     // pools because its nominal plan is exhausted or being conserved. Sits AFTER
     // the modelMap cascade so it overrides the nominal mapping, and BEFORE
@@ -783,11 +816,14 @@ export async function createProxyServer(
     // resolveFailoverTargetForSession walks the cascade skipping TTL-failed
     // steps, plus the per-session dwell (#91 point 4) when a session key is
     // available. Inert unless CLAUDISH_FAILOVER_* is configured. See fork/failover.ts.
-    if (role) {
-      const resolved = resolveFailoverTargetForSession(role, sessionKey);
+    if (role && getFailoverRule(role)) {
+      // #275: the diversion test is bucket-scoped — compute this request's
+      // nominal bucket (unless the caller — the cascade loop — already did).
+      const bucket = nominalBucket ?? (await nominalBucketOfModel(requestedModel));
+      const resolved = resolveFailoverTargetForSession(role, sessionKey, bucket);
       if (resolved.step && resolved.step.target !== target) {
         log(
-          `[Proxy] Failover: role '${role}' ${target} → ${resolved.step.target} step[${resolved.stepIndex}] (${resolved.step.label})`
+          `[Proxy] Failover: role '${role}' [${bucket}] ${target} → ${resolved.step.target} step[${resolved.stepIndex}] (${resolved.step.label})`
         );
         target = resolved.step.target;
         wasFromModelMap = true;
@@ -1005,10 +1041,17 @@ export async function createProxyServer(
   const handleWithCascade = async (
     c: Context,
     body: any,
-    requestedModel: string
+    requestedModel: string,
+    nominalBucket?: string
   ): Promise<Response> => {
     const role = roleFromModelName(requestedModel);
     const rule = role ? getFailoverRule(role) : undefined;
+    // #275: the provider bucket THIS request's nominal draws on. Computed once
+    // (the routing consult is in-memory but not free) and threaded through every
+    // failover decision below — the arm, the resolution and the success callback
+    // must all key on the same bucket or the diversion test lies.
+    const bucket =
+      nominalBucket ?? (rule ? await nominalBucketOfModel(requestedModel) : undefined);
     const maxAttempts = rule ? rule.steps.length + 1 : 1; // nominal + each step
     const armGraceMs = getArmGraceMs();
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
@@ -1025,8 +1068,8 @@ export async function createProxyServer(
     let revisits = 0;
     let response: Response | undefined;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const handler = await getHandlerForRequest(requestedModel, 0, sessionKey);
-      const { stepIndex } = role ? resolveFailoverTargetForSession(role, sessionKey) : { stepIndex: -1 };
+      const handler = await getHandlerForRequest(requestedModel, 0, sessionKey, bucket);
+      const { stepIndex } = role ? resolveFailoverTargetForSession(role, sessionKey, bucket) : { stepIndex: -1 };
       if (role && stepIndex >= 0 && triedSteps.has(stepIndex) && revisits < (rule?.steps.length ?? 0)) {
         revisits++;
         markStepFailed(role, stepIndex, `re-selected after a concurrent clear — already failed in this request`);
@@ -1052,7 +1095,7 @@ export async function createProxyServer(
       if (pinnedModel && !response.ok) body.model = modelBeforePin;
       if (response.ok) {
         if (role) {
-          if (stepIndex === -1) onNominalSuccess(role); // nominal healthy → fresh episode + maybe recovery
+          if (stepIndex === -1) onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
           else resetStepSuccess(role, stepIndex);
         }
         return response;
@@ -1108,7 +1151,7 @@ export async function createProxyServer(
         // cascade instead of surfacing a raw 429 (production 2026-08-20: the
         // disarm-probe window at each 10-min TTL raced two opus requests; the
         // loser died client-side with "API Error").
-        const verdict = onNominalRefusal(role, reason, response.headers.get("retry-after"), errBody);
+        const verdict = onNominalRefusal(role, reason, response.headers.get("retry-after"), errBody, bucket);
         if (verdict.outcome === "burst") {
           // A short retry-after names a burst: surface it, the client ladder
           // absorbs it, the role never exiles for a 10-min TTL off a blip.
@@ -1368,19 +1411,26 @@ export async function createProxyServer(
         if (declared) log(`[Capability] session=${sessionKey.slice(0, 8)} declared ${JSON.stringify(declared)}`);
       }
 
-      const handler = await getHandlerForRequest(body.model, 0, sessionKey);
+      // #275: the nominal bucket computed once for the failover cascade AND the
+      // notices — both must key on the same meter or a notice announces a
+      // diversion the session never took.
+      const requestRole = roleFromModelName(body.model);
+      const requestBucket =
+        requestRole && getFailoverRule(requestRole) ? await nominalBucketOfModel(body.model) : undefined;
+      const handler = await getHandlerForRequest(body.model, 0, sessionKey, requestBucket);
       logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
       stripBillingHeaderFromBody(body, handler instanceof NativeHandler);
 
       // Route through the budget-failover cascade (nominal → step0 → step1 …),
       // then inject onset/recovery notices. See handleWithCascade / applyFailoverNotices.
-      const response = await handleWithCascade(c, body, body.model);
+      const response = await handleWithCascade(c, body, body.model, requestBucket);
       const noticed = await applyFailoverNotices(
         response,
-        roleFromModelName(body.model),
+        requestRole,
         sessionKey,
         body.stream === true,
-        noticePolicyForIngress(c.req.path)
+        noticePolicyForIngress(c.req.path),
+        requestBucket
       );
       // The `await` is load-bearing (218c3586): `return promise` hands it back
       // BEFORE it settles, so a rejection escapes this try/catch entirely and
@@ -1435,7 +1485,18 @@ export async function createProxyServer(
       const anthropicBody = convertOpenAIRequestToAnthropic(openaiBody);
       const wantsStream = openaiBody.stream === true;
 
-      const handler = await getHandlerForRequest(anthropicBody.model, 0, extractSessionKey(anthropicBody));
+      // #275: same one-bucket-per-request rule as /v1/messages (see there).
+      const requestRole = roleFromModelName(anthropicBody.model);
+      const requestBucket =
+        requestRole && getFailoverRule(requestRole)
+          ? await nominalBucketOfModel(anthropicBody.model)
+          : undefined;
+      const handler = await getHandlerForRequest(
+        anthropicBody.model,
+        0,
+        extractSessionKey(anthropicBody),
+        requestBucket
+      );
       logRequest(anthropicBody, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
       stripBillingHeaderFromBody(anthropicBody, handler instanceof NativeHandler);
 
@@ -1445,13 +1506,14 @@ export async function createProxyServer(
       // client) — the notice rides the response header, NOT the content, so an
       // empty model output stays visibly empty instead of being masked by the
       // notice-as-answer.
-      let response = await handleWithCascade(c, anthropicBody, anthropicBody.model);
+      let response = await handleWithCascade(c, anthropicBody, anthropicBody.model, requestBucket);
       response = await applyFailoverNotices(
         response,
-        roleFromModelName(anthropicBody.model),
+        requestRole,
         extractSessionKey(anthropicBody),
         wantsStream,
-        noticePolicyForIngress(c.req.path)
+        noticePolicyForIngress(c.req.path),
+        requestBucket
       );
 
       // Translate the final Anthropic response to OpenAI shape.

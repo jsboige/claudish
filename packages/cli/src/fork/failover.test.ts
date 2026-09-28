@@ -36,6 +36,8 @@ import {
   isRecovering,
   consumeStreamNotice,
   extractSessionKey,
+  providerBucketOf,
+  NATIVE_BUCKET,
 } from "./failover.js";
 
 // 1-step config (backward-compatible: no ">" separator).
@@ -1570,5 +1572,151 @@ describe("#91 — grace before arming + retry-after burst discrimination", () =>
     initFailover({ ...AUTO_ON, CLAUDISH_FAILOVER_ACTIVE: "opus" });
     const v = onNominalRefusal("opus", "HTTP 429 from claude-opus-5", null, WALL_BODY);
     expect(v.outcome).toBe("armed");
+  });
+});
+
+// ── #275: per-model maxing, provider-scoped contagion ───────────────────────────
+// The wall is a property of the provider BUCKET (the meter), never of the role: a
+// refusal walls bucket(M); only requests whose own nominal sits in a walled bucket
+// divert. Incident replay (hub, 2026-09-28): gpt-6-sol (bucket cx, OpenAI Pro)
+// walled, the role-keyed arm exiled EVERY sonnet request — including those served
+// by a healthy z.ai nominal — and the fleet walked Mistral(402)→Kimi(403)→PAYG.
+
+const SONNET_CASCADE = {
+  CLAUDISH_FAILOVER_SONNET: "mistral@zai-glm-5-3>kc@k3>ds@deepseek-flash",
+  CLAUDISH_FAILOVER_SONNET_LABEL: "Mistral GLM>Kimi K3>DeepSeek PAYG",
+  CLAUDISH_FAILOVER_SONNET_DIRECTION: "degraded>lateral>degraded",
+} as NodeJS.ProcessEnv;
+
+const OPUS_FABLE_CASCADES = {
+  CLAUDISH_FAILOVER_OPUS: "gc@glm-5.3>kc@k3",
+  CLAUDISH_FAILOVER_OPUS_LABEL: "GLM Coding>Kimi K3",
+  CLAUDISH_FAILOVER_FABLE: "cx@gpt-6-sol>ds@deepseek-flash",
+  CLAUDISH_FAILOVER_FABLE_LABEL: "GPT-6 Sol>DeepSeek PAYG",
+} as NodeJS.ProcessEnv;
+
+const S275_AUTO = { CLAUDISH_FAILOVER_AUTO: "1" } as NodeJS.ProcessEnv;
+const S275_WALL_BODY = JSON.stringify({
+  error: { type: "usage_limit_reached", message: "You've reached your weekly usage limit." },
+});
+
+describe("#275 — per-bucket walls, provider-scoped contagion", () => {
+  let clock = 1_000_000;
+  const realNow = Date.now;
+  beforeEach(() => {
+    Date.now = () => clock;
+  });
+  afterEach(() => {
+    Date.now = realNow;
+  });
+  it("providerBucketOf: prefix before @, before /, bare name = native meter", () => {
+    expect(providerBucketOf("gc@glm-5.3")).toBe("gc");
+    expect(providerBucketOf("qwen-token-plan@deepseek-v4.1-flash")).toBe("qwen-token-plan");
+    expect(providerBucketOf("openrouter/qwen/qwen3-coder")).toBe("openrouter");
+    expect(providerBucketOf("claude-sonnet-4-6")).toBe(NATIVE_BUCKET);
+    expect(providerBucketOf("glm-5.3")).toBe(NATIVE_BUCKET);
+  });
+
+  it("a wall on bucket cx does not divert a request whose nominal is gc (the incident)", () => {
+    initFailover({ ...S275_AUTO, ...SONNET_CASCADE });
+    // Sol (cx, OpenAI Pro) walls through a sonnet-role request:
+    expect(onNominalRefusal("sonnet", "HTTP 429 from gpt-6-sol", null, S275_WALL_BODY, "cx").outcome).toBe("grace");
+    expect(onNominalRefusal("sonnet", "HTTP 429 from gpt-6-sol", null, S275_WALL_BODY, "cx").outcome).toBe("armed");
+    // The z.ai-nominal request of the SAME role is NOT diverted:
+    const healthy = resolveFailoverTargetForSession("sonnet", "sess-zai", "gc");
+    expect(healthy.step).toBeNull();
+    expect(healthy.stepIndex).toBe(-1);
+    // The cx-nominal request diverts to marche 1 (never the nominal — #274 ruling):
+    const walled = resolveFailoverTargetForSession("sonnet", "sess-sol", "cx");
+    expect(walled.stepIndex).toBe(0);
+    expect(walled.step?.target).toBe("mistral@zai-glm-5-3");
+  });
+
+  it("provider contagion: one cx wall diverts both roles whose nominal sits in cx", () => {
+    initFailover({ ...S275_AUTO, ...OPUS_FABLE_CASCADES });
+    expect(armFailover("fable", "HTTP 429 from cx@gpt-6-sol", "cx")).toBe(true);
+    // fable's own cx-nominal requests divert:
+    expect(resolveFailoverTargetForSession("fable", "s-f", "cx").stepIndex).toBe(0);
+    // an opus-role request whose nominal is ALSO cx (routing mapped it there) diverts
+    // to OPUS's own cascade — the wall is the provider's, the cascade is the role's:
+    const viaOpus = resolveFailoverTargetForSession("opus", "s-o", "cx");
+    expect(viaOpus.stepIndex).toBe(0);
+    expect(viaOpus.step?.target).toBe("gc@glm-5.3");
+    // and a gc-nominal opus request is untouched:
+    expect(resolveFailoverTargetForSession("opus", "s-o2", "gc").step).toBeNull();
+  });
+
+  it("a native (anthropic-native) wall never diverts gc-nominal requests — the live 28/09 specimen", () => {
+    initFailover({ ...S275_AUTO, ...SONNET_CASCADE });
+    expect(armFailover("sonnet", "HTTP 429 from claude-sonnet-4-6", NATIVE_BUCKET)).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "s1", "gc").step).toBeNull();
+    expect(resolveFailoverTargetForSession("sonnet", "s2", NATIVE_BUCKET).stepIndex).toBe(0);
+  });
+
+  it("config-arm (CLAUDISH_FAILOVER_ACTIVE) diverts every bucket of the role", () => {
+    initFailover({ ...SONNET_CASCADE, CLAUDISH_FAILOVER_ACTIVE: "sonnet" });
+    expect(resolveFailoverTargetForSession("sonnet", "s1", "gc").stepIndex).toBe(0);
+    expect(resolveFailoverTargetForSession("sonnet", "s2", NATIVE_BUCKET).stepIndex).toBe(0);
+  });
+
+  it("ARM_AFTER grace runs are per bucket: gc refusals do not count toward a cx wall", () => {
+    initFailover({ ...S275_AUTO, ...SONNET_CASCADE });
+    expect(onNominalRefusal("sonnet", "HTTP 429 A", null, S275_WALL_BODY, "cx").outcome).toBe("grace");
+    expect(onNominalRefusal("sonnet", "HTTP 429 B", null, S275_WALL_BODY, "gc").outcome).toBe("grace");
+    // First refusal of cx — the gc refusal did not advance its counter:
+    expect(onNominalRefusal("sonnet", "HTTP 429 C", null, S275_WALL_BODY, "cx").outcome).toBe("armed");
+  });
+
+  it("a nominal success from a healthy bucket does NOT clear step backoff while a sibling wall holds", () => {
+    initFailover({ ...S275_AUTO, ...SONNET_CASCADE });
+    armFailover("sonnet", "weekly wall", NATIVE_BUCKET);
+    // diverted native request watches step 0 wall (Mistral 402):
+    markStepFailed("sonnet", 0, "HTTP 402 forfait");
+    // a gc-nominal request succeeds — the wall on anthropic-native still holds:
+    onNominalSuccess("sonnet", "gc");
+    const stillWalled = resolveFailoverTargetForSession("sonnet", "s-native", NATIVE_BUCKET);
+    // step 0 stays backoff'd — the next diverted request advances, it does not
+    // re-pay a doomed Mistral probe (the probe-storm guard):
+    expect(stillWalled.stepIndex).toBe(1);
+    // and once no wall remains anywhere, the steps reset (fresh episode):
+    clock += 11 * 60 * 1000;
+    isFailoverActive("sonnet"); // expire the wall
+    onNominalSuccess("sonnet", "gc");
+    const fresh = resolveFailoverTargetForSession("sonnet", "s-native2", NATIVE_BUCKET);
+    expect(fresh.step).toBeNull();
+  });
+
+  it("recovery is per (role, bucket): the gc sessions learn nothing of a cx recovery", () => {
+    initFailover({ ...S275_AUTO, ...SONNET_CASCADE });
+    armFailover("sonnet", "weekly wall", "cx");
+    // cx session diverted and notified:
+    expect(consumeStreamNotice("sonnet", "s-cx", "cx")).toContain("Mistral GLM");
+    clock += 11 * 60 * 1000;
+    isFailoverActive("sonnet", "cx"); // expire the wall
+    onNominalSuccess("sonnet", "cx");
+    expect(isRecovering("sonnet")).toBe(true);
+    // the recovery stream notice fires for the cx session, NOT for a gc session:
+    expect(consumeStreamNotice("sonnet", "s-cx", "cx")).toContain("back on the nominal");
+    expect(consumeStreamNotice("sonnet", "s-gc", "gc")).toBeNull();
+    // condensation notice scoped to (role, bucket) too:
+    expect(buildFailoverNotice("sonnet", "gc")).toBeNull();
+    expect(buildFailoverNotice("sonnet", "cx")).toContain("back on the nominal");
+  });
+
+  it("TTL expiry and re-arm escalation are per bucket", () => {
+    initFailover({ ...S275_AUTO, ...SONNET_CASCADE });
+    armFailover("sonnet", "wall", "cx");
+    clock += 5 * 60 * 1000;
+    armFailover("sonnet", "wall", "gc"); // armed 5 min later — its TTL outlives cx's
+    clock += 6 * 60 * 1000; // t+11: cx (10-min TTL) expired, gc (armed t+5) still holds
+    // expiring cx does not expire gc:
+    expect(isFailoverActive("sonnet", "cx")).toBe(false);
+    expect(isFailoverActive("sonnet", "gc")).toBe(true);
+    // re-arming cx escalates ONLY cx (ARM_AFTER=2: two fresh refusals after expiry):
+    onNominalRefusal("sonnet", "still walled", null, S275_WALL_BODY, "cx");
+    const v = onNominalRefusal("sonnet", "still walled", null, S275_WALL_BODY, "cx");
+    expect(v.outcome).toBe("armed");
+    clock += 21 * 60 * 1000;
+    expect(isFailoverActive("sonnet", "gc")).toBe(false); // its 10-min TTL elapsed
   });
 });

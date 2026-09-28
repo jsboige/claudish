@@ -7,7 +7,10 @@
  * concern. This one swaps the *model itself* for a whole role (opus/sonnet/haiku/fable)
  * when the nominal model's budget is exhausted — a subscription concern.
  *
- * Each role has an ORDERED CASCADE of substitutes, `>`-separated in env:
+ * Each role has an ORDERED CASCADE of substitutes, `>`-separated in env. Walls are
+ * per PROVIDER BUCKET (#275): a refusal walls the meter the refusing nominal draws
+ * on, and only requests whose own nominal sits in a walled bucket divert — the
+ * maxing of one provider never contaminates another role's healthy nominal.
  *
  *   CLAUDISH_FAILOVER_OPUS=qwen-token-plan@qwen3.8-max>gc@glm-5.2>deepseek@deepseek-payg
  *   CLAUDISH_FAILOVER_OPUS_LABEL=Qwen 3.8 Max>GLM-5.2>DeepSeek PAYG
@@ -79,14 +82,14 @@ export interface FailoverRule {
   steps: FailoverStep[];
 }
 
-/** A role whose nominal is currently walled (armed). Does not carry the resolved
- * step — that depends on per-step failure state, resolved on demand. */
+/** A provider bucket currently walled (armed). Does not carry the resolved
+ * step — that depends on the ROLE's per-step failure state, resolved on demand. */
 export interface ArmedFailover {
   since: Date;
-  /** "config" when armed by CLAUDISH_FAILOVER_ACTIVE, else the upstream error. */
+  /** The upstream error that armed the wall. */
   reason: string;
-  /** How long THIS arm holds before the nominal is probed again (#91 point 3:
-   * grows with each disarm→re-arm cycle while the wall holds). */
+  /** How long THIS wall holds before the bucket's nominals are probed again
+   * (#91 point 3: grows with each disarm→re-arm cycle while the wall holds). */
   ttlMs: number;
 }
 
@@ -121,25 +124,70 @@ interface RecoveryState {
 /** Parsed once at module load; re-read only by resetFailoverForTests(). */
 let rules = new Map<FailoverRole, FailoverRule>();
 let autoArmEnabled = false;
-const armed = new Map<FailoverRole, ArmedFailover>();
-/** Per-step failure counters. Independent of the role-level arm TTL. */
+
+// ─── #275: per-model maxing, provider-scoped contagion ─────────────────────────
+// Walls used to be keyed by ROLE: any member's refusal (Sol's weekly wall, a native
+// claude-sonnet 429) exiled EVERY request of that role — including those whose own
+// nominal (z.ai GLM at 47% credit remaining) was perfectly healthy. Measured
+// 2026-09-28 on the hub: two arms keyed `sonnet` off `gpt-6-sol` and the whole
+// fleet walked Mistral(402)→Kimi(403)→DeepSeek while z.ai served nothing.
+//
+// The operator ruling: maxing is a property of the MODEL'S PROVIDER BUCKET — the
+// meter — and NOTHING else. A qualifying refusal while serving model M walls
+// bucket(M); only requests whose own resolved nominal sits in a walled bucket
+// divert to THEIR role's cascade (marche 1, never the nominal — see #274). The
+// OpenAI Pro plan exhausting walls `cx` (Sol AND astra divert, across roles); the
+// z.ai 5h window walls `gc`; it never reaches a healthy `gc`-nominal request
+// through the sonnet role.
+
+/** The bucket a bare Claude id (or any unmapped bare name) draws on: the
+ * Anthropic-native meter. */
+export const NATIVE_BUCKET = "anthropic-native";
+/** Legacy/test bucket: a wall on `*` diverts the role regardless of nominal
+ * (the pre-#275 role-wide arm, still what `armFailover(role, reason)` creates). */
+export const LEGACY_ROLE_WIDE_BUCKET = "*";
+
+/** The provider bucket a target string belongs to — i.e. which meter its quota
+ * draws on. `provider@model` and `provider/model` bucket on the prefix; a bare
+ * name buckets native (the isNative predicate of the routing step). Bucklets are
+ * compared against the ROUTING-resolved provider of a request's nominal, which
+ * uses the same prefix vocabulary (gc, cx, ds, kc, mistral, mmc, …). */
+export function providerBucketOf(target: string): string {
+  const t = (target || "").trim();
+  const at = t.indexOf("@");
+  if (at > 0) return t.slice(0, at);
+  const slash = t.indexOf("/");
+  if (slash > 0) return t.slice(0, slash);
+  return NATIVE_BUCKET;
+}
+
+/** Walled provider buckets (auto-arms; TTL-expiring). Config-arms live separately
+ * in configArmedRoles — they are operator-held and never self-clear. */
+const walled = new Map<string, ArmedFailover>();
+/** Roles armed by CLAUDISH_FAILOVER_ACTIVE — divert regardless of bucket. */
+const configArmedRoles = new Set<FailoverRole>();
+/** Per-step failure counters, per role. Independent of the bucket-wall TTL: the
+ * cascade steps are shared targets, their walls are facts about the STEP, not
+ * about whichever nominal diverted onto it. */
 const stepFailures = new Map<FailoverRole, StepFailure[]>();
-/** Roles that just returned to nominal after failover — emitting recovery notices. */
-const recovering = new Map<FailoverRole, RecoveryState>();
-/** Bridge: step a role WAS serving, captured when its auto-arm TTL expires. The
- * cascade loop consumes this to seed `recovering` if the nominal probe succeeds. */
-const pendingRecovery = new Map<
-  FailoverRole,
-  { label: string; direction: FailoverDirection; stepIndex: number }
->();
+/** (role|bucket) pairs that just returned to nominal — emitting recovery notices. */
+const recovering = new Map<string, RecoveryState>();
+/** (role|bucket) → the cascade step that pair was last seen serving while its
+ * bucket was walled. Replaces the old per-role pendingRecovery: recovery is now
+ * knowable per (role, bucket), and the wall expiry itself no longer sees the role. */
+const servedUnderWall = new Map<string, { label: string; direction: FailoverDirection; stepIndex: number }>();
 /**
  * Sessions that have already received the "moment of failover" stream notice, per
- * role, mapped to the LAST step index they were notified at. Re-notify when the
- * resolved step CHANGES (Qwen→GLM mid-session) so the agent recalibrates to the new
- * substitute. Cleared on auto-arm TTL expiry (a fresh episode re-notifies) and on
- * full reset. Condensation notices are independent of this map.
+ * (role|bucket), mapped to the set of step indices they were notified at. Re-notify
+ * when the resolved step CHANGES (Qwen→GLM mid-session) so the agent recalibrates
+ * to the new substitute. Cleared on wall TTL expiry (a fresh episode re-notifies)
+ * and on full reset. Condensation notices are independent of this map.
  */
-const notifiedSessions = new Map<FailoverRole, Map<string, Set<number>>>();
+const notifiedSessions = new Map<string, Map<string, Set<number>>>();
+
+function roleBucketKey(role: FailoverRole, bucket: string | undefined): string {
+  return `${role}|${bucket ?? LEGACY_ROLE_WIDE_BUCKET}`;
+}
 
 const AUTO_ARM_TTL_MS = 10 * 60 * 1000;
 /** #91 point 3: the re-probe TTL grows while the wall holds. A flat 10-minute
@@ -173,17 +221,19 @@ let armRetryAfterCeilingMs = 120_000;
  * in-flight conversation cannot flip providers mid-work (each flip = cold
  * prompt-cache at both ends). 0 disables the per-session dwell. */
 let sessionDwellMs = 600_000;
-/** Run of consecutive qualifying nominal refusals, per role (#91 gate). */
-const nominalRefusals = new Map<FailoverRole, { count: number; lastAt: number }>();
-/** #91 point 3: TTL-expiry disarms per role that led back to an arm (the wall
- * still held). Grows the NEXT arm's TTL; reset by any nominal success. */
-const armTtlEscalation = new Map<FailoverRole, { disarms: number; lastDisarmAt: number }>();
+/** Run of consecutive qualifying nominal refusals, per bucket (#91 gate). All the
+ * nominals of a bucket draw on the same meter, so every refusal through it — from
+ * any role — counts toward the same wall. */
+const nominalRefusals = new Map<string, { count: number; lastAt: number }>();
+/** #91 point 3: TTL-expiry disarms per bucket that led back to an arm (the wall
+ * still held). Grows the NEXT wall's TTL; reset by any nominal success. */
+const armTtlEscalation = new Map<string, { disarms: number; lastDisarmAt: number }>();
 
-/** TTL for a fresh arm of `role`: base, or the escalated step when the previous
+/** TTL for a fresh wall of `bucket`: base, or the escalated step when the previous
  * disarm re-armed (wall still up). A re-arm more than ARM_TTL_MAX_MS after the
  * last disarm is a fresh episode — the escalation decayed. */
-function armTtlFor(role: FailoverRole): number {
-  const esc = armTtlEscalation.get(role);
+function armTtlFor(bucket: string): number {
+  const esc = armTtlEscalation.get(bucket);
   if (!esc || Date.now() - esc.lastDisarmAt > ARM_TTL_MAX_MS) return ARM_TTL_STEPS_MS[0];
   return ARM_TTL_STEPS_MS[Math.min(esc.disarms, ARM_TTL_STEPS_MS.length - 1)];
 }
@@ -284,11 +334,12 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   rules = loadRules(env);
   roleAliases = parseRoleAliases(env.CLAUDISH_FAILOVER_ROLE_MODELS || "");
   autoArmEnabled = /^(1|true|yes|on)$/i.test((env.CLAUDISH_FAILOVER_AUTO || "").trim());
-  armed.clear();
+  walled.clear();
+  configArmedRoles.clear();
   // In-memory probe/recovery state does not survive a restart — start fresh.
   stepFailures.clear();
   recovering.clear();
-  pendingRecovery.clear();
+  servedUnderWall.clear();
   notifiedSessions.clear();
   nominalRefusals.clear();
   armTtlEscalation.clear();
@@ -319,17 +370,15 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
         );
         continue;
       }
-      // Date.now() (not new Date()) so `since` and the TTL comparison read the same
-      // clock — otherwise a test that fakes Date.now cannot exercise the expiry.
-      armed.set(role, { since: new Date(Date.now()), reason: "config", ttlMs: Number.POSITIVE_INFINITY });
+      configArmedRoles.add(role);
     }
   }
 
-  if (armed.size > 0 || rules.size > 0) {
-    const armedList =
-      armed.size > 0
-        ? [...armed.keys()].map((r) => `${r}→${describeResolved(r)}`).join(", ")
-        : "none";
+  if (configArmedRoles.size > 0 || walled.size > 0 || rules.size > 0) {
+    const parts: string[] = [];
+    for (const role of configArmedRoles) parts.push(`${role}→${describeResolved(role)}`);
+    for (const bucket of walled.keys()) parts.push(`${bucket}→walled`);
+    const armedList = parts.length > 0 ? parts.join(", ") : "none";
     logStderr(
       `[Failover] configured=${rules.size} armed=[${armedList}] auto=${autoArmEnabled ? "on" : "off"}`
     );
@@ -442,11 +491,30 @@ export function resetAllStepFailures(role: FailoverRole): void {
  * Walks the cascade, skipping TTL-failed steps; if every step is TTL-failed, returns
  * the LAST step anyway (PAYG is meant to always work). Single source of truth — used
  * by `getHandlerForRequest`'s swap AND the cascade loop.
+ *
+ * `bucket` (#275) is the provider bucket of THIS request's resolved nominal. With
+ * it, the diversion test is `isFailoverActive(role, bucket)`: the request diverts
+ * only when its OWN nominal's meter is walled (or the role is config-armed). Without
+ * it (banner, tests), any wall or config-arm of the role diverts — the pre-#275
+ * role-wide behavior.
  */
-export function resolveFailoverTarget(role: FailoverRole): { step: FailoverStep | null; stepIndex: number } {
+export function resolveFailoverTarget(
+  role: FailoverRole,
+  bucket?: string
+): { step: FailoverStep | null; stepIndex: number } {
   const rule = rules.get(role);
-  if (!rule || !isFailoverActive(role)) return { step: null, stepIndex: -1 };
-  return resolveSkippingFailed(role, rule);
+  if (!rule || !isFailoverActive(role, bucket)) return { step: null, stepIndex: -1 };
+  const resolved = resolveSkippingFailed(role, rule);
+  if (resolved.stepIndex >= 0 && bucket !== undefined) {
+    // Remember what (role, bucket) is serving while walled — the recovery notice
+    // needs it, and the wall's TTL expiry cannot see the role (#275).
+    servedUnderWall.set(roleBucketKey(role, bucket), {
+      label: resolved.step!.label,
+      direction: resolved.step!.direction,
+      stepIndex: resolved.stepIndex,
+    });
+  }
+  return resolved;
 }
 
 // ─── #91 point 4: per-session dwell ────────────────────────────────────────────
@@ -503,12 +571,13 @@ export function getSessionDwellMs(): number {
  */
 export function resolveFailoverTargetForSession(
   role: FailoverRole,
-  sessionKey: string | null
+  sessionKey: string | null,
+  bucket?: string
 ): { step: FailoverStep | null; stepIndex: number } {
   const rule = rules.get(role);
   if (!rule) return { step: null, stepIndex: -1 };
   const dwell = sessionDwellMs;
-  if (!sessionKey || dwell <= 0) return resolveFailoverTarget(role);
+  if (!sessionKey || dwell <= 0) return resolveFailoverTarget(role, bucket);
 
   const now = Date.now();
   const pins = dwellPins.get(role);
@@ -527,7 +596,7 @@ export function resolveFailoverTargetForSession(
     // Pinned step TTL-failed (genuine advancement) — fall through, re-pin below.
   }
 
-  const resolved = resolveFailoverTarget(role);
+  const resolved = resolveFailoverTarget(role, bucket);
   if (resolved.stepIndex >= 0) {
     const m = dwellPins.get(role) ?? new Map();
     // Pin (or re-pin at a new step) only on change: resolve runs twice per
@@ -571,74 +640,114 @@ function resolveSkippingFailed(
  * plan. Ten minutes recovers promptly while probing at most ~6×/hour.
  */
 /**
- * True when requests for this role must be routed into the cascade. Auto-arms EXPIRE
- * after AUTO_ARM_TTL_MS: once expired the entry is dropped and the role's prior
- * resolved step is stashed in `pendingRecovery` so the cascade loop can emit a
- * recovery notice if the nominal probe succeeds. Config-arms never expire.
+ * True when the wall on `bucket` still holds. Auto-walls EXPIRE after their TTL:
+ * once expired the entry is dropped (the next request through the bucket serves its
+ * nominal — the probe), and every (role|bucket) notified-session map is cleared so a
+ * re-arm re-notifies. Config-arms never expire (they live in configArmedRoles, not
+ * here). Recovery state is NOT seeded here — servedUnderWall holds it per
+ * (role, bucket) and onNominalSuccess consumes it on a successful probe.
  *
  * NOTE: step-failure state is intentionally NOT cleared here — the per-step backoff
- * must outlive the role-arm cycle so a weekly-walled step isn't re-probed every
+ * must outlive the wall cycle so a weekly-walled step isn't re-probed every
  * 10 minutes. It is cleared only on full nominal recovery (resetAllStepFailures).
  */
-export function isFailoverActive(role: FailoverRole): boolean {
-  const entry = armed.get(role);
+export function isBucketWalled(bucket: string): boolean {
+  const entry = walled.get(bucket);
   if (!entry) return false;
-  if (entry.reason === "config") return true; // operator-held: never self-clears
   if (Date.now() - entry.since.getTime() < entry.ttlMs) return true;
-  // TTL expired. Capture what this role was serving so the loop can seed recovery on
-  // a successful nominal probe, then disarm.
-  const rule = rules.get(role);
-  if (rule) {
-    const { step, stepIndex } = resolveSkippingFailed(role, rule);
-    if (step) pendingRecovery.set(role, { label: step.label, direction: step.direction, stepIndex });
+  walled.delete(bucket);
+  for (const key of notifiedSessions.keys()) {
+    if (key.endsWith(`|${bucket}`)) notifiedSessions.delete(key);
   }
-  armed.delete(role);
-  notifiedSessions.delete(role); // a fresh episode may re-notify at a new depth
-  // #91 point 3: this disarm escalates the NEXT arm's TTL if the wall is still
-  // up (the re-arm reads this count). A nominal success clears it first.
-  const esc = armTtlEscalation.get(role);
-  armTtlEscalation.set(role, { disarms: (esc?.disarms || 0) + 1, lastDisarmAt: Date.now() });
-  const nextTtlMs = armTtlFor(role);
+  // #91 point 3: this disarm escalates the NEXT wall's TTL if it is still up
+  // (the re-arm reads this count). A nominal success clears it first.
+  const esc = armTtlEscalation.get(bucket);
+  armTtlEscalation.set(bucket, { disarms: (esc?.disarms || 0) + 1, lastDisarmAt: Date.now() });
+  const nextTtlMs = armTtlFor(bucket);
   logStderr(
-    `[Failover] DISARMED ${role} → probing nominal (auto-arm TTL elapsed after ${Math.round(
+    `[Failover] DISARMED bucket ${bucket} → probing nominals (auto-arm TTL elapsed after ${Math.round(
       (Date.now() - entry.since.getTime()) / 60000
-    )}min). Re-arms if the wall is still up${
+    )}min). Re-walls if the wall is still up${
       nextTtlMs > ARM_TTL_STEPS_MS[0] ? ` (next arm TTL grows to ${Math.round(nextTtlMs / 60000)}min)` : ""
     }.`
   );
   return false;
 }
 
-/** Currently-armed roles with their resolved step, in stable role order. */
-export function getActiveFailovers(): ResolvedFailover[] {
-  const out: ResolvedFailover[] = [];
+/**
+ * True when requests for this role must be routed into the cascade. With `bucket`
+ * (#275): the request diverts when its OWN nominal's bucket is walled, when the
+ * legacy role-wide bucket is walled, or when the role is config-armed — never
+ * because some OTHER bucket's nominal maxed. Without `bucket` (banner, health,
+ * tests): any wall or config-arm of the role diverts.
+ */
+export function isFailoverActive(role: FailoverRole, bucket?: string): boolean {
+  if (configArmedRoles.has(role)) return true;
+  if (bucket !== undefined) return isBucketWalled(bucket) || isBucketWalled(LEGACY_ROLE_WIDE_BUCKET);
+  if (isBucketWalled(LEGACY_ROLE_WIDE_BUCKET)) return true;
+  for (const b of walled.keys()) {
+    if (isBucketWalled(b)) return true;
+  }
+  return false;
+}
+
+/** Currently-armed (role, bucket) pairs with their resolved step, in stable order.
+ * Roles config-armed resolve once (bucket "*"); each walled bucket is reported for
+ * every role that has actually been serving under it (servedUnderWall) — a wall
+ * diverts only the sessions whose nominal sits in it, and those are the pairs that
+ * did. */
+export function getActiveFailovers(): (ResolvedFailover & { bucket: string })[] {
+  const out: (ResolvedFailover & { bucket: string })[] = [];
   for (const role of FAILOVER_ROLES) {
-    if (!isFailoverActive(role)) continue;
-    const { step, stepIndex } = resolveFailoverTarget(role);
-    if (step) out.push({ role, step, stepIndex });
+    if (configArmedRoles.has(role)) {
+      const { step, stepIndex } = resolveFailoverTarget(role);
+      if (step) out.push({ role, step, stepIndex, bucket: LEGACY_ROLE_WIDE_BUCKET });
+      continue;
+    }
+    const seen = new Set<string>();
+    for (const key of servedUnderWall.keys()) {
+      if (!key.startsWith(`${role}|`)) continue;
+      const bucket = key.slice(role.length + 1);
+      if (seen.has(bucket) || !isBucketWalled(bucket)) continue;
+      seen.add(bucket);
+      const rule = rules.get(role);
+      if (!rule) continue;
+      const { step, stepIndex } = resolveSkippingFailed(role, rule);
+      if (step) out.push({ role, step, stepIndex, bucket });
+    }
   }
   return out;
 }
 
 /**
- * Arm a role after an upstream refusal. No-op unless CLAUDISH_FAILOVER_AUTO is on and
- * a cascade is configured. Returns true only on the transition. Re-arming clears any
- * stale recovery state for the role — we are back in failover, a recovery notice
- * would mislead.
+ * Wall `bucket` after an upstream refusal from a nominal that draws on it. No-op
+ * unless CLAUDISH_FAILOVER_AUTO is on and the refusing ROLE has a cascade (the wall
+ * is only useful if there is somewhere to divert to — but it walls the BUCKET, so
+ * every other role with a nominal in it diverts too). Returns true only on the
+ * transition. Re-walling clears stale recovery state for the (role|bucket) pairs of
+ * that role — we are back in failover, a recovery notice would mislead.
+ *
+ * The default bucket is the legacy role-wide one, so `armFailover(role, reason)`
+ * keeps its pre-#275 meaning (divert the whole role).
  */
-export function armFailover(role: FailoverRole, reason: string): boolean {
+export function armFailover(role: FailoverRole, reason: string, bucket: string = LEGACY_ROLE_WIDE_BUCKET): boolean {
   if (!autoArmEnabled) return false;
-  // isFailoverActive (not armed.has) so an EXPIRED auto-arm can re-arm.
-  if (isFailoverActive(role)) return false;
+  // isBucketWalled (not walled.has) so an EXPIRED wall can re-arm.
+  if (isBucketWalled(bucket)) return false;
   const rule = rules.get(role);
   if (!rule) return false;
-  const ttlMs = armTtlFor(role);
-  armed.set(role, { since: new Date(Date.now()), reason, ttlMs });
-  pendingRecovery.delete(role);
-  recovering.delete(role);
-  const { step } = resolveFailoverTarget(role);
+  const ttlMs = armTtlFor(bucket);
+  walled.set(bucket, { since: new Date(Date.now()), reason, ttlMs });
+  for (const key of [...recovering.keys()]) {
+    if (key.startsWith(`${role}|`)) recovering.delete(key);
+  }
+  // Seeding the serving memory HERE (not at TTL expiry): the wall's expiry cannot
+  // see the role, and a caller that arms without first resolving (tests, and the
+  // arm-time log line below) still leaves a recovery breadcrumb. Resolutions
+  // during the wall refresh it.
+  const { step } = resolveFailoverTarget(role, bucket);
   logStderr(
-    `[Failover] ARMED ${role} → ${step ? step.label : "cascade"} — ${reason}${
+    `[Failover] ARMED bucket ${bucket} (${role} nominal) → ${step ? step.label : "cascade"} — ${reason}${
       ttlMs > ARM_TTL_STEPS_MS[0] ? ` (ttl ${Math.round(ttlMs / 60000)}min, escalated)` : ""
     }`
   );
@@ -703,28 +812,29 @@ export function onNominalRefusal(
   role: FailoverRole,
   reason: string,
   retryAfterHeader: string | null,
-  errBody: string
+  errBody: string,
+  bucket: string = LEGACY_ROLE_WIDE_BUCKET
 ): NominalRefusalVerdict {
-  if (isFailoverActive(role)) return { outcome: "armed" };
+  if (isFailoverActive(role, bucket)) return { outcome: "armed" };
   const burst = burstRetryAfterMs(retryAfterHeader, errBody);
   if (burst !== null) {
     logStderr(
-      `[Failover] BURST ${role} — retry-after ${Math.round(burst / 1000)}s names a short window; not arming (a wall speaks in hours)`
+      `[Failover] BURST ${role} (${bucket}) — retry-after ${Math.round(burst / 1000)}s names a short window; not arming (a wall speaks in hours)`
     );
     return { outcome: "burst", retryAfterMs: burst };
   }
-  const rec = nominalRefusals.get(role);
+  const rec = nominalRefusals.get(bucket);
   const count = (rec?.count || 0) + 1;
   if (count >= armAfterRefusals) {
-    nominalRefusals.delete(role);
-    if (armFailover(role, reason)) return { outcome: "armed" };
+    nominalRefusals.delete(bucket);
+    if (armFailover(role, reason, bucket)) return { outcome: "armed" };
     // autoArmEnabled off or unconfigured rule: behave like the old call site —
     // not armed, not active, the caller surfaces the raw response.
     return { outcome: "grace", count, needed: armAfterRefusals };
   }
-  nominalRefusals.set(role, { count, lastAt: Date.now() });
+  nominalRefusals.set(bucket, { count, lastAt: Date.now() });
   logStderr(
-    `[Failover] ARM-GRACE ${role} — qualifying refusal ${count}/${armAfterRefusals} (CLAUDISH_FAILOVER_ARM_AFTER); not arming yet`
+    `[Failover] ARM-GRACE ${role} (${bucket}) — qualifying refusal ${count}/${armAfterRefusals} (CLAUDISH_FAILOVER_ARM_AFTER); not arming yet`
   );
   return { outcome: "grace", count, needed: armAfterRefusals };
 }
@@ -908,21 +1018,28 @@ export function isWiringError(status: number, body: string): boolean {
 }
 
 /**
- * Called by the cascade loop when the NOMINAL model answered successfully for `role`.
- * Clears all step failures (healthy nominal = fresh episode) and, if the role had a
- * pending recovery (its auto-arm just expired), seeds the recovery notice state.
+ * Called by the cascade loop when the NOMINAL model answered successfully for `role`
+ * drawing on `bucket`. Clears that bucket's refusal run and TTL escalation (healthy
+ * nominal = fresh episode for the METER) and, if (role|bucket) was serving under a
+ * wall whose TTL had just expired, seeds the recovery notice state.
+ *
+ * Step failures are reset only when NO wall remains anywhere: a sibling bucket's
+ * persistent wall (native sonnet walled while z.ai serves nominal successes on
+ * every request, measured 2026-09-28) keeps its sessions walking the cascade, and
+ * clearing the steps' backoff under it would make every diverted request re-pay a
+ * doomed probe on step 0 before advancing.
  */
-export function onNominalSuccess(role: FailoverRole): void {
-  // #91: a healthy nominal means a fresh episode — the consecutive-refusal run
-  // that was building toward an arm is void, and so is the TTL escalation it
-  // was feeding (point 3: the wall is gone; prompt recovery over damping).
-  nominalRefusals.delete(role);
-  armTtlEscalation.delete(role);
-  resetAllStepFailures(role);
-  const pending = pendingRecovery.get(role);
+export function onNominalSuccess(role: FailoverRole, bucket: string = LEGACY_ROLE_WIDE_BUCKET): void {
+  // #91: a healthy nominal means a fresh episode for this bucket — the
+  // consecutive-refusal run that was building toward a wall is void, and so is the
+  // TTL escalation it was feeding (point 3: prompt recovery over damping).
+  nominalRefusals.delete(bucket);
+  armTtlEscalation.delete(bucket);
+  const key = roleBucketKey(role, bucket);
+  const pending = servedUnderWall.get(key);
   if (pending) {
-    pendingRecovery.delete(role);
-    recovering.set(role, {
+    servedUnderWall.delete(key);
+    recovering.set(key, {
       since: new Date(Date.now()),
       remaining: RECOVERY_CONDENSATIONS,
       prevLabel: pending.label,
@@ -931,26 +1048,48 @@ export function onNominalSuccess(role: FailoverRole): void {
       notifiedSessions: new Set(),
     });
     logStderr(
-      `[Failover] RECOVERED ${role} → nominal (was ${pending.label}, the ${ordinal(
+      `[Failover] RECOVERED ${role} (${bucket}) → nominal (was ${pending.label}, the ${ordinal(
         pending.stepIndex
       )} fallback). Recovery notices for ${RECOVERY_CONDENSATIONS} condensations.`
     );
   }
+  let wallsRemain = walled.size > 0;
+  if (wallsRemain) {
+    // Expire what has expired before counting it as remaining.
+    let live = 0;
+    for (const b of walled.keys()) {
+      if (isBucketWalled(b)) live++;
+    }
+    wallsRemain = live > 0;
+  }
+  if (!wallsRemain) resetAllStepFailures(role);
+}
+
+/** Recovery entries matching (role[, bucket]) — exact key when bucket is given,
+ * any bucket of the role otherwise. Self-clears expired entries. */
+function recoveringEntries(
+  role?: FailoverRole | null,
+  bucket?: string
+): { key: string; role: FailoverRole; state: RecoveryState }[] {
+  const out: { key: string; role: FailoverRole; state: RecoveryState }[] = [];
+  for (const [key, st] of recovering) {
+    if (Date.now() - st.since.getTime() > RECOVERY_MAX_MS) {
+      recovering.delete(key);
+      continue;
+    }
+    const sep = key.indexOf("|");
+    const roleStr = key.slice(0, sep);
+    const keyBucket = key.slice(sep + 1);
+    if (role && roleStr !== role) continue;
+    if (bucket !== undefined && keyBucket !== bucket) continue;
+    out.push({ key, role: roleStr as FailoverRole, state: st });
+  }
+  return out;
 }
 
 /** True while recovery notices should fire for `role` (self-clears after TTL). */
 export function isRecovering(role: FailoverRole): boolean {
-  const r = recovering.get(role);
-  if (!r) return false;
-  if (Date.now() - r.since.getTime() > RECOVERY_MAX_MS) {
-    recovering.delete(role);
-    return false;
-  }
-  return true;
-}
-
-function recoveringState(role: FailoverRole): RecoveryState | undefined {
-  return isRecovering(role) ? recovering.get(role) : undefined;
+  return recoveringEntries(role).length > 0;
 }
 
 // ─── notices ───────────────────────────────────────────────────────────────────
@@ -978,12 +1117,18 @@ function ordinal(n: number): string {
  * serving you". An armed sibling role is someone else's failover — announcing it
  * here tells the agent its own requests are substituted when they are not.
  */
-export function buildFailoverNotice(role?: FailoverRole | null): string | null {
-  const active = getActiveFailovers().filter((a) => !role || a.role === role);
-  const rec = FAILOVER_ROLES.filter((r) => (!role || r === role) && isRecovering(r)).map((r) => ({
-    role: r,
-    state: recoveringState(r)!,
-  }));
+export function buildFailoverNotice(role?: FailoverRole | null, bucket?: string): string | null {
+  const active: (ResolvedFailover & { bucket: string })[] = [];
+  if (role) {
+    // One session, one (role, bucket): only ITS OWN bucket's diversion is "the
+    // model actually serving you" — a sibling bucket's wall is someone else's
+    // failover and must not be announced here (#275).
+    const { step, stepIndex } = resolveFailoverTarget(role, bucket);
+    if (step) active.push({ role, step, stepIndex, bucket: bucket ?? LEGACY_ROLE_WIDE_BUCKET });
+  } else {
+    active.push(...getActiveFailovers());
+  }
+  const rec = recoveringEntries(role, bucket);
   if (active.length === 0 && rec.length === 0) return null;
 
   const lines: string[] = [];
@@ -1017,7 +1162,7 @@ export function buildFailoverNotice(role?: FailoverRole | null): string | null {
     );
     // Decrement after emitting; clear when the budget of condensations is spent.
     r.state.remaining -= 1;
-    if (r.state.remaining <= 0) recovering.delete(r.role);
+    if (r.state.remaining <= 0) recovering.delete(r.key);
   }
 
   const header =
@@ -1044,9 +1189,9 @@ export function buildFailoverNotice(role?: FailoverRole | null): string | null {
  * `content[0]`), otherwise pushes one. Never throws — a malformed message must not
  * turn a working condensation into a failed one.
  */
-export function appendFailoverNoticeToMessage(message: any, role?: FailoverRole | null): void {
+export function appendFailoverNoticeToMessage(message: any, role?: FailoverRole | null, bucket?: string): void {
   try {
-    const notice = buildFailoverNotice(role);
+    const notice = buildFailoverNotice(role, bucket);
     if (!notice) return;
     if (!message || !Array.isArray(message.content)) return;
 
@@ -1126,28 +1271,33 @@ function buildStreamRecoveryText(role: FailoverRole, st: RecoveryState): string 
  * that return fired a fresh notice every time the resolver oscillated. Atomic
  * (check + mark in one call) so two concurrent in-flight requests can't both win.
  */
-export function consumeStreamNotice(role: FailoverRole, sessionKey: string | null): string | null {
+export function consumeStreamNotice(
+  role: FailoverRole,
+  sessionKey: string | null,
+  bucket?: string
+): string | null {
   if (!sessionKey) return null;
 
-  const rec = recoveringState(role);
+  const rec = recoveringEntries(role, bucket)[0]?.state;
   if (rec) {
     if (rec.notifiedSessions.has(sessionKey)) return null;
     rec.notifiedSessions.add(sessionKey);
     return buildStreamRecoveryText(role, rec);
   }
 
-  if (!isFailoverActive(role)) return null;
-  const { step, stepIndex } = resolveFailoverTarget(role);
+  if (!isFailoverActive(role, bucket)) return null;
+  const { step, stepIndex } = resolveFailoverTarget(role, bucket);
   if (!step) return null;
-  let perRole = notifiedSessions.get(role);
-  if (!perRole) {
-    perRole = new Map();
-    notifiedSessions.set(role, perRole);
+  const key = roleBucketKey(role, bucket);
+  let perPair = notifiedSessions.get(key);
+  if (!perPair) {
+    perPair = new Map();
+    notifiedSessions.set(key, perPair);
   }
-  let announced = perRole.get(sessionKey);
+  let announced = perPair.get(sessionKey);
   if (!announced) {
     announced = new Set();
-    perRole.set(sessionKey, announced);
+    perPair.set(sessionKey, announced);
   }
   if (announced.has(stepIndex)) return null; // already announced this depth in this session
   announced.add(stepIndex);
@@ -1190,10 +1340,11 @@ export function resetFailoverForTests(env?: NodeJS.ProcessEnv): void {
     rules = new Map();
     roleAliases = [];
     autoArmEnabled = false;
-    armed.clear();
+    walled.clear();
+    configArmedRoles.clear();
     stepFailures.clear();
     recovering.clear();
-    pendingRecovery.clear();
+    servedUnderWall.clear();
     notifiedSessions.clear();
     nominalRefusals.clear();
     armTtlEscalation.clear();
