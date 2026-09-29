@@ -165,6 +165,17 @@ export function main(argv: string[]): number {
       `[STRICT] 🔴 RUN KILLED at wall-clock ${WALL_CLOCK_MS / 1000}s — a hook hung beyond the per-test timeout. ` +
         `No verdict can be drawn from a killed run; re-run (the flaky tail is exactly this class of event).\n`,
     );
+    // Diagnosis: the last file that produced output is the usual suspect —
+    // spawnSync's buffers hold whatever was read before the kill, so surface
+    // it instead of leaving the hung hook nameless.
+    const tail = ((r.stdout ?? "") + (r.stderr ?? ""))
+      .split(/\r?\n/)
+      .filter((l) => l.trim() !== "" && !l.startsWith("[ENV-GATE]"))
+      .slice(-15);
+    if (tail.length > 0) {
+      process.stdout.write(`[STRICT] last output before the kill (diagnosis):\n`);
+      for (const l of tail) process.stdout.write(`[STRICT] | ${l.slice(0, 160)}\n`);
+    }
     return 3;
   }
   const raw = (r.stdout ?? "") + (r.stderr ?? "");
