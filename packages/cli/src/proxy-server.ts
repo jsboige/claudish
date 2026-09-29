@@ -57,6 +57,9 @@ import {
   classifyNominalBucket,
   providerBucketOf,
   resolveFailoverTargetForSession,
+  resolveConcreteTarget,
+  findCascadeStepForTarget,
+  setRoleNominalResolver,
   markStepFailed,
   parseResetAtFromBody,
   resetStepSuccess,
@@ -455,6 +458,12 @@ export async function createProxyServer(
   // env; when set, diverts a whole role to another pool and announces it at the
   // next condensation. Read once per proxy lifetime. See fork/failover.ts.
   initFailover();
+
+  // #274: the failover module needs each role's NOMINAL routing target to
+  // resolve a `role:` cascade step (modelMap is the owner). The reverse mapping
+  // of resolveRoleMappedModel — a role whose modelMap entry is unset has no
+  // known nominal, and the delegation falls to that role's own cascade.
+  setRoleNominalResolver((r) => modelMap?.[r]);
 
   // Load user-declared custom endpoints from ~/.claudish/config.json and
   // register them in the runtime provider registry so they appear in lookups
@@ -1084,6 +1093,21 @@ export async function createProxyServer(
         continue;
       }
       if (stepIndex >= 0) triedSteps.add(stepIndex);
+      // #274: the concrete model actually being attempted (a role-step's
+      // delegation resolved, or the model target itself). Failover bookkeeping
+      // happens on BOTH levels: the delegating role's step (dwell/skip/notice,
+      // already handled above) AND the owning cascade — a delegated wall of the
+      // target's nominal arms the target's nominal bucket, and a delegated wall
+      // of an owning cascade step marks THAT step's backoff.
+      const concreteTarget = role
+        ? (() => {
+            const { step } = resolveFailoverTargetForSession(role, sessionKey, bucket);
+            return step ? resolveConcreteTarget(role, step) : null;
+          })()
+        : null;
+      const nominalTargetForRole = modelMap?.[role as keyof RoleModelMap] as string | undefined;
+      const isRoleNominalServing = stepIndex >= 0 && concreteTarget !== null && concreteTarget === nominalTargetForRole;
+      const owning = concreteTarget !== null ? findCascadeStepForTarget(concreteTarget) : null;
       // Native-lane version pin. Applied HERE rather than at the route, because the
       // cascade re-resolves the handler every attempt: only the attempt that actually
       // lands on NativeHandler may carry a bare Anthropic id, and a later attempt is a
@@ -1104,6 +1128,9 @@ export async function createProxyServer(
         if (role) {
           if (stepIndex === -1) onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
           else resetStepSuccess(role, stepIndex);
+          // #274: the concrete model succeeded — clear the OWNING side too.
+          if (isRoleNominalServing) onNominalSuccess(role, bucket);
+          else if (owning) resetStepSuccess(owning.role, owning.stepIndex);
         }
         return response;
       }
@@ -1147,6 +1174,8 @@ export async function createProxyServer(
         // marking makes every subsequent request re-pay the round-trip (and its
         // timeout) to a step that may be down for hours. Any success resets the count.
         markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody));
+        if (isRoleNominalServing) markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody), true);
+        else if (owning) markStepFailed(owning.role, owning.stepIndex, why, parseResetAtFromBody(errBody));
         continue;
       }
       const reason = `HTTP ${response.status} from ${requestedModel}`;
@@ -1180,6 +1209,15 @@ export async function createProxyServer(
         // serves from the cascade.
       } else {
         markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody));
+        if (isRoleNominalServing) {
+          // #274: the failing concrete model was the TARGET ROLE'S NOMINAL —
+          // re-mark with wasNominal so the dwell pin re-resolves the delegate
+          // (joins the target's own cascade) instead of dropping the session
+          // blindly to the delegating role's next step.
+          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody), true);
+        } else if (owning) {
+          markStepFailed(owning.role, owning.stepIndex, reason, parseResetAtFromBody(errBody));
+        }
         if (rule && stepIndex === rule.steps.length - 1) return response; // last step also walled
       }
     }

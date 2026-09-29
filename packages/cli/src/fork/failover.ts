@@ -64,8 +64,17 @@ export type FailoverDirection = "degraded" | "improved" | "lateral";
 
 /** One substitution target within a role's cascade. */
 export interface FailoverStep {
-  /** Routing target, in any form `getHandlerForRequest` accepts. */
+  /** Routing target, in any form `getHandlerForRequest` accepts. When this step
+   * delegates to another role (#274), this holds the CONCRETE model currently
+   * serving that role (its nominal if healthy, else the target of its own
+   * resolved cascade step) — refreshed at every resolution. The dwell pin, the
+   * notices and the routing log all read this field, so a role-step is always
+   * announced and pinned by what it actually serves, never by the role name. */
   target: string;
+  /** #274: set when this step was configured as `role:<r>` — a delegation to
+   * another role rather than a model target. `target` then holds the resolved
+   * concrete model (see above). */
+  roleRef?: FailoverRole;
   /** Human label for the notice; defaults to the target string. */
   label: string;
   direction: FailoverDirection;
@@ -109,6 +118,12 @@ interface StepFailure {
    * regardless of backoff — the wall cannot lift before its reset. Once it passes,
    * the step is probed again (a reset step must be consumed, not avoided). */
   resetAt?: Date;
+  /** #274: true when the model last failing this step was the TARGET ROLE'S
+   * NOMINAL (a role-step served the nominal and it walled). The pinned-step
+   * servability test uses it to re-resolve the delegate instead of blindly
+   * dropping the session to the delegating role's next step (that would skip
+   * the target's OWN cascade, which may have a healthy step 0). */
+  wasNominal?: boolean;
 }
 
 interface RecoveryState {
@@ -293,6 +308,39 @@ function splitSteps(raw: string): string[] {
   return raw.split(">").map((s) => s.trim()).filter(Boolean);
 }
 
+/** #274: parse a `role:<r>` step reference. Returns the role when the raw step
+ * is exactly that form (case-insensitive, trimmed); undefined otherwise — a
+ * model target must never be misparsed as a delegation (models can contain
+ * colons, e.g. `ollama@llama3.2:3`, but `role:` is unambiguous). */
+function parseRoleRef(raw: string): FailoverRole | undefined {
+  const m = /^role\s*:\s*(.+)$/i.exec((raw || "").trim());
+  if (!m) return undefined;
+  const role = m[1].trim().toLowerCase() as FailoverRole;
+  return FAILOVER_ROLES.includes(role) ? role : undefined;
+}
+
+/**
+ * #274 acyclicity guard: the delegation graph (role → roles it references via
+ * `role:` steps) must stay acyclic — Sonnet's chain stays model-only by design,
+ * so role-steps terminate there. A cycle is refused at LOAD time (never at
+ * resolution): the config is dropped with a loud log rather than letting a
+ * recursive resolution loop forever at runtime. Self-reference is a cycle of 1.
+ * Returns true when the graph is acyclic (no delegation path returns to `from`).
+ */
+function delegationAcyclic(
+  from: FailoverRole,
+  visiting: Set<FailoverRole>,
+  refs: Map<FailoverRole, FailoverRole[]>
+): boolean {
+  if (visiting.has(from)) return false;
+  visiting.add(from);
+  for (const next of refs.get(from) ?? []) {
+    if (!delegationAcyclic(next, visiting, refs)) return false;
+  }
+  visiting.delete(from);
+  return true;
+}
+
 /** Parse CLAUDISH_FAILOVER_<ROLE>_RESET into per-step dates. Unlike labels, position
  * matters even for empty entries: ">2026-08-25T22:28:00Z" declares a reset for step 1
  * only — so empties must NOT be filtered out the way splitSteps does. Invalid entries
@@ -316,27 +364,56 @@ function parseStepResets(raw: string | undefined, count: number, role: FailoverR
 }
 
 function loadRules(env: NodeJS.ProcessEnv): Map<FailoverRole, FailoverRule> {
+  const rawTargets = new Map<FailoverRole, string[]>();
+  for (const role of FAILOVER_ROLES) {
+    const targets = splitSteps(env[`CLAUDISH_FAILOVER_${role.toUpperCase()}`] || "");
+    if (targets.length > 0) rawTargets.set(role, targets);
+  }
+  // #274: collect the delegation graph and refuse a cyclic config at load —
+  // resolution must be able to assume the graph terminates.
+  const refs = new Map<FailoverRole, FailoverRole[]>();
+  for (const [role, targets] of rawTargets) {
+    const r = targets.map(parseRoleRef).filter((x): x is FailoverRole => x !== undefined);
+    if (r.length > 0) refs.set(role, r);
+  }
+  const rejected = new Set<FailoverRole>();
+  for (const role of rawTargets.keys()) {
+    if (!delegationAcyclic(role, new Set(), refs)) {
+      rejected.add(role);
+      logStderr(
+        `[Failover] ${role}: REFUSED — its 'role:' delegation forms a cycle (${[...(refs.get(role) ?? [])].join(", ")}). The delegation graph must stay acyclic; check CLAUDISH_FAILOVER_${role.toUpperCase()} and every role it delegates to.`
+      );
+    }
+  }
+
   const out = new Map<FailoverRole, FailoverRule>();
   for (const role of FAILOVER_ROLES) {
+    const targets = rawTargets.get(role);
+    if (!targets || rejected.has(role)) continue;
     const key = `CLAUDISH_FAILOVER_${role.toUpperCase()}`;
-    const targets = splitSteps(env[key] || "");
-    if (targets.length === 0) continue;
     const labels = splitSteps(env[`${key}_LABEL`] || "");
     const directions = splitSteps(env[`${key}_DIRECTION`] || "");
     const notes = splitSteps(env[`${key}_NOTE`] || "");
     const resets = parseStepResets(env[`${key}_RESET`], targets.length, role);
     if (labels.length !== 0 && labels.length !== targets.length) {
       logStderr(
-        `[Failover] ${role}: ${labels.length} labels vs ${targets.length} targets — padding with defaults. Check CLAUDISH_FAILOVER_${role.toUpperCase()}_LABEL.`
+        `[Failover] ${role}: ${labels.length} labels vs ${targets.length} targets — padding with defaults. Check ${key}_LABEL.`
       );
     }
-    const steps: FailoverStep[] = targets.map((target, i) => ({
-      target,
-      label: labels[i]?.trim() || target,
-      direction: parseDirection(directions[i]),
-      note: notes[i]?.trim() || undefined,
-      resetAt: resets[i],
-    }));
+    const steps: FailoverStep[] = targets.map((target, i) => {
+      const roleRef = parseRoleRef(target);
+      return {
+        // A role-step's target starts as the role keyword; the first resolution
+        // replaces it with the concrete model actually serving that role. Until
+        // then nothing routes to it (resolution always runs before serving).
+        target: roleRef ?? target,
+        roleRef,
+        label: labels[i]?.trim() || target,
+        direction: parseDirection(directions[i]),
+        note: notes[i]?.trim() || undefined,
+        resetAt: resets[i],
+      };
+    });
     out.set(role, { role, steps });
   }
   return out;
@@ -457,6 +534,99 @@ export function getFailoverRule(role: FailoverRole): FailoverRule | undefined {
   return rules.get(role);
 }
 
+// ─── #274: role-as-failover-step ───────────────────────────────────────────────
+// A cascade step of the form `role:sonnet` delegates to another ROLE instead of
+// naming a model — the operator's mental model ("when X maxes, become role Y")
+// made config, removing the duplication where a healthy role's nominal had to be
+// copied as step 0 of every other role's cascade (deployed 2026-09-28 13:41Z as
+// the interim fix, removed once this lands).
+//
+// Delegation resolution = the target role's NOMINAL when healthy, else the
+// target's currently-resolved cascade step (shared walk state) — delegated
+// traffic joins the target's existing resolution instead of re-walking walled
+// steps. The graph is proven acyclic at load (delegationAcyclic), so the
+// recursion below terminates. Failover bookkeeping happens on BOTH levels: the
+// delegating step records against its own role (dwell/skip/notice) AND the
+// concrete model records against the owning cascade (nominal walls the owning
+// bucket, an owning-step wall marks the owning step's backoff).
+
+/** Resolves a role's NOMINAL routing target — injected by proxy-server (the
+ * modelMap owner). Unset in tests: a role-step then resolves to its next best
+ * concrete substitute (the target role's own cascade, never the unknown
+ * nominal), and if the target has no cascade either the delegating step is
+ * skipped. Never returns the placeholder role keyword as a servable target. */
+let roleNominalResolver: ((role: FailoverRole) => string | undefined) | null = null;
+
+export function setRoleNominalResolver(fn: ((role: FailoverRole) => string | undefined) | null): void {
+  roleNominalResolver = fn;
+}
+
+/** Resolve a role-step to the concrete model currently serving `step.roleRef`:
+ * the target's nominal when healthy enough, else the target's own resolved
+ * cascade step (recursed — acyclic by load-time proof). "Healthy enough" holds
+ * the delegation to the SAME bar the cascade loop holds the nominal: not the
+ * arm-after-refusals grace threshold (a wall whose escalate-TTL expired is a
+ * live, confirmed wall — its probe belongs to the target's own cascade, not to
+ * every session delegated into it). Returns the concrete target string, or null
+ * when the delegation cannot serve right now. Side effects: arms the target's
+ * nominal bucket when that bucket is already walled but unconfigured; refreshes
+ * `step.target` in place. */
+function resolveRoleStep(_role: FailoverRole, step: FailoverStep): string | null {
+  const targetRole = step.roleRef!;
+  const nominal = roleNominalResolver?.(targetRole);
+  if (nominal) {
+    const nb = classifyNominalBucket(nominal, () => false);
+    if ("bucket" in nb) {
+      const walledNow =
+        isBucketWalled(nb.bucket) || isBucketWalled(LEGACY_ROLE_WIDE_BUCKET);
+      // A walled bucket whose grace threshold never fired still counts as
+      // walled for the delegation — but the nominal had its chance when the
+      // escalate-TTL elapsed (probe window): then, and only then, may the
+      // delegate take the probe instead of diverting.
+      const probeWindowOpen =
+        (nominalRefusals.get(nb.bucket)?.count ?? 0) >= armAfterRefusals;
+      if (!walledNow || probeWindowOpen) {
+        step.target = nominal;
+        return nominal;
+      }
+      if (!rules.get(targetRole)) {
+        // Walled bucket and the target role has NO cascade to fall to: arm the
+        // bucket so the wall owns a failover (a role-step resolves to the
+        // nominal if healthy — a walled bucket is not healthy, and with nowhere
+        // to fall the delegating role advances to its own next step).
+        armFailover(targetRole, `role-step nominal ${nominal} found its bucket ${nb.bucket} walled with no cascade`, nb.bucket);
+      }
+    } else {
+      // Bare routing-chain nominal: the credential-filtered bucket is a
+      // proxy-side (route()) call the failover module must not make. Serving
+      // the nominal is the safe default — its own refusal walls the bucket it
+      // names, and the NEXT delegation resolves to the target's cascade.
+      step.target = nominal;
+      return nominal;
+    }
+  }
+  const own = rules.get(targetRole);
+  if (own) {
+    const ownResolved = resolveSkippingFailed(targetRole, own);
+    if (ownResolved.step) {
+      const concrete = resolveConcreteTarget(targetRole, ownResolved.step);
+      if (concrete) {
+        step.target = concrete;
+        return concrete;
+      }
+    }
+  }
+  return null;
+}
+
+/** The concrete target of any step: the model itself, or the role-step's
+ * resolved delegation. Exposed for the proxy's bookkeeping (knowing WHICH
+ * concrete model a role-step currently serves without re-resolving). */
+export function resolveConcreteTarget(role: FailoverRole, step: FailoverStep): string | null {
+  if (!step.roleRef) return step.target;
+  return resolveRoleStep(role, step);
+}
+
 // ─── per-step backoff ──────────────────────────────────────────────────────────
 
 function stepTtlMs(count: number): number {
@@ -495,18 +665,21 @@ function stepFailuresFor(role: FailoverRole): StepFailure[] {
 
 /** Record that cascade step `idx` for `role` just quota-walled. `bodyResetAt` is the
  * reset time parsed from the provider's own error body (most accurate at wall time);
- * when absent, the operator-declared step.resetAt applies if configured. */
+ * when absent, the operator-declared step.resetAt applies if configured.
+ * `wasNominal` (#274): the failing concrete model was the target role's NOMINAL
+ * (only meaningful on a role-step) — the dwell pin re-resolves on it. */
 export function markStepFailed(
   role: FailoverRole,
   idx: number,
   reason: string,
-  bodyResetAt?: Date
+  bodyResetAt?: Date,
+  wasNominal?: boolean
 ): void {
   const rule = rules.get(role);
   if (!rule || idx < 0 || idx >= rule.steps.length) return;
   const arr = stepFailuresFor(role);
   const resetAt = bodyResetAt ?? rule.steps[idx].resetAt;
-  arr[idx] = { count: arr[idx].count + 1, lastFailure: new Date(Date.now()), resetAt };
+  arr[idx] = { count: arr[idx].count + 1, lastFailure: new Date(Date.now()), resetAt, wasNominal };
   const ttlText = resetAt ? `until ${resetAt.toISOString()}` : `${Math.round(stepTtlMs(arr[idx].count) / 60000)}min`;
   logStderr(
     `[Failover] step ${role}[${idx}] (${rule.steps[idx].label}) walled — count=${arr[idx].count} ttl=${ttlText} (${reason})`
@@ -523,6 +696,33 @@ export function resetStepSuccess(role: FailoverRole, idx: number): void {
 /** Clear ALL step failures for a role — used when the nominal itself recovers. */
 export function resetAllStepFailures(role: FailoverRole): void {
   stepFailures.delete(role);
+}
+
+// ─── #274 bookkeeping seam (proxy-side) ────────────────────────────────────────
+// When a role-step serves, the concrete model must ALSO record against the
+// OWNING cascade — a delegated wall of sonnet's nominal arms sonnet's nominal
+// bucket, not merely marks the delegating role's step. The proxy knows which
+// concrete model it is about to attempt (it resolved it); this lookup turns
+// that target back into its owning cascade coordinate, if any. Nominal: the
+// proxy compares against its own roleNominalResolver — it owns the modelMap.
+
+/** Find (role, stepIndex) whose step currently resolves to `concreteTarget`
+ * (its `target` refreshed at resolution time). Returns null when no configured
+ * step serves that target right now — the concrete model is then a nominal or
+ * an unmanaged target. */
+export function findCascadeStepForTarget(
+  concreteTarget: string
+): { role: FailoverRole; stepIndex: number } | null {
+  const t = (concreteTarget || "").trim();
+  if (!t) return null;
+  for (const role of FAILOVER_ROLES) {
+    const rule = rules.get(role);
+    if (!rule) continue;
+    for (let i = 0; i < rule.steps.length; i++) {
+      if (rule.steps[i].target === t) return { role, stepIndex: i };
+    }
+  }
+  return null;
 }
 
 // ─── resolution ────────────────────────────────────────────────────────────────
@@ -626,7 +826,22 @@ export function resolveFailoverTargetForSession(
 
   if (pin && pin.until > now) {
     const fails = stepFailures.get(role);
-    const pinnedStillServable = pin.stepIndex < rule.steps.length && !isStepTtlFailed(fails?.[pin.stepIndex]);
+    const pinnedStep = rule.steps[pin.stepIndex];
+    const pinnedFailure = fails?.[pin.stepIndex];
+    let pinnedStillServable =
+      pin.stepIndex < rule.steps.length && !isStepTtlFailed(pinnedFailure);
+    if (pinnedStillServable && pinnedStep?.roleRef) {
+      if (pinnedFailure?.wasNominal) {
+        // The pin's last failure was the TARGET'S NOMINAL walling — the delegate
+        // must re-resolve (join the target's own cascade), never blindly drop
+        // this session to the delegating role's next step.
+        pinnedStillServable = false;
+      } else if (resolveRoleStep(role, pinnedStep) === null) {
+        // The delegation can no longer serve (its own resolution went nominal,
+        // or its concrete target died) — re-resolve; never pin a placeholder.
+        pinnedStillServable = false;
+      }
+    }
     if (pinnedStillServable) {
       // Sliding dwell: an in-flight conversation (one that keeps resolving)
       // renews, so the hold lasts as long as the session is active. An idle
@@ -661,17 +876,32 @@ export function resolveFailoverTargetForSession(
 }
 
 /** Resolution that does NOT call isFailoverActive (used inside isFailoverActive's
- * own expiry path, to avoid recursion and to read pre-deletion state). Assumes armed. */
+ * own expiry path, to avoid recursion and to read pre-deletion state). Assumes armed.
+ * #274: a role-step that cannot serve (null delegation) is skipped like a failed
+ * step; an all-delegation cascade with no servable delegate yields null (no
+ * substitution) rather than routing to a placeholder. */
 function resolveSkippingFailed(
   role: FailoverRole,
   rule: FailoverRule
 ): { step: FailoverStep | null; stepIndex: number } {
   const fails = stepFailures.get(role);
   for (let i = 0; i < rule.steps.length; i++) {
-    if (!isStepTtlFailed(fails?.[i])) return { step: rule.steps[i], stepIndex: i };
+    if (isStepTtlFailed(fails?.[i])) continue;
+    const step = rule.steps[i];
+    if (step.roleRef && resolveRoleStep(role, step) === null) continue;
+    return { step, stepIndex: i };
   }
+  // Every step is TTL-failed: serve the LAST step anyway — a PAYG target should
+  // not wall, and its real error beats a synthetic one. A last step that is a
+  // role delegation is the exception: it is not a guaranteed-servable PAYG —
+  // when its delegation cannot resolve concrete, yielding nothing lets the raw
+  // refusal surface instead of routing to a placeholder.
   const last = rule.steps.length - 1;
-  return { step: rule.steps[last], stepIndex: last };
+  const lastStep = rule.steps[last];
+  if (lastStep.roleRef && resolveRoleStep(role, lastStep) === null) {
+    return { step: null, stepIndex: -1 };
+  }
+  return { step: lastStep, stepIndex: last };
 }
 
 /**
@@ -1394,6 +1624,7 @@ export function resetFailoverForTests(env?: NodeJS.ProcessEnv): void {
     nominalRefusals.clear();
     armTtlEscalation.clear();
     dwellPins.clear();
+    roleNominalResolver = null;
     armAfterRefusals = 2;
     armGraceMs = 0;
     armRetryAfterCeilingMs = 120_000;
