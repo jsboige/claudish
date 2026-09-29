@@ -246,11 +246,14 @@ export async function applyFailoverNotices(
   role: FailoverRole | null,
   sessionKey: string | null,
   wantsStreaming: boolean,
-  policy: NoticeIngressPolicy = { inContent: true }
+  policy: NoticeIngressPolicy = { inContent: true },
+  /** #275: provider bucket of THIS request's nominal — the notice fires only for
+   * the diversion the session actually took, never for a sibling bucket's wall. */
+  nominalBucket?: string
 ): Promise<Response> {
   if (!role) return response;
   if (wantsStreaming) {
-    const text = consumeStreamNotice(role, sessionKey);
+    const text = consumeStreamNotice(role, sessionKey, nominalBucket);
     if (!text) return response;
     if (!policy.inContent) {
       return responseWithNoticeHeader(response, text);
@@ -273,13 +276,13 @@ export async function applyFailoverNotices(
   if (!policy.inContent) {
     // Same notice text and side effects (recovery-budget decrement) as the
     // content path — only the channel differs.
-    const text = buildFailoverNotice(role);
+    const text = buildFailoverNotice(role, nominalBucket);
     if (text) return responseWithNoticeHeader(response, text);
     return response;
   }
   try {
     const message = await response.clone().json();
-    appendFailoverNoticeToMessage(message, role);
+    appendFailoverNoticeToMessage(message, role, nominalBucket);
     const headers = new Headers(response.headers);
     headers.set("Content-Type", "application/json");
     return new Response(JSON.stringify(message), { status: response.status, headers });
