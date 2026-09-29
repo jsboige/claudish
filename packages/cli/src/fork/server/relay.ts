@@ -27,6 +27,7 @@
 import type { Context } from "hono";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { log } from "../../logger.js";
+import { getInstanceId } from "../../instance-id.js";
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
 import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
 import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
@@ -51,6 +52,13 @@ export interface RelayState {
   consecutiveOk: number;
   /** ms epoch of the last alive→false / false→true transition (recovery cooldown). */
   lastFlipAt: number;
+  /**
+   * #156: the upstream's /health published OUR OWN instanceId — the upstream IS
+   * this process, whatever the URL says (the 2026-09-19 ARR-loop shape). Sticky
+   * per detection: latched true by `heartbeat()`, cleared when a reply stops
+   * matching. Published on /health as `selfLoop`.
+   */
+  selfLoop: boolean;
 }
 
 // ── Hysteresis tuning ──────────────────────────────────────────────
@@ -120,6 +128,7 @@ export function createRelayState(opts: {
     consecutiveFail: 0,
     consecutiveOk: 0,
     lastFlipAt: 0,
+    selfLoop: false,
   };
 }
 
@@ -459,14 +468,64 @@ export async function forwardToUpstream(
   );
 }
 
-/** Cheap liveness heartbeat: the hub's unauthenticated /health endpoint. */
-async function heartbeat(state: RelayState): Promise<boolean> {
+/**
+ * Cheap liveness heartbeat: the hub's unauthenticated /health endpoint.
+ *
+ * #156 — self-loop detection. The 2026-09-19 incident (a hub recreated as a
+ * relay forwarding to itself through ARR) flapped 193 times in 4h40 while
+ * serving 200s: string comparison cannot see a public URL looping back, but
+ * IDENTITY can. /health publishes a per-process `instanceId` (see
+ * instance-id.ts); when the upstream's equals ours, the upstream IS this
+ * process — whatever the URL. The first detection logs one forceConsole
+ * marker, and the heartbeat counts as failed so the hysteresis settles
+ * AUTONOMOUS (the node serves locally, which is right for a hub misconfigured
+ * as a relay) instead of flapping. Detection is deliberately conservative: a
+ * reply with no `instanceId` (older image), a non-JSON body, or a different id
+ * is NOT a self-loop, and the verdict falls back to `res.ok` exactly as before.
+ *
+ * Exported for the regression test only.
+ */
+export async function heartbeat(state: RelayState): Promise<boolean> {
   try {
     const res = await fetch(`${state.upstream}/health`, {
       method: "GET",
       signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT_MS),
     });
-    return res.ok;
+    if (!res.ok) return false;
+    // Body-read failure is a fetch failure (false), NOT "not detected" — an
+    // aborted read must not be laundered into a healthy verdict.
+    let text: string;
+    try {
+      text = await res.text();
+    } catch {
+      return false;
+    }
+    // JSON.parse failure IS "not detected": a non-JSON 200 keeps the pre-#156
+    // verdict (true) rather than reaching the outer catch as a failure.
+    let upstreamId: unknown = undefined;
+    try {
+      upstreamId = (JSON.parse(text) as { instanceId?: unknown } | null)?.instanceId;
+    } catch {
+      // non-JSON → not detected
+    }
+    if (typeof upstreamId === "string") {
+      const isSelf = upstreamId === getInstanceId();
+      if (isSelf !== state.selfLoop) {
+        state.selfLoop = isSelf;
+        if (isSelf) {
+          log(
+            `[Relay] upstream resolves to SELF — misconfigured topology (${redactUpstreamForLog(state.upstream)}) — heartbeat counted as failed, settling AUTONOMOUS`,
+            true
+          );
+        } else {
+          log(
+            `[Relay] upstream no longer resolves to SELF (${redactUpstreamForLog(state.upstream)}) — resuming normal health evaluation`
+          );
+        }
+      }
+      if (isSelf) return false;
+    }
+    return true;
   } catch {
     return false;
   }
@@ -590,57 +649,70 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
 }
 
 /**
+ * One prober pass: heartbeat → hysteresis. Extracted from `startUpstreamProber`
+ * (#156) so the self-loop regression can drive the REAL decision loop (not a
+ * re-implementation) without waiting on wall-clock intervals. Behavior-identical
+ * to the former inline closure; the "at most one in-flight deep probe per state"
+ * guard lives in a WeakSet so it survives the extraction.
+ *
+ * Exported for the regression test only — production reaches it through
+ * `startUpstreamProber`.
+ */
+const probingStates = new WeakSet<RelayState>();
+
+export async function proberTick(state: RelayState): Promise<void> {
+  const ok = await heartbeat(state);
+  if (state.alive) {
+    // Nominal: any heartbeat failure counts toward failover.
+    if (ok) state.consecutiveFail = 0;
+    else markFail(state, "heartbeat");
+    return;
+  }
+  // Autonomous: accumulate OK heartbeats, then confirm with a deep probe
+  // (+ cooldown) before returning to relay — avoids flapping on a flaky link.
+  if (!ok) {
+    state.consecutiveOk = 0;
+    return;
+  }
+  state.consecutiveOk++;
+  if (
+    state.consecutiveOk >= OK_THRESHOLD &&
+    Date.now() - state.lastFlipAt >= RECOVERY_COOLDOWN_MS &&
+    !probingStates.has(state)
+  ) {
+    probingStates.add(state);
+    try {
+      const deep = await deepProbe(state);
+      if (deep) {
+        state.alive = true;
+        state.consecutiveFail = 0;
+        state.consecutiveOk = 0;
+        state.lastFlipAt = Date.now();
+        log(
+          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)`,
+          true
+        );
+      } else {
+        // deepProbe logged the reason on every false path.
+        state.consecutiveOk = 0; // keep waiting
+      }
+    } finally {
+      probingStates.delete(state);
+    }
+  }
+}
+
+/**
  * Start the background prober. Returns a stop function. Only call when an upstream
  * is configured (i.e. this process is a sidecar, not the hub). Never throws.
  */
 export function startUpstreamProber(state: RelayState): () => void {
   let stopped = false;
-  let probing = false; // guard: at most one in-flight deep probe. setInterval does
-  // not await tick(), so without this a 30s deepProbe would let the next 10s ticks
-  // launch overlapping probes (double-spending budget tokens during recovery).
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
     try {
-      const ok = await heartbeat(state);
-      if (state.alive) {
-        // Nominal: any heartbeat failure counts toward failover.
-        if (ok) state.consecutiveFail = 0;
-        else markFail(state, "heartbeat");
-      } else {
-        // Autonomous: accumulate OK heartbeats, then confirm with a deep probe
-        // (+ cooldown) before returning to relay — avoids flapping on a flaky link.
-        if (!ok) {
-          state.consecutiveOk = 0;
-          return;
-        }
-        state.consecutiveOk++;
-        if (
-          !probing &&
-          state.consecutiveOk >= OK_THRESHOLD &&
-          Date.now() - state.lastFlipAt >= RECOVERY_COOLDOWN_MS
-        ) {
-          probing = true;
-          try {
-            const deep = await deepProbe(state);
-            if (deep) {
-              state.alive = true;
-              state.consecutiveFail = 0;
-              state.consecutiveOk = 0;
-              state.lastFlipAt = Date.now();
-              log(
-                `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)`,
-                true
-              );
-            } else {
-              // deepProbe logged the reason on every false path.
-              state.consecutiveOk = 0; // keep waiting
-            }
-          } finally {
-            probing = false;
-          }
-        }
-      }
+      await proberTick(state);
     } catch (e) {
       // The prober must never throw.
       log(`[Relay] prober tick error: ${String(e)}`);
