@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import { log, logStderr } from "./logger.js";
 import type { ProxyServer } from "./types.js";
-import { NativeHandler } from "./handlers/native-handler.js";
+import { NativeHandler, stripProxyOwnHeaders } from "./handlers/native-handler.js";
 import { OpenRouterProviderTransport } from "./providers/transport/openrouter.js";
 import { OpenRouterAPIFormat } from "./adapters/openrouter-api-format.js";
 import { LocalTransport } from "./providers/transport/local.js";
@@ -1334,6 +1334,9 @@ export async function createProxyServer(
           if (HOP_BY_HOP.has(key.toLowerCase()) || typeof value !== "string") continue;
           reqHeaders[key] = value;
         }
+        // #282 — same strip as NativeHandler.handle: the proxy's own headers
+        // (cluster key, attribution, hop list) never reach api.anthropic.com.
+        stripProxyOwnHeaders(reqHeaders);
         // Proxy key override (same logic as NativeHandler)
         if (proxyKeys.length > 0) {
           const authHeader = c.req.header("authorization");
