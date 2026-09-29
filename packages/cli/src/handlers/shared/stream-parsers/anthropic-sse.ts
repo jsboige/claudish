@@ -141,6 +141,14 @@ export function createAnthropicPassthroughStream(
         let pendingEventLine: string | null = null;
         /** A frame was just dropped — swallow its trailing blank separator too. */
         let suppressedFrame = false;
+        // #286 — "nothing client-visible" must mean "no data line was FORWARDED",
+        // whatever its schema. Declared HERE (start() scope, beside emitDataLine —
+        // the try block below is a nested scope and would shadow-bind) because
+        // emitDataLine sets it and handleInStreamError / tryPreVisibleReforward
+        // inside the try must read the SAME binding (the ReferenceError lesson
+        // of the server_tool_use fix: same-name variables in nested scopes are
+        // two variables).
+        let forwardedAnyData = false;
         const flushPendingEvent = () => {
           if (pendingEventLine !== null && !isClosed) {
             controller.enqueue(encoder.encode(pendingEventLine + "\n"));
@@ -152,6 +160,11 @@ export function createAnthropicPassthroughStream(
           flushPendingEvent();
           if (!isClosed) {
             controller.enqueue(encoder.encode(text + "\n"));
+            // #286 — one choke point for every data-line emission (both filter
+            // branches, the remap layer, the unparseable pass-through): what was
+            // FORWARDED is client-visible whatever its schema. See the flag's
+            // declaration for why the parser-state gates below need it.
+            forwardedAnyData = true;
           }
         };
         /** Mark the current frame as dropped: header and blank separator go too. */
@@ -489,8 +502,12 @@ export function createAnthropicPassthroughStream(
             const errCode = typeof errObj?.code === "string" ? errObj.code : "";
             const errMsg = errObj?.message || JSON.stringify(errObj);
             if (isPolicyRefusal(errCode, errMsg)) {
+              // #286 — "nothing client-visible" includes "no data line was
+              // forwarded": on the OpenAI wire an error chunk can arrive after
+              // content chunks the parser cannot classify, and retrying then
+              // would duplicate what the client already holds.
               const nothingVisible =
-                !sawMessageStart && highestSeenIndex === -1 && !lastBlockOpen;
+                !sawMessageStart && highestSeenIndex === -1 && !lastBlockOpen && !forwardedAnyData;
               const canRetry =
                 !!opts.retryUpstream &&
                 policyRetryAttempts < policyRetryBackoff.length &&
@@ -572,7 +589,15 @@ export function createAnthropicPassthroughStream(
             if (preVisibleReforwards >= preVisibleReforwardBound) return false;
             // Same predicate as the policy-refusal gate: past any of these three a
             // replacement stream would duplicate what the client already holds.
-            if (sawMessageStart || highestSeenIndex !== -1 || lastBlockOpen) return false;
+            // #286 adds forwardedAnyData: those three are anthropic parser state
+            // and never arm on the OpenAI wire, where a graceful end after the
+            // FULL body was delivered read as "died before anything visible" and
+            // re-forwarded twice — 3 hub requests, 3 copies of the content. With
+            // the flag, the recovery still fires for a death BEFORE the first
+            // chunk on both wires (the 13-restart fleet killer it was built for).
+            if (sawMessageStart || highestSeenIndex !== -1 || lastBlockOpen || forwardedAnyData) {
+              return false;
+            }
             const backoffMs = PRE_VISIBLE_REFORWARD_BACKOFF_MS[preVisibleReforwards];
             preVisibleReforwards++;
             log(
@@ -1079,7 +1104,13 @@ export function createAnthropicPassthroughStream(
           // reports "API returned an empty or malformed response (HTTP 200)".
           if (!isClosed && !sawMessageStop) {
             log(`[AnthropicSSE] Stream ended without message_stop (stopReason=${stopReason}) — emitting synthetic finalization`);
-            if (!sawMessageStart) {
+            // #286 — the synthetic EMPTY-response body is for a stream that
+            // delivered nothing. On the OpenAI wire (relayed /v1/chat/completions)
+            // sawMessageStart never arms while the real chunks went through, and
+            // appending "[Error: The model returned an empty response…]" AFTER a
+            // complete, delivered body is a lie — the terminal message_stop tail
+            // below still closes the stream (never-hang intact).
+            if (!sawMessageStart && !forwardedAnyData) {
               const synthId = `msg_${Date.now()}`;
               // JSON.stringify, same rule as finalizeWithError (S4-a): a quote
               // in a custom-endpoint model name must not break the client.
