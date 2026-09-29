@@ -6,11 +6,14 @@ import {
   readRequestBody,
   forwardToUpstream,
   deepProbe,
+  heartbeat,
+  proberTick,
   relayHealthFields,
   redactUpstreamForLog,
   FORWARD_HEADERS_TIMEOUT_MS,
   type RelayState,
 } from "./relay.js";
+import { getInstanceId } from "../../instance-id.js";
 
 // ── fetch mock ─────────────────────────────────────────────────────
 const realFetch = globalThis.fetch;
@@ -641,6 +644,141 @@ describe("relayHealthFields", () => {
   });
 });
 
+// ── heartbeat self-loop detection (#156): identity, not string matching ──
+//
+// The 2026-09-19 shape — a hub recreated as a relay forwarding to ITSELF
+// through a public URL (ARR loops back) — is invisible to every string
+// comparison: nothing in "https://models.myia.io" resembles anything the
+// process knows about itself. A per-process nonce published on /health makes
+// the upstream RECOGNISABLE: same instanceId ⇒ the upstream IS this process.
+// Detection must be conservative (the negatives below pin exactly what it must
+// NOT see), and a detected loop must settle AUTONOMOUS — never flap, never
+// refuse to serve.
+
+describe("heartbeat — self-loop detection (#156)", () => {
+  const realConsoleLog = console.log;
+  let consoleLines: string[];
+
+  beforeEach(() => {
+    consoleLines = [];
+    console.log = ((m: unknown) => {
+      consoleLines.push(String(m));
+    }) as typeof console.log;
+  });
+  afterEach(() => {
+    console.log = realConsoleLog;
+  });
+
+  const selfMarkers = () => consoleLines.filter((l) => l.includes("resolves to SELF"));
+
+  it("matching instanceId ⇒ heartbeat failed + exactly one forceConsole marker at the transition", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "ok", instanceId: getInstanceId() }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "https://models.myia.io" });
+    expect(await heartbeat(state)).toBe(false);
+    expect(state.selfLoop).toBe(true);
+    expect(selfMarkers()).toHaveLength(1);
+    expect(selfMarkers()[0]).toContain("https://models.myia.io");
+    // transition only — the second detection must not repeat the marker
+    consoleLines = [];
+    expect(await heartbeat(state)).toBe(false);
+    expect(selfMarkers()).toHaveLength(0);
+    expect(state.selfLoop).toBe(true);
+  });
+
+  it("negative: reply WITHOUT instanceId (older image) ⇒ not detected, verdict unchanged (true)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "ok" }), { status: 200, headers: { "content-type": "application/json" } });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    expect(state.selfLoop).toBe(false);
+    expect(selfMarkers()).toHaveLength(0);
+  });
+
+  it("negative: non-JSON 200 body ⇒ not detected, behaviour unchanged (true)", async () => {
+    fetchImpl = async () => new Response("OK", { status: 200, headers: { "content-type": "text/plain" } });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    expect(state.selfLoop).toBe(false);
+    expect(selfMarkers()).toHaveLength(0);
+  });
+
+  it("negative: a DIFFERENT instanceId (a real upstream) ⇒ not detected (true)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "ok", instanceId: "11111111-2222-3333-4444-555555555555" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    expect(state.selfLoop).toBe(false);
+    expect(selfMarkers()).toHaveLength(0);
+  });
+
+  it("a plain !res.ok still fails with no marker (pre-#156 path untouched)", async () => {
+    fetchImpl = async () => new Response("nope", { status: 503 });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(false);
+    expect(state.selfLoop).toBe(false);
+    expect(selfMarkers()).toHaveLength(0);
+  });
+
+  it("an unreadable body is a FAILED heartbeat, not an undetected one", async () => {
+    fetchImpl = async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.error(new Error("aborted mid-body"));
+          },
+        }),
+        { status: 200 }
+      );
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(false);
+    expect(state.selfLoop).toBe(false);
+  });
+
+  it("self-loop settles AUTONOMOUS via the real hysteresis (proberTick) and NEVER flaps", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "ok", instanceId: getInstanceId() }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "https://models.myia.io" });
+    await proberTick(state); // failure 1/2 — still nominal, marker fired
+    expect(state.alive).toBe(true);
+    expect(selfMarkers()).toHaveLength(1);
+    await proberTick(state); // failure 2/2 → AUTONOMOUS
+    expect(state.alive).toBe(false);
+    expect(relayHealthFields(state).role).toBe("relay-autonomous");
+    // every further tick keeps failing (the upstream is still ourselves) —
+    // stable AUTONOMOUS, no recovery attempt, no flap, no repeated marker
+    await proberTick(state);
+    await proberTick(state);
+    await proberTick(state);
+    expect(state.alive).toBe(false);
+    expect(selfMarkers()).toHaveLength(1);
+  });
+
+  it("a normal relay → real upstream stays nominal with selfLoop false (proberTick)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "ok", instanceId: "11111111-2222-3333-4444-555555555555" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    await proberTick(state);
+    await proberTick(state);
+    expect(state.alive).toBe(true);
+    expect(state.selfLoop).toBe(false);
+    expect(relayHealthFields(state).role).toBe("relay-nominal");
+    expect(selfMarkers()).toHaveLength(0);
+  });
+});
+
 // ── redactUpstreamForLog (#160): the LOG must not carry credentials either ──
 //
 // #159 fixed `/health`; the three log lines that interpolate `state.upstream`
@@ -701,8 +839,10 @@ describe("redactUpstreamForLog", () => {
 
     // Positive control: the matcher must find the log calls at all, and must
     // find the redacted form — otherwise "0 verbatim" would mean "0 matched".
+    // 5 = boot + 2 hysteresis transitions (#160) + both #156 self-loop
+    // transition lines; grows with every new redacted call site.
     expect(logCalls.length).toBeGreaterThan(3);
-    expect(logCalls.filter((l) => l.includes("redactUpstreamForLog(state.upstream)")).length).toBe(3);
+    expect(logCalls.filter((l) => l.includes("redactUpstreamForLog(state.upstream)")).length).toBe(5);
 
     const verbatim = logCalls.filter((l) => /\$\{state\.upstream\}/.test(l));
     expect(verbatim).toEqual([]);

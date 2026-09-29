@@ -45,6 +45,7 @@ import { loadConfig } from "./profile-config.js";
 import { createStreamTracker, stallThresholdMs } from "./fork/server/stream-registry";
 import { registerForkExtensions, stripBillingHeaderFromBody, logRequest, createHostnameConfig } from "./fork/index.js";
 import { forwardToUpstream, readRequestBody, relayHealthFields, type RelayState } from "./fork/server/relay.js";
+import { getInstanceId } from "./instance-id.js";
 import {
   initFailover,
   isFailoverActive,
@@ -1252,6 +1253,11 @@ export async function createProxyServer(
   // "ok" for 4h40 while flapping 193 times. `role` + `upstream` (origin only)
   // make that visible in one call. Same parse-safety rule: appended after the
   // existing fields, nothing renamed.
+  //
+  // #156 closes that loop with identity: `instanceId` is a random per-process
+  // nonce, and a relay additionally publishes `selfLoop` — true when the
+  // upstream's /health returned OUR OWN id (detected in relay.ts heartbeat).
+  // Appended after the existing fields; nothing renamed.
   app.get("/health", (c) => {
     const thresholdMs = stallThresholdMs();
     const stalled = streamTracker.isStalled(thresholdMs);
@@ -1266,6 +1272,8 @@ export async function createProxyServer(
         uptimeSec: Math.round((Date.now() - startedAt) / 1000),
         role,
         upstream,
+        instanceId: getInstanceId(),
+        ...(options.relay ? { selfLoop: options.relay.selfLoop } : {}),
       },
       stalled ? 503 : 200
     );
