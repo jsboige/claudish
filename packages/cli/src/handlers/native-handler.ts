@@ -18,6 +18,29 @@ import {
   swapAdvisorToolInBody,
 } from "./native-handler-advisor.js";
 
+/**
+ * #282: remove OUR OWN proxy headers before the wire to api.anthropic.com.
+ *
+ * The native passthrough forwards every inbound header (that is deliberate —
+ * Max-subscription internals must survive), but the proxy's OWN headers used to
+ * ride along verbatim: the cluster credential `x-proxy-key` (read by the auth
+ * gate, ignored by the key swap — and ignoring is not stripping), the
+ * attribution `x-claudish-machine`, and the relay hop list `x-claudish-hops`
+ * (#279). Measured 2026-09-29 (ai-01, fetch stub, no network): all three
+ * reached the Anthropic upstream on every native request, `x-proxy-key`
+ * byte-equal to the inbound value.
+ *
+ * Shared by `NativeHandler.handle` AND the native `count_tokens` path in
+ * proxy-server.ts so the two lists cannot drift. `authorization` is untouched:
+ * when it is the client's OAuth it is what makes the subscription work.
+ */
+export function stripProxyOwnHeaders(headers: Record<string, string>): void {
+  delete headers["x-proxy-key"];
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase().startsWith("x-claudish-")) delete headers[key];
+  }
+}
+
 export class NativeHandler implements ModelHandler {
   private apiKey?: string;
   private baseUrl: string;
@@ -176,6 +199,10 @@ export class NativeHandler implements ModelHandler {
       if (typeof value !== "string") continue;
       headers[key] = value;
     }
+    // #282 — the proxy's own headers (cluster key, attribution, hop list) stop
+    // HERE: everything past this point belongs to the client and the API, and
+    // api.anthropic.com is a third party to our cluster auth.
+    stripProxyOwnHeaders(headers);
 
     // Proxy key override: if the client auth matches one of our proxy keys
     // (primary or previous, during a rotation), replace it with the stored
