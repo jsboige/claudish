@@ -8,6 +8,7 @@
  */
 
 import { BaseAPIFormat, AdapterResult, matchesModelFamily } from "./base-api-format.js";
+import { clientRequestedThinking } from "../handlers/shared/client-thinking.js";
 import { log } from "../logger.js";
 import { lookupModel } from "./model-catalog.js";
 import type { PrepareRequestContext } from "./model-dialect.js";
@@ -86,9 +87,18 @@ export class GLMModelDialect extends BaseAPIFormat {
       log("[GLMModelDialect] openai wire: thinking disabled (CLAUDISH_GLM_THINKING=disabled)");
       return request;
     }
-    if (originalRequest.thinking) {
+    // #245: a truthy `thinking` inverted the client's ask — `{"type":"disabled"}`
+    // reached GLM as `{"type":"enabled"}`. The shared predicate (#237/#239)
+    // counts enabled/adaptive as an ask and disabled as the opposite ask.
+    if (clientRequestedThinking(originalRequest.thinking)) {
       request.thinking = { type: "enabled" };
       log("[GLMModelDialect] openai wire: thinking enabled (client asked)");
+    } else if ((originalRequest.thinking as { type?: string } | undefined)?.type === "disabled") {
+      // Explicit disabled, not merely absent: sending no field would leave GLM
+      // thinking by default (probe 2026-08-20: 37→3 out tokens with the field),
+      // which is the defect again in another shape.
+      request.thinking = { type: "disabled" };
+      log("[GLMModelDialect] openai wire: thinking disabled (client asked)");
     }
     return request;
   }

@@ -53,7 +53,10 @@ export function matchesModelFamily(modelId: string, family: string): boolean {
   return lower.startsWith(fam) || lower.includes(`/${fam}`);
 }
 import { convertMessagesToOpenAI } from "../handlers/shared/format/openai-messages.js";
-import { convertToolsToOpenAI } from "../handlers/shared/format/openai-tools.js";
+import {
+  convertToolsToOpenAI,
+  mapToolChoiceToOpenAI,
+} from "../handlers/shared/format/openai-tools.js";
 
 export interface ToolCall {
   id: string;
@@ -238,6 +241,16 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
     };
     if (tools.length > 0) {
       payload.tools = tools;
+
+      // This builder had no tool_choice handling at ALL, which is easy to miss
+      // because it holds no copy of the mapping to grep for. It is not dead:
+      // every provider profile that supplies no explicit Layer-1 format builds
+      // its payload here — and dropped the caller's tool_choice entirely, not
+      // just `any`.
+      const toolChoice = mapToolChoiceToOpenAI(claudeRequest.tool_choice);
+      if (toolChoice !== undefined) {
+        payload.tool_choice = toolChoice;
+      }
     }
     if (claudeRequest.max_tokens) {
       payload.max_tokens = claudeRequest.max_tokens;

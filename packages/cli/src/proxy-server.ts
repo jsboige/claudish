@@ -39,6 +39,7 @@ import {
   route,
 } from "./providers/routing-rules.js";
 import { createHandlerForProvider } from "./providers/provider-profiles.js";
+import { applyNativePinOverride } from "./providers/native-pin-auto.js";
 import { loadCustomEndpoints } from "./providers/custom-endpoints-loader.js";
 import { getRuntimeProviders } from "./providers/runtime-providers.js";
 import { loadConfig } from "./profile-config.js";
@@ -60,10 +61,7 @@ import {
   onNominalSuccess,
   onNominalRefusal,
   getArmGraceMs,
-  consumeStreamNotice,
-  appendFailoverNoticeToMessage,
   extractSessionKey,
-  type FailoverRole,
 } from "./fork/failover.js";
 import {
   appendCapabilityQueryToMessage,
@@ -73,7 +71,11 @@ import {
 import { executeWebSearch, executeWebFetch, isLowQualityWebContent, extractUrlFromWebContent, cleanRawWebContent } from "./handlers/shared/web-search-executor.js";
 import { convertOpenAIRequestToAnthropic } from "./handlers/shared/format/openai-request-to-anthropic.js";
 import { anthropicMessageToChatCompletion, createOpenAIChatStreamFromAnthropic } from "./handlers/shared/anthropic-to-openai.js";
-import { prependNoticeToAnthropicStream } from "./handlers/shared/failover-stream-notice.js";
+import {
+  applyFailoverNotices,
+  carryNoticeHeader,
+  noticePolicyForIngress,
+} from "./handlers/shared/failover-stream-notice.js";
 
 /**
  * Routing failures are TERMINAL — no provider can serve the request (missing
@@ -413,7 +415,10 @@ export function resolveNativeModelPin(
   const roleTarget = resolveRoleMappedModel(requestedModel.toLowerCase(), modelMap);
   if (!roleTarget || roleTarget === requestedModel) return undefined;
   if (!roleTarget.startsWith("claude-")) return undefined;
-  return roleTarget;
+  // #219: an adopted catalog override (CLAUDISH_NATIVE_PIN_AUTO=on) replaces
+  // the version within the same family. Inert — byte-identical pass-through —
+  // unless the watch resolved and adopted a newer id.
+  return applyNativePinOverride(roleTarget);
 }
 
 export interface ProxyServerOptions {
@@ -1009,10 +1014,27 @@ export async function createProxyServer(
     const armGraceMs = getArmGraceMs();
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
     let graceRetried = false; // #91: one wait-and-retry on the nominal per request
+    // #263: steps this request already saw fail. A concurrent nominal success
+    // (onNominalSuccess → resetAllStepFailures) can clear their marks mid-request —
+    // routine once ROLE_MODELS folds several nominals into one role — and the next
+    // resolution then re-selects a step this request just watched wall. Re-paying
+    // it burned the attempt budget and surfaced its raw error (hub 2026-09-25:
+    // Sol → Mistral 402 twice, never reaching the healthy last step). Re-mark and
+    // re-resolve instead, without calling the handler or consuming an attempt;
+    // `revisits` is capped at the step count, so the loop stays bounded.
+    const triedSteps = new Set<number>();
+    let revisits = 0;
     let response: Response | undefined;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const handler = await getHandlerForRequest(requestedModel, 0, sessionKey);
       const { stepIndex } = role ? resolveFailoverTargetForSession(role, sessionKey) : { stepIndex: -1 };
+      if (role && stepIndex >= 0 && triedSteps.has(stepIndex) && revisits < (rule?.steps.length ?? 0)) {
+        revisits++;
+        markStepFailed(role, stepIndex, `re-selected after a concurrent clear — already failed in this request`);
+        attempt--;
+        continue;
+      }
+      if (stepIndex >= 0) triedSteps.add(stepIndex);
       // Native-lane version pin. Applied HERE rather than at the route, because the
       // cascade re-resolves the handler every attempt: only the attempt that actually
       // lands on NativeHandler may carry a bare Anthropic id, and a later attempt is a
@@ -1115,52 +1137,9 @@ export async function createProxyServer(
     return response as Response;
   };
 
-  /**
-   * Inject failover/recovery notices into a successful Anthropic-shape response.
-   * Streaming: a one-time-per-session (per resolved depth) notice prepended as
-   * block 0, so the substitute/back-to-nominal model reads it from its own prior
-   * turn next time. Non-streaming: the condensation notice appended to the
-   * collected message (fires every /compact while armed, RECOVERY_CONDENSATIONS
-   * times while recovering). Never throws — a malformed body passes through.
-   *
-   * Centralized here (not in ComposedHandler) so it also covers NativeHandler
-   * responses — the recovery case, where the nominal (Opus) is back, must be
-   * announced even though NativeHandler is a thin passthrough.
-   */
-  const applyFailoverNotices = async (
-    response: Response,
-    role: FailoverRole | null,
-    sessionKey: string | null,
-    wantsStreaming: boolean
-  ): Promise<Response> => {
-    if (!role) return response;
-    if (wantsStreaming) {
-      const text = consumeStreamNotice(role, sessionKey);
-      if (text && response.body) {
-        try {
-          const wrapped = prependNoticeToAnthropicStream(response.body, text);
-          const headers = new Headers(response.headers);
-          return new Response(wrapped as any, {
-            status: response.status,
-            statusText: response.statusText,
-            headers,
-          });
-        } catch {
-          // Never hang: fall through to the unmodified stream.
-        }
-      }
-      return response;
-    }
-    try {
-      const message = await response.clone().json();
-      appendFailoverNoticeToMessage(message, role);
-      const headers = new Headers(response.headers);
-      headers.set("Content-Type", "application/json");
-      return new Response(JSON.stringify(message), { status: response.status, headers });
-    } catch {
-      return response;
-    }
-  };
+  // Failover/recovery notices: applyFailoverNotices() in
+  // failover-stream-notice.ts, applied per route through noticePolicyForIngress —
+  // content on /v1/messages, response header on /v1/chat/completions (#229).
 
   // Fork extension: hostname binding + remote address tracking
   const hostnameConfig = createHostnameConfig(options.hostname);
@@ -1408,7 +1387,8 @@ export async function createProxyServer(
         response,
         roleFromModelName(body.model),
         sessionKey,
-        body.stream === true
+        body.stream === true,
+        noticePolicyForIngress(c.req.path)
       );
       // The `await` is load-bearing (218c3586): `return promise` hands it back
       // BEFORE it settles, so a rejection escapes this try/catch entirely and
@@ -1468,14 +1448,18 @@ export async function createProxyServer(
       stripBillingHeaderFromBody(anthropicBody, handler instanceof NativeHandler);
 
       // Route through the cascade, then inject onset/recovery notices on the
-      // Anthropic-shape response BEFORE translation to OpenAI wire shape (the
-      // notice becomes ordinary content the OpenAI client sees).
+      // Anthropic-shape response BEFORE translation to OpenAI wire shape. #229:
+      // this ingress's consumers are programmatic (sk-agent, any AsyncOpenAI
+      // client) — the notice rides the response header, NOT the content, so an
+      // empty model output stays visibly empty instead of being masked by the
+      // notice-as-answer.
       let response = await handleWithCascade(c, anthropicBody, anthropicBody.model);
       response = await applyFailoverNotices(
         response,
         roleFromModelName(anthropicBody.model),
         extractSessionKey(anthropicBody),
-        wantsStream
+        wantsStream,
+        noticePolicyForIngress(c.req.path)
       );
 
       // Translate the final Anthropic response to OpenAI shape.
@@ -1500,12 +1484,21 @@ export async function createProxyServer(
       }
 
       if (wantsStream) {
-        return createOpenAIChatStreamFromAnthropic(response, anthropicBody.model);
+        // #229 review: both translations below rebuild their headers from
+        // scratch, which is where the notice header set above used to die —
+        // consumed (dedup + recovery-budget side effects) then never delivered.
+        return carryNoticeHeader(
+          response,
+          createOpenAIChatStreamFromAnthropic(response, anthropicBody.model)
+        );
       }
       const message = await response.json();
-      return c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return carryNoticeHeader(
+        response,
+        c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
+          headers: { "Content-Type": "application/json" },
+        })
+      );
     } catch (e) {
       log(`[Proxy] /v1/chat/completions error: ${e}`);
       // Same RoutingError doctrine as /v1/messages (bbb448f6), on the OpenAI
@@ -1560,6 +1553,9 @@ export async function createProxyServer(
   return {
     port,
     url: `http://${hostnameConfig.hostname}:${port}`,
+    // #255: the SIGTERM path logs this at the die — the tracker lives inside
+    // this closure, and /health stops answering once close() drops the socket.
+    getActiveStreams: () => streamTracker.getActiveStreams(),
     shutdown: async () => {
       return new Promise<void>((resolve) => server.close(() => resolve()));
     },

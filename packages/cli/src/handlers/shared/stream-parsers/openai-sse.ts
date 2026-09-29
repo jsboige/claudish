@@ -280,6 +280,12 @@ export function createStreamingResponseHandler(
   const tHeaders = performance.now();
   const reqN = requestNumberFor(c.req);
   const cap = createResponseCapture("openai", target, true, reqN);
+  // The stop_reason of the terminal message_delta the client actually received
+  // (#220). Every ending path emits it through `send`, so recording it there
+  // keeps the [resp] marker in step with the stream instead of logging `stop=?`
+  // on every response. Stays undefined when no message_delta went out, and the
+  // marker then falls back to `?`: "the stream ended without one".
+  let sentStopReason: string | undefined;
   let ttftLogged = false;
 
   return c.body(
@@ -296,6 +302,11 @@ export function createStreamingResponseHandler(
         const send = (e: string, d: any) => {
           if (!isClosed) {
             controller.enqueue(encoder.encode(`event: ${e}\ndata: ${JSON.stringify(d)}\n\n`));
+            // After the enqueue: a throw (controller closed under us) means the
+            // client never got this value, so it must not be reported.
+            if (e === "message_delta" && d?.delta?.stop_reason) {
+              sentStopReason = d.delta.stop_reason;
+            }
           }
         };
 
@@ -885,7 +896,14 @@ export function createStreamingResponseHandler(
               if (ping) clearInterval(ping);
               try {
                 cap.note(`close reason=${reason}`);
-                cap.done({ closed: true, reason, tools: toolCount, text_len: state.accumulatedText.length, err: err ?? null });
+                cap.done({
+                  closed: true,
+                  stop_reason: sentStopReason,
+                  reason,
+                  tools: toolCount,
+                  text_len: state.accumulatedText.length,
+                  err: err ?? null,
+                });
               } catch {}
             }
           }
@@ -1017,6 +1035,7 @@ export function createStreamingResponseHandler(
                       cap.note("policy-refusal->surface");
                       cap.done({
                         closed: true,
+                        stop_reason: sentStopReason,
                         reason: "policy-refusal",
                         tools: 0,
                         text_len: state.accumulatedText.length,
@@ -1469,7 +1488,16 @@ export function createStreamingResponseHandler(
           await finalize("error", String(e));
         }
       },
+      // Client disconnected before the stream ended. The finalize path skips
+      // its capture once isClosed is set, so without this a cancelled stream
+      // left no [resp] marker and no capture at all, which reads exactly like
+      // a parser that never reached close (#220). Same closing as the Codex
+      // and anthropic lanes: closed=false, stop_reason "client-cancel".
       cancel() {
+        try {
+          cap.note("client-cancel");
+          cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
+        } catch {}
         isClosed = true;
         if (ping) clearInterval(ping);
       },

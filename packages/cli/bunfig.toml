@@ -1,0 +1,3 @@
+# Sandbox the home directory for every test run started from packages/cli (#242).
+[test]
+preload = ["./src/test-preload.ts"]

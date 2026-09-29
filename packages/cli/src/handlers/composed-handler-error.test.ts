@@ -33,6 +33,8 @@ import { wrapAnthropicError } from "./shared/anthropic-error.js";
 const realFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = realFetch;
+  delete process.env.CLAUDISH_CONNECT_RETRY_MAX;
+  delete process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS;
 });
 
 /**
@@ -75,11 +77,20 @@ function makeContext(): { c: Context; captured: CapturedResponse } {
   const c = {
     req: { header: () => ({}) },
     header: () => {},
-    json: (body: unknown, status?: number) => {
+    json: (body: unknown, statusOrInit?: number | ResponseInit) => {
       captured.body = body as CapturedErrorBody;
-      captured.status = status;
-      return new Response(JSON.stringify(body), { status: status ?? 200 });
+      captured.status = typeof statusOrInit === "number" ? statusOrInit : 200;
+      // Hono accepts either a bare status or a ResponseInit — the buffered
+      // path (composed-handler.ts:1252) passes { headers } with no status.
+      return new Response(JSON.stringify(body), {
+        ...(typeof statusOrInit === "object" ? statusOrInit : {}),
+        status: typeof statusOrInit === "number" ? statusOrInit : 200,
+      });
     },
+    // Hono's c.body(stream, init) — the SSE path the success case returns
+    // through (openai-sse.ts). Wraps the stream in a real Response so tests
+    // can await its content.
+    body: (stream: ReadableStream, init?: ResponseInit) => new Response(stream, init),
   } as unknown as Context;
   return { c, captured };
 }
@@ -282,5 +293,94 @@ describe("FallbackHandler chain — a connect failure advances, all-hosts-down s
 
     expect(secondCalled).toBe(true);
     expect(res.ok).toBe(true);
+  });
+});
+
+describe("ComposedHandler.handle — bounded same-provider connect retry (#251)", () => {
+  /**
+   * The fleet report: a z.ai reset (ECONNRESET before any byte) surfaced as a
+   * blocking 400 in mono-candidate routing — no FallbackHandler exists there,
+   * so nothing absorbed the blip. These tests pin the retry: "closed" only,
+   * bounded, env-disarmable, and the upstream's real answer replaces the
+   * connection error on recovery.
+   */
+  function stubUpstreamSequence(behaviors: Array<() => Promise<Response>>) {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      const behavior = behaviors[Math.min(calls, behaviors.length - 1)];
+      calls += 1;
+      return behavior();
+    }) as unknown as typeof fetch;
+    return () => calls;
+  }
+
+  const closedThrow = () => {
+    throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+  };
+
+  test("all retry attempts fail — still the 400 connection_error, fetch called 1+2 times", async () => {
+    process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS = "0,0";
+    const calls = stubUpstreamSequence([closedThrow, closedThrow, closedThrow]);
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    expect(calls()).toBe(3);
+    expect(captured.status).toBe(400);
+    expect(captured.body?.error?.type).toBe("connection_error");
+    expect(captured.body?.error?.message).toContain("was closed before a response arrived");
+  });
+
+  test("CLAUDISH_CONNECT_RETRY_MAX=0 disarms — single call, the 400 contract unchanged", async () => {
+    process.env.CLAUDISH_CONNECT_RETRY_MAX = "0";
+    const calls = stubUpstreamSequence([closedThrow, closedThrow, closedThrow]);
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    expect(calls()).toBe(1);
+    expect(captured.status).toBe(400);
+    expect(captured.body?.error?.type).toBe("connection_error");
+  });
+
+  test("refused is NOT retried — dns/refused/unreachable are stable conditions", async () => {
+    process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS = "0,0";
+    const calls = stubUpstreamSequence([
+      () => {
+        throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+      },
+    ]);
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    expect(calls()).toBe(1);
+    expect(captured.body?.error?.message).toContain("Make sure the server is running");
+  });
+
+  test("recovery on the second call — the upstream's answer replaces the connection error", async () => {
+    process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS = "0,0";
+    const calls = stubUpstreamSequence([
+      closedThrow,
+      () =>
+        Promise.resolve(
+          new Response(
+            'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+            { status: 200 }
+          )
+        ),
+    ]);
+    const { c } = makeContext();
+    const res = await makeHandler().handle(c, PAYLOAD);
+
+    expect(calls()).toBe(2);
+    // A real turn came back — PAYLOAD carries no stream:true, so the answer
+    // is the buffered single JSON message (composed-handler.ts:1250), not the
+    // 400 connection_error the first throw would have surfaced.
+    expect(res.status).toBe(200);
+    const message = (await res.json()) as {
+      type?: string;
+      stop_reason?: string;
+    };
+    expect(message.type).toBe("message");
+    expect(message.stop_reason).toBeTruthy();
+    expect(JSON.stringify(message)).not.toContain("connection_error");
   });
 });

@@ -128,3 +128,35 @@ export function buildConnectionErrorMessage(
       return `The connection to ${displayName} at ${endpoint} was closed before a response arrived. This is usually the provider or a proxy in between, not your network.`;
   }
 }
+
+/**
+ * Bounded same-provider retry for "closed" connect failures (#251).
+ *
+ * "closed" (ECONNRESET / EPIPE / socket closed before any byte) is the
+ * transient class: the host was REACHED, then dropped the connection — the
+ * measured case is a z.ai reset surfacing as a blocking 400 in
+ * mono-candidate routing (2026-09-24). dns/refused/unreachable are
+ * deliberately NOT retried: they are stable conditions, and in a chain the
+ * other hosts cover them.
+ *
+ * CLAUDISH_CONNECT_RETRY_MAX — retries after the initial attempt (default 2,
+ *   "0" disarms; re-read per request so an operator flip needs no restart).
+ * CLAUDISH_CONNECT_RETRY_DELAYS_MS — comma-separated ladder before each
+ *   retry (default "400,1200"; the last entry repeats when MAX exceeds it).
+ */
+export function connectRetryMax(): number {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_MAX;
+  if (raw === undefined || raw === "") return 2;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+}
+
+export function connectRetryDelaysMs(): number[] {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS;
+  if (raw === undefined || raw === "") return [400, 1200];
+  const parsed = raw
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  return parsed.length ? parsed : [400, 1200];
+}

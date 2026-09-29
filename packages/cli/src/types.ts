@@ -142,6 +142,8 @@ export interface OpenRouterResponse {
 export interface ProxyServer {
   port: number;
   url: string;
+  // #255: read by the SIGTERM path to log activeStreams at the die
+  getActiveStreams: () => number;
   shutdown: () => Promise<void>;
 }
 

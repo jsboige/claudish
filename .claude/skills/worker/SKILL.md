@@ -46,6 +46,11 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
   `-EnvFile` est **obligatoire** avec `-Recreate` et refuse vite sans lui — compose interpole
   chaque `${VAR:-}` depuis ce fichier, et le vrai `.env` du hub vit **hors** du répertoire
   compose (07/09 : un recreate nu a vidé tous les `CLAUDISH_FAILOVER_*`).
+  🔴 **Jamais en ligne dans un appel d'outil** : pire cas ≈12,5 min, au-delà du plafond d'un
+  appel. Lancer **détaché** (`Start-Process` ou tâche planifiée), puis poller `drain.log` jusqu'à
+  la ligne `OUTCOME` (#233/#236). Un appelant tué en plein compose a coupé le hub 16 min le
+  23/09 ; et un jumeau `<ID[:12]>_<nom>` laissé derrière fait désormais **refuser** le run
+  suivant avant tout arrêt : `docker rm` le jumeau nommé, puis relancer.
   ⚠ Et si seul un **fichier bind-mounté** a changé (ex. `config.json`), `compose up -d`
   est un **no-op silencieux** — compose ne voit aucun delta, le process garde l'ancienne
   config en mémoire. Preuve : `uptimeSec` non reset. Il faut drainer à zéro flux puis

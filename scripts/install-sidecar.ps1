@@ -117,14 +117,15 @@ function Die($msg)        { Write-Host "   XX  $msg" -ForegroundColor Red; exit 
 
 # ── .env runtime-policy preservation (#141) ─────────────────────────
 # docker-compose.yml interpolates runtime-policy vars this script never writes:
-# CLAUDISH_FAILOVER_*, CLAUDISH_QWEN_THINKING, CLAUDISH_GLM_THINKING, SEARXNG_URL,
+# CLAUDISH_FAILOVER_*, CLAUDISH_QWEN_THINKING, CLAUDISH_GLM_THINKING,
+# CLAUDISH_MINIMAX_THINKING, SEARXNG_URL,
 # and set-but-empty CLAUDISH_CAPTURE_DIR (= capture disabled). Before #141 a rerun
 # rewrote .env wholesale and silently dropped them, so an armed cascade lived only
 # in the container's Docker env record — and the very `compose up` this script
 # runs wiped it (measured on ai-01 18/09: 6 vars in the file, 23 armed
 # CLAUDISH_FAILOVER_* in the live container; the 07/09 hub incident requalified
 # as default tool behavior, not operator error).
-$PreservedEnvPattern = '^(CLAUDISH_FAILOVER_[A-Z0-9_]+|CLAUDISH_QWEN_THINKING|CLAUDISH_GLM_THINKING|SEARXNG_URL)='
+$PreservedEnvPattern = '^(CLAUDISH_FAILOVER_[A-Z0-9_]+|CLAUDISH_QWEN_THINKING|CLAUDISH_GLM_THINKING|CLAUDISH_MINIMAX_THINKING|SEARXNG_URL)='
 
 function Get-ClaudishContainerEnv {
     # CLAUDISH_*/SEARXNG_URL lines from the live container's env record, or $null

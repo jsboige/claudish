@@ -64,6 +64,8 @@ import { createProxyServer } from "../../proxy-server.js";
 import { deferSignalExitToHost } from "../../stats-buffer.js";
 import { loadConfig, getModelMapping } from "../../profile-config.js";
 import { createRelayState, startUpstreamProber, type RelayState } from "./relay.js";
+import { emitShutdownDieLine } from "./shutdown-die-log.js";
+import { startNativePinAutoWatch } from "../../providers/native-pin-auto.js";
 
 // Role remapping from the active profile (2026-06-25). Without a modelMap, a
 // client that sends a literal Anthropic role name — e.g. `claude-sonnet-4-6`
@@ -118,6 +120,12 @@ console.log(`[claudish-proxy] Press Ctrl+C to stop`);
 // which each client reports as `Connection lost mid-response`.
 deferSignalExitToHost();
 
+// #219: periodic native-pin check against the hosted catalog. Default mode
+// (CLAUDISH_NATIVE_PIN_AUTO unset) only logs when a newer Anthropic family
+// member appears — the pin itself stays the configured value until an
+// operator opts in with =on.
+const stopNativePinWatch = startNativePinAutoWatch(modelMap);
+
 let shuttingDown = false;
 
 /**
@@ -135,12 +143,15 @@ let shuttingDown = false;
 const gracefulExit = async (signal: string): Promise<void> => {
   if (shuttingDown) {
     console.log(`\n[claudish-proxy] ${signal} again — exiting now, in-flight streams will be cut.`);
+    emitShutdownDieLine("forced", server.getActiveStreams());
     process.exit(0);
   }
   shuttingDown = true;
   console.log(`\n[claudish-proxy] ${signal} — letting in-flight responses finish (send again to exit now)...`);
   stopProber?.();
+  stopNativePinWatch();
   await server.shutdown();
+  emitShutdownDieLine("graceful", server.getActiveStreams());
   process.exit(0);
 };
 

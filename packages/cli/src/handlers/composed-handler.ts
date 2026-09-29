@@ -25,6 +25,7 @@ type BaseModelAdapter = BaseAPIFormat;
 import { DialectManager } from "../adapters/dialect-manager.js";
 import { MiddlewareManager, GeminiThoughtSignatureMiddleware } from "../middleware/index.js";
 import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
+import { clientRequestedThinking } from "./shared/client-thinking.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { filterIdentity } from "./shared/openai-compat.js";
 import { stripReasoningContent } from "./shared/format/openai-messages.js";
@@ -65,7 +66,12 @@ import {
 import { reportError, classifyError } from "../telemetry.js";
 import { recordStats } from "../stats.js";
 import { wrapAnthropicError, ensureAnthropicErrorFormat } from "./shared/anthropic-error.js";
-import { buildConnectionErrorMessage, classifyConnectionError } from "./shared/connection-error.js";
+import {
+  buildConnectionErrorMessage,
+  classifyConnectionError,
+  connectRetryDelaysMs,
+  connectRetryMax,
+} from "./shared/connection-error.js";
 import { peekStreamStart } from "./shared/stream-peek.js";
 
 function extractAuthHeaders(c: Context): VisionProxyAuthHeaders {
@@ -91,6 +97,38 @@ function extractAuthHeaders(c: Context): VisionProxyAuthHeaders {
  */
 export const STRIPPED_IMAGE_PLACEHOLDER =
   "[An image was present in the original request but was removed by the proxy: this model is not flagged as accepting image input.]";
+
+/**
+ * Bounded same-provider retry for a transient "closed" connect failure
+ * (#251). Returns the recovered Response, or null when the ladder is
+ * exhausted or the error changed shape — the caller then falls back to the
+ * original 400 connection_error contract.
+ */
+async function retryClosedConnect(
+  providerDisplayName: string,
+  bareModelName: string,
+  refetch: () => Promise<Response>,
+  firstError: unknown
+): Promise<Response | null> {
+  const maxRetries = connectRetryMax();
+  const delays = connectRetryDelaysMs();
+  let lastError = firstError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const delayMs = delays[Math.min(attempt - 1, delays.length - 1)] ?? 1200;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const code = classifyConnectionError(lastError)?.code ?? "?";
+    logStderr(
+      `[ConnectRetry] ${providerDisplayName} ${bareModelName} closed before response (code=${code}) — retry ${attempt}/${maxRetries}`
+    );
+    try {
+      return await refetch();
+    } catch (error: any) {
+      lastError = error;
+      if (classifyConnectionError(error)?.kind !== "closed") return null;
+    }
+  }
+  return null;
+}
 
 /**
  * Factual removal notice appended when stripped parts had surviving siblings.
@@ -630,7 +668,28 @@ export class ComposedHandler implements ModelHandler {
       // server error. Surface it as a 400 connection_error with an honest,
       // actionable message so Claude Code shows "can't reach host — check your
       // network/DNS" instead of a mystifying 500.
-      const conn = classifyConnectionError(error);
+      //
+      // #251: "closed" alone (reached, then dropped before any byte —
+      // ECONNRESET/EPIPE/socket closed) is transient, and in mono-candidate
+      // routing no FallbackHandler exists to absorb it: the 400 below reached
+      // Claude Code verbatim and killed the turn (z.ai reset, 2026-09-24). A
+      // bounded same-provider retry runs FIRST; it also keeps a chain's
+      // preferred provider (and its prompt cache) instead of skipping it on a
+      // blip. dns/refused/unreachable stay unretried — stable conditions the
+      // chain's other hosts cover. Pre-headers only, so never-hang is
+      // unaffected; bounded worst case ≈ +1.6 s.
+      const recovered =
+        classifyConnectionError(error)?.kind === "closed"
+          ? await retryClosedConnect(
+              this.provider.displayName,
+              this.bareModelName,
+              this.provider.enqueueRequest
+                ? () => this.provider.enqueueRequest!(doFetch)
+                : doFetch,
+              error
+            )
+          : null;
+      const conn = recovered ? null : classifyConnectionError(error);
       if (conn) {
         const msg = buildConnectionErrorMessage(conn.kind, this.provider.displayName, endpoint);
         log(`[${this.provider.displayName}] ${msg} (code=${conn.code})`);
@@ -680,7 +739,8 @@ export class ComposedHandler implements ModelHandler {
         // directly — which is where the UX gain lives.
         return c.json(wrapAnthropicError(400, msg, "connection_error"), 400 as any);
       }
-      throw error;
+      if (!recovered) throw error;
+      response = recovered;
     }
 
     // ── Patient overload backoff (2026-06-25) ──────────────────────────────
@@ -1361,7 +1421,18 @@ export class ComposedHandler implements ModelHandler {
         return createAnthropicPassthroughStream(c, response, {
           modelName: this.bareModelName,
           onTokenUpdate,
-          adapter: adapter as BaseAPIFormat,
+          // Thinking-filter consultation must reach the MODEL dialect
+          // (MiniMaxModelDialect.shouldFilterThinking()=true), not stop at the
+          // explicit wire adapter (AnthropicAPIFormat, base default false) that
+          // shadows it on this lane — until 2026-09-23 the documented MiniMax
+          // thinking filter never actually fired on the mmc@ lane for exactly
+          // this reason. The dialect is the semantic owner of "this model's
+          // unrequested thinking blocks leak"; the wire adapter answers a
+          // different question.
+          adapter: (this.modelAdapter ?? adapter) as BaseAPIFormat,
+          // Filter only what the client did not ask for (see parser opts) —
+          // `adaptive` is a request too, not just `enabled`.
+          clientRequestedThinking: clientRequestedThinking(claudeRequest?.thinking),
           headerLatencyMs,
           retryUpstream: retryUpstreamBounded,
           providerName: this.provider.name,

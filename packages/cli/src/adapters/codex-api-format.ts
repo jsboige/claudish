@@ -12,6 +12,7 @@
  */
 
 import { BaseAPIFormat, type AdapterResult, matchesModelFamily } from "./base-api-format.js";
+import { mapToolChoiceToResponsesAPI } from "../handlers/shared/format/openai-tools.js";
 import type { StreamFormat } from "../providers/transport/types.js";
 
 /**
@@ -115,6 +116,14 @@ export class CodexAPIFormat extends BaseAPIFormat {
         }
         return tool;
       });
+
+      // The Responses API spells tool_choice as Chat Completions does, except
+      // that the function form is flat. Gated on there being tools, for the
+      // same reason Gemini is.
+      const toolChoice = mapToolChoiceToResponsesAPI(claudeRequest.tool_choice);
+      if (toolChoice !== undefined) {
+        payload.tool_choice = toolChoice;
+      }
     }
 
     return payload;
