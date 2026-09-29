@@ -10,6 +10,9 @@ import {
   proberTick,
   relayHealthFields,
   redactUpstreamForLog,
+  appendHop,
+  hopsContainSelf,
+  requestLoopedBack,
   FORWARD_HEADERS_TIMEOUT_MS,
   type RelayState,
 } from "./relay.js";
@@ -1066,5 +1069,100 @@ describe("#229 — relay carries the failover-notice header across both branches
     expect(out!.headers.get(NOTICE_HEADER)).toBe(noticeToHeaderValue(NOTICE));
     const text = await out!.text();
     expect(text).toContain("message_stop"); // stream passthrough intact under the header
+  });
+});
+
+describe("#279a — deep-probe overlap guard (proberTick)", () => {
+  it("two concurrent ticks on an AUTONOMOUS state past cooldown run exactly ONE deep probe", async () => {
+    // The guard under test: `probingStates` (WeakSet) must stop a second tick
+    // from launching another deep probe while one is in flight. setInterval
+    // does not await tick(), and a real probe is a model call (up to ~30 s) —
+    // without the guard, every 10 s tick during recovery double-spends.
+    let deepProbes = 0;
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    fetchImpl = async (url: any) => {
+      const u = String(url);
+      if (u.endsWith("/health")) {
+        // Healthy AND not self (a different node's id) — the heartbeat returns
+        // true without tripping #156's self-loop detection.
+        return new Response(
+          JSON.stringify({ status: "ok", instanceId: "11111111-1111-4111-8111-111111111111" }),
+          { status: 200, headers: { "content-type": "application/json" } }
+        );
+      }
+      deepProbes++; // a deep-probe POST reached the stub
+      await held; // hold the probe in flight like a real 30 s model call
+      return sseResponse("event: message_stop\ndata: {}\n\n");
+    };
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    state.alive = false; // AUTONOMOUS
+    state.lastFlipAt = 0; // epoch → the 60 s recovery cooldown is long past
+    state.consecutiveOk = 3; // OK_THRESHOLD already reached → first tick deep-probes
+    const t1 = proberTick(state);
+    await new Promise((r) => setTimeout(r, 20)); // t1 parks inside the held probe
+    const t2 = proberTick(state); // concurrent tick while the probe is in flight
+    await new Promise((r) => setTimeout(r, 20));
+    expect(deepProbes).toBe(1); // the overlap guard: t2 must NOT launch a second probe
+    release();
+    await Promise.all([t1, t2]);
+    expect(state.alive).toBe(true); // held probe completed with message_stop → recovered
+  });
+});
+
+describe("#279b — hop-list self-detection", () => {
+  it("appendHop: absent header → [id]; existing list → appended, upstream ids preserved in order", () => {
+    expect(appendHop(undefined, "a")).toBe("a");
+    expect(appendHop(null, "a")).toBe("a");
+    expect(appendHop("", "a")).toBe("a");
+    expect(appendHop("   ", "a")).toBe("a"); // whitespace-only ≈ absent
+    expect(appendHop("node-a", "node-b")).toBe("node-a,node-b");
+    expect(appendHop("node-a, node-b", "node-c")).toBe("node-a,node-b,node-c"); // spaces trimmed
+  });
+
+  it("hopsContainSelf: own id in list → true; absent/empty/others → false", () => {
+    const own = getInstanceId();
+    expect(hopsContainSelf(own)).toBe(true);
+    expect(hopsContainSelf(`node-b,${own}`)).toBe(true); // mid-list
+    expect(hopsContainSelf(`${own},node-b`)).toBe(true); // head of list
+    expect(hopsContainSelf("node-b,node-c")).toBe(false);
+    expect(hopsContainSelf(undefined)).toBe(false);
+    expect(hopsContainSelf("")).toBe(false);
+    expect(hopsContainSelf("  ")).toBe(false);
+  });
+
+  it("requestLoopedBack: true only when the INCOMING request carries our own id (AC-b 1/3)", () => {
+    const own = getInstanceId();
+    expect(requestLoopedBack(mockForwardContext({ "x-claudish-hops": `node-b,${own}` }))).toBe(true);
+    expect(requestLoopedBack(mockForwardContext({ "x-claudish-hops": "node-b,node-c" }))).toBe(false);
+    expect(requestLoopedBack(mockForwardContext({}))).toBe(false); // no header → exactly today's behavior
+  });
+
+  it("forwardToUpstream appends own id to the hop list, attribution/auth headers untouched (AC-b 2)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    const state = createRelayState({ upstream: "http://hub:3000", proxyKey: "cluster-key" });
+    const c = mockForwardContext({
+      "x-claudish-hops": "node-a", // an upstream relay already marked this request
+      "x-claudish-machine": "myia-po-203",
+      authorization: "Bearer client-oauth",
+    });
+
+    await forwardToUpstream(c, { model: "glm-5.2" }, state);
+
+    const h = lastFetch!.init.headers as Record<string, string>;
+    expect(h["x-claudish-hops"]).toBe(`node-a,${getInstanceId()}`); // appended, upstream ids preserved
+    expect(h["x-claudish-machine"]).toBe("myia-po-203"); // attribution survives, untouched
+    expect(h["authorization"]).toBe("Bearer client-oauth"); // client OAuth untouched
+    expect(h["x-proxy-key"]).toBe("cluster-key"); // cluster gate untouched
+  });
+
+  it("forwardToUpstream with NO incoming hop header → list starts with own id (boot window marks hop 1)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    await forwardToUpstream(mockForwardContext({}), { model: "glm-5.2" }, state);
+    const h = lastFetch!.init.headers as Record<string, string>;
+    expect(h["x-claudish-hops"]).toBe(getInstanceId());
   });
 });
