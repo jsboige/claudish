@@ -237,6 +237,56 @@ function logFallthrough(state: RelayState, reason: string): void {
   );
 }
 
+// ── #279: per-request hop marker ────────────────────────────────────
+// #156's heartbeat identity sees a node forwarding to ITSELF (its own /health
+// comes back). It cannot see (a) the boot window — `alive` starts optimistic,
+// so a request arriving before the ~10s first heartbeat still forwards — nor
+// (b) an A→B→A cycle, where each node's /health is answered by the OTHER node
+// and every id comparison says "healthy, not self". The request itself is the
+// only witness that traverses the loop: each forward appends its sender's
+// instanceId to a hop list, and a node that finds ITS OWN id in the list it
+// received is, by construction, re-receiving a request it already forwarded.
+
+/**
+ * #279: the hop-list header. Appended-to on every forward (never replaced —
+ * upstream ids are the evidence), checked on arrival. A plain custom header in
+ * the same survival class as X-Claudish-Machine (which the copy loop in
+ * `forwardToUpstream` preserves across the hop); it must never collide with
+ * `authorization` / `x-proxy-key` handling, and it carries nothing but random
+ * per-process nonces, derived from nothing.
+ */
+export const HOPS_HEADER = "x-claudish-hops";
+
+export function parseHops(value: string | undefined | null): string[] {
+  if (!value) return [];
+  return value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/** Append `id` to the incoming hop list, preserving whatever arrived. */
+export function appendHop(value: string | undefined | null, id: string): string {
+  return [...parseHops(value), id].join(",");
+}
+
+/** True when the hop list names THIS process — a forward of ours came back. */
+export function hopsContainSelf(value: string | undefined | null): boolean {
+  return parseHops(value).includes(getInstanceId());
+}
+
+/**
+ * #279 route seam: did one of OUR forwards come back to us? The caller serves
+ * the request locally instead of forwarding again (never-hang outranks
+ * diagnostic cleanliness — a refusal would stall the agent) and logs one
+ * forceConsole marker. Only meaningful on a relay (`options.relay` set): a hub
+ * legitimately receives hop-marked forwards from its sidecars and must ignore
+ * the header. Accepted trade-off: `instanceId` is published on the
+ * unauthenticated `/health`, so a client COULD forge a one-hop list naming us
+ * to force local serving of its own request — worst case is one request served
+ * by the local cascade instead of the hub, loudly logged by the marker.
+ */
+export function requestLoopedBack(c: Context): boolean {
+  return hopsContainSelf(c.req.raw.headers.get(HOPS_HEADER));
+}
+
 /**
  * Forward a request to the upstream hub. Returns the piped Response on success,
  * or `null` on a pre-stream failure (caller falls through to local handling).
@@ -258,6 +308,11 @@ export async function forwardToUpstream(
     if (typeof value !== "string") continue;
     headers[key] = value;
   }
+  // #279 — append this process's id to the hop list (an inbound list is
+  // preserved verbatim before our id: the upstream ids ARE the evidence a
+  // re-visited node will check). Overwrites the copy the loop above made of
+  // the inbound value, if any.
+  headers[HOPS_HEADER] = appendHop(c.req.raw.headers.get(HOPS_HEADER), getInstanceId());
   if (state.proxyKey) {
     // Inject the cluster proxy key as x-proxy-key (NOT x-api-key). The hub's
     // auth gate accepts x-proxy-key, but NativeHandler's proxyKey→Anthropic swap

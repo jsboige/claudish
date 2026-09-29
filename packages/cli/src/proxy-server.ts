@@ -45,7 +45,7 @@ import { getRuntimeProviders } from "./providers/runtime-providers.js";
 import { loadConfig } from "./profile-config.js";
 import { createStreamTracker, stallThresholdMs } from "./fork/server/stream-registry";
 import { registerForkExtensions, stripBillingHeaderFromBody, logRequest, createHostnameConfig } from "./fork/index.js";
-import { forwardToUpstream, readRequestBody, relayHealthFields, type RelayState } from "./fork/server/relay.js";
+import { forwardToUpstream, readRequestBody, relayHealthFields, requestLoopedBack, HOPS_HEADER, type RelayState } from "./fork/server/relay.js";
 import { getInstanceId } from "./instance-id.js";
 import {
   initFailover,
@@ -1388,8 +1388,18 @@ export async function createProxyServer(
       // centrally) — mode-aware capture for free. A pre-stream forward failure
       // returns null → fall through to the normal local path for this one request
       // (and feeds the prober's hysteresis toward AUTONOMOUS).
+      //
+      // #279 — checked BEFORE forwarding: a request whose hop list carries our
+      // own instanceId is one of our forwards coming back (boot window before the
+      // heartbeat latched selfLoop, or an A→B→A cycle heartbeat identity cannot
+      // see). Serving locally is the only reaction — never a refusal.
       const relay = options.relay;
-      if (relay?.upstream && relay.alive) {
+      if (relay?.upstream && requestLoopedBack(c)) {
+        log(
+          `[Relay] request returned via ${HOPS_HEADER} — own id in hop list (boot window or relay cycle) — serving LOCALLY`,
+          true
+        );
+      } else if (relay?.upstream && relay.alive) {
         const forwarded = await forwardToUpstream(c, body, relay);
         if (forwarded) return forwarded;
       }
@@ -1483,8 +1493,15 @@ export async function createProxyServer(
       // Relay (sidecar NOMINAL): forward the RAW OpenAI body to the hub's
       // /v1/chat/completions — the hub translates. Path-aware forward
       // (relay.ts) means this reaches the right hub route, not /v1/messages.
+      // #279: same hop-list gate as /v1/messages — a loop can enter on either
+      // ingress.
       const relay = options.relay;
-      if (relay?.upstream && relay.alive) {
+      if (relay?.upstream && requestLoopedBack(c)) {
+        log(
+          `[Relay] request returned via ${HOPS_HEADER} — own id in hop list (boot window or relay cycle) — serving LOCALLY`,
+          true
+        );
+      } else if (relay?.upstream && relay.alive) {
         const forwarded = await forwardToUpstream(c, openaiBody, relay);
         if (forwarded) return forwarded;
       }
