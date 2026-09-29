@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   initFailover,
   isFailoverActive,
@@ -40,10 +41,11 @@ import {
   classifyNominalBucket,
   nativeBucketFor,
   resolveConcreteTarget,
-  findCascadeStepForTarget,
+  resolveDelegationOwner,
   setRoleNominalResolver,
   NATIVE_BUCKET,
 } from "./failover.js";
+import type { DelegationOwner } from "./failover.js";
 import { route } from "../providers/routing-rules.js";
 import { DEFAULT_ROUTING_RULES } from "../providers/default-routing-rules.js";
 
@@ -1968,10 +1970,81 @@ describe("#274 — dwell pin pins the concrete step, never the role reference", 
     expect(second.step!.target).toBe("ds@deepseek-flash"); // …but re-resolved concrete
   });
 
-  it("findCascadeStepForTarget locates the owning cascade step of a concrete target", () => {
-    initFailover({ ...OPUS_CASCADE });
-    expect(findCascadeStepForTarget("gc@glm-5.2")).toEqual({ role: "opus", stepIndex: 1 });
-    expect(findCascadeStepForTarget("qwen-token-plan@qwen3.8-max")).toEqual({ role: "opus", stepIndex: 0 });
-    expect(findCascadeStepForTarget("no-such-target")).toBeNull();
+  it("findCascadeStepForTarget is GONE — the owner comes from the resolution (review 29/09)", () => {
+    // The reverse target→step lookup found the DELEGATING step back (its target
+    // is refreshed in place), never the true owner. Resolution-derived owners
+    // are pinned below and in the route test; the export must not exist.
+    const source = readFileSync(new URL("./failover.ts", import.meta.url), "utf-8");
+    expect(source.includes("function findCascadeStepForTarget")).toBe(false);
+  });
+});
+
+// ── #274 review (29/09) — ownership derived from the resolution itself ─────────
+// S1/S2/S3 of the coordinator's probe: the owner of the concrete model a
+// delegation resolves to must be the TARGET's nominal bucket or the TARGET's
+// step — never the delegating step itself, never another role's delegation.
+describe("#274 — resolveDelegationOwner (ownership from resolution)", () => {
+  const envReview = (extra: Record<string, string> = {}): NodeJS.ProcessEnv =>
+    ({
+      // The operator's target shape (probe 29/09): opus delegates to sonnet's
+      // nominal gc@glm-5.3; sonnet walks Mistral→Kimi; haiku ends on sonnet.
+      CLAUDISH_FAILOVER_OPUS: "cx@gpt-6-sol>role:sonnet",
+      CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3>kimi@kimi-k3",
+      CLAUDISH_FAILOVER_HAIKU: "mm@minimax-m3>kimi@kimi-k2.8>role:sonnet",
+      CLAUDISH_FAILOVER_AUTO: "1",
+      ...extra,
+    } as NodeJS.ProcessEnv);
+  const modelMap = { opus: "claude-opus-5-5", sonnet: "gc@glm-5.3", haiku: "mm@minimax-m3" };
+
+  /** The opus delegation step (index 1) resolved. */
+  function opusDelegation(): { concrete: string; owner: DelegationOwner } | null {
+    const rule = getFailoverRule("opus")!;
+    return resolveDelegationOwner("opus", rule.steps[1]);
+  }
+
+  it("S1: healthy target nominal → owner is the TARGET's nominal, not the delegating role's", () => {
+    initFailover({ ...envReview(), CLAUDISH_FAILOVER_ACTIVE: "opus" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (modelMap as Record<string, string>)[r]);
+    // opus walled (Sol), sonnet healthy → opus[1] serves sonnet's nominal.
+    armFailover("opus", "probe: sol wall", "openai-codex");
+    markStepFailed("opus", 0, "probe: sol wall");
+    const d = opusDelegation();
+    expect(d).not.toBeNull();
+    expect(d!.concrete).toBe("gc@glm-5.3");
+    expect(d!.owner).toEqual({ role: "sonnet", nominal: true });
+  });
+
+  it("S2: target bucket walled → owner is the TARGET's cascade step 0, never the delegating step", () => {
+    initFailover({ ...envReview(), CLAUDISH_FAILOVER_ACTIVE: "opus" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (modelMap as Record<string, string>)[r]);
+    armFailover("opus", "probe: sol wall", "openai-codex");
+    markStepFailed("opus", 0, "probe: sol wall");
+    // Sonnet's own bucket walls → the delegation joins sonnet's cascade.
+    armFailover("sonnet", "probe: glm wall", "glm-coding");
+    const d = opusDelegation();
+    expect(d).not.toBeNull();
+    expect(d!.concrete).toBe("mistral@glm-5.3");
+    expect(d!.owner).toEqual({ role: "sonnet", nominal: false, stepIndex: 0 });
+  });
+
+  it("S3: nested delegation resolves to the TERMINAL owner (sonnet step 0), not haiku's or opus's delegation step", () => {
+    initFailover({ ...envReview(), CLAUDISH_FAILOVER_ACTIVE: "haiku" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (modelMap as Record<string, string>)[r]);
+    armFailover("haiku", "probe: minimax wall", "minimax-coding");
+    markStepFailed("haiku", 0, "probe");
+    markStepFailed("haiku", 1, "probe");
+    armFailover("sonnet", "probe: glm wall", "glm-coding");
+    const rule = getFailoverRule("haiku")!;
+    const d = resolveDelegationOwner("haiku", rule.steps[2]);
+    expect(d).not.toBeNull();
+    expect(d!.concrete).toBe("mistral@glm-5.3");
+    expect(d!.owner).toEqual({ role: "sonnet", nominal: false, stepIndex: 0 });
+  });
+
+  it("a model step has no delegation to own (null)", () => {
+    initFailover({ ...envReview(), CLAUDISH_FAILOVER_ACTIVE: "opus" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (modelMap as Record<string, string>)[r]);
+    const rule = getFailoverRule("opus")!;
+    expect(resolveDelegationOwner("opus", rule.steps[0])).toBeNull();
   });
 });

@@ -561,17 +561,33 @@ export function setRoleNominalResolver(fn: ((role: FailoverRole) => string | und
   roleNominalResolver = fn;
 }
 
+/** #274: which cascade OWNS the concrete model a delegation just resolved to.
+ * Derived BY the resolution itself (see resolveRoleStep) — a reverse
+ * target→step lookup cannot find it: role-steps carry targets refreshed in
+ * place to the concrete model, so the delegating step (or another role's
+ * delegation) wins any string search while the real owner is never matched.
+ * `nominal: true` → the concrete model is the target role's NOMINAL (walls
+ * arm its bucket through onNominalRefusal); `nominal: false` + `stepIndex` →
+ * the concrete model is the target's cascade step i (walls mark that step). */
+export type DelegationOwner =
+  | { role: FailoverRole; nominal: true }
+  | { role: FailoverRole; nominal: false; stepIndex: number };
+
 /** Resolve a role-step to the concrete model currently serving `step.roleRef`:
  * the target's nominal when healthy enough, else the target's own resolved
  * cascade step (recursed — acyclic by load-time proof). "Healthy enough" holds
  * the delegation to the SAME bar the cascade loop holds the nominal: not the
  * arm-after-refusals grace threshold (a wall whose escalate-TTL expired is a
  * live, confirmed wall — its probe belongs to the target's own cascade, not to
- * every session delegated into it). Returns the concrete target string, or null
- * when the delegation cannot serve right now. Side effects: arms the target's
- * nominal bucket when that bucket is already walled but unconfigured; refreshes
- * `step.target` in place. */
-function resolveRoleStep(_role: FailoverRole, step: FailoverStep): string | null {
+ * every session delegated into it). Returns the concrete target string PLUS
+ * the owning coordinate (recursed to the terminal role for nested
+ * delegations), or null when the delegation cannot serve right now. Side
+ * effects: arms the target's nominal bucket when that bucket is already walled
+ * but unconfigured; refreshes `step.target` in place. */
+function resolveRoleStep(
+  _role: FailoverRole,
+  step: FailoverStep
+): { concrete: string; owner: DelegationOwner } | null {
   const targetRole = step.roleRef!;
   const nominal = roleNominalResolver?.(targetRole);
   if (nominal) {
@@ -579,15 +595,9 @@ function resolveRoleStep(_role: FailoverRole, step: FailoverStep): string | null
     if ("bucket" in nb) {
       const walledNow =
         isBucketWalled(nb.bucket) || isBucketWalled(LEGACY_ROLE_WIDE_BUCKET);
-      // A walled bucket whose grace threshold never fired still counts as
-      // walled for the delegation — but the nominal had its chance when the
-      // escalate-TTL elapsed (probe window): then, and only then, may the
-      // delegate take the probe instead of diverting.
-      const probeWindowOpen =
-        (nominalRefusals.get(nb.bucket)?.count ?? 0) >= armAfterRefusals;
-      if (!walledNow || probeWindowOpen) {
+      if (!walledNow) {
         step.target = nominal;
-        return nominal;
+        return { concrete: nominal, owner: { role: targetRole, nominal: true } };
       }
       if (!rules.get(targetRole)) {
         // Walled bucket and the target role has NO cascade to fall to: arm the
@@ -602,17 +612,27 @@ function resolveRoleStep(_role: FailoverRole, step: FailoverStep): string | null
       // the nominal is the safe default — its own refusal walls the bucket it
       // names, and the NEXT delegation resolves to the target's cascade.
       step.target = nominal;
-      return nominal;
+      return { concrete: nominal, owner: { role: targetRole, nominal: true } };
     }
   }
   const own = rules.get(targetRole);
   if (own) {
     const ownResolved = resolveSkippingFailed(targetRole, own);
     if (ownResolved.step) {
-      const concrete = resolveConcreteTarget(targetRole, ownResolved.step);
-      if (concrete) {
-        step.target = concrete;
-        return concrete;
+      if (ownResolved.step.roleRef) {
+        // Nested delegation: recurse — the terminal owner is the innermost
+        // cascade actually serving, never an intermediate role-step.
+        const nested = resolveRoleStep(targetRole, ownResolved.step);
+        if (nested) {
+          step.target = nested.concrete;
+          return nested;
+        }
+      } else {
+        step.target = ownResolved.step.target;
+        return {
+          concrete: ownResolved.step.target,
+          owner: { role: targetRole, nominal: false, stepIndex: ownResolved.stepIndex },
+        };
       }
     }
   }
@@ -624,6 +644,20 @@ function resolveRoleStep(_role: FailoverRole, step: FailoverStep): string | null
  * concrete model a role-step currently serves without re-resolving). */
 export function resolveConcreteTarget(role: FailoverRole, step: FailoverStep): string | null {
   if (!step.roleRef) return step.target;
+  return resolveRoleStep(role, step)?.concrete ?? null;
+}
+
+/** #274 (review 29/09): the concrete model AND its owning coordinate for a
+ * role-step, derived from the resolution itself. The proxy's cascade loop uses
+ * this for delegated bookkeeping: a wall of the concrete model must arm/mark
+ * the OWNING cascade (the target's nominal bucket or the target's step), not
+ * the delegating step a second time. Null when `step` is not a role-step or
+ * the delegation cannot serve right now. */
+export function resolveDelegationOwner(
+  role: FailoverRole,
+  step: FailoverStep
+): { concrete: string; owner: DelegationOwner } | null {
+  if (!step.roleRef) return null;
   return resolveRoleStep(role, step);
 }
 
@@ -701,29 +735,13 @@ export function resetAllStepFailures(role: FailoverRole): void {
 // ─── #274 bookkeeping seam (proxy-side) ────────────────────────────────────────
 // When a role-step serves, the concrete model must ALSO record against the
 // OWNING cascade — a delegated wall of sonnet's nominal arms sonnet's nominal
-// bucket, not merely marks the delegating role's step. The proxy knows which
-// concrete model it is about to attempt (it resolved it); this lookup turns
-// that target back into its owning cascade coordinate, if any. Nominal: the
-// proxy compares against its own roleNominalResolver — it owns the modelMap.
-
-/** Find (role, stepIndex) whose step currently resolves to `concreteTarget`
- * (its `target` refreshed at resolution time). Returns null when no configured
- * step serves that target right now — the concrete model is then a nominal or
- * an unmanaged target. */
-export function findCascadeStepForTarget(
-  concreteTarget: string
-): { role: FailoverRole; stepIndex: number } | null {
-  const t = (concreteTarget || "").trim();
-  if (!t) return null;
-  for (const role of FAILOVER_ROLES) {
-    const rule = rules.get(role);
-    if (!rule) continue;
-    for (let i = 0; i < rule.steps.length; i++) {
-      if (rule.steps[i].target === t) return { role, stepIndex: i };
-    }
-  }
-  return null;
-}
+// bucket, not merely marks the delegating role's step. The owning coordinate
+// comes from the resolution itself (resolveDelegationOwner above): the first
+// version of #274 derived it by reverse lookup (findCascadeStepForTarget) and
+// the review probe (29/09) measured it finding the DELEGATING step back — a
+// role-step's `target` is refreshed in place to the concrete model, so the
+// string search can never single out the true owner. That function is gone;
+// resolution is the single source of truth.
 
 // ─── resolution ────────────────────────────────────────────────────────────────
 
