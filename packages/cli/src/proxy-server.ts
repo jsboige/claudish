@@ -1182,7 +1182,7 @@ export async function createProxyServer(
         // blip costs one short skip of a step that has a live successor — whereas not
         // marking makes every subsequent request re-pay the round-trip (and its
         // timeout) to a step that may be down for hours. Any success resets the count.
-        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody), delegation?.owner.nominal === true);
+        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody));
         if (delegation && !delegation.owner.nominal) {
           markStepFailed(delegation.owner.role, delegation.owner.stepIndex, why, parseResetAtFromBody(errBody));
         }
@@ -1218,11 +1218,8 @@ export async function createProxyServer(
         // "armed" — fall through: the retry below re-resolves the handler and
         // serves from the cascade.
       } else {
-        // #274 delegated bookkeeping: the delegating step is marked ONCE (with
-        // wasNominal when the delegated model was the TARGET'S nominal, so the
-        // dwell pin re-resolves the delegate into the target's own cascade
-        // instead of dropping the session to the delegating role's next step),
-        // and the owning side records the wall in ITS OWN vocabulary — a
+        // #274 delegated bookkeeping: the delegating step is marked ONCE, and
+        // the owning side records the wall in ITS OWN vocabulary — a
         // delegated qualifying wall of the target's nominal goes through the
         // TARGET's grace/arm semantics (onNominalRefusal on the target's
         // bucket, so delegated traffic itself accumulates the arm instead of
@@ -1231,7 +1228,7 @@ export async function createProxyServer(
         // each side (the first cut double-marked the delegating step: 10→30min
         // off a single wall).
         if (delegation?.owner.nominal) {
-          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody), true);
+          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody));
           const ownerBucket = await nominalBucketOfModel(delegation.concrete);
           onNominalRefusal(delegation.owner.role, reason, response.headers.get("retry-after"), errBody, ownerBucket);
         } else {

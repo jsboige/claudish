@@ -2050,17 +2050,20 @@ describe("#274 — resolveDelegationOwner (ownership from resolution)", () => {
 });
 
 // ── #274 re-review 01/10 — the two unpinned UNIT branches ──────────────────────
-// (ii) the dwell pin's wasNominal yield: a session pinned to a role-step whose
-//      last failure was the TARGET's nominal must re-resolve (join the target's
-//      own cascade) rather than keep serving the delegation's frozen concrete.
+// (ii) the dwell pin on a role-step: a pinned session keeps the DELEGATION step
+//      and its concrete refreshes to the target's CURRENT walk (never frozen).
+// (ii-b) adopted from the coordinator's probe (re-review 3): the pin HOLDS even
+//      when the delegating role's own earlier step becomes probeable — no
+//      provider switch inside the dwell. (The removed `wasNominal` yield broke
+//      exactly that, and its flag survived delegated successes for hours.)
 // (iii) nested delegation: the owner recorded is the TERMINAL role's coordinate.
-describe("#274 re-review — wasNominal dwell yield + nested delegation owner", () => {
+describe("#274 re-review — dwell pin on role-steps + nested delegation owner", () => {
   // Known-provider vocabulary (buckets already pinned by the tests above):
   // gc@glm-5.3 → glm-coding, cx@gpt-6-sol → openai-codex.
   const SONNET_NOM = "gc@glm-5.3";
   const OPUS_NOM = "cx@gpt-6-sol";
 
-  it("(ii) a pinned session re-resolves after the pinned failure was the target's nominal — the concrete is refreshed to the target's CURRENT walk, not frozen at the walled nominal", () => {
+  it("(ii) a pinned session keeps the delegation step while its target's nominal walls — the concrete is refreshed to the target's CURRENT walk, not frozen at the walled nominal", () => {
     const realNow = Date.now;
     let clock = 1_000_000_000_000;
     Date.now = () => clock;
@@ -2081,9 +2084,9 @@ describe("#274 re-review — wasNominal dwell yield + nested delegation owner", 
       expect(p1.stepIndex).toBe(0);
       expect(p1.step?.target).toBe(SONNET_NOM);
 
-      // The route's own failure shape (proxy-server.ts:1234): a qualifying wall
-      // of the delegated TARGET NOMINAL marks the delegating step wasNominal=true.
-      markStepFailed("opus", 0, "test: delegated wall of the target nominal", undefined, true);
+      // The route's own failure shape (proxy-server.ts delegated-owner branch):
+      // a qualifying wall of the delegated TARGET NOMINAL marks the delegating step.
+      markStepFailed("opus", 0, "test: delegated wall of the target nominal");
       armFailover("sonnet", "test: target nominal walled", "glm-coding");
       markStepFailed("sonnet", 0, "test: kimi walled");
 
@@ -2101,6 +2104,51 @@ describe("#274 re-review — wasNominal dwell yield + nested delegation owner", 
       // (failover.ts:851) keeps the pin and returns target === gc@glm-5.3 —
       // this assert goes red.
       expect(p2.stepIndex).toBe(0);
+      expect(p2.step?.target).toBe("ds@deepseek-flash");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  // (ii-b) adopted from the coordinator's probe (re-review 3, c.5938875564),
+  // adapted to the post-deletion 4-arg markStepFailed: same state, earlier step
+  // made probeable. This is the pin for the DELETION itself.
+  it("(ii-b) a pinned delegation step HOLDS when the delegating role's earlier step becomes probeable — no provider switch inside the dwell", () => {
+    const realNow = Date.now;
+    let clock = 1_000_000_000_000;
+    Date.now = () => clock;
+    try {
+      initFailover({
+        CLAUDISH_FAILOVER_OPUS: "kimi@kimi-k3>role:sonnet",
+        CLAUDISH_FAILOVER_SONNET: "ds@deepseek-flash",
+        CLAUDISH_FAILOVER_AUTO: "1",
+        CLAUDISH_FAILOVER_ACTIVE: "opus",
+        CLAUDISH_FAILOVER_SESSION_DWELL_MS: "3600000",
+      } as NodeJS.ProcessEnv);
+      setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOM : r === "opus" ? OPUS_NOM : undefined));
+
+      // opus step 0 (kimi) walls → the session lands on the delegation step 1
+      // and pins there.
+      markStepFailed("opus", 0, "test: kimi walled");
+      const p1 = resolveFailoverTargetForSession("opus", "sess-probe");
+      expect(p1.stepIndex).toBe(1);
+      expect(p1.step?.target).toBe(SONNET_NOM);
+
+      // The delegated TARGET NOMINAL walls: the delegating step is marked, the
+      // owning side arms sonnet (route shape, proxy-server.ts delegated branch).
+      markStepFailed("opus", 1, "test: delegated target nominal walled");
+      armFailover("sonnet", "test: sonnet nominal walled", "glm-coding");
+
+      // Past every 10-min rung: the pin (1 h) still live, opus step 0 probeable
+      // again, sonnet's walk sitting on ds@deepseek-flash.
+      clock += 11 * 60_000;
+      armFailover("sonnet", "test: sonnet nominal still walled", "glm-coding");
+      const p2 = resolveFailoverTargetForSession("opus", "sess-probe");
+      // The pin HOLDS on step 1 and its concrete is the delegation's CURRENT
+      // resolution (deepseek) — never a switch back to the now-probeable kimi
+      // step 0. Reintroducing a yield on the pinned step's failure record (the
+      // removed wasNominal branch did exactly that) makes this assert go red.
+      expect(p2.stepIndex).toBe(1);
       expect(p2.step?.target).toBe("ds@deepseek-flash");
     } finally {
       Date.now = realNow;

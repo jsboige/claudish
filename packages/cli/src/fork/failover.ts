@@ -118,12 +118,6 @@ interface StepFailure {
    * regardless of backoff — the wall cannot lift before its reset. Once it passes,
    * the step is probed again (a reset step must be consumed, not avoided). */
   resetAt?: Date;
-  /** #274: true when the model last failing this step was the TARGET ROLE'S
-   * NOMINAL (a role-step served the nominal and it walled). The pinned-step
-   * servability test uses it to re-resolve the delegate instead of blindly
-   * dropping the session to the delegating role's next step (that would skip
-   * the target's OWN cascade, which may have a healthy step 0). */
-  wasNominal?: boolean;
 }
 
 interface RecoveryState {
@@ -699,21 +693,18 @@ function stepFailuresFor(role: FailoverRole): StepFailure[] {
 
 /** Record that cascade step `idx` for `role` just quota-walled. `bodyResetAt` is the
  * reset time parsed from the provider's own error body (most accurate at wall time);
- * when absent, the operator-declared step.resetAt applies if configured.
- * `wasNominal` (#274): the failing concrete model was the target role's NOMINAL
- * (only meaningful on a role-step) — the dwell pin re-resolves on it. */
+ * when absent, the operator-declared step.resetAt applies if configured. */
 export function markStepFailed(
   role: FailoverRole,
   idx: number,
   reason: string,
-  bodyResetAt?: Date,
-  wasNominal?: boolean
+  bodyResetAt?: Date
 ): void {
   const rule = rules.get(role);
   if (!rule || idx < 0 || idx >= rule.steps.length) return;
   const arr = stepFailuresFor(role);
   const resetAt = bodyResetAt ?? rule.steps[idx].resetAt;
-  arr[idx] = { count: arr[idx].count + 1, lastFailure: new Date(Date.now()), resetAt, wasNominal };
+  arr[idx] = { count: arr[idx].count + 1, lastFailure: new Date(Date.now()), resetAt };
   const ttlText = resetAt ? `until ${resetAt.toISOString()}` : `${Math.round(stepTtlMs(arr[idx].count) / 60000)}min`;
   logStderr(
     `[Failover] step ${role}[${idx}] (${rule.steps[idx].label}) walled — count=${arr[idx].count} ttl=${ttlText} (${reason})`
@@ -849,14 +840,17 @@ export function resolveFailoverTargetForSession(
     let pinnedStillServable =
       pin.stepIndex < rule.steps.length && !isStepTtlFailed(pinnedFailure);
     if (pinnedStillServable && pinnedStep?.roleRef) {
-      if (pinnedFailure?.wasNominal) {
-        // The pin's last failure was the TARGET'S NOMINAL walling — the delegate
-        // must re-resolve (join the target's own cascade), never blindly drop
-        // this session to the delegating role's next step.
-        pinnedStillServable = false;
-      } else if (resolveRoleStep(role, pinnedStep) === null) {
+      if (resolveRoleStep(role, pinnedStep) === null) {
         // The delegation can no longer serve (its own resolution went nominal,
         // or its concrete target died) — re-resolve; never pin a placeholder.
+        // Otherwise the pin HOLDS even if the delegating role's own earlier
+        // steps became probeable: `resolveRoleStep` refreshes `step.target` in
+        // place, so the session rides the target's cascade without a provider
+        // switch inside its dwell (#91 point 4). A `wasNominal` yield here
+        // moved sessions to an earlier probeable step mid-dwell — removed in
+        // review (probe, 01/10): the flag survived delegated successes (the
+        // reset clears the OWNER's coordinate), so one nominal wall unpinned
+        // every session on that step for hours.
         pinnedStillServable = false;
       }
     }
