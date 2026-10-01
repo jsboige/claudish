@@ -786,7 +786,7 @@ export function resolveFailoverTarget(
 /** Live dwell pins: role → session → the step it must keep serving until `until`.
  * Set only while armed at a step (stepIndex >= 0) — nominal is never pinned. */
 const dwellPins = new Map<FailoverRole, Map<string, { stepIndex: number; until: number }>>();
-/** Timestamp of the last VERIFIED nominal success (onNominalSuccess), keyed by
+/** Timestamp of the FIRST verified nominal success since the last arm (onNominalSuccess), keyed by
  * role|bucket like the other #275 state. A live dwell pin yields once this is
  * older than `recoveryGraceMs`, so an ACTIVE conversation returns to the
  * nominal when its own provider is proven healthy — without this exit the pin
