@@ -1488,6 +1488,177 @@ describe("#91 point 4 — per-session dwell", () => {
   });
 });
 
+// Nominal-recovery yield — the exit the dwell lacked (measured 2026-10-01,
+// minimax wall 19:23→20:08Z): new sessions returned to the nominal within ~2 min
+// of the wall lifting, but conversations pinned by the dwell rode the fallback
+// for as long as they lived, because the pin only ever yielded on step-death.
+// The yield fires on a VERIFIED recovery (onNominalSuccess — a real nominal
+// request succeeded; a TTL expiry only STARTS a probe and proves nothing) held
+// for recoveryGraceMs (default 2 min), and any re-arm voids the marker.
+describe("dwell — nominal-recovery yield", () => {
+  const ENV = {
+    CLAUDISH_FAILOVER_SONNET: "ds@deepseek-v4-flash>ds@deepseek-payg",
+    CLAUDISH_FAILOVER_SONNET_LABEL: "Flash>PAYG",
+    CLAUDISH_FAILOVER_AUTO: "1",
+  } as NodeJS.ProcessEnv;
+
+  const realNow = Date.now;
+  let clock = 1_000_000;
+
+  beforeEach(() => {
+    clock = 1_000_000;
+    Date.now = () => clock;
+    initFailover(ENV);
+  });
+  afterEach(() => {
+    Date.now = realNow;
+  });
+
+  /** Arm, pin the session at step 0, keep the pin alive across the wall's TTL
+   * expiry. Leaves the clock at t=11min with the wall expired and NO nominal
+   * request served yet. */
+  function pinThenLift(session: string, bucket?: string): void {
+    expect(armFailover("sonnet", "wall", bucket ?? "*")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", session, bucket).stepIndex).toBe(0);
+    clock += 9 * 60 * 1000;
+    expect(resolveFailoverTargetForSession("sonnet", session, bucket).stepIndex).toBe(0); // renew
+    clock += 2 * 60 * 1000; // t=11min: wall TTL (10 min) expired
+    expect(isFailoverActive("sonnet", bucket)).toBe(false);
+  }
+
+  /** pinThenLift + one served nominal request (the verified recovery). */
+  function pinThenRecover(session: string, bucket?: string): void {
+    pinThenLift(session, bucket);
+    onNominalSuccess("sonnet", bucket ?? "*"); // the probe SUCCEEDED
+  }
+
+  it("a live pin YIELDS to the nominal once a verified recovery is older than the grace", () => {
+    pinThenRecover("sess-A");
+    clock += 60 * 1000; // t=12min: 1 min after the recovery — grace is 2 min
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(0); // held
+    clock += 2 * 60 * 1000; // t=14min: 3 min after the recovery
+    const yielded = resolveFailoverTargetForSession("sonnet", "sess-A");
+    expect(yielded.stepIndex).toBe(-1); // back at the nominal
+    expect(yielded.step).toBeNull();
+    // The yield removed the pin: nominal is never re-pinned, later resolves stay.
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(-1);
+  });
+
+  it("a TTL expiry alone does NOT un-pin — only a served nominal request does", () => {
+    // Same shape as pinThenRecover minus the onNominalSuccess: the wall expires,
+    // a NEW session walks to the nominal, but no nominal request has been
+    // SERVED yet, so the pinned conversation must keep its step.
+    expect(armFailover("sonnet", "wall")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(0);
+    clock += 9 * 60 * 1000;
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(0); // renew
+    clock += 2 * 60 * 1000; // t=11min: wall TTL expired, pin (until t=19min) live
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-B").stepIndex).toBe(-1); // fresh walk probes
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(0); // pin holds
+    clock += 3 * 60 * 1000; // t=14min: no recovery ever verified — still holds
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(0);
+  });
+
+  it("a re-arm voids the marker: the pin re-holds until the nominal proves itself again", () => {
+    pinThenRecover("sess-A");
+    clock += 3 * 60 * 1000; // t=14min: past the grace — but the wall came back first
+    expect(armFailover("sonnet", "refused again")).toBe(true);
+    const held = resolveFailoverTargetForSession("sonnet", "sess-A");
+    expect(held.stepIndex).toBe(0); // re-held: no provider switch back into the wall
+    expect(held.step?.target).toBe("ds@deepseek-v4-flash");
+    // The marker is gone for real: with the wall holding, repeated resolves
+    // (each renewing the sliding dwell) keep serving the step, grace or not.
+    clock += 6 * 60 * 1000; // t=20min
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(0);
+    clock += 6 * 60 * 1000; // t=26min
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(0);
+  });
+
+  it("bucket-scoped: a sibling bucket's recovery cannot un-pin this bucket's sessions", () => {
+    // The mixed state of 2026-09-28 (native sonnet walled while z.ai served
+    // nominal successes): role-keyed, every request of the still-walled bucket
+    // would yield, re-resolve to the fallback step and re-pin — a two-log-line
+    // loop per request for as long as the mixed state held.
+    expect(armFailover("sonnet", "wall", "native-bucket")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-N", "native-bucket").stepIndex).toBe(0);
+    clock += 9 * 60 * 1000;
+    expect(resolveFailoverTargetForSession("sonnet", "sess-N", "native-bucket").stepIndex).toBe(0); // renew
+    clock += 3 * 60 * 1000; // t=12min: wall TTL (10 min) expired → probeable
+    onNominalSuccess("sonnet", "zai-coding"); // the SIBLING bucket recovers
+    clock += 3 * 60 * 1000; // t=15min: sibling grace elapsed, native pin live (until t=19)
+    // native-bucket never verified a recovery: the pin holds.
+    expect(resolveFailoverTargetForSession("sonnet", "sess-N", "native-bucket").stepIndex).toBe(0);
+    // Its OWN nominal now succeeds → its sessions yield too.
+    onNominalSuccess("sonnet", "native-bucket");
+    clock += 3 * 60 * 1000; // t=18min: own grace elapsed
+    expect(resolveFailoverTargetForSession("sonnet", "sess-N", "native-bucket").stepIndex).toBe(-1);
+  });
+
+  // Coordinator probes (review of the first cut, 01/10). The stamp must age
+  // from the FIRST post-arm success only, and never be written under a live
+  // wall — otherwise the fix fails under exactly the traffic it targets.
+  it("P1 — a BUSY nominal releases the pins: the stamp is not refreshed by later successes", () => {
+    // The post-lift state measured on the hub: the nominal serves someone every
+    // ~10 s (minimax 23-29 responses / 5 min). If every success re-stamped, the
+    // grace would measure since the LAST success and no pinned session would
+    // EVER yield while the nominal is busy — the defect the review caught.
+    pinThenLift("sess-A");
+    const perMinute: number[] = [];
+    for (let s = 0; s <= 300; s += 10) {
+      onNominalSuccess("sonnet"); // other sessions' requests, every 10 s
+      clock += 10 * 1000;
+      if (s % 60 === 0) perMinute.push(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex);
+    }
+    // Held through the 2-min grace (minutes 0-1), yielded from minute 2 on —
+    // the recovery is measured from the FIRST success, not the last.
+    expect(perMinute).toEqual([0, 0, -1, -1, -1, -1]);
+  });
+
+  it("P2 — control: a busy nominal that then goes QUIET still yields (grace from the first success)", () => {
+    pinThenLift("sess-A");
+    for (let s = 0; s <= 300; s += 10) {
+      onNominalSuccess("sonnet");
+      clock += 10 * 1000;
+      resolveFailoverTargetForSession("sonnet", "sess-A"); // renewing reads
+    }
+    clock += 3 * 60 * 1000; // quiet: no success for 3 min (>> grace)
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(-1);
+  });
+
+  it("P3 — an in-flight success under a LIVE wall never stamps: no yield lines while the wall holds", () => {
+    // The false-recovery shape measured 19:23:33Z: ARMED, then a success 458 ms
+    // later from a request admitted before the arm. A stamp written there would
+    // age under the wall (the bucket diverts every new request, nothing
+    // refreshes it), past the grace every pinned request would yield →
+    // re-resolve to the same armed step → re-pin, and at the wall's TTL expiry
+    // the stale stamp would mass-un-pin with NO verified post-lift success.
+    const writes: string[] = [];
+    const origWrite = process.stderr.write;
+    const realWrite = process.stderr.write.bind(process.stderr) as (c: string) => boolean;
+    (process.stderr as unknown as { write: (c: unknown) => boolean }).write = (chunk: unknown) => {
+      const s = String(chunk);
+      writes.push(s);
+      return realWrite(s);
+    };
+    try {
+      expect(armFailover("sonnet", "wall", "minimax")).toBe(true);
+      expect(resolveFailoverTargetForSession("sonnet", "sess-A", "minimax").stepIndex).toBe(0);
+      clock += 500;
+      onNominalSuccess("sonnet", "minimax"); // the in-flight request lands
+      expect(isFailoverActive("sonnet", "minimax")).toBe(true); // wall STILL holds
+      for (let i = 0; i < 6; i++) {
+        clock += 30 * 1000; // 3 min of pinned traffic, well past the grace
+        expect(resolveFailoverTargetForSession("sonnet", "sess-A", "minimax").stepIndex).toBe(0);
+      }
+    } finally {
+      (process.stderr as unknown as { write: typeof origWrite }).write = origWrite;
+    }
+    const yields = writes.filter((w) => w.includes("DWELL sonnet") && w.includes("yielded")).length;
+    expect(yields).toBe(0); // not one yield under a live wall
+  });
+});
+
 // #91 — damp the nominal/substitute flap: grace before arming, and a short
 // retry-after means burst, not wall. One transient 429 must cost a few seconds
 // of patience, never a 10-minute model exile plus two cold prompt caches.
