@@ -349,7 +349,13 @@ async function runClaudeWithMcp(
 let claudeAvailable = false;
 try {
   const proc = spawn("claude", ["--version"], { stdio: "pipe" });
-  const code = await new Promise<number>((r) => proc.on("exit", (c) => r(c ?? 1)));
+  const code = await new Promise<number>((r) => {
+    proc.on("exit", (c) => r(c ?? 1));
+    // A failed spawn (ENOENT — npm-shim installs have no claude.exe for CreateProcess
+    // to resolve) emits an async 'error' and never 'exit': without this listener the
+    // top-level await hangs forever and takes the whole bounded run down with it.
+    proc.on("error", () => r(1));
+  });
   claudeAvailable = code === 0;
 } catch {}
 
