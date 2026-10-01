@@ -1015,6 +1015,101 @@ describe("forwardToUpstream — pre-visible re-forward (#170)", () => {
   });
 });
 
+// ── #286: the passthrough's "nothing client-visible" predicates are
+// wire-agnostic ────────────────────────────────────────────────────────────────
+// Measured while writing #283's route-level control: a NOMINAL relay forwarding
+// /v1/chat/completions pipes the hub's OpenAI-SSE body through
+// createAnthropicPassthroughStream, whose #170 gate (`sawMessageStart ||
+// highestSeenIndex !== -1 || lastBlockOpen`) is anthropic parser state that
+// NEVER arms on the OpenAI wire. A graceful end after the FULL body was
+// delivered read as "died before anything visible": 2 re-forwards, 3 hub
+// requests, 3 copies of the content, then a synthetic "[Error: The model
+// returned an empty response…]" tail in anthropic event format after the real
+// [DONE]. The fix tracks forwardedAnyData at emitDataLine — the one choke
+// point every data-line emission funnels through — so "nothing client-visible"
+// means "no data line was FORWARDED", whatever its schema.
+
+/** Spec-correct OpenAI SSE chunks (what the hub really answers on that route). */
+function openaiChunkSse(marker: string): string {
+  const chunk = (delta: any, finish_reason: string | null = null) =>
+    `data: ${JSON.stringify({
+      id: "chatcmpl-hub",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "fake",
+      choices: [{ index: 0, delta, finish_reason }],
+    })}\n\n`;
+  return (
+    chunk({ role: "assistant", content: "" }) +
+    chunk({ content: marker }) +
+    chunk({}, "stop") +
+    "data: [DONE]\n\n"
+  );
+}
+
+describe("forwardToUpstream — wire-agnostic re-forward predicates (#286)", () => {
+  it("OpenAI wire: graceful end after the full body → NO re-forward, single copy, no empty-response tail", async () => {
+    let calls = 0;
+    fetchImpl = async () => {
+      calls++;
+      return sseResponse(openaiChunkSse("FROM-THE-HUB"));
+    };
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const c = mockForwardContext({});
+    c.req.path = "/v1/chat/completions";
+    const out = await drainResponse(await forwardToUpstream(c, { model: "m" }, state));
+
+    // Pre-fix this measured: calls=3, marker ×3, + the empty-response error text.
+    expect(calls).toBe(1);
+    expect(out.split("FROM-THE-HUB").length - 1).toBe(1);
+    expect(out).toContain("[DONE]");
+    expect(out).not.toContain("empty response");
+    // never-hang intact: the stream still terminates (synthetic terminal tail).
+    expect(out).toContain("message_stop");
+  });
+
+  it("OpenAI wire: hub death BEFORE any chunk → the #170 recovery still fires across wires", async () => {
+    let calls = 0;
+    fetchImpl = async () => {
+      calls++;
+      return calls === 1 ? sseDyingResponse() : sseResponse(openaiChunkSse("served after the restart"));
+    };
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const c = mockForwardContext({});
+    c.req.path = "/v1/chat/completions";
+    const out = await drainResponse(await forwardToUpstream(c, { model: "m" }, state));
+
+    expect(calls).toBe(2); // original + exactly one re-forward — recovery preserved
+    expect(out.split("served after the restart").length - 1).toBe(1);
+  });
+
+  it("OpenAI wire: a policy-refusal error chunk arriving AFTER content → surfaced, never retried", async () => {
+    // Content first, then the in-stream error shape both wire parsers detect
+    // (`data: {"error":…}`). Pre-fix, the #65 nothingVisible predicate was
+    // anthropic parser state only → it retried the identical body with the
+    // content already client-visible, duplicating what the client holds.
+    let calls = 0;
+    fetchImpl = async () => {
+      calls++;
+      return sseResponse(
+        openaiChunkSse("PARTIAL-CONTENT").slice(0, openaiChunkSse("PARTIAL-CONTENT").indexOf("data: [DONE]")) +
+          `data: ${JSON.stringify({ error: { code: "invalid_prompt", message: "request rejected due to usage policy" } })}\n\n`
+      );
+    };
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const c = mockForwardContext({});
+    c.req.path = "/v1/chat/completions";
+    const out = await drainResponse(await forwardToUpstream(c, { model: "m" }, state));
+
+    expect(calls).toBe(1); // content already visible → the retry gate must stay shut
+    expect(out).toContain("PARTIAL-CONTENT");
+    expect(out.split("PARTIAL-CONTENT").length - 1).toBe(1);
+    // The persistent refusal surfaces labeled (#65), and the turn terminates.
+    expect(out.toLowerCase()).toContain("policy refusal");
+    expect(out).toContain("message_stop");
+  });
+});
+
 // ── #229 review: the relay must not be where the hub's notice header dies ────
 // Both relay branches rebuild their client-facing response headers (the
 // non-stream branch from a 1-key literal, the stream branch through the
