@@ -155,9 +155,14 @@ export function main(argv: string[]): number {
   // timeout to save it (measured same day: two identical bounded runs, one
   // finished in 145 s, the other still silent at 420 s). Killed ≠ verdict.
   const WALL_CLOCK_MS = 420_000;
+  // Scope to src/: a compiled dist/ in the tree gets picked up by a bare `bun test`
+  // and its compiled tests fail en masse on fixture/import resolution they were never
+  // meant to survive (the documented "tool-choice-mapping/dist" class — measured
+  // 2026-10-01: a fresh tsc emit inflated the failing population from 9 to 52 without
+  // a single source change). The dist is a build artifact, not a test population.
   const r = spawnSync(
     process.execPath,
-    ["test", "--timeout", String(DEFAULT_TEST_TIMEOUT_MS)],
+    ["test", "packages/cli/src", "--timeout", String(DEFAULT_TEST_TIMEOUT_MS)],
     { encoding: "utf-8", maxBuffer: 64 * 1024 * 1024, cwd, timeout: WALL_CLOCK_MS },
   );
   if (r.error && (r.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
