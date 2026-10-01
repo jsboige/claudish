@@ -57,6 +57,8 @@ import {
   classifyNominalBucket,
   providerBucketOf,
   resolveFailoverTargetForSession,
+  resolveDelegationOwner,
+  setRoleNominalResolver,
   markStepFailed,
   parseResetAtFromBody,
   resetStepSuccess,
@@ -455,6 +457,12 @@ export async function createProxyServer(
   // env; when set, diverts a whole role to another pool and announces it at the
   // next condensation. Read once per proxy lifetime. See fork/failover.ts.
   initFailover();
+
+  // #274: the failover module needs each role's NOMINAL routing target to
+  // resolve a `role:` cascade step (modelMap is the owner). The reverse mapping
+  // of resolveRoleMappedModel — a role whose modelMap entry is unset has no
+  // known nominal, and the delegation falls to that role's own cascade.
+  setRoleNominalResolver((r) => modelMap?.[r]);
 
   // Load user-declared custom endpoints from ~/.claudish/config.json and
   // register them in the runtime provider registry so they appear in lookups
@@ -1076,7 +1084,10 @@ export async function createProxyServer(
     let response: Response | undefined;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const handler = await getHandlerForRequest(requestedModel, 0, sessionKey, bucket);
-      const { stepIndex } = role ? resolveFailoverTargetForSession(role, sessionKey, bucket) : { stepIndex: -1 };
+      const resolved = role
+        ? resolveFailoverTargetForSession(role, sessionKey, bucket)
+        : { step: null, stepIndex: -1 };
+      const { stepIndex } = resolved;
       if (role && stepIndex >= 0 && triedSteps.has(stepIndex) && revisits < (rule?.steps.length ?? 0)) {
         revisits++;
         markStepFailed(role, stepIndex, `re-selected after a concurrent clear — already failed in this request`);
@@ -1084,6 +1095,19 @@ export async function createProxyServer(
         continue;
       }
       if (stepIndex >= 0) triedSteps.add(stepIndex);
+      // #274 (review 29/09): when this attempt serves a role-step's DELEGATION,
+      // the concrete model belongs to another cascade, and failover bookkeeping
+      // must reach the OWNING side — a delegated wall of the target's nominal
+      // arms the target's bucket, a delegated wall of the target's step marks
+      // that step. The owning coordinate comes from the RESOLUTION itself
+      // (resolveDelegationOwner): the first cut derived it by comparing the
+      // concrete target to the DELEGATING role's own nominal (never equal — a
+      // role's nominal never appears in its own cascade) and by reverse
+      // target→step lookup (which finds the delegating step back, since a
+      // role-step's `target` is refreshed in place). Null for model steps and
+      // the nominal attempt — no owning side to record.
+      const delegation =
+        role && resolved.step?.roleRef ? resolveDelegationOwner(role, resolved.step) : null;
       // Native-lane version pin. Applied HERE rather than at the route, because the
       // cascade re-resolves the handler every attempt: only the attempt that actually
       // lands on NativeHandler may carry a bare Anthropic id, and a later attempt is a
@@ -1104,6 +1128,18 @@ export async function createProxyServer(
         if (role) {
           if (stepIndex === -1) onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
           else resetStepSuccess(role, stepIndex);
+          // #274: the concrete model succeeded — clear the OWNING side too,
+          // in the owner's vocabulary: the TARGET's bucket when the delegated
+          // model was its nominal (never the delegating role's own bucket),
+          // the TARGET's step otherwise.
+          if (delegation) {
+            if (delegation.owner.nominal) {
+              const ownerBucket = await nominalBucketOfModel(delegation.concrete);
+              onNominalSuccess(delegation.owner.role, ownerBucket);
+            } else {
+              resetStepSuccess(delegation.owner.role, delegation.owner.stepIndex);
+            }
+          }
         }
         return response;
       }
@@ -1147,6 +1183,9 @@ export async function createProxyServer(
         // marking makes every subsequent request re-pay the round-trip (and its
         // timeout) to a step that may be down for hours. Any success resets the count.
         markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody));
+        if (delegation && !delegation.owner.nominal) {
+          markStepFailed(delegation.owner.role, delegation.owner.stepIndex, why, parseResetAtFromBody(errBody));
+        }
         continue;
       }
       const reason = `HTTP ${response.status} from ${requestedModel}`;
@@ -1179,7 +1218,25 @@ export async function createProxyServer(
         // "armed" — fall through: the retry below re-resolves the handler and
         // serves from the cascade.
       } else {
-        markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody));
+        // #274 delegated bookkeeping: the delegating step is marked ONCE, and
+        // the owning side records the wall in ITS OWN vocabulary — a
+        // delegated qualifying wall of the target's nominal goes through the
+        // TARGET's grace/arm semantics (onNominalRefusal on the target's
+        // bucket, so delegated traffic itself accumulates the arm instead of
+        // waiting for direct traffic), and a delegated wall of the target's
+        // step marks THAT step's backoff. Exactly one increment per failure on
+        // each side (the first cut double-marked the delegating step: 10→30min
+        // off a single wall).
+        if (delegation?.owner.nominal) {
+          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody));
+          const ownerBucket = await nominalBucketOfModel(delegation.concrete);
+          onNominalRefusal(delegation.owner.role, reason, response.headers.get("retry-after"), errBody, ownerBucket);
+        } else {
+          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody));
+          if (delegation && delegation.owner.nominal === false) {
+            markStepFailed(delegation.owner.role, delegation.owner.stepIndex, reason, parseResetAtFromBody(errBody));
+          }
+        }
         if (rule && stepIndex === rule.steps.length - 1) return response; // last step also walled
       }
     }

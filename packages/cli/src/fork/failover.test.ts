@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   initFailover,
   isFailoverActive,
@@ -39,8 +40,12 @@ import {
   providerBucketOf,
   classifyNominalBucket,
   nativeBucketFor,
+  resolveConcreteTarget,
+  resolveDelegationOwner,
+  setRoleNominalResolver,
   NATIVE_BUCKET,
 } from "./failover.js";
+import type { DelegationOwner } from "./failover.js";
 import { route } from "../providers/routing-rules.js";
 import { DEFAULT_ROUTING_RULES } from "../providers/default-routing-rules.js";
 
@@ -1809,5 +1814,370 @@ describe("#275 — classifyNominalBucket (request-side bucket derivation)", () =
     expect(classifyNominalBucket("qwen/qwen3-coder", noOverride)).toEqual({
       routeModel: "qwen3-coder", // the vendor prefix is stripped by parseModelSpec
     });
+  });
+});
+
+// ── #274 — role-as-failover-step ───────────────────────────────────────────────
+// A cascade step of the form `role:sonnet` delegates to another ROLE. Resolution:
+// the target's nominal when healthy, else the target's own resolved cascade step
+// (shared walk state). The delegation graph is proven acyclic at load; the dwell
+// pin pins the concrete resolved step, never the role reference.
+
+describe("#274 — role-as-failover-step (parsing + acyclicity)", () => {
+  it("parses a `role:<r>` step into a delegation (roleRef set, target = placeholder until resolution)", () => {
+    initFailover({ CLAUDISH_FAILOVER_OPUS: "role:sonnet" } as NodeJS.ProcessEnv);
+    const step = getFailoverRule("opus")!.steps[0];
+    expect(step.roleRef).toBe("sonnet");
+    expect(step.target).toBe("sonnet"); // placeholder — replaced at resolution
+    expect(step.label).toBe("role:sonnet"); // label defaults to the raw step string
+  });
+
+  it("is case-insensitive and space-tolerant on the role: prefix", () => {
+    initFailover({ CLAUDISH_FAILOVER_OPUS: " ROLE : Sonnet " } as NodeJS.ProcessEnv);
+    expect(getFailoverRule("opus")!.steps[0].roleRef).toBe("sonnet");
+  });
+
+  it("a model target is never misparsed as a delegation (colon inside a model name)", () => {
+    initFailover({ CLAUDISH_FAILOVER_OPUS: "ollama@llama3.2:3b" } as NodeJS.ProcessEnv);
+    const step = getFailoverRule("opus")!.steps[0];
+    expect(step.roleRef).toBeUndefined();
+    expect(step.target).toBe("ollama@llama3.2:3b");
+  });
+
+  it("an unknown role name is treated as a model target (never a silent delegation)", () => {
+    initFailover({ CLAUDISH_FAILOVER_OPUS: "role:banana" } as NodeJS.ProcessEnv);
+    const step = getFailoverRule("opus")!.steps[0];
+    expect(step.roleRef).toBeUndefined();
+    expect(step.target).toBe("role:banana");
+  });
+
+  it("refuses a self-delegation cycle at load", () => {
+    initFailover({ CLAUDISH_FAILOVER_OPUS: "role:opus" } as NodeJS.ProcessEnv);
+    expect(getFailoverRule("opus")).toBeUndefined();
+  });
+
+  it("refuses a two-role cycle (opus→fable→opus), keeping the acyclic role", () => {
+    initFailover({
+      CLAUDISH_FAILOVER_OPUS: "role:fable",
+      CLAUDISH_FAILOVER_FABLE: "role:opus",
+      CLAUDISH_FAILOVER_SONNET: "deepseek@deepseek-payg",
+    } as NodeJS.ProcessEnv);
+    expect(getFailoverRule("opus")).toBeUndefined();
+    expect(getFailoverRule("fable")).toBeUndefined();
+    expect(getFailoverRule("sonnet")).toBeDefined(); // model-only chain is untouched
+  });
+
+  it("accepts a terminating delegation chain (haiku→sonnet, sonnet model-only)", () => {
+    initFailover({
+      CLAUDISH_FAILOVER_HAIKU: "kc@kimi-for-coding>role:sonnet",
+      CLAUDISH_FAILOVER_SONNET: "ds@deepseek-flash",
+    } as NodeJS.ProcessEnv);
+    expect(getFailoverRule("haiku")!.steps[1].roleRef).toBe("sonnet");
+    expect(getFailoverRule("sonnet")!.steps[0].target).toBe("ds@deepseek-flash");
+  });
+});
+
+describe("#274 — role-step resolution", () => {
+  const env274 = (extra: Record<string, string> = {}): NodeJS.ProcessEnv =>
+    ({
+      CLAUDISH_FAILOVER_OPUS: "role:sonnet",
+      CLAUDISH_FAILOVER_OPUS_LABEL: "Rôle Sonnet",
+      CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3>ds@deepseek-flash",
+      CLAUDISH_FAILOVER_SONNET_LABEL: "Mistral GLM>DeepSeek Flash",
+      ...extra,
+    } as NodeJS.ProcessEnv);
+
+  it("resolves to the target role's NOMINAL when that bucket is healthy", () => {
+    initFailover(env274({ CLAUDISH_FAILOVER_ACTIVE: "opus" }));
+    setRoleNominalResolver((r) => (r === "sonnet" ? "gc@glm-5.3" : undefined));
+    const { step, stepIndex } = resolveFailoverTarget("opus");
+    expect(stepIndex).toBe(0);
+    expect(step!.roleRef).toBe("sonnet");
+    expect(step!.target).toBe("gc@glm-5.3"); // concrete, not the role keyword
+  });
+
+  it("joins the target's own resolved cascade step when its nominal bucket is walled", () => {
+    initFailover(env274({ CLAUDISH_FAILOVER_ACTIVE: "opus", CLAUDISH_FAILOVER_AUTO: "1" }));
+    setRoleNominalResolver((r) => (r === "sonnet" ? "gc@glm-5.3" : undefined));
+    // Wall the sonnet nominal's bucket (gc@ → glm-coding): the delegation must
+    // join sonnet's own cascade, not serve the walled nominal.
+    armFailover("sonnet", "test wall", "glm-coding");
+    const { step, stepIndex } = resolveFailoverTarget("opus");
+    expect(stepIndex).toBe(0);
+    expect(step!.target).toBe("mistral@glm-5.3"); // sonnet's cascade step 0
+  });
+
+  it("advances to the target's next cascade step when its step 0 is TTL-failed (shared walk state)", () => {
+    initFailover(env274({ CLAUDISH_FAILOVER_ACTIVE: "opus", CLAUDISH_FAILOVER_AUTO: "1" }));
+    setRoleNominalResolver((r) => (r === "sonnet" ? "gc@glm-5.3" : undefined));
+    armFailover("sonnet", "test wall", "glm-coding");
+    markStepFailed("sonnet", 0, "mistral walled");
+    const { step } = resolveFailoverTarget("opus");
+    expect(step!.target).toBe("ds@deepseek-flash"); // sonnet step 1
+  });
+
+  it("a delegation that cannot serve is skipped (no nominal resolver, no target cascade)", () => {
+    initFailover({
+      CLAUDISH_FAILOVER_OPUS: "role:sonnet>ds@deepseek-payg",
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+    } as NodeJS.ProcessEnv);
+    // No setRoleNominalResolver and no CLAUDISH_FAILOVER_SONNET: the role-step
+    // cannot resolve concrete — the cascade falls through to the next step.
+    const { step, stepIndex } = resolveFailoverTarget("opus");
+    expect(stepIndex).toBe(1);
+    expect(step!.target).toBe("ds@deepseek-payg");
+  });
+
+  it("a fully-delegated cascade with no servable delegate yields no substitution (never a placeholder)", () => {
+    initFailover({
+      CLAUDISH_FAILOVER_OPUS: "role:sonnet",
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+    } as NodeJS.ProcessEnv);
+    const { step, stepIndex } = resolveFailoverTarget("opus");
+    expect(step).toBeNull();
+    expect(stepIndex).toBe(-1);
+  });
+
+  it("resolveConcreteTarget returns the model target as-is for a model step", () => {
+    initFailover({ ...OPUS_CASCADE });
+    const step = getFailoverRule("opus")!.steps[1];
+    expect(resolveConcreteTarget("opus", step)).toBe("gc@glm-5.2");
+  });
+});
+
+describe("#274 — dwell pin pins the concrete step, never the role reference", () => {
+  const envDwell = (): NodeJS.ProcessEnv =>
+    ({
+      CLAUDISH_FAILOVER_OPUS: "role:sonnet>ds@deepseek-payg",
+      CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3>ds@deepseek-flash",
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+      CLAUDISH_FAILOVER_SESSION_DWELL_MS: "600000",
+    } as NodeJS.ProcessEnv);
+
+  it("holds a pinned role-step while the target's own cascade step stays servable", () => {
+    initFailover({ ...envDwell(), CLAUDISH_FAILOVER_AUTO: "1" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (r === "sonnet" ? "gc@glm-5.3" : undefined));
+    // Wall sonnet's nominal bucket so the delegation joins sonnet's cascade.
+    armFailover("sonnet", "wall", "glm-coding");
+    const first = resolveFailoverTargetForSession("opus", "sess-1", "openai-codex");
+    expect(first.stepIndex).toBe(0);
+    expect(first.step!.target).toBe("mistral@glm-5.3");
+    // Sonnet step 0 TTL-fails mid-dwell: the pin must YIELD to genuine
+    // advancement and re-pin at the delegate's next concrete step.
+    markStepFailed("sonnet", 0, "mistral walled");
+    const second = resolveFailoverTargetForSession("opus", "sess-1", "openai-codex");
+    expect(second.stepIndex).toBe(0); // same delegating step…
+    expect(second.step!.target).toBe("ds@deepseek-flash"); // …but re-resolved concrete
+  });
+
+  it("findCascadeStepForTarget is GONE — the owner comes from the resolution (review 29/09)", () => {
+    // The reverse target→step lookup found the DELEGATING step back (its target
+    // is refreshed in place), never the true owner. Resolution-derived owners
+    // are pinned below and in the route test; the export must not exist.
+    const source = readFileSync(new URL("./failover.ts", import.meta.url), "utf-8");
+    expect(source.includes("function findCascadeStepForTarget")).toBe(false);
+  });
+});
+
+// ── #274 review (29/09) — ownership derived from the resolution itself ─────────
+// S1/S2/S3 of the coordinator's probe: the owner of the concrete model a
+// delegation resolves to must be the TARGET's nominal bucket or the TARGET's
+// step — never the delegating step itself, never another role's delegation.
+describe("#274 — resolveDelegationOwner (ownership from resolution)", () => {
+  const envReview = (extra: Record<string, string> = {}): NodeJS.ProcessEnv =>
+    ({
+      // The operator's target shape (probe 29/09): opus delegates to sonnet's
+      // nominal gc@glm-5.3; sonnet walks Mistral→Kimi; haiku ends on sonnet.
+      CLAUDISH_FAILOVER_OPUS: "cx@gpt-6-sol>role:sonnet",
+      CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3>kimi@kimi-k3",
+      CLAUDISH_FAILOVER_HAIKU: "mm@minimax-m3>kimi@kimi-k2.8>role:sonnet",
+      CLAUDISH_FAILOVER_AUTO: "1",
+      ...extra,
+    } as NodeJS.ProcessEnv);
+  const modelMap = { opus: "claude-opus-5-5", sonnet: "gc@glm-5.3", haiku: "mm@minimax-m3" };
+
+  /** The opus delegation step (index 1) resolved. */
+  function opusDelegation(): { concrete: string; owner: DelegationOwner } | null {
+    const rule = getFailoverRule("opus")!;
+    return resolveDelegationOwner("opus", rule.steps[1]);
+  }
+
+  it("S1: healthy target nominal → owner is the TARGET's nominal, not the delegating role's", () => {
+    initFailover({ ...envReview(), CLAUDISH_FAILOVER_ACTIVE: "opus" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (modelMap as Record<string, string>)[r]);
+    // opus walled (Sol), sonnet healthy → opus[1] serves sonnet's nominal.
+    armFailover("opus", "probe: sol wall", "openai-codex");
+    markStepFailed("opus", 0, "probe: sol wall");
+    const d = opusDelegation();
+    expect(d).not.toBeNull();
+    expect(d!.concrete).toBe("gc@glm-5.3");
+    expect(d!.owner).toEqual({ role: "sonnet", nominal: true });
+  });
+
+  it("S2: target bucket walled → owner is the TARGET's cascade step 0, never the delegating step", () => {
+    initFailover({ ...envReview(), CLAUDISH_FAILOVER_ACTIVE: "opus" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (modelMap as Record<string, string>)[r]);
+    armFailover("opus", "probe: sol wall", "openai-codex");
+    markStepFailed("opus", 0, "probe: sol wall");
+    // Sonnet's own bucket walls → the delegation joins sonnet's cascade.
+    armFailover("sonnet", "probe: glm wall", "glm-coding");
+    const d = opusDelegation();
+    expect(d).not.toBeNull();
+    expect(d!.concrete).toBe("mistral@glm-5.3");
+    expect(d!.owner).toEqual({ role: "sonnet", nominal: false, stepIndex: 0 });
+  });
+
+  it("S3: nested delegation resolves to the TERMINAL owner (sonnet step 0), not haiku's or opus's delegation step", () => {
+    initFailover({ ...envReview(), CLAUDISH_FAILOVER_ACTIVE: "haiku" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (modelMap as Record<string, string>)[r]);
+    armFailover("haiku", "probe: minimax wall", "minimax-coding");
+    markStepFailed("haiku", 0, "probe");
+    markStepFailed("haiku", 1, "probe");
+    armFailover("sonnet", "probe: glm wall", "glm-coding");
+    const rule = getFailoverRule("haiku")!;
+    const d = resolveDelegationOwner("haiku", rule.steps[2]);
+    expect(d).not.toBeNull();
+    expect(d!.concrete).toBe("mistral@glm-5.3");
+    expect(d!.owner).toEqual({ role: "sonnet", nominal: false, stepIndex: 0 });
+  });
+
+  it("a model step has no delegation to own (null)", () => {
+    initFailover({ ...envReview(), CLAUDISH_FAILOVER_ACTIVE: "opus" } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (modelMap as Record<string, string>)[r]);
+    const rule = getFailoverRule("opus")!;
+    expect(resolveDelegationOwner("opus", rule.steps[0])).toBeNull();
+  });
+});
+
+// ── #274 re-review 01/10 — the two unpinned UNIT branches ──────────────────────
+// (ii) the dwell pin on a role-step: a pinned session keeps the DELEGATION step
+//      and its concrete refreshes to the target's CURRENT walk (never frozen).
+// (ii-b) adopted from the coordinator's probe (re-review 3): the pin HOLDS even
+//      when the delegating role's own earlier step becomes probeable — no
+//      provider switch inside the dwell. (The removed `wasNominal` yield broke
+//      exactly that, and its flag survived delegated successes for hours.)
+// (iii) nested delegation: the owner recorded is the TERMINAL role's coordinate.
+describe("#274 re-review — dwell pin on role-steps + nested delegation owner", () => {
+  // Known-provider vocabulary (buckets already pinned by the tests above):
+  // gc@glm-5.3 → glm-coding, cx@gpt-6-sol → openai-codex.
+  const SONNET_NOM = "gc@glm-5.3";
+  const OPUS_NOM = "cx@gpt-6-sol";
+
+  it("(ii) a pinned session keeps the delegation step while its target's nominal walls — the concrete is refreshed to the target's CURRENT walk, not frozen at the walled nominal", () => {
+    const realNow = Date.now;
+    let clock = 1_000_000_000_000;
+    Date.now = () => clock;
+    try {
+      initFailover({
+        CLAUDISH_FAILOVER_OPUS: "role:sonnet",
+        CLAUDISH_FAILOVER_SONNET: "kimi@kimi-k3>ds@deepseek-flash",
+        CLAUDISH_FAILOVER_AUTO: "1",
+        CLAUDISH_FAILOVER_ACTIVE: "opus",
+        // The pin must OUTLIVE the step's first backoff rung (10 min) — the
+        // yield's window is exactly "pin live + pinned step probeable again".
+        CLAUDISH_FAILOVER_SESSION_DWELL_MS: "3600000",
+      } as NodeJS.ProcessEnv);
+      setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOM : r === "opus" ? OPUS_NOM : undefined));
+
+      // Pin the session on the delegation step while the target nominal is healthy.
+      const p1 = resolveFailoverTargetForSession("opus", "sess-yn");
+      expect(p1.stepIndex).toBe(0);
+      expect(p1.step?.target).toBe(SONNET_NOM);
+
+      // The route's own failure shape (proxy-server.ts delegated-owner branch):
+      // a qualifying wall of the delegated TARGET NOMINAL marks the delegating step.
+      markStepFailed("opus", 0, "test: delegated wall of the target nominal");
+      armFailover("sonnet", "test: target nominal walled", "glm-coding");
+      markStepFailed("sonnet", 0, "test: kimi walled");
+
+      // Past the step's first rung (10 min): pin still live (dwell 1 h), pinned
+      // step probeable — the re-resolution must land on the target's walk.
+      clock += 11 * 60_000;
+      // Refresh the target-side walls (they TTL out on the same 10-min scale).
+      armFailover("sonnet", "test: target nominal still walled", "glm-coding");
+      markStepFailed("sonnet", 0, "test: kimi still walled");
+
+      const p2 = resolveFailoverTargetForSession("opus", "sess-yn");
+      // Same delegation step, but re-RESOLVED: the concrete the session sees is
+      // sonnet's CURRENT walk state (deepseek), not the stale walled nominal
+      // the pin froze on. Deleting the whole `pinnedStep?.roleRef` block
+      // (failover.ts:851) keeps the pin and returns target === gc@glm-5.3 —
+      // this assert goes red.
+      expect(p2.stepIndex).toBe(0);
+      expect(p2.step?.target).toBe("ds@deepseek-flash");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  // (ii-b) adopted from the coordinator's probe (re-review 3, c.5938875564),
+  // adapted to the post-deletion 4-arg markStepFailed: same state, earlier step
+  // made probeable. This is the pin for the DELETION itself.
+  it("(ii-b) a pinned delegation step HOLDS when the delegating role's earlier step becomes probeable — no provider switch inside the dwell", () => {
+    const realNow = Date.now;
+    let clock = 1_000_000_000_000;
+    Date.now = () => clock;
+    try {
+      initFailover({
+        CLAUDISH_FAILOVER_OPUS: "kimi@kimi-k3>role:sonnet",
+        CLAUDISH_FAILOVER_SONNET: "ds@deepseek-flash",
+        CLAUDISH_FAILOVER_AUTO: "1",
+        CLAUDISH_FAILOVER_ACTIVE: "opus",
+        CLAUDISH_FAILOVER_SESSION_DWELL_MS: "3600000",
+      } as NodeJS.ProcessEnv);
+      setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOM : r === "opus" ? OPUS_NOM : undefined));
+
+      // opus step 0 (kimi) walls → the session lands on the delegation step 1
+      // and pins there.
+      markStepFailed("opus", 0, "test: kimi walled");
+      const p1 = resolveFailoverTargetForSession("opus", "sess-probe");
+      expect(p1.stepIndex).toBe(1);
+      expect(p1.step?.target).toBe(SONNET_NOM);
+
+      // The delegated TARGET NOMINAL walls: the delegating step is marked, the
+      // owning side arms sonnet (route shape, proxy-server.ts delegated branch).
+      markStepFailed("opus", 1, "test: delegated target nominal walled");
+      armFailover("sonnet", "test: sonnet nominal walled", "glm-coding");
+
+      // Past every 10-min rung: the pin (1 h) still live, opus step 0 probeable
+      // again, sonnet's walk sitting on ds@deepseek-flash.
+      clock += 11 * 60_000;
+      armFailover("sonnet", "test: sonnet nominal still walled", "glm-coding");
+      const p2 = resolveFailoverTargetForSession("opus", "sess-probe");
+      // The pin HOLDS on step 1 and its concrete is the delegation's CURRENT
+      // resolution (deepseek) — never a switch back to the now-probeable kimi
+      // step 0. Reintroducing a yield on the pinned step's failure record (the
+      // removed wasNominal branch did exactly that) makes this assert go red.
+      expect(p2.stepIndex).toBe(1);
+      expect(p2.step?.target).toBe("ds@deepseek-flash");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("(iii) a two-hop delegation records the TERMINAL role's coordinate as owner (haiku → role:opus → role:sonnet)", () => {
+    initFailover({
+      CLAUDISH_FAILOVER_HAIKU: "role:opus",
+      CLAUDISH_FAILOVER_OPUS: "role:sonnet",
+      CLAUDISH_FAILOVER_SONNET: "kimi@kimi-k3>ds@deepseek-flash",
+      CLAUDISH_FAILOVER_AUTO: "1",
+      CLAUDISH_FAILOVER_ACTIVE: "haiku",
+    } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOM : r === "opus" ? OPUS_NOM : undefined));
+    // Both intermediate nominals walled + the terminal walk's step 0 failed:
+    // the owner must be sonnet[1], reached through the failover.ts:622
+    // recursion — never the intermediate {opus, 0}.
+    armFailover("opus", "test: opus nominal walled", "openai-codex");
+    armFailover("sonnet", "test: sonnet nominal walled", "glm-coding");
+    markStepFailed("sonnet", 0, "test: kimi walled");
+
+    const haikuStep = getFailoverRule("haiku")!.steps[0];
+    const d = resolveDelegationOwner("haiku", haikuStep);
+    expect(d).not.toBeNull();
+    expect(d!.concrete).toBe("ds@deepseek-flash");
+    expect(d!.owner).toEqual({ role: "sonnet", nominal: false, stepIndex: 1 });
+    // Mutation (failover.ts:622 recursion disabled): the owner comes back as
+    // the INTERMEDIATE {opus, 0} with the unresolved placeholder concrete —
+    // both asserts go red.
   });
 });
