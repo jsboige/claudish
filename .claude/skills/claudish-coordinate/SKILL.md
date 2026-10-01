@@ -1,16 +1,16 @@
 ---
 name: claudish-coordinate
-description: Cycle de coordination du workspace claudish sur myia-ai-01 (rôle coordinateur, cadence 5h sous Opus). Dispatche du grain aux 3 workers et fait avancer les issues, review/merge exigeants, lit dashboard + inbox, sonde le hub et le sidecar, contrôle le trafic et la leak-policy Anthropic, fait le point PRs, présente les arbitrages au user, publie un bilan [DONE]. À invoquer au réveil du cron ou quand le user demande un tour de coordination claudish.
+description: Cycle de coordination du workspace claudish sur myia-ai-01 (rôle coordinateur, cadence 6h sous Opus). Dispatche du grain aux 3 workers et fait avancer les issues, review/merge exigeants, lit dashboard + inbox, sonde le hub et le sidecar, contrôle le trafic et la leak-policy Anthropic, fait le point PRs, présente les arbitrages au user, publie un bilan [DONE]. À invoquer au réveil du cron ou quand le user demande un tour de coordination claudish.
 ---
 
 # Cycle de coordination claudish — myia-ai-01
 
-**Cadence :** **5h** via `CronCreate` (`37 */5 * * *`, heure locale), **sous Opus**.
+**Cadence :** **6h** via `CronCreate` (`37 */6 * * *`, heure locale), **sous Opus**.
 
-⚠️ **Cette valeur suit le budget Anthropic et a changé sept fois** : 12h → 24h le 01/09
+⚠️ **Cette valeur suit le budget Anthropic et a changé huit fois** : 12h → 24h le 01/09
 (famine annoncée pour le jeudi, reset vendredi 03h), puis 24h → **5h** le soir même (reset Anthropic
 couvrant ~2 jours), puis 5h → **12h** le 03/09, puis 12h → **6h** le 06/09, puis 6h → **3h** le
-14/09, puis 3h → **5h** le 18/09 — toutes sur demande du user. **Ne jamais la changer de sa propre
+14/09, puis 3h → **5h** le 18/09, puis 5h → **6h** le 02/10 — toutes sur demande du user. **Ne jamais la changer de sa propre
 initiative** — elle est un arbitrage de dépense qui appartient au user.
 
 🔎 **Piège de lecture du delta en Phase 0** : avec `*/N`, les créneaux sont des heures fixes, pas un
@@ -45,6 +45,13 @@ perdu après le cycle 08:07Z — dernier [DONE] coordinateur, ~5 h de trou). Cro
 session qui porte le cron tourne sous `claude-opus-5[1m]` : **le cron n'a pas de paramètre de modèle,
 il hérite du modèle de la session** — donc réarmer depuis une session Sonnet reviendrait à annuler la
 demande en silence. Vérifier le modèle de session avant tout réarmement.
+
+📌 **Tranché le 02/10 (~01:50 locale)** : demande user directe « Tu peux passer ton cron à 6h stp ? »,
+reçue en fin de cycle, juste après le [DONE]. Le cron `430a7cf3` est armé à `37 */6 * * *` depuis une
+session `claude-opus-5-5[1m]`, et l'ancien `fda62aed` (`*/5`) est annulé. Ce paragraphe et la ligne
+de cadence ont été patchés dans le même geste. Le prompt garde le mandat du 18/09 en clair.
+L'armement a eu lieu 73 min après le créneau 00:37 : un tir de rattrapage immédiat est donc possible
+(voir l'avertissement plus bas). Si c'est le cas, mener ce cycle économiquement.
 
 🔴 **MANDAT COORDINATEUR (user, 18/09 ~13:30 locale)** — verbatim : « J'attends de toi que tu endosses
 ton rôle de coordinateur et que tu fasses avancer les issues en dispatchant du travail à tes désormais
@@ -136,8 +143,8 @@ Trois leçons, dans l'ordre où elles mordent :
 `CronList`. Si le job `/claudish-coordinate` est absent → le ré-armer **immédiatement** :
 
 ```
-CronCreate(cron: "37 */5 * * *",
-           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7.",
+CronCreate(cron: "37 */6 * * *",
+           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7. Mandat user du 18/09 : endosser le rôle de coordinateur — faire avancer les issues en dispatchant du grain aux 3 workers (po-2023, po-2024, po-2025), et faire des reviews/merges exigeants. Aucun cycle idle.",
            recurring: true)
 ```
 
