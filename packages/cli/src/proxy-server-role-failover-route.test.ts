@@ -39,6 +39,7 @@ import {
   armFailover,
   classifyNominalBucket,
   isBucketWalled,
+  markStepFailed,
   resetFailoverForTests,
   setRoleNominalResolver,
 } from "./fork/failover.js";
@@ -126,11 +127,14 @@ const bucketOfNominal = () => {
   return nb.bucket;
 };
 
-function resetDelegation(extra: Record<string, string> = {}): void {
+function resetDelegation(
+  extra: Record<string, string> = {},
+  nominals: Record<string, string | undefined> = { sonnet: SONNET_NOMINAL }
+): void {
   resetFailoverForTests({ ...DELEGATION_ENV, ...extra });
   // resetFailoverForTests clears the injected resolver — re-inject, as
   // createProxyServer does at startup (the proxy owns the modelMap).
-  setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
+  setRoleNominalResolver((r) => nominals[r]);
 }
 
 async function postMessage(model: string): Promise<Response> {
@@ -147,7 +151,7 @@ async function postMessage(model: string): Promise<Response> {
 }
 
 beforeEach(() => {
-  calls = { nm: 0, s0: 0, s1: 0 };
+  calls = { nm: 0, s0: 0, s1: 0, or: 0 };
   wallLog = [];
   wallEndpoints = new Set(["nm"]);
   configExisted = existsSync(REAL_CONFIG_PATH);
@@ -162,7 +166,12 @@ beforeEach(() => {
   writeFileSync(
     REAL_CONFIG_PATH,
     JSON.stringify({
-      customEndpoints: { "nom-ep": ep("nm"), "s0-ep": ep("s0"), "s1-ep": ep("s1") },
+      customEndpoints: {
+        "nom-ep": ep("nm"),
+        "s0-ep": ep("s0"),
+        "s1-ep": ep("s1"),
+        "or-ep": ep("or"),
+      },
     }),
     "utf-8"
   );
@@ -181,8 +190,11 @@ beforeEach(() => {
   // Capture the failover wall log (logStderr) without silencing the harness.
   (process.stderr as any).write = ((chunk: any, ...rest: any[]) => {
     const text = typeof chunk === "string" ? chunk : String(chunk);
+    // All [Failover] lines, not just "walled" ones: the re-review tests pin the
+    // RECOVERED line too (a false recovery is the worst regression of the
+    // delegated success path).
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]") && line.includes("walled")) wallLog.push(line);
+      if (line.includes("[Failover]")) wallLog.push(line);
     }
     return realStderrWrite(chunk, ...rest);
   }) as any;
@@ -320,5 +332,124 @@ describe("#274 review — delegated bookkeeping through the real cascade loop", 
     expect(calls.s1).toBe(1);
     // All three attempts were real walls, and the bucket stays armed.
     expect(isBucketWalled(bucketOfNominal())).toBe(true);
+  }, 30_000);
+});
+
+// ---- re-review 01/10: the three unpinned branches --------------------------------
+//
+// (i) the SUCCESS path of a delegation. The wall path is pinned by S1-S4 above;
+//     the success half is the one with the worst failure mode: clearing the
+//     DELEGATING role's bucket on a delegated success seeds a false
+//     "RECOVERED opus → nominal", flips traffic back onto the still-walled
+//     nominal, and can resetAllStepFailures(opus).
+//
+// (ii) nested delegation — failover.ts:622's recursion must return the
+//     TERMINAL role's coordinate as owner, never the intermediate role-step.
+
+describe("#274 re-review — delegated success and nested delegation", () => {
+  const bucketOf = (model: string): string => {
+    const nb = classifyNominalBucket(model, () => false);
+    if (!("bucket" in nb)) throw new Error(`route test: ${model} must classify to a bucket`);
+    return nb.bucket;
+  };
+  const OPUS_NOMINAL = "or-ep@fake-or";
+
+  test("I1: a delegated SUCCESS on the target's nominal does not clear the delegating role's wall nor seed a false RECOVERED", async () => {
+    await spin();
+    // opus is walled on ITS OWN bucket (or-ep) and config-armed; sonnet is
+    // healthy. Every opus request therefore delegates to sonnet's NOMINAL.
+    resetDelegation({ CLAUDISH_FAILOVER_ACTIVE: "opus" }, { sonnet: SONNET_NOMINAL, opus: OPUS_NOMINAL });
+    armFailover("opus", "test: opus nominal pre-walled", bucketOf(OPUS_NOMINAL));
+    wallEndpoints = new Set([]);
+
+    // R1: the delegation serves sonnet's nominal, which answers 200.
+    const r1 = await postMessage("claude-opus-5");
+    expect(r1.status).toBe(200);
+    expect(calls.or).toBe(0); // the walled nominal is never paid
+    expect(calls.nm).toBe(1); // the delegated success
+
+    // THE PIN: the success cleared the TARGET's side only. opus never
+    // recovered — no RECOVERED line, and its wall still holds.
+    expect(wallLog.find((l) => l.includes("RECOVERED opus"))).toBeUndefined();
+    expect(isBucketWalled(bucketOf(OPUS_NOMINAL))).toBe(true);
+
+    // Mutation (:1138 → onNominalSuccess(role, bucket)): the success clears
+    // the DELEGATING role's bucket instead — servedUnderWall(opus|bucket) was
+    // filled by the swap's own resolution, so the mutation logs
+    // "RECOVERED opus" here and the first pin above goes red.
+
+    // R2 (control): opus is still walled, so the request delegates again —
+    // the walled nominal is still never paid.
+    const r2 = await postMessage("claude-opus-5");
+    expect(r2.status).toBe(200);
+    expect(calls.or).toBe(0);
+    expect(calls.nm).toBe(2);
+  }, 30_000);
+
+  test("I2: a delegated SUCCESS on the target's STEP exercises the owner-side reset (behavioral pin)", async () => {
+    await spin();
+    resetDelegation({ CLAUDISH_FAILOVER_ACTIVE: "opus,sonnet" });
+    // Target nominal walled + target step 0 already failed: the delegation
+    // serves sonnet's step 1 (s1), whose owner coordinate is {sonnet, 1}.
+    armFailover("sonnet", "test: nominal pre-walled", bucketOfNominal());
+    markStepFailed("sonnet", 0, "test: s0 pre-walled");
+    wallEndpoints = new Set([]);
+
+    const r1 = await postMessage("claude-opus-5");
+    expect(r1.status).toBe(200);
+    expect(calls.s0).toBe(0); // skipped by the owner's own walk state
+    expect(calls.s1).toBe(1); // the delegated success, on the owner's step
+
+    // A DIRECT sonnet request joins the same walk (s0 skipped), landing on s1.
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s1).toBe(2);
+    expect(calls.nm).toBe(0);
+    // NOTE (measured, reported on the PR): the mutation
+    // resetStepSuccess(owner…) → resetStepSuccess(role, stepIndex) is NOT
+    // observable at this layer: a marked step is TTL-failed for 10 min and is
+    // only ever served again through the last-step fallback, which by
+    // definition has no successor to distinguish a reset from a skip. The
+    // owner-half of the success branch is covered here for real (the branch
+    // runs), but its mutation pin lives in the unit layer's reasoning, not in
+    // a behavioral assert.
+  }, 30_000);
+
+  test("N1: a TWO-HOP delegation records the wall on the TERMINAL role's step (haiku → role:opus → role:sonnet → s0)", async () => {
+    await spin();
+    resetDelegation(
+      {
+        CLAUDISH_FAILOVER_ACTIVE: "haiku,sonnet",
+        CLAUDISH_FAILOVER_HAIKU: "role:opus",
+        CLAUDISH_FAILOVER_OPUS: "role:sonnet",
+      },
+      { sonnet: SONNET_NOMINAL, opus: OPUS_NOMINAL }
+    );
+    // Both intermediate nominals walled: haiku's only step resolves opus's
+    // only step, which resolves sonnet's step 0 — the recursion at
+    // failover.ts:622 must hand back sonnet[0] as the owner.
+    armFailover("opus", "test: opus nominal pre-walled", bucketOf(OPUS_NOMINAL));
+    armFailover("sonnet", "test: sonnet nominal pre-walled", bucketOfNominal());
+    wallEndpoints = new Set(["s0"]);
+
+    const r1 = await postMessage("claude-haiku-4-5");
+    expect(r1.status).toBe(402); // haiku[0] is the last step — the wall surfaces
+    expect(calls.s0).toBe(1);
+    expect(calls.or).toBe(0); // never routed through the intermediates' nominals
+    expect(calls.nm).toBe(0);
+
+    // THE PIN: the wall was recorded on the TERMINAL owner (sonnet[0]) — the
+    // wall log names sonnet[0] and never opus[0].
+    expect(wallLog.some((l) => l.includes("step sonnet[0]") && l.includes("s0-ep@fake-s0"))).toBe(true);
+    expect(wallLog.some((l) => l.includes("step opus[0]"))).toBe(false);
+    // Mutation (failover.ts:622 recursion disabled): the owner comes back as
+    // the INTERMEDIATE {opus, 0} — the log names opus[0] and both pins go red.
+
+    // Control: a direct sonnet request now skips the s0 that r1's wall marked.
+    wallEndpoints.delete("s0");
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(1);
   }, 30_000);
 });

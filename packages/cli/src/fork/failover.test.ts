@@ -2048,3 +2048,88 @@ describe("#274 — resolveDelegationOwner (ownership from resolution)", () => {
     expect(resolveDelegationOwner("opus", rule.steps[0])).toBeNull();
   });
 });
+
+// ── #274 re-review 01/10 — the two unpinned UNIT branches ──────────────────────
+// (ii) the dwell pin's wasNominal yield: a session pinned to a role-step whose
+//      last failure was the TARGET's nominal must re-resolve (join the target's
+//      own cascade) rather than keep serving the delegation's frozen concrete.
+// (iii) nested delegation: the owner recorded is the TERMINAL role's coordinate.
+describe("#274 re-review — wasNominal dwell yield + nested delegation owner", () => {
+  // Known-provider vocabulary (buckets already pinned by the tests above):
+  // gc@glm-5.3 → glm-coding, cx@gpt-6-sol → openai-codex.
+  const SONNET_NOM = "gc@glm-5.3";
+  const OPUS_NOM = "cx@gpt-6-sol";
+
+  it("(ii) a pinned session re-resolves after the pinned failure was the target's nominal — the concrete is refreshed to the target's CURRENT walk, not frozen at the walled nominal", () => {
+    const realNow = Date.now;
+    let clock = 1_000_000_000_000;
+    Date.now = () => clock;
+    try {
+      initFailover({
+        CLAUDISH_FAILOVER_OPUS: "role:sonnet",
+        CLAUDISH_FAILOVER_SONNET: "kimi@kimi-k3>ds@deepseek-flash",
+        CLAUDISH_FAILOVER_AUTO: "1",
+        CLAUDISH_FAILOVER_ACTIVE: "opus",
+        // The pin must OUTLIVE the step's first backoff rung (10 min) — the
+        // yield's window is exactly "pin live + pinned step probeable again".
+        CLAUDISH_FAILOVER_SESSION_DWELL_MS: "3600000",
+      } as NodeJS.ProcessEnv);
+      setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOM : r === "opus" ? OPUS_NOM : undefined));
+
+      // Pin the session on the delegation step while the target nominal is healthy.
+      const p1 = resolveFailoverTargetForSession("opus", "sess-yn");
+      expect(p1.stepIndex).toBe(0);
+      expect(p1.step?.target).toBe(SONNET_NOM);
+
+      // The route's own failure shape (proxy-server.ts:1234): a qualifying wall
+      // of the delegated TARGET NOMINAL marks the delegating step wasNominal=true.
+      markStepFailed("opus", 0, "test: delegated wall of the target nominal", undefined, true);
+      armFailover("sonnet", "test: target nominal walled", "glm-coding");
+      markStepFailed("sonnet", 0, "test: kimi walled");
+
+      // Past the step's first rung (10 min): pin still live (dwell 1 h), pinned
+      // step probeable — the re-resolution must land on the target's walk.
+      clock += 11 * 60_000;
+      // Refresh the target-side walls (they TTL out on the same 10-min scale).
+      armFailover("sonnet", "test: target nominal still walled", "glm-coding");
+      markStepFailed("sonnet", 0, "test: kimi still walled");
+
+      const p2 = resolveFailoverTargetForSession("opus", "sess-yn");
+      // Same delegation step, but re-RESOLVED: the concrete the session sees is
+      // sonnet's CURRENT walk state (deepseek), not the stale walled nominal
+      // the pin froze on. Deleting the whole `pinnedStep?.roleRef` block
+      // (failover.ts:851) keeps the pin and returns target === gc@glm-5.3 —
+      // this assert goes red.
+      expect(p2.stepIndex).toBe(0);
+      expect(p2.step?.target).toBe("ds@deepseek-flash");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("(iii) a two-hop delegation records the TERMINAL role's coordinate as owner (haiku → role:opus → role:sonnet)", () => {
+    initFailover({
+      CLAUDISH_FAILOVER_HAIKU: "role:opus",
+      CLAUDISH_FAILOVER_OPUS: "role:sonnet",
+      CLAUDISH_FAILOVER_SONNET: "kimi@kimi-k3>ds@deepseek-flash",
+      CLAUDISH_FAILOVER_AUTO: "1",
+      CLAUDISH_FAILOVER_ACTIVE: "haiku",
+    } as NodeJS.ProcessEnv);
+    setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOM : r === "opus" ? OPUS_NOM : undefined));
+    // Both intermediate nominals walled + the terminal walk's step 0 failed:
+    // the owner must be sonnet[1], reached through the failover.ts:622
+    // recursion — never the intermediate {opus, 0}.
+    armFailover("opus", "test: opus nominal walled", "openai-codex");
+    armFailover("sonnet", "test: sonnet nominal walled", "glm-coding");
+    markStepFailed("sonnet", 0, "test: kimi walled");
+
+    const haikuStep = getFailoverRule("haiku")!.steps[0];
+    const d = resolveDelegationOwner("haiku", haikuStep);
+    expect(d).not.toBeNull();
+    expect(d!.concrete).toBe("ds@deepseek-flash");
+    expect(d!.owner).toEqual({ role: "sonnet", nominal: false, stepIndex: 1 });
+    // Mutation (failover.ts:622 recursion disabled): the owner comes back as
+    // the INTERMEDIATE {opus, 0} with the unresolved placeholder concrete —
+    // both asserts go red.
+  });
+});
