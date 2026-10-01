@@ -432,6 +432,20 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 - **Chercher les collisions** : tous les agents poussent sous `jsboige`. Deux PRs qui touchent les mêmes fichiers = doublon probable (cas #63/#64, 27-28/08). Comparer les `files`, pas les titres.
 - **Avant tout merge/review** : lire le body complet, tous les commentaires, toutes les reviews avec leur `state`, et le diff. Ne pas merger sur un `CHANGES_REQUESTED` non adressé. Il n'y a **aucun gate CI** sur ce dépôt (le seul check est un no-op) : « en attente de CI » est un faux bloqueur, les tests locaux font foi.
 
+### Phase 4b — Relevé des consoles fournisseurs (depuis le 01/10)
+
+Le user a connecté et ouvert lui-même, dans le **Playwright Edge** d'ai-01, un onglet d'usage par fournisseur, 11 au total : forfaits et pay-as-you-go. **Les URLs font foi, mot pour mot, dans `C:\Users\MYIA\.claudish-browser\provider-consoles-urls.json`.** Ne jamais les deviner ni les modifier : mes URLs devinées menaient à des accueils, des 404 ou des redirections.
+
+- **Lecture** : `provider-consoles-reader.py`, lancé **détaché** (`Start-Process`). Une tâche d'outil en arrière-plan meurt à sa limite de temps et ferme la fenêtre du user avec elle (vécu le 01/10). Le lecteur écrit `readings/tab-NN-<nom>.txt` toutes les 30 s et `readings/_pass.txt` (`opened N read M`). **Un relevé ne vaut que si `read` = 11.**
+- **Fréquence** : un relevé par jour suffit à voir venir un mur de quota (reco rendue au user le 01/10).
+- **Règles** :
+  - chiffres d'usage seulement, jamais les titres de conversations ;
+  - publication sur le **dashboard interne**, jamais sur GitHub ;
+  - aucune navigation ni aucun clic dans une fenêtre que le user a disposée ;
+  - réauthentification par « Continuer avec Google » quand la console le propose, sinon demander au user.
+- **Piège** : `ctx.pages` de Playwright ne liste pas les onglets ouverts à la main (7 vus sur 11, le 01/10). En cas de doute, la source de vérité est le fichier de session d'Edge (`read-edge-session-tabs.py`).
+- **Les périodes diffèrent d'une console à l'autre** (fenêtre 5 h, semaine, mois civil, « dernier mois ») : ne jamais additionner deux chiffres sans avoir lu leur période sur la page.
+
 ### Phase 5 — Arbitrages au user
 
 Pour chaque décision pendante, donner assez de contexte pour trancher **sans ouvrir GitHub** : ce que ça change concrètement, risque si approuvé, risque si rejeté, recommandation. Représenter les arbitrages différés au cycle suivant tant qu'ils ne sont pas tranchés.
@@ -491,4 +505,4 @@ vérifié présent **à cette heure** », jamais « cron garanti jusqu'au procha
 
 ## Hors périmètre
 
-Console Mistral / Qwen / OpenAI (inaccessibles aux agents → question au user) · arbitrages de coût et de souscription · reboots de machines tierces · bugs harness d'autres workspaces (relayer, ne pas instruire).
+Actions dans les consoles fournisseurs : le relevé est en Phase 4b, mais tout clic qui engage le compte (réinitialisation de quota, achat, changement de forfait) revient au user · arbitrages de coût et de souscription · reboots de machines tierces · bugs harness d'autres workspaces (relayer, ne pas instruire).
