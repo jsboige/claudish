@@ -17,6 +17,7 @@ import {
   normalizeFailLine,
   parseEnvGateManifests,
   parseRunOutput,
+  realSuiteRunner,
   runIsAccountable,
   splitFreshByReproduction,
   type StrictBaseline,
@@ -103,6 +104,55 @@ describe("parseRunOutput (real bun output)", () => {
     expect(runIsAccountable(parsed)).toBe(true);
     expect(parsed.entries.length).toBe(Math.max(parsed.fail, parsed.error));
   });
+});
+
+describe("realSuiteRunner (kill path — re-review 2 defect)", () => {
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const d of tmpDirs.splice(0)) spawnSync("cmd", ["/c", "rmdir", "/s", "/q", d]);
+  });
+
+  function captureStdout(fn: () => number): { code: number; out: string } {
+    const chunks: string[] = [];
+    const orig = process.stdout.write.bind(process.stdout);
+    (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => {
+      chunks.push(String(s));
+      return true;
+    };
+    try {
+      return { code: fn(), out: chunks.join("") };
+    } finally {
+      (process.stdout as unknown as { write: (s: string) => boolean }).write = orig as unknown as (s: string) => boolean;
+    }
+  }
+
+  test("a wall-clock kill keeps the partial output and names the last file WITH output", () => {
+    const d = mkdtempSync(join(tmpdir(), "strict-kill-"));
+    tmpDirs.push(d);
+    // aaa-first produces output (header + a named fail), zzz-hang blocks in
+    // beforeAll forever: bun never prints its header (non-TTY headers come
+    // only with output), so the diagnosis can only name the PRECEDING file.
+    writeFileSync(
+      join(d, "aaa-first.test.ts"),
+      "import { test, expect } from 'bun:test';\ntest('red', () => { expect(1).toBe(2); });\n",
+      "utf-8",
+    );
+    writeFileSync(
+      join(d, "zzz-hang.test.ts"),
+      "import { beforeAll, test } from 'bun:test';\nbeforeAll(() => new Promise(() => {}));\ntest('never runs', () => {});\n",
+      "utf-8",
+    );
+
+    const { code, out } = captureStdout(() =>
+      main([], realSuiteRunner(d, { testPath: ".", wallClockMs: 8000 })),
+    );
+    expect(code).toBe(3);
+    // The kill fired on the REAL spawn path and the diagnosis feature is alive
+    // (the 28472efb regression returned raw:"" here, killing it silently).
+    expect(out).toContain("RUN KILLED (ETIMEDOUT)");
+    expect(out).toContain("the hung file is the NEXT one");
+    expect(out).toContain("aaa-first.test.ts");
+  }, 20000);
 });
 
 describe("runIsAccountable (no verdict without accounting)", () => {

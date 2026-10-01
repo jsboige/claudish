@@ -109,6 +109,18 @@ export function parseEnvGateManifests(raw: string): EnvGateSummaryEntry[] {
 const FILE_HEADER_RE = /^(.+\.test\.[cm]?[jt]sx?):\s*$/;
 const UNHANDLED_RE = /^# Unhandled error between tests/;
 
+/** Last match of an anchored multiline regex, or null (see parseRunOutput). */
+function lastSummaryMatch(raw: string, re: RegExp): string | null {
+  const g = new RegExp(re.source, "gm");
+  let m: RegExpExecArray | null = null;
+  let last: RegExpExecArray | null = null;
+  while ((m = g.exec(raw)) !== null) {
+    last = m;
+    if (m[0].length === 0) g.lastIndex += 1;
+  }
+  return last?.[1] ?? null;
+}
+
 /**
  * Parse a real `bun test` output into named failing entries.
  *
@@ -146,8 +158,12 @@ export function parseRunOutput(raw: string): SuiteRun {
       entries.push(currentFile ? `${currentFile} > ${name}` : name);
     }
   }
-  const fail = Number(raw.match(/^\s*(\d+) fail\b/m)?.[1] ?? -1);
-  const error = Number(raw.match(/^\s*(\d+) errors?\b/m)?.[1] ?? 0);
+  // Anchor the summary counters on the LAST match: nothing in the suite echoes
+  // a child bun summary today, but a test that ever does would sit before the
+  // real one, and the first-match read would count the child's (re-review 2,
+  // non-blocking — the gate stays no-verdict either way, this is robustness).
+  const fail = Number(lastSummaryMatch(raw, /^\s*(\d+) fail\b/m) ?? -1);
+  const error = Number(lastSummaryMatch(raw, /^\s*(\d+) errors?\b/m) ?? 0);
   const ranLinePresent = /^Ran \d+ tests? across \d+ files?\./m.test(raw);
   return { entries, fail, error, ranLinePresent, envGates: parseEnvGateManifests(raw), raw };
 }
@@ -206,29 +222,46 @@ export function diffAgainstBaseline(
 
 type SuiteRunner = () => { raw: string; killed?: boolean; errorCode?: string };
 
-function realSuiteRunner(cwd: string): SuiteRunner {
+const WALL_CLOCK_MS = 420_000;
+
+/**
+ * The real suite runner. Bounded by default: an unbounded suite cannot back a
+ * review verdict (a single network-hanging test stalls it past any usable wall
+ * clock — measured 2026-09-29: unbounded run looped >35 min, bounded finished
+ * in 145 s). The wall-clock bound exists because bun's --timeout covers TESTS,
+ * not hooks: a beforeAll stuck on a network call hangs the run with no per-test
+ * timeout to save it. Killed ≠ verdict.
+ *
+ * Scope to src/: a compiled dist/ in the tree gets picked up by a bare
+ * `bun test` and its compiled tests fail en masse on fixture/import
+ * resolution they were never meant to survive (the documented
+ * tool-choice-mapping/dist class — measured 2026-10-01: a fresh tsc emit
+ * inflated the failing population from 9 to 52 without a single source
+ * change). The dist is a build artifact, not a test population.
+ *
+ * `opts` exists for the tests: an injectable wall clock and test path are what
+ * let the kill diagnosis be exercised on the REAL spawn path (re-review 2,
+ * 2026-10-01: a fixture branch injecting `raw` cannot see a runner that drops
+ * its own output on ETIMEDOUT).
+ *
+ * On a kill (ETIMEDOUT, ENOBUFS, any spawn error) the PARTIAL output is kept:
+ * spawnSync's buffers hold everything read before the kill, and that tail is
+ * the only diagnosis a hung hook will ever get — returning `raw: ""` there
+ * (the regression this fixed) silently killed the diagnosis feature.
+ */
+export function realSuiteRunner(
+  cwd: string,
+  opts: { testPath?: string; wallClockMs?: number } = {},
+): SuiteRunner {
   return () => {
-    // Bounded by default: an unbounded suite cannot back a review verdict (a
-    // single network-hanging test stalls it past any usable wall clock —
-    // measured 2026-09-29: unbounded run looped >35 min, bounded finished in 145 s).
-    // The wall-clock bound exists because bun's --timeout covers TESTS, not
-    // hooks: a beforeAll stuck on a network call hangs the run with no per-test
-    // timeout to save it. Killed ≠ verdict.
-    //
-    // Scope to src/: a compiled dist/ in the tree gets picked up by a bare
-    // `bun test` and its compiled tests fail en masse on fixture/import
-    // resolution they were never meant to survive (the documented
-    // tool-choice-mapping/dist class — measured 2026-10-01: a fresh tsc emit
-    // inflated the failing population from 9 to 52 without a single source
-    // change). The dist is a build artifact, not a test population.
-    const WALL_CLOCK_MS = 420_000;
     const r = spawnSync(
       process.execPath,
-      ["test", "packages/cli/src", "--timeout", String(DEFAULT_TEST_TIMEOUT_MS)],
-      { encoding: "utf-8", maxBuffer: 64 * 1024 * 1024, cwd, timeout: WALL_CLOCK_MS },
+      ["test", opts.testPath ?? "packages/cli/src", "--timeout", String(DEFAULT_TEST_TIMEOUT_MS)],
+      { encoding: "utf-8", maxBuffer: 64 * 1024 * 1024, cwd, timeout: opts.wallClockMs ?? WALL_CLOCK_MS },
     );
-    if (r.error) return { raw: "", killed: true, errorCode: (r.error as NodeJS.ErrnoException).code ?? "?" };
-    return { raw: (r.stdout ?? "") + (r.stderr ?? "") };
+    const raw = (r.stdout ?? "") + (r.stderr ?? "");
+    if (r.error) return { raw, killed: true, errorCode: (r.error as NodeJS.ErrnoException).code ?? "?" };
+    return { raw };
   };
 }
 
@@ -269,9 +302,6 @@ function printVerdict(v: StrictVerdict, hadBaseline: boolean): void {
     } else {
       line(`[STRICT] ✅ no regression: every fresh entry failed to reproduce`);
     }
-  } else if (v.flakyTail.length > 0) {
-    line(`[STRICT] flaky tail (within tolerance, not regression): ${v.flakyTail.length}`);
-    for (const n of v.flakyTail) line(`[STRICT]   · ${n}`);
   } else {
     line(`[STRICT] ✅ no regression: observed ⊆ baseline`);
   }
@@ -286,15 +316,16 @@ function printKill(errorCode: string, raw: string): void {
     `[STRICT] 🔴 RUN KILLED (${errorCode}) — no verdict can be drawn from a killed run; ` +
       `re-run (the flaky tail is exactly this class of event).\n`,
   );
-  // Diagnosis: the last file that produced output is the usual suspect —
-  // spawnSync's buffers hold whatever was read before the kill, so surface
-  // it instead of leaving the hung hook nameless.
+  // Diagnosis: bun's non-TTY reporter prints a file header only once that file
+  // produces output, so a file hung in a hook stays nameless — the last file
+  // WITH output names the file just before the one hanging. Say so, instead
+  // of implying the named file is the suspect.
   const tail = raw
     .split(/\r?\n/)
     .filter((l) => l.trim() !== "" && !l.startsWith("[ENV-GATE]"))
     .slice(-15);
   if (tail.length > 0) {
-    process.stdout.write(`[STRICT] last output before the kill (diagnosis):\n`);
+    process.stdout.write(`[STRICT] last file with output (the hung file is the NEXT one — bun does not name a file until it produces output):\n`);
     for (const l of tail) process.stdout.write(`[STRICT] | ${l.slice(0, 160)}\n`);
   }
 }
