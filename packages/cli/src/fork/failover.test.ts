@@ -1515,14 +1515,20 @@ describe("dwell — nominal-recovery yield", () => {
   });
 
   /** Arm, pin the session at step 0, keep the pin alive across the wall's TTL
-   * expiry, then serve a successful nominal request (the verified recovery). */
-  function pinThenRecover(session: string, bucket?: string): void {
+   * expiry. Leaves the clock at t=11min with the wall expired and NO nominal
+   * request served yet. */
+  function pinThenLift(session: string, bucket?: string): void {
     expect(armFailover("sonnet", "wall", bucket ?? "*")).toBe(true);
     expect(resolveFailoverTargetForSession("sonnet", session, bucket).stepIndex).toBe(0);
     clock += 9 * 60 * 1000;
     expect(resolveFailoverTargetForSession("sonnet", session, bucket).stepIndex).toBe(0); // renew
     clock += 2 * 60 * 1000; // t=11min: wall TTL (10 min) expired
     expect(isFailoverActive("sonnet", bucket)).toBe(false);
+  }
+
+  /** pinThenLift + one served nominal request (the verified recovery). */
+  function pinThenRecover(session: string, bucket?: string): void {
+    pinThenLift(session, bucket);
     onNominalSuccess("sonnet", bucket ?? "*"); // the probe SUCCEEDED
   }
 
@@ -1587,6 +1593,69 @@ describe("dwell — nominal-recovery yield", () => {
     onNominalSuccess("sonnet", "native-bucket");
     clock += 3 * 60 * 1000; // t=18min: own grace elapsed
     expect(resolveFailoverTargetForSession("sonnet", "sess-N", "native-bucket").stepIndex).toBe(-1);
+  });
+
+  // Coordinator probes (review of the first cut, 01/10). The stamp must age
+  // from the FIRST post-arm success only, and never be written under a live
+  // wall — otherwise the fix fails under exactly the traffic it targets.
+  it("P1 — a BUSY nominal releases the pins: the stamp is not refreshed by later successes", () => {
+    // The post-lift state measured on the hub: the nominal serves someone every
+    // ~10 s (minimax 23-29 responses / 5 min). If every success re-stamped, the
+    // grace would measure since the LAST success and no pinned session would
+    // EVER yield while the nominal is busy — the defect the review caught.
+    pinThenLift("sess-A");
+    const perMinute: number[] = [];
+    for (let s = 0; s <= 300; s += 10) {
+      onNominalSuccess("sonnet"); // other sessions' requests, every 10 s
+      clock += 10 * 1000;
+      if (s % 60 === 0) perMinute.push(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex);
+    }
+    // Held through the 2-min grace (minutes 0-1), yielded from minute 2 on —
+    // the recovery is measured from the FIRST success, not the last.
+    expect(perMinute).toEqual([0, 0, -1, -1, -1, -1]);
+  });
+
+  it("P2 — control: a busy nominal that then goes QUIET still yields (grace from the first success)", () => {
+    pinThenLift("sess-A");
+    for (let s = 0; s <= 300; s += 10) {
+      onNominalSuccess("sonnet");
+      clock += 10 * 1000;
+      resolveFailoverTargetForSession("sonnet", "sess-A"); // renewing reads
+    }
+    clock += 3 * 60 * 1000; // quiet: no success for 3 min (>> grace)
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(-1);
+  });
+
+  it("P3 — an in-flight success under a LIVE wall never stamps: no yield lines while the wall holds", () => {
+    // The false-recovery shape measured 19:23:33Z: ARMED, then a success 458 ms
+    // later from a request admitted before the arm. A stamp written there would
+    // age under the wall (the bucket diverts every new request, nothing
+    // refreshes it), past the grace every pinned request would yield →
+    // re-resolve to the same armed step → re-pin, and at the wall's TTL expiry
+    // the stale stamp would mass-un-pin with NO verified post-lift success.
+    const writes: string[] = [];
+    const origWrite = process.stderr.write;
+    const realWrite = process.stderr.write.bind(process.stderr) as (c: string) => boolean;
+    (process.stderr as unknown as { write: (c: unknown) => boolean }).write = (chunk: unknown) => {
+      const s = String(chunk);
+      writes.push(s);
+      return realWrite(s);
+    };
+    try {
+      expect(armFailover("sonnet", "wall", "minimax")).toBe(true);
+      expect(resolveFailoverTargetForSession("sonnet", "sess-A", "minimax").stepIndex).toBe(0);
+      clock += 500;
+      onNominalSuccess("sonnet", "minimax"); // the in-flight request lands
+      expect(isFailoverActive("sonnet", "minimax")).toBe(true); // wall STILL holds
+      for (let i = 0; i < 6; i++) {
+        clock += 30 * 1000; // 3 min of pinned traffic, well past the grace
+        expect(resolveFailoverTargetForSession("sonnet", "sess-A", "minimax").stepIndex).toBe(0);
+      }
+    } finally {
+      (process.stderr as unknown as { write: typeof origWrite }).write = origWrite;
+    }
+    const yields = writes.filter((w) => w.includes("DWELL sonnet") && w.includes("yielded")).length;
+    expect(yields).toBe(0); // not one yield under a live wall
   });
 });
 

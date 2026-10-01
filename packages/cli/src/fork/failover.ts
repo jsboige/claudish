@@ -1368,8 +1368,19 @@ export function onNominalSuccess(role: FailoverRole, bucket: string = LEGACY_ROL
   armTtlEscalation.delete(bucket);
   // Verified recovery: a real request just served by the nominal. This is what
   // lets live dwell pins yield back to it (after recoveryGraceMs) — a TTL
-  // expiry only starts a probe and must NOT un-pin anything.
-  nominalRecoveredAt.set(roleBucketKey(role, bucket), Date.now());
+  // expiry only starts a probe and must NOT un-pin anything. Stamp the FIRST
+  // success of a recovery only (a busy nominal must not keep pushing it
+  // forward: measuring since the LAST success, a nominal serving anyone every
+  // <grace would hold every pin forever — coordinator probe P1, 01/10), and
+  // never under a live wall (an in-flight request admitted before the arm
+  // proves nothing about the meter — its stamp would age under the wall and
+  // mass-un-pin at the TTL expiry, probe P3). `armFailover` voids the stamp,
+  // so `!has` is exactly "first success since the last arm", and a
+  // config-armed role never stamps (isFailoverActive is always true for it).
+  const recKey = roleBucketKey(role, bucket);
+  if (!nominalRecoveredAt.has(recKey) && !isFailoverActive(role, bucket)) {
+    nominalRecoveredAt.set(recKey, Date.now());
+  }
   const key = roleBucketKey(role, bucket);
   const pending = servedUnderWall.get(key);
   if (pending) {
