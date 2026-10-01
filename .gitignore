@@ -106,3 +106,6 @@ deploy-notes-*.md
 # exactly this signal.
 __pycache__/
 *.pyc
+
+# #175 strict-runner per-machine baseline (systematic fail population is machine-local)
+.test-strict-baseline.json

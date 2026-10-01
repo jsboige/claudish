@@ -58,3 +58,29 @@ describe("env-gate controls", () => {
     expect(ids).toContain("ctl-active:1");
   });
 });
+
+describe("env-gate doctrine: real reds are never gatable", () => {
+  // #175 dispatch, standing rule: classes 2 (stale contract) and 2b (win32
+  // source defect) must STAY red — a gate that swallows them would turn a
+  // broken-on-main defect into a green line, the exact false-green this
+  // mechanism exists to prevent. TEST-15 (team-orchestrator
+  // validateSessionPath, `startsWith(cwd + "/")` on win32) is the known 2b
+  // resident: this static pin refuses the "cleanup" that would silence it.
+  // Positive control: the posix-path-shim file below IS allowed to gate, so
+  // this test can never pass by matching nothing.
+  test("class-2b host file carries no env gate", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    const gated = readFileSync(
+      join(dirname(import.meta.dir), "channel", "channel-wire-format.test.ts"),
+      "utf-8",
+    );
+    expect(gated).toContain("envDescribe"); // positive control: detector works
+    const host2b = readFileSync(
+      join(dirname(import.meta.dir), "team-orchestrator.test.ts"),
+      "utf-8",
+    );
+    expect(host2b).not.toContain("envDescribe");
+    expect(host2b).not.toContain("env-gate");
+  });
+});
