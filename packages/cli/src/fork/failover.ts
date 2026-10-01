@@ -271,6 +271,11 @@ let armRetryAfterCeilingMs = 120_000;
  * in-flight conversation cannot flip providers mid-work (each flip = cold
  * prompt-cache at both ends). 0 disables the per-session dwell. */
 let sessionDwellMs = 600_000;
+/** Dwell recovery: how long a VERIFIED nominal recovery (a real request served
+ * by the nominal, not a TTL expiry that merely starts a probe) must hold before
+ * live dwell pins yield back to it. Bounds the oscillation cost of an
+ * intermittent wall's isolated success to one provider switch per arm cycle. */
+let recoveryGraceMs = 120_000;
 /** Run of consecutive qualifying nominal refusals, per bucket (#91 gate). All the
  * nominals of a bucket draw on the same meter, so every refusal through it — from
  * any role — counts toward the same wall. */
@@ -456,6 +461,7 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   nominalRefusals.clear();
   armTtlEscalation.clear();
   dwellPins.clear();
+  nominalRecoveredAt.clear();
   const parseIntEnv = (raw: string | undefined, fallback: number): number => {
     const n = Number.parseInt((raw || "").trim(), 10);
     return Number.isFinite(n) ? n : fallback;
@@ -464,6 +470,7 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   armGraceMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_GRACE_MS, 0));
   armRetryAfterCeilingMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS, 120_000));
   sessionDwellMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_SESSION_DWELL_MS, 600_000));
+  recoveryGraceMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_RECOVERY_GRACE_MS, 120_000));
 
   const activeRaw = (env.CLAUDISH_FAILOVER_ACTIVE || "").trim().toLowerCase();
   if (activeRaw && activeRaw !== "none") {
@@ -779,6 +786,19 @@ export function resolveFailoverTarget(
 /** Live dwell pins: role → session → the step it must keep serving until `until`.
  * Set only while armed at a step (stepIndex >= 0) — nominal is never pinned. */
 const dwellPins = new Map<FailoverRole, Map<string, { stepIndex: number; until: number }>>();
+/** Timestamp of the last VERIFIED nominal success (onNominalSuccess), keyed by
+ * role|bucket like the other #275 state. A live dwell pin yields once this is
+ * older than `recoveryGraceMs`, so an ACTIVE conversation returns to the
+ * nominal when its own provider is proven healthy — without this exit the pin
+ * only ever yields on step-death, and a long-lived conversation rides the
+ * fallback until it ends. Measured 2026-10-01 (minimax wall, 19:23→20:08Z):
+ * new sessions returned to the nominal within ~2 min of the lift, pinned cron
+ * conversations were still ~70% on the Kimi fallback 20 min later. Bucket-keyed
+ * (not role-keyed) so a sibling bucket's recovery cannot un-pin sessions whose
+ * OWN nominal is still walled — role-keyed, every request of a still-walled
+ * bucket would yield, re-resolve to the fallback step and re-pin, with two log
+ * lines each, for as long as the mixed state held. Cleared by armFailover. */
+const nominalRecoveredAt = new Map<string, number>();
 /** Prune guard so the pin map cannot grow without bound across a long uptime. */
 const DWELL_PINS_MAX = 512;
 
@@ -816,6 +836,13 @@ export function getSessionDwellMs(): number {
  *  - The pin YIELDS on genuine advancement: the pinned step itself TTL-failed
  *    (markStepFailed walked past it), or the pin expired. Yielding re-pins at
  *    the new step.
+ *  - The pin also YIELDS on VERIFIED nominal recovery: a real request served by
+ *    the nominal (onNominalSuccess) more than `recoveryGraceMs` ago. Without
+ *    this exit an active conversation rides its fallback step until it ENDS —
+ *    measured 2026-10-01, pinned cron sessions still on the fallback 20 min
+ *    after the wall lifted while new sessions had long returned. The grace
+ *    bounds the cost of an intermittent wall's isolated success to one switch
+ *    per arm cycle, and any re-arm re-holds.
  *  - Nominal (stepIndex -1) is never pinned: pinning it would feed a session
  *    into an armed wall when its own refusal just caused the arm.
  */
@@ -854,7 +881,17 @@ export function resolveFailoverTargetForSession(
         pinnedStillServable = false;
       }
     }
-    if (pinnedStillServable) {
+    const recoveredAt = nominalRecoveredAt.get(roleBucketKey(role, bucket));
+    if (pinnedStillServable && recoveredAt !== undefined && now - recoveredAt >= recoveryGraceMs) {
+      // Verified nominal recovery past the grace — return this conversation to
+      // the nominal (re-resolution lands there; nominal is never re-pinned).
+      pins?.delete(sessionKey);
+      logStderr(
+        `[Failover] DWELL ${role} session …${sessionKey.slice(-8)} yielded — nominal recovered ${Math.round(
+          (now - recoveredAt) / 1000
+        )}s ago`
+      );
+    } else if (pinnedStillServable) {
       // Sliding dwell: an in-flight conversation (one that keeps resolving)
       // renews, so the hold lasts as long as the session is active. An idle
       // session's pin expires dwell after its last request.
@@ -1023,6 +1060,17 @@ export function armFailover(role: FailoverRole, reason: string, bucket: string =
   walled.set(bucket, { since: new Date(Date.now()), reason, ttlMs });
   for (const key of [...recovering.keys()]) {
     if (key.startsWith(`${role}|`)) recovering.delete(key);
+  }
+  // A fresh arm voids any recovery: dwell pins must hold again until the
+  // nominal proves itself once more (the grace restarts with the next success).
+  // A bucket arm voids that bucket's marker; a legacy role-wide arm voids every
+  // bucket's (the role-wide wall walls them all).
+  if (bucket === LEGACY_ROLE_WIDE_BUCKET) {
+    for (const k of nominalRecoveredAt.keys()) {
+      if (k.startsWith(`${role}|`)) nominalRecoveredAt.delete(k);
+    }
+  } else {
+    nominalRecoveredAt.delete(roleBucketKey(role, bucket));
   }
   // Seeding the serving memory HERE (not at TTL expiry): the wall's expiry cannot
   // see the role, and a caller that arms without first resolving (tests, and the
@@ -1318,6 +1366,10 @@ export function onNominalSuccess(role: FailoverRole, bucket: string = LEGACY_ROL
   // TTL escalation it was feeding (point 3: prompt recovery over damping).
   nominalRefusals.delete(bucket);
   armTtlEscalation.delete(bucket);
+  // Verified recovery: a real request just served by the nominal. This is what
+  // lets live dwell pins yield back to it (after recoveryGraceMs) — a TTL
+  // expiry only starts a probe and must NOT un-pin anything.
+  nominalRecoveredAt.set(roleBucketKey(role, bucket), Date.now());
   const key = roleBucketKey(role, bucket);
   const pending = servedUnderWall.get(key);
   if (pending) {
