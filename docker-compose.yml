@@ -80,6 +80,10 @@ services:
       # empty = guard on. Listed here because the env file only interpolates —
       # a name absent from this list never reaches the container.
       - CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD=${CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD:-}
+      # #218 kill switch (native model pin): same absence class as the guard
+      # above — it postdated this list, so "=0" in a .env never reached a
+      # container (#304). Only an explicit "0" disarms; empty = pin active.
+      - CLAUDISH_NATIVE_MODEL_PIN=${CLAUDISH_NATIVE_MODEL_PIN:-}
       # Budget failover (fork extension). All empty → inert: no routing change,
       # no notice, zero added bytes. Belongs on the machine that actually CALLS
       # the models. That is the hub most of the time, but a sidecar calls them
@@ -116,6 +120,18 @@ services:
       - CLAUDISH_FAILOVER_ROLE_MODELS=${CLAUDISH_FAILOVER_ROLE_MODELS:-}
       - CLAUDISH_FAILOVER_ACTIVE=${CLAUDISH_FAILOVER_ACTIVE:-}
       - CLAUDISH_FAILOVER_AUTO=${CLAUDISH_FAILOVER_AUTO:-}
+      # #304 — knobs read by initFailover() that postdated the 23-name list
+      # above. The env file only interpolates: a value written for a name
+      # absent from this list never reaches the process, and the proxy runs on
+      # its defaults whatever the operator wrote. Documented (with values) in
+      # .env.sidecar.example. compose-env-coverage.test.ts pins code↔compose.
+      # NB these are STARTUP reads (initFailover), unlike the THINKING knobs
+      # below — a flip needs a recreate, not just a file edit.
+      - CLAUDISH_FAILOVER_ARM_AFTER=${CLAUDISH_FAILOVER_ARM_AFTER:-}
+      - CLAUDISH_FAILOVER_ARM_GRACE_MS=${CLAUDISH_FAILOVER_ARM_GRACE_MS:-}
+      - CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS=${CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS:-}
+      - CLAUDISH_FAILOVER_SESSION_DWELL_MS=${CLAUDISH_FAILOVER_SESSION_DWELL_MS:-}
+      - CLAUDISH_FAILOVER_RECOVERY_GRACE_MS=${CLAUDISH_FAILOVER_RECOVERY_GRACE_MS:-}
       # Qwen reasons by default and bills on output. disabled (default) |
       # passthrough | budget:<n>. Re-read per request: flip without a restart.
       - CLAUDISH_QWEN_THINKING=${CLAUDISH_QWEN_THINKING:-}

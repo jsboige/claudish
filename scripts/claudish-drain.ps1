@@ -320,21 +320,28 @@ function Invoke-ClaudishDrainedRestartImpl {
         # #141 point 3, second surface: an env file can EXIST and still gut the
         # cascades — it merely lacks them (po-203 measured 16 in file vs 23 in
         # container: the 16 present mask the 7 that would be lost). If the file
-        # carries no armed CLAUDISH_FAILOVER_* while the live container does, the
-        # recreate would wipe an armed state that exists nowhere else. Refuse
-        # before spending the drain. Fail OPEN when docker cannot answer (no
-        # container = no armed state to lose; the existence checks above still
-        # hold).
+        # carries no armed CLAUDISH_FAILOVER_* cascade while the live container
+        # does, the recreate would wipe an armed state that exists nowhere
+        # else. Refuse before spending the drain. Fail OPEN when docker cannot
+        # answer (no container = no armed state to lose; the existence checks
+        # above still hold).
+        # #304 discrimination: only the four cascade-carrying names count as
+        # armed. Knobs (ARM_AFTER, SESSION_DWELL_MS, ...) and decorators
+        # (_LABEL/_RESET/_ACTIVE/...) are injected since #304 — counting any
+        # FAILOVER name let a knob-only file pass as "armed" and gut a live
+        # cascade undetected. Keep in sync with Get-ArmedCascadeCount in
+        # install-sidecar.ps1 (pinned by claudish-drain.Tests.ps1).
+        $armedPattern = '^CLAUDISH_FAILOVER_(OPUS|SONNET|HAIKU|FABLE)=.+'
         $envArmed = 0
         $contArmed = 0
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
             $envArmed = @([System.IO.File]::ReadAllLines($EnvFile) |
-                Where-Object { $_ -match '^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+' }).Count
+                Where-Object { $_ -match $armedPattern }).Count
             $contEnv = docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $Container 2>$null
             if ($LASTEXITCODE -eq 0) {
-                $contArmed = @($contEnv | Where-Object { $_ -match '^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+' }).Count
+                $contArmed = @($contEnv | Where-Object { $_ -match $armedPattern }).Count
             }
         } finally { $ErrorActionPreference = $prevEap }
         if ($contArmed -gt 0 -and $envArmed -eq 0) {
