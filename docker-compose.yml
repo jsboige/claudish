@@ -76,6 +76,10 @@ services:
       - CLAUDISH_RELAY_UPSTREAM=${CLAUDISH_RELAY_UPSTREAM:-}
       - CLAUDISH_RELAY_COMPRESS=${CLAUDISH_RELAY_COMPRESS:-}
       - CLAUDISH_NO_ANTHROPIC=${CLAUDISH_NO_ANTHROPIC:-}
+      # Native credential guard kill switch (#296): only an explicit "0" disarms;
+      # empty = guard on. Listed here because the env file only interpolates —
+      # a name absent from this list never reaches the container.
+      - CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD=${CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD:-}
       # Budget failover (fork extension). All empty → inert: no routing change,
       # no notice, zero added bytes. Belongs on the machine that actually CALLS
       # the models. That is the hub most of the time, but a sidecar calls them

@@ -4,6 +4,10 @@ import { serve } from "@hono/node-server";
 import { log, logStderr } from "./logger.js";
 import type { ProxyServer } from "./types.js";
 import { NativeHandler, stripProxyOwnHeaders } from "./handlers/native-handler.js";
+import {
+  nativeCredentialRefusalResponse,
+  nativeCredentialRefusalShape,
+} from "./handlers/shared/native-credential-guard.js";
 import { OpenRouterProviderTransport } from "./providers/transport/openrouter.js";
 import { OpenRouterAPIFormat } from "./adapters/openrouter-api-format.js";
 import { LocalTransport } from "./providers/transport/local.js";
@@ -1395,6 +1399,7 @@ export async function createProxyServer(
         // (cluster key, attribution, hop list) never reach api.anthropic.com.
         stripProxyOwnHeaders(reqHeaders);
         // Proxy key override (same logic as NativeHandler)
+        let credentialSubstituted = false;
         if (proxyKeys.length > 0) {
           const authHeader = c.req.header("authorization");
           const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
@@ -1403,6 +1408,7 @@ export async function createProxyServer(
             delete reqHeaders["x-api-key"];
             delete reqHeaders["authorization"];
             if (anthropicApiKey) {
+              credentialSubstituted = true;
               if (anthropicApiKey.startsWith("sk-ant-oat")) {
                 reqHeaders["authorization"] = `Bearer ${anthropicApiKey}`;
               } else {
@@ -1410,6 +1416,18 @@ export async function createProxyServer(
               }
             }
           }
+        }
+
+        // #296 — same credential guard as NativeHandler.handle: refuse locally
+        // when the post-swap credential is absent (shape A) or foreign
+        // (shape B), instead of forwarding to api.anthropic.com.
+        const refusalShape = nativeCredentialRefusalShape(reqHeaders, credentialSubstituted);
+        if (refusalShape) {
+          log(
+            `[Native] refused — no Anthropic credential to send (shape=${refusalShape}, model=${body.model}, path=count_tokens)`,
+            true
+          );
+          return nativeCredentialRefusalResponse(body.model);
         }
 
         const res = await fetch("https://api.anthropic.com/v1/messages/count_tokens", {

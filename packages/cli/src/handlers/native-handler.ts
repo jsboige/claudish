@@ -7,6 +7,10 @@ import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { stripUnsignedThinkingBlocks } from "./shared/thinking-signature.js";
 import { matchesProxyKey } from "./shared/proxy-keys.js";
 import {
+  nativeCredentialRefusalResponse,
+  nativeCredentialRefusalShape,
+} from "./shared/native-credential-guard.js";
+import {
   fetchMultiModelAdvice,
   findPendingAdvisorToolResults,
   loadAdvisorSwapConfig,
@@ -209,6 +213,7 @@ export class NativeHandler implements ModelHandler {
     // Anthropic key (proxy key is for the local proxy only, not for
     // api.anthropic.com). When no proxy key is configured (pass-through
     // mode), everything flows through unmodified.
+    let credentialSubstituted = false;
     if (this.proxyKeys?.length) {
       const bearerToken = originalHeaders["authorization"]?.startsWith("Bearer ")
         ? originalHeaders["authorization"].slice(7)
@@ -219,6 +224,7 @@ export class NativeHandler implements ModelHandler {
         delete headers["x-api-key"];
         delete headers["authorization"];
         if (this.apiKey) {
+          credentialSubstituted = true;
           if (this.apiKey.startsWith("sk-ant-oat")) {
             headers["authorization"] = `Bearer ${this.apiKey}`;
           } else {
@@ -226,6 +232,22 @@ export class NativeHandler implements ModelHandler {
           }
         }
       }
+    }
+
+    // #296 — the credential state that would now leave for api.anthropic.com
+    // is either absent (shape A: the swap removed the client's token and there
+    // is no stored key to substitute) or foreign (shape B: a Bearer belonging
+    // to another party, about to be handed to a third party — same class #282
+    // closed for x-proxy-key). Refuse locally, labeled, zero upstream fetch.
+    // An sk-ant-* credential (OAuth or API key, the ai-01 passthrough) and the
+    // substituted-key path above stay untouched.
+    const refusalShape = nativeCredentialRefusalShape(headers, credentialSubstituted);
+    if (refusalShape) {
+      log(
+        `[Native] refused — no Anthropic credential to send (shape=${refusalShape}, model=${target})`,
+        true
+      );
+      return nativeCredentialRefusalResponse(target);
     }
 
     // Advisor-swap: strip advisor beta flag when we swapped the tool

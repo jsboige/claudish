@@ -121,10 +121,16 @@ afterEach(async () => {
   resetFailoverForTests();
 });
 
-/** The fleet-client inbound set: fake OAuth + the proxy's own three headers. */
+/**
+ * The fleet-client inbound set: fake OAuth + the proxy's own three headers.
+ * The fake token is sk-ant-oat-SHAPED since #296: the native credential guard
+ * refuses a non-Anthropic-shaped Bearer, so a realistic shape is what lets
+ * this passthrough pin stay exercisable. The shape is fixture dressing — the
+ * assertions below are about strip vs passthrough, unchanged.
+ */
 const INBOUND_HEADERS: Record<string, string> = {
   "Content-Type": "application/json",
-  authorization: "Bearer fake-client-oauth-route-test",
+  authorization: "Bearer sk-ant-oat01-fake-client-oauth-route-test",
   "x-proxy-key": "fake-cluster-key-route-test",
   "x-claudish-machine": "myia-fake",
   "x-claudish-hops": "fake-hop-id-route-test",
