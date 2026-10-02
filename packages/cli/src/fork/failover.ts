@@ -774,6 +774,40 @@ export function resolveFailoverTarget(
   return resolved;
 }
 
+// ─── #299 B: one cascade step on a TRANSIENT nominal overload ──────────────────
+// A provider-side surge (MiniMax 529 code 2064, 2026-10-02: ~30% of haiku
+// requests failing while `isQuotaExhaustion` — deliberately narrow — never
+// matched, so the cascade never walked and the raw 529 surfaced) is not a
+// wall: it lifts in minutes and must not exile the role for a 10-min TTL.
+// This resolution serves ONE step for the REQUEST that saw the overload —
+// no arm, no bucket wall, no dwell pin, no step-failure mark. The request
+// that follows resolves the nominal again, as it should.
+
+/** Pick the first servable cascade step for a transient-overload deviation.
+ * Same walk as an armed resolution (`resolveSkippingFailed`: TTL-failed steps
+ * and unresolvable delegations skipped), minus every persistent side effect —
+ * no `servedUnderWall` record (nothing is walled), no dwell pin (the very
+ * next request goes back to the nominal). Null when the role has no cascade
+ * or nothing servable: the transient failure then surfaces as before. */
+export function resolveTransientStep(
+  role: FailoverRole
+): { step: FailoverStep | null; stepIndex: number } {
+  const rule = rules.get(role);
+  if (!rule) return { step: null, stepIndex: -1 };
+  return resolveSkippingFailed(role, rule);
+}
+
+/** Cap on transient-overload deviations per request (#299 B).
+ * `CLAUDISH_FAILOVER_TRANSIENT_STEP_MAX` — default 1 (one step), "0" disarms
+ * (kill switch), re-read on every call so an operator flip needs no restart
+ * of the proxy everyone is using (same idiom as connectRetryMax). */
+export function getTransientStepMax(): number {
+  const raw = process.env.CLAUDISH_FAILOVER_TRANSIENT_STEP_MAX;
+  if (raw === undefined || raw === "") return 1;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 1;
+}
+
 // ─── #91 point 4: per-session dwell ────────────────────────────────────────────
 // Each provider switch re-cold the prompt cache at BOTH ends — on a large agentic
 // context the dominant avoidable cost of the failover feature. The role-level

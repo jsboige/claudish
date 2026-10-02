@@ -43,6 +43,8 @@ import {
   resolveConcreteTarget,
   resolveDelegationOwner,
   setRoleNominalResolver,
+  resolveTransientStep,
+  getTransientStepMax,
   NATIVE_BUCKET,
 } from "./failover.js";
 import type { DelegationOwner } from "./failover.js";
@@ -300,6 +302,79 @@ describe("resolveFailoverTarget — cascade walk", () => {
     const r = resolveFailoverTarget("opus");
     expect(r.stepIndex).toBe(2);
     expect(r.step?.target).toBe("deepseek@deepseek-payg");
+  });
+});
+
+// ── #299 B: one cascade step on a transient nominal overload ──────────────────
+
+describe("resolveTransientStep — #299 B (no arm, no pin, per request)", () => {
+  it("serves the first servable step WITHOUT the role being armed", () => {
+    // THE point of #299 B: an armed resolution would return nominal here
+    // (isFailoverActive false); the transient deviation must not require one.
+    initFailover({ ...OPUS_CASCADE });
+    expect(isFailoverActive("opus")).toBe(false);
+    const r = resolveTransientStep("opus");
+    expect(r.stepIndex).toBe(0);
+    expect(r.step?.target).toBe("qwen-token-plan@qwen3.8-max");
+  });
+
+  it("skips TTL-failed steps like the armed walk — a walled step is not re-paid by a surge", () => {
+    initFailover({ ...OPUS_CASCADE });
+    markStepFailed("opus", 0, "qwen weekly wall");
+    const r = resolveTransientStep("opus");
+    expect(r.stepIndex).toBe(1);
+    expect(r.step?.target).toBe("gc@glm-5.2");
+  });
+
+  it("null when the role has no cascade — the transient failure surfaces as before", () => {
+    initFailover({});
+    expect(resolveTransientStep("opus")).toEqual({ step: null, stepIndex: -1 });
+  });
+
+  it("leaves NO dwell pin behind — the next session resolve goes back to the nominal", () => {
+    // A pin is observable without touching private state: an armed role's
+    // session resolution must still return the ARMED walk's step (not be
+    // influenced by the transient one), and an unarmed role's session
+    // resolution must return nominal even after resolveTransientStep ran.
+    initFailover({ ...OPUS_CASCADE });
+    resolveTransientStep("opus");
+    const s = resolveFailoverTargetForSession("opus", "sess-1");
+    expect(s).toEqual({ step: null, stepIndex: -1 }); // nominal, un-armed
+  });
+});
+
+describe("getTransientStepMax — kill switch, re-read per call", () => {
+  const KEY = "CLAUDISH_FAILOVER_TRANSIENT_STEP_MAX";
+  const saved = process.env[KEY];
+  afterEach(() => {
+    if (saved === undefined) delete process.env[KEY];
+    else process.env[KEY] = saved;
+  });
+
+  it("defaults to 1 (one step per request)", () => {
+    delete process.env[KEY];
+    expect(getTransientStepMax()).toBe(1);
+  });
+
+  it('"0" disarms — the kill switch', () => {
+    process.env[KEY] = "0";
+    expect(getTransientStepMax()).toBe(0);
+  });
+
+  it("re-reads on every call — an operator flip needs no restart", () => {
+    delete process.env[KEY];
+    expect(getTransientStepMax()).toBe(1);
+    process.env[KEY] = "0";
+    expect(getTransientStepMax()).toBe(0); // same process, new answer
+    process.env[KEY] = "3";
+    expect(getTransientStepMax()).toBe(3);
+  });
+
+  it("garbage falls back to the default, not NaN", () => {
+    process.env[KEY] = "not-a-number";
+    expect(getTransientStepMax()).toBe(1);
+    process.env[KEY] = "-4";
+    expect(getTransientStepMax()).toBe(1);
   });
 });
 
