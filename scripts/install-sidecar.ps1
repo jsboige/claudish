@@ -144,11 +144,17 @@ function Get-ClaudishContainerEnv {
 }
 
 function Get-ArmedCascadeCount {
-    # Non-empty CLAUDISH_FAILOVER_* assignments — the armed state that must
-    # survive a recreate. (Empty assignments are inert: compose's `:-` default.)
+    # Non-empty CLAUDISH_FAILOVER_<ROLE> cascade assignments — the armed state
+    # that must survive a recreate. (Empty assignments are inert: compose's
+    # `:-` default.) #304 discrimination: only the four cascade-carrying names
+    # count. The knobs (ARM_AFTER, SESSION_DWELL_MS, ...) and the per-step
+    # decorators (_LABEL/_DIRECTION/_NOTE/_RESET, _ACTIVE/_AUTO/_ROLE_MODELS)
+    # are injected too since #304 — under the old any-FAILOVER-name pattern a
+    # knob-only env file counted as "armed" and the #141 gut-guard let a
+    # cascade-less recreate through.
     param([string[]]$EnvLines)
     if (-not $EnvLines) { return 0 }
-    return @($EnvLines | Where-Object { $_ -match '^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+' }).Count
+    return @($EnvLines | Where-Object { $_ -match '^CLAUDISH_FAILOVER_(OPUS|SONNET|HAIKU|FABLE)=.+' }).Count
 }
 
 function Test-RecreateWouldGutCascades {
