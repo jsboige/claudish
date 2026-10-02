@@ -274,6 +274,53 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     expect(state.consecutiveFail).toBe(1);
   });
 
+  // ── #299 A: provider overload relayed by a live hub ────────────────────────
+  // MiniMax answering 529 overloaded_error for the haiku nominal: two consecutive
+  // 529s used to flip the relay AUTONOMOUS (markFail forward-http-529) and replay
+  // each request against the SAME overloaded provider — a cron conversation
+  // retried 12 times in 3 minutes, then dropped. The overload is the provider's,
+  // not the hub's: the hub answered.
+  const OVERLOAD_529_BODY = JSON.stringify({
+    type: "error",
+    error: { type: "overloaded_error", code: "2064", message: "The server cluster is currently under high load" },
+  });
+
+  it("HTTP 529 is PASSED THROUGH (non-streaming request) — client gets 529 + body, no markFail, no local replay (#299 A)", async () => {
+    fetchImpl = async () =>
+      new Response(OVERLOAD_529_BODY, { status: 529, headers: { "content-type": "application/json" } });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).not.toBeNull(); // non-null ⇒ the caller forwards it; null is the local-replay fallthrough
+    expect(r!.status).toBe(529);
+    expect(await r!.text()).toBe(OVERLOAD_529_BODY);
+    expect(state.consecutiveFail).toBe(0);
+  });
+
+  it("HTTP 529 is PASSED THROUGH (streaming request) and two consecutive 529s keep the relay NOMINAL (#299 A)", async () => {
+    fetchImpl = async () =>
+      new Response(OVERLOAD_529_BODY, { status: 529, headers: { "content-type": "application/json" } });
+    const state = deadState();
+    const r1 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+    const r2 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+    for (const r of [r1, r2]) {
+      expect(r).not.toBeNull();
+      expect(r!.status).toBe(529);
+      expect(await r!.text()).toBe(OVERLOAD_529_BODY);
+    }
+    expect(state.consecutiveFail).toBe(0); // a 529 never fed the hysteresis
+    expect(state.alive).toBe(true); // still NOMINAL after two consecutive 529s
+  });
+
+  it("a 529 RESETS an existing failure streak (the hub answered — that is liveness evidence)", async () => {
+    fetchImpl = async () =>
+      new Response(OVERLOAD_529_BODY, { status: 529, headers: { "content-type": "application/json" } });
+    const state = deadState();
+    state.consecutiveFail = 1; // one prior genuine failure
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
+    expect(r).not.toBeNull();
+    expect(state.consecutiveFail).toBe(0);
+  });
+
   it("success resets the failure streak", async () => {
     const state = deadState();
     state.consecutiveFail = 1; // one prior failure

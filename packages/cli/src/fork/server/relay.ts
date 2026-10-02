@@ -448,15 +448,30 @@ export async function forwardToUpstream(
   }
   if (!res) return null; // unreachable: loop exits with res set or lastErr set
 
-  if (res.status >= 500) {
+  if (res.status !== 529 && res.status >= 500) {
     // Hub answered 5xx → treat as unhealthy, fall back to local for this request.
+    // (500/502/503/504 keep this behavior — those CAN be the hub's own failure.)
     markFail(state, `forward-http-${res.status}`);
     logFallthrough(state, `hub HTTP ${res.status}`);
     return null;
   }
 
-  // Success (2xx/3xx/4xx). Reset the failure streak; a 4xx is a real client error
-  // that local handling would reproduce, so pass it through rather than retry.
+  if (res.status === 529) {
+    // #299 A — provider overload relayed by a LIVE hub. The hub answered, so it
+    // is healthy: 529 is the upstream provider saying "overloaded", the same
+    // principle the header deadline established ("a throttled provider must not
+    // drive the hub's state machine"). Falling through to local here would (a)
+    // replay the request against the SAME overloaded provider, doubling its
+    // load on every client retry, (b) move the request off the central capture,
+    // and (c) two in a row would flip the whole machine AUTONOMOUS for every
+    // role. Pass it through exactly like a 4xx: the hub spoke, the client hears it.
+    log(`[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`);
+  }
+
+  // Success (2xx/3xx/4xx), or a relayed 529. Reset the failure streak; a 4xx is
+  // a real client error that local handling would reproduce, and a 529 is the
+  // provider's overload — neither is evidence about the hub's health, so pass
+  // through rather than replay locally.
   state.consecutiveFail = 0;
 
   const contentType = res.headers.get("content-type") || "";
