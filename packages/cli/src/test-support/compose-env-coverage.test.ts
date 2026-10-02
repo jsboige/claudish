@@ -1,36 +1,46 @@
 /**
- * #304 — static cross-check: every CLAUDISH_* env name the proxy READS must be
- * injected by docker-compose.yml's `environment:` list, or it is unreachable in
- * a container.
+ * #304 → #310 — static cross-check: every CLAUDISH_* env name the code READS
+ * must be injected by docker-compose.yml's `environment:` list, unless it is
+ * explicitly exempted below as not-for-containers.
  *
  * The compose `environment:` list is an explicit allowlist: the env file is
  * used for interpolation only, so a knob written there for a name the list
  * does not carry never reaches the process — the proxy runs on its defaults
  * whatever the operator wrote. That is how five #91/#293 failover knobs and
- * the #218 kill switch (`CLAUDISH_NATIVE_MODEL_PIN`) shipped documented
- * (.env.sidecar.example) but unreachable in every compose deployment.
+ * the #218 kill switch shipped documented but unreachable (#304); #310
+ * widened the check from the failover family to all CLAUDISH_* names and
+ * found the same state for 22 more runtime knobs, including the two
+ * never-hang kill switches (FIRST_EVENT_TIMEOUT_MS, PREVISIBLE_REFORWARD_MAX)
+ * and the key-rotation overlap (PROXY_KEY_PREVIOUS).
  *
  * What this test pins, in both directions:
  *   1. code → compose: every name read in production sources (tests excluded)
- *      appears in the compose list. This is the AC that failed for #304.
- *   2. compose → code: every CLAUDISH_FAILOVER_* name in the compose list is
- *      read by the code (statically or through the dynamic role family) — a
- *      renamed knob would otherwise leave a dead compose line that looks
- *      configurable and is not.
+ *      appears in the compose list, or carries an entry in EXEMPT below with
+ *      the reason it is not for containers. The default for a NEW name is
+ *      "must be injected" — adding a read without a compose line (or an
+ *      exemption) fails this test.
+ *   2. compose → code: every CLAUDISH_* name in the compose list is read by
+ *      the code — a renamed knob would otherwise leave a dead compose line
+ *      that looks configurable and is not.
  *
- * Dynamic reads are template literals (`env[`CLAUDISH_FAILOVER_${role}`]`,
- * `env[`${key}_LABEL`]`) — they cannot be extracted as literals, so the closed
- * role set {OPUS,SONNET,HAIKU,FABLE} is resolved here, and the resolution is
- * itself pinned: if FAILOVER_ROLES ever grows a fifth role, the bare-role
- * anchor assertion below fails and forces the family (and compose) to follow.
+ * Read shapes covered: `.NAME` dot access on `process.env` (or the `env`
+ * parameter objects that carry it), `["NAME"]` bracket access with a literal
+ * string, and the failover dynamic templates (`env[`CLAUDISH_FAILOVER_${role}`]`,
+ * `env[`${key}_LABEL`]`). The templates cannot be extracted as literals, so
+ * the closed role set {OPUS,SONNET,HAIKU,FABLE} is resolved here, and the
+ * resolution is itself pinned: if FAILOVER_ROLES ever grows a fifth role, the
+ * bare-role anchor assertion below fails and forces the family (and compose)
+ * to follow.
  *
  * Positive controls (a detector that silently matches nothing proves nothing):
  *   - the compose parser must find the known 23-name family (parser alive);
- *   - the code scan must collect ≥ 10 names incl. CLAUDISH_FAILOVER_ACTIVE
- *     (scanner alive);
+ *   - the code scan must collect a broad, named population (scanner alive);
+ *   - the bracket shape is proven on a synthetic fixture — zero production
+ *     sites use it today, so only a fixture keeps the shape from silently
+ *     rotting until the first real `process.env["CLAUDISH_…"]` appears;
  *   - the gap checker must report a name on a synthetic compose that lacks it
- *     (verdict alive — this is the mutation, run as a fixture so the real
- *     repository is never touched).
+ *     (verdict alive — the mutation, run as a fixture so the real repository
+ *     is never touched).
  */
 
 import { describe, test, expect } from "bun:test";
@@ -45,23 +55,41 @@ const COMPOSE_FILE = join(REPO_ROOT, "docker-compose.yml");
 const ROLES = ["OPUS", "SONNET", "HAIKU", "FABLE"] as const;
 
 /**
- * Env names covered by this cross-check. CLAUDISH_FAILOVER_* wholesale, plus
- * the two kill switches the #304 addendum named (NATIVE_MODEL_PIN was in the
- * same absent-from-compose state; FOREIGN_TOKEN_GUARD is the control member —
- * it was ADDED to the list as a review fixup on #303, so it must stay).
+ * #310's not-for-containers list. Every entry states WHY the name is exempt —
+ * an exemption without a reason is how a real gap hides. And an exemption can
+ * never outlive its read: the stale-exemption test below requires each name
+ * to still be read somewhere in packages/cli/src, so a rename that drops the
+ * read also fails this suite until the exemption is removed — at which point
+ * the name is back under the must-be-injected default.
  */
-const WATCHED = [
-  "CLAUDISH_FAILOVER_",
-  "CLAUDISH_NATIVE_MODEL_PIN",
-  "CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD",
-  // #305 AC-1 instrument — added with the name itself, so it cannot ship
-  // unreachable the way the #304 knobs did. #310 widens this to all CLAUDISH_*.
-  "CLAUDISH_NATIVE_HEADER_NAMES_LOG",
+const EXEMPT: ReadonlyArray<{ name: string; why: string }> = [
+  {
+    name: "CLAUDISH_ACTIVE_MODEL_NAME",
+    why: "set by the claudish runner for the spawned session's status line; never a proxy knob",
+  },
+  { name: "CLAUDISH_IS_LOCAL", why: "statusline pair of CLAUDISH_ACTIVE_MODEL_NAME" },
+  {
+    name: "CLAUDISH_MODEL",
+    why: "CLI default-model knob; the proxy reads it only for stats attribution (detectInvocationMode in proxy-server.ts), never for routing",
+  },
+  {
+    name: "CLAUDISH_HOST",
+    why: "standalone-proxy bind default; compose's command pins --host and argv overrides the env (standalone-proxy.ts:58-61), so an injected value is dead by construction",
+  },
+  {
+    name: "CLAUDISH_MCP_TOOLS",
+    why: "gates the MCP stdio server (--mcp), a host-side process; no MCP server runs in the proxy container",
+  },
+  {
+    name: "CLAUDISH_CATALOG_TTL_HOURS",
+    why: "launcher cache-warm CLI knob; the proxy reads CLAUDISH_CATALOG_URL, not the warm TTL",
+  },
+  { name: "CLAUDISH_TEST_ENV_ALLOW", why: "test harness gate (test-support/env-gate.ts)" },
+  { name: "CLAUDISH_TEST_ENV_STRICT", why: "test harness gate (test-support/env-gate.ts)" },
+  { name: "CLAUDISH_TEST_HOME_SANDBOX", why: "test harness preload (test-preload.ts)" },
+  { name: "CLAUDISH_TEST_REAL_HOME", why: "test harness preload (test-preload.ts)" },
 ];
-
-function isWatched(name: string): boolean {
-  return WATCHED.some((w) => (w.endsWith("_") ? name.startsWith(w) : name === w));
-}
+const EXEMPT_NAMES = new Set(EXEMPT.map((e) => e.name));
 
 /** Recursively collect non-test .ts files under packages/cli/src. */
 function collectSourceFiles(dir: string, out: string[] = []): string[] {
@@ -84,14 +112,18 @@ export interface ScanResult {
   dynamicSuffixes: Set<string>;
 }
 
-/** Scan sources for the shapes the failover code uses to read the environment. */
+/**
+ * Scan sources for the shapes the code uses to read the environment.
+ * `\benv\b`: standalone `env.` / `env[…]` (parameter objects that carry the
+ * process env, e.g. initFailover's) — must NOT match `xenv.`/`myenv.`;
+ * `process.env` matched by its own alternative.
+ */
 export function scanSources(files: { path: string; text: string }[]): ScanResult {
   const staticReads = new Map<string, string[]>();
   let dynamicBareRole = false;
   const dynamicSuffixes = new Set<string>();
-  // \benv\b: standalone `env.` (initFailover's parameter) — must NOT match
-  // `xenv.`/`myenv.`; `process.env` matched by its own alternative.
-  const staticRe = /(?:process\.env|\benv\b)\.(CLAUDISH_FAILOVER_[A-Z0-9_]+|CLAUDISH_NATIVE_MODEL_PIN|CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD|CLAUDISH_NATIVE_HEADER_NAMES_LOG)/g;
+  const dotRe = /(?:process\.env|\benv\b)\.(CLAUDISH_[A-Z0-9_]+)/g;
+  const bracketRe = /(?:process\.env|\benv\b)\[\s*["'](CLAUDISH_[A-Z0-9_]+)["']\s*\]/g;
   const dynamicBareRe = /env\[`CLAUDISH_FAILOVER_\$\{[^}]+\}`\]/;
   // `env[`${key}_LABEL`]` — capture the suffix WITHOUT its joining underscore
   // (the required name is built as `${role}_${suffix}`).
@@ -99,12 +131,13 @@ export function scanSources(files: { path: string; text: string }[]): ScanResult
   for (const f of files) {
     const lines = f.text.split("\n");
     lines.forEach((line, i) => {
-      for (const m of line.matchAll(staticRe)) {
-        const name = m[1];
-        const where = `${f.path.replace(SRC_ROOT + "\\", "").replace(/\\/g, "/")}:${i + 1}`;
-        const list = staticReads.get(name) ?? [];
-        list.push(where);
-        staticReads.set(name, list);
+      const where = `${f.path.replace(SRC_ROOT + "\\", "").replace(/\\/g, "/")}:${i + 1}`;
+      for (const re of [dotRe, bracketRe]) {
+        for (const m of line.matchAll(re)) {
+          const list = staticReads.get(m[1]) ?? [];
+          list.push(where);
+          staticReads.set(m[1], list);
+        }
       }
       if (dynamicBareRe.test(line)) dynamicBareRole = true;
       for (const m of line.matchAll(dynamicSuffixRe)) dynamicSuffixes.add(m[1]);
@@ -124,7 +157,7 @@ export function composeEnvNames(composeText: string): Set<string> {
 
 /**
  * The full set of names the code can read, dynamic templates resolved onto
- * the role family. Everything in this set must be in the compose list.
+ * the role family. Exemptions are NOT subtracted here — see coverageGaps.
  */
 export function requiredNames(scan: ScanResult): Set<string> {
   const required = new Set<string>();
@@ -142,26 +175,25 @@ export function requiredNames(scan: ScanResult): Set<string> {
 export function coverageGaps(scan: ScanResult, composeNames: Set<string>): string[] {
   const gaps: string[] = [];
   for (const name of requiredNames(scan)) {
+    if (EXEMPT_NAMES.has(name)) continue;
     if (!composeNames.has(name)) gaps.push(name);
   }
   return gaps.sort();
 }
 
-/** Direction 2 verdict: failover compose entries the code no longer reads. */
+/** Direction 2 verdict: CLAUDISH_* compose entries the code no longer reads. */
 export function deadComposeEntries(scan: ScanResult, composeNames: Set<string>): string[] {
   const required = requiredNames(scan);
-  return [...composeNames]
-    .filter((n) => isWatched(n) && !required.has(n))
-    .sort();
+  return [...composeNames].filter((n) => !required.has(n)).sort();
 }
 
-describe("#304 compose env coverage", () => {
+describe("#310 compose env coverage (all CLAUDISH_*)", () => {
   const composeText = readFileSync(COMPOSE_FILE, "utf-8");
   const files = collectSourceFiles(SRC_ROOT).map((path) => ({ path, text: readFileSync(path, "utf-8") }));
   const scan = scanSources(files);
   const composeNames = composeEnvNames(composeText);
 
-  test("positive control: the compose parser sees the known 23-name family", () => {
+  test("positive control: the compose parser sees the known families", () => {
     // If this fires, the parser is matching nothing and every assertion below
     // is vacuously green — the exact blindness this control exists to catch.
     for (const role of ROLES) {
@@ -173,10 +205,16 @@ describe("#304 compose env coverage", () => {
     expect(composeNames.has("CLAUDISH_FAILOVER_ROLE_MODELS")).toBe(true);
     expect(composeNames.has("CLAUDISH_FAILOVER_ACTIVE")).toBe(true);
     expect(composeNames.has("CLAUDISH_FAILOVER_AUTO")).toBe(true);
+    // #310 additions — one per themed group.
+    expect(composeNames.has("CLAUDISH_FIRST_EVENT_TIMEOUT_MS")).toBe(true);
+    expect(composeNames.has("CLAUDISH_PROXY_KEY_PREVIOUS")).toBe(true);
+    expect(composeNames.has("CLAUDISH_DEFAULT_PROVIDER")).toBe(true);
+    expect(composeNames.has("CLAUDISH_TELEMETRY")).toBe(true);
   });
 
-  test("positive control: the source scanner collected the known reads", () => {
-    // initFailover (fork/failover.ts) reads these as literals.
+  test("positive control: the source scanner collected a broad population", () => {
+    // initFailover (fork/failover.ts) and the #310 runtime knobs, read as
+    // literals across the tree.
     for (const name of [
       "CLAUDISH_FAILOVER_ACTIVE",
       "CLAUDISH_FAILOVER_AUTO",
@@ -187,40 +225,69 @@ describe("#304 compose env coverage", () => {
       "CLAUDISH_NATIVE_MODEL_PIN",
       "CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD",
       "CLAUDISH_NATIVE_HEADER_NAMES_LOG",
+      "CLAUDISH_FIRST_EVENT_TIMEOUT_MS",
+      "CLAUDISH_PREVISIBLE_REFORWARD_MAX",
+      "CLAUDISH_PROXY_KEY_PREVIOUS",
+      "CLAUDISH_STALL_THRESHOLD_MS",
+      "CLAUDISH_TELEMETRY",
+      "CLAUDISH_STATS",
+      "CLAUDISH_DEFAULT_PROVIDER",
     ]) {
       expect(scan.staticReads.has(name)).toBe(true);
     }
     // The dynamic role family is detected, not assumed.
     expect(scan.dynamicBareRole).toBe(true);
     expect(scan.dynamicSuffixes.has("LABEL")).toBe(true);
-    expect(scan.staticReads.size).toBeGreaterThanOrEqual(10);
+    // The widened population is what #310 measured (52 literal names at
+    // b967fae); the floor leaves room for small refactors without letting
+    // the scanner quietly degrade to the failover family alone.
+    expect(scan.staticReads.size).toBeGreaterThanOrEqual(45);
   });
 
-  test("every env name the code reads is injected by docker-compose.yml (#304 AC1)", () => {
+  test("positive control: the bracket read shape is live (synthetic fixture)", () => {
+    // Zero production sites use process.env["CLAUDISH_…"] today — without this
+    // fixture the bracket regex could rot until the first real bracket read
+    // ships unpinned.
+    const synthetic = scanSources([
+      { path: "synthetic-bracket.ts", text: `const v = process.env["CLAUDISH_BRACKET_FIXTURE"] ?? "";\n` },
+    ]);
+    expect(synthetic.staticReads.has("CLAUDISH_BRACKET_FIXTURE")).toBe(true);
+  });
+
+  test("every env name the code reads is injected or exempted (#310 AC1)", () => {
     const gaps = coverageGaps(scan, composeNames);
     const detail = gaps.map((g) => {
       const where = scan.staticReads.get(g) ?? ["(dynamic role-family read)"];
-      return `  ${g} — read at ${where.join(", ")}`;
+      const exempt = EXEMPT.find((e) => e.name === g);
+      return `  ${g} — read at ${where.join(", ")}${exempt ? ` (exempt: ${exempt.why})` : ""}`;
     });
-    expect(gaps).toEqual([], `names read in code but absent from docker-compose.yml environment:\n${detail.join("\n")}\n(the env file only interpolates — these never reach a container)`);
+    expect(gaps).toEqual([], `names read in code but absent from docker-compose.yml environment:\n${detail.join("\n")}\n(the env file only interpolates — these never reach a container; add them to compose or to EXEMPT with a reason)`);
   });
 
-  test("every CLAUDISH_FAILOVER_* compose entry is read by the code (no dead knobs)", () => {
+  test("every CLAUDISH_* compose entry is read by the code (no dead knobs)", () => {
     const dead = deadComposeEntries(scan, composeNames);
     expect(dead).toEqual([], `compose entries the code never reads (renamed knob? stale line?):\n  ${dead.join("\n  ")}`);
   });
 
+  test("no stale exemptions — every EXEMPT name is still read somewhere", () => {
+    // An exemption that no longer corresponds to a read is how a future gap
+    // hides: the name would be skipped forever for a reason that no longer
+    // exists. Each must anchor to a live read.
+    const stale = EXEMPT.filter((e) => !scan.staticReads.has(e.name));
+    expect(stale.map((e) => e.name)).toEqual([], `exemptions whose read disappeared (rename? deletion?) — remove them:\n${stale.map((e) => `  ${e.name} — ${e.why}`).join("\n")}`);
+  });
+
   test("positive control (mutation): the gap checker reports a name the compose lacks", () => {
-    // Synthetic fixture: the real compose minus one knob. The checker must
-    // name it — proving the verdict function can fail, not just return [].
+    // Synthetic fixture: the real compose minus one #310 knob. The checker
+    // must name it — proving the verdict function can fail, not just return [].
     const gutted = composeText.replace(
-      /^\s*- CLAUDISH_FAILOVER_ARM_AFTER=\$\{CLAUDISH_FAILOVER_ARM_AFTER:-\}\r?\n/m,
+      /^\s*- CLAUDISH_FIRST_EVENT_TIMEOUT_MS=\$\{CLAUDISH_FIRST_EVENT_TIMEOUT_MS:-\}\r?\n/m,
       ""
     );
     const gaps = coverageGaps(scan, composeEnvNames(gutted));
-    expect(gaps).toContain("CLAUDISH_FAILOVER_ARM_AFTER");
+    expect(gaps).toContain("CLAUDISH_FIRST_EVENT_TIMEOUT_MS");
     // And the direction-2 checker on a synthetic name nothing reads.
-    const withGhost = composeText + "      - CLAUDISH_FAILOVER_GHOST=${CLAUDISH_FAILOVER_GHOST:-}\n";
-    expect(deadComposeEntries(scan, composeEnvNames(withGhost))).toContain("CLAUDISH_FAILOVER_GHOST");
+    const withGhost = composeText + "      - CLAUDISH_GHOST_KNOB=${CLAUDISH_GHOST_KNOB:-}\n";
+    expect(deadComposeEntries(scan, composeEnvNames(withGhost))).toContain("CLAUDISH_GHOST_KNOB");
   });
 });
