@@ -21,6 +21,12 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
    après lecture intégrale.
 3. **Exécution** : ton périmètre (voir ci-dessous). Règle HARD globale : lire le body
    complet + commentaires + diff avant tout comment/review/merge/fix.
+   - **Relais model-version-watch** (si le fichier existe) : lire
+     `~/.claudish/model-version-events.log` (NDJSON), relayer chaque événement
+     sur le dashboard workspace — `minor-applied` → tag INFO (le drainer a déjà
+     rechargé), `major-ask` → tag **ASK** (arbitrage user, la mineure seule
+     n'arme rien), `probe-fail`/`error` → tag WARN. Vider le fichier après
+     relais (les événements relaisés une fois ne se re-postent pas).
 4. **Commit + PR AVANT le rapport** — ne jamais annoncer un travail non commité.
    `cd d:/Dev/claudish && git pull origin main` d'abord ; conventional commits.
 5. **Rapport [DONE] sur le dashboard workspace** — faits, métriques, décisions prises
