@@ -8,19 +8,31 @@ import {
 } from "../all-models-cache.js";
 import { logStderr } from "../../logger.js";
 
+/** Default slim-catalog endpoint (the models-index cloud function). */
+const DEFAULT_CATALOG_URL =
+  "https://us-central1-claudish-6da10.cloudfunctions.net/queryModels?status=active&catalog=slim&limit=1000";
+
 /**
- * Firebase slim catalog endpoint. Override via:
- *   - `CLAUDISH_CATALOG_URL` (preferred, documented spelling)
+ * The slim-catalog endpoint, resolved at each refresh. Overrides, preferred
+ * spelling first:
+ *   - `CLAUDISH_CATALOG_URL`
  *   - `FIREBASE_CATALOG_URL` (backwards-compat alias)
+ *
+ * `||`, not `??`, deliberately: compose injects CLAUDISH_CATALOG_URL as ""
+ * (#310 review), "" is not nullish, and the ?? chain fetched "" on every
+ * recreated container — refresh failed, the dynamic catalog (documented
+ * PRIMARY) fell back to the cold-start vendor map, and native-pin-auto
+ * (#219), which reads the same in-memory catalog, went blind with it. A
+ * function, not a module const, so the resolution is testable per call and
+ * a flip needs no re-import.
  *
  * Used both by the proxy bg warm and the launcher's `refreshCatalog`. Chiefly
  * useful for integration tests that point at a local server to force fetch
  * failures (V4/V5 in `validation-criteria.md`).
  */
-const FIREBASE_CATALOG_URL =
-  process.env.CLAUDISH_CATALOG_URL ??
-  process.env.FIREBASE_CATALOG_URL ??
-  "https://us-central1-claudish-6da10.cloudfunctions.net/queryModels?status=active&catalog=slim&limit=1000";
+export function firebaseCatalogUrl(): string {
+  return process.env.CLAUDISH_CATALOG_URL || process.env.FIREBASE_CATALOG_URL || DEFAULT_CATALOG_URL;
+}
 
 // Re-export so existing imports of DiskCache type from this module continue to work.
 export type DiskCache = DiskCacheV2;
@@ -235,7 +247,7 @@ export class OpenRouterCatalogResolver implements ModelCatalogResolver {
   async refreshCatalog(timeoutMs: number): Promise<RefreshOutcome> {
     let response: Response;
     try {
-      response = await fetch(FIREBASE_CATALOG_URL, {
+      response = await fetch(firebaseCatalogUrl(), {
         signal: AbortSignal.timeout(timeoutMs),
         headers: { Accept: CATALOG_ACCEPT_V3 },
       });

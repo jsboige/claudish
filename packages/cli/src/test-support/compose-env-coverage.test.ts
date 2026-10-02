@@ -22,6 +22,12 @@
  *   2. compose → code: every CLAUDISH_* name in the compose list is read by
  *      the code — a renamed knob would otherwise leave a dead compose line
  *      that looks configurable and is not.
+ *   3. empty-string safety (#310 review): compose's `${VAR:-}` makes every
+ *      injected name PRESENT with value "", so for compose-injected names a
+ *      `?? fallback` read is a trap — "" is not nullish, the fallback never
+ *      fires, and "" becomes a live value (Number("") === 0 turned the
+ *      overflow floor OFF; the catalog URL chain fetched ""). Reads of those
+ *      names must treat "" as unset at the site.
  *
  * Read shapes covered: `.NAME` dot access on `process.env` (or the `env`
  * parameter objects that carry it), `["NAME"]` bracket access with a literal
@@ -187,6 +193,67 @@ export function deadComposeEntries(scan: ScanResult, composeNames: Set<string>):
   return [...composeNames].filter((n) => !required.has(n)).sort();
 }
 
+/** A compose-injected name read with `??` whose effective RHS is not `""`. */
+export interface EmptyStringTrap {
+  name: string;
+  where: string;
+  rhs: string;
+}
+
+/**
+ * Read shape the empty-string rule refuses: `NAME ?? <something not "">` on a
+ * name the compose list injects. Scoped to compose-injected names on purpose —
+ * CLI-only knobs (exemptions) never see compose's "" and may keep `?? "24"`
+ * style defaults freely. The `??` must follow the name directly;
+ * `NAME?.trim() ?? x` is a different shape this deliberately does not chase
+ * (zero sites today — the optional-chain read is covered by per-name pins
+ * where it exists).
+ */
+const NULLISH_READ_RE = /(?:process\.env|\benv\b)\.(CLAUDISH_[A-Z0-9_]+)\s*\?\?/g;
+
+/**
+ * The effective right-hand side of a `??`: walk a chain of env reads
+ * (`env.A ?? env.B ?? "terminal"`) to its terminal and return the terminal's
+ * literal value ("" for an empty string literal), or the first token when the
+ * terminal is not a string literal — a non-literal fallback cannot be proven
+ * empty, so it is reported and a human decides.
+ */
+function resolveNullishRhs(tail: string): string {
+  let rest = tail;
+  for (let hop = 0; hop < 5; hop++) {
+    const trimmed = rest.replace(/^\s+/, "");
+    const envHop = trimmed.match(/^(?:process\.env|\benv\b)\.[A-Za-z0-9_]+\s*\?\?\s*/);
+    if (!envHop) {
+      rest = trimmed;
+      break;
+    }
+    rest = trimmed.slice(envHop[0].length);
+  }
+  const literal = rest.match(/^(?:"([^"]*)"|'([^']*)'|`([^`]*)`)/);
+  if (literal) return literal[1] ?? literal[2] ?? literal[3] ?? "";
+  const token = rest.match(/^\S+/);
+  return token ? token[0] : "(unparseable rhs)";
+}
+
+/** Direction 3 verdict: compose-injected names whose `??` fallback makes "" live. */
+export function emptyUnsafeNullishReads(
+  files: { path: string; text: string }[],
+  composeNames: Set<string>
+): EmptyStringTrap[] {
+  const traps: EmptyStringTrap[] = [];
+  for (const f of files) {
+    for (const m of f.text.matchAll(NULLISH_READ_RE)) {
+      const name = m[1];
+      if (!composeNames.has(name)) continue;
+      const rhs = resolveNullishRhs(f.text.slice(m.index! + m[0].length, m.index! + m[0].length + 200));
+      if (rhs === "") continue;
+      const line = f.text.slice(0, m.index!).split("\n").length;
+      traps.push({ name, rhs, where: `${f.path.replace(SRC_ROOT + "\\", "").replace(/\\/g, "/")}:${line}` });
+    }
+  }
+  return traps;
+}
+
 describe("#310 compose env coverage (all CLAUDISH_*)", () => {
   const composeText = readFileSync(COMPOSE_FILE, "utf-8");
   const files = collectSourceFiles(SRC_ROOT).map((path) => ({ path, text: readFileSync(path, "utf-8") }));
@@ -275,6 +342,44 @@ describe("#310 compose env coverage (all CLAUDISH_*)", () => {
     // exists. Each must anchor to a live read.
     const stale = EXEMPT.filter((e) => !scan.staticReads.has(e.name));
     expect(stale.map((e) => e.name)).toEqual([], `exemptions whose read disappeared (rename? deletion?) — remove them:\n${stale.map((e) => `  ${e.name} — ${e.why}`).join("\n")}`);
+  });
+
+  test("empty-string safety: no compose-injected name is read with `?? <non-empty>` (#310 review)", () => {
+    // compose injects every listed name as "" — for those names "" must behave
+    // like unset, and `?? nonEmpty` is the one read shape where it does not.
+    // First real catch (pre-fix tree, this PR): openrouter.ts:21
+    // CLAUDISH_CATALOG_URL ?? FIREBASE_CATALOG_URL ?? "https://…cloudfunctions…".
+    const traps = emptyUnsafeNullishReads(files, composeNames);
+    expect(traps).toEqual([], `compose injects these names as "" — a ?? whose effective RHS is not "" makes "" a live value:\n${traps.map((t) => `  ${t.name} — ?? ${t.rhs} (${t.where})`).join("\n")}`);
+  });
+
+  test("positive control: the empty-string trap detector fires on the pre-fix openrouter shape", () => {
+    // This IS openrouter.ts:20-23 as it stood before this PR's fix — the ?? chain
+    // over two env reads ending in the cloudfunctions URL, the guard's first real
+    // catch (run red on the unfixed tree before the fix landed). The empty-RHS
+    // read next to it must NOT be flagged.
+    const preFixShape = [
+      {
+        path: "prefix-openrouter.ts",
+        text: [
+          "const FIREBASE_CATALOG_URL =",
+          "  process.env.CLAUDISH_CATALOG_URL ??",
+          "  process.env.FIREBASE_CATALOG_URL ??",
+          '  "https://us-central1-claudish-6da10.cloudfunctions.net/queryModels?status=active&catalog=slim&limit=1000";',
+          "",
+        ].join("\n"),
+      },
+      {
+        path: "prefix-safe.ts",
+        text: 'const raw = (env.CLAUDISH_CAPABILITY_QUERY_MAX_ASKS ?? "").trim();\n',
+      },
+    ];
+    const names = new Set(["CLAUDISH_CATALOG_URL", "CLAUDISH_CAPABILITY_QUERY_MAX_ASKS"]);
+    const traps = emptyUnsafeNullishReads(preFixShape, names);
+    expect(traps.length).toBe(1);
+    expect(traps[0].name).toBe("CLAUDISH_CATALOG_URL");
+    expect(traps[0].where).toBe("prefix-openrouter.ts:2");
+    expect(traps[0].rhs).toContain("cloudfunctions.net");
   });
 
   test("positive control (mutation): the gap checker reports a name the compose lacks", () => {

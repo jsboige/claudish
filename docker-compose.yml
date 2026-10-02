@@ -139,11 +139,14 @@ services:
       # #310 — runtime knobs the proxy reads that were never in this list
       # (same absence class as the #304 failover knobs above: the env file only
       # interpolates, so a value set for a name this list does not carry never
-      # reached a container). All empty defaults — deploying this changes no
-      # behavior on any machine. compose-env-coverage.test.ts pins code↔compose
-      # in both directions, with an explicit exemption list there for CLI-only
-      # names (CLAUDISH_MODEL, CLAUDISH_HOST, CLAUDISH_MCP_TOOLS, the statusline
-      # pair, the launcher TTL, CLAUDISH_TEST_*).
+      # reached a container). NOTE: ${VAR:-} makes each name PRESENT with value
+      # "" — every read site was verified for "" ≡ unset (review #310): 20 held
+      # by construction, 2 were fixed in that review (OVERFLOW_REPORT_FLOOR,
+      # CATALOG_URL), and compose-env-coverage.test.ts now refuses a
+      # `?? <non-empty>` read on any name this list injects. Explicit exemption
+      # list there for CLI-only names (CLAUDISH_MODEL, CLAUDISH_HOST,
+      # CLAUDISH_MCP_TOOLS, the statusline pair, the launcher TTL,
+      # CLAUDISH_TEST_*).
       # Never-hang & recovery bounds. Re-read per request/stream INSIDE the
       # process; a NEW value enters a container only at its next recreate.
       - CLAUDISH_FIRST_EVENT_TIMEOUT_MS=${CLAUDISH_FIRST_EVENT_TIMEOUT_MS:-}
