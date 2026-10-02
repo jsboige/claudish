@@ -118,7 +118,15 @@ capped at `steps.length + 1` attempts.
 - On `response.ok`: nominal success resets all step failures for the role (fresh episode); step
   success resets just that step.
 - On `!ok` plus `isQuotaExhaustion`: a nominal wall arms the role; a step wall marks that step failed.
-- Non-quota errors (401/404/wiring) return as-is without advancing.
+- Non-quota errors (401/404/wiring) return as-is without advancing — **except the transient-overload
+  class on the NOMINAL (#299 B)**: status 529, 503, an overload-worded 429 (`isTransientOverload`), or
+  the synthesized transport 400 (`"connection_error"`) takes ONE cascade step for THIS request only,
+  via `resolveTransientStep` + a per-request `forceStepIndex` on both resolution sites. No arm, no
+  bucket wall, no step mark, no dwell pin — the next request re-pays the nominal. Bounded by
+  `CLAUDISH_FAILOVER_TRANSIENT_STEP_MAX` (default 1, `0` = kill switch, re-read per request). Marker:
+  `[Failover] TRANSIENT <role> — nominal HTTP <status> … — no arm`. Driver: MiniMax 529 code 2064
+  surge, 2026-10-02 (~30 % of haiku requests failing, cascade never walked). Pins + 4 mutations:
+  `proxy-server-transient-step-route.test.ts`.
 
 Bounded, no `while(true)`, never hangs. The **c-reuse invariant** is load-bearing: handlers must not
 mutate the Hono `Context` before returning a non-ok `Response`, so re-calling `handler.handle(c, body)`

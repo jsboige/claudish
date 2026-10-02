@@ -10,7 +10,7 @@ import { LocalTransport } from "./providers/transport/local.js";
 import { LocalModelAdapter } from "./adapters/local-adapter.js";
 import { PoeProvider } from "./providers/transport/poe.js";
 import type { ModelHandler } from "./handlers/types.js";
-import { ComposedHandler, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
+import { ComposedHandler, isTransientOverload, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import {
   resolveProvider,
   parseUrlModel,
@@ -66,6 +66,8 @@ import {
   onNominalRefusal,
   getArmGraceMs,
   extractSessionKey,
+  resolveTransientStep,
+  getTransientStepMax,
 } from "./fork/failover.js";
 import {
   appendCapabilityQueryToMessage,
@@ -805,7 +807,8 @@ export async function createProxyServer(
     requestedModel: string,
     depth = 0,
     sessionKey: string | null = null,
-    nominalBucket?: string
+    nominalBucket?: string,
+    forceStepIndex?: number
   ): Promise<ModelHandler> => {
     // 1. Monitor Mode Override
     if (monitorMode) return nativeHandler;
@@ -835,7 +838,20 @@ export async function createProxyServer(
       // #275: the diversion test is bucket-scoped — compute this request's
       // nominal bucket (unless the caller — the cascade loop — already did).
       const bucket = nominalBucket ?? (await nominalBucketOfModel(requestedModel));
-      const resolved = resolveFailoverTargetForSession(role, sessionKey, bucket);
+      // #299 B: a per-REQUEST forced step (transient nominal overload) bypasses
+      // the session resolution — no dwell pin is written for a one-shot
+      // deviation, and the very next request must resolve the nominal again.
+      // The step object is shared with the loop's resolveTransientStep() call,
+      // so a role: delegation's refreshed target is the same on both sides.
+      const forcedRule =
+        forceStepIndex !== undefined &&
+        forceStepIndex >= 0 &&
+        forceStepIndex < getFailoverRule(role)!.steps.length
+          ? getFailoverRule(role)!
+          : null;
+      const resolved = forcedRule
+        ? { step: forcedRule.steps[forceStepIndex!], stepIndex: forceStepIndex! }
+        : resolveFailoverTargetForSession(role, sessionKey, bucket);
       if (resolved.step && resolved.step.target !== target) {
         log(
           `[Proxy] Failover: role '${role}' [${bucket}] ${target} → ${resolved.step.target} step[${resolved.stepIndex}] (${resolved.step.label})`
@@ -1053,6 +1069,19 @@ export async function createProxyServer(
    * the SAME source of truth this loop reads — so mutating failover state between attempts
    * is enough; no override target is passed in (that would race two resolutions).
    */
+  /** #299 B: a nominal failure the cascade may step over for THIS request only.
+   * Provider-side surge — 529 (the surfaced shape after the patient overload
+   * backoff gives up; MiniMax code 2064 lives there), 503, an overload-worded
+   * 429 (isTransientOverload) — plus the synthesized transport 400
+   * (connection-error.ts wraps connect failures as `type: "connection_error"`,
+   * the #298 egress class). None of these are quota: `isQuotaExhaustion`
+   * deliberately never matches them, which is why the cascade stood still
+   * while ~30% of haiku requests died on a MiniMax surge (2026-10-02). */
+  const isTransientNominalFailure = (status: number, text: string): boolean =>
+    status === 529 ||
+    isTransientOverload(status, text) ||
+    (status === 400 && text.includes('"connection_error"'));
+
   const handleWithCascade = async (
     c: Context,
     body: any,
@@ -1081,12 +1110,27 @@ export async function createProxyServer(
     // `revisits` is capped at the step count, so the loop stays bounded.
     const triedSteps = new Set<number>();
     let revisits = 0;
+    // #299 B: transient-overload state. `forcedTransient` holds the one-shot
+    // deviation for THIS request; `transientUsed` bounds it (kill switch +
+    // cap re-read per request via getTransientStepMax). Consumed exactly once:
+    // cleared right after the handler call so a later iteration of this same
+    // request resolves naturally (armed state, fail-forward), never forced twice.
+    let transientUsed = 0;
+    let forcedTransient: ReturnType<typeof resolveTransientStep> | null = null;
     let response: Response | undefined;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const handler = await getHandlerForRequest(requestedModel, 0, sessionKey, bucket);
-      const resolved = role
-        ? resolveFailoverTargetForSession(role, sessionKey, bucket)
-        : { step: null, stepIndex: -1 };
+      const handler = await getHandlerForRequest(
+        requestedModel,
+        0,
+        sessionKey,
+        bucket,
+        forcedTransient?.stepIndex
+      );
+      const resolved = forcedTransient
+        ? { step: forcedTransient.step, stepIndex: forcedTransient.stepIndex }
+        : role
+          ? resolveFailoverTargetForSession(role, sessionKey, bucket)
+          : { step: null, stepIndex: -1 };
       const { stepIndex } = resolved;
       if (role && stepIndex >= 0 && triedSteps.has(stepIndex) && revisits < (rule?.steps.length ?? 0)) {
         revisits++;
@@ -1123,6 +1167,7 @@ export async function createProxyServer(
         body.model = pinnedModel;
       }
       response = await handler.handle(c, body);
+      forcedTransient = null; // #299 B: the one-shot deviation is consumed
       if (pinnedModel && !response.ok) body.model = modelBeforePin;
       if (response.ok) {
         if (role) {
@@ -1151,6 +1196,34 @@ export async function createProxyServer(
         // unreadable body — status alone still decides for 402
       }
       if (!isQuotaExhaustion(response.status, errBody)) {
+        // #299 B: transient overload on the NOMINAL — one cascade step for this
+        // request only. Not a wall: no armFailover, no bucket markFail, no
+        // step-failure mark, no dwell pin (resolveTransientStep is side-effect
+        // free; getHandlerForRequest's forced path bypasses the pin write). The
+        // next request resolves the nominal again — a surge that PERSISTS then
+        // costs one extra round-trip per request, which the countable marker
+        // below makes visible, instead of a 10-min TTL exile the surge never
+        // justified. Bounded by CLAUDISH_FAILOVER_TRANSIENT_STEP_MAX (0=off,
+        // re-read per request).
+        if (
+          stepIndex === -1 &&
+          forcedTransient === null &&
+          transientUsed < getTransientStepMax() &&
+          rule != null &&
+          rule.steps.length > 0 &&
+          isTransientNominalFailure(response.status, errBody)
+        ) {
+          const transient = resolveTransientStep(role);
+          if (transient.step) {
+            transientUsed++;
+            log(
+              `[Failover] TRANSIENT ${role} — nominal HTTP ${response.status} (transient overload); serving step[${transient.stepIndex}] (${transient.step.label}) for this request only — no arm`,
+              true
+            );
+            forcedTransient = transient;
+            continue; // the next iteration serves the forced step
+          }
+        }
         // Fail-forward. A non-quota failure on an INTERMEDIATE cascade step still
         // has a working successor beneath it, so advancing serves the user instead
         // of surfacing a substitute's incident as if it were their own. This is what
