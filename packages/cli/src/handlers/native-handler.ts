@@ -7,8 +7,11 @@ import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { stripUnsignedThinkingBlocks } from "./shared/thinking-signature.js";
 import { matchesProxyKey } from "./shared/proxy-keys.js";
 import {
+  nativeAuthHeaderNames,
   nativeCredentialRefusalResponse,
   nativeCredentialRefusalShape,
+  nativeHeaderNamesLogEnabled,
+  stripForeignCredentialBesideAnthropic,
 } from "./shared/native-credential-guard.js";
 import {
   fetchMultiModelAdvice,
@@ -63,6 +66,14 @@ export class NativeHandler implements ModelHandler {
   async handle(c: Context, payload: any): Promise<Response> {
     const originalHeaders = c.req.header();
     const target = payload.model;
+
+    // #305 AC 1 — measurement instrument, OFF by default. Logs which auth
+    // header NAMES the client sent (authorization / x-api-key / both / none),
+    // before anything touches them. Runs on the ORIGINAL inbound set so it
+    // measures the client, not our own mutations. Names only, never values.
+    if (nativeHeaderNamesLogEnabled()) {
+      log(`[Native][hdr-names] ${nativeAuthHeaderNames(originalHeaders)}`, true);
+    }
 
     // -------------------------------------------------------------------
     // Advisor-swap experiment (opt-in via CLAUDISH_SWAP_ADVISOR=1).
@@ -248,6 +259,18 @@ export class NativeHandler implements ModelHandler {
         true
       );
       return nativeCredentialRefusalResponse(target);
+    }
+
+    // #305 — mixed credentials: a FOREIGN credential riding beside an
+    // Anthropic-shaped one is stripped, never forwarded. The sk-ant-
+    // credential still authenticates, so the authorized lane survives
+    // whatever AC 1 measures; the foreign token never leaves.
+    const strippedForeign = stripForeignCredentialBesideAnthropic(headers);
+    if (strippedForeign.length > 0) {
+      log(
+        `[Native] stripped foreign credential beside Anthropic credential (header=${strippedForeign.join(",")}, model=${target})`,
+        true
+      );
     }
 
     // Advisor-swap: strip advisor beta flag when we swapped the tool

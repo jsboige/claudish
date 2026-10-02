@@ -50,7 +50,14 @@ const ROLES = ["OPUS", "SONNET", "HAIKU", "FABLE"] as const;
  * same absent-from-compose state; FOREIGN_TOKEN_GUARD is the control member —
  * it was ADDED to the list as a review fixup on #303, so it must stay).
  */
-const WATCHED = ["CLAUDISH_FAILOVER_", "CLAUDISH_NATIVE_MODEL_PIN", "CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD"];
+const WATCHED = [
+  "CLAUDISH_FAILOVER_",
+  "CLAUDISH_NATIVE_MODEL_PIN",
+  "CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD",
+  // #305 AC-1 instrument — added with the name itself, so it cannot ship
+  // unreachable the way the #304 knobs did. #310 widens this to all CLAUDISH_*.
+  "CLAUDISH_NATIVE_HEADER_NAMES_LOG",
+];
 
 function isWatched(name: string): boolean {
   return WATCHED.some((w) => (w.endsWith("_") ? name.startsWith(w) : name === w));
@@ -84,7 +91,7 @@ export function scanSources(files: { path: string; text: string }[]): ScanResult
   const dynamicSuffixes = new Set<string>();
   // \benv\b: standalone `env.` (initFailover's parameter) — must NOT match
   // `xenv.`/`myenv.`; `process.env` matched by its own alternative.
-  const staticRe = /(?:process\.env|\benv\b)\.(CLAUDISH_FAILOVER_[A-Z0-9_]+|CLAUDISH_NATIVE_MODEL_PIN|CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD)/g;
+  const staticRe = /(?:process\.env|\benv\b)\.(CLAUDISH_FAILOVER_[A-Z0-9_]+|CLAUDISH_NATIVE_MODEL_PIN|CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD|CLAUDISH_NATIVE_HEADER_NAMES_LOG)/g;
   const dynamicBareRe = /env\[`CLAUDISH_FAILOVER_\$\{[^}]+\}`\]/;
   // `env[`${key}_LABEL`]` — capture the suffix WITHOUT its joining underscore
   // (the required name is built as `${role}_${suffix}`).
@@ -179,6 +186,7 @@ describe("#304 compose env coverage", () => {
       "CLAUDISH_FAILOVER_RECOVERY_GRACE_MS",
       "CLAUDISH_NATIVE_MODEL_PIN",
       "CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD",
+      "CLAUDISH_NATIVE_HEADER_NAMES_LOG",
     ]) {
       expect(scan.staticReads.has(name)).toBe(true);
     }

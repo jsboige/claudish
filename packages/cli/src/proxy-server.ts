@@ -5,8 +5,11 @@ import { log, logStderr } from "./logger.js";
 import type { ProxyServer } from "./types.js";
 import { NativeHandler, stripProxyOwnHeaders } from "./handlers/native-handler.js";
 import {
+  nativeAuthHeaderNames,
   nativeCredentialRefusalResponse,
   nativeCredentialRefusalShape,
+  nativeHeaderNamesLogEnabled,
+  stripForeignCredentialBesideAnthropic,
 } from "./handlers/shared/native-credential-guard.js";
 import { OpenRouterProviderTransport } from "./providers/transport/openrouter.js";
 import { OpenRouterAPIFormat } from "./adapters/openrouter-api-format.js";
@@ -1428,6 +1431,19 @@ export async function createProxyServer(
             true
           );
           return nativeCredentialRefusalResponse(body.model);
+        }
+
+        // #305 — same mixed-credential strip as NativeHandler.handle.
+        const strippedForeign = stripForeignCredentialBesideAnthropic(reqHeaders);
+        if (strippedForeign.length > 0) {
+          log(
+            `[Native] stripped foreign credential beside Anthropic credential (header=${strippedForeign.join(",")}, model=${body.model}, path=count_tokens)`,
+            true
+          );
+        }
+        // #305 AC 1 — same measurement instrument (names only, OFF by default).
+        if (nativeHeaderNamesLogEnabled()) {
+          log(`[Native][hdr-names] ${nativeAuthHeaderNames(c.req.header())} (count_tokens)`, true);
         }
 
         const res = await fetch("https://api.anthropic.com/v1/messages/count_tokens", {

@@ -95,3 +95,72 @@ export function nativeCredentialRefusalResponse(model: string): Response {
     { status: 403, headers: { "content-type": "application/json" } }
   );
 }
+
+/**
+ * #305 — mixed-credential strip: a FOREIGN credential riding BESIDE an
+ * Anthropic-shaped one is removed instead of forwarded.
+ *
+ * The #296/#303 refusal predicate is an OR (`bearerToken.startsWith("sk-ant-")
+ * || apiKey.startsWith("sk-ant-")`), so a request carrying one `sk-ant-`
+ * credential and one foreign one passed, and the foreign one still reached
+ * api.anthropic.com with it — the exact class #296 B exists to close.
+ *
+ * The fix STRIPS rather than refuses: whether the authorized client ever
+ * sends both headers is unmeasured (#305 AC 1 — the captures carry no
+ * headers), and a refusal could cut the only authorized Opus lane. Stripping
+ * the foreign sibling is safe under either answer: the `sk-ant-` credential
+ * still authenticates, and the foreign token never leaves. Same pattern as
+ * the relay dropping a stale client `x-api-key` (#282's regression: "clients
+ * may still carry a stale x-api-key from an older settings.json").
+ *
+ * Only the MIXED case strips. Neither shaped → the shape-B refusal owns the
+ * request. Both shaped → both are Anthropic's, forwarded as today. Governed
+ * by the same kill switch as the refusal (one switch, one policy).
+ *
+ * Mutates `headers` in place; returns the names it removed (for the marker —
+ * a header NAME, never anything derived from its value).
+ */
+export function stripForeignCredentialBesideAnthropic(
+  headers: Record<string, string>
+): string[] {
+  if (guardDisabled()) return [];
+  const auth = headers["authorization"] ?? "";
+  const apiKey = headers["x-api-key"] ?? "";
+  const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  const authShaped = bearerToken.startsWith("sk-ant-");
+  const keyShaped = apiKey.startsWith("sk-ant-");
+  const stripped: string[] = [];
+  if (authShaped && !keyShaped && apiKey.length > 0) {
+    delete headers["x-api-key"];
+    stripped.push("x-api-key");
+  }
+  if (keyShaped && !authShaped && bearerToken.length > 0) {
+    delete headers["authorization"];
+    stripped.push("authorization");
+  }
+  return stripped;
+}
+
+/**
+ * #305 AC 1 — the measurement instrument: does the authorized client ever
+ * send BOTH auth headers on its native requests?
+ *
+ * Gated by `CLAUDISH_NATIVE_HEADER_NAMES_LOG=1` (default off, zero
+ * production overhead): logs the header NAMES present (`authorization`,
+ * `x-api-key`, both, or none) on every native request. The captures carry no
+ * headers, so this marker is the only way to measure the client's shape —
+ * meant to run on the hub, where the authorized native traffic lands.
+ *
+ * Names ONLY. Never a value, prefix, length or fingerprint.
+ */
+export function nativeHeaderNamesLogEnabled(): boolean {
+  return process.env.CLAUDISH_NATIVE_HEADER_NAMES_LOG === "1";
+}
+
+/** The auth header names present, as a compact string. Names only. */
+export function nativeAuthHeaderNames(headers: Record<string, string>): string {
+  const names: string[] = [];
+  if ((headers["authorization"] ?? "").length > 0) names.push("authorization");
+  if ((headers["x-api-key"] ?? "").length > 0) names.push("x-api-key");
+  return names.length ? names.join("+") : "(none)";
+}

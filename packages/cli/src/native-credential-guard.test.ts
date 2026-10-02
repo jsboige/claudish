@@ -26,7 +26,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
 import { resetFailoverForTests, isQuotaExhaustion } from "./fork/failover.js";
-import { nativeCredentialRefusalShape } from "./handlers/shared/native-credential-guard.js";
+import {
+  nativeAuthHeaderNames,
+  nativeCredentialRefusalShape,
+  stripForeignCredentialBesideAnthropic,
+} from "./handlers/shared/native-credential-guard.js";
 import type { ProxyServer } from "./types.js";
 
 // ---- harness -----------------------------------------------------------------
@@ -329,5 +333,130 @@ describe("#296 — count_tokens native branch", () => {
     );
     await expectForwarded(res, true);
     expect(anthropicCalls[0].url).toBe("https://api.anthropic.com/v1/messages/count_tokens");
+  }, 30_000);
+});
+
+// ---- #305 — mixed credentials: strip the foreign sibling, forward the sk-ant one ----
+
+describe("#305 unit — stripForeignCredentialBesideAnthropic", () => {
+  test("sk-ant Bearer + foreign x-api-key → x-api-key stripped, authorization kept", () => {
+    const h: Record<string, string> = {
+      authorization: "Bearer sk-ant-oat01-x",
+      "x-api-key": "other-provider-key",
+    };
+    expect(stripForeignCredentialBesideAnthropic(h)).toEqual(["x-api-key"]);
+    expect(h["x-api-key"]).toBeUndefined();
+    expect(h["authorization"]).toBe("Bearer sk-ant-oat01-x");
+  });
+
+  test("foreign Bearer + sk-ant x-api-key → authorization stripped, x-api-key kept", () => {
+    const h: Record<string, string> = {
+      authorization: "Bearer some-foreign-token",
+      "x-api-key": "sk-ant-api03-x",
+    };
+    expect(stripForeignCredentialBesideAnthropic(h)).toEqual(["authorization"]);
+    expect(h["authorization"]).toBeUndefined();
+    expect(h["x-api-key"]).toBe("sk-ant-api03-x");
+  });
+
+  test("both sk-ant → nothing stripped (both are Anthropic's)", () => {
+    const h: Record<string, string> = {
+      authorization: "Bearer sk-ant-oat01-x",
+      "x-api-key": "sk-ant-api03-x",
+    };
+    expect(stripForeignCredentialBesideAnthropic(h)).toEqual([]);
+    expect(h["authorization"]).toBeDefined();
+    expect(h["x-api-key"]).toBeDefined();
+  });
+
+  test("single credential (any shape) → no-op (shape-B refusal owns the foreign one)", () => {
+    expect(stripForeignCredentialBesideAnthropic({ authorization: "Bearer sk-ant-oat01-x" })).toEqual([]);
+    expect(stripForeignCredentialBesideAnthropic({ authorization: "Bearer foreign" })).toEqual([]);
+    expect(stripForeignCredentialBesideAnthropic({})).toEqual([]);
+  });
+
+  test("kill switch disables the strip with the refusal (one switch, one policy)", () => {
+    process.env.CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD = "0";
+    try {
+      const h: Record<string, string> = {
+        authorization: "Bearer sk-ant-oat01-x",
+        "x-api-key": "other-provider-key",
+      };
+      expect(stripForeignCredentialBesideAnthropic(h)).toEqual([]);
+      expect(h["x-api-key"]).toBe("other-provider-key");
+    } finally {
+      delete process.env.CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD;
+    }
+  });
+});
+
+describe("#305 unit — nativeAuthHeaderNames (the AC-1 instrument, names only)", () => {
+  test("combinations render as names, never values", () => {
+    expect(nativeAuthHeaderNames({})).toBe("(none)");
+    expect(nativeAuthHeaderNames({ authorization: "Bearer x" })).toBe("authorization");
+    expect(nativeAuthHeaderNames({ "x-api-key": "y" })).toBe("x-api-key");
+    expect(nativeAuthHeaderNames({ authorization: "Bearer x", "x-api-key": "y" })).toBe(
+      "authorization+x-api-key"
+    );
+  });
+});
+
+describe("#305 — /v1/messages mixed shapes", () => {
+  test("sk-ant Bearer + foreign x-api-key → 1 call, authorization forwarded, x-api-key NOT", async () => {
+    await spin();
+    const res = await post(
+      "/v1/messages",
+      headers({ authorization: "Bearer sk-ant-oat01-test", "x-api-key": "other-provider-key" }),
+      NATIVE_BODY
+    );
+    expect(res.status).toBe(200);
+    expect(anthropicCalls.length).toBe(1);
+    const names = anthropicCalls[0].headerNames.map((n) => n.toLowerCase());
+    expect(names).toContain("authorization");
+    expect(names).not.toContain("x-api-key"); // the foreign sibling never leaves
+  }, 30_000);
+
+  test("foreign Bearer + sk-ant x-api-key → 1 call, x-api-key forwarded, authorization NOT", async () => {
+    await spin();
+    const res = await post(
+      "/v1/messages",
+      headers({ authorization: "Bearer some-foreign-token", "x-api-key": "sk-ant-api03-test" }),
+      NATIVE_BODY
+    );
+    expect(res.status).toBe(200);
+    expect(anthropicCalls.length).toBe(1);
+    const names = anthropicCalls[0].headerNames.map((n) => n.toLowerCase());
+    expect(names).toContain("x-api-key");
+    expect(names).not.toContain("authorization"); // the foreign sibling never leaves
+  }, 30_000);
+});
+
+describe("#305 — count_tokens mixed shapes", () => {
+  test("sk-ant Bearer + foreign x-api-key → 1 call, authorization only", async () => {
+    await spin();
+    const res = await post(
+      "/v1/messages/count_tokens",
+      headers({ authorization: "Bearer sk-ant-oat01-test", "x-api-key": "other-provider-key" }),
+      { model: "claude-opus-5-5", messages: [{ role: "user", content: "ok" }] }
+    );
+    expect(res.status).toBe(200);
+    expect(anthropicCalls.length).toBe(1);
+    const names = anthropicCalls[0].headerNames.map((n) => n.toLowerCase());
+    expect(names).toContain("authorization");
+    expect(names).not.toContain("x-api-key");
+  }, 30_000);
+
+  test("foreign Bearer + sk-ant x-api-key → 1 call, x-api-key only", async () => {
+    await spin();
+    const res = await post(
+      "/v1/messages/count_tokens",
+      headers({ authorization: "Bearer some-foreign-token", "x-api-key": "sk-ant-api03-test" }),
+      { model: "claude-opus-5-5", messages: [{ role: "user", content: "ok" }] }
+    );
+    expect(res.status).toBe(200);
+    expect(anthropicCalls.length).toBe(1);
+    const names = anthropicCalls[0].headerNames.map((n) => n.toLowerCase());
+    expect(names).toContain("x-api-key");
+    expect(names).not.toContain("authorization");
   }, 30_000);
 });

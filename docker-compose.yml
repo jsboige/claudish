@@ -84,6 +84,10 @@ services:
       # above — it postdated this list, so "=0" in a .env never reached a
       # container (#304). Only an explicit "0" disarms; empty = pin active.
       - CLAUDISH_NATIVE_MODEL_PIN=${CLAUDISH_NATIVE_MODEL_PIN:-}
+      # #305 AC-1 instrument: "1" logs the auth header NAMES a native request
+      # carries (never values). Off when empty. Read per request, but like every
+      # name here it enters the container only at a recreate.
+      - CLAUDISH_NATIVE_HEADER_NAMES_LOG=${CLAUDISH_NATIVE_HEADER_NAMES_LOG:-}
       # Budget failover (fork extension). All empty → inert: no routing change,
       # no notice, zero added bytes. Belongs on the machine that actually CALLS
       # the models. That is the hub most of the time, but a sidecar calls them
