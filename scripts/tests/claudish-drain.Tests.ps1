@@ -348,6 +348,74 @@ Describe 'Invoke-ClaudishDrainedRestart — terminal OUTCOME lines (#233 AC3)' {
     }
 }
 
+Describe 'armed-cascade guard counts CASCADES, not knobs (#141 x #304)' {
+    It 'refuses when the env file carries only #304 knobs while the container holds an armed cascade' {
+        Reset-DrainFixture
+        # The #304 trap made real: the knobs are injected since the fix, so a
+        # file can hold three non-empty CLAUDISH_FAILOVER_*/native lines and
+        # ZERO cascades. Under the pre-#304 any-FAILOVER-name pattern this
+        # counted as armed (2) and the gut-guard let the recreate through,
+        # wiping the container's cascade. Only the four <ROLE> cascade names
+        # are an armed state; a knob is runtime policy, not a cascade.
+        $saved = [System.IO.File]::ReadAllText($script:EnvFile)
+        try {
+            [System.IO.File]::WriteAllText($script:EnvFile, "CLAUDISH_FAILOVER_ARM_AFTER=2`nCLAUDISH_FAILOVER_SESSION_DWELL_MS=600000`nCLAUDISH_NATIVE_MODEL_PIN=1`n", (New-Object System.Text.UTF8Encoding($false)))
+            [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+            [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`nCLAUDISH_FAILOVER_ARM_AFTER=2`n", (New-Object System.Text.ASCIIEncoding))
+
+            $r = Invoke-ClaudishDrainedRestart -Reason 'knob-only' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+            $r | Should -BeFalse
+            $log = Get-DrainLogText
+            $log | Should -Match 'RECREATE REFUSED'
+            $log | Should -Match 'carries no armed'
+            $log | Should -Match 'OUTCOME refused'
+            # Refused BEFORE stopping anything: compose is where the stop
+            # happens and must never have been invoked.
+            (Get-CallsText) | Should -Not -Match '(?m)^compose'
+        } finally {
+            [System.IO.File]::WriteAllText($script:EnvFile, $saved, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    }
+
+    It 'a cascade line in the env file keeps the guard open (no false refuse)' {
+        Reset-DrainFixture
+        # Mirror of the refuse above: same armed container, but the file now
+        # carries the cascade itself — nothing to lose, no refuse. With clean
+        # fixtures the run then proceeds all the way to OUTCOME success.
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'cascade-present' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeTrue
+        (Get-DrainLogText) | Should -Not -Match 'carries no armed'
+        (Get-DrainLogText) | Should -Match 'OUTCOME success'
+    }
+
+    It 'drift pin: both scripts count armed with the same role-only pattern' {
+        # Two copies of the armed-count exist (Get-ArmedCascadeCount in
+        # install-sidecar.ps1, inline x2 in claudish-drain.ps1). Nothing
+        # executes install-sidecar.ps1 in this suite, so the only pin against
+        # the copies drifting apart is source-level: both must match this
+        # exact role-only alternation, and neither may still count armed with
+        # the pre-#304 any-FAILOVER-name pattern (Get-EnvLinesToPreserve's
+        # broad carry-over pattern is a DIFFERENT, legitimate use and is
+        # anchored on a bare `=` so it cannot match `.=`).
+        $rolePattern = [regex]::Escape('^CLAUDISH_FAILOVER_(OPUS|SONNET|HAIKU|FABLE)=.+')
+        $drainText = [System.IO.File]::ReadAllText($script:DrainScript)
+        $installText = [System.IO.File]::ReadAllText((Join-Path $script:ScriptsRoot 'install-sidecar.ps1'))
+        # (BeTrue rather than BeGreaterThanOrEqual: the numeric-operator
+        # parameter set does not resolve under this suite's Pester binding.)
+        (@([regex]::Matches($drainText, $rolePattern)).Count -ge 1) | Should -BeTrue
+        (@([regex]::Matches($installText, $rolePattern)).Count -ge 1) | Should -BeTrue
+        # Neither script may still count armed with the pre-#304 any-name
+        # pattern — the exact text it used to carry, escaped. (The drain must
+        # not count knobs as armed anymore; same for Get-ArmedCascadeCount.)
+        $oldBroad = [regex]::Escape('^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+')
+        $drainText | Should -Not -Match $oldBroad
+        $installText | Should -Not -Match $oldBroad
+    }
+}
+
 Describe 'Invoke-ClaudishDrainedRestart — compose stderr and deployed-image attestation (#257)' {
     It 'compose stderr under EAP Stop completes with OUTCOME success — no terminating RemoteException' {
         Reset-DrainFixture
