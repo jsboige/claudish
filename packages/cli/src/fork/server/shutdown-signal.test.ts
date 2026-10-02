@@ -53,7 +53,11 @@ function runFixture(deferToHost: boolean): { stdout: string; exitCode: number } 
       `console.log("STILL-ALIVE-AFTER-EMIT");`,
     ].join("\n")
   );
-  const proc = Bun.spawnSync(["bun", "run", file], {
+  // #175 — process.execPath, not a bare "bun": npm-shim installs have no
+  // bun.exe for CreateProcess to resolve, and the fixture dies with ENOENT
+  // uv_spawn before either assertion runs (measured on po-2024, passing on
+  // machines whose PATH holds a real bun.exe — e.g. ai-01).
+  const proc = Bun.spawnSync([process.execPath, "run", file], {
     env: { ...process.env, CLAUDISH_STATS: "0" },
     stdout: "pipe",
     stderr: "pipe",

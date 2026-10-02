@@ -28,6 +28,13 @@
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
+
+// #175 — spawn the CURRENT runtime, never a bare "bun": on machines where bun
+// is an npm shim there is no bun.exe for CreateProcess to resolve ("where bun"
+// → bun.cmd), and spawn("bun") dies with ENOENT uv_spawn before the test body
+// runs — the same machine class as the e2e claude.exe shim fix (e19f0634).
+// process.execPath is the absolute path of the very binary running this suite.
+const BUN = process.execPath;
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -81,7 +88,7 @@ async function captureSessionFrames(opts: {
   shimArgs?: string[]; // extra args passed to fake-claudish via spawn
   timeoutMs?: number;
 }): Promise<CapturedFrames> {
-  const proc: ChildProcess = spawn("bun", ["run", SERVER_ENTRY, "--mcp"], {
+  const proc: ChildProcess = spawn(BUN, ["run", SERVER_ENTRY, "--mcp"], {
     stdio: ["pipe", "pipe", "pipe"],
     env: {
       ...process.env,
@@ -358,7 +365,7 @@ describe("MCP capability declaration", () => {
     "initialize response declares experimental.claude/channel capability",
     async () => {
       // Drive only the initialize handshake — no session needed.
-      const proc: ChildProcess = spawn("bun", ["run", SERVER_ENTRY, "--mcp"], {
+      const proc: ChildProcess = spawn(BUN, ["run", SERVER_ENTRY, "--mcp"], {
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, CLAUDISH_MCP_TOOLS: "all" },
       });
@@ -417,7 +424,7 @@ describe("MCP capability declaration", () => {
     async () => {
       // With CLAUDISH_MCP_TOOLS=low-level, channel tools are gated off and
       // the experimental.claude/channel capability should NOT be declared.
-      const proc: ChildProcess = spawn("bun", ["run", SERVER_ENTRY, "--mcp"], {
+      const proc: ChildProcess = spawn(BUN, ["run", SERVER_ENTRY, "--mcp"], {
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, CLAUDISH_MCP_TOOLS: "low-level" },
       });
