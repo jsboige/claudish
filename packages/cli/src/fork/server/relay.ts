@@ -465,7 +465,9 @@ export async function forwardToUpstream(
     // load on every client retry, (b) move the request off the central capture,
     // and (c) two in a row would flip the whole machine AUTONOMOUS for every
     // role. Pass it through exactly like a 4xx: the hub spoke, the client hears it.
-    log(`[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`);
+    // forceConsole: the fallthrough line this replaces was forceConsole, and a
+    // plain log() is file-only — a no-op on a production relay (debug off).
+    log(`[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`, true);
   }
 
   // Success (2xx/3xx/4xx), or a relayed 529. Reset the failure streak; a 4xx is
