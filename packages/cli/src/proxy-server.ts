@@ -1508,7 +1508,18 @@ export async function createProxyServer(
       }),
       {
         status: 503,
-        headers: { "content-type": "application/json", "retry-after": "15" },
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "15",
+          // #318 — marks this 503 as OUR deliberate drain window. A relaying
+          // sidecar treats an unmarked 503 as a hub failure (markFail + local
+          // replay, #299 A's rationale); the marker lets it pass this one
+          // through like a 4xx instead. Explicit header, not body sniffing:
+          // real provider overloads emit an Anthropic-shaped overloaded_error
+          // body too. Never stripped on the hub→relay response path (#282's
+          // x-claudish-* strip is native-lane-toward-Anthropic only).
+          "x-claudish-drain-freeze": "1",
+        },
       }
     );
   };
