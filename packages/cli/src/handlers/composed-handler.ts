@@ -73,11 +73,58 @@ import {
   connectRetryMax,
 } from "./shared/connection-error.js";
 import { peekStreamStart } from "./shared/stream-peek.js";
+import { matchesProxyKey } from "./shared/proxy-keys.js";
+import { stripProxyOwnHeaders } from "./native-handler.js";
 
-function extractAuthHeaders(c: Context): VisionProxyAuthHeaders {
+/**
+ * #289 — credential policy for the vision fallback, injected once by
+ * proxy-server at boot (same pattern as setRoleNominalResolver): the
+ * ComposedHandler constructor has ~20 call sites and none of them knows
+ * about proxy keys. Unset (tests, library use), NO key can match, so an
+ * inbound proxy-shaped key is forwarded verbatim — the boot wiring in
+ * proxy-server is what arms the sanitizer in production (pinned by a
+ * createProxyServer test; review 03/10, mutation W).
+ */
+interface VisionAuthPolicy {
+  proxyKeys?: string[];
+  anthropicApiKey?: string;
+}
+let visionAuthPolicy: VisionAuthPolicy = {};
+export function setVisionAuthPolicy(policy: VisionAuthPolicy): void {
+  visionAuthPolicy = policy;
+}
+
+/**
+ * #289 — the proxy's own key never leaves for api.anthropic.com, whichever
+ * path carries the credential. The vision fallback used to forward the
+ * inbound `x-api-key` verbatim to the image-description call; a client that
+ * authenticates to the proxy with its key in that header would hand it to
+ * Anthropic on every described image. Same family as #282/#285 (stripped on
+ * the two native sites) and the same swap rule as NativeHandler: a matching
+ * key (primary or previous) is replaced by the stored Anthropic key when one
+ * is configured — `authorization: Bearer` for an sk-ant-oat, `x-api-key`
+ * otherwise — and dropped entirely when none is. A genuine client Anthropic
+ * key (no match) passes through unchanged: that is this path's purpose.
+ */
+export function sanitizeVisionAuthHeaders(auth: VisionProxyAuthHeaders): void {
+  // Defense in depth (#285 helper): this path forwards auth headers only,
+  // but if it ever copies more, the strip runs here so the lists cannot drift.
+  stripProxyOwnHeaders(auth as Record<string, string>);
+  if (!visionAuthPolicy.proxyKeys?.length) return;
+  if (!matchesProxyKey(auth["x-api-key"], visionAuthPolicy.proxyKeys)) return;
+  delete auth["x-api-key"];
+  const stored = visionAuthPolicy.anthropicApiKey;
+  if (stored) {
+    if (stored.startsWith("sk-ant-oat")) auth["authorization"] = `Bearer ${stored}`;
+    else auth["x-api-key"] = stored;
+  }
+}
+
+export function extractAuthHeaders(c: Context): VisionProxyAuthHeaders {
   const headers = c.req.header();
   const auth: VisionProxyAuthHeaders = {};
   if (headers["x-api-key"]) auth["x-api-key"] = headers["x-api-key"];
+  sanitizeVisionAuthHeaders(auth);
   return auth;
 }
 
