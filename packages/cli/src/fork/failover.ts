@@ -118,6 +118,17 @@ interface StepFailure {
    * regardless of backoff — the wall cannot lift before its reset. Once it passes,
    * the step is probed again (a reset step must be consumed, not avoided). */
   resetAt?: Date;
+  /** #276: the LATEST failure was NON-quota — the STEP-ADVANCE class (the step is
+   * broken or content-filtering; its provider's meter is NOT walled). Set only by
+   * the proxy's non-quota fail-forward site. A dwell pin whose step died this way
+   * yields WITHOUT re-pinning, so the session rejoins the general resolution and
+   * returns to the nominal the moment its bucket wall expires — instead of riding
+   * the next cascade step past a recovered nominal (measured 2026-09-28: a pinned
+   * session sat on the PAYG tail for hours while the nominal sat healthy at 47%).
+   * Absent = quota-class (or unmarked) — ordinary advancement, the pin re-pins at
+   * the next step. The record is replaced whole on each mark, so the flag always
+   * reflects the most recent death, never an older episode. */
+  nonQuota?: true;
 }
 
 interface RecoveryState {
@@ -461,6 +472,7 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   nominalRefusals.clear();
   armTtlEscalation.clear();
   dwellPins.clear();
+  dwellYieldTombstones.clear();
   nominalRecoveredAt.clear();
   const parseIntEnv = (raw: string | undefined, fallback: number): number => {
     const n = Number.parseInt((raw || "").trim(), 10);
@@ -698,23 +710,33 @@ function stepFailuresFor(role: FailoverRole): StepFailure[] {
   return arr;
 }
 
-/** Record that cascade step `idx` for `role` just quota-walled. `bodyResetAt` is the
- * reset time parsed from the provider's own error body (most accurate at wall time);
- * when absent, the operator-declared step.resetAt applies if configured. */
+/** Record that cascade step `idx` for `role` just failed. A quota wall is the
+ * default vocabulary; `opts.nonQuota` marks the STEP-ADVANCE class instead (the
+ * step is broken, not walled — different log verb, and a dwell pin on it yields
+ * without re-pinning, #276). `bodyResetAt` is the reset time parsed from the
+ * provider's own error body (most accurate at wall time); when absent, the
+ * operator-declared step.resetAt applies if configured. */
 export function markStepFailed(
   role: FailoverRole,
   idx: number,
   reason: string,
-  bodyResetAt?: Date
+  bodyResetAt?: Date,
+  opts?: { nonQuota?: boolean }
 ): void {
   const rule = rules.get(role);
   if (!rule || idx < 0 || idx >= rule.steps.length) return;
   const arr = stepFailuresFor(role);
   const resetAt = bodyResetAt ?? rule.steps[idx].resetAt;
-  arr[idx] = { count: arr[idx].count + 1, lastFailure: new Date(Date.now()), resetAt };
+  const nonQuota = opts?.nonQuota === true;
+  arr[idx] = {
+    count: arr[idx].count + 1,
+    lastFailure: new Date(Date.now()),
+    resetAt,
+    ...(nonQuota ? { nonQuota: true } : {}),
+  };
   const ttlText = resetAt ? `until ${resetAt.toISOString()}` : `${Math.round(stepTtlMs(arr[idx].count) / 60000)}min`;
   logStderr(
-    `[Failover] step ${role}[${idx}] (${rule.steps[idx].label}) walled — count=${arr[idx].count} ttl=${ttlText} (${reason})`
+    `[Failover] step ${role}[${idx}] (${rule.steps[idx].label}) ${nonQuota ? "failed (non-quota)" : "walled"} — count=${arr[idx].count} ttl=${ttlText} (${reason})`
   );
 }
 
@@ -799,8 +821,24 @@ const dwellPins = new Map<FailoverRole, Map<string, { stepIndex: number; until: 
  * bucket would yield, re-resolve to the fallback step and re-pin, with two log
  * lines each, for as long as the mixed state held. Cleared by armFailover. */
 const nominalRecoveredAt = new Map<string, number>();
+/** #276: sessions that forfeited their dwell because their pinned step died of a
+ * NON-QUOTA error, → when the forfeit lapses. While live, a resolution landing on
+ * a cascade step returns it WITHOUT re-pinning. The forfeit must outlive the
+ * intra-request resolutions that follow a STEP-ADVANCE (the loop resolves twice
+ * per attempt — swap + loop read): without it the sibling resolution re-pins the
+ * deeper step immediately and the pin then outlives the nominal's bucket wall,
+ * which is the measured defect (2026-09-28: armed 11:05Z, pinned step 2 died
+ * non-quota 12:31Z, the session rode the PAYG tail for hours while the nominal
+ * sat healthy at 47% — no pinned session ever probed it, so no #294 recovery
+ * stamp ever landed either; the wall had long expired). One dwell window long —
+ * bounded: a real, long wall re-establishes ordinary dwell after it lapses, and
+ * a resolution landing on the nominal clears it (the forfeit served its purpose). */
+const dwellYieldTombstones = new Map<FailoverRole, Map<string, number>>();
 /** Prune guard so the pin map cannot grow without bound across a long uptime. */
 const DWELL_PINS_MAX = 512;
+/** Same guard for the #276 forfeit map (review of #316). Exported for the
+ * cap test so the constant cannot drift from its assertion. */
+export const DWELL_TOMBSTONES_MAX = 512;
 
 function pruneDwellPins(role: FailoverRole): void {
   const pins = dwellPins.get(role);
@@ -825,6 +863,23 @@ export function getSessionDwellMs(): number {
   return sessionDwellMs;
 }
 
+/** Test seam (#276): the live dwell pin of a session, or null — so tests can
+ * assert pin state directly instead of inferring it from resolution outcomes. */
+export function getSessionDwellPinForTests(
+  role: FailoverRole,
+  sessionKey: string
+): { stepIndex: number; until: number } | null {
+  const pin = dwellPins.get(role)?.get(sessionKey);
+  if (!pin || pin.until <= Date.now()) return null;
+  return { ...pin };
+}
+
+/** Test seam (#276, review of #316): entries currently held in the forfeit
+ * map — proves the DWELL_TOMBSTONES_MAX lapsed-entry sweep. */
+export function getDwellYieldTombstoneCountForTests(role: FailoverRole): number {
+  return dwellYieldTombstones.get(role)?.size ?? 0;
+}
+
 /**
  * Session-aware cascade resolution — the routing seam `getHandlerForRequest` and
  * the cascade loop use when a session key is available. Same walk as
@@ -835,7 +890,10 @@ export function getSessionDwellMs(): number {
  *    oscillation is exactly what the dwell exists to keep off one conversation.
  *  - The pin YIELDS on genuine advancement: the pinned step itself TTL-failed
  *    (markStepFailed walked past it), or the pin expired. Yielding re-pins at
- *    the new step.
+ *    the new step — EXCEPT when the step died of a NON-QUOTA error (#276): the
+ *    dwell is then FORFEITED (yield without re-pin, see dwellYieldTombstones),
+ *    so the session rejoins the general resolution each request instead of
+ *    dwelling on the successor past a recovered nominal.
  *  - The pin also YIELDS on VERIFIED nominal recovery: a real request served by
  *    the nominal (onNominalSuccess) more than `recoveryGraceMs` ago. Without
  *    this exit an active conversation rides its fallback step until it ENDS —
@@ -859,6 +917,10 @@ export function resolveFailoverTargetForSession(
   const now = Date.now();
   const pins = dwellPins.get(role);
   const pin = pins?.get(sessionKey);
+  // #276: set when a live pin's step died of a NON-QUOTA error — the dwell is
+  // forfeited below instead of re-pinned at the walk's next step.
+  let pinnedDiedNonQuota = false;
+  let diedStepIndex = -1;
 
   if (pin && pin.until > now) {
     const fails = stepFailures.get(role);
@@ -899,10 +961,54 @@ export function resolveFailoverTargetForSession(
       return { step: rule.steps[pin.stepIndex], stepIndex: pin.stepIndex };
     }
     // Pinned step TTL-failed (genuine advancement) — fall through, re-pin below.
+    // #276 carve-out: a NON-QUOTA death means the step is broken, not walled —
+    // re-pinning the successor is what strands a session on the cascade tail
+    // past a recovered nominal (the pin then holds through the wall's TTL expiry,
+    // and with every active session pinned the nominal is never probed, so no
+    // #294 recovery stamp ever lands). TTL-failed must be re-checked here, not
+    // inferred from !pinnedStillServable: that flag is also cleared by a dead
+    // delegation, which keeps its own re-resolve-and-re-pin semantics.
+    pinnedDiedNonQuota =
+      !pinnedStillServable &&
+      pinnedFailure != null &&
+      pinnedFailure.nonQuota === true &&
+      isStepTtlFailed(pinnedFailure);
+    diedStepIndex = pin.stepIndex;
   }
 
   const resolved = resolveFailoverTarget(role, bucket);
+  if (pinnedDiedNonQuota) {
+    // #276: yield WITHOUT re-pinning. The tombstone keeps the sibling resolution
+    // of this same cascade attempt (the loop resolves twice per attempt) from
+    // re-pinning the walk's step; the session re-decides from scratch on every
+    // request until the forfeit lapses — nominal the moment the wall is gone.
+    pins?.delete(sessionKey);
+    const tombs = dwellYieldTombstones.get(role) ?? new Map();
+    // Bounded like DWELL_PINS_MAX (review of #316): an entry otherwise leaves
+    // only when its OWN session resolves again, so a conversation that ends
+    // right after its forfeit leaves its entry for the process lifetime. Lapsed
+    // entries are dropped on this write; live forfeits are never evicted (the
+    // temporary over-cap is bounded by one dwell window, same as the pin map's
+    // oldest-excess pass tolerates).
+    if (tombs.size >= DWELL_TOMBSTONES_MAX) {
+      for (const [k, until] of tombs) {
+        if (until <= now) tombs.delete(k);
+      }
+    }
+    tombs.set(sessionKey, now + dwell);
+    dwellYieldTombstones.set(role, tombs);
+    logStderr(
+      `[Failover] DWELL ${role} session …${sessionKey.slice(-8)} yielded — step ${diedStepIndex} (${rule.steps[diedStepIndex]?.label}) died non-quota; dwell forfeited, re-resolving unpinned`
+    );
+    return resolved;
+  }
   if (resolved.stepIndex >= 0) {
+    const tombs = dwellYieldTombstones.get(role);
+    const tomb = tombs?.get(sessionKey);
+    if (tomb !== undefined) {
+      if (tomb > now) return resolved; // #276 forfeit live — serve the walk, don't re-pin
+      tombs?.delete(sessionKey); // lapsed — ordinary dwell resumes
+    }
     const m = dwellPins.get(role) ?? new Map();
     // Pin (or re-pin at a new step) only on change: resolve runs twice per
     // cascade attempt (swap + loop read) and identical results must not churn
@@ -920,6 +1026,9 @@ export function resolveFailoverTargetForSession(
     }
   } else if (pins) {
     pins.delete(sessionKey); // back at nominal: no pin
+    // The #276 forfeit served its purpose — the session is back at the nominal
+    // (which is never pinned); let ordinary dwell apply on a future re-arm.
+    dwellYieldTombstones.get(role)?.delete(sessionKey);
   }
   return resolved;
 }
@@ -1699,6 +1808,7 @@ export function resetFailoverForTests(env?: NodeJS.ProcessEnv): void {
     nominalRefusals.clear();
     armTtlEscalation.clear();
     dwellPins.clear();
+    dwellYieldTombstones.clear();
     roleNominalResolver = null;
     armAfterRefusals = 2;
     armGraceMs = 0;
