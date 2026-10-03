@@ -25,7 +25,12 @@
 
 export function overflowReportFloor(): number {
   const raw = process.env.CLAUDISH_OVERFLOW_REPORT_FLOOR;
-  if (raw === undefined) return 280_000;
+  // "" ≡ unset (#310 review): compose injects every listed name as "" by
+  // default, and Number("") === 0 — finite, >= 0 — so an empty value would
+  // sail past the guard below and read as 0, the documented *disable* value:
+  // every recreated container would silently turn the floor off. Trim also
+  // covers whitespace-only values from hand-edited .env files.
+  if (raw === undefined || raw.trim() === "") return 280_000;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return 280_000;
   return Math.floor(n);
