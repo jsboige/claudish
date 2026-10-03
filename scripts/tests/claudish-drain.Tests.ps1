@@ -466,3 +466,35 @@ Describe 'Invoke-ClaudishDrainedRestart — compose stderr and deployed-image at
         $offenders | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture (#306)' {
+    It 'with consent: arms before the gesture, clears in finally, logs the window' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        $freezeHome = Join-Path $TestDrive 'freeze-home'
+        New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-consent' -Url 'http://127.0.0.1:1' -FreezeClaudishHome $freezeHome
+        $r | Should -BeTrue
+        # The finally ALWAYS clears the flag — a flag surviving the run is a
+        # machine refusing admissions with no drain running.
+        Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
+        # And the arm is attested: the FREEZE line only logs when the flag was
+        # actually written ($DrainFreezeArmed), never unconditionally.
+        (Get-DrainLogText) | Should -Match 'FREEZE \(freeze-consent\): admissions frozen .+ — flag cleared'
+    }
+
+    It 'without consent (the default everywhere): no flag, no FREEZE line, restart unaffected' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        $freezeHome = Join-Path $TestDrive 'noconsent-home'
+        New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-noconsent' -Url 'http://127.0.0.1:1' -FreezeClaudishHome $freezeHome
+        $r | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
+        (Get-DrainLogText) | Should -Not -Match 'FREEZE \('
+        (Get-DrainLogText) | Should -Match 'OUTCOME success'
+    }
+}

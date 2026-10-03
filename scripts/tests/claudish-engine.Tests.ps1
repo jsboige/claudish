@@ -199,6 +199,62 @@ Describe 'Test-WedgeWatchOptIn' {
     }
 }
 
+Describe 'Enable/Disable-DrainAdmissionFreeze (#306: the drain admission-freeze flag)' {
+    It 'writes NO flag and returns $false without consent (default OFF everywhere)' {
+        Enable-DrainAdmissionFreeze -ClaudishHome $TestDrive | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $TestDrive 'drain-freeze') | Should -BeFalse
+    }
+
+    It 'writes NO flag on an empty or wrong-content consent file' {
+        Set-Content -Path (Join-Path $TestDrive 'drain-freeze.enabled') -Value '' -NoNewline
+        Enable-DrainAdmissionFreeze -ClaudishHome $TestDrive | Should -BeFalse
+        Set-Content -Path (Join-Path $TestDrive 'drain-freeze.enabled') -Value 'yes please'
+        Enable-DrainAdmissionFreeze -ClaudishHome $TestDrive | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $TestDrive 'drain-freeze') | Should -BeFalse
+    }
+
+    It 'writes the flag on the literal token — content a human can read (timestamp)' {
+        Set-Content -Path (Join-Path $TestDrive 'drain-freeze.enabled') -Value (Get-ClaudishOptInToken)
+        Enable-DrainAdmissionFreeze -ClaudishHome $TestDrive | Should -BeTrue
+        $flag = Join-Path $TestDrive 'drain-freeze'
+        Test-Path -LiteralPath $flag | Should -BeTrue
+        # The proxy reads the MTIME, not the bytes; the bytes are for the
+        # operator reading the directory. ISO 8601 round-trips on both.
+        [datetime]::Parse([System.IO.File]::ReadAllText($flag), [Globalization.CultureInfo]::InvariantCulture) |
+            Should -BeOfType [datetime]
+    }
+
+    It 'Disable removes the flag and is idempotent when it is already gone' {
+        Set-Content -Path (Join-Path $TestDrive 'drain-freeze.enabled') -Value (Get-ClaudishOptInToken)
+        Enable-DrainAdmissionFreeze -ClaudishHome $TestDrive | Should -BeTrue
+        Disable-DrainAdmissionFreeze -ClaudishHome $TestDrive
+        Test-Path -LiteralPath (Join-Path $TestDrive 'drain-freeze') | Should -BeFalse
+        { Disable-DrainAdmissionFreeze -ClaudishHome $TestDrive } | Should -Not -Throw
+    }
+
+    It 'REGRESSION: the freeze consent is NOT the wedge-watch consent nor the relaunch preflight one' {
+        # #188 rule, third instance: three distinct gestures, three distinct
+        # files — one consent must never silently carry another. Written
+        # against the real file names so a "let's reuse wedge-watch.enabled"
+        # refactor goes red here.
+        $drive = Join-Path $TestDrive ([guid]::NewGuid().ToString('n'))
+        New-Item -ItemType Directory -Path $drive -Force | Out-Null
+
+        Set-Content -Path (Join-Path $drive (Get-ClaudishOptInFileName)) -Value 'enabled'
+        Enable-DrainAdmissionFreeze -ClaudishHome $drive | Should -BeFalse
+        Remove-Item (Join-Path $drive (Get-ClaudishOptInFileName)) -Force
+
+        Set-Content -Path (Join-Path $drive (Get-RelaunchPreflightOptInFileName)) -Value 'enabled'
+        Enable-DrainAdmissionFreeze -ClaudishHome $drive | Should -BeFalse
+        Remove-Item (Join-Path $drive (Get-RelaunchPreflightOptInFileName)) -Force
+
+        Set-Content -Path (Join-Path $drive 'drain-freeze.enabled') -Value 'enabled'
+        Test-WedgeWatchOptIn -ClaudishHome $drive | Should -BeFalse
+        Test-RelaunchPreflightOptIn -ClaudishHome $drive | Should -BeFalse
+        Enable-DrainAdmissionFreeze -ClaudishHome $drive | Should -BeTrue
+    }
+}
+
 Describe 'ConvertFrom-QuserOutput / Get-InteractiveUserId' {
     It 'REGRESSION (locale): parses the FRENCH quser output captured on the hub' {
         # Verbatim from po-2025, 2026-09-20. A parser keying on the word

@@ -289,6 +289,10 @@ function Invoke-ClaudishDrainedRestartImpl {
         # Interpolation env file for `docker compose up -d` ($Recreate only).
         [string]$EnvFile = "",
         [string]$ComposeDir = (Split-Path -Parent $PSScriptRoot),
+        # #306 — home for the admission-freeze flag; same dynamic-default
+        # pattern as $Container/$Url above (the watchdog restores the script
+        # param around its dot-source precisely so these read right).
+        [string]$FreezeClaudishHome = $ClaudishHome,
         # #233 AC2 — auto-remove leftover Created-state compose twins instead
         # of refusing. Never removes a twin that ever ran.
         [switch]$RemoveCreatedTwins
@@ -485,6 +489,14 @@ function Invoke-ClaudishDrainedRestartImpl {
         $scriptDelayMs = [int](($preRestartAt - $decisionAt).TotalMilliseconds)
         Write-DrainLog "RESTART ($Reason): decision->action ${scriptDelayMs}ms; streams at decision $decisionCount, at action $($preRestartCount)"
     }
+    # #306 — opt-in admission freeze for the gesture window: new admissions
+    # get 503 + Retry-After from the proxy while the restart runs. Consent-
+    # gated (drain-freeze.enabled, token 'enabled'): a machine that never
+    # opted in freezes nothing. Cleared by the WRAPPER's finally on every
+    # exit; the proxy's own 900 s mtime expiry is the crashed-drain backstop.
+    $script:DrainFreezeArmed = Enable-DrainAdmissionFreeze -ClaudishHome $FreezeClaudishHome
+    if ($script:DrainFreezeArmed) { $script:DrainFreezeAt = Get-Date }
+
     $restartAt = Get-Date
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
     # governs how long Docker waits between SIGTERM and SIGKILL, and without it
@@ -589,14 +601,30 @@ function Invoke-ClaudishDrainedRestart {
         [switch]$Recreate,
         [string]$EnvFile = "",
         [string]$ComposeDir = (Split-Path -Parent $PSScriptRoot),
+        [string]$FreezeClaudishHome = $ClaudishHome,
         [switch]$RemoveCreatedTwins
     )
+    # #306 — armed by the impl right before its gesture; cleared HERE on every
+    # exit (success, failure, exception), so a crashed run cannot outlive its
+    # own flag (the proxy's 900 s mtime expiry is the belt to these
+    # suspenders). One drain.log line per frozen run, window included.
+    $script:DrainFreezeArmed = $false
+    $script:DrainFreezeAt = $null
     try {
         return Invoke-ClaudishDrainedRestartImpl @PSBoundParameters
     } catch {
         Write-DrainLog "RESTART ($Reason): EXCEPTION — $($_.Exception.Message)"
         Write-DrainOutcome "exception" "${Reason}: $($_.Exception.GetType().Name)"
         return $false
+    } finally {
+        if ($script:DrainFreezeArmed) {
+            $null = Disable-DrainAdmissionFreeze -ClaudishHome $FreezeClaudishHome
+            $end = Get-Date
+            $secs = if ($null -ne $script:DrainFreezeAt) { [int](($end - $script:DrainFreezeAt).TotalSeconds) } else { -1 }
+            Write-DrainLog "FREEZE ($Reason): admissions frozen $($script:DrainFreezeAt.ToString('HH:mm:ss')) -> $($end.ToString('HH:mm:ss')) (${secs}s) — flag cleared"
+        }
+        $script:DrainFreezeArmed = $false
+        $script:DrainFreezeAt = $null
     }
 }
 
