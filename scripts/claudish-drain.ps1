@@ -249,6 +249,30 @@ function Get-ClaudishActiveStreams {
     }
 }
 
+function Get-DrainFreezeProxyState {
+    <#
+        #306 review (ai-01, 03/10) — the FREEZE line must attest what the
+        PROXY saw, not what the drain wrote. The drain writes the flag in its
+        own ClaudishHome; the proxy reads it in homedir()/.claudish, which in
+        a container is the bind mount of CLAUDISH_CONFIG_DIR — three
+        independent settings decide whether those are the same directory, and
+        a VM clock skew can expire a fresh flag on sight. /health now carries
+        admissionFreeze ("flag" | "no-consent" | "no-flag" | "expired"); this
+        probe returns it, or $null when the proxy cannot answer (pre-#306
+        image, or /health down) — $null means "not honored", never "unknown,
+        assume fine".
+    #>
+    param([string]$Url = $ProxyUrl)
+    try {
+        $r = Invoke-WebRequest -Uri "$Url/health" -TimeoutSec 5 -UseBasicParsing
+        $j = $r.Content | ConvertFrom-Json
+        if ($null -eq $j.admissionFreeze) { return $null }
+        return [string]$j.admissionFreeze
+    } catch {
+        return $null
+    }
+}
+
 function Invoke-ClaudishDrainedRestartImpl {
     <#
         Restarts the container at the quietest moment it can find.
@@ -495,7 +519,26 @@ function Invoke-ClaudishDrainedRestartImpl {
     # opted in freezes nothing. Cleared by the WRAPPER's finally on every
     # exit; the proxy's own 900 s mtime expiry is the crashed-drain backstop.
     $script:DrainFreezeArmed = Enable-DrainAdmissionFreeze -ClaudishHome $FreezeClaudishHome
-    if ($script:DrainFreezeArmed) { $script:DrainFreezeAt = Get-Date }
+    $script:DrainFreezeConfirmed = $false
+    if ($script:DrainFreezeArmed) {
+        $script:DrainFreezeAt = Get-Date
+        # #306 review — the FREEZE line must attest what the PROXY saw. The
+        # flag we wrote lives in the drain's home; the proxy reads it through
+        # the container's mount, and the two can differ (three independent
+        # settings) or a VM clock skew can expire the flag on sight. Ask the
+        # proxy itself, once, right here: on "flag" the window below is real;
+        # anything else is recorded as NOT HONORED and the gesture carries on
+        # unfrozen — exactly as today without consent. Never abort the restart
+        # over it: an unfrozen restart is the status quo ante, not an outage.
+        $proxyFreezeState = Get-DrainFreezeProxyState -Url $Url
+        if ($proxyFreezeState -eq 'flag') {
+            $script:DrainFreezeConfirmed = $true
+            Write-DrainLog "FREEZE armed — proxy confirms"
+        } else {
+            $shown = if ($null -ne $proxyFreezeState) { $proxyFreezeState } else { 'no-signal' }
+            Write-DrainLog "FREEZE NOT HONORED (proxy=$shown) — drain home and container mount differ?"
+        }
+    }
 
     $restartAt = Get-Date
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
@@ -607,8 +650,12 @@ function Invoke-ClaudishDrainedRestart {
     # #306 — armed by the impl right before its gesture; cleared HERE on every
     # exit (success, failure, exception), so a crashed run cannot outlive its
     # own flag (the proxy's 900 s mtime expiry is the belt to these
-    # suspenders). One drain.log line per frozen run, window included.
+    # suspenders). The window line is emitted ONLY when the proxy confirmed
+    # the freeze (review 03/10): an unconfirmed arm already logged NOT HONORED
+    # — a window line for a freeze nobody enforced would blame the turns cut
+    # in that window on bad luck instead of on the instrument.
     $script:DrainFreezeArmed = $false
+    $script:DrainFreezeConfirmed = $false
     $script:DrainFreezeAt = $null
     try {
         return Invoke-ClaudishDrainedRestartImpl @PSBoundParameters
@@ -620,10 +667,13 @@ function Invoke-ClaudishDrainedRestart {
         if ($script:DrainFreezeArmed) {
             $null = Disable-DrainAdmissionFreeze -ClaudishHome $FreezeClaudishHome
             $end = Get-Date
-            $secs = if ($null -ne $script:DrainFreezeAt) { [int](($end - $script:DrainFreezeAt).TotalSeconds) } else { -1 }
-            Write-DrainLog "FREEZE ($Reason): admissions frozen $($script:DrainFreezeAt.ToString('HH:mm:ss')) -> $($end.ToString('HH:mm:ss')) (${secs}s) — flag cleared"
+            if ($script:DrainFreezeConfirmed) {
+                $secs = if ($null -ne $script:DrainFreezeAt) { [int](($end - $script:DrainFreezeAt).TotalSeconds) } else { -1 }
+                Write-DrainLog "FREEZE ($Reason): admissions frozen $($script:DrainFreezeAt.ToString('HH:mm:ss')) -> $($end.ToString('HH:mm:ss')) (${secs}s) — flag cleared"
+            }
         }
         $script:DrainFreezeArmed = $false
+        $script:DrainFreezeConfirmed = $false
         $script:DrainFreezeAt = $null
     }
 }

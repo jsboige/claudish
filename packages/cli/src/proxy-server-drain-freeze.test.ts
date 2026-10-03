@@ -210,12 +210,41 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     expect(res.status).toBe(200);
   });
 
-  test("/health is NOT gated — the drain keeps polling through the freeze", async () => {
+  test("/health is NOT gated — and it REPORTS the freeze state (drain's confirmation channel)", async () => {
     writeConsent();
     writeFlag();
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
     expect(res.status).toBe(200);
+    const body: any = await res.json();
+    expect(body.admissionFreeze).toBe("flag");
+    // And the unfrozen reason is observable too — the drain distinguishes
+    // "no-consent" (home/mount mismatch) from "expired" (VM clock skew) from it.
+    rmSync(FLAG_PATH);
+    const res2 = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    const body2: any = await res2.json();
+    expect(body2.admissionFreeze).toBe("no-flag");
+  });
+
+  test("default /health reports no-consent when nothing is set up", async () => {
+    await spin();
+    const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    const body: any = await res.json();
+    expect(body.admissionFreeze).toBe("no-consent");
+  });
+
+  test("count_tokens freezes too — no counting for a message that cannot be admitted (review: asymmetry)", async () => {
+    writeConsent();
+    writeFlag();
+    await spin();
+    const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: INBOUND_HEADERS,
+      body: JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: "ok" }] }),
+    });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("retry-after")).toBe("15");
+    expect(anthropicCalls).toBe(0);
   });
 
   test("OpenAI ingress freezes too: /v1/chat/completions gets the same 503", async () => {

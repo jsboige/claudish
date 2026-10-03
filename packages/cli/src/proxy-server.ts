@@ -1366,6 +1366,10 @@ export async function createProxyServer(
         role,
         upstream,
         instanceId: getInstanceId(),
+        // #306 review — the drain reads THIS to confirm the proxy actually
+        // sees its flag (drain home vs container mount can differ; a VM clock
+        // skew can expire a fresh flag). The reason, never the flag content.
+        admissionFreeze: admissionFreezeState().reason,
         ...(options.relay ? { selfLoop: options.relay.selfLoop } : {}),
       },
       stalled ? 503 : 200
@@ -1376,6 +1380,12 @@ export async function createProxyServer(
   app.post("/v1/messages/count_tokens", async (c) => {
     try {
       const body = await c.req.json();
+      // #306 review — same admission freeze as the serving routes: messages
+      // are refused during the window, so counting for a message that can no
+      // longer be admitted is the asymmetry po-2024 flagged. Same 503 +
+      // Retry-After, in-flight streams untouched.
+      const freeze = drainFreezeGate();
+      if (freeze) return freeze;
       if (typeof body?.model !== "string" || body.model.length === 0) {
         return c.json(
           wrapAnthropicError(400, "missing required field: model"),

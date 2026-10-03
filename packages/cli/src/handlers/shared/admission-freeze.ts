@@ -27,10 +27,15 @@
  *
  * Safety expiry: a drain killed mid-gesture would leave the flag behind and
  * freeze admissions forever. The proxy ignores any flag older than
- * DRAIN_FREEZE_MAX_AGE_MS — 900 s covers the drain's own worst case
- * (MaxWaitSec 600 s + compose ~124 s ≈ 724 s) with margin, so a live drain's
- * flag is always honored and a dead one's expires on its own. The drain also
- * clears the flag in a finally block; the expiry is the belt to that.
+ * DRAIN_FREEZE_MAX_AGE_MS — the flag is posed AFTER the drain's wait, so the
+ * bound only needs to cover the gesture itself (docker stop 120 s + compose
+ * ~124 s ≈ 244 s worst case); 900 s keeps ~3.7× margin over that while
+ * staying far below any plausible legitimate restart interval (review 03/10:
+ * the earlier "MaxWaitSec + gesture" arithmetic double-counted the wait,
+ * which has already happened by the time the flag exists). The drain also
+ * clears the flag in a finally block — but only logs a freeze window the
+ * PROXY confirmed via /health (drain home and container mount can differ);
+ * the expiry is the belt to all of that.
  *
  * Deliberately a leaf module with NO env var: every CLAUDE/CLAUDISH_* name
  * the code reads must also reach the containers (compose coverage, #310/#311)
