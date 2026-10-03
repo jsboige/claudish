@@ -1194,15 +1194,9 @@ export async function createProxyServer(
         // blip costs one short skip of a step that has a live successor — whereas not
         // marking makes every subsequent request re-pay the round-trip (and its
         // timeout) to a step that may be down for hours. Any success resets the count.
-        // The nonQuota flag (#276) is what keeps a dwell-pinned session from being
-        // re-pinned DEEPER by this advance: the step is broken, not walled, so the
-        // session's dwell is forfeited (it rejoins the general resolution each
-        // request) instead of riding this step's successor past a recovered nominal.
-        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody), { nonQuota: true });
+        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody));
         if (delegation && !delegation.owner.nominal) {
-          markStepFailed(delegation.owner.role, delegation.owner.stepIndex, why, parseResetAtFromBody(errBody), {
-            nonQuota: true,
-          });
+          markStepFailed(delegation.owner.role, delegation.owner.stepIndex, why, parseResetAtFromBody(errBody));
         }
         continue;
       }
@@ -1514,7 +1508,18 @@ export async function createProxyServer(
       }),
       {
         status: 503,
-        headers: { "content-type": "application/json", "retry-after": "15" },
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "15",
+          // #318 — marks this 503 as OUR deliberate drain window. A relaying
+          // sidecar treats an unmarked 503 as a hub failure (markFail + local
+          // replay, #299 A's rationale); the marker lets it pass this one
+          // through like a 4xx instead. Explicit header, not body sniffing:
+          // real provider overloads emit an Anthropic-shaped overloaded_error
+          // body too. Never stripped on the hub→relay response path (#282's
+          // x-claudish-* strip is native-lane-toward-Anthropic only).
+          "x-claudish-drain-freeze": "1",
+        },
       }
     );
   };
