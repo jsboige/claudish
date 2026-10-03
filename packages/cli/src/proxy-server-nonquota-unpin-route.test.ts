@@ -34,7 +34,12 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
-import { resetFailoverForTests, setRoleNominalResolver } from "./fork/failover.js";
+import {
+  armFailover,
+  classifyNominalBucket,
+  resetFailoverForTests,
+  setRoleNominalResolver,
+} from "./fork/failover.js";
 import type { ProxyServer } from "./types.js";
 
 // Distinct range from the other in-process route tests (19700+, 19851/19951,
@@ -150,18 +155,39 @@ function resetCascade(): void {
   setRoleNominalResolver((r) => nominals[r]);
 }
 
+/** The Md (review) env: opus is config-armed with a DELEGATED first step —
+ * role:sonnet — and or-ep as its own second step, so a non-quota death of the
+ * delegated step is INTERMEDIATE in opus (a 1-step opus would surface before
+ * any markStepFailed, delegation included). */
+function resetDelegated(): void {
+  resetFailoverForTests({
+    ...CASCADE_ENV,
+    CLAUDISH_FAILOVER_OPUS: "role:sonnet>or-ep@fake-or",
+    CLAUDISH_FAILOVER_ACTIVE: "opus",
+  });
+  const nominals: Record<string, string | undefined> = { sonnet: SONNET_NOMINAL };
+  setRoleNominalResolver((r) => nominals[r]);
+}
+
 const SESSION_ID = "route-sess-276";
 
-async function postMessage(): Promise<Response> {
+/** The sonnet nominal's bucket (#275 request-side derivation, as the route does). */
+const bucketOfNominal = () => {
+  const nb = classifyNominalBucket(SONNET_NOMINAL, () => false);
+  if (!("bucket" in nb)) throw new Error("route test: custom-endpoint nominal must classify to a bucket");
+  return nb.bucket;
+};
+
+async function postMessage(model = "claude-sonnet-5", sessionId = SESSION_ID): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
     body: JSON.stringify({
-      model: "claude-sonnet-5",
+      model,
       max_tokens: 64,
       stream: false,
       // The per-session dwell key (#91 point 4) — one conversation across R1-R3.
-      metadata: { user_id: JSON.stringify({ session_id: SESSION_ID }) },
+      metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
       messages: [{ role: "user", content: "say hi" }],
     }),
   });
@@ -169,20 +195,19 @@ async function postMessage(): Promise<Response> {
 
 /** Advance the wall (and only the wall — the 1 h pin/tombstone survives)
  * past its 10-min TTL: the lazy expiry drops on the next read. */
-async function pastWallExpiry(): Promise<void> {
+async function pastWallExpiry(model = "claude-sonnet-5", sessionId = SESSION_ID): Promise<Response> {
   const realNow = Date.now;
   const at = realNow();
   Date.now = () => at + 11 * 60 * 1000;
   try {
-    const r = await postMessage();
-    expect(r.status).toBe(200);
+    return await postMessage(model, sessionId);
   } finally {
     Date.now = realNow;
   }
 }
 
 beforeEach(() => {
-  calls = { nm: 0, s0: 0, s1: 0 };
+  calls = { nm: 0, s0: 0, s1: 0, or: 0 };
   failoverLog = [];
   wallEndpoints = new Set(["nm"]);
   nonQuotaEndpoints = new Set();
@@ -203,6 +228,7 @@ beforeEach(() => {
         "nom-ep": ep("nm"),
         "s0-ep": ep("s0"),
         "s1-ep": ep("s1"),
+        "or-ep": ep("or"),
       },
     }),
     "utf-8"
@@ -351,5 +377,53 @@ describe("#276 — non-quota step death does not deepen the dwell pin", () => {
     expect(calls.s0).toBe(3); // R1 + R2 + R3 — the pin held s0 throughout
     expect(calls.nm).toBe(1); // never re-paid while walled
     expect(failoverLog.some((l) => l.includes("died non-quota"))).toBe(false);
+  }, 30_000);
+
+  // Md (review of #316): the delegation.owner markStepFailed line. A non-quota
+  // death seen through DELEGATED traffic must mark the OWNER's step non-quota,
+  // or the #276 defect replays on the owner role: sessions pinned directly on
+  // the owner's step get re-pinned deeper instead of forfeiting. Mutation: drop
+  // `{ nonQuota: true }` from the delegation.owner call ⇒ the sonnet[0] log line
+  // reads "walled", R3 re-pins s1, and R4 serves s1 again instead of the nominal.
+  test("Md: a delegated non-quota death marks the OWNER's step non-quota — the owner's pinned session forfeits, never re-pins deeper", async () => {
+    await spin();
+    resetDelegated();
+    // Pre-wall sonnet's nominal bucket (S2-style) — sonnet walks to s0.
+    armFailover("sonnet", "test: sonnet nominal walled", bucketOfNominal());
+
+    // R1: a sonnet session dwells on sonnet[0] (s0).
+    const r1 = await postMessage("claude-sonnet-5", "sess-owner");
+    expect(r1.status).toBe(200);
+    expect(calls.s0).toBe(1);
+
+    // R2: an opus request (config-armed, step 0 = role:sonnet) is delegated
+    // into sonnet's walk → s0 dies NON-quota. opus[0] is intermediate, so the
+    // loop marks BOTH sides — opus[0] and, via delegation.owner, sonnet[0]
+    // NON-QUOTA — then fail-forwards to opus[1] (or-ep; the delegated step is
+    // backoffed, so the opus walk skips it).
+    nonQuotaEndpoints.add("s0");
+    const r2 = await postMessage("claude-opus-5", "sess-del");
+    expect(r2.status).toBe(200);
+    expect(calls.s0).toBe(2);
+    expect(calls.or).toBe(1);
+    expect(failoverLog.some((l) => l.includes("step sonnet[0]") && l.includes("failed (non-quota)"))).toBe(true);
+
+    // R3: s0 healthy again. The sonnet session's next resolution sees its pin
+    // on the dead step → FORFEIT (serves s1 UNPINNED, marker fires).
+    nonQuotaEndpoints.delete("s0");
+    const r3 = await postMessage("claude-sonnet-5", "sess-owner");
+    expect(r3.status).toBe(200);
+    expect(calls.s1).toBe(1);
+    expect(failoverLog.some((l) => l.includes("DWELL sonnet session") && l.includes("died non-quota"))).toBe(true);
+
+    // R4: the wall lapses (the pre-wall never cost nm a fetch — R1 went
+    // straight to s0); the nominal is healthy from here. Unpinned, the owner's
+    // session returns to it. Under the Md mutation, R3's resolution re-pinned
+    // s1 (the plain fall-through) and R4 would serve s1 again — s1=2, nm=0.
+    wallEndpoints.delete("nm");
+    const r4 = await pastWallExpiry("claude-sonnet-5", "sess-owner");
+    expect(r4.status).toBe(200);
+    expect(calls.nm).toBe(1);
+    expect(calls.s1).toBe(1);
   }, 30_000);
 });

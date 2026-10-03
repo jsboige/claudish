@@ -836,6 +836,9 @@ const nominalRecoveredAt = new Map<string, number>();
 const dwellYieldTombstones = new Map<FailoverRole, Map<string, number>>();
 /** Prune guard so the pin map cannot grow without bound across a long uptime. */
 const DWELL_PINS_MAX = 512;
+/** Same guard for the #276 forfeit map (review of #316). Exported for the
+ * cap test so the constant cannot drift from its assertion. */
+export const DWELL_TOMBSTONES_MAX = 512;
 
 function pruneDwellPins(role: FailoverRole): void {
   const pins = dwellPins.get(role);
@@ -869,6 +872,12 @@ export function getSessionDwellPinForTests(
   const pin = dwellPins.get(role)?.get(sessionKey);
   if (!pin || pin.until <= Date.now()) return null;
   return { ...pin };
+}
+
+/** Test seam (#276, review of #316): entries currently held in the forfeit
+ * map — proves the DWELL_TOMBSTONES_MAX lapsed-entry sweep. */
+export function getDwellYieldTombstoneCountForTests(role: FailoverRole): number {
+  return dwellYieldTombstones.get(role)?.size ?? 0;
 }
 
 /**
@@ -975,6 +984,17 @@ export function resolveFailoverTargetForSession(
     // request until the forfeit lapses — nominal the moment the wall is gone.
     pins?.delete(sessionKey);
     const tombs = dwellYieldTombstones.get(role) ?? new Map();
+    // Bounded like DWELL_PINS_MAX (review of #316): an entry otherwise leaves
+    // only when its OWN session resolves again, so a conversation that ends
+    // right after its forfeit leaves its entry for the process lifetime. Lapsed
+    // entries are dropped on this write; live forfeits are never evicted (the
+    // temporary over-cap is bounded by one dwell window, same as the pin map's
+    // oldest-excess pass tolerates).
+    if (tombs.size >= DWELL_TOMBSTONES_MAX) {
+      for (const [k, until] of tombs) {
+        if (until <= now) tombs.delete(k);
+      }
+    }
     tombs.set(sessionKey, now + dwell);
     dwellYieldTombstones.set(role, tombs);
     logStderr(
