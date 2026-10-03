@@ -258,15 +258,20 @@ function Get-DrainFreezeProxyState {
         independent settings decide whether those are the same directory, and
         a VM clock skew can expire a fresh flag on sight. /health now carries
         admissionFreeze ("flag" | "no-consent" | "no-flag" | "expired"); this
-        probe returns it, or $null when the proxy cannot answer (pre-#306
-        image, or /health down) — $null means "not honored", never "unknown,
-        assume fine".
+        probe returns it, or $null when the proxy cannot answer (/health
+        down, non-JSON) — $null means "not honored", never "unknown, assume
+        fine". A proxy that ANSWERS but carries no admissionFreeze field is
+        a pre-#306 image and gets its own token "absent": that is the shape
+        the first freeze-capable -Recreate meets on every machine, because
+        it probes the container it is about to replace (review 03/10, D3 —
+        reading the absent field as "flag" must turn a test red, it was the
+        false-attestation vector of the first deploy).
     #>
     param([string]$Url = $ProxyUrl)
     try {
         $r = Invoke-WebRequest -Uri "$Url/health" -TimeoutSec 5 -UseBasicParsing
         $j = $r.Content | ConvertFrom-Json
-        if ($null -eq $j.admissionFreeze) { return $null }
+        if ($null -eq $j.PSObject.Properties['admissionFreeze']) { return 'absent' }
         return [string]$j.admissionFreeze
     } catch {
         return $null
@@ -536,7 +541,11 @@ function Invoke-ClaudishDrainedRestartImpl {
             Write-DrainLog "FREEZE armed — proxy confirms"
         } else {
             $shown = if ($null -ne $proxyFreezeState) { $proxyFreezeState } else { 'no-signal' }
-            Write-DrainLog "FREEZE NOT HONORED (proxy=$shown) — drain home and container mount differ?"
+            # absent = the proxy ANSWERED but publishes no admissionFreeze —
+            # a pre-#306 image, i.e. the very first freeze-capable recreate
+            # on each machine. Mount mismatch is not the suspect there.
+            $hint = if ($shown -eq 'absent') { 'proxy predates #306 — freeze takes effect on the NEXT deploy' } else { 'drain home and container mount differ?' }
+            Write-DrainLog "FREEZE NOT HONORED (proxy=$shown) — $hint"
         }
     }
 

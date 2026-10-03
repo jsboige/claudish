@@ -477,6 +477,9 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
     # same trap).
     BeforeAll {
         function New-FakeProxyHealth {
+            # AdmissionFreeze 'omit' serves the /health of a PRE-#306 image:
+            # JSON answers, but no admissionFreeze field at all — the shape the
+            # first freeze-capable -Recreate probes on every machine (review D3).
             param([string]$AdmissionFreeze)
             $job = Start-Job -ScriptBlock {
                 param($state)
@@ -486,7 +489,7 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
                 try {
                     while ($l.IsListening) {
                         $ctx = $l.GetContext()
-                        $body = ('{"status":"ok","activeStreams":0,"admissionFreeze":"' + $state + '"}')
+                        $body = if ($state -eq 'omit') { '{"status":"ok","activeStreams":0}' } else { ('{"status":"ok","activeStreams":0,"admissionFreeze":"' + $state + '"}') }
                         $buf = [System.Text.Encoding]::UTF8.GetBytes($body)
                         $ctx.Response.ContentType = 'application/json'
                         $ctx.Response.ContentLength64 = $buf.Length
@@ -562,6 +565,30 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
         $log = Get-DrainLogText
         $log | Should -Match 'FREEZE NOT HONORED \(proxy=no-signal\)'
         $log | Should -Not -Match 'admissions frozen'
+    }
+
+    It 'proxy ANSWERS but carries no admissionFreeze field (pre-#306 image, first deploy): NOT HONORED (absent), no window line (review D3)' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", [System.Text.Encoding]::ASCII)
+        $freezeHome = Join-Path $TestDrive 'absent-home'
+        New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
+        $job = New-FakeProxyHealth -AdmissionFreeze 'omit'
+        try {
+            # The shape every machine meets exactly once: the -Recreate that
+            # deploys #306 probes the container it is about to replace —
+            # pre-#306 by definition, so /health answers WITHOUT the field.
+            # Reading that absence as "flag" (mutation D3) would re-arm the
+            # false attestation on the very first run an operator reads.
+            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-absent' -Url 'http://127.0.0.1:19937' -FreezeClaudishHome $freezeHome
+            $r | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
+            $log = Get-DrainLogText
+            $log | Should -Match 'FREEZE NOT HONORED \(proxy=absent\) — proxy predates #306 — freeze takes effect on the NEXT deploy'
+            $log | Should -Not -Match 'FREEZE armed'
+            $log | Should -Not -Match 'admissions frozen'
+            $log | Should -Match 'OUTCOME success'
+        } finally { Remove-FakeProxyHealth $job }
     }
 
     It 'without consent (the default everywhere): no flag, no FREEZE line, restart unaffected' {
