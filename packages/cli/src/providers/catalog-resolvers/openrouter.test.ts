@@ -8,7 +8,7 @@ import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
 
 // We need to test the resolver's resolveSync logic with controlled cache state.
 // The resolver uses module-level _memCache, so we import the class and inject test data.
-import { OpenRouterCatalogResolver, setMemCatalogForTests } from "./openrouter.js";
+import { OpenRouterCatalogResolver, setMemCatalogForTests, firebaseCatalogUrl } from "./openrouter.js";
 import type { SlimModelEntry } from "../all-models-cache.js";
 
 // Helper: create a slim catalog entry
@@ -557,5 +557,37 @@ describe("OpenRouterCatalogResolver.refreshCatalog — catalog contract v3 (#222
     expect(entries[1].sources).toEqual({});
     expect(() => resolver.resolveSync("future-contract")).not.toThrow();
     expect(resolver.resolveSync("legacy-1")).toBe("v/legacy-1");
+  });
+});
+
+describe("firebaseCatalogUrl — empty overrides fall through (#310 review)", () => {
+  // compose injects CLAUDISH_CATALOG_URL as "" (the ${VAR:-} default); the
+  // documented default URL must win, not "" — the pre-fix ?? chain fetched ""
+  // on every recreated container and refreshCatalog failed as fetch_failed.
+  const A = "CLAUDISH_CATALOG_URL";
+  const B = "FIREBASE_CATALOG_URL";
+  const DEFAULT = "https://us-central1-claudish-6da10.cloudfunctions.net/queryModels?status=active&catalog=slim&limit=1000";
+
+  afterEach(() => {
+    delete process.env[A];
+    delete process.env[B];
+  });
+
+  test("unset → the cloudfunctions default", () => {
+    expect(firebaseCatalogUrl()).toBe(DEFAULT);
+  });
+
+  test('"" (compose default) → the default, never ""', () => {
+    process.env[A] = "";
+    expect(firebaseCatalogUrl()).toBe(DEFAULT);
+    process.env[B] = "";
+    expect(firebaseCatalogUrl()).toBe(DEFAULT);
+  });
+
+  test("explicit values win in documented order", () => {
+    process.env[B] = "http://alias.example/cat";
+    expect(firebaseCatalogUrl()).toBe("http://alias.example/cat");
+    process.env[A] = "http://preferred.example/cat";
+    expect(firebaseCatalogUrl()).toBe("http://preferred.example/cat");
   });
 });

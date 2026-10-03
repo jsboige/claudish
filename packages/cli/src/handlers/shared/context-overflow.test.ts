@@ -156,6 +156,17 @@ describe("overflowReportFloor / overflowReportedTokens", () => {
     expect(overflowReportFloor()).toBe(280_000);
   });
 
+  it('reads "" as unset — the floor survives compose\'s empty default (#310 review)', () => {
+    // compose injects every listed name as "" (the ${VAR:-} default); "" must
+    // behave like unset, never like 0 (the documented disable value) — the
+    // naive parse gives Number("") === 0, silently turning the floor off on
+    // every recreated container.
+    process.env[KEY] = "";
+    expect(overflowReportFloor()).toBe(280_000);
+    process.env[KEY] = "   ";
+    expect(overflowReportFloor()).toBe(280_000);
+  });
+
   it("reports the max of body-used, estimate and floor", () => {
     expect(overflowReportedTokens(310_000, 200_000, 280_000)).toBe(310_000);
     expect(overflowReportedTokens(undefined, 150_000, 280_000)).toBe(280_000);

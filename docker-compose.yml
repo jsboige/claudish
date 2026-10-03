@@ -136,6 +136,45 @@ services:
       - CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS=${CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS:-}
       - CLAUDISH_FAILOVER_SESSION_DWELL_MS=${CLAUDISH_FAILOVER_SESSION_DWELL_MS:-}
       - CLAUDISH_FAILOVER_RECOVERY_GRACE_MS=${CLAUDISH_FAILOVER_RECOVERY_GRACE_MS:-}
+      # #310 — runtime knobs the proxy reads that were never in this list
+      # (same absence class as the #304 failover knobs above: the env file only
+      # interpolates, so a value set for a name this list does not carry never
+      # reached a container). NOTE: ${VAR:-} makes each name PRESENT with value
+      # "" — every read site was verified for "" ≡ unset (review #310): 20 held
+      # by construction, 2 were fixed in that review (OVERFLOW_REPORT_FLOOR,
+      # CATALOG_URL), and compose-env-coverage.test.ts now refuses a
+      # `?? <non-empty>` read on any name this list injects. Explicit exemption
+      # list there for CLI-only names (CLAUDISH_MODEL, CLAUDISH_HOST,
+      # CLAUDISH_MCP_TOOLS, the statusline pair, the launcher TTL,
+      # CLAUDISH_TEST_*).
+      # Never-hang & recovery bounds. Re-read per request/stream INSIDE the
+      # process; a NEW value enters a container only at its next recreate.
+      - CLAUDISH_FIRST_EVENT_TIMEOUT_MS=${CLAUDISH_FIRST_EVENT_TIMEOUT_MS:-}
+      - CLAUDISH_PREVISIBLE_REFORWARD_MAX=${CLAUDISH_PREVISIBLE_REFORWARD_MAX:-}
+      - CLAUDISH_CONNECT_RETRY_MAX=${CLAUDISH_CONNECT_RETRY_MAX:-}
+      - CLAUDISH_CONNECT_RETRY_DELAYS_MS=${CLAUDISH_CONNECT_RETRY_DELAYS_MS:-}
+      - CLAUDISH_STALL_THRESHOLD_MS=${CLAUDISH_STALL_THRESHOLD_MS:-}
+      # Auth & native lane: key-rotation overlap + #219 auto-pin.
+      - CLAUDISH_PROXY_KEY_PREVIOUS=${CLAUDISH_PROXY_KEY_PREVIOUS:-}
+      - CLAUDISH_NATIVE_PIN_AUTO=${CLAUDISH_NATIVE_PIN_AUTO:-}
+      - CLAUDISH_NATIVE_PIN_AUTO_INTERVAL_MS=${CLAUDISH_NATIVE_PIN_AUTO_INTERVAL_MS:-}
+      # Routing, catalog & capability vocabulary (#83 gate, default off).
+      - CLAUDISH_DEFAULT_PROVIDER=${CLAUDISH_DEFAULT_PROVIDER:-}
+      - CLAUDISH_CATALOG_URL=${CLAUDISH_CATALOG_URL:-}
+      - CLAUDISH_CAPABILITY_VOCAB=${CLAUDISH_CAPABILITY_VOCAB:-}
+      - CLAUDISH_CAPABILITY_QUERY_MAX_ASKS=${CLAUDISH_CAPABILITY_QUERY_MAX_ASKS:-}
+      # Local lane (lmstudio/ollama reached through the host gateway).
+      - CLAUDISH_CONTEXT_WINDOW=${CLAUDISH_CONTEXT_WINDOW:-}
+      - CLAUDISH_LOCAL_QUEUE_ENABLED=${CLAUDISH_LOCAL_QUEUE_ENABLED:-}
+      - CLAUDISH_LOCAL_MAX_PARALLEL=${CLAUDISH_LOCAL_MAX_PARALLEL:-}
+      - CLAUDISH_QWEN_NO_THINK=${CLAUDISH_QWEN_NO_THINK:-}
+      # Observability toggles (0/false/off disables).
+      - CLAUDISH_TELEMETRY=${CLAUDISH_TELEMETRY:-}
+      - CLAUDISH_STATS=${CLAUDISH_STATS:-}
+      - CLAUDISH_OVERFLOW_REPORT_FLOOR=${CLAUDISH_OVERFLOW_REPORT_FLOOR:-}
+      - CLAUDISH_SWAP_ADVISOR=${CLAUDISH_SWAP_ADVISOR:-}
+      - CLAUDISH_SWAP_ADVISOR_LOG=${CLAUDISH_SWAP_ADVISOR_LOG:-}
+      - CLAUDISH_SWAP_ADVISOR_DUMP=${CLAUDISH_SWAP_ADVISOR_DUMP:-}
       # Qwen reasons by default and bills on output. disabled (default) |
       # passthrough | budget:<n>. Re-read per request: flip without a restart.
       - CLAUDISH_QWEN_THINKING=${CLAUDISH_QWEN_THINKING:-}
