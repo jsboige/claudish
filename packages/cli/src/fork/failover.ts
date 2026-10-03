@@ -987,7 +987,7 @@ export function resolveFailoverTargetForSession(
     const tomb = tombs?.get(sessionKey);
     if (tomb !== undefined) {
       if (tomb > now) return resolved; // #276 forfeit live — serve the walk, don't re-pin
-      tombs.delete(sessionKey); // lapsed — ordinary dwell resumes
+      tombs?.delete(sessionKey); // lapsed — ordinary dwell resumes
     }
     const m = dwellPins.get(role) ?? new Map();
     // Pin (or re-pin at a new step) only on change: resolve runs twice per

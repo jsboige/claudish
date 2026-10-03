@@ -118,7 +118,23 @@ capped at `steps.length + 1` attempts.
 - On `response.ok`: nominal success resets all step failures for the role (fresh episode); step
   success resets just that step.
 - On `!ok` plus `isQuotaExhaustion`: a nominal wall arms the role; a step wall marks that step failed.
-- Non-quota errors (401/404/wiring) return as-is without advancing.
+- Non-quota errors: wiring (401/404) returns as-is without advancing; any OTHER non-quota error on an
+  INTERMEDIATE step fail-forwards to the next step (`STEP-ADVANCE`) and marks the step
+  `nonQuota` — which **forfeits the dwell of any session pinned there** (#276, see below)
+  instead of re-pinning the session at the successor.
+
+**Per-session dwell, in brief.** With a session key (`metadata.user_id`), `resolveFailoverTargetForSession`
+pins a conversation to its resolved step for `CLAUDISH_FAILOVER_SESSION_DWELL_MS` (default 10 min,
+sliding — renewed by activity, never pins the nominal): the pin HOLDS while the step is servable, even
+through role-level disarm/re-arm churn; it YIELDS on genuine advancement (re-pins at the new step) and
+on verified nominal recovery past `CLAUDISH_FAILOVER_RECOVERY_GRACE_MS` (#294 — `onNominalSuccess`
+stamp, no re-pin back to the nominal). **#276 carve-out:** when the pinned step died of a NON-quota
+error, the yield does NOT re-pin — the dwell is forfeited for one dwell window (a tombstone covering
+the same request's sibling resolution), so the session rejoins the general resolution each request and
+returns to the nominal as soon as its bucket wall expires. Measured driver (2026-09-28): a pinned
+session rode the PAYG tail for hours past a healthy 47%-credit nominal because the re-pinned pin was
+the only thing outliving the 10-min wall. Markers: `DWELL … yielded — nominal recovered Ns ago`
+(#294) · `DWELL … yielded — step N (…) died non-quota; dwell forfeited, re-resolving unpinned` (#276).
 
 Bounded, no `while(true)`, never hangs. The **c-reuse invariant** is load-bearing: handlers must not
 mutate the Hono `Context` before returning a non-ok `Response`, so re-calling `handler.handle(c, body)`
