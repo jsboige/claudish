@@ -75,6 +75,7 @@ import {
 import { peekStreamStart } from "./shared/stream-peek.js";
 import { matchesProxyKey } from "./shared/proxy-keys.js";
 import { stripProxyOwnHeaders } from "./native-handler.js";
+import { stripForeignVisionApiKey } from "./shared/native-credential-guard.js";
 
 /**
  * #289 — credential policy for the vision fallback, injected once by
@@ -105,18 +106,31 @@ export function setVisionAuthPolicy(policy: VisionAuthPolicy): void {
  * is configured — `authorization: Bearer` for an sk-ant-oat, `x-api-key`
  * otherwise — and dropped entirely when none is. A genuine client Anthropic
  * key (no match) passes through unchanged: that is this path's purpose.
+ *
+ * #315 — a NON-matching key is still the only client-controlled credential
+ * here, and it may leave for api.anthropic.com only when it is
+ * Anthropic-shaped. A foreign key is dropped (`stripForeignVisionApiKey`,
+ * the native lane's predicate — not a second copy) and the call degrades
+ * like a missing credential: the images are stripped, the turn continues.
  */
 export function sanitizeVisionAuthHeaders(auth: VisionProxyAuthHeaders): void {
   // Defense in depth (#285 helper): this path forwards auth headers only,
   // but if it ever copies more, the strip runs here so the lists cannot drift.
   stripProxyOwnHeaders(auth as Record<string, string>);
-  if (!visionAuthPolicy.proxyKeys?.length) return;
-  if (!matchesProxyKey(auth["x-api-key"], visionAuthPolicy.proxyKeys)) return;
-  delete auth["x-api-key"];
-  const stored = visionAuthPolicy.anthropicApiKey;
-  if (stored) {
-    if (stored.startsWith("sk-ant-oat")) auth["authorization"] = `Bearer ${stored}`;
-    else auth["x-api-key"] = stored;
+  if (
+    visionAuthPolicy.proxyKeys?.length &&
+    matchesProxyKey(auth["x-api-key"], visionAuthPolicy.proxyKeys)
+  ) {
+    delete auth["x-api-key"];
+    const stored = visionAuthPolicy.anthropicApiKey;
+    if (stored) {
+      if (stored.startsWith("sk-ant-oat")) auth["authorization"] = `Bearer ${stored}`;
+      else auth["x-api-key"] = stored;
+    }
+    return; // swapped or dropped — the operator's own choice, nothing left to check
+  }
+  if (stripForeignVisionApiKey(auth)) {
+    log("[VisionProxy] dropped non-Anthropic client x-api-key (#315) — describing without a credential", true);
   }
 }
 

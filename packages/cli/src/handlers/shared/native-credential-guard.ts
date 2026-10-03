@@ -46,6 +46,18 @@ function guardDisabled(): boolean {
 }
 
 /**
+ * The Anthropic-shape predicate, extracted (#315) so every site that must ask
+ * "is this credential Anthropic's?" shares ONE answer instead of carrying
+ * copies that drift. The native refusal (#296 B), the mixed strip (#305) and
+ * the vision fallback (#315) all branch on this single prefix.
+ *
+ * Takes the TOKEN (Bearer already unwrapped on the caller's side).
+ */
+export function isAnthropicShapedCredential(value: string): boolean {
+  return value.startsWith("sk-ant-");
+}
+
+/**
  * Which refusal shape (if any) the post-swap credential state represents.
  *
  * @param postSwapHeaders       headers as they would leave for api.anthropic.com
@@ -66,7 +78,8 @@ export function nativeCredentialRefusalShape(
   const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
   const hasCredential = bearerToken.length > 0 || apiKey.length > 0;
   const anthropicShaped =
-    bearerToken.startsWith("sk-ant-") || apiKey.startsWith("sk-ant-");
+    isAnthropicShapedCredential(bearerToken) ||
+    isAnthropicShapedCredential(apiKey);
   if (!hasCredential) return "A";
   if (!anthropicShaped) return "B";
   return null;
@@ -127,8 +140,8 @@ export function stripForeignCredentialBesideAnthropic(
   const auth = headers["authorization"] ?? "";
   const apiKey = headers["x-api-key"] ?? "";
   const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
-  const authShaped = bearerToken.startsWith("sk-ant-");
-  const keyShaped = apiKey.startsWith("sk-ant-");
+  const authShaped = isAnthropicShapedCredential(bearerToken);
+  const keyShaped = isAnthropicShapedCredential(apiKey);
   const stripped: string[] = [];
   if (authShaped && !keyShaped && apiKey.length > 0) {
     delete headers["x-api-key"];
@@ -163,4 +176,42 @@ export function nativeAuthHeaderNames(headers: Record<string, string>): string {
   if ((headers["authorization"] ?? "").length > 0) names.push("authorization");
   if ((headers["x-api-key"] ?? "").length > 0) names.push("x-api-key");
   return names.length ? names.join("+") : "(none)";
+}
+
+/**
+ * #315 — vision-path form B: drop a client `x-api-key` that is NOT
+ * Anthropic-shaped before the image-description call leaves for
+ * api.anthropic.com.
+ *
+ * The vision fallback's sanitizer (#289) swaps a MATCHING proxy key; what
+ * passes through is the client's own credential, and until now it flowed
+ * verbatim whatever its shape — a third party's key (another provider's, a
+ * pre-rotation cluster key) handed to Anthropic on every described image.
+ * This is the #296 shape-B class on a third call site: since #303 the native
+ * lane refuses that shape locally; the vision path strips instead (there is
+ * no client turn to refuse — the fallback's own contract is to degrade).
+ *
+ * After the drop the description call runs with NO credential and degrades
+ * exactly like the already-existing missing-credential case: Anthropic 401 →
+ * `describeImage` returns null → the caller strips the images and the turn
+ * continues (never-hang holds). An `sk-ant-*` key — api or oat — passes
+ * unchanged: that is this path's purpose.
+ *
+ * Only the client-controlled header is touched; the `authorization` the #289
+ * swap substitutes is the operator's stored key, never dropped here. Governed
+ * by the same kill switch as the native refusal (one switch, one policy —
+ * #305 precedent), read per call.
+ *
+ * Mutates `auth` in place; returns whether it dropped (for the marker — the
+ * header NAME is the whole diagnosis, nothing derived from the value).
+ */
+export function stripForeignVisionApiKey(auth: {
+  "x-api-key"?: string;
+  authorization?: string;
+}): boolean {
+  if (guardDisabled()) return false;
+  const key = auth["x-api-key"];
+  if (!key || isAnthropicShapedCredential(key)) return false;
+  delete auth["x-api-key"];
+  return true;
 }
