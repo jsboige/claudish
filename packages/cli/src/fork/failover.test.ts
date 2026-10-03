@@ -27,6 +27,7 @@ import {
   resetFailoverForTests,
   resolveFailoverTarget,
   resolveFailoverTargetForSession,
+  getSessionDwellPinForTests,
   markStepFailed,
   parseResetAtFromBody,
   resetStepSuccess,
@@ -1485,6 +1486,105 @@ describe("#91 point 4 — per-session dwell", () => {
       seen.add(resolveFailoverTargetForSession("sonnet", "sess-A").step?.target || "nominal");
     }
     expect(seen.size).toBe(1); // step 0 the whole way: one switch (the arm), zero after
+  });
+});
+
+// #276 — non-quota death of a dwell-pinned step must not deepen the pin.
+// Measured 2026-09-28 (hub po-2025): armed 11:05Z, a session dwell-pinned to
+// cascade step 2 (qwen-token-plan@deepseek-v4.1-flash) received the wrapped
+// content-filter false positive `HTTP 400 {"code":"InvalidParameter", …
+// "data_inspection_failed"}` at 12:31Z. The non-quota fail-forward advanced the
+// walk AND the resolution re-pinned the session at the NEXT step — the PAYG
+// tail — where the renewed dwell held it for hours while the nominal sat
+// healthy at 47%: no pinned session ever probed the nominal, so no recovery
+// stamp (#294) ever landed either. The pin was the only thing outliving the
+// 10-min bucket wall, and it did.
+describe("#276 — non-quota step death forfeits the dwell", () => {
+  const ENV = {
+    CLAUDISH_FAILOVER_SONNET: "ds@deepseek-v4-flash>ds@deepseek-payg",
+    CLAUDISH_FAILOVER_SONNET_LABEL: "Flash>PAYG",
+    CLAUDISH_FAILOVER_AUTO: "1",
+    // 1 h: the pin must not be what outlives the 10-min bucket wall — the
+    // incident shape (a default 10-min dwell would lapse with the wall and
+    // hide the defect).
+    CLAUDISH_FAILOVER_SESSION_DWELL_MS: "3600000",
+  } as NodeJS.ProcessEnv;
+
+  const realNow = Date.now;
+  let clock = 1_000_000;
+
+  beforeEach(() => {
+    clock = 1_000_000;
+    Date.now = () => clock;
+    initFailover(ENV);
+  });
+  afterEach(() => {
+    Date.now = realNow;
+  });
+
+  it("measured case: successor serves unpinned; after the wall expires the session returns to the NOMINAL, not the PAYG tail", () => {
+    expect(armFailover("sonnet", "HTTP 429 weekly limit")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-276").stepIndex).toBe(0);
+    expect(getSessionDwellPinForTests("sonnet", "sess-276")?.stepIndex).toBe(0);
+    // The 12:31Z shape: non-quota, non-wiring (400 data_inspection_failed).
+    markStepFailed("sonnet", 0, "HTTP 400 (non-quota) from step 0", undefined, { nonQuota: true });
+    // While the wall holds, the walk still fail-forwards to step 1 (PAYG) —
+    // but the dwell is FORFEITED, not re-pinned: the step is broken, not walled.
+    const advanced = resolveFailoverTargetForSession("sonnet", "sess-276");
+    expect(advanced.stepIndex).toBe(1);
+    expect(advanced.step?.target).toBe("ds@deepseek-payg");
+    expect(getSessionDwellPinForTests("sonnet", "sess-276")).toBeNull();
+    // The SIBLING resolution of the same cascade attempt (the loop resolves
+    // twice per attempt — swap + loop read) must not re-pin either: that is
+    // the tombstone's job, and without it the fix is erased in-request.
+    expect(resolveFailoverTargetForSession("sonnet", "sess-276").stepIndex).toBe(1);
+    expect(getSessionDwellPinForTests("sonnet", "sess-276")).toBeNull();
+    // The wall expires (10-min TTL). An unpinned session rejoins the general
+    // resolution: nominal. Without the forfeit, the re-pinned step-1 pin (1 h)
+    // holds past the expiry — the measured defect.
+    clock += 11 * 60 * 1000;
+    expect(resolveFailoverTargetForSession("sonnet", "sess-276").stepIndex).toBe(-1);
+  });
+
+  it("negative: a QUOTA death still re-pins the successor — the dwell holds past the wall expiry (genuine advancement)", () => {
+    expect(armFailover("sonnet", "wall")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-q").stepIndex).toBe(0);
+    markStepFailed("sonnet", 0, "flash weekly"); // quota-class — no flag
+    const advanced = resolveFailoverTargetForSession("sonnet", "sess-q");
+    expect(advanced.stepIndex).toBe(1);
+    expect(getSessionDwellPinForTests("sonnet", "sess-q")?.stepIndex).toBe(1); // re-pinned deeper
+    clock += 11 * 60 * 1000;
+    // The pin holds through the wall expiry — the anti-flap core, untouched.
+    expect(resolveFailoverTargetForSession("sonnet", "sess-q").stepIndex).toBe(1);
+  });
+
+  it("negative: a wiring fault never marks the step — the pin holds, nothing arms", () => {
+    expect(armFailover("sonnet", "wall")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-w").stepIndex).toBe(0);
+    // 401/404 surface BEFORE markStepFailed on the proxy site (STEP-WIRING) —
+    // the step record and the pin are untouched by design.
+    expect(isWiringError(401, "")).toBe(true);
+    expect(isWiringError(404, "")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-w").stepIndex).toBe(0);
+    expect(getSessionDwellPinForTests("sonnet", "sess-w")?.stepIndex).toBe(0);
+  });
+
+  it("the forfeit is bounded: after one dwell window, ordinary dwell resumes", () => {
+    expect(armFailover("sonnet", "wall")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-b").stepIndex).toBe(0);
+    markStepFailed("sonnet", 0, "HTTP 400 (non-quota) from step 0", undefined, { nonQuota: true });
+    expect(resolveFailoverTargetForSession("sonnet", "sess-b").stepIndex).toBe(1);
+    expect(getSessionDwellPinForTests("sonnet", "sess-b")).toBeNull();
+    // t=+9 min: wall, step-0 backoff and forfeit all still hold.
+    clock += 9 * 60 * 1000;
+    expect(resolveFailoverTargetForSession("sonnet", "sess-b").stepIndex).toBe(1);
+    expect(getSessionDwellPinForTests("sonnet", "sess-b")).toBeNull();
+    // t=+61 min: forfeit (one dwell window) and every backoff lapsed. Re-arm
+    // and the session re-pins like any other — the forfeit is not permanent.
+    clock += 52 * 60 * 1000;
+    expect(armFailover("sonnet", "re-armed")).toBe(true);
+    expect(resolveFailoverTargetForSession("sonnet", "sess-b").stepIndex).toBe(0);
+    expect(getSessionDwellPinForTests("sonnet", "sess-b")?.stepIndex).toBe(0);
   });
 });
 
