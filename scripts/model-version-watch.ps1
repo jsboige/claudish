@@ -2,8 +2,14 @@
 #
 # Watches the model versions the providers actually offer and keeps the hub's
 # ROUTING on the latest MINOR of each family, automatically:
-#   - minor bump available + acceptance probe 200 -> repin routing (config.json)
-#     + detached drained restart + event 'minor-applied' (worker relays INFO).
+#   - minor bump available + acceptance probe (200 AND a terminal
+#     'response.completed' in the body — a 200 alone can carry an in-stream
+#     failure, #65 class) -> repin routing (config.json), per spelling.
+#   - reload: DEFERRED to the daily drained restart while the old id still
+#     serves; immediate detached drained restart only when the old id fails
+#     its own probe (the minor was retired upstream — every request on the
+#     in-memory config fails until reload). The minor-applied event names
+#     which of the two happened.
 #   - major bump available -> NO edit; event 'major-ask' (worker relays ASK on
 #     the dashboard + registers the user question — the user arbitrates).
 #   - nothing new -> one info line, zero writes.
@@ -110,90 +116,128 @@ try { $config = [System.IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json } 
 
 $decisions = Compare-RoutingToFamilies -Routing $config.routing -AvailableIds $available
 $pending = @($decisions | Where-Object { $_.Action -ne 'current' })
-& $logTs ("decisions: " + (($decisions | ForEach-Object { "$($_.Family)=$($_.Action)($($_.CurrentId)->$($_.LatestId))" }) -join ' ; '))
+& $logTs ("decisions: " + (($decisions | ForEach-Object { "$($_.Family)/$($_.Action)[$($_.Spelling): $($_.CurrentId)->$($_.LatestId)]" }) -join ' ; '))
 
 if ($pending.Count -eq 0) { exit 0 }
 
 # --- 3. Apply policy ---------------------------------------------------------
+#
+# Decisions are PER SPELLING (review #307 D2/D3): a family whose spellings sit
+# on different majors yields minor for the on-latest-major spelling AND
+# major-ask for the older one, in the same pass. Applied per FAMILY: one
+# acceptance probe per family (all minor spellings of a family share the same
+# LatestId), then one surgical edit carrying every spelling's own target.
 
-foreach ($d in $pending) {
-    if ($d.Action -eq 'major') {
-        & $logTs "MAJOR available: $($d.Family) $($d.CurrentId) -> $($d.LatestId) — NOT applied, user arbitrates"
-        if (-not $DryRun) {
-            Write-VersionEvent -EventsPath $eventsPath -Kind major-ask -Family $d.Family -From $d.CurrentId -To $d.LatestId `
-                -Detail "spellings: $($d.Spellings -join ',')"
-        }
-        continue
-    }
-
-    # minor: acceptance probe BEFORE any edit — a listed id that does not serve
-    # never enters routing (Invoke-WebRequest: 200 = accepted, anything else or
-    # a timeout = refuse). Probe constraints measured 2026-10-02: stream must
-    # be true, max_output_tokens must be absent.
-    $provider = ''
-    foreach ($prop in $config.routing.PSObject.Properties) {
-        if ($d.Spellings -contains $prop.Name) { $provider = ((@($prop.Value)[0]) -split '@')[0]; break }
-    }
-    $newTarget = if ($provider) { "$provider@$($d.LatestId)" } else { $d.LatestId }
-    $probeOk = $false
+function Test-ModelServes {
+    # Acceptance probe, used for BOTH the new id (before any edit) and the old
+    # id (reload decision, D4). A 200 alone is NOT acceptance (review #307 D5):
+    # this wire can answer 200 with an in-stream error body (#65 class) — the
+    # probe accepts only when the accumulated body carries a terminal
+    # 'response.completed' event. Probe constraints measured 2026-10-02:
+    # stream must be true, max_output_tokens must be absent.
+    param([Parameter(Mandatory = $true)][string]$Id, [Parameter(Mandatory = $true)]$Headers)
     try {
         $body = @{
-            model = $d.LatestId
+            model = $Id
             instructions = 'Reply with exactly: ok'
             input = @(@{ role = 'user'; content = @(@{ type = 'input_text'; text = 'say ok' }) })
             stream = $true
             store = $false
         } | ConvertTo-Json -Depth 8
-        $null = Invoke-WebRequest -Uri 'https://chatgpt.com/backend-api/codex/responses' `
-            -Headers $headers -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 90
-        $probeOk = $true
+        $resp = Invoke-WebRequest -Uri 'https://chatgpt.com/backend-api/codex/responses' `
+            -Headers $Headers -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 90
+        if ($resp.StatusCode -ne 200) { return $false }
+        if ($resp.Content -notmatch 'response\.completed') { return $false }
+        return $true
     } catch {
-        $status = ''
-        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-        & $logTs "probe REFUSED for $($d.LatestId) (HTTP $status $($_.Exception.Message)) — no edit"
-        if (-not $DryRun) {
-            Write-VersionEvent -EventsPath $eventsPath -Kind probe-fail -Family $d.Family -To $d.LatestId `
-                -Detail "probe HTTP $status — listed but not serving (or probe shape drifted)"
-        }
+        return $false
     }
-    if (-not $probeOk) { continue }
+}
+
+$majors = @($pending | Where-Object Action -eq 'major')
+foreach ($fam in @($majors | Group-Object Family)) {
+    $d0 = @($fam.Group)[0]
+    $fromIds = @($fam.Group | ForEach-Object { "$($_.Spelling)=$($_.CurrentId)" }) -join ','
+    & $logTs "MAJOR available: $($fam.Name) $($fromIds) -> $($d0.LatestId) — NOT applied, user arbitrates"
+    if (-not $DryRun) {
+        Write-VersionEvent -EventsPath $eventsPath -Kind major-ask -Family $fam.Name `
+            -From (@($fam.Group | ForEach-Object { $_.CurrentId } | Select-Object -Unique) -join ',') `
+            -To $d0.LatestId -Detail "spellings: $fromIds"
+    }
+}
+
+$restartNow = $false
+$restartWhy = @()
+$minors = @($pending | Where-Object Action -eq 'minor')
+foreach ($fam in @($minors | Group-Object Family)) {
+    $latestId = @($fam.Group)[0].LatestId
+    $fromIds = (@($fam.Group | ForEach-Object { $_.CurrentId } | Select-Object -Unique) -join ',')
+
+    # Acceptance probe BEFORE any edit — a listed id that does not serve never
+    # enters routing (deepseek lesson: probe before trusting either direction).
+    if (-not (Test-ModelServes -Id $latestId -Headers $headers)) {
+        & $logTs "probe REFUSED for $latestId — no edit (listed but not serving, or probe shape drifted)"
+        if (-not $DryRun) {
+            Write-VersionEvent -EventsPath $eventsPath -Kind probe-fail -Family $fam.Name -To $latestId `
+                -Detail "acceptance probe did not complete 'response.completed' — listed but not serving"
+        }
+        continue
+    }
+
+    $repins = @{}
+    foreach ($d in $fam.Group) { $repins[$d.Spelling] = $d.NewTarget }
+    # The new spelling takes a provider-qualified target when any spelling of
+    # the family carries one; bare spellings repin bare (per-spelling, D1).
+    $newTarget = ''
+    foreach ($d in $fam.Group) { if ($d.Provider) { $newTarget = $d.NewTarget } }
+    if (-not $newTarget) { $newTarget = $latestId }
 
     if ($DryRun) {
-        & $logTs "DRYRUN would repin $($d.Family): $($d.Spellings -join ',') -> $newTarget"
+        & $logTs "DRYRUN would repin $($fam.Name): $(@($repins.GetEnumerator() | ForEach-Object { "$($_.Key) -> $($_.Value)" }) -join '; ') + register $latestId -> $newTarget"
         continue
     }
-    $backup = Edit-RoutingForMinor -ConfigPath $ConfigPath -Spellings $d.Spellings -NewTarget $newTarget
+    $backup = Edit-RoutingForMinor -ConfigPath $ConfigPath -Family $fam.Name -Repins $repins `
+        -NewSpelling $latestId -NewSpellingTarget $newTarget
     if (-not $backup) {
-        & $logTs "edit REFUSED for $($d.Family) (parse/empty diff) — no restart"
-        Write-VersionEvent -EventsPath $eventsPath -Kind error -Family $d.Family -Detail "Edit-RoutingForMinor refused"
+        & $logTs "edit REFUSED for $($fam.Name) (parse/empty diff) — no restart"
+        Write-VersionEvent -EventsPath $eventsPath -Kind error -Family $fam.Name -Detail "Edit-RoutingForMinor refused"
         continue
     }
-    Write-VersionEvent -EventsPath $eventsPath -Kind minor-applied -Family $d.Family -From $d.CurrentId -To $d.LatestId `
-        -Detail "spellings repinned: $($d.Spellings -join ','); backup: $backup; cascades/profiles untouched (operator act)"
-    & $logTs "MINOR applied: $($d.Family) $($d.CurrentId) -> $($d.LatestId) (backup $backup)"
+
+    # Reload decision (D4): the config on disk has moved; whether the hub
+    # reloads NOW or at the daily drained restart depends on whether the OLD
+    # id still serves. All old ids still answering = nothing is broken by
+    # serving from the in-memory config one more day — defer. An old id that
+    # fails its own probe = the minor was retired upstream = every request
+    # routed to it fails until reload — restart now, detached, drained.
+    $reloadMode = 'deferred-to-daily-restart'
+    $deadOld = @()
+    foreach ($oldId in @($fam.Group | ForEach-Object { $_.CurrentId } | Select-Object -Unique)) {
+        if (-not (Test-ModelServes -Id $oldId -Headers $headers)) { $deadOld += $oldId }
+    }
+    if ($deadOld.Count -gt 0) {
+        $restartNow = $true
+        $restartWhy += "$($fam.Name): old id(s) retired: $($deadOld -join ',')"
+        $reloadMode = "restart-now (old id(s) $($deadOld -join ',') no longer serve)"
+    }
+
+    Write-VersionEvent -EventsPath $eventsPath -Kind minor-applied -Family $fam.Name -From $fromIds -To $latestId `
+        -Detail "spellings repinned: $(@($repins.Keys) -join ','); reload: $reloadMode; backup: $backup; cascades/profiles untouched (operator act)"
+    & $logTs "MINOR applied: $($fam.Name) $fromIds -> $latestId (reload: $reloadMode; backup $backup)"
 }
 
 # --- 4. Reload (config.json is bind-mounted: a drained docker RESTART re-reads
 #        it; env is preserved, so cascades are safe — measured 2026-09-15) ----
 
-$applied = @($decisions | Where-Object { $_.Action -eq 'minor' })
-$anyApplied = $false
-if (-not $DryRun -and $applied.Count -gt 0) {
-    # Re-read: only restart if the config on disk actually moved this run.
-    $after = [System.IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json
-    foreach ($d in $applied) {
-        $sp = $d.Spellings | Select-Object -First 1
-        if ($after.routing.$sp -and ((@($after.routing.$sp)[0]) -split '@')[-1] -eq $d.LatestId) { $anyApplied = $true }
-    }
-}
-if ($anyApplied) {
+if (-not $DryRun -and $restartNow) {
     if (-not (Test-Path -LiteralPath $DrainScript)) {
-        & $logTs "config repinned but drain script not found at $DrainScript — reload deferred to next restart"
-        Write-VersionEvent -EventsPath $eventsPath -Kind info -Family reload -Detail "reload deferred: drain script absent"
+        & $logTs "old id retired but drain script not found at $DrainScript — reload deferred, escalate"
+        Write-VersionEvent -EventsPath $eventsPath -Kind error -Family reload `
+            -Detail "restart-now decided ($($restartWhy -join '; ')) but drain script absent — routing repinned, hub still on old id"
     } else {
-        & $logTs "launching detached drained restart (config reload)"
+        & $logTs "launching detached drained restart (reload mode: $($restartWhy -join '; '))"
         Start-Process powershell -WindowStyle Hidden -ArgumentList `
-            '-ExecutionPolicy', 'Bypass', '-File', $DrainScript, '-Reason', 'model-version-watch minor repin'
+            '-ExecutionPolicy', 'Bypass', '-File', $DrainScript, '-Reason', 'model-version-watch minor repin (old id retired)'
     }
 }
 exit 0

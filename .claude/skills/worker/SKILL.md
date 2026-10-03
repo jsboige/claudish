@@ -22,11 +22,18 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
 3. **Exécution** : ton périmètre (voir ci-dessous). Règle HARD globale : lire le body
    complet + commentaires + diff avant tout comment/review/merge/fix.
    - **Relais model-version-watch** (si le fichier existe) : lire
-     `~/.claudish/model-version-events.log` (NDJSON), relayer chaque événement
-     sur le dashboard workspace — `minor-applied` → tag INFO (le drainer a déjà
-     rechargé), `major-ask` → tag **ASK** (arbitrage user, la mineure seule
-     n'arme rien), `probe-fail`/`error` → tag WARN. Vider le fichier après
-     relais (les événements relaisés une fois ne se re-postent pas).
+     `~/.claudish/model-version-events.log` (NDJSON), relayer sur le dashboard
+     workspace les événements **plus récents que le watermark**
+     (`~/.claudish/model-version-relay.ts`, une ligne ISO-UTC : dernier `ts`
+     relayé ; fichier absent ⇒ tout relayer) — `minor-applied` → tag INFO (le
+     champ `detail` dit si le reload a été différé au restart quotidien ou
+     déclenché immédiatement : ancien id retiré amont), `major-ask` → tag
+     **ASK** (arbitrage user, la majeure seule n'arme rien),
+     `probe-fail`/`error` → tag WARN. Après relais, mettre à jour le watermark
+     avec le dernier `ts` relayé. **Ne JAMAIS tronquer ni vider le fichier** :
+     il est la seule trace durable des éditions automatiques de l'infra
+     partagée (post-mortem après incident), et une troncature détruirait les
+     événements arrivés pendant le relai.
 4. **Commit + PR AVANT le rapport** — ne jamais annoncer un travail non commité.
    `cd d:/Dev/claudish && git pull origin main` d'abord ; conventional commits.
 5. **Rapport [DONE] sur le dashboard workspace** — faits, métriques, décisions prises

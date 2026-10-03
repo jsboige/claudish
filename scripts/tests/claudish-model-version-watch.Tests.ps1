@@ -74,34 +74,63 @@ Describe 'Compare-RoutingToFamilies decisions' {
     BeforeAll {
         $script:routing = [pscustomobject]@{
             'gpt-6-sol'   = @('cx@gpt-6-sol')
-            'gpt-5.6-sol' = @('cx@gpt-6-sol')
+            'gpt-5.6-sol' = @('cx@gpt-5.6-sol')
             'gpt-6.1-sol' = @('cx@gpt-6.1-sol')
             'gpt-6-astra' = @('cx@gpt-6-astra')
             'glm-5.3'     = @('gc@glm-5.3')
         }
         $script:available = @('gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-astra', 'glm-5.3')
     }
-    It 'groups every spelling of a family into one decision' {
-        $d = Compare-RoutingToFamilies -Routing $script:routing -AvailableIds $script:available
+    It 'yields ONE decision PER SPELLING, each judged on its own version' {
+        $d = @(Compare-RoutingToFamilies -Routing $script:routing -AvailableIds $script:available)
         $sol = @($d | Where-Object Family -eq 'gpt-sol')
-        $sol.Count | Should -Be 1
-        @($sol[0].Spellings) -contains 'gpt-6-sol' | Should -Be $true
-        @($sol[0].Spellings) -contains 'gpt-5.6-sol' | Should -Be $true
-        @($sol[0].Spellings) -contains 'gpt-6.1-sol' | Should -Be $true
+        $sol.Count | Should -Be 3   # three spellings, three decisions — not one per family
+        (@($sol | Where-Object Spelling -eq 'gpt-6-sol')[0].Action) | Should -Be 'minor'     # 6.0 -> 6.1
+        (@($sol | Where-Object Spelling -eq 'gpt-5.6-sol')[0].Action) | Should -Be 'major'   # 5.6 -> 6
+        (@($sol | Where-Object Spelling -eq 'gpt-6.1-sol')[0].Action) | Should -Be 'current'
     }
-    It 'flags a minor bump' {
-        $d = Compare-RoutingToFamilies -Routing $script:routing -AvailableIds $script:available
-        (@($d | Where-Object Family -eq 'gpt-sol')[0].Action) | Should -Be 'minor'
+    It 'is order-independent: same entries in any key order give the same decision set (D2)' {
+        $a = [pscustomobject][ordered]@{ 'stale' = @('cx@gpt-6-sol'); 'fresh' = @('cx@gpt-6.1-sol') }
+        $b = [pscustomobject][ordered]@{ 'fresh' = @('cx@gpt-6.1-sol'); 'stale' = @('cx@gpt-6-sol') }
+        $avail = @('gpt-6.1-sol', 'gpt-6-sol')
+        # Compare as spelling->action maps, never as ordered lists: the test
+        # must be order-agnostic by construction. (A first draft compared
+        # Sort-Object output — under 5.1 Sort-Object does not see hashtable
+        # properties, sorted on a null key and flipped one of the two orders.)
+        $mapA = @{}; foreach ($d in @(Compare-RoutingToFamilies -Routing $a -AvailableIds $avail)) { $mapA[$d.Spelling] = $d.Action }
+        $mapB = @{}; foreach ($d in @(Compare-RoutingToFamilies -Routing $b -AvailableIds $avail)) { $mapB[$d.Spelling] = $d.Action }
+        $mapA.Count | Should -Be 2
+        $mapB.Count | Should -Be 2
+        # The defect this pins: first-seen-family keyed 'fresh' as stale when
+        # 'stale' came first — 'fresh' must be CURRENT in BOTH orders.
+        $mapA['fresh'] | Should -Be 'current'
+        $mapB['fresh'] | Should -Be 'current'
+        $mapA['stale'] | Should -Be 'minor'
+        $mapB['stale'] | Should -Be 'minor'
+    }
+    It 'mixed majors in one family: minor for the on-major spelling, major for the older (D3)' {
+        $r = [pscustomobject]@{ 'a' = @('cx@gpt-6-sol'); 'b' = @('cx@gpt-5.6-sol') }
+        $d = Compare-RoutingToFamilies -Routing $r -AvailableIds @('gpt-6.1-sol', 'gpt-6-sol', 'gpt-5.6-sol')
+        (@($d | Where-Object Spelling -eq 'a')[0].Action) | Should -Be 'minor'
+        (@($d | Where-Object Spelling -eq 'b')[0].Action) | Should -Be 'major'
+    }
+    It 'keeps the provider prefix ONLY from a value that has one (D1)' {
+        $r = [pscustomobject]@{ 'qualified' = @('cx@gpt-6-sol'); 'bare' = @('gpt-6-sol') }
+        $d = Compare-RoutingToFamilies -Routing $r -AvailableIds @('gpt-6.1-sol', 'gpt-6-sol')
+        (@($d | Where-Object Spelling -eq 'qualified')[0].NewTarget) | Should -Be 'cx@gpt-6.1-sol'
+        # The defect this pins: bare values used to fabricate 'gpt-6-sol@gpt-6.1-sol'.
+        (@($d | Where-Object Spelling -eq 'bare')[0].NewTarget) | Should -Be 'gpt-6.1-sol'
+        (@($d | Where-Object Spelling -eq 'bare')[0].Provider) | Should -Be ''
     }
     It 'reports current when routing already points at the latest' {
         $d = Compare-RoutingToFamilies -Routing $script:routing -AvailableIds $script:available
         (@($d | Where-Object Family -eq 'gpt-astra')[0].Action) | Should -Be 'current'
         (@($d | Where-Object Family -eq 'glm')[0].Action) | Should -Be 'current'
     }
-    It 'flags a major bump (5.6 -> 6)' {
-        $r56 = [pscustomobject]@{ 'gpt-5.6-sol' = @('cx@gpt-5.6-sol') }
-        $d56 = Compare-RoutingToFamilies -Routing $r56 -AvailableIds @('gpt-6-sol', 'gpt-5.6-sol')
-        (@($d56 | Where-Object Family -eq 'gpt-sol')[0].Action) | Should -Be 'major'
+    It 'never proposes a downgrade (routing ahead of the listing stays current)' {
+        $r = [pscustomobject]@{ 'ahead' = @('cx@gpt-6.2-sol') }
+        $d = Compare-RoutingToFamilies -Routing $r -AvailableIds @('gpt-6.1-sol')
+        (@($d | Where-Object Spelling -eq 'ahead')[0].Action) | Should -Be 'current'
     }
 }
 
@@ -111,9 +140,9 @@ Describe 'Edit-RoutingForMinor surgery' {
         $script:config = @{
             apiKeys  = @{ DEMO_KEY = 'value-that-must-survive' }
             routing  = @{
-                'gpt-6-sol'   = @('cx@gpt-6-sol')
-                'gpt-5.6-sol' = @('cx@gpt-6-sol')
-                'glm-5.3'     = @('gc@glm-5.3')
+                'gpt-6-sol' = @('cx@gpt-6-sol')
+                'gpt-5.6-sol' = @('cx@gpt-5.6-sol')
+                'glm-5.3'   = @('gc@glm-5.3')
             }
             profiles = @{ default = @{ models = @{ sonnet = 'glm-5.3' } } }
         }
@@ -126,8 +155,10 @@ Describe 'Edit-RoutingForMinor surgery' {
         Get-ChildItem "$($script:tmp).bak-*" -ErrorAction SilentlyContinue | Remove-Item -Force
     }
 
-    It 'repins every spelling of the family and registers the new one' {
-        $backup = Edit-RoutingForMinor -ConfigPath $script:tmp -Spellings @('gpt-6-sol', 'gpt-5.6-sol') -NewTarget 'cx@gpt-6.1-sol'
+    It 'repins each spelling to its OWN target and registers the new spelling' {
+        $backup = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol'; 'gpt-5.6-sol' = 'cx@gpt-6.1-sol' } `
+            -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
         $backup | Should -Not -BeNullOrEmpty
         (Test-Path $backup) | Should -Be $true
         $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
@@ -135,8 +166,28 @@ Describe 'Edit-RoutingForMinor surgery' {
         $after.routing.'gpt-5.6-sol' | Should -Be 'cx@gpt-6.1-sol'
         $after.routing.'gpt-6.1-sol' | Should -Be 'cx@gpt-6.1-sol'
     }
+    It 'repins a bare spelling BARE (no fabricated provider prefix)' {
+        $r = @{ routing = @{ 'gpt-6-sol' = @('gpt-6-sol') } }
+        [System.IO.File]::WriteAllText($script:tmp, ($r | ConvertTo-Json -Depth 16), (New-Object System.Text.UTF8Encoding($false)))
+        $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'gpt-6-sol' = 'gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'gpt-6.1-sol'
+        $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
+        $after.routing.'gpt-6-sol' | Should -Be 'gpt-6.1-sol'
+        $after.routing.'gpt-6.1-sol' | Should -Be 'gpt-6.1-sol'
+    }
+    It 'preserves the OTHER-family member of a multi-target spelling' {
+        $r = @{ routing = @{ 'sonnet' = @('cx@gpt-6-sol', 'gc@glm-5.3') } }
+        [System.IO.File]::WriteAllText($script:tmp, ($r | ConvertTo-Json -Depth 16), (New-Object System.Text.UTF8Encoding($false)))
+        $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'sonnet' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
+        $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
+        @($after.routing.sonnet).Count | Should -Be 2
+        @($after.routing.sonnet)[0] | Should -Be 'cx@gpt-6.1-sol'   # gpt-sol member moved
+        @($after.routing.sonnet)[1] | Should -Be 'gc@glm-5.3'       # glm member preserved in place
+    }
     It 'leaves other families, apiKeys and profiles intact in value' {
-        $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Spellings @('gpt-6-sol') -NewTarget 'cx@gpt-6.1-sol'
+        $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
         $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
         $after.routing.'glm-5.3' | Should -Be 'gc@glm-5.3'
         $after.apiKeys.DEMO_KEY | Should -Be 'value-that-must-survive'
@@ -145,21 +196,25 @@ Describe 'Edit-RoutingForMinor surgery' {
     It 'refuses on unparseable config (returns null, file untouched)' {
         [System.IO.File]::WriteAllText($script:tmp, 'this is not json {{{', (New-Object System.Text.UTF8Encoding($false)))
         $before = [System.IO.File]::ReadAllText($script:tmp)
-        $r = Edit-RoutingForMinor -ConfigPath $script:tmp -Spellings @('gpt-6-sol') -NewTarget 'cx@gpt-6.1-sol'
+        $r = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
         $r | Should -BeNullOrEmpty
         [System.IO.File]::ReadAllText($script:tmp) | Should -Be $before
     }
     It 'refuses on a missing file' {
-        (Edit-RoutingForMinor -ConfigPath "$($script:tmp)-absent" -Spellings @('gpt-6-sol') -NewTarget 'cx@gpt-6.1-sol') | Should -BeNullOrEmpty
+        (Edit-RoutingForMinor -ConfigPath "$($script:tmp)-absent" -Family 'gpt-sol' `
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol') | Should -BeNullOrEmpty
     }
     It 'is idempotent when the target already holds the value (no diff, no backup)' {
-        $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Spellings @('gpt-6-sol') -NewTarget 'cx@gpt-6.1-sol'
+        $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
         $b1 = (Get-ChildItem "$($script:tmp).bak-*").Count
-        # Second call with the same target: every spelling and the new-spelling
+        # Second call with the same targets: every spelling and the new-spelling
         # entry already hold the value — $changed stays false, null returned,
         # NO second backup. (Pinned because the first draft set $changed
         # unconditionally and wrote a fresh backup every run.)
-        $r2 = Edit-RoutingForMinor -ConfigPath $script:tmp -Spellings @('gpt-6-sol') -NewTarget 'cx@gpt-6.1-sol'
+        $r2 = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
         $r2 | Should -BeNullOrEmpty
         (Get-ChildItem "$($script:tmp).bak-*").Count | Should -Be $b1
     }

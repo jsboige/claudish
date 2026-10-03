@@ -72,49 +72,52 @@ function Get-LatestFamilyVersion {
 # --- Routing diff -----------------------------------------------------------
 
 function Compare-RoutingToFamilies {
-    # For every routing TARGET whose model id parses to a known family, decide
-    # whether the provider's latest for that family is a MINOR bump (auto), a
-    # MAJOR bump (ask), or current. Returns decision objects:
-    #   @{ Family; CurrentId; LatestId; Action='minor'|'major'|'current' }
+    # One decision per (spelling, family) PAIR — never per family (review #307
+    # D2/D3): a family-level decision keyed on the FIRST target seen made the
+    # answer depend on key order (a-old/b-new both-repinned vs a-old-stuck
+    # forever on the same two entries), and an older-major spelling masked the
+    # minor bump of its newer sibling (5.6 pinned + 6.0 pinned + 6.1 available
+    # => 'major', 6.0->6.1 never applied). Per spelling, each entry is compared
+    # to the family latest on its own version: same major + lower minor =>
+    # 'minor' (auto), older major => 'major' (ask), at or ahead of latest =>
+    # 'current' (never downgrade). Order-independent by construction.
+    #
+    # Each decision also carries NewTarget (D1): the provider prefix is kept
+    # ONLY from a value that actually contains '@' — deriving it from a bare
+    # value fabricated 'gpt-6-sol@gpt-6.1-sol', an invalid target the
+    # acceptance probe (which names only the id) cannot catch. A bare spelling
+    # repins to the bare id.
+    #   @{ Family; Spelling; CurrentId; Provider; LatestId; NewTarget; Action }
     # $Routing is the parsed routing object (requested-spelling -> target[]).
-    # Explicit provider@model targets and bare spellings are both read through
-    # their model part; the requested-spelling KEYS of one family are returned
-    # together so a repin moves every alias of the family in one gesture
-    # (gpt-5.6-sol followed gpt-6-sol to 6-sol; same precedent).
     param([Parameter(Mandatory = $true)]$Routing, [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$AvailableIds)
 
     $decisions = @()
-    $byFamily = @{}
+    $latestCache = @{}
     foreach ($prop in $Routing.PSObject.Properties) {
         foreach ($target in @($prop.Value)) {
             $model = ($target -split '@')[-1]
             $v = ConvertTo-ModelVersion -Id $model
             if ($null -eq $v) { continue }
-            if (-not $byFamily.ContainsKey($v.Family)) {
-                $byFamily[$v.Family] = @{
-                    CurrentId  = $model
-                    Spellings  = @()
-                }
+            if (-not $latestCache.ContainsKey($v.Family)) {
+                $latestCache[$v.Family] = Get-LatestFamilyVersion -Family $v.Family -AvailableIds $AvailableIds
             }
-            if ($byFamily[$v.Family].Spellings -notcontains $prop.Name) {
-                $byFamily[$v.Family].Spellings += $prop.Name
+            $latest = $latestCache[$v.Family]
+            if ($null -eq $latest) { continue }
+            $action = 'current'
+            if ($latest.Major -gt $v.Major) { $action = 'major' }
+            elseif ($latest.Major -eq $v.Major -and $latest.Minor -gt $v.Minor) { $action = 'minor' }
+            $provider = ''
+            $at = ([string]$target).IndexOf('@')
+            if ($at -gt 0) { $provider = ([string]$target).Substring(0, $at + 1) }
+            $decisions += @{
+                Family    = $v.Family
+                Spelling  = $prop.Name
+                CurrentId = $model
+                Provider  = $provider
+                LatestId  = $latest.Id
+                NewTarget = $provider + $latest.Id
+                Action    = $action
             }
-        }
-    }
-    foreach ($family in $byFamily.Keys) {
-        $entry = $byFamily[$family]
-        $latest = Get-LatestFamilyVersion -Family $family -AvailableIds $AvailableIds
-        if ($null -eq $latest) { continue }
-        $current = ConvertTo-ModelVersion -Id $entry.CurrentId
-        $action = 'current'
-        if ($latest.Major -gt $current.Major) { $action = 'major' }
-        elseif ($latest.Major -eq $current.Major -and $latest.Minor -gt $current.Minor) { $action = 'minor' }
-        $decisions += @{
-            Family    = $family
-            CurrentId = $entry.CurrentId
-            LatestId  = $latest.Id
-            Spellings = $entry.Spellings
-            Action    = $action
         }
     }
     return $decisions
@@ -123,15 +126,22 @@ function Compare-RoutingToFamilies {
 # --- Config surgery ---------------------------------------------------------
 
 function Edit-RoutingForMinor {
-    # Repin every spelling of ONE family to provider@<LatestId> and register the
-    # new spelling as its own entry. Surgical: loads config.json, touches ONLY
-    # $Routing keys named in $Spellings (plus the new spelling), saves with a
-    # timestamped backup. Returns the backup path, or $null on any refusal
-    # (parse failure, missing file, empty diff).
+    # Repin ONE family in routing. $Repins maps each requested-spelling of that
+    # family to its own new target (per-spelling, review #307: a bare spelling
+    # repins bare, a provider-qualified one keeps its prefix — one uniform
+    # $NewTarget fabricated 'gpt-6-sol@gpt-6.1-sol' for a bare entry). Surgical
+    # per family: within a spelling that holds SEVERAL targets (multi-lane
+    # routing entries), only the members whose model id parses to $Family move;
+    # the other families' members are preserved in place — a whole-array
+    # overwrite would silently drop them. The new id is registered as its own
+    # spelling. One timestamped backup per call. Returns the backup path, or
+    # $null on any refusal (parse failure, missing file, empty diff).
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
-        [Parameter(Mandatory = $true)][string[]]$Spellings,
-        [Parameter(Mandatory = $true)][string]$NewTarget   # e.g. 'cx@gpt-6.1-sol'
+        [Parameter(Mandatory = $true)][string]$Family,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Repins,      # spelling -> new target
+        [Parameter(Mandatory = $true)][string]$NewSpelling,                        # e.g. 'gpt-6.1-sol'
+        [Parameter(Mandatory = $true)][string]$NewSpellingTarget                   # target for the new entry
     )
 
     if (-not (Test-Path -LiteralPath $ConfigPath)) { return $null }
@@ -140,22 +150,33 @@ function Edit-RoutingForMinor {
     if ($null -eq $config.routing) { return $null }
 
     $changed = $false
-    foreach ($sp in $Spellings) {
-        if ($config.routing.PSObject.Properties.Name -contains $sp) {
-            if ((@($config.routing.$sp) -join '|') -ne $NewTarget) {
-                $config.routing.$sp = @($NewTarget)
+    foreach ($sp in @($Repins.Keys)) {
+        if ($config.routing.PSObject.Properties.Name -notcontains $sp) { continue }
+        $target = [string]$Repins[$sp]
+        $vals = @($config.routing.$sp)
+        for ($i = 0; $i -lt $vals.Count; $i++) {
+            $memberFamily = ''
+            $memberModel = (([string]$vals[$i]) -split '@')[-1]
+            $mv = ConvertTo-ModelVersion -Id $memberModel
+            if ($mv) { $memberFamily = $mv.Family }
+            if ($memberFamily -eq $Family -and $vals[$i] -ne $target) {
+                $vals[$i] = $target
                 $changed = $true
             }
         }
+        if ($vals.Count -eq 1 -and $vals[0] -eq $target) {
+            $config.routing.$sp = $vals[0]   # keep single-entry spellings scalar
+        } else {
+            $config.routing.$sp = $vals
+        }
     }
-    $newSpelling = ($NewTarget -split '@')[-1]
-    if ($config.routing.PSObject.Properties.Name -contains $newSpelling) {
-        if ((@($config.routing.$newSpelling) -join '|') -ne $NewTarget) {
-            $config.routing.$newSpelling = @($NewTarget)
+    if ($config.routing.PSObject.Properties.Name -contains $NewSpelling) {
+        if ((@($config.routing.$NewSpelling) -join '|') -ne $NewSpellingTarget) {
+            $config.routing.$NewSpelling = @($NewSpellingTarget)
             $changed = $true
         }
     } else {
-        $config.routing | Add-Member -MemberType NoteProperty -Name $newSpelling -Value @($NewTarget)
+        $config.routing | Add-Member -MemberType NoteProperty -Name $NewSpelling -Value @($NewSpellingTarget)
         $changed = $true
     }
     if (-not $changed) { return $null }
