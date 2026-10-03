@@ -39,6 +39,7 @@ import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
 import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
 import { resolveProxyKeys, matchesProxyKey } from "./handlers/shared/proxy-keys.js";
+import { admissionFreezeState } from "./handlers/shared/admission-freeze.js";
 import {
   loadRoutingRules,
   loadUserRoutingRules,
@@ -1375,6 +1376,10 @@ export async function createProxyServer(
         role,
         upstream,
         instanceId: getInstanceId(),
+        // #306 review — the drain reads THIS to confirm the proxy actually
+        // sees its flag (drain home vs container mount can differ; a VM clock
+        // skew can expire a fresh flag). The reason, never the flag content.
+        admissionFreeze: admissionFreezeState().reason,
         ...(options.relay ? { selfLoop: options.relay.selfLoop } : {}),
       },
       stalled ? 503 : 200
@@ -1385,6 +1390,12 @@ export async function createProxyServer(
   app.post("/v1/messages/count_tokens", async (c) => {
     try {
       const body = await c.req.json();
+      // #306 review — same admission freeze as the serving routes: messages
+      // are refused during the window, so counting for a message that can no
+      // longer be admitted is the asymmetry po-2024 flagged. Same 503 +
+      // Retry-After, in-flight streams untouched.
+      const freeze = drainFreezeGate();
+      if (freeze) return freeze;
       if (typeof body?.model !== "string" || body.model.length === 0) {
         return c.json(
           wrapAnthropicError(400, "missing required field: model"),
@@ -1479,11 +1490,47 @@ export async function createProxyServer(
     }
   });
 
+  /**
+   * #306 — admission freeze gate for the drain's final pre-restart window.
+   * Returns the 503+Retry-After Response when the freeze is live, null when
+   * admissions flow. Called after the body is read (keep-alive hygiene: an
+   * unread body would poison the next request on the connection) and before
+   * any handler/relay work. In-flight streams never re-enter a route, so they
+   * are untouched by construction; /health is not gated, so the drain keeps
+   * polling right through the freeze.
+   */
+  const drainFreezeGate = (): Response | null => {
+    const state = admissionFreezeState();
+    if (!state.frozen) return null;
+    log(`[DrainFreeze] admission refused — 503 + Retry-After (state=${state.reason})`, true);
+    return new Response(
+      JSON.stringify({
+        type: "error",
+        error: {
+          type: "overloaded_error",
+          message:
+            "Proxy is draining for a restart (admission freeze). Retry shortly — in-flight streams are unaffected.",
+        },
+      }),
+      {
+        status: 503,
+        headers: { "content-type": "application/json", "retry-after": "15" },
+      }
+    );
+  };
+
   app.post("/v1/messages", async (c) => {
     try {
       // readRequestBody inflates a gzipped body (WAN external sidecar → hub);
       // identical to c.req.json() on the uncompressed LAN/direct path.
       const body = await readRequestBody(c);
+
+      // #306 — opt-in admission freeze, BEFORE the relay branch: the freeze
+      // belongs to THIS container's restart, so a frozen admission must not
+      // be forwarded either (a forward would die mid-body when the local
+      // container restarts — strictly worse than a clean retryable 503).
+      const freeze = drainFreezeGate();
+      if (freeze) return freeze;
 
       // Sidecar relay (fork extension). In NOMINAL mode (upstream configured +
       // alive) forward the raw request to the central hub and return its piped
@@ -1593,6 +1640,11 @@ export async function createProxyServer(
   app.post("/v1/chat/completions", async (c) => {
     try {
       const openaiBody = await readRequestBody(c);
+
+      // #306 — same admission freeze as /v1/messages, same placement before
+      // the relay branch, for the same reason.
+      const freeze = drainFreezeGate();
+      if (freeze) return freeze;
 
       // Relay (sidecar NOMINAL): forward the RAW OpenAI body to the hub's
       // /v1/chat/completions — the hub translates. Path-aware forward

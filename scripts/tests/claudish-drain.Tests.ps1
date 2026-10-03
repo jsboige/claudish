@@ -1,4 +1,4 @@
-<#
+﻿<#
     Pester 5 suite for claudish-drain.ps1 (#233).
 
     Run:  bun run test:scripts        (pwsh 7)
@@ -464,5 +464,149 @@ Describe 'Invoke-ClaudishDrainedRestart — compose stderr and deployed-image at
             }
         }
         $offenders | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture (#306)' {
+    # Review 03/10: the FREEZE window line must attest what the PROXY saw, not
+    # what the drain wrote. A tiny HttpListener job stands in for the proxy's
+    # /health and answers whatever admissionFreeze the case needs — the same
+    # JSON shape proxy-server now publishes. The helpers live in BeforeAll, not
+    # in the Describe body: Pester runs that body at DISCOVERY and a function
+    # declared there is gone by the time an It runs (engine.Tests documents the
+    # same trap).
+    BeforeAll {
+        function New-FakeProxyHealth {
+            # AdmissionFreeze 'omit' serves the /health of a PRE-#306 image:
+            # JSON answers, but no admissionFreeze field at all — the shape the
+            # first freeze-capable -Recreate probes on every machine (review D3).
+            param([string]$AdmissionFreeze)
+            $job = Start-Job -ScriptBlock {
+                param($state)
+                $l = [System.Net.HttpListener]::new()
+                $l.Prefixes.Add('http://127.0.0.1:19937/')
+                $l.Start()
+                try {
+                    while ($l.IsListening) {
+                        $ctx = $l.GetContext()
+                        $body = if ($state -eq 'omit') { '{"status":"ok","activeStreams":0}' } else { ('{"status":"ok","activeStreams":0,"admissionFreeze":"' + $state + '"}') }
+                        $buf = [System.Text.Encoding]::UTF8.GetBytes($body)
+                        $ctx.Response.ContentType = 'application/json'
+                        $ctx.Response.ContentLength64 = $buf.Length
+                        $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
+                        $ctx.Response.Close()
+                    }
+                } catch { } finally { try { $l.Stop() } catch { } }
+            } -ArgumentList $AdmissionFreeze
+            # Wait for the listener to bind (job startup races the drain's first poll).
+            $deadline = (Get-Date).AddSeconds(10)
+            while ((Get-Date) -lt $deadline) {
+                try {
+                    $null = Invoke-WebRequest -Uri 'http://127.0.0.1:19937/health' -TimeoutSec 2 -UseBasicParsing
+                    return $job
+                } catch { Start-Sleep -Milliseconds 200 }
+            }
+            throw 'fake proxy /health did not come up within 10s'
+        }
+
+        function Remove-FakeProxyHealth($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'with consent + proxy CONFIRMS (admissionFreeze=flag): armed line + window line + flag cleared' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", [System.Text.Encoding]::ASCII)
+        $freezeHome = Join-Path $TestDrive 'freeze-home'
+        New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
+        $job = New-FakeProxyHealth -AdmissionFreeze 'flag'
+        try {
+            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-ok' -Url 'http://127.0.0.1:19937' -FreezeClaudishHome $freezeHome
+            $r | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
+            $log = Get-DrainLogText
+            $log | Should -Match 'FREEZE armed — proxy confirms'
+            $log | Should -Match 'FREEZE \(freeze-ok\): admissions frozen .+ — flag cleared'
+        } finally { Remove-FakeProxyHealth $job }
+    }
+
+    It 'with consent but proxy reports NO-CONSENT (mount mismatch): NOT HONORED, no window line, gesture proceeds' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", [System.Text.Encoding]::ASCII)
+        $freezeHome = Join-Path $TestDrive 'mismatch-home'
+        New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
+        $job = New-FakeProxyHealth -AdmissionFreeze 'no-consent'
+        try {
+            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-mismatch' -Url 'http://127.0.0.1:19937' -FreezeClaudishHome $freezeHome
+            $r | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
+            $log = Get-DrainLogText
+            $log | Should -Match 'FREEZE NOT HONORED \(proxy=no-consent\) — drain home and container mount differ\?'
+            # The window line is reserved for a freeze the proxy confirmed —
+            # the exact false-attestation the review rejected.
+            $log | Should -Not -Match 'admissions frozen'
+            $log | Should -Match 'OUTCOME success'
+        } finally { Remove-FakeProxyHealth $job }
+    }
+
+    It 'with consent but NO proxy answering (dead URL): NOT HONORED (no-signal), no window line' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", [System.Text.Encoding]::ASCII)
+        $freezeHome = Join-Path $TestDrive 'deaf-home'
+        New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-deaf' -Url 'http://127.0.0.1:1' -FreezeClaudishHome $freezeHome
+        $r | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
+        $log = Get-DrainLogText
+        $log | Should -Match 'FREEZE NOT HONORED \(proxy=no-signal\)'
+        $log | Should -Not -Match 'admissions frozen'
+    }
+
+    It 'proxy ANSWERS but carries no admissionFreeze field (pre-#306 image, first deploy): NOT HONORED (absent), no window line (review D3)' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", [System.Text.Encoding]::ASCII)
+        $freezeHome = Join-Path $TestDrive 'absent-home'
+        New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
+        $job = New-FakeProxyHealth -AdmissionFreeze 'omit'
+        try {
+            # The shape every machine meets exactly once: the -Recreate that
+            # deploys #306 probes the container it is about to replace —
+            # pre-#306 by definition, so /health answers WITHOUT the field.
+            # Reading that absence as "flag" (mutation D3) would re-arm the
+            # false attestation on the very first run an operator reads.
+            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-absent' -Url 'http://127.0.0.1:19937' -FreezeClaudishHome $freezeHome
+            $r | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
+            $log = Get-DrainLogText
+            $log | Should -Match 'FREEZE NOT HONORED \(proxy=absent\) — proxy predates #306 — freeze takes effect on the NEXT deploy'
+            $log | Should -Not -Match 'FREEZE armed'
+            $log | Should -Not -Match 'admissions frozen'
+            $log | Should -Match 'OUTCOME success'
+        } finally { Remove-FakeProxyHealth $job }
+    }
+
+    It 'without consent (the default everywhere): no flag, no FREEZE line, restart unaffected' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", [System.Text.Encoding]::ASCII)
+        $freezeHome = Join-Path $TestDrive 'noconsent-home'
+        New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
+
+        # Reason deliberately avoids the word "freeze": -Match is
+        # case-insensitive, so a reason carrying it would self-match the
+        # negative assertion below.
+        $r = Invoke-ClaudishDrainedRestart -Reason 'plain-noconsent' -Url 'http://127.0.0.1:1' -FreezeClaudishHome $freezeHome
+        $r | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
+        $log = Get-DrainLogText
+        $log | Should -Not -Match 'admissions frozen'
+        $log | Should -Not -Match 'FREEZE armed'
+        $log | Should -Not -Match 'FREEZE NOT HONORED'
+        $log | Should -Match 'OUTCOME success'
     }
 }

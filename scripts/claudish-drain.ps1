@@ -249,6 +249,35 @@ function Get-ClaudishActiveStreams {
     }
 }
 
+function Get-DrainFreezeProxyState {
+    <#
+        #306 review (ai-01, 03/10) — the FREEZE line must attest what the
+        PROXY saw, not what the drain wrote. The drain writes the flag in its
+        own ClaudishHome; the proxy reads it in homedir()/.claudish, which in
+        a container is the bind mount of CLAUDISH_CONFIG_DIR — three
+        independent settings decide whether those are the same directory, and
+        a VM clock skew can expire a fresh flag on sight. /health now carries
+        admissionFreeze ("flag" | "no-consent" | "no-flag" | "expired"); this
+        probe returns it, or $null when the proxy cannot answer (/health
+        down, non-JSON) — $null means "not honored", never "unknown, assume
+        fine". A proxy that ANSWERS but carries no admissionFreeze field is
+        a pre-#306 image and gets its own token "absent": that is the shape
+        the first freeze-capable -Recreate meets on every machine, because
+        it probes the container it is about to replace (review 03/10, D3 —
+        reading the absent field as "flag" must turn a test red, it was the
+        false-attestation vector of the first deploy).
+    #>
+    param([string]$Url = $ProxyUrl)
+    try {
+        $r = Invoke-WebRequest -Uri "$Url/health" -TimeoutSec 5 -UseBasicParsing
+        $j = $r.Content | ConvertFrom-Json
+        if ($null -eq $j.PSObject.Properties['admissionFreeze']) { return 'absent' }
+        return [string]$j.admissionFreeze
+    } catch {
+        return $null
+    }
+}
+
 function Invoke-ClaudishDrainedRestartImpl {
     <#
         Restarts the container at the quietest moment it can find.
@@ -289,6 +318,10 @@ function Invoke-ClaudishDrainedRestartImpl {
         # Interpolation env file for `docker compose up -d` ($Recreate only).
         [string]$EnvFile = "",
         [string]$ComposeDir = (Split-Path -Parent $PSScriptRoot),
+        # #306 — home for the admission-freeze flag; same dynamic-default
+        # pattern as $Container/$Url above (the watchdog restores the script
+        # param around its dot-source precisely so these read right).
+        [string]$FreezeClaudishHome = $ClaudishHome,
         # #233 AC2 — auto-remove leftover Created-state compose twins instead
         # of refusing. Never removes a twin that ever ran.
         [switch]$RemoveCreatedTwins
@@ -485,6 +518,37 @@ function Invoke-ClaudishDrainedRestartImpl {
         $scriptDelayMs = [int](($preRestartAt - $decisionAt).TotalMilliseconds)
         Write-DrainLog "RESTART ($Reason): decision->action ${scriptDelayMs}ms; streams at decision $decisionCount, at action $($preRestartCount)"
     }
+    # #306 — opt-in admission freeze for the gesture window: new admissions
+    # get 503 + Retry-After from the proxy while the restart runs. Consent-
+    # gated (drain-freeze.enabled, token 'enabled'): a machine that never
+    # opted in freezes nothing. Cleared by the WRAPPER's finally on every
+    # exit; the proxy's own 900 s mtime expiry is the crashed-drain backstop.
+    $script:DrainFreezeArmed = Enable-DrainAdmissionFreeze -ClaudishHome $FreezeClaudishHome
+    $script:DrainFreezeConfirmed = $false
+    if ($script:DrainFreezeArmed) {
+        $script:DrainFreezeAt = Get-Date
+        # #306 review — the FREEZE line must attest what the PROXY saw. The
+        # flag we wrote lives in the drain's home; the proxy reads it through
+        # the container's mount, and the two can differ (three independent
+        # settings) or a VM clock skew can expire the flag on sight. Ask the
+        # proxy itself, once, right here: on "flag" the window below is real;
+        # anything else is recorded as NOT HONORED and the gesture carries on
+        # unfrozen — exactly as today without consent. Never abort the restart
+        # over it: an unfrozen restart is the status quo ante, not an outage.
+        $proxyFreezeState = Get-DrainFreezeProxyState -Url $Url
+        if ($proxyFreezeState -eq 'flag') {
+            $script:DrainFreezeConfirmed = $true
+            Write-DrainLog "FREEZE armed — proxy confirms"
+        } else {
+            $shown = if ($null -ne $proxyFreezeState) { $proxyFreezeState } else { 'no-signal' }
+            # absent = the proxy ANSWERED but publishes no admissionFreeze —
+            # a pre-#306 image, i.e. the very first freeze-capable recreate
+            # on each machine. Mount mismatch is not the suspect there.
+            $hint = if ($shown -eq 'absent') { 'proxy predates #306 — freeze takes effect on the NEXT deploy' } else { 'drain home and container mount differ?' }
+            Write-DrainLog "FREEZE NOT HONORED (proxy=$shown) — $hint"
+        }
+    }
+
     $restartAt = Get-Date
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
     # governs how long Docker waits between SIGTERM and SIGKILL, and without it
@@ -589,14 +653,37 @@ function Invoke-ClaudishDrainedRestart {
         [switch]$Recreate,
         [string]$EnvFile = "",
         [string]$ComposeDir = (Split-Path -Parent $PSScriptRoot),
+        [string]$FreezeClaudishHome = $ClaudishHome,
         [switch]$RemoveCreatedTwins
     )
+    # #306 — armed by the impl right before its gesture; cleared HERE on every
+    # exit (success, failure, exception), so a crashed run cannot outlive its
+    # own flag (the proxy's 900 s mtime expiry is the belt to these
+    # suspenders). The window line is emitted ONLY when the proxy confirmed
+    # the freeze (review 03/10): an unconfirmed arm already logged NOT HONORED
+    # — a window line for a freeze nobody enforced would blame the turns cut
+    # in that window on bad luck instead of on the instrument.
+    $script:DrainFreezeArmed = $false
+    $script:DrainFreezeConfirmed = $false
+    $script:DrainFreezeAt = $null
     try {
         return Invoke-ClaudishDrainedRestartImpl @PSBoundParameters
     } catch {
         Write-DrainLog "RESTART ($Reason): EXCEPTION — $($_.Exception.Message)"
         Write-DrainOutcome "exception" "${Reason}: $($_.Exception.GetType().Name)"
         return $false
+    } finally {
+        if ($script:DrainFreezeArmed) {
+            $null = Disable-DrainAdmissionFreeze -ClaudishHome $FreezeClaudishHome
+            $end = Get-Date
+            if ($script:DrainFreezeConfirmed) {
+                $secs = if ($null -ne $script:DrainFreezeAt) { [int](($end - $script:DrainFreezeAt).TotalSeconds) } else { -1 }
+                Write-DrainLog "FREEZE ($Reason): admissions frozen $($script:DrainFreezeAt.ToString('HH:mm:ss')) -> $($end.ToString('HH:mm:ss')) (${secs}s) — flag cleared"
+            }
+        }
+        $script:DrainFreezeArmed = $false
+        $script:DrainFreezeConfirmed = $false
+        $script:DrainFreezeAt = $null
     }
 }
 

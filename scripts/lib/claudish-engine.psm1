@@ -251,6 +251,40 @@ function Test-RelaunchPreflightOptIn {
     return (Test-ClaudishOptIn -ClaudishHome $ClaudishHome -FileName $script:RelaunchPreflightOptInFileName)
 }
 
+function Enable-DrainAdmissionFreeze {
+    <#
+        #306 — pose the drain's admission-freeze flag, ONLY on consent.
+
+        The flag file (<ClaudishHome>\drain-freeze) is what the proxy reads
+        (mtime, not bytes — the content below is for humans) to answer new
+        /v1/messages and /v1/chat/completions admissions with 503 +
+        Retry-After while the restart gesture runs. The consent file
+        (drain-freeze.enabled, literal token 'enabled') keeps the whole
+        feature OFF on machines that never opted in — same bar as
+        wedge-watch / relaunch-preflight. Returns $true only when the flag
+        was actually written: a machine without consent freezes nothing.
+    #>
+    param([Parameter(Mandatory)][string]$ClaudishHome)
+    if (-not (Test-ClaudishOptIn -ClaudishHome $ClaudishHome -FileName 'drain-freeze.enabled')) { return $false }
+    $flagPath = Join-Path $ClaudishHome 'drain-freeze'
+    [System.IO.File]::WriteAllText($flagPath, (Get-Date).ToString('o'), [System.Text.UTF8Encoding]::new($false))
+    return (Test-Path -LiteralPath $flagPath)
+}
+
+function Disable-DrainAdmissionFreeze {
+    <#
+        #306 — remove the flag, unconditionally and idempotently. Called in
+        the drain's finally path: a drain killed mid-gesture leaves the flag
+        behind, and the proxy's own mtime expiry (900 s) is the belt to
+        these suspenders.
+    #>
+    param([Parameter(Mandatory)][string]$ClaudishHome)
+    $flagPath = Join-Path $ClaudishHome 'drain-freeze'
+    if (Test-Path -LiteralPath $flagPath) {
+        Remove-Item -LiteralPath $flagPath -Force -Confirm:$false
+    }
+}
+
 function New-EngineRelaunchRegistration {
     <#
         Registers (without starting) the task that relaunches Docker Desktop in
@@ -1798,6 +1832,8 @@ Export-ModuleMember -Function @(
     'Test-ClaudishOptIn'
     'Test-RelaunchPreflightOptIn'
     'Get-RelaunchPreflightOptInFileName'
+    'Enable-DrainAdmissionFreeze'
+    'Disable-DrainAdmissionFreeze'
     'New-EngineRelaunchRegistration'
     'Get-InteractiveUserId'
     'ConvertFrom-QuserOutput'
