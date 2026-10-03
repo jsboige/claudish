@@ -162,9 +162,11 @@ describe("#289 — the vision fallback never forwards the proxy's own key", () =
     expect(outboundHeaderNames).not.toContain("x-api-key");
   });
 
-  test("policy unset (tests, library use): a matching-shaped key still never substitutes — passthrough of a NON-matching key is unaffected", () => {
+  test("policy unset (tests, library use): a NON-matching key passes through unchanged, nothing substituted", () => {
     // Unset policy cannot know the fixture is a proxy key: the genuine key
-    // still flows through, and nothing is invented on its behalf.
+    // still flows through, and nothing is invented on its behalf. (The flip
+    // side — a proxy-shaped key IS forwarded under an unset policy — is why
+    // the boot wiring test below exists.)
     setVisionAuthPolicy({});
     const auth = extractAuthHeaders(fakeContext({ "x-api-key": GENUINE_CLIENT_KEY }));
     expect(auth["x-api-key"]).toBe(GENUINE_CLIENT_KEY);
@@ -185,5 +187,67 @@ describe("#289 — the vision fallback never forwards the proxy's own key", () =
     expect(auth["x-claudish-hops"]).toBeUndefined();
     // The genuine key survives the strip: the helper only removes proxy-own names.
     expect(auth["x-api-key"]).toBe(GENUINE_CLIENT_KEY);
+  });
+});
+
+// ---- boot wiring (review 03/10: "mutation W") ------------------------------------
+//
+// Every test above injects the policy itself — the suite proves the sanitizer
+// and says nothing about whether production ever arms it. Removing the
+// `setVisionAuthPolicy({ proxyKeys, anthropicApiKey })` call in
+// proxy-server.ts left this file 8/8 green while the inbound proxy key
+// flowed to api.anthropic.com verbatim (unset policy = no key can match).
+// This describe goes through createProxyServer with fixture proxy keys in
+// the env (the exact production source: `resolveProxyKeys(process.env.
+// CLAUDISH_PROXY_KEY …)`) and asserts the sanitizer is armed after boot.
+// Mutation W ⇒ the swap assertions go red.
+
+describe("#289 — boot wiring: createProxyServer arms the vision policy", () => {
+  const BOOT_PORT = 19922; // distinct from every other in-process server suite
+
+  // Same hermeticism contract as proxy-server-drain-freeze.test.ts: unset
+  // keys would change handler resolution during the spin.
+  const SANDBOX_ENV_KEYS = [
+    "ZAI_API_KEY", "ZAI_CODING_API_KEY", "GLM_API_KEY", "ZHIPU_API_KEY",
+    "GLM_CODING_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_CODING_API_KEY",
+    "OPENAI_API_KEY", "OPENAI_CODEX_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
+    "MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY", "LITELLM_API_KEY", "POE_API_KEY",
+    "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
+    "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
+    "CLAUDISH_CAPTURE_DIR",
+  ];
+  const savedEnv: Record<string, string | undefined> = {};
+
+  test("after boot with CLAUDISH_PROXY_KEY set, the inbound proxy key is swapped, not forwarded", async () => {
+    for (const k of SANDBOX_ENV_KEYS) {
+      savedEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+    process.env.CLAUDISH_PROXY_KEY = PROXY_PRIMARY;
+    process.env.CLAUDISH_PROXY_KEY_PREVIOUS = PROXY_PREVIOUS;
+    const { createProxyServer } = await import("./proxy-server.js");
+    const proxy = await createProxyServer(
+      BOOT_PORT, undefined, undefined, false, STORED_API_KEY, undefined, { quiet: true }
+    );
+    try {
+      // THE wiring assertions — these are what mutation W turns red: with the
+      // policy unset, proxyKeys is empty, nothing matches, and the proxy key
+      // would pass through verbatim instead of being swapped.
+      const swapped = extractAuthHeaders(fakeContext({ "x-api-key": PROXY_PRIMARY }));
+      expect(swapped["x-api-key"]).toBe(STORED_API_KEY);
+      const swappedPrev = extractAuthHeaders(fakeContext({ "x-api-key": PROXY_PREVIOUS }));
+      expect(swappedPrev["x-api-key"]).toBe(STORED_API_KEY);
+      // And the negative still holds through the real boot path.
+      const genuine = extractAuthHeaders(fakeContext({ "x-api-key": GENUINE_CLIENT_KEY }));
+      expect(genuine["x-api-key"]).toBe(GENUINE_CLIENT_KEY);
+    } finally {
+      await proxy.shutdown();
+      delete process.env.CLAUDISH_PROXY_KEY;
+      delete process.env.CLAUDISH_PROXY_KEY_PREVIOUS;
+      for (const k of SANDBOX_ENV_KEYS) {
+        if (savedEnv[k] === undefined) delete process.env[k];
+        else process.env[k] = savedEnv[k];
+      }
+    }
   });
 });

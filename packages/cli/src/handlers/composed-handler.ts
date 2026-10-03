@@ -80,9 +80,10 @@ import { stripProxyOwnHeaders } from "./native-handler.js";
  * #289 — credential policy for the vision fallback, injected once by
  * proxy-server at boot (same pattern as setRoleNominalResolver): the
  * ComposedHandler constructor has ~20 call sites and none of them knows
- * about proxy keys. Unset (tests, library use), a non-matching inbound
- * key flows through unchanged and a matching one is simply dropped —
- * never forwarded.
+ * about proxy keys. Unset (tests, library use), NO key can match, so an
+ * inbound proxy-shaped key is forwarded verbatim — the boot wiring in
+ * proxy-server is what arms the sanitizer in production (pinned by a
+ * createProxyServer test; review 03/10, mutation W).
  */
 interface VisionAuthPolicy {
   proxyKeys?: string[];
