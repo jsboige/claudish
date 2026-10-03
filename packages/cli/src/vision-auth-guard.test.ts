@@ -251,3 +251,97 @@ describe("#289 — boot wiring: createProxyServer arms the vision policy", () =>
     }
   });
 });
+
+// ---- #315: a foreign client key never leaves on the vision path ------------------
+//
+// The #289 sanitizer swaps a MATCHING proxy key; a NON-matching key is the
+// client's own credential and used to flow verbatim to api.anthropic.com
+// whatever its shape — the #296 shape-B class on a third call site (the
+// native lane has refused that shape since #303). Here it strips instead:
+// there is no client turn to refuse, the fallback's own contract is to
+// degrade. The predicate is the native lane's (isAnthropicShapedCredential,
+// shared — not a second copy), so the sites cannot drift.
+//
+// Mutation proof (one per half):
+//  - remove the `stripForeignVisionApiKey(auth)` call in
+//    sanitizeVisionAuthHeaders ⇒ the drop tests below go red while the #289
+//    suite stays green;
+//  - narrow isAnthropicShapedCredential to `sk-ant-api` (the drift this
+//    extraction forbids) ⇒ the oat-passes test here AND the native-lane
+//    OAuth assertions in native-credential-guard.test.ts go red together.
+
+describe("#315 — a non-Anthropic client x-api-key is dropped on the vision path", () => {
+  // Foreign fixtures, deliberately OTHER providers' shapes — never sk-ant-.
+  const FOREIGN_OR_KEY = "sk-or-v1-fixture-foreign-315";
+  const FOREIGN_GSK_KEY = "gsk-fixture-foreign-315";
+  // An oat-shaped CLIENT key: still Anthropic's, must pass (pins the shared
+  // predicate at `sk-ant-`, not `sk-ant-api`).
+  const CLIENT_OAT_KEY = "sk-ant-oat01-fixture-client-315";
+
+  test("foreign key (OpenRouter shape), policy armed: dropped, the outbound call carries no credential", async () => {
+    setVisionAuthPolicy({ proxyKeys: [PROXY_PRIMARY], anthropicApiKey: STORED_API_KEY });
+    const auth = extractAuthHeaders(fakeContext({ "x-api-key": FOREIGN_OR_KEY }));
+    expect(auth["x-api-key"]).toBeUndefined();
+    // The stored key must NOT be invented on the foreign key's behalf: the
+    // substitution is reserved for a MATCHING proxy key (#289).
+    expect(auth.authorization).toBeUndefined();
+
+    await describeImages(ONE_IMAGE, auth);
+    expect(outboundHeaderNames).not.toContain("x-api-key");
+    expect(outboundHeaderNames).not.toContain("authorization");
+  });
+
+  test("foreign key (Groq shape) degrades exactly like a missing credential: 401 → describeImages null (caller strips images, turn continues)", async () => {
+    setVisionAuthPolicy({ proxyKeys: [PROXY_PRIMARY] });
+    const auth = extractAuthHeaders(fakeContext({ "x-api-key": FOREIGN_GSK_KEY }));
+    expect(auth["x-api-key"]).toBeUndefined();
+
+    // The beforeEach stub answers 200; re-point it at the 401 Anthropic sends
+    // a credential-less call — the pre-#315 missing-credential behavior.
+    const stub = globalThis.fetch;
+    globalThis.fetch = (async (_input: any, _init: any) =>
+      new Response(JSON.stringify({ type: "error", error: { type: "authentication_error" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    try {
+      const descriptions = await describeImages(ONE_IMAGE, auth);
+      // null = the documented fallback trigger: the caller strips the images
+      // and the turn continues (never-hang holds).
+      expect(descriptions).toBeNull();
+    } finally {
+      globalThis.fetch = stub;
+    }
+  });
+
+  test("policy UNSET (tests, library use): a foreign key is STILL dropped — the shape is knowable without config", () => {
+    // Contrast with #289's unset doctrine (a proxy-shaped key cannot be
+    // recognized without the policy): sk-ant- is a prefix, not a config.
+    setVisionAuthPolicy({});
+    const auth = extractAuthHeaders(fakeContext({ "x-api-key": FOREIGN_OR_KEY }));
+    expect(auth["x-api-key"]).toBeUndefined();
+  });
+
+  test("AC negative: an sk-ant-oat CLIENT key passes unchanged — the shared predicate is sk-ant-, not sk-ant-api", async () => {
+    setVisionAuthPolicy({ proxyKeys: [PROXY_PRIMARY] });
+    const auth = extractAuthHeaders(fakeContext({ "x-api-key": CLIENT_OAT_KEY }));
+    expect(auth["x-api-key"]).toBe(CLIENT_OAT_KEY);
+
+    await describeImages(ONE_IMAGE, auth);
+    expect(outboundHeaders["x-api-key"]).toBe(CLIENT_OAT_KEY);
+  });
+
+  test("kill switch CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD=0 restores the passthrough (one switch, one policy — #305 precedent)", () => {
+    const saved = process.env.CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD;
+    process.env.CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD = "0";
+    try {
+      setVisionAuthPolicy({ proxyKeys: [PROXY_PRIMARY] });
+      const auth = extractAuthHeaders(fakeContext({ "x-api-key": FOREIGN_OR_KEY }));
+      // Pre-#315 behavior: the operator explicitly disarmed the shape guard.
+      expect(auth["x-api-key"]).toBe(FOREIGN_OR_KEY);
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD;
+      else process.env.CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD = saved;
+    }
+  });
+});
