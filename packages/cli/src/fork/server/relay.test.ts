@@ -352,6 +352,12 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     // The freeze's contract with the client survives the rebuild — it used to
     // be dropped for every relayed non-streaming error.
     expect(r!.headers.get("retry-after")).toBe("15");
+    // #318 review — the MARKER survives the hop too: in a chain A→B→hub, this
+    // response is what relay A receives, and A is itself a relay. Without the
+    // marker here, A reads a plain 503 and replays locally — exactly what
+    // #318 removes — so the property has to compose across hops (#279's
+    // x-claudish-hops exists because A→B chains are a supported topology).
+    expect(r!.headers.get("x-claudish-drain-freeze")).toBe("1");
     expect(state.consecutiveFail).toBe(0);
   });
 

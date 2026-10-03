@@ -509,6 +509,14 @@ export async function forwardToUpstream(
     // 15s") and the old rebuild dropped it for every relayed non-streaming
     // error; preserve it whenever the hub sent one.
     const retryAfter = res.headers.get("retry-after");
+    // #318 review — the marker must survive the hop too. In a chain A→B→hub,
+    // B passes the freeze 503 through to A, and A is itself a relay: without
+    // the marker on the relayed response, A reads a plain 503 and does exactly
+    // what #318 removes (markFail + local replay + AUTONOMOUS flips, all
+    // because the hub is being drained). Chains are a supported topology
+    // (#279's hop list exists because A→B shapes happen), so the property
+    // has to compose. Fixed literal set by our own hub — nothing sensitive.
+    const drainFreezeMarker = res.headers.get("x-claudish-drain-freeze");
     return carryNoticeHeader(
       res,
       new Response(text, {
@@ -516,6 +524,7 @@ export async function forwardToUpstream(
         headers: {
           "Content-Type": contentType || "application/json",
           ...(retryAfter ? { "retry-after": retryAfter } : {}),
+          ...(drainFreezeMarker ? { "x-claudish-drain-freeze": drainFreezeMarker } : {}),
         },
       })
     );
