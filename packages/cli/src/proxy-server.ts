@@ -17,7 +17,7 @@ import { LocalTransport } from "./providers/transport/local.js";
 import { LocalModelAdapter } from "./adapters/local-adapter.js";
 import { PoeProvider } from "./providers/transport/poe.js";
 import type { ModelHandler } from "./handlers/types.js";
-import { ComposedHandler, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
+import { ComposedHandler, setVisionAuthPolicy, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import {
   resolveProvider,
   parseUrlModel,
@@ -496,6 +496,10 @@ export async function createProxyServer(
 
   // Define handlers for different roles
   const nativeHandler = new NativeHandler(anthropicApiKey, options.advisorModels, options.advisorCollector, proxyKeys);
+  // #289 — the vision fallback (image descriptions on the ComposedHandler
+  // path) must never forward the proxy's own key to api.anthropic.com: same
+  // key set, same swap rule as the native lane above.
+  setVisionAuthPolicy({ proxyKeys, anthropicApiKey });
   const openRouterHandlers = new Map<string, ModelHandler>(); // Map from Target Model ID -> OpenRouter Handler
   const localProviderHandlers = new Map<string, ModelHandler>(); // Map from Target Model ID -> Local Provider Handler
   const remoteProviderHandlers = new Map<string, ModelHandler>(); // Map from Target Model ID -> Gemini/OpenAI Handler

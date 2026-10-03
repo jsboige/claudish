@@ -32,10 +32,13 @@ Be comprehensive - this description will be the only information the model has a
 
 /**
  * Auth headers extracted from the original Claude Code request.
- * Passed through unchanged to the Anthropic vision API call.
+ * Passed to the Anthropic vision API call — after sanitizeVisionAuthHeaders
+ * (#289) has replaced a matching proxy key with the stored Anthropic key.
  */
 export interface VisionProxyAuthHeaders {
   "x-api-key"?: string;
+  /** #289 — substituted sk-ant-oat key, same swap rule as NativeHandler. */
+  authorization?: string;
 }
 
 /**
@@ -117,6 +120,7 @@ async function describeImage(
     "anthropic-version": "2023-06-01",
   };
   if (auth["x-api-key"]) headers["x-api-key"] = auth["x-api-key"];
+  if (auth["authorization"]) headers["authorization"] = auth["authorization"];
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
