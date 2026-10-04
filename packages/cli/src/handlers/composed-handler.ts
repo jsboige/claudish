@@ -1666,6 +1666,23 @@ export function isTransientOverload(status: number, errorText: string): boolean 
 }
 
 /**
+ * #299-B — the class the cascade's one-shot overload walk answers to: a
+ * provider overload in either of its wire shapes. A bare 529 is the shape the
+ * proxy itself surfaces once the patient backoff is exhausted (the 429/503
+ * overload forms convert to 529 above); `isTransientOverload` covers the
+ * 429-with-overloaded-body and 503 forms that reach the cascade directly.
+ *
+ * Deliberately NOT folded into isTransientOverload: that predicate also gates
+ * the ~5-minute patient backoff, and a 529 entering it would delay every
+ * overloaded turn by minutes before the walk could run — the 2026-10-02 hub
+ * measurement shows sustained 529s, where a fast walk to a healthy step beats
+ * a patient wait on a provider already refusing ~30 % of attempts.
+ */
+export function isOverloadWalkClass(status: number, errorText: string): boolean {
+  return status === 529 || isTransientOverload(status, errorText);
+}
+
+/**
  * Return a human-readable recovery hint based on HTTP status and error body.
  *
  * Exported for tests: this hint is the line an operator reads first, and a wrong
