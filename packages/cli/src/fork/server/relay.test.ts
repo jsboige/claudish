@@ -324,6 +324,69 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     expect(state.consecutiveFail).toBe(0);
   });
 
+  // ── #318: the hub's own drain admission freeze, marked ─────────────────────
+  // The #306 freeze answers new admissions with 503 + Retry-After while the hub
+  // is about to restart. A relay used to read that as a hub failure (markFail +
+  // local replay), fighting the drain it exists to survive. The marker header
+  // is the discriminator: an UNMARKED 503 keeps the fallthrough (a hub's own
+  // death is still a real 503), and only the hub writes the marker — real
+  // provider overloads emit an Anthropic-shaped overloaded_error body too, so
+  // the body alone could never tell them apart.
+  const DRAIN_FREEZE_503_BODY = JSON.stringify({
+    type: "error",
+    error: {
+      type: "overloaded_error",
+      message: "Proxy is draining for a restart (admission freeze). Retry shortly — in-flight streams are unaffected.",
+    },
+  });
+  const DRAIN_FREEZE_503_HEADERS = {
+    "content-type": "application/json",
+    "retry-after": "15",
+    "x-claudish-drain-freeze": "1",
+  };
+
+  it("a MARKED 503 is PASSED THROUGH — client gets 503 + body + Retry-After, no markFail, no local replay (#318)", async () => {
+    fetchImpl = async () => new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).not.toBeNull(); // non-null ⇒ forwarded to the client; null is the local-replay fallthrough
+    expect(r!.status).toBe(503);
+    expect(await r!.text()).toBe(DRAIN_FREEZE_503_BODY);
+    // The freeze's contract with the client survives the rebuild — it used to
+    // be dropped for every relayed non-streaming error.
+    expect(r!.headers.get("retry-after")).toBe("15");
+    // #318 review — the MARKER survives the hop too: in a chain A→B→hub, this
+    // response is what relay A receives, and A is itself a relay. Without the
+    // marker here, A reads a plain 503 and replays locally — exactly what
+    // #318 removes — so the property has to compose across hops (#279's
+    // x-claudish-hops exists because A→B chains are a supported topology).
+    expect(r!.headers.get("x-claudish-drain-freeze")).toBe("1");
+    expect(state.consecutiveFail).toBe(0);
+  });
+
+  it("a MARKED 503 passes through for a STREAMING request too, and two keep the relay NOMINAL (#318)", async () => {
+    fetchImpl = async () => new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
+    const state = deadState();
+    const r1 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+    const r2 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+    for (const r of [r1, r2]) {
+      expect(r).not.toBeNull();
+      expect(r!.status).toBe(503);
+      expect(await r!.text()).toBe(DRAIN_FREEZE_503_BODY);
+    }
+    expect(state.consecutiveFail).toBe(0); // a drain freeze never fed the hysteresis
+    expect(state.alive).toBe(true); // still NOMINAL after two consecutive freezes
+  });
+
+  it("an UNMARKED 503 keeps the fallthrough — a hub's own failure is NOT passed through (#318 control)", async () => {
+    fetchImpl = async () =>
+      new Response("hub boom", { status: 503, headers: { "content-type": "application/json" } });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).toBeNull(); // still the local-replay fallthrough
+    expect(state.consecutiveFail).toBe(1); // still a markFail
+  });
+
   it("success resets the failure streak", async () => {
     const state = deadState();
     state.consecutiveFail = 1; // one prior failure

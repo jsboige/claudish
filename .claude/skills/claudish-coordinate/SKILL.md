@@ -1,6 +1,6 @@
 ---
 name: claudish-coordinate
-description: Cycle de coordination du workspace claudish sur myia-ai-01 (rôle coordinateur, cadence 6h sous Opus). Dispatche du grain aux 3 workers et fait avancer les issues, review/merge exigeants, lit dashboard + inbox, sonde le hub et le sidecar, contrôle le trafic et la leak-policy Anthropic, fait le point PRs, présente les arbitrages au user, publie un bilan [DONE]. À invoquer au réveil du cron ou quand le user demande un tour de coordination claudish.
+description: Cycle de coordination du workspace claudish sur myia-ai-01 (rôle coordinateur, cadence 6h sous Opus). Dispatche une file de 5-6 grains à chacun des 4 workers et fait avancer les issues, review/merge exigeants, lit dashboard + inbox, sonde le hub et le sidecar, contrôle le trafic et la leak-policy Anthropic, fait le point PRs, présente les arbitrages au user, publie un bilan [DONE]. À invoquer au réveil du cron ou quand le user demande un tour de coordination claudish.
 ---
 
 # Cycle de coordination claudish — myia-ai-01
@@ -59,9 +59,10 @@ ton rôle de coordinateur et que tu fasses avancer les issues en dispatchant du 
 de flottements ? » Conséquences opératoires, à tenir **chaque cycle** :
 1. **Aucun cycle idle** — un cycle qui ne fait que sonder l'infra et publier un [DONE] de surveillance
    est un cycle raté. La surveillance est le socle, pas le livrable.
-2. **Dispatch explicite aux 3 workers** (`po-2023`, `po-2024`, `po-2025`) : chaque worker sort du cycle
-   avec un grain nommé, borné, et une issue de rattachement. Un worker qui signale « file vide » est
-   un défaut de dispatch, pas un état acceptable (po-2024 l'a signalé le 18/09 11:18Z).
+2. **Dispatch explicite aux workers** (`po-2023`, `po-2024`, `po-2025`, et `po-2026` depuis fin septembre) :
+   chaque worker sort du cycle avec une **file de plusieurs grains**, cible **5 à 6 grains cohérents**,
+   chacun nommé, borné et rattaché à une issue (mandat user du 04/10, voir Phase 4c). Un worker qui
+   signale « file vide » est un défaut de dispatch, pas un état acceptable (po-2024 l'a signalé le 18/09 11:18Z).
 3. **Reviews et merges exigeants** — lecture intégrale (body, commentaires, reviews avec `state`, diff),
    `Closes #NN` vérifié, et refus assumé quand le grain ne tient pas. « Exigeant » veut dire que le
    merge n'est pas l'issue par défaut d'une PR.
@@ -144,7 +145,7 @@ Trois leçons, dans l'ordre où elles mordent :
 
 ```
 CronCreate(cron: "37 */6 * * *",
-           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7. Mandat user du 18/09 : endosser le rôle de coordinateur — faire avancer les issues en dispatchant du grain aux 3 workers (po-2023, po-2024, po-2025), et faire des reviews/merges exigeants. Aucun cycle idle.",
+           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7. Mandat user du 18/09 : endosser le rôle de coordinateur — faire avancer les issues en dispatchant une file de 5-6 grains cohérents à chacun des 4 workers (po-2023, po-2024, po-2025, po-2026 — mandat user 04/10, Phase 4c), et faire des reviews/merges exigeants. Aucun cycle idle.",
            recurring: true)
 ```
 
@@ -369,6 +370,12 @@ Opus est **cantonné aux 5 lanes coordinatrices d'ai-01** :
 | `d--Argumentum` | pré-release qui s'éternise |
 | `d--claudish` | coordination (ce workspace) |
 
+**Lanes promues par le user (autorisées, à compter mais pas à signaler)** : `g--Mon-Drive-Maintenance`
+sur ai-01 (08/09, SAV du matin) · **`D:\Dev\CoursIA-3` sur po-2024** (04/10, registre #44 : « Oui
+elle a le droit »). Cette dernière est la première lane Opus **hors ai-01**. Son identifiant de poste paie,
+sur le même forfait hebdomadaire. Signature : `machine=myia-po-2024`, `device_id8=0b9b0d8c`. Le détail
+est dans la memory `opus-spend-policy-five-lanes`.
+
 **Tout le reste = Sonnet/GLM ou Haiku/MiniMax avec leurs failover respectifs** (quelques `gpt sol`
 sur po-2025). L'enveloppe est **élastique** : elle dépend des crédits hebdo, et **il n'existe pas de
 sonde fiable sur tous les providers** — donc ne jamais présenter un plafond comme mesuré. Une lane
@@ -439,6 +446,33 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 - **Chercher les collisions** : tous les agents poussent sous `jsboige`. Deux PRs qui touchent les mêmes fichiers = doublon probable (cas #63/#64, 27-28/08). Comparer les `files`, pas les titres.
 - **Avant tout merge/review** : lire le body complet, tous les commentaires, toutes les reviews avec leur `state`, et le diff. Ne pas merger sur un `CHANGES_REQUESTED` non adressé. Il n'y a **aucun gate CI** sur ce dépôt (le seul check est un no-op) : « en attente de CI » est un faux bloqueur, les tests locaux font foi.
 
+### Phase 4c — Dispatch : une file de grains par worker (mandat user 04/10)
+
+Verbatim : « il faudrait que tu mandates plusieurs grains à chaque worker par cycle de coordination ».
+Hypothèse du user : en juillet, la gestion **mandatait explicitement 5 ou 6 grains cohérents à chaque lane
+entre deux coordinations**, au lieu de laisser le worker piocher ses grains « plus péniblement ». C'est
+ce qui donnait sa fluidité à la production. Un premier indice existe : mesure du 15/09 sur la lane CoursIA,
+**56 dispatchs sortants par jour en juillet contre 8 en septembre**. Un second indice date du 04/10 :
+CoursIA mergeait **~23 PR par issue fermée en juillet, contre ~3 en septembre**. Le grain est passé de
+« une PR » à « une issue, une PR, une review ». L'enquête en cours est **#328** (G6 = la mesure de cette
+phase sur claudish), à relire avant de changer cette phase.
+
+Avec un seul grain par cycle de 6 h, chaque aller-retour de review immobilise le worker jusqu'au cycle
+suivant. Avec une file, il enchaîne le grain suivant pendant que le précédent attend ma review.
+
+Règles de la file :
+- **5 à 6 grains par worker, ordonnés.** Chaque grain donne son issue, son livrable vérifiable (AC) et sa taille.
+  Le worker les prend dans l'ordre et poste `[CLAIMED] #NN` au moment où il commence chacun d'eux.
+- **Cohérents** : une même zone de code ou une même famille d'issues par worker, pour qu'il garde son contexte
+  chargé. Deux files ne touchent pas les mêmes fichiers : comparer les zones avant de poster.
+- **Indépendants du merge des autres** autant que possible. Un grain qui dépend d'une PR non mergée se met
+  en fin de file, jamais en PR empilée (une PR empilée blanchit du code non relu).
+- **Retour de review prioritaire** : une PR du worker sous CR passe en tête de sa file, avec « attend TON push ».
+- **Une file se renouvelle, elle ne s'empile pas.** À chaque cycle, relire ce qui a été fait, retirer
+  ce qui est obsolète, compléter jusqu'à 5-6. Le message de dispatch republie la file entière, pas un delta.
+- Au bilan (Phase 6), compter par worker les **grains dispatchés et les grains livrés** depuis le cycle
+  précédent : c'est la mesure de l'intervention elle-même.
+
 ### Phase 4b — Relevé des consoles fournisseurs (depuis le 01/10)
 
 Le user a connecté et ouvert lui-même, dans le **Playwright Edge** d'ai-01, un onglet d'usage par fournisseur, 11 au total : forfaits et pay-as-you-go. **Les URLs font foi, mot pour mot, dans `C:\Users\MYIA\.claudish-browser\provider-consoles-urls.json`.** Ne jamais les deviner ni les modifier : mes URLs devinées menaient à des accueils, des 404 ou des redirections.
@@ -482,6 +516,27 @@ roosync_dashboard(action:"append", type:"workspace", content:"[DONE] ...")
 Les rapports vont sur le dashboard, **pas** dans des fichiers du dépôt.
 
 Le bilan **représente le registre des questions ouvertes** (entrées en attente, non bloquant) — section obligatoire tant que le registre n'est pas vide.
+
+**Tableau d'avancement, obligatoire dans chaque bilan** (question user du 04/10 : « Est-ce que la
+coordination de vos issues avance de cycle en cycle ? »). Une réponse sans chiffres ne vaut rien, d'où
+quatre lignes **mesurées**, jamais estimées :
+
+1. **Depuis le cycle précédent** : PRs mergées · issues fermées · issues ouvertes (`gh pr list --state merged`
+   et `gh issue list --state all`, sur `mergedAt` / `closedAt` / `createdAt`).
+2. **Qui tient chaque PR ouverte** : *auteur* (un CR de ma part attend son push) ou *moi* (un push attend ma
+   review), avec l'âge en heures. Une PR de plus de 24 h dans l'une ou l'autre colonne se nomme dans le bilan.
+   Le piège est mesuré : mes CR sont des **commentaires** (même compte, pas de `REQUEST_CHANGES`), et un worker
+   qui lit « 0 review » attend ma re-review pendant que j'attends son push. #319 et #307 ont été bloquées ~19 h
+   ainsi, le 03-04/10.
+3. **Issues actionnables sans activité depuis 7 jours ou plus** (hors épics) : nommées, puis dispatchées,
+   fermées ou parquées explicitement.
+4. **Dérive d'une issue** : un fil qui accumule des commentaires d'enquête sans livrer son AC. Cas fondateur :
+   #298, 22 commentaires de décompte de fenêtres, alors que son correctif A dormait dans #302. Il se recadre
+   vers son livrable.
+
+Mesure de référence (04/10, semaines lundi→dimanche) : mergées 65 / 58 / 23, issues fermées 28 / 25 / 18,
+ouvertes 29 / 25 / 26 (semaines du 14/09, 21/09, 28/09). La file grossit de +8 la dernière semaine ; le délai
+PR médian est passé de 0,7 h à 3,6 h depuis le mandat « reviews exigeantes ».
 
 ### Phase 7 — Cron : garde-fou de sortie (CRITIQUE)
 
