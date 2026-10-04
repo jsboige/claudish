@@ -1194,9 +1194,15 @@ export async function createProxyServer(
         // blip costs one short skip of a step that has a live successor — whereas not
         // marking makes every subsequent request re-pay the round-trip (and its
         // timeout) to a step that may be down for hours. Any success resets the count.
-        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody));
+        // The nonQuota flag (#276) is what keeps a dwell-pinned session from being
+        // re-pinned DEEPER by this advance: the step is broken, not walled, so the
+        // session's dwell is forfeited (it rejoins the general resolution each
+        // request) instead of riding this step's successor past a recovered nominal.
+        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody), { nonQuota: true });
         if (delegation && !delegation.owner.nominal) {
-          markStepFailed(delegation.owner.role, delegation.owner.stepIndex, why, parseResetAtFromBody(errBody));
+          markStepFailed(delegation.owner.role, delegation.owner.stepIndex, why, parseResetAtFromBody(errBody), {
+            nonQuota: true,
+          });
         }
         continue;
       }
