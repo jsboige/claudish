@@ -54,14 +54,20 @@ SEP_RE = re.compile(r"[\\/]+")
 USAGE_RX = re.compile(r'"usage"\s*:\s*\{([^}]*)\}')
 FIELD_RX = re.compile(
     r'"(input_tokens|cache_read_input_tokens|cache_creation_input_tokens|output_tokens)"\s*:\s*(\d+)')
-# The request envelope's attribution lives at OPPOSITE ENDS of the file, and a
-# head-only read silently loses one of them: `Primary working directory` is in
-# messages[0] (near the top) while `body.metadata.user_id` comes AFTER messages
-# and tools (near the bottom). Reading the head alone measured 4 559 captures as
-# `unattributed` over a 2 h window — a silent under-count that looks exactly
-# like "these clients send no attribution". Both ends are read.
-HEAD_BYTES = 256 * 1024
-TAIL_BYTES = 256 * 1024
+# Three attribution markers at three depths, measured on 254 sampled captures
+# over a 2 h hub window: the ENVELOPE (`machine`) opens the file; the workspace
+# marker (`Primary working directory`, first occurrence inside messages) sits in
+# the MIDDLE at p50 267 KB / p95 351 KB — `messages` itself starts around byte
+# 200, but the conversation turns precede the message that carries the marker;
+# and `body.metadata.user_id` closes the body, near the end. A head-only read
+# measured 4 559 captures as `unattributed` (user_id lost); a 256 KB head then
+# left a large share of attributed captures with workspace `-` (marker inside
+# the dropped middle of files p50 649 KB / p95 899 KB). Hence a DEEP head that
+# must reach the workdir marker, plus a short tail that only has to reach the
+# trailing metadata. What the dropped middle of >640 KB files holds is later
+# conversation turns, which nothing here reads.
+HEAD_BYTES = 512 * 1024
+TAIL_BYTES = 128 * 1024
 
 
 def ts_of(m):

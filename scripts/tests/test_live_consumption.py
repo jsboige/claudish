@@ -158,10 +158,49 @@ def test_attribution_at_the_far_end_is_still_read():
               (unatt, list(per_h)))
 
 
+def test_workdir_marker_in_the_dropped_middle():
+    """Measured live: the workspace marker sits at p50 267 KB inside `messages`
+    (conversation turns precede the message carrying it), while `messages`
+    starts around byte 200 — so a head too shallow loses the workspace on
+    captures p50 649 KB even though it finds machine and session. The shallow
+    pass below is the NEGATIVE CONTROL: if it ever starts finding the workspace
+    too, this pin has stopped testing the seam."""
+    with tempfile.TemporaryDirectory() as d:
+        req = "req-1-0011-2026-10-04T22-30-00-000Z-direct.json"
+        uid = json.dumps({"session_id": "feedfacefeed", "is_subagent": False})
+        # pad pushes the marker past a 256 KB head; tailpad makes the file big
+        # enough that the marker lands in the range a shallow head+tail drops.
+        pad = "x" * 300_000
+        tailpad = "y" * 200_000
+        body = ('{"machine":"myia-po-2025","pid":1,"body":{"messages":'
+                '[{"content":['
+                '{"text":' + json.dumps(pad) + '},'
+                '{"text":' + json.dumps("Primary working directory: D:\\dev\\claudish\n") + '}]},'
+                '{"content":[{"text":' + json.dumps(tailpad) + '}]}],'
+                '"metadata":{"user_id":' + json.dumps(uid) + '}}}')
+        with open(os.path.join(d, req), "w", encoding="utf-8") as f:
+            f.write(body)
+        resp = "resp-1-r0011-2026-10-04T22-30-05-000Z-openai-glm-5.3.sse"
+        with open(os.path.join(d, resp), "w", encoding="utf-8") as f:
+            f.write('{"usage":{"output_tokens":2}}')
+
+        rows, _ = lc.collect(d, hours=24 * 365 * 10)
+        per = lc.rollup(rows)
+        check("middle: default caps find the workspace",
+              "myia-po-2025:claudish:feedfacefeed" in per, list(per))
+
+        rows_s, _ = lc.collect(d, hours=24 * 365 * 10, head=256 * 1024, tail=128 * 1024)
+        per_s = lc.rollup(rows_s)
+        check("middle: NEGATIVE CONTROL — a shallow head loses the workspace",
+              "myia-po-2025:-:feedfacefeed" in per_s
+              and "myia-po-2025:claudish:feedfacefeed" not in per_s, list(per_s))
+
+
 if __name__ == "__main__":
     for fn in (test_usage_takes_max_not_first, test_user_id_parse_and_the_echo_trap,
                test_pick_request_prefers_the_preceding_one, test_workspace_extraction,
-               test_end_to_end_rollup, test_attribution_at_the_far_end_is_still_read):
+               test_end_to_end_rollup, test_attribution_at_the_far_end_is_still_read,
+               test_workdir_marker_in_the_dropped_middle):
         print(f"== {fn.__name__}")
         fn()
     print()
