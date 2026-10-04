@@ -608,6 +608,75 @@ describe("#320 CLAUDISH_RELAY_HEADER_TIMEOUT_MS — configurable, empty-safe, bo
     expect(r).toBeNull(); // fell through to local — the turn continues, bounded
     expect(Date.now() - t0).toBeLessThan(5_000);
   });
+
+  it("the NOMINAL→AUTONOMOUS flip releases in-flight header waits with their own label (#323 B1)", async () => {
+    // /health probes fail fast (the prober's evidence); /v1/messages stays mute,
+    // so the forward sits in the header phase when the flip lands. At a 360s
+    // budget the flip (~200s in production) is the FIRST thing that knows those
+    // waits are dead — without the abort, every forward dispatched inside the
+    // detection window sits out the full budget (review B1). Mutation pin: drop
+    // the abort loop in markFail and this test times out red (60s budget never
+    // fires inside the 20s window).
+    fetchImpl = (url: any, init: any) => {
+      if (String(url).endsWith("/health")) throw new Error("probe refused");
+      return muteFetchImpl()(url, init);
+    };
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const consoleLines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      consoleLines.push(a.join(" "));
+    };
+    try {
+      const t0 = Date.now();
+      const pending = forwardToUpstream(
+        mockForwardContext({}),
+        { model: "m" },
+        state,
+        60_000
+      );
+      await new Promise((r) => setTimeout(r, 30)); // reach the header wait
+      await proberTick(state); // heartbeat failure #1
+      await proberTick(state); // #2 → flip → the waiter is released
+      const r = await pending;
+      const dt = Date.now() - t0;
+      expect(r).toBeNull();
+      expect(dt).toBeLessThan(5_000); // released at the flip (~30ms), not the 60s budget
+      expect(state.alive).toBe(false);
+      // The two prober failures set consecutiveFail=2; the abort itself must not
+      // count as a third failure — the flip already spoke, it is not new evidence.
+      expect(state.consecutiveFail).toBe(2);
+      // Distinct label: not "header-timeout" (that reads as latency) and not
+      // "connect:" (that reads as transport and would feed the hysteresis).
+      expect(consoleLines.some((l) => l.includes("aborted-on-autonomous"))).toBe(true);
+      expect(consoleLines.some((l) => l.includes("header-timeout after"))).toBe(false);
+    } finally {
+      console.log = origLog;
+    }
+  }, 20_000);
+
+  it("a re-forward draws on the turn's ONE header deadline, not a fresh budget (#323 B2)", async () => {
+    // Original forward: headers arrive instantly, the body dies pre-visible
+    // (#170's trigger). The re-forward target is mute — only its abort ends it.
+    // With the turn-wide 600ms deadline: ladder delay 400ms + ~200ms remaining
+    // budget ≈ 600ms total. A fresh per-leg budget (the mutation) adds the full
+    // 600ms at the re-forward → ~1000ms; the pin sits between at 800ms.
+    let calls = 0;
+    fetchImpl = (_url: any, init: any) => {
+      calls++;
+      if (calls === 1) return Promise.resolve(sseDyingResponse());
+      return muteFetchImpl()(_url, init);
+    };
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const t0 = Date.now();
+    const out = await drainResponse(
+      await forwardToUpstream(mockForwardContext({}), { model: "m" }, state, 600)
+    );
+    const dt = Date.now() - t0;
+    expect(calls).toBeGreaterThanOrEqual(2); // the death did trigger a re-forward
+    expect(out).toContain("message_stop"); // finalized with the original death, not hung
+    expect(dt).toBeLessThan(800); // the ONE deadline bounded the whole turn's header legs
+  }, 20_000);
 });
 
 describe("forwardToUpstream — streaming (never-hang delegation)", () => {
