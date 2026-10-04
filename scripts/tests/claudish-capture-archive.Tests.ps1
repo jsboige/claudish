@@ -331,3 +331,129 @@ exit /b 0
         $purgeCheck  | Should -BeLessThan $purgeDelete
     }
 }
+
+Describe 'compress-captures.ps1 partial-archive quarantine + re-upload integrity gate (#322)' {
+    # The 04/10 incident: 7z a failed mid-pack, the partial stayed under the
+    # canonical name, and the re-upload pass shipped it off-site as a valid
+    # archive (93 MB standing in for 22 GB). Two guards: the partial is
+    # quarantined (renamed, suffix after .7z) the moment the pack fails, and
+    # the re-upload pass requires `7z t` before shipping anything.
+    BeforeAll {
+        $script:FakeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-fake7z-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:FakeRoot -Force | Out-Null
+        $script:Fake7z = Join-Path $script:FakeRoot 'fake7z.bat'
+        [System.IO.File]::WriteAllText($script:Fake7z, @'
+@echo off
+setlocal
+set "MODE=%~1"
+set "TARGET="
+for %%F in (%*) do if /i "%%~xF"==".7z" set "TARGET=%%~fF"
+if /i "%MODE%"=="a" goto add
+if /i "%MODE%"=="t" goto test
+exit /b 1
+:add
+if not defined TARGET exit /b 1
+if "%CC_FAKE7Z_FAIL_ADD%"=="1" (
+  echo partial> "%TARGET%"
+  exit /b 2
+)
+echo fake> "%TARGET%"
+exit /b 0
+:test
+if not defined TARGET exit /b 2
+if not exist "%TARGET%" exit /b 2
+if "%CC_FAKE7Z_FAIL_TEST%"=="1" exit /b 2
+exit /b 0
+'@, (New-Object System.Text.ASCIIEncoding))
+        function Invoke-CompactionRun {
+            param([string]$CaptureDir, [string]$GDriveDir)
+            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+        }
+        function New-GuardSandbox {
+            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-322-{0}" -f ([guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'gd')  -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap\archive') -Force | Out-Null
+            return $tmp
+        }
+        function Add-LooseCapture {
+            param([string]$CaptureDir, [int]$DaysBack)
+            $day = (Get-Date).ToUniversalTime().Date.AddDays(-$DaysBack).ToString('yyyy-MM-dd')
+            [System.IO.File]::WriteAllText((Join-Path $CaptureDir "req-1-1-$($day)T00-00-00.json"), 'loose')
+            return $day
+        }
+    }
+    BeforeEach {
+        # Inert unless a test sets its FAIL_* var (and always restored, so the
+        # shared #208 fake semantics never leak across tests).
+        $script:SavedFailAdd  = $env:CC_FAKE7Z_FAIL_ADD
+        $script:SavedFailTest = $env:CC_FAKE7Z_FAIL_TEST
+        $env:CC_FAKE7Z_FAIL_ADD  = $null
+        $env:CC_FAKE7Z_FAIL_TEST = $null
+    }
+    AfterEach {
+        $env:CC_FAKE7Z_FAIL_ADD  = $script:SavedFailAdd
+        $env:CC_FAKE7Z_FAIL_TEST = $script:SavedFailTest
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:FakeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'a failed pack quarantines its partial instead of leaving the canonical name behind (#322 AC1)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day  = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $env:CC_FAKE7Z_FAIL_ADD = '1'
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0          # the failed night is visible
+            $log | Should -Match 'QUARANTINE'                 # loud, countable marker
+            # The canonical name no longer exists...
+            Test-Path (Join-Path $cap "archive\captures-$($day)-testbox.7z") | Should -BeFalse
+            # ...the partial lives under a .7z-prefixed quarantine suffix, which
+            # the captures-*.7z filter, the day parser and every reader exclude
+            # structurally (nothing can ever ship or list it again).
+            $q = Get-ChildItem (Join-Path $cap 'archive') -Filter "captures-$($day)-testbox.7z.partial-*" -File
+            @($q).Count | Should -Be 1
+            # Loose originals kept (KEEPING loose files): the next run re-packs from scratch.
+            Test-Path (Join-Path $cap "req-1-1-$($day)T00-00-00.json") | Should -BeTrue
+            # And nothing left the machine under the canonical name.
+            Test-Path (Join-Path $gd "captures-$($day)-testbox.7z") | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'the re-upload pass refuses a local archive that fails 7z t (#322 AC2 — the 04/10 shape)' {
+        # Without the gate this run re-uploads the 30-byte unreadable archive
+        # (destination absent = write verdict), which is exactly the incident.
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1     # today's pack: uploads normally
+            $oldDay = (Get-Date).ToUniversalTime().Date.AddDays(-2).ToString('yyyy-MM-dd')
+            [System.IO.File]::WriteAllText((Join-Path $cap "archive\captures-$($oldDay)-testbox.7z"), ('y' * 30))
+            $env:CC_FAKE7Z_FAIL_TEST = '1'                            # every integrity test fails
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0
+            # Refused, never renamed (old day: loose originals long gone, the
+            # log line is the escalation), never uploaded.
+            $log | Should -Match ("REFUSE captures-$($oldDay)-testbox: local archive fails 7z t")
+            Test-Path (Join-Path $gd "captures-$($oldDay)-testbox.7z") | Should -BeFalse
+            (Get-Item (Join-Path $cap "archive\captures-$($oldDay)-testbox.7z")).Length | Should -Be 30
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'wiring: the integrity gate runs BEFORE the re-upload Copy-Item' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        $reup  = $text.IndexOf('re-upload pass')
+        $gate  = $text.IndexOf('& $SevenZip t', $reup)
+        $copy  = $text.IndexOf('Copy-Item -LiteralPath $arch.FullName', $reup)
+        $reup | Should -BeGreaterThan 0
+        $gate | Should -BeGreaterThan 0
+        $gate | Should -BeLessThan $copy
+    }
+}

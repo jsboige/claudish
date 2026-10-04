@@ -220,6 +220,30 @@ foreach ($day in $daysToArchive) {
       }
     } else {
       $errors++
+      # #322: a failed pack leaves a PARTIAL archive on disk, and the re-upload
+      # pass below ships whatever carries the canonical name — measured 04/10:
+      # captures-2026-09-30.7z truncated mid-pack (93 MB standing in for 22 GB
+      # of input) went off-site as a valid archive, and the next nights kept
+      # retrying against the corpse. Quarantine the partial the moment the pack
+      # fails: rename (reversible, never delete), suffix AFTER ".7z" so the
+      # captures-*.7z filter, the day parser and every reader exclude it
+      # structurally. The loose files are kept below, so the next run re-packs
+      # the day from scratch instead of appending to a corpse. If the rename
+      # itself fails, the partial keeps its canonical name — but the re-upload
+      # pass now tests every archive with `7z t` before shipping it, so the two
+      # guards cover each other.
+      if (Test-Path -LiteralPath $archivePath) {
+        $qTs = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
+        $qPath = "$archivePath.partial-$qTs"
+        $n = 1
+        while (Test-Path -LiteralPath $qPath) { $n++; $qPath = "$archivePath.partial-$qTs-$n" }
+        try {
+          Rename-Item -LiteralPath $archivePath -NewName (Split-Path $qPath -Leaf) -ErrorAction Stop
+          Log ("QUARANTINE {0}: partial archive renamed to {1} (add rc={2} test rc={3}) - loose files kept for re-pack" -f $day, (Split-Path $qPath -Leaf), $addRc, $testRc)
+        } catch {
+          Log ("WARN  {0}: quarantine rename failed ({1}) - partial LEFT under canonical name, the 7z t re-upload gate must catch it" -f $day, $_.Exception.Message)
+        }
+      }
       Log ("ERROR {0}: 7z add rc={1} test rc={2} -> KEEPING loose files (not deleted)" -f $day, $addRc, $testRc)
     }
   }
@@ -252,6 +276,20 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
     }
     if ($verdict.Action -eq 'idempotent') {
       Log ("GDRIVE {0}: already current ({1} bytes), idempotent - no re-upload needed" -f $arch.BaseName, $arch.Length)
+      continue
+    }
+    # #322: the verdict only compares SIZES — it cannot know the local archive
+    # itself is unreadable (the 04/10 incident: a pack truncated mid-run, left
+    # under the canonical name, shipped off-site as valid). Whatever produced
+    # the file, it must pass its own integrity test before leaving the machine.
+    # Refuse + error (non-zero night for the scheduler), never rename here:
+    # for an OLD day the loose originals are long gone, so renaming its only
+    # copy on a possibly-transient test failure would hide the day from every
+    # reader without helping anyone — the log line is the escalation.
+    & $SevenZip t -bso0 -bsp0 "$($arch.FullName)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      $errors++
+      Log ("REFUSE {0}: local archive fails 7z t (rc={1}) -> NOT uploaded, kept local for review" -f $arch.BaseName, $LASTEXITCODE)
       continue
     }
     try {
