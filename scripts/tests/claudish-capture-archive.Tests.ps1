@@ -134,7 +134,7 @@ Describe 'compress-captures.ps1 wiring' {
             # before touching 7z (which is deliberately pointed at a missing path:
             # if the gate did NOT fire first we would get the 7z FATAL, exit 2).
             & $exe -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
-                -CaptureDir $tmp -GDriveDir $tmp -SevenZip (Join-Path $tmp 'nope.exe') *> $null
+                -CaptureDir $tmp -GDriveDir $tmp -SevenZip (Join-Path $tmp 'nope.exe') -NoSevenZipFallback *> $null
             $LASTEXITCODE | Should -Be 3
         } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
@@ -145,10 +145,94 @@ Describe 'compress-captures.ps1 wiring' {
         try {
             $exe = (Get-Process -Id $PID).Path
             & $exe -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
-                -CaptureDir $tmp -GDriveDir $tmp -MachineTag 'testbox' -SevenZip (Join-Path $tmp 'nope.exe') *> $null
+                -CaptureDir $tmp -GDriveDir $tmp -MachineTag 'testbox' -SevenZip (Join-Path $tmp 'nope.exe') -NoSevenZipFallback *> $null
             # 2 = the 7z precondition, i.e. the namespace gate let the run through.
             $LASTEXITCODE | Should -Be 2
         } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe 'Get-SevenZipCandidates' {
+    It 'lists the verified PortableApps path FIRST' {
+        (Get-SevenZipCandidates)[0] | Should -Be 'D:\PortableApps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe'
+    }
+    It 'still lists the legacy D:\Apps spelling as a fallback, not as the only entry' {
+        $c = Get-SevenZipCandidates
+        ($c -contains 'D:\Apps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe') | Should -BeTrue
+        $c.Count | Should -BeGreaterThan 1
+    }
+    It 'appends caller-supplied -Extra paths LAST (a fallback, not a priority)' {
+        $c = Get-SevenZipCandidates -Extra 'X:\custom\7z.exe'
+        $c[-1] | Should -Be 'X:\custom\7z.exe'
+    }
+    It 'skips an empty -Extra entry' {
+        (Get-SevenZipCandidates -Extra @('')).Count | Should -Be (Get-SevenZipCandidates).Count
+    }
+}
+
+Describe 'Resolve-SevenZipPath (#214)' {
+    BeforeAll {
+        $script:existsNone = { param($p) $false }
+        $script:existsOnly = { param($p) $p -eq 'C:\real\7z.exe' }
+    }
+
+    It 'uses the explicit path when it exists (source=explicit, tried names only it)' {
+        $r = Resolve-SevenZipPath -Explicit 'C:\real\7z.exe' -Candidates @('C:\other\7z.exe') -Exists $script:existsOnly
+        $r.Path | Should -Be 'C:\real\7z.exe'
+        $r.Source | Should -Be 'explicit'
+        $r.ExplicitMissing | Should -BeFalse
+        $r.Tried | Should -Be @('C:\real\7z.exe')
+    }
+
+    It 'falls back to the candidate list when the explicit path is MISSING (the c.33 outage class)' {
+        $r = Resolve-SevenZipPath -Explicit 'D:\Apps\wrong\7z.exe' -Candidates @('C:\real\7z.exe') -Exists $script:existsOnly
+        $r.Path | Should -Be 'C:\real\7z.exe'
+        $r.Source | Should -Be 'candidate'
+        $r.ExplicitMissing | Should -BeTrue
+    }
+
+    It 'honours candidate order (first existing wins)' {
+        $exists = { param($p) $p -in @('B', 'C') }
+        (Resolve-SevenZipPath -Candidates @('A', 'B', 'C') -Exists $exists).Path | Should -Be 'B'
+    }
+
+    It 'skips empty and duplicate candidates' {
+        $exists = { param($p) $p -eq 'C' }
+        (Resolve-SevenZipPath -Candidates @('', 'C') -Exists $exists).Tried | Should -Be @('C')
+        (Resolve-SevenZipPath -Candidates @('B', 'B') -Exists $exists).Tried | Should -Be @('B')
+    }
+
+    It 'with -NoFallback a missing explicit resolves to nothing (the FATAL stays reachable)' {
+        $r = Resolve-SevenZipPath -Explicit 'C:\real\7z.exe' -Candidates @('C:\real\7z.exe') -NoFallback -Exists $script:existsNone
+        $r.Path | Should -Be ''
+        $r.Source | Should -Be 'none'
+        $r.Tried | Should -Be @('C:\real\7z.exe')
+    }
+
+    It 'names EVERY path it tried when nothing resolves (the diagnostic contract)' {
+        $r = Resolve-SevenZipPath -Explicit 'E:\x\7z.exe' -Candidates @('C:\a\7z.exe', 'C:\b\7z.exe') -Exists $script:existsNone
+        $r.Path | Should -Be ''
+        ($r.Tried -join '; ') | Should -Be 'E:\x\7z.exe; C:\a\7z.exe; C:\b\7z.exe'
+    }
+}
+
+Describe 'compress-captures.ps1 7z resolution wiring (#214)' {
+    It 'delegates resolution to the module instead of one hardcoded default' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        $text | Should -Match 'Resolve-SevenZipPath'
+        $text | Should -Match 'Get-SevenZipCandidates'
+        # the old single hardcoded DEFAULT must be gone (a caller may still PASS one)
+        $text | Should -Not -Match '\[string\]\$SevenZip\s*=\s*"D:\\Apps\\PortableApps'
+    }
+
+    It 'logs every tried path on the FATAL branch' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        $text | Should -Match 'FATAL: 7z not found - tried:'
+    }
+
+    It 'warns instead of dying when an explicit -SevenZip is missing' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        $text | Should -Match 'does not exist -> resolved to'
     }
 }
 
