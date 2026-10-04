@@ -231,9 +231,17 @@ Lecture :
 
 ### Phase 3 — Trafic et leak-policy
 
-```powershell
-.\scripts\traffic-live.ps1 -Hours 12 -Container claudish-sidecar
 ```
+claudish_traffic(container:"claudish-sidecar", since:"6h", bucket_minutes:60)   # MCP roo-state-manager
+```
+
+**Instrument par défaut depuis le 05/10 (#72, PR #330)** : l'outil MCP refuse un verdict sur un corpus
+roté (`UNKNOWN` au lieu d'un faux NOMINAL), rend l'histogramme jusqu'à maintenant et sépare
+cron/interactif par machine. Mesuré le 04/10 sur le relais .46, même fenêtre : `traffic-live.ps1` a rendu
+un verdict sur ce corpus non validé **et fabriqué 2 faux HANG SUSPECTS** à partir de lignes
+`[resp] capture write error: EIO`. Sur le sidecar, ses `[Request]` comptent **uniquement le servi
+local** (replis `header-timeout` + AUTONOMOUS) — le relayé n'émet pas de `[Request]`. Le script reste
+documenté ci-dessous pour mémoire et pour le cron de surveillance 6 h qui l'appelle encore.
 
 ⚠️ **`-Hours N` n'est pas la fenêtre obtenue.** `--since` étant écarté par le GOTCHA #2, la fenêtre est
 approximée par `--tail Hours×8000` — le débit du **hub** en pointe. Sur ce sidecar (~170 lignes/jour),
