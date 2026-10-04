@@ -580,17 +580,36 @@ export class ComposedHandler implements ModelHandler {
     // For those, the thinking block must survive so the OpenAI-format converter
     // can re-emit reasoning_content on the outbound payload — stripping it makes
     // the converter omit the field, which DeepSeek rejects with HTTP 400.
+    //
+    // Per-block opt-out (#324 B1): under a `forced` thinking policy, MiniMax
+    // must keep its OWN history thinking blocks (M3 only restarts thinking on
+    // a continuation turn when the preceding assistant turn carries one —
+    // #295 T4a/T4c) while FOREIGN blocks (an Anthropic signature carried in by
+    // a session that switched from Opus to a MiniMax cascade step) stay
+    // stripped. The dialect discriminates by signature shape; default false
+    // keeps strip-everything for every other provider.
     if (requestPayload.messages && !this.modelAdapter?.preserveThinkingInHistory?.()) {
       let stripped = 0;
+      let preserved = 0;
       for (const msg of requestPayload.messages) {
         if (msg.role === "assistant" && Array.isArray(msg.content)) {
           const before = msg.content.length;
-          msg.content = msg.content.filter((block: any) => block.type !== "thinking");
+          msg.content = msg.content.filter((block: any) => {
+            if (block.type !== "thinking") return true;
+            if (this.modelAdapter?.preserveThinkingBlock?.(block) === true) {
+              preserved++;
+              return true;
+            }
+            return false;
+          });
           stripped += before - msg.content.length;
         }
       }
       if (stripped > 0) {
         log(`[ComposedHandler] Stripped ${stripped} thinking block(s) from message history for ${this.provider.displayName}`);
+      }
+      if (preserved > 0) {
+        log(`[ComposedHandler] Preserved ${preserved} own thinking block(s) in history for ${this.provider.displayName} (dialect exempted them from the strip)`);
       }
     }
 
