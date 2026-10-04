@@ -369,6 +369,12 @@ Opus est **cantonné aux 5 lanes coordinatrices d'ai-01** :
 | `d--Argumentum` | pré-release qui s'éternise |
 | `d--claudish` | coordination (ce workspace) |
 
+**Lanes promues par le user (autorisées, à compter mais pas à signaler)** : `g--Mon-Drive-Maintenance`
+sur ai-01 (08/09, SAV du matin) · **`D:\Dev\CoursIA-3` sur po-2024** (04/10, registre #44 : « Oui
+elle a le droit »). Cette dernière est la première lane Opus **hors ai-01**. Son identifiant de poste paie,
+sur le même forfait hebdomadaire. Signature : `machine=myia-po-2024`, `device_id8=0b9b0d8c`. Le détail
+est dans la memory `opus-spend-policy-five-lanes`.
+
 **Tout le reste = Sonnet/GLM ou Haiku/MiniMax avec leurs failover respectifs** (quelques `gpt sol`
 sur po-2025). L'enveloppe est **élastique** : elle dépend des crédits hebdo, et **il n'existe pas de
 sonde fiable sur tous les providers** — donc ne jamais présenter un plafond comme mesuré. Une lane
@@ -482,6 +488,27 @@ roosync_dashboard(action:"append", type:"workspace", content:"[DONE] ...")
 Les rapports vont sur le dashboard, **pas** dans des fichiers du dépôt.
 
 Le bilan **représente le registre des questions ouvertes** (entrées en attente, non bloquant) — section obligatoire tant que le registre n'est pas vide.
+
+**Tableau d'avancement, obligatoire dans chaque bilan** (question user du 04/10 : « Est-ce que la
+coordination de vos issues avance de cycle en cycle ? »). Une réponse sans chiffres ne vaut rien, d'où
+quatre lignes **mesurées**, jamais estimées :
+
+1. **Depuis le cycle précédent** : PRs mergées · issues fermées · issues ouvertes (`gh pr list --state merged`
+   et `gh issue list --state all`, sur `mergedAt` / `closedAt` / `createdAt`).
+2. **Qui tient chaque PR ouverte** : *auteur* (un CR de ma part attend son push) ou *moi* (un push attend ma
+   review), avec l'âge en heures. Une PR de plus de 24 h dans l'une ou l'autre colonne se nomme dans le bilan.
+   Le piège est mesuré : mes CR sont des **commentaires** (même compte, pas de `REQUEST_CHANGES`), et un worker
+   qui lit « 0 review » attend ma re-review pendant que j'attends son push. #319 et #307 ont été bloquées ~19 h
+   ainsi, le 03-04/10.
+3. **Issues actionnables sans activité depuis 7 jours ou plus** (hors épics) : nommées, puis dispatchées,
+   fermées ou parquées explicitement.
+4. **Dérive d'une issue** : un fil qui accumule des commentaires d'enquête sans livrer son AC. Cas fondateur :
+   #298, 22 commentaires de décompte de fenêtres, alors que son correctif A dormait dans #302. Il se recadre
+   vers son livrable.
+
+Mesure de référence (04/10, semaines lundi→dimanche) : mergées 65 / 58 / 23, issues fermées 28 / 25 / 18,
+ouvertes 29 / 25 / 26 (semaines du 14/09, 21/09, 28/09). La file grossit de +8 la dernière semaine ; le délai
+PR médian est passé de 0,7 h à 3,6 h depuis le mandat « reviews exigeantes ».
 
 ### Phase 7 — Cron : garde-fou de sortie (CRITIQUE)
 
