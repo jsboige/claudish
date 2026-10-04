@@ -54,7 +54,14 @@ SEP_RE = re.compile(r"[\\/]+")
 USAGE_RX = re.compile(r'"usage"\s*:\s*\{([^}]*)\}')
 FIELD_RX = re.compile(
     r'"(input_tokens|cache_read_input_tokens|cache_creation_input_tokens|output_tokens)"\s*:\s*(\d+)')
-HEAD_BYTES = 512 * 1024
+# The request envelope's attribution lives at OPPOSITE ENDS of the file, and a
+# head-only read silently loses one of them: `Primary working directory` is in
+# messages[0] (near the top) while `body.metadata.user_id` comes AFTER messages
+# and tools (near the bottom). Reading the head alone measured 4 559 captures as
+# `unattributed` over a 2 h window — a silent under-count that looks exactly
+# like "these clients send no attribution". Both ends are read.
+HEAD_BYTES = 256 * 1024
+TAIL_BYTES = 256 * 1024
 
 
 def ts_of(m):
@@ -115,12 +122,23 @@ def pick_request(candidates, resp_ts):
     return min(candidates, key=lambda c: c[0])[1]
 
 
-def read_capped(path, limit=HEAD_BYTES):
-    with open(path, encoding="utf-8", errors="replace") as f:
-        return f.read(limit)
+def read_capped(path, head=HEAD_BYTES, tail=TAIL_BYTES):
+    """Head + tail. See HEAD_BYTES for why one end is not enough. A file shorter
+    than the sum is returned whole, so small fixtures behave as before."""
+    size = os.path.getsize(path)
+    # Binary mode: text mode refuses a nonzero end-relative seek, and the tail is
+    # the whole point of this function.
+    with open(path, "rb") as f:
+        if size <= head + tail:
+            blob = f.read()
+        else:
+            first = f.read(head)
+            f.seek(-tail, os.SEEK_END)
+            blob = first + f.read()
+    return blob.decode("utf-8", errors="replace")
 
 
-def collect(capture_dir, hours):
+def collect(capture_dir, hours, head=HEAD_BYTES, tail=TAIL_BYTES):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     reqs = defaultdict(list)
     resps = []
@@ -137,7 +155,7 @@ def collect(capture_dir, hours):
                 continue
             if ts < cutoff:
                 continue
-            raw = read_capped(path)
+            raw = read_capped(path, head, tail)
             mm = MACHINE_RE.search(raw)
             env = mm.group(1) if mm else None
             uid = None
@@ -163,7 +181,7 @@ def collect(capture_dir, hours):
             if ts < cutoff:
                 continue
             resps.append((ts, int(sm.group(1)), int(sm.group(2)),
-                          extract_usage(read_capped(path))))
+                          extract_usage(read_capped(path, head, tail))))
 
     rows = []
     for ts, pid, reqn, usage in resps:

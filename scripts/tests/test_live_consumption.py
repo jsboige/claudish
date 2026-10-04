@@ -124,10 +124,44 @@ def test_end_to_end_rollup():
         check("e2e: markdown states the unattributed count", "unattributed" in md)
 
 
+def test_attribution_at_the_far_end_is_still_read():
+    """Measured on the live corpus: a head-only read reported 4 559 captures as
+    `unattributed` over 2 h, because `metadata` comes AFTER `messages` and
+    `tools` while `Primary working directory` sits in messages[0]. The two ends
+    are read for exactly this. The head-only pass below is the NEGATIVE CONTROL:
+    if it ever starts finding the session too, this pin has stopped testing
+    anything and the seam it guards is gone."""
+    with tempfile.TemporaryDirectory() as d:
+        req = "req-1-0009-2026-10-04T21-09-18-851Z-direct.json"
+        uid = json.dumps({"session_id": "deadbeefcafe", "is_subagent": False})
+        workdir = "Primary working directory: D:\\dev\\claudish\n"
+        # Written by hand, not via json.dump, so the key ORDER is the capture's:
+        # messages (huge) first, metadata last.
+        with open(os.path.join(d, req), "w", encoding="utf-8") as f:
+            f.write('{"machine":"myia-po-2025","pid":1,"body":{"messages":[{"content":'
+                    '[{"text":' + json.dumps(workdir) + '},'
+                    '{"text":' + json.dumps("P" * 40_000) + '}]}],'
+                    '"metadata":{"user_id":' + json.dumps(uid) + '}}}')
+        resp = "resp-1-r0009-2026-10-04T21-09-20-100Z-openai-glm-5.3.sse"
+        with open(os.path.join(d, resp), "w", encoding="utf-8") as f:
+            f.write('{"usage":{"output_tokens":3}}')
+
+        rows, _ = lc.collect(d, hours=24 * 365 * 10, head=4096, tail=4096)
+        per = lc.rollup(rows)
+        check("far-end: session found with a two-ended read",
+              "myia-po-2025:claudish:deadbeefcafe" in per, list(per))
+
+        rows_h, unatt = lc.collect(d, hours=24 * 365 * 10, head=4096, tail=0)
+        per_h = lc.rollup(rows_h)
+        check("far-end: NEGATIVE CONTROL — head-only really does lose it",
+              unatt == 1 and "myia-po-2025:claudish:deadbeefcafe" not in per_h,
+              (unatt, list(per_h)))
+
+
 if __name__ == "__main__":
     for fn in (test_usage_takes_max_not_first, test_user_id_parse_and_the_echo_trap,
                test_pick_request_prefers_the_preceding_one, test_workspace_extraction,
-               test_end_to_end_rollup):
+               test_end_to_end_rollup, test_attribution_at_the_far_end_is_still_read):
         print(f"== {fn.__name__}")
         fn()
     print()
