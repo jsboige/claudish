@@ -1110,6 +1110,43 @@ function resolveSkippingFailed(
   return { step: lastStep, stepIndex: last };
 }
 
+/** #299-B — the FIRST SERVABLE cascade step for the one-shot overload walk,
+ * read-only (the `resolveSkippingFailed` half without its armed-resolution
+ * side effects; the "resolveTransientStep" idea is #302's, credit po-2025).
+ * Skips exactly what the armed resolver would skip — TTL-failed steps (the
+ * per-step backoff) and role-steps whose delegation cannot currently resolve
+ * a concrete target — plus one exclusion of the walk's own: a step whose
+ * provider bucket is WALLED (a weekly OpenAI wall on step 0 must not turn
+ * every nominal 529 into a round-trip at a step we already know is dead while
+ * a healthy step waits behind it — review of #326, point 3). Unlike
+ * `resolveSkippingFailed` there is NO last-step fallback: the walk is a
+ * recovery attempt, not a substitution, so walking into a step we know is
+ * unservable is pure cost — null means "surface the original overload".
+ *
+ * Read-only in failover-STATE terms (no arm, no mark, no dwell pin). Two
+ * benign touches remain, both the module's shared idiom rather than new
+ * writes: `isBucketWalled`'s lazy TTL expiry drops an already-expired wall
+ * exactly as the next ordinary resolution would, and `resolveConcreteTarget`
+ * refreshes a role-step's `target` in place to the model actually serving it
+ * — which is also what keeps the walk from ever routing the ROLE NAME as a
+ * model id (the pre-refresh `target` can still be `roleRef`). */
+export function resolveTransientStep(
+  role: FailoverRole
+): { step: FailoverStep; stepIndex: number; concrete: string } | null {
+  const rule = rules.get(role);
+  if (!rule) return null;
+  const fails = stepFailures.get(role);
+  for (let i = 0; i < rule.steps.length; i++) {
+    if (isStepTtlFailed(fails?.[i])) continue;
+    const step = rule.steps[i];
+    const concrete = step.roleRef ? resolveConcreteTarget(role, step) : step.target;
+    if (concrete === null) continue;
+    if (isBucketWalled(providerBucketOf(concrete))) continue;
+    return { step, stepIndex: i, concrete };
+  }
+  return null;
+}
+
 /**
  * How long an auto-armed substitution holds before the nominal model is retried. A
  * provider wall is a window (Z.AI 5h cap, Anthropic weekly, MiniMax quota) that lifts
