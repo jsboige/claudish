@@ -90,6 +90,19 @@ def test_workspace_extraction():
           lc.workspace_of(raw))
     check("workspace: positive control — a doc without the marker yields None",
           lc.workspace_of("no marker here") is None)
+    # Measured live: the marker is ECHOED in prose (quoted rule text, harness
+    # summaries), yielding values like `CoursIA)` or a whole clause — which
+    # split one session across two rows. Echoes are skipped, scanning continues.
+    echo_first = ('prose "Primary working directory: D:\\\\Dev\\\\CoursIA)\\n" '
+                  'then the real "Primary working directory: D:\\\\dev\\\\claudish\\n"')
+    check("workspace: an echoed marker yielding a non-path is skipped",
+          lc.workspace_of(echo_first) == "claudish", lc.workspace_of(echo_first))
+    clause = '"Primary working directory: continue` cron prompt remains.\\n"'
+    check("workspace: a clause echo yields None, never a sentence row",
+          lc.workspace_of(clause) is None, lc.workspace_of(clause))
+    spaced = '"Primary working directory: C:\\\\Users\\\\jsboi\\\\some dir\\\\proj\\n"'
+    check("workspace: spaces inside a real path stay valid",
+          lc.workspace_of(spaced) == "proj", lc.workspace_of(spaced))
 
 
 def test_end_to_end_rollup():

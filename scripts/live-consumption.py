@@ -110,11 +110,23 @@ def user_id_fields(uid):
             bool(sub) if sub is not None else None)
 
 
+# The marker string is ECHOED in conversation prose — quoted rule text, harness
+# summaries — and an echo captures a sentence fragment, not the path (measured
+# live: workspace values like `CoursIA)` or a whole clause, splitting one
+# session across two rows). Only an absolute path is accepted; echoes are
+# skipped and the scan continues to the next occurrence.
+PATHISH_RE = re.compile(r"^[A-Za-z]:[\\/][^()<>|?*{}'\"]*$")
+
+
 def workspace_of(raw):
-    m = WORKDIR_RE.search(raw)
-    if not m:
-        return None
-    return SEP_RE.split(m.group(1).strip())[-1] or None
+    for m in WORKDIR_RE.finditer(raw):
+        val = m.group(1).strip()
+        if not PATHISH_RE.match(val):
+            continue
+        seg = SEP_RE.split(val)[-1]
+        if seg:
+            return seg
+    return None
 
 
 def pick_request(candidates, resp_ts):
