@@ -161,9 +161,24 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    * stream — the parser consults this only when the client did NOT itself
    * request thinking (anthropic-sse opts.clientRequestedThinking), so a
    * client that asks for thinking still receives its blocks.
+   *
+   * #295 — EXCEPT under a `forced` policy. M3 only (re)starts thinking on a
+   * tool-continuation turn when the preceding assistant turn carries its
+   * preserved thinking block (live bisect T4a/T4c), and `forced` is exactly
+   * the state "model thinks, client did not ask": filtering there strips every
+   * thinking block from every forced response, so the client never holds one,
+   * never echoes one, and the chain mutes on every continuation turn (the
+   * 1/30 production shape). Under `forced` the blocks pass through — the cost
+   * of them appearing in CC is the one the issue accepts. The leak this filter
+   * exists for (passthrough policy, unrequested thinking) is unchanged.
+   *
+   * Re-read per call like readThinkingPolicy(): the fleet flips this knob
+   * mid-flight. The forced-but-budget-doesn't-fit request also lands here
+   * unfiltered — harmless: no injection means M3 emits no thinking block,
+   * so there is nothing to pass through anyway.
    */
   override shouldFilterThinking(): boolean {
-    return true;
+    return readThinkingPolicy().kind !== "forced";
   }
 
   shouldHandle(modelId: string): boolean {

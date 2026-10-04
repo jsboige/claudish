@@ -32,8 +32,12 @@ function makeTransport(): ProviderTransport {
 
 const sse = (event: string, data: unknown) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 
-/** What MiniMax streams when it reasons: a thinking block, then the answer. */
-function upstreamWithThinking(): Response {
+/** What MiniMax streams when it reasons: a thinking block, then the answer.
+ *  `withSignature` adds the signature_delta M3 emits after its thinking —
+ *  the part the client needs to legally echo the block back (#295). */
+function upstreamWithThinking(withSignature = false): Response {
+  const signature =
+    (withSignature ? sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-abc123" } }) : "");
   const body =
     sse("message_start", {
       type: "message_start",
@@ -44,6 +48,7 @@ function upstreamWithThinking(): Response {
     }) +
     sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }) +
     sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "reasoning here" } }) +
+    signature +
     sse("content_block_stop", { type: "content_block_stop", index: 0 }) +
     sse("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }) +
     sse("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "It's 12:00." } }) +
@@ -53,7 +58,7 @@ function upstreamWithThinking(): Response {
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
-async function run(thinking: unknown): Promise<string> {
+async function run(thinking: unknown, withSignature = false): Promise<string> {
   const handler = new ComposedHandler(makeTransport(), MODEL, MODEL, 8472, {
     adapter: new AnthropicAPIFormat(MODEL),
   });
@@ -67,7 +72,7 @@ async function run(thinking: unknown): Promise<string> {
   const app = new Hono();
   app.post("/v1/messages", async (c: any) => handler.handle(c, payload));
   const original = (globalThis as any).fetch;
-  (globalThis as any).fetch = async () => upstreamWithThinking();
+  (globalThis as any).fetch = async () => upstreamWithThinking(withSignature);
   try {
     const res = await app.request("/v1/messages", {
       method: "POST",
@@ -104,6 +109,48 @@ describe("MiniMax thinking filter through ComposedHandler (#237 review)", () => 
   test("disabled client gets the answer without the unrequested thinking", async () => {
     delete process.env.CLAUDISH_MINIMAX_THINKING;
     const body = await run({ type: "disabled" });
+    expect(body).not.toContain("thinking_delta");
+    expect(body).toContain("It's 12:00.");
+    expect(body).toContain("message_stop");
+  });
+});
+
+describe("forced policy passes thinking blocks through (#295 chain)", () => {
+  const saved = process.env.CLAUDISH_MINIMAX_THINKING;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.CLAUDISH_MINIMAX_THINKING;
+    else process.env.CLAUDISH_MINIMAX_THINKING = saved;
+  });
+
+  // The chain, as bisected live in #295: M3 only (re)starts thinking on a
+  // tool-continuation turn when the preceding assistant turn carries its
+  // preserved thinking block (T4c). Under `forced` the proxy makes the model
+  // think for a client that did not ask — so the response's thinking block
+  // (and its signature, without which the client cannot legally echo it)
+  // must REACH the client, or it can never hold, echo, and restart the chain.
+  test("forced + client silent: the thinking block and signature reach the client", async () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced";
+    const body = await run(undefined, true);
+    expect(body).toContain("thinking_delta");
+    expect(body).toContain("signature_delta");
+    expect(body).toContain("sig-abc123");
+    expect(body).toContain("It's 12:00.");
+    expect(body).toContain("message_stop");
+  });
+
+  test("forced:n budget variant behaves the same", async () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced:8000";
+    const body = await run(undefined);
+    expect(body).toContain("thinking_delta");
+    expect(body).toContain("message_stop");
+  });
+
+  // The filter's original purpose stands when the policy is NOT forced:
+  // passthrough + silent client still strips the unrequested thinking
+  // (the leak this filter exists for, unchanged by #295).
+  test("passthrough policy + silent client: unrequested thinking still stripped", async () => {
+    delete process.env.CLAUDISH_MINIMAX_THINKING;
+    const body = await run(undefined);
     expect(body).not.toContain("thinking_delta");
     expect(body).toContain("It's 12:00.");
     expect(body).toContain("message_stop");
