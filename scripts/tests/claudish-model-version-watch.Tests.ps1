@@ -121,6 +121,21 @@ Describe 'Compare-RoutingToFamilies decisions' {
         # The defect this pins: bare values used to fabricate 'gpt-6-sol@gpt-6.1-sol'.
         (@($d | Where-Object Spelling -eq 'bare')[0].NewTarget) | Should -Be 'gpt-6.1-sol'
         (@($d | Where-Object Spelling -eq 'bare')[0].Provider) | Should -Be ''
+        (@($d | Where-Object Spelling -eq 'qualified')[0].Eligible) | Should -Be $true    # cx@ is watched
+        (@($d | Where-Object Spelling -eq 'bare')[0].Eligible) | Should -Be $false        # bare is report-only
+    }
+    It 'scopes eligibility to the watched provider (B1): cx@ eligible, oai@/bare report-only' {
+        $r = [pscustomobject][ordered]@{
+            'via-codex'      = @('cx@gpt-6-sol')
+            'via-openai-api' = @('oai@gpt-6-sol')
+            'bare'           = @('gpt-6-sol')
+        }
+        $d = Compare-RoutingToFamilies -Routing $r -AvailableIds @('gpt-6.1-sol', 'gpt-6-sol') -WatchedProviders @('cx@', 'codex@')
+        (@($d | Where-Object Spelling -eq 'via-codex')[0].Eligible)      | Should -Be $true
+        (@($d | Where-Object Spelling -eq 'via-openai-api')[0].Eligible) | Should -Be $false
+        (@($d | Where-Object Spelling -eq 'bare')[0].Eligible)           | Should -Be $false
+        # eligibility gates the EDIT, not the computation: all three still read 'minor'
+        (@($d | Where-Object Spelling -eq 'via-openai-api')[0].Action)   | Should -Be 'minor'
     }
     It 'reports current when routing already points at the latest' {
         $d = Compare-RoutingToFamilies -Routing $script:routing -AvailableIds $script:available
@@ -158,7 +173,7 @@ Describe 'Edit-RoutingForMinor surgery' {
     It 'repins each spelling to its OWN target and registers the new spelling' {
         $backup = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
             -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol'; 'gpt-5.6-sol' = 'cx@gpt-6.1-sol' } `
-            -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
+            -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' -ProviderPrefixes @('cx@')
         $backup | Should -Not -BeNullOrEmpty
         (Test-Path $backup) | Should -Be $true
         $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
@@ -166,20 +181,45 @@ Describe 'Edit-RoutingForMinor surgery' {
         $after.routing.'gpt-5.6-sol' | Should -Be 'cx@gpt-6.1-sol'
         $after.routing.'gpt-6.1-sol' | Should -Be 'cx@gpt-6.1-sol'
     }
-    It 'repins a bare spelling BARE (no fabricated provider prefix)' {
+    It 'LEAVES a bare member in place — report-only, never edited (B1)' {
+        # A bare value resolves through the default chain, which this runner
+        # does not list/probe; editing it would enter an unprobeable target.
         $r = @{ routing = @{ 'gpt-6-sol' = @('gpt-6-sol') } }
         [System.IO.File]::WriteAllText($script:tmp, ($r | ConvertTo-Json -Depth 16), (New-Object System.Text.UTF8Encoding($false)))
         $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
-            -Repins @{ 'gpt-6-sol' = 'gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'gpt-6.1-sol'
+            -Repins @{ 'gpt-6-sol' = 'gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'gpt-6.1-sol' `
+            -ProviderPrefixes @('cx@')
         $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
-        $after.routing.'gpt-6-sol' | Should -Be 'gpt-6.1-sol'
-        $after.routing.'gpt-6.1-sol' | Should -Be 'gpt-6.1-sol'
+        $after.routing.'gpt-6-sol' | Should -Be 'gpt-6-sol'   # untouched
+    }
+    It 'moves ONLY the watched-provider member of a same-family chain; the other stays in place (B2)' {
+        # The defect this pins: a single target per spelling was written into
+        # EVERY member of the family, duplicating the survivor and deleting the
+        # oai@ lane (cx@gpt-6-sol, oai@gpt-6-sol -> oai@gpt-6.1-sol x2).
+        $r = @{ routing = @{ 'sonnet' = @('cx@gpt-6-sol', 'oai@gpt-6-sol') } }
+        [System.IO.File]::WriteAllText($script:tmp, ($r | ConvertTo-Json -Depth 16), (New-Object System.Text.UTF8Encoding($false)))
+        $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'sonnet' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' `
+            -ProviderPrefixes @('cx@')
+        $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
+        @($after.routing.sonnet).Count | Should -Be 2
+        @($after.routing.sonnet)[0] | Should -Be 'cx@gpt-6.1-sol'   # cx@ member moved
+        @($after.routing.sonnet)[1] | Should -Be 'oai@gpt-6-sol'    # oai@ member untouched, in place
+    }
+    It 'keeps the member OWN prefix when it differs from the repin (codex@ stays codex@)' {
+        $r = @{ routing = @{ 'gpt-6-sol' = @('codex@gpt-6-sol') } }
+        [System.IO.File]::WriteAllText($script:tmp, ($r | ConvertTo-Json -Depth 16), (New-Object System.Text.UTF8Encoding($false)))
+        $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' `
+            -ProviderPrefixes @('cx@', 'codex@')
+        $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
+        $after.routing.'gpt-6-sol' | Should -Be 'codex@gpt-6.1-sol'
     }
     It 'preserves the OTHER-family member of a multi-target spelling' {
         $r = @{ routing = @{ 'sonnet' = @('cx@gpt-6-sol', 'gc@glm-5.3') } }
         [System.IO.File]::WriteAllText($script:tmp, ($r | ConvertTo-Json -Depth 16), (New-Object System.Text.UTF8Encoding($false)))
         $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
-            -Repins @{ 'sonnet' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
+            -Repins @{ 'sonnet' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' -ProviderPrefixes @('cx@')
         $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
         @($after.routing.sonnet).Count | Should -Be 2
         @($after.routing.sonnet)[0] | Should -Be 'cx@gpt-6.1-sol'   # gpt-sol member moved
@@ -187,7 +227,7 @@ Describe 'Edit-RoutingForMinor surgery' {
     }
     It 'leaves other families, apiKeys and profiles intact in value' {
         $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
-            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' -ProviderPrefixes @('cx@')
         $after = [System.IO.File]::ReadAllText($script:tmp) | ConvertFrom-Json
         $after.routing.'glm-5.3' | Should -Be 'gc@glm-5.3'
         $after.apiKeys.DEMO_KEY | Should -Be 'value-that-must-survive'
@@ -197,26 +237,90 @@ Describe 'Edit-RoutingForMinor surgery' {
         [System.IO.File]::WriteAllText($script:tmp, 'this is not json {{{', (New-Object System.Text.UTF8Encoding($false)))
         $before = [System.IO.File]::ReadAllText($script:tmp)
         $r = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
-            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' -ProviderPrefixes @('cx@')
         $r | Should -BeNullOrEmpty
         [System.IO.File]::ReadAllText($script:tmp) | Should -Be $before
     }
     It 'refuses on a missing file' {
         (Edit-RoutingForMinor -ConfigPath "$($script:tmp)-absent" -Family 'gpt-sol' `
-            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol') | Should -BeNullOrEmpty
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' -ProviderPrefixes @('cx@')) | Should -BeNullOrEmpty
     }
     It 'is idempotent when the target already holds the value (no diff, no backup)' {
         $null = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
-            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' -ProviderPrefixes @('cx@')
         $b1 = (Get-ChildItem "$($script:tmp).bak-*").Count
         # Second call with the same targets: every spelling and the new-spelling
         # entry already hold the value — $changed stays false, null returned,
         # NO second backup. (Pinned because the first draft set $changed
         # unconditionally and wrote a fresh backup every run.)
         $r2 = Edit-RoutingForMinor -ConfigPath $script:tmp -Family 'gpt-sol' `
-            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol'
+            -Repins @{ 'gpt-6-sol' = 'cx@gpt-6.1-sol' } -NewSpelling 'gpt-6.1-sol' -NewSpellingTarget 'cx@gpt-6.1-sol' -ProviderPrefixes @('cx@')
         $r2 | Should -BeNullOrEmpty
         (Get-ChildItem "$($script:tmp).bak-*").Count | Should -Be $b1
+    }
+}
+
+Describe 'Test-ProbeAccepted (B3/D5 acceptance gate, extracted from the runner)' {
+    It 'refuses a 200 whose body has no terminal response.completed (in-stream error, #65 class)' {
+        # The defect this pins: the runner accepted on StatusCode alone, so a
+        # 200 carrying an in-stream failure passed the gate before an edit.
+        (Test-ProbeAccepted -StatusCode 200 -Content '{"type":"error","error":{"message":"invalid_prompt"}}') | Should -Be $false
+    }
+    It 'accepts only a 200 carrying a terminal response.completed' {
+        (Test-ProbeAccepted -StatusCode 200 -Content 'data: {"type":"response.completed"}') | Should -Be $true
+    }
+    It 'refuses any non-200 even with the marker present' {
+        (Test-ProbeAccepted -StatusCode 429 -Content 'response.completed') | Should -Be $false
+        (Test-ProbeAccepted -StatusCode 0 -Content 'response.completed') | Should -Be $false
+    }
+}
+
+Describe 'Test-ModelRetired + Get-ReloadMode (B3/D4 reload decision, extracted)' {
+    It 'a 4xx naming the model is retired' {
+        (Test-ModelRetired -StatusCode 404 -ModelId 'gpt-6-sol' -Content '{"detail":"model gpt-6-sol not found"}') | Should -Be $true
+    }
+    It 'a 4xx that says unknown/not-found/unretired-marker is retired' {
+        (Test-ModelRetired -StatusCode 400 -ModelId 'gpt-6-sol' -Content '{"error":"unknown model"}') | Should -Be $true
+    }
+    It 'a 429 is NOT retired — status unknown, no restart (stream killer)' {
+        (Test-ModelRetired -StatusCode 429 -ModelId 'gpt-6-sol' -Content 'rate limit exceeded for gpt-6-sol') | Should -Be $false
+    }
+    It 'a 5xx is NOT retired' {
+        (Test-ModelRetired -StatusCode 503 -ModelId 'gpt-6-sol' -Content 'gpt-6-sol unavailable') | Should -Be $false
+    }
+    It 'auth/timeout 4xx are NOT retired even when the body names the model (401/403/408/429 excluded)' {
+        (Test-ModelRetired -StatusCode 403 -ModelId 'gpt-6-sol' -Content '{"detail":"forbidden: gpt-6-sol"}') | Should -Be $false
+        (Test-ModelRetired -StatusCode 408 -ModelId 'gpt-6-sol' -Content 'timeout waiting for gpt-6-sol') | Should -Be $false
+    }
+    It 'a 4xx neither naming the model nor using a retirement marker is NOT retired' {
+        (Test-ModelRetired -StatusCode 400 -ModelId 'gpt-6-sol' -Content '{"error":"malformed request"}') | Should -Be $false
+    }
+    It 'Get-ReloadMode: empty -> deferred, any confirmed-dead id -> restart-now' {
+        (Get-ReloadMode -DeadOldIds @()) | Should -Be 'deferred'
+        (Get-ReloadMode -DeadOldIds @('gpt-6-sol')) | Should -Be 'restart-now'
+    }
+}
+
+Describe 'model-version-watch.ps1 runner wiring (B1/B3)' {
+    BeforeAll { $script:RunnerPath = Join-Path $PSScriptRoot '..\model-version-watch.ps1' }
+    It 'parses under this interpreter (production runs 5.1)' {
+        $errors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($script:RunnerPath, [ref]$null, [ref]$errors)
+        @($errors).Count | Should -Be 0
+    }
+    It 'consults the PURE guards, never re-implements them in glue (B3)' {
+        $text = Get-Content -LiteralPath $script:RunnerPath -Raw
+        $text | Should -Match 'Test-ProbeAccepted'
+        $text | Should -Match 'Test-ModelRetired'
+        $text | Should -Match 'Get-ReloadMode'
+        # the old status-only acceptance glue must be gone
+        $text | Should -Not -Match '\$resp\.Content -notmatch'
+    }
+    It 'scopes eligibility and the edit to the watched providers (B1)' {
+        $text = Get-Content -LiteralPath $script:RunnerPath -Raw
+        $text | Should -Match '-WatchedProviders \$watchedProviders'
+        $text | Should -Match '-ProviderPrefixes \$watchedProviders'
+        $text | Should -Match 'REPORT-ONLY'
     }
 }
 

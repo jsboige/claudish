@@ -87,9 +87,21 @@ function Compare-RoutingToFamilies {
     # value fabricated 'gpt-6-sol@gpt-6.1-sol', an invalid target the
     # acceptance probe (which names only the id) cannot catch. A bare spelling
     # repins to the bare id.
-    #   @{ Family; Spelling; CurrentId; Provider; LatestId; NewTarget; Action }
+    #   @{ Family; Spelling; CurrentId; Provider; Eligible; LatestId; NewTarget; Action }
+    # Eligible (B1): the member's provider is one the runner actually lists and
+    # probes. Only eligible members may ever be edited — an oai@/bare member of
+    # a tracked family is REPORT-ONLY (the runner emits an info event), because
+    # repinning it to an id probed on the Codex backend would enter routing an
+    # unprobeable target, breaking the "listed-but-unprobeable never enters
+    # routing" rule.
     # $Routing is the parsed routing object (requested-spelling -> target[]).
-    param([Parameter(Mandatory = $true)]$Routing, [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$AvailableIds)
+    param(
+        [Parameter(Mandatory = $true)]$Routing,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$AvailableIds,
+        # Phase 1 watches the Codex backend; other providers join as their
+        # /models surfaces are probed (cx@/codex@ are the two spellings of it).
+        [string[]]$WatchedProviders = @('cx@', 'codex@')
+    )
 
     $decisions = @()
     $latestCache = @{}
@@ -114,6 +126,7 @@ function Compare-RoutingToFamilies {
                 Spelling  = $prop.Name
                 CurrentId = $model
                 Provider  = $provider
+                Eligible  = ($WatchedProviders -contains $provider)
                 LatestId  = $latest.Id
                 NewTarget = $provider + $latest.Id
                 Action    = $action
@@ -136,12 +149,21 @@ function Edit-RoutingForMinor {
     # overwrite would silently drop them. The new id is registered as its own
     # spelling. One timestamped backup per call. Returns the backup path, or
     # $null on any refusal (parse failure, missing file, empty diff).
+    #
+    # A member moves only when its family matches AND its provider prefix is in
+    # $ProviderPrefixes (review #307 B1/B2). Two members of one family on
+    # different providers in the same spelling stay independent: the watched
+    # one moves to <its own prefix><new model>, the other is left in place —
+    # the old single-target-per-spelling write duplicated the survivor and
+    # deleted the lane. The target is rebuilt per member from $Repins' model id
+    # so a codex@ member keeps codex@, not the cx@ the repin named.
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
         [Parameter(Mandatory = $true)][string]$Family,
         [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Repins,      # spelling -> new target
         [Parameter(Mandatory = $true)][string]$NewSpelling,                        # e.g. 'gpt-6.1-sol'
-        [Parameter(Mandatory = $true)][string]$NewSpellingTarget                   # target for the new entry
+        [Parameter(Mandatory = $true)][string]$NewSpellingTarget,                  # target for the new entry
+        [Parameter(Mandatory = $true)][string[]]$ProviderPrefixes                  # e.g. @('cx@','codex@')
     )
 
     if (-not (Test-Path -LiteralPath $ConfigPath)) { return $null }
@@ -152,19 +174,22 @@ function Edit-RoutingForMinor {
     $changed = $false
     foreach ($sp in @($Repins.Keys)) {
         if ($config.routing.PSObject.Properties.Name -notcontains $sp) { continue }
-        $target = [string]$Repins[$sp]
+        $newModel = (([string]$Repins[$sp]) -split '@')[-1]   # model id, prefix-free
         $vals = @($config.routing.$sp)
         for ($i = 0; $i -lt $vals.Count; $i++) {
-            $memberFamily = ''
-            $memberModel = (([string]$vals[$i]) -split '@')[-1]
+            $member = [string]$vals[$i]
+            $memberModel = ($member -split '@')[-1]
+            $memberPrefix = ''
+            $at = $member.IndexOf('@')
+            if ($at -gt 0) { $memberPrefix = $member.Substring(0, $at + 1) }
             $mv = ConvertTo-ModelVersion -Id $memberModel
-            if ($mv) { $memberFamily = $mv.Family }
-            if ($memberFamily -eq $Family -and $vals[$i] -ne $target) {
-                $vals[$i] = $target
-                $changed = $true
+            if ($null -ne $mv -and $mv.Family -eq $Family -and
+                ($ProviderPrefixes -contains $memberPrefix)) {
+                $want = $memberPrefix + $newModel
+                if ($member -ne $want) { $vals[$i] = $want; $changed = $true }
             }
         }
-        if ($vals.Count -eq 1 -and $vals[0] -eq $target) {
+        if ($vals.Count -eq 1) {
             $config.routing.$sp = $vals[0]   # keep single-entry spellings scalar
         } else {
             $config.routing.$sp = $vals
@@ -225,6 +250,56 @@ function Test-ClaudishOptIn {
     return ($content -eq $Token)
 }
 
+# --- Probe verdicts (pure) --------------------------------------------------
+# Extracted from the runner's glue (review #307 B3): both guards decide
+# something expensive — one gates an automatic edit of the hub's shared config,
+# the other decides whether the hub gets a restart (a stream killer). A guard
+# that lives only in a runner the suite does not load can be deleted silently.
+
+function Test-ProbeAccepted {
+    # Acceptance for a NEW id before any edit. A 200 alone is NOT acceptance
+    # (review #307 D5): this wire answers 200 with an in-stream error body
+    # (#65 class), so the accumulated body must carry a terminal
+    # 'response.completed' event.
+    param(
+        [Parameter(Mandatory = $true)][int]$StatusCode,
+        [AllowEmptyString()][string]$Content = ''
+    )
+    if ($StatusCode -ne 200) { return $false }
+    if ($Content -notmatch 'response\.completed') { return $false }
+    return $true
+}
+
+function Test-ModelRetired {
+    # Did an OLD id really disappear upstream? (review #307 non-blocking: a
+    # restart is a stream killer, so only a 4xx that NAMES the model — or says
+    # it is unknown/not-found/retired — counts as retired. A 429, a 5xx or a
+    # timeout is 'status unknown' and must NOT trigger a restart.)
+    param(
+        [Parameter(Mandatory = $true)][int]$StatusCode,
+        [Parameter(Mandatory = $true)][string]$ModelId,
+        [AllowEmptyString()][string]$Content = ''
+    )
+    if ($StatusCode -lt 400 -or $StatusCode -ge 500) { return $false }
+    # Auth (401/403), timeout (408) and rate-limit (429) are transient or
+    # credential states, not model retirement — the model's status is UNKNOWN
+    # and a restart must not be triggered even when the body names the model.
+    if (@(401, 403, 408, 429) -contains $StatusCode) { return $false }
+    if ($Content -match [regex]::Escape($ModelId)) { return $true }
+    if ($Content -match '(?i)(unknown\s+model|model[^\n]{0,40}not\s+found|does\s+not\s+exist|invalid\s+model|unsupported\s+model|retired)') { return $true }
+    return $false
+}
+
+function Get-ReloadMode {
+    # 'restart-now' only when at least one old id is CONFIRMED retired, else
+    # 'deferred' — the daily drained restart reloads the edited config (review
+    # #307 B3/D4). The caller passes only ids it has classified retired.
+    param([AllowEmptyCollection()][string[]]$DeadOldIds = @())
+    if (@($DeadOldIds).Count -gt 0) { return 'restart-now' }
+    return 'deferred'
+}
+
 Export-ModuleMember -Function `
     ConvertTo-ModelVersion, Get-LatestFamilyVersion, Compare-RoutingToFamilies, `
-    Edit-RoutingForMinor, Write-VersionEvent, Test-ClaudishOptIn
+    Edit-RoutingForMinor, Write-VersionEvent, Test-ClaudishOptIn, `
+    Test-ProbeAccepted, Test-ModelRetired, Get-ReloadMode

@@ -114,11 +114,29 @@ try { $config = [System.IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json } 
     exit 1
 }
 
-$decisions = Compare-RoutingToFamilies -Routing $config.routing -AvailableIds $available
+$watchedProviders = @('cx@', 'codex@')
+$decisions = Compare-RoutingToFamilies -Routing $config.routing -AvailableIds $available -WatchedProviders $watchedProviders
 $pending = @($decisions | Where-Object { $_.Action -ne 'current' })
 & $logTs ("decisions: " + (($decisions | ForEach-Object { "$($_.Family)/$($_.Action)[$($_.Spelling): $($_.CurrentId)->$($_.LatestId)]" }) -join ' ; '))
 
 if ($pending.Count -eq 0) { exit 0 }
+
+# Report-only (B1): a member of a tracked family on a provider this runner does
+# NOT list/probe (or bare, whose chain the module cannot resolve) is never
+# edited — repinning it to an id probed on the Codex backend would enter
+# routing an unprobeable target. Reported so the omission is visible.
+foreach ($d in @($pending | Where-Object { -not $_.Eligible })) {
+    $shown = 'bare (default chain)'
+    if ($d.Provider) { $shown = $d.Provider }
+    & $logTs "REPORT-ONLY $($d.Family) [provider $shown]: $($d.CurrentId) -> $($d.LatestId) — not probed, not touched"
+    if (-not $DryRun) {
+        Write-VersionEvent -EventsPath $eventsPath -Kind info -Family $d.Family `
+            -From $d.CurrentId -To $d.LatestId `
+            -Detail "same family on provider '$shown' (spelling $($d.Spelling)); not probed, not touched — eligibility scoped to the watched provider"
+    }
+}
+$actionable = @($pending | Where-Object { $_.Eligible })
+if ($actionable.Count -eq 0) { exit 0 }
 
 # --- 3. Apply policy ---------------------------------------------------------
 #
@@ -127,15 +145,20 @@ if ($pending.Count -eq 0) { exit 0 }
 # major-ask for the older one, in the same pass. Applied per FAMILY: one
 # acceptance probe per family (all minor spellings of a family share the same
 # LatestId), then one surgical edit carrying every spelling's own target.
+#
+# Only ELIGIBLE members are acted on (review #307 B1): eligibility is scoped to
+# the provider this runner lists/probes. A member of a tracked family on any
+# other provider (or bare) is report-only — an info event, never edited — so an
+# id probed only on the Codex backend never enters routing under oai@/bare.
 
-function Test-ModelServes {
-    # Acceptance probe, used for BOTH the new id (before any edit) and the old
-    # id (reload decision, D4). A 200 alone is NOT acceptance (review #307 D5):
-    # this wire can answer 200 with an in-stream error body (#65 class) — the
-    # probe accepts only when the accumulated body carries a terminal
-    # 'response.completed' event. Probe constraints measured 2026-10-02:
-    # stream must be true, max_output_tokens must be absent.
+function Invoke-ModelProbe {
+    # Networking ONLY: returns the raw HTTP status + accumulated body. The
+    # ACCEPTANCE / RETIREMENT decisions are the pure Test-ProbeAccepted and
+    # Test-ModelRetired in the module (review #307 B3) — a guard in glue can be
+    # deleted silently. Probe constraints measured 2026-10-02: stream must be
+    # true, max_output_tokens must be absent.
     param([Parameter(Mandatory = $true)][string]$Id, [Parameter(Mandatory = $true)]$Headers)
+    $probe = @{ StatusCode = 0; Content = '' }
     try {
         $body = @{
             model = $Id
@@ -146,15 +169,29 @@ function Test-ModelServes {
         } | ConvertTo-Json -Depth 8
         $resp = Invoke-WebRequest -Uri 'https://chatgpt.com/backend-api/codex/responses' `
             -Headers $Headers -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 90
-        if ($resp.StatusCode -ne 200) { return $false }
-        if ($resp.Content -notmatch 'response\.completed') { return $false }
-        return $true
+        $probe.StatusCode = [int]$resp.StatusCode
+        $probe.Content = [string]$resp.Content
     } catch {
-        return $false
+        # Non-2xx throws: capture the status, and the body when the interpreter
+        # exposes it (5.1 HttpWebResponse.GetResponseStream, pwsh 7
+        # HttpResponseMessage.Content) so a 4xx naming the model is read.
+        $r = $_.Exception.Response
+        if ($r) {
+            try { $probe.StatusCode = [int]$r.StatusCode } catch {}
+            try {
+                if ($r.GetResponseStream) {
+                    $sr = New-Object System.IO.StreamReader($r.GetResponseStream())
+                    $probe.Content = $sr.ReadToEnd()
+                } elseif ($r.Content) {
+                    $probe.Content = $r.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                }
+            } catch {}
+        }
     }
+    return $probe
 }
 
-$majors = @($pending | Where-Object Action -eq 'major')
+$majors = @($actionable | Where-Object Action -eq 'major')
 foreach ($fam in @($majors | Group-Object Family)) {
     $d0 = @($fam.Group)[0]
     $fromIds = @($fam.Group | ForEach-Object { "$($_.Spelling)=$($_.CurrentId)" }) -join ','
@@ -168,18 +205,19 @@ foreach ($fam in @($majors | Group-Object Family)) {
 
 $restartNow = $false
 $restartWhy = @()
-$minors = @($pending | Where-Object Action -eq 'minor')
+$minors = @($actionable | Where-Object Action -eq 'minor')
 foreach ($fam in @($minors | Group-Object Family)) {
     $latestId = @($fam.Group)[0].LatestId
     $fromIds = (@($fam.Group | ForEach-Object { $_.CurrentId } | Select-Object -Unique) -join ',')
 
     # Acceptance probe BEFORE any edit — a listed id that does not serve never
     # enters routing (deepseek lesson: probe before trusting either direction).
-    if (-not (Test-ModelServes -Id $latestId -Headers $headers)) {
-        & $logTs "probe REFUSED for $latestId — no edit (listed but not serving, or probe shape drifted)"
+    $accept = Invoke-ModelProbe -Id $latestId -Headers $headers
+    if (-not (Test-ProbeAccepted -StatusCode $accept.StatusCode -Content $accept.Content)) {
+        & $logTs "probe REFUSED for $latestId (HTTP $($accept.StatusCode)) — no edit (listed but not serving, or probe shape drifted)"
         if (-not $DryRun) {
             Write-VersionEvent -EventsPath $eventsPath -Kind probe-fail -Family $fam.Name -To $latestId `
-                -Detail "acceptance probe did not complete 'response.completed' — listed but not serving"
+                -Detail "acceptance probe did not complete 'response.completed' (HTTP $($accept.StatusCode)) — listed but not serving"
         }
         continue
     }
@@ -197,7 +235,7 @@ foreach ($fam in @($minors | Group-Object Family)) {
         continue
     }
     $backup = Edit-RoutingForMinor -ConfigPath $ConfigPath -Family $fam.Name -Repins $repins `
-        -NewSpelling $latestId -NewSpellingTarget $newTarget
+        -NewSpelling $latestId -NewSpellingTarget $newTarget -ProviderPrefixes $watchedProviders
     if (-not $backup) {
         & $logTs "edit REFUSED for $($fam.Name) (parse/empty diff) — no restart"
         Write-VersionEvent -EventsPath $eventsPath -Kind error -Family $fam.Name -Detail "Edit-RoutingForMinor refused"
@@ -210,20 +248,34 @@ foreach ($fam in @($minors | Group-Object Family)) {
     # serving from the in-memory config one more day — defer. An old id that
     # fails its own probe = the minor was retired upstream = every request
     # routed to it fails until reload — restart now, detached, drained.
-    $reloadMode = 'deferred-to-daily-restart'
+    # Reload decision (D4 + review #307 non-blocking). Only an old id CONFIRMED
+    # retired (a 4xx naming the model) forces an immediate restart — a restart
+    # is a stream killer, so a 429/5xx/timeout on the old id is 'status unknown'
+    # and defers. All old ids still serving => defer to the daily drained restart.
     $deadOld = @()
+    $unknownOld = @()
     foreach ($oldId in @($fam.Group | ForEach-Object { $_.CurrentId } | Select-Object -Unique)) {
-        if (-not (Test-ModelServes -Id $oldId -Headers $headers)) { $deadOld += $oldId }
+        $op = Invoke-ModelProbe -Id $oldId -Headers $headers
+        if (Test-ProbeAccepted -StatusCode $op.StatusCode -Content $op.Content) { continue }   # still serves
+        if (Test-ModelRetired -StatusCode $op.StatusCode -ModelId $oldId -Content $op.Content) {
+            $deadOld += $oldId
+        } else {
+            $unknownOld += "$oldId(HTTP $($op.StatusCode))"
+        }
     }
-    if ($deadOld.Count -gt 0) {
+    $reloadMode = Get-ReloadMode -DeadOldIds $deadOld
+    $reloadDetail = 'deferred-to-daily-restart'
+    if ($reloadMode -eq 'restart-now') {
         $restartNow = $true
         $restartWhy += "$($fam.Name): old id(s) retired: $($deadOld -join ',')"
-        $reloadMode = "restart-now (old id(s) $($deadOld -join ',') no longer serve)"
+        $reloadDetail = "restart-now (old id(s) $($deadOld -join ',') retired)"
+    } elseif ($unknownOld.Count -gt 0) {
+        $reloadDetail = "deferred-to-daily-restart (old id status unknown: $($unknownOld -join ','))"
     }
 
     Write-VersionEvent -EventsPath $eventsPath -Kind minor-applied -Family $fam.Name -From $fromIds -To $latestId `
-        -Detail "spellings repinned: $(@($repins.Keys) -join ','); reload: $reloadMode; backup: $backup; cascades/profiles untouched (operator act)"
-    & $logTs "MINOR applied: $($fam.Name) $fromIds -> $latestId (reload: $reloadMode; backup $backup)"
+        -Detail "spellings repinned: $(@($repins.Keys) -join ','); reload: $reloadDetail; backup: $backup; cascades/profiles untouched (operator act)"
+    & $logTs "MINOR applied: $($fam.Name) $fromIds -> $latestId (reload: $reloadDetail; backup $backup)"
 }
 
 # --- 4. Reload (config.json is bind-mounted: a drained docker RESTART re-reads
