@@ -180,9 +180,29 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     });
     expect(res.status).toBe(503);
     expect(res.headers.get("retry-after")).toBe("15");
+    // #318 — the marker a relaying sidecar keys on to pass this 503 through
+    // instead of replaying it locally as a hub failure. Its absence on a
+    // frozen answer is a wire-contract break (hub-half mutation pin).
+    expect(res.headers.get("x-claudish-drain-freeze")).toBe("1");
     const body: any = await res.json();
     expect(body.error.type).toBe("overloaded_error");
     expect(anthropicCalls).toBe(0); // refused at admission, zero upstream work
+  });
+
+  test("an UNFROZEN answer never carries the #318 drain-freeze marker", async () => {
+    // The control from the other side: a 200 must not claim the marker, or a
+    // relay would pass through ordinary traffic under drain semantics.
+    writeConsent();
+    writeFlag();
+    rmSync(FLAG_PATH);
+    await spin();
+    const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
+      method: "POST",
+      headers: INBOUND_HEADERS,
+      body: MESSAGES_BODY,
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-claudish-drain-freeze")).toBeNull();
   });
 
   test("unfrozen: flag removed — admissions flow again", async () => {
