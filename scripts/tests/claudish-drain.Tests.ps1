@@ -610,3 +610,125 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
         $log | Should -Match 'OUTCOME success'
     }
 }
+
+Describe 'drain -Detach — quoted detached launch (#312)' {
+    BeforeAll {
+        # Real powershell.exe children, zero docker anywhere (AC3: the child
+        # command is injected — these fixtures, not the drain). Three shapes:
+        #   child-ok.ps1     binds a spaced argument, writes it to the watch
+        #                    log (the "first drain.log line" proxy)
+        #   child-exit7.ps1  dies immediately with stderr noise (AC3c)
+        #   child-bindfail   dies during PARAMETER BINDING — the AC2 evidence
+        #                    class: nothing in the watch log, error in stderr
+        $script:DetachDir = Join-Path $script:TestDir 'detach'
+        New-Item -ItemType Directory -Path $script:DetachDir -Force | Out-Null
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+        $okBody = @'
+param([string]$SpacedValue, [string]$WatchLog)
+Add-Content -LiteralPath $WatchLog -Value "bound:[$SpacedValue]"
+'@
+        [System.IO.File]::WriteAllText((Join-Path $script:DetachDir 'child-ok.ps1'), $okBody, $utf8)
+
+        $exitBody = @'
+param([string]$WatchLog)
+Write-Error 'detach-child-boom'
+exit 7
+'@
+        [System.IO.File]::WriteAllText((Join-Path $script:DetachDir 'child-exit7.ps1'), $exitBody, $utf8)
+
+        $bindBody = @'
+param([int]$MustBeInt, [string]$WatchLog)
+Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
+'@
+        [System.IO.File]::WriteAllText((Join-Path $script:DetachDir 'child-bindfail.ps1'), $bindBody, $utf8)
+
+        # The detach functions live in the dot-sourced drain script.
+        function New-DetachArgumentString {
+            param([string]$Fixture, [string[]]$ExtraArgs)
+            $parts = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Fixture) + $ExtraArgs
+            Join-DrainDetachArguments $parts
+        }
+    }
+
+    It 'a spaced argument binds through the detached path (AC1/AC3a)' {
+        $watch = Join-Path $script:DetachDir 'watch-ok.log'
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-ok.ps1') `
+            -ExtraArgs @('-SpacedValue', 'a value with  spaces', '-WatchLog', $watch)
+        $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
+        $r.Ok | Should -BeTrue
+        $r.Status | Should -Be 'alive'
+        $r.ChildPid | Should -BeGreaterThan 0
+        # Double space inside the value: a broken join cannot reassemble it.
+        # NB the pattern is precomputed: a bare [regex]::Escape('…') as a
+        # Should argument is parsed in ARGUMENT mode and splits at the spaces
+        # inside the value — the suite then matches the literal text
+        # "[regex]::Escape" (first run of this test, measured).
+        $expectedSpaced = [regex]::Escape('a value with  spaces')
+        (Get-Content -LiteralPath $watch -Raw) | Should -Match $expectedSpaced
+        # Evidence files exist under the Claudish home, per-run named (AC1).
+        (Get-ChildItem -LiteralPath $script:DetachDir -Filter 'drain-detach-*.out.log' | Measure-Object).Count | Should -BeGreaterOrEqual 1
+    }
+
+    It 'an immediately-exiting child returns not-Ok with its stderr tail (AC1b/AC3c)' {
+        $watch = Join-Path $script:DetachDir 'watch-exit.log'
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-exit7.ps1') `
+            -ExtraArgs @('-WatchLog', $watch)
+        $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
+        $r.Ok | Should -BeFalse
+        $r.Status | Should -Be 'exited'
+        $r.ExitCode | Should -Be 7
+        ($r.StderrTail -join "`n") | Should -Match 'detach-child-boom'
+        Test-Path -LiteralPath $r.StderrPath | Should -BeTrue
+        # The child never wrote its line — the watch log must stay absent.
+        Test-Path -LiteralPath $watch | Should -BeFalse
+    }
+
+    It 'a parameter-binding failure leaves its error in the stderr file (AC2)' {
+        $watch = Join-Path $script:DetachDir 'watch-bind.log'
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-bindfail.ps1') `
+            -ExtraArgs @('-MustBeInt', 'not an int', '-WatchLog', $watch)
+        $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
+        $r.Ok | Should -BeFalse
+        # Binding dies BEFORE the script body: no watch-log line ever.
+        Test-Path -LiteralPath $watch | Should -BeFalse
+        # Locale-proof pin: the message text is localized (this machine's 5.1
+        # says «Impossible de convertir…», not "Cannot convert") but the
+        # FullyQualifiedErrorId is stable — it must appear in the evidence
+        # file for the AC2 case to be tellable apart from a silent death.
+        ($r.StderrTail -join "`n") | Should -Match 'ParameterArgumentTransformationError'
+        Test-Path -LiteralPath $r.StderrPath | Should -BeTrue
+    }
+
+    It 'forwarded arguments are complete and the join quotes every element (AC1)' {
+        $parts = Get-DrainDetachForwardedArguments -ScriptPath 'C:\some where\claudish-drain.ps1' `
+            -Reason 'why not' -ContainerName 'claudish-proxy' -ProxyUrl 'http://localhost:3000' `
+            -MaxWaitSec 600 -LogPath 'C:\logs with space\drain.log' -ClaudishHome 'C:\home dir' `
+            -EnvFile 'D:\env dir\hub.env' -Recreate -RemoveCreatedTwins
+        $parts[-1] | Should -Be '-RemoveCreatedTwins'
+        $parts | Should -Not -Contain '-Detach'   # no recursion: the child is a plain drain run
+        $joined = Join-DrainDetachArguments $parts
+        # Every element — names AND values — carries its own quotes: the 5.1
+        # -ArgumentList join adds none, so ours must be visible per element.
+        foreach ($p in $parts) {
+            $joined | Should -Match ('"' + [regex]::Escape($p) + '"')
+        }
+    }
+
+    It 'zero-actuator: the detach functions launch no docker/Restart/Stop of their own (AC5)' {
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:DrainScript, [ref]$tokens, [ref]$errors)
+        $names = @('Join-DrainDetachArguments', 'Start-DrainDetached', 'Get-DrainDetachForwardedArguments')
+        $bodies = @($ast.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name
+            }, $true))
+        # A filter that matched nothing would prove nothing: all three must be found.
+        $bodies.Count | Should -Be 3
+        $forbidden = 'Restart-\w|Stop-\w|docker\s+(stop|restart|kill)|-Verb\s+RunAs'
+        foreach ($b in $bodies) {
+            $b.Extent.Text | Should -Not -Match $forbidden
+        }
+        # Positive control: the same predicate must fire on an actuator.
+        'function f { Stop-Service -Name x }' | Should -Match $forbidden
+    }
+}
