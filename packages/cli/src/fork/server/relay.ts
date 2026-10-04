@@ -53,6 +53,19 @@ export interface RelayState {
   /** ms epoch of the last alive→false / false→true transition (recovery cooldown). */
   lastFlipAt: number;
   /**
+   * #323 (review B1): the header-phase AbortControllers currently waiting on
+   * upstream headers. The prober's NOMINAL→AUTONOMOUS flip aborts every one of
+   * them: at a 360s budget the flip (~200s: stall detector 180s + 2 heartbeats)
+   * is the FIRST thing that knows the waits are dead, and without this release
+   * every forward dispatched inside the detection window would sit out the full
+   * budget — ~160s of pure dead time per request, per machine, on the exact
+   * 2026-09-02 wedge shape this module documents. Controllers are flagged
+   * `_relayFlipAbort` before the abort so the fallthrough can label them apart
+   * from a budget deadline (`aborted-on-autonomous`) and neither markFail a
+   * second time nor get retried.
+   */
+  headerWaiters: Set<AbortController>;
+  /**
    * #156: the upstream's /health published OUR OWN instanceId — the upstream IS
    * this process, whatever the URL says (the 2026-09-19 ARR-loop shape). Sticky
    * per detection: latched true by `heartbeat()`, cleared when a reply stops
@@ -85,8 +98,75 @@ const HEARTBEAT_TIMEOUT_MS = 4_000;
  * orphaned but still billed, then the sidecar re-runs the same prompt locally).
  * Worse, on a CLAUDISH_NO_ANTHROPIC machine that fallthrough reroutes a native
  * target to the budget model — a policy-visible behavior change caused by latency.
+ *
+ * #320: the 30s value sat inside the hub's own LEGITIMATE header waits, not above
+ * them. The hub's header-phase contract is bounded by two mechanisms of its own
+ * (composed-handler.ts): the first-event watchdog confines a mute upstream to
+ * CLAUDISH_FIRST_EVENT_TIMEOUT_MS (300s default), and an overload path may hold the
+ * response for "transport 60s + patient backoff ~305s ≈ 6 min, well under the
+ * 10-min client timeout" — the contract a DIRECT client of the hub enjoys. A relay
+ * cutting at 30s defeated both: measured 2026-10-03/04, every >30s hub header wait
+ * was raw upstream latency in GLM bursts (salves 35-92s, queue to 221s, max 221s;
+ * ZERO `[Overload]` patient-retry lines in 83,695 log lines — the backoff loop
+ * never fired), so the relay was amputating waits the hub was faithfully holding
+ * for its provider. Each cut stalled the client 30s, orphaned the hub's in-flight
+ * (billed) call, replayed the prompt on the local cascade (invisible to central
+ * capture, possibly PAYG), and could flip the machine AUTONOMOUS via the failure
+ * streak. The default is now derived from the hub's contract, not the first-byte
+ * sample: 360s = the ~6 min a live hub may legitimately spend before its first
+ * header, still 4 min under the client's own 10-min timeout. The bound is a
+ * BACKSTOP: a genuinely wedged hub is detected elsewhere and sooner — /health's
+ * stall detector counts a request from the moment it enters the middleware
+ * (stream-registry.ts, pendingRequests), so header-phase silences feed the 503 the
+ * prober already acts on (180s default) — this deadline only guarantees the client
+ * turn ends even if that whole chain somehow stays quiet.
+ *
+ * Abort-on-AUTONOMOUS-flip IS wired (#323 review B1). The residual without it is
+ * not "one request": a wedged-but-/health-answering hub (the 2026-09-02 shape,
+ * 2h27 fleet-wide) is detected in ~200s (stall detector 180s + 2 heartbeats) —
+ * every forward dispatched inside that window (a sidecar holds 7-10 in flight,
+ * plus each new arrival) would otherwise sit out the full 360s budget, ~160s of
+ * dead time per request after the flip already knew. markFail's transition now
+ * aborts every registered header waiter (RelayState.headerWaiters), the abort
+ * carries its own fallthrough label (`aborted-on-autonomous`), and it never
+ * markFails a second time. Liveness stays with the prober; this deadline is the
+ * backstop for a flip that somehow never comes.
  */
-export const FORWARD_HEADERS_TIMEOUT_MS = 30_000;
+export const FORWARD_HEADERS_TIMEOUT_MS = 360_000;
+
+/**
+ * Legal range for CLAUDISH_RELAY_HEADER_TIMEOUT_MS. The MIN keeps an operator from
+ * re-creating the original 5s bug (first byte measured at up to 8.3s on ORDINARY
+ * traffic — a budget inside that spread demotes routine requests to local). The
+ * MAX is the client's documented 10-min timeout: past it the client has abandoned
+ * the turn, so the bound protects no one while the local replay never happens.
+ * `0` is NOT a legal "disable" here — an unbounded header wait is exactly the
+ * never-hang violation this bound exists to prevent; use MAX for the longest wait.
+ */
+export const MIN_FORWARD_HEADERS_TIMEOUT_MS = 5_000;
+export const MAX_FORWARD_HEADERS_TIMEOUT_MS = 600_000;
+
+/**
+ * Per-request read of CLAUDISH_RELAY_HEADER_TIMEOUT_MS (never cached — same
+ * rationale as stallThresholdMs: this is a knob an operator turns mid-incident).
+ * Empty/unset mean the default — NOT 0: compose injects every listed name as ""
+ * (#310 review), and Number("") === 0, so a naive parse would turn every
+ * unconfigured container into an instant-timeout relay. Garbage and out-of-range
+ * values also fall back to the default rather than silently disarming the bound.
+ */
+export function resolveForwardHeadersTimeoutMs(): number {
+  const raw = process.env.CLAUDISH_RELAY_HEADER_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return FORWARD_HEADERS_TIMEOUT_MS;
+  const n = Number(raw);
+  if (
+    !Number.isFinite(n) ||
+    n < MIN_FORWARD_HEADERS_TIMEOUT_MS ||
+    n > MAX_FORWARD_HEADERS_TIMEOUT_MS
+  ) {
+    return FORWARD_HEADERS_TIMEOUT_MS;
+  }
+  return Math.floor(n);
+}
 const DEEP_PROBE_TIMEOUT_MS = 30_000;
 /** #80 part 2: one retry on a connect-phase failure before falling through
  * (the Docker Desktop tunnel's chronic resets — see forwardToUpstream). */
@@ -128,6 +208,7 @@ export function createRelayState(opts: {
     consecutiveFail: 0,
     consecutiveOk: 0,
     lastFlipAt: 0,
+    headerWaiters: new Set(),
     selfLoop: false,
   };
 }
@@ -213,6 +294,18 @@ function markFail(state: RelayState, reason: string): void {
   if (state.alive && state.consecutiveFail >= FAIL_THRESHOLD) {
     state.alive = false;
     state.lastFlipAt = Date.now();
+    // #323 (review B1) — release the in-flight header waits on the flip. The
+    // flip is the earliest trustworthy verdict that those waits are dead (the
+    // stall detector + 2 heartbeats ≈ 200s, vs a 360s budget they would each
+    // otherwise sit out). Flag BEFORE aborting so forwardToUpstream's catch can
+    // tell a flip-abort from its own deadline (distinct fallthrough label, no
+    // second markFail, no pointless retry).
+    if (state.headerWaiters) {
+      for (const ctl of state.headerWaiters) {
+        (ctl as any)._relayFlipAbort = true;
+        ctl.abort();
+      }
+    }
     log(
       `[Relay] upstream ${redactUpstreamForLog(state.upstream)} DOWN after ${state.consecutiveFail} failure(s) (${reason}) → AUTONOMOUS`,
       true
@@ -296,7 +389,7 @@ export async function forwardToUpstream(
   c: Context,
   body: unknown,
   state: RelayState,
-  headerTimeoutMs: number = FORWARD_HEADERS_TIMEOUT_MS
+  headerTimeoutMs: number = resolveForwardHeadersTimeoutMs()
 ): Promise<Response | null> {
   // Build outbound headers: copy inbound minus hop-by-hop (this PRESERVES
   // X-Claudish-Machine so central attribution survives the relay — the whole
@@ -358,11 +451,12 @@ export async function forwardToUpstream(
   // markFail, so the chronic blips stop feeding the AUTONOMOUS hysteresis and
   // stop diverting requests to the local cascades (which the central capture
   // never sees, and which may bill PAYG the hub's subscriptions would have
-  // covered). A header deadline is NOT retried (that would double the 30 s
+  // covered). A header deadline is NOT retried (that would double the budgeted
   // stall), and neither is an HTTP 5xx (the hub answered; hysteresis owns it).
   let res: Response | null = null;
   let lastErr: unknown = null;
   let lastWasHeaderDeadline = false;
+  let lastWasFlipAbort = false;
   let fetchStartedAt = performance.now();
   // Path-aware forward: relay to the SAME route the client hit, so an OpenAI
   // request (/v1/chat/completions) reaches the hub's OpenAI ingress rather
@@ -372,10 +466,26 @@ export async function forwardToUpstream(
     typeof c.req?.path === "string" && c.req.path.startsWith("/v1/")
       ? c.req.path
       : "/v1/messages";
+  // #323 (review B2): ONE header deadline for the whole relayed turn. Every
+  // header leg — the initial attempt, its connect retry, and each #170
+  // re-forward — arms `max(0, deadline − now)`, never a fresh budget: 3 legs ×
+  // 360s would spend 1 080s in headers alone, past the client's 10-min timeout,
+  // and the client would abandon the turn with a timeout error instead of
+  // receiving the relay's well-formed finalization. When no budget remains the
+  // leg aborts immediately and returns null, so the parser surfaces the
+  // original death exactly as it does today.
+  const headerDeadlineAt = Date.now() + headerTimeoutMs;
   for (let attempt = 0; attempt <= CONNECT_RETRIES; attempt++) {
     const headerController = new AbortController();
-    const headerTimer = setTimeout(() => headerController.abort(), headerTimeoutMs);
+    const headerTimer = setTimeout(
+      () => headerController.abort(),
+      Math.max(0, headerDeadlineAt - Date.now())
+    );
     fetchStartedAt = performance.now();
+    // Registered for the prober's flip-abort (see RelayState.headerWaiters) —
+    // only while headers are pending; a controller whose headers arrived must
+    // not be aborted by a later flip (the body is unbounded by design).
+    (state.headerWaiters ??= new Set()).add(headerController);
     try {
       res = await fetch(`${state.upstream}${reqPath}`, {
         method: "POST",
@@ -389,8 +499,11 @@ export async function forwardToUpstream(
     } catch (e) {
       clearTimeout(headerTimer);
       lastErr = e;
-      lastWasHeaderDeadline = (e as any)?.name === "AbortError";
-      if (lastWasHeaderDeadline) break; // slow upstream: retrying doubles the stall
+      lastWasFlipAbort = (headerController as any)._relayFlipAbort === true;
+      lastWasHeaderDeadline = (e as any)?.name === "AbortError" && !lastWasFlipAbort;
+      // A slow upstream or a flipped hub: retrying either doubles the stall or
+      // forwards to a hub we just declared dead.
+      if (lastWasHeaderDeadline || lastWasFlipAbort) break;
       if (attempt < CONNECT_RETRIES) {
         log(
           `[Relay] forward connect failed (${String(e).slice(0, 80)}) — retrying ${attempt + 1}/${CONNECT_RETRIES}`,
@@ -398,10 +511,12 @@ export async function forwardToUpstream(
         );
         await new Promise((r) => setTimeout(r, CONNECT_RETRY_DELAY_MS));
       }
+    } finally {
+      state.headerWaiters.delete(headerController);
     }
   }
   if (lastErr !== null) {
-    // Two failures of opposite natures land here, and only one of them
+    // Three outcomes of opposite natures land here, and only one of them
     // says anything about whether the HUB is alive.
     //
     // A refused / reset / DNS-failed connection is direct evidence the hub is
@@ -427,22 +542,34 @@ export async function forwardToUpstream(
     // silent at 03:20:45Z, kept answering /health from a wedged process, and no
     // machine failed over until a manual reboot 2h27 later. The conclusion was
     // still right (this path must not own liveness) but the gap was real, so it
-    // is now closed where it belongs: /health itself reports whether the request
+    // is now closed twice over: /health itself reports whether the request
     // pipeline is MOVING (streams in flight with no byte for
-    // CLAUDISH_STALL_THRESHOLD_MS → 503), which the prober below already acts on.
-    // See fork/server/stream-registry.ts.
+    // CLAUDISH_STALL_THRESHOLD_MS → 503), which the prober below already acts on
+    // (see fork/server/stream-registry.ts) — and since #323 the NOMINAL→AUTONOMOUS
+    // flip proactively aborts the in-flight header waits, so a wedged hub no
+    // longer costs each request its full budget.
+    //
+    // A flip-abort is the third nature: the waiter was aborted by the prober's
+    // transition (markFail), not by its own deadline. The flip has already spoken
+    // (this very markFail is what aborted us), so it must neither markFail again
+    // — double-counting one verdict — nor read as latency. Its fallthrough label
+    // `aborted-on-autonomous` is what keeps the three apart in the logs.
     //
     // The request itself still falls through, and every fallthrough is still logged.
     // Only the machine-wide contagion is removed.
     const detail = String(lastErr).slice(0, 80);
-    if (!lastWasHeaderDeadline) {
+    if (!lastWasHeaderDeadline && !lastWasFlipAbort) {
       markFail(state, `forward-connect: ${detail}`);
     }
-    // Label the two apart. Reporting a header deadline as `connect:` is what hid
+    // Label the natures apart. Reporting a header deadline as `connect:` is what hid
     // this: the log named a connection failure while the cause was latency.
     logFallthrough(
       state,
-      lastWasHeaderDeadline ? `header-timeout after ${headerTimeoutMs}ms` : `connect: ${detail}`
+      lastWasFlipAbort
+        ? "aborted-on-autonomous"
+        : lastWasHeaderDeadline
+          ? `header-timeout after ${headerTimeoutMs}ms`
+          : `connect: ${detail}`
     );
     return null;
   }
@@ -547,7 +674,17 @@ export async function forwardToUpstream(
   // mute-but-200 replacement would hang the client (#108's exact failure mode).
   const reforward = boundRetryUpstream(async () => {
     const reforwardController = new AbortController();
-    const reforwardTimer = setTimeout(() => reforwardController.abort(), headerTimeoutMs);
+    // #323 (review B2): the re-forward draws on the turn's ONE header deadline
+    // (headerDeadlineAt), never a fresh budget — 2 re-forwards × a fresh 360s
+    // each would spend 1 080s in headers on one turn, past the client's 10-min
+    // timeout. Zero remaining aborts immediately → null → the parser surfaces
+    // the original death. Registered in headerWaiters like the initial attempt:
+    // a prober flip while a re-forward waits on headers releases it too.
+    const reforwardTimer = setTimeout(
+      () => reforwardController.abort(),
+      Math.max(0, headerDeadlineAt - Date.now())
+    );
+    (state.headerWaiters ??= new Set()).add(reforwardController);
     try {
       return await fetch(`${state.upstream}${reqPath}`, {
         method: "POST",
@@ -556,9 +693,10 @@ export async function forwardToUpstream(
         signal: reforwardController.signal,
       });
     } catch {
-      return null; // refused / reset / deadline → the parser surfaces the original death
+      return null; // refused / reset / deadline / flip-abort → the parser surfaces the original death
     } finally {
       clearTimeout(reforwardTimer);
+      state.headerWaiters.delete(reforwardController);
     }
   }, String(model));
   // #229: the passthrough rebuilds its response headers from a fresh literal,
