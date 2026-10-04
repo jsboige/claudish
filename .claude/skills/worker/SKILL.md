@@ -31,10 +31,25 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
 
 ## Pièges du périmètre hub (vérifiés, ne pas réapprendre)
 
+- **Traces proxy → outil MCP `claudish_traffic`** (livré, #72), pas `traffic-live.ps1`.
+  Le MCP **refuse un verdict** quand `docker logs --since` a servi un corpus **roté**
+  (le fichier courant du conteneur va plus loin que ce que `--since` a rendu) et rend
+  l'histogramme **jusqu'à maintenant** — les buckets finaux vides SONT la réponse.
+  A/B mesuré le 04/10 sur le relais .46, même fenêtre 24 h : le MCP a rendu `UNKNOWN`
+  (corpus roté, fichier courant à 21:01Z vs `--since` arrêté à 19:18Z) là où
+  `traffic-live.ps1` a rendu un verdict sur ce corpus non validé **et fabriqué 2 faux
+  « HANG SUSPECTS »** à partir de lignes `[resp] capture write error: EIO` (un échec
+  d'écriture de capture, pas un stream resté ouvert). Le script reste pour la cadence
+  de surveillance 6 h ; ne pas lui ajouter de nouveaux appelants.
 - **`traffic-live.ps1 -Container`** : défaut = `claudish-proxy` (hub). Sur un sidecar,
-  passer `-Container claudish-sidecar` ou le script exit 1.
+  passer `-Container claudish-sidecar` ou le script exit 1. (L'outil MCP prend
+  `container` en argument.)
 - **`--since Nh`** : réévalué à chaque invocation → 1 seule invocation par fenêtre ;
-  snapshoter une fois, ancrer sur `^ *\[resp\] `. `--tail` = fallback sur signature
+  snapshoter une fois, ancrer sur `^ *\[resp\] `. ⚠ Sur po-203 le `--since` **tronque la
+  fin** (il s'arrête à l'arrêt précédent du conteneur et ignore le segment post-restart)
+  et `--tail` est **instable** (`--tail 45` a rendu 0 ligne là où `--tail 25` rendait le
+  segment) : mesurer par **filtrage timestamp** (`docker logs -t … | awk '$1 >= "…" && $1 <= "…"'`)
+  et **croiser avec les captures** (`/captures`). `--tail` = fallback sur signature
   GOTCHA #2 seulement.
 - **Comptage watchdog** : référence « 13 bannières » = PAR JOUR, pas cumulé. Scanner
   tout le fichier rend 111 et fabrique une fausse ALERTE. Ne compter que
