@@ -85,8 +85,71 @@ const HEARTBEAT_TIMEOUT_MS = 4_000;
  * orphaned but still billed, then the sidecar re-runs the same prompt locally).
  * Worse, on a CLAUDISH_NO_ANTHROPIC machine that fallthrough reroutes a native
  * target to the budget model — a policy-visible behavior change caused by latency.
+ *
+ * #320: the 30s value sat inside the hub's own LEGITIMATE header waits, not above
+ * them. The hub's header-phase contract is bounded by two mechanisms of its own
+ * (composed-handler.ts): the first-event watchdog confines a mute upstream to
+ * CLAUDISH_FIRST_EVENT_TIMEOUT_MS (300s default), and an overload path may hold the
+ * response for "transport 60s + patient backoff ~305s ≈ 6 min, well under the
+ * 10-min client timeout" — the contract a DIRECT client of the hub enjoys. A relay
+ * cutting at 30s defeated both: measured 2026-10-03/04, every >30s hub header wait
+ * was raw upstream latency in GLM bursts (salves 35-92s, queue to 221s, max 221s;
+ * ZERO `[Overload]` patient-retry lines in 83,695 log lines — the backoff loop
+ * never fired), so the relay was amputating waits the hub was faithfully holding
+ * for its provider. Each cut stalled the client 30s, orphaned the hub's in-flight
+ * (billed) call, replayed the prompt on the local cascade (invisible to central
+ * capture, possibly PAYG), and could flip the machine AUTONOMOUS via the failure
+ * streak. The default is now derived from the hub's contract, not the first-byte
+ * sample: 360s = the ~6 min a live hub may legitimately spend before its first
+ * header, still 4 min under the client's own 10-min timeout. The bound is a
+ * BACKSTOP: a genuinely wedged hub is detected elsewhere and sooner — /health's
+ * stall detector counts a request from the moment it enters the middleware
+ * (stream-registry.ts, pendingRequests), so header-phase silences feed the 503 the
+ * prober already acts on (180s default) — this deadline only guarantees the client
+ * turn ends even if that whole chain somehow stays quiet.
+ *
+ * Abort-on-AUTONOMOUS-flip (abort in-flight header waits when the prober demotes
+ * the hub) was evaluated for #320 and deliberately NOT wired: the flip already
+ * stops NEW forwards, so the residual is one request already waiting, bounded by
+ * this budget; distinguishing a flip-abort from a deadline-abort in the fallthrough
+ * label needs its own careful pass (the message must not say "header-timeout" for
+ * an abort the prober caused). Traced here so the option is not re-derived blind.
  */
-export const FORWARD_HEADERS_TIMEOUT_MS = 30_000;
+export const FORWARD_HEADERS_TIMEOUT_MS = 360_000;
+
+/**
+ * Legal range for CLAUDISH_RELAY_HEADER_TIMEOUT_MS. The MIN keeps an operator from
+ * re-creating the original 5s bug (first byte measured at up to 8.3s on ORDINARY
+ * traffic — a budget inside that spread demotes routine requests to local). The
+ * MAX is the client's documented 10-min timeout: past it the client has abandoned
+ * the turn, so the bound protects no one while the local replay never happens.
+ * `0` is NOT a legal "disable" here — an unbounded header wait is exactly the
+ * never-hang violation this bound exists to prevent; use MAX for the longest wait.
+ */
+export const MIN_FORWARD_HEADERS_TIMEOUT_MS = 5_000;
+export const MAX_FORWARD_HEADERS_TIMEOUT_MS = 600_000;
+
+/**
+ * Per-request read of CLAUDISH_RELAY_HEADER_TIMEOUT_MS (never cached — same
+ * rationale as stallThresholdMs: this is a knob an operator turns mid-incident).
+ * Empty/unset mean the default — NOT 0: compose injects every listed name as ""
+ * (#310 review), and Number("") === 0, so a naive parse would turn every
+ * unconfigured container into an instant-timeout relay. Garbage and out-of-range
+ * values also fall back to the default rather than silently disarming the bound.
+ */
+export function resolveForwardHeadersTimeoutMs(): number {
+  const raw = process.env.CLAUDISH_RELAY_HEADER_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return FORWARD_HEADERS_TIMEOUT_MS;
+  const n = Number(raw);
+  if (
+    !Number.isFinite(n) ||
+    n < MIN_FORWARD_HEADERS_TIMEOUT_MS ||
+    n > MAX_FORWARD_HEADERS_TIMEOUT_MS
+  ) {
+    return FORWARD_HEADERS_TIMEOUT_MS;
+  }
+  return Math.floor(n);
+}
 const DEEP_PROBE_TIMEOUT_MS = 30_000;
 /** #80 part 2: one retry on a connect-phase failure before falling through
  * (the Docker Desktop tunnel's chronic resets — see forwardToUpstream). */
@@ -296,7 +359,7 @@ export async function forwardToUpstream(
   c: Context,
   body: unknown,
   state: RelayState,
-  headerTimeoutMs: number = FORWARD_HEADERS_TIMEOUT_MS
+  headerTimeoutMs: number = resolveForwardHeadersTimeoutMs()
 ): Promise<Response | null> {
   // Build outbound headers: copy inbound minus hop-by-hop (this PRESERVES
   // X-Claudish-Machine so central attribution survives the relay — the whole
@@ -358,7 +421,7 @@ export async function forwardToUpstream(
   // markFail, so the chronic blips stop feeding the AUTONOMOUS hysteresis and
   // stop diverting requests to the local cascades (which the central capture
   // never sees, and which may bill PAYG the hub's subscriptions would have
-  // covered). A header deadline is NOT retried (that would double the 30 s
+  // covered). A header deadline is NOT retried (that would double the budgeted
   // stall), and neither is an HTTP 5xx (the hub answered; hysteresis owns it).
   let res: Response | null = null;
   let lastErr: unknown = null;

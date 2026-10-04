@@ -73,8 +73,11 @@ services:
       #   CLAUDISH_RELAY_UPSTREAM — hub URL (LAN http://192.168.0.46:3000, WAN https://models.myia.io)
       #   CLAUDISH_RELAY_COMPRESS — 1 on WAN externals (po-2025, web1) only
       #   CLAUDISH_NO_ANTHROPIC   — 1 on every machine except ai-01 (leak-policy backstop)
+      #   CLAUDISH_RELAY_HEADER_TIMEOUT_MS — relay header budget (#320); empty = the
+      #     360s hub-contract default, NEVER 0 (Number("") trap, #310 review)
       - CLAUDISH_RELAY_UPSTREAM=${CLAUDISH_RELAY_UPSTREAM:-}
       - CLAUDISH_RELAY_COMPRESS=${CLAUDISH_RELAY_COMPRESS:-}
+      - CLAUDISH_RELAY_HEADER_TIMEOUT_MS=${CLAUDISH_RELAY_HEADER_TIMEOUT_MS:-}
       - CLAUDISH_NO_ANTHROPIC=${CLAUDISH_NO_ANTHROPIC:-}
       # Native credential guard kill switch (#296): only an explicit "0" disarms;
       # empty = guard on. Listed here because the env file only interpolates —
