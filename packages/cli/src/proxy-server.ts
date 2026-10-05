@@ -17,7 +17,7 @@ import { LocalTransport } from "./providers/transport/local.js";
 import { LocalModelAdapter } from "./adapters/local-adapter.js";
 import { PoeProvider } from "./providers/transport/poe.js";
 import type { ModelHandler } from "./handlers/types.js";
-import { ComposedHandler, setVisionAuthPolicy, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
+import { ComposedHandler, isOverloadWalkClass, setVisionAuthPolicy, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import {
   resolveProvider,
   parseUrlModel,
@@ -68,8 +68,10 @@ import {
   resolveDelegationOwner,
   setRoleNominalResolver,
   markStepFailed,
+  NATIVE_BUCKET,
   parseResetAtFromBody,
   resetStepSuccess,
+  resolveTransientStep,
   onNominalSuccess,
   onNominalRefusal,
   getArmGraceMs,
@@ -817,16 +819,31 @@ export async function createProxyServer(
     requestedModel: string,
     depth = 0,
     sessionKey: string | null = null,
-    nominalBucket?: string
+    nominalBucket?: string,
+    /**
+     * #299-B: serve THIS target verbatim, bypassing both the modelMap lookup
+     * and the failover swap (2a). Used only by the cascade loop's one-shot
+     * overload walk, where the step to try is chosen by the walk itself, not
+     * by resolution — a state read would either re-select the nominal (no arm)
+     * or write the dwell pin the walk must not write.
+     */
+    forceTarget?: string
   ): Promise<ModelHandler> => {
     // 1. Monitor Mode Override
     if (monitorMode) return nativeHandler;
 
-    // 2. Resolve target model based on mappings or defaults
-    // Priority: role mappings > default model (--model) > requested model (native)
-    const { target: mappedTarget, mapped } = resolveNominalTarget(requestedModel);
-    let target = mappedTarget;
-    let wasFromModelMap = mapped;
+    let target: string;
+    let wasFromModelMap: boolean;
+    if (forceTarget) {
+      target = forceTarget;
+      wasFromModelMap = true; // a walk step is as explicit as a swap target
+    } else {
+      // 2. Resolve target model based on mappings or defaults
+      // Priority: role mappings > default model (--model) > requested model (native)
+      const { target: mappedTarget, mapped } = resolveNominalTarget(requestedModel);
+      target = mappedTarget;
+      wasFromModelMap = mapped;
+    }
 
     // The role is derived from what the CLIENT asked for, independently of
     // whether modelMap has an entry for it — a failover must be able to divert
@@ -843,7 +860,9 @@ export async function createProxyServer(
     // resolveFailoverTargetForSession walks the cascade skipping TTL-failed
     // steps, plus the per-session dwell (#91 point 4) when a session key is
     // available. Inert unless CLAUDISH_FAILOVER_* is configured. See fork/failover.ts.
-    if (role && getFailoverRule(role)) {
+    // Skipped entirely for a forced walk target: that attempt must not read
+    // failover state (the walk changes none).
+    if (!forceTarget && role && getFailoverRule(role)) {
       // #275: the diversion test is bucket-scoped — compute this request's
       // nominal bucket (unless the caller — the cascade loop — already did).
       const bucket = nominalBucket ?? (await nominalBucketOfModel(requestedModel));
@@ -1094,6 +1113,10 @@ export async function createProxyServer(
     const triedSteps = new Set<number>();
     let revisits = 0;
     let response: Response | undefined;
+    // #299-B: one-shot bounded — a nominal transient overload walks to the
+    // first servable cascade step at most ONCE per request, whatever the loop
+    // does afterwards.
+    let overloadWalked = false;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const handler = await getHandlerForRequest(requestedModel, 0, sessionKey, bucket);
       const resolved = role
@@ -1171,13 +1194,104 @@ export async function createProxyServer(
         // not a failed request.
         //
         // Narrow on three axes, each for a different reason:
-        //  - nominal (stepIndex -1) never advances: that is the user's own model
-        //    failing, and it must surface.
+        //  - nominal (stepIndex -1) never advances ON A NON-OVERLOAD FAILURE:
+        //    that is the user's own model failing, and it must surface. The one
+        //    exception is the transient-overload walk below (#299-B).
         //  - the last step never advances: there is nothing beneath it.
         //  - wiring faults never advance: a mistyped model id in a step would become
         //    permanently invisible, every request stepping over it in silence.
         const isIntermediateStep =
           stepIndex >= 0 && rule != null && stepIndex < rule.steps.length - 1;
+        // #299-B — one-shot overload walk. A 529 (or a 429/503 the patient
+        // backoff already exhausted into a 529, or a 400 `connection_error`)
+        // on the NOMINAL is a PROVIDER saying "unreachable/overloaded", not
+        // the role's plan being walled (#299 measured 30 % of MiniMax
+        // attempts failing so, 2026-10-02): the client retried a dozen times
+        // against the same overloaded provider and then dropped the turn.
+        // Try the FIRST SERVABLE cascade step ONCE, for this request only,
+        // and write no FAILURE state — no arm, no stepFailures mark, no
+        // bucket wall, no dwell pin (a SERVED attempt still mirrors the
+        // loop's success bookkeeping, which a wall never feeds). The
+        // separation is the #170 re-forward's (`no
+        // markFail`): the moment the overload lifts, the very next request
+        // re-probes the nominal instead of riding a cascade the role was
+        // never exiled to.
+        //
+        // The NATIVE lane is excluded on purpose (review of #326, point 1):
+        // its bucket is `anthropic-native/<model>` and its meter is the
+        // CLIENT's own Anthropic credential — a native 529 says nothing about
+        // a plan being walled, but serving the turn from a non-Claude step
+        // WITHOUT a notice would contradict "every substitution is
+        // announced", on the one model the client picked deliberately, while
+        // Claude Code already retries its 529s on its own.
+        const walkDisabled = (process.env.CLAUDISH_FAILOVER_OVERLOAD_WALK || "").trim() === "0";
+        if (
+          !isIntermediateStep &&
+          stepIndex === -1 &&
+          !overloadWalked &&
+          !walkDisabled &&
+          rule != null &&
+          rule.steps.length > 0 &&
+          !(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`) &&
+          isOverloadWalkClass(response.status, errBody)
+        ) {
+          overloadWalked = true;
+          // First SERVABLE step, read-only (a step in per-step backoff or a
+          // walled bucket is skipped — walking there is a round-trip at a
+          // target we already know is dead; a role-step whose delegation
+          // cannot resolve concrete is skipped too, so the ROLE NAME can
+          // never reach the wire as a model id). Null ⇒ no servable step:
+          // surface the original overload rather than substitute blind.
+          const walk = resolveTransientStep(role);
+          if (walk) {
+            const walkDelegation = walk.step.roleRef
+              ? resolveDelegationOwner(role, walk.step)
+              : null;
+            log(
+              `[Failover] WALK ${role} one-shot (HTTP ${response.status} on nominal ${requestedModel}) → ${walk.concrete} (step ${walk.stepIndex})`,
+              true
+            );
+            const modelBeforeWalk = body.model;
+            try {
+              const walkHandler = await getHandlerForRequest(
+                walk.concrete,
+                0,
+                sessionKey,
+                bucket,
+                walk.concrete
+              );
+              const walkResp = await walkHandler.handle(c, body);
+              if (walkResp.ok) {
+                // The step proved itself — mirror the loop's success
+                // bookkeeping (a success resets a step's failure count; it
+                // never arms).
+                if (!walk.step.roleRef) resetStepSuccess(role, walk.stepIndex);
+                if (walkDelegation) {
+                  if (walkDelegation.owner.nominal) {
+                    const ownerBucket = await nominalBucketOfModel(walkDelegation.concrete);
+                    onNominalSuccess(walkDelegation.owner.role, ownerBucket);
+                  } else {
+                    resetStepSuccess(walkDelegation.owner.role, walkDelegation.owner.stepIndex);
+                  }
+                }
+                body.model = modelBeforeWalk;
+                return walkResp;
+              }
+              // Not ok: the step's own incident must not become the client's
+              // answer, and its unread body is a connection held open for
+              // nothing — drain it before surfacing the ORIGINAL overload.
+              try {
+                await walkResp.body?.cancel();
+              } catch {
+                // already gone — nothing to drain
+              }
+            } catch {
+              // The walk attempt itself threw — the original overload stands.
+            }
+            body.model = modelBeforeWalk;
+          }
+          return response;
+        }
         if (!isIntermediateStep) return response;
         if (isWiringError(response.status, errBody)) {
           log(

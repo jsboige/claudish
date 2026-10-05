@@ -73,8 +73,11 @@ services:
       #   CLAUDISH_RELAY_UPSTREAM — hub URL (LAN http://192.168.0.46:3000, WAN https://models.myia.io)
       #   CLAUDISH_RELAY_COMPRESS — 1 on WAN externals (po-2025, web1) only
       #   CLAUDISH_NO_ANTHROPIC   — 1 on every machine except ai-01 (leak-policy backstop)
+      #   CLAUDISH_RELAY_HEADER_TIMEOUT_MS — relay header budget (#320); empty = the
+      #     360s hub-contract default, NEVER 0 (Number("") trap, #310 review)
       - CLAUDISH_RELAY_UPSTREAM=${CLAUDISH_RELAY_UPSTREAM:-}
       - CLAUDISH_RELAY_COMPRESS=${CLAUDISH_RELAY_COMPRESS:-}
+      - CLAUDISH_RELAY_HEADER_TIMEOUT_MS=${CLAUDISH_RELAY_HEADER_TIMEOUT_MS:-}
       - CLAUDISH_NO_ANTHROPIC=${CLAUDISH_NO_ANTHROPIC:-}
       # Native credential guard kill switch (#296): only an explicit "0" disarms;
       # empty = guard on. Listed here because the env file only interpolates —
@@ -136,6 +139,10 @@ services:
       - CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS=${CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS:-}
       - CLAUDISH_FAILOVER_SESSION_DWELL_MS=${CLAUDISH_FAILOVER_SESSION_DWELL_MS:-}
       - CLAUDISH_FAILOVER_RECOVERY_GRACE_MS=${CLAUDISH_FAILOVER_RECOVERY_GRACE_MS:-}
+      # #299-B — one-shot overload walk kill switch. Unlike the knobs above this
+      # is a read-per-request switch (the fleet flips it mid-flight; no recreate),
+      # but a container still needs the NAME here to ever see any value at all.
+      - CLAUDISH_FAILOVER_OVERLOAD_WALK=${CLAUDISH_FAILOVER_OVERLOAD_WALK:-}
       # #310 — runtime knobs the proxy reads that were never in this list
       # (same absence class as the #304 failover knobs above: the env file only
       # interpolates, so a value set for a name this list does not carry never

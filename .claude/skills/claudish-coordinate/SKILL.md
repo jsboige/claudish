@@ -1,16 +1,16 @@
 ---
 name: claudish-coordinate
-description: Cycle de coordination du workspace claudish sur myia-ai-01 (rôle coordinateur, cadence 6h sous Opus). Dispatche une file de 5-6 grains à chacun des 4 workers et fait avancer les issues, review/merge exigeants, lit dashboard + inbox, sonde le hub et le sidecar, contrôle le trafic et la leak-policy Anthropic, fait le point PRs, présente les arbitrages au user, publie un bilan [DONE]. À invoquer au réveil du cron ou quand le user demande un tour de coordination claudish.
+description: Cycle de coordination du workspace claudish sur myia-ai-01 (rôle coordinateur, cadence 12h sous Opus). Dispatche une file profonde (~10 grains ordonnés, avec repli) à chacun des 4 workers et fait avancer les issues, review/merge exigeants, lit dashboard + inbox, sonde le hub et le sidecar, contrôle le trafic et la leak-policy Anthropic, fait le point PRs, présente les arbitrages au user, publie un bilan [DONE]. À invoquer au réveil du cron ou quand le user demande un tour de coordination claudish.
 ---
 
 # Cycle de coordination claudish — myia-ai-01
 
-**Cadence :** **6h** via `CronCreate` (`37 */6 * * *`, heure locale), **sous Opus**.
+**Cadence :** **12h** via `CronCreate` (`37 */12 * * *`, heure locale : 00:37 et 12:37), **sous Opus**.
 
-⚠️ **Cette valeur suit le budget Anthropic et a changé huit fois** : 12h → 24h le 01/09
+⚠️ **Cette valeur suit le budget Anthropic et a changé neuf fois** : 12h → 24h le 01/09
 (famine annoncée pour le jeudi, reset vendredi 03h), puis 24h → **5h** le soir même (reset Anthropic
 couvrant ~2 jours), puis 5h → **12h** le 03/09, puis 12h → **6h** le 06/09, puis 6h → **3h** le
-14/09, puis 3h → **5h** le 18/09, puis 5h → **6h** le 02/10 — toutes sur demande du user. **Ne jamais la changer de sa propre
+14/09, puis 3h → **5h** le 18/09, puis 5h → **6h** le 02/10, puis 6h → **12h** le 05/10 — toutes sur demande du user. **Ne jamais la changer de sa propre
 initiative** — elle est un arbitrage de dépense qui appartient au user.
 
 🔎 **Piège de lecture du delta en Phase 0** : avec `*/N`, les créneaux sont des heures fixes, pas un
@@ -53,6 +53,17 @@ de cadence ont été patchés dans le même geste. Le prompt garde le mandat du 
 L'armement a eu lieu 73 min après le créneau 00:37 : un tir de rattrapage immédiat est donc possible
 (voir l'avertissement plus bas). Si c'est le cas, mener ce cycle économiquement.
 
+📌 **Tranché le 05/10 (~13:40 locale)** : demande user directe, en plein cycle : « Est-ce que tu pourrais
+ralentir de moitié ton cron tout en dispatchant des deep queues aux workers ? ». Le contexte : le forfait
+Claude hebdomadaire était à 57 % le lundi, et la console annonçait l'épuisement pour mercredi soir
+(registre #45, reco (b) = ralentir à 12 h, donc reco suivie). Le cron `00c08a92` est armé à
+`37 */12 * * *` depuis une session `claude-opus-5-5[1m]`, l'ancien `9eb7a0dc` (`*/6`) est annulé, et
+ce paragraphe, la ligne de cadence et le gabarit de Phase 0 ont été patchés dans le même geste.
+**Contrepartie exigée dans la même phrase : des files profondes** (Phase 4c). Avec 12 h entre deux
+passages, une file de 5-6 grains s'épuise avant mon retour et le worker se remet à piocher : c'est
+exactement ce que le mandat du 04/10 voulait supprimer. 24 est divisible par 12, donc pas de piège
+de delta. L'armement a eu lieu 1 h après le créneau 12:37 : un tir de rattrapage reste possible.
+
 🔴 **MANDAT COORDINATEUR (user, 18/09 ~13:30 locale)** — verbatim : « J'attends de toi que tu endosses
 ton rôle de coordinateur et que tu fasses avancer les issues en dispatchant du travail à tes désormais
 3 workers, tout en faisant des reviews et des merges exigeants. OK pour le mandat, après quelques jours
@@ -60,8 +71,9 @@ de flottements ? » Conséquences opératoires, à tenir **chaque cycle** :
 1. **Aucun cycle idle** — un cycle qui ne fait que sonder l'infra et publier un [DONE] de surveillance
    est un cycle raté. La surveillance est le socle, pas le livrable.
 2. **Dispatch explicite aux workers** (`po-2023`, `po-2024`, `po-2025`, et `po-2026` depuis fin septembre) :
-   chaque worker sort du cycle avec une **file de plusieurs grains**, cible **5 à 6 grains cohérents**,
-   chacun nommé, borné et rattaché à une issue (mandat user du 04/10, voir Phase 4c). Un worker qui
+   chaque worker sort du cycle avec une **file profonde**, cible **~10 grains cohérents et ordonnés,
+   dont des grains de repli**, chacun nommé, borné et rattaché à une issue (mandats user du 04/10 et
+   du 05/10, voir Phase 4c). Un worker qui
    signale « file vide » est un défaut de dispatch, pas un état acceptable (po-2024 l'a signalé le 18/09 11:18Z).
 3. **Reviews et merges exigeants** — lecture intégrale (body, commentaires, reviews avec `state`, diff),
    `Closes #NN` vérifié, et refus assumé quand le grain ne tient pas. « Exigeant » veut dire que le
@@ -144,8 +156,8 @@ Trois leçons, dans l'ordre où elles mordent :
 `CronList`. Si le job `/claudish-coordinate` est absent → le ré-armer **immédiatement** :
 
 ```
-CronCreate(cron: "37 */6 * * *",
-           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7. Mandat user du 18/09 : endosser le rôle de coordinateur — faire avancer les issues en dispatchant une file de 5-6 grains cohérents à chacun des 4 workers (po-2023, po-2024, po-2025, po-2026 — mandat user 04/10, Phase 4c), et faire des reviews/merges exigeants. Aucun cycle idle.",
+CronCreate(cron: "37 */12 * * *",
+           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7. Mandat user du 18/09 : endosser le rôle de coordinateur — faire avancer les issues en dispatchant une file PROFONDE (~10 grains ordonnés, avec grains de repli) à chacun des 4 workers (po-2023, po-2024, po-2025, po-2026 — mandats user 04/10 et 05/10, Phase 4c), et faire des reviews/merges exigeants. Aucun cycle idle.",
            recurring: true)
 ```
 
@@ -231,9 +243,17 @@ Lecture :
 
 ### Phase 3 — Trafic et leak-policy
 
-```powershell
-.\scripts\traffic-live.ps1 -Hours 12 -Container claudish-sidecar
 ```
+claudish_traffic(container:"claudish-sidecar", since:"6h", bucket_minutes:60)   # MCP roo-state-manager
+```
+
+**Instrument par défaut depuis le 05/10 (#72, PR #330)** : l'outil MCP refuse un verdict sur un corpus
+roté (`UNKNOWN` au lieu d'un faux NOMINAL), rend l'histogramme jusqu'à maintenant et sépare
+cron/interactif par machine. Mesuré le 04/10 sur le relais .46, même fenêtre : `traffic-live.ps1` a rendu
+un verdict sur ce corpus non validé **et fabriqué 2 faux HANG SUSPECTS** à partir de lignes
+`[resp] capture write error: EIO`. Sur le sidecar, ses `[Request]` comptent **uniquement le servi
+local** (replis `header-timeout` + AUTONOMOUS) — le relayé n'émet pas de `[Request]`. Le script reste
+documenté ci-dessous pour mémoire et pour le cron de surveillance 6 h qui l'appelle encore.
 
 ⚠️ **`-Hours N` n'est pas la fenêtre obtenue.** `--since` étant écarté par le GOTCHA #2, la fenêtre est
 approximée par `--tail Hours×8000` — le débit du **hub** en pointe. Sur ce sidecar (~170 lignes/jour),
@@ -457,11 +477,23 @@ CoursIA mergeait **~23 PR par issue fermée en juillet, contre ~3 en septembre**
 « une PR » à « une issue, une PR, une review ». L'enquête en cours est **#328** (G6 = la mesure de cette
 phase sur claudish), à relire avant de changer cette phase.
 
-Avec un seul grain par cycle de 6 h, chaque aller-retour de review immobilise le worker jusqu'au cycle
+Avec un seul grain par cycle, chaque aller-retour de review immobilise le worker jusqu'au cycle
 suivant. Avec une file, il enchaîne le grain suivant pendant que le précédent attend ma review.
 
+**File profonde (mandat user 05/10, avec le passage à 12 h).** Verbatim : « ralentir de moitié ton cron
+tout en dispatchant des deep queues aux workers ». Entre deux de mes passages, un worker fait ~2 à 4
+cycles (mesuré le 05/10 entre 05:10Z et 11:30Z : 1 à 4 grains livrés par worker). Une file de 5-6 grains
+s'épuise donc avant mon retour, et le worker se remet à piocher. Une file profonde couvre la fenêtre de
+12 h même quand un grain bloque.
+
 Règles de la file :
-- **5 à 6 grains par worker, ordonnés.** Chaque grain donne son issue, son livrable vérifiable (AC) et sa taille.
+- **~10 grains par worker, ordonnés, en deux étages.** Les **6-7 premiers** sont la file principale : retours
+  de review d'abord, puis les grains de sa zone par priorité. Les **3-4 derniers** sont des **grains de
+  repli**, à prendre quand un grain principal bloque (attente de review, de mesure, de déploiement, d'un
+  user) : des grains autonomes, sans dépendance à un merge ni à une fenêtre, souvent des mesures ou de la
+  documentation. Un worker ne laisse jamais une heure passer à attendre : il note `[BLOCKED] #NN — attend X`
+  et passe au grain suivant.
+- Chaque grain donne son issue, son livrable vérifiable (AC) et sa taille.
   Le worker les prend dans l'ordre et poste `[CLAIMED] #NN` au moment où il commence chacun d'eux.
 - **Cohérents** : une même zone de code ou une même famille d'issues par worker, pour qu'il garde son contexte
   chargé. Deux files ne touchent pas les mêmes fichiers : comparer les zones avant de poster.
@@ -469,7 +501,7 @@ Règles de la file :
   en fin de file, jamais en PR empilée (une PR empilée blanchit du code non relu).
 - **Retour de review prioritaire** : une PR du worker sous CR passe en tête de sa file, avec « attend TON push ».
 - **Une file se renouvelle, elle ne s'empile pas.** À chaque cycle, relire ce qui a été fait, retirer
-  ce qui est obsolète, compléter jusqu'à 5-6. Le message de dispatch republie la file entière, pas un delta.
+  ce qui est obsolète, compléter jusqu'à ~10. Le message de dispatch republie la file entière, pas un delta.
 - Au bilan (Phase 6), compter par worker les **grains dispatchés et les grains livrés** depuis le cycle
   précédent : c'est la mesure de l'intervention elle-même.
 

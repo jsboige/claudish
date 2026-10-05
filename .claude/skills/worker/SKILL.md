@@ -21,6 +21,21 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
    après lecture intégrale.
 3. **Exécution** : ton périmètre (voir ci-dessous). Règle HARD globale : lire le body
    complet + commentaires + diff avant tout comment/review/merge/fix.
+   - **Relais model-version-watch** (si le fichier existe) : lire
+     `~/.claudish/model-version-events.log` (NDJSON), relayer sur le dashboard
+     workspace les événements **plus récents que le watermark**
+     (`~/.claudish/model-version-relay.ts`, une ligne ISO-UTC : dernier `ts`
+     relayé ; fichier absent ⇒ tout relayer) — `minor-applied` → tag INFO (le
+     champ `detail` dit si le reload a été différé au restart quotidien ou
+     déclenché immédiatement : ancien id retiré amont), `major-ask` → tag
+     **ASK** (arbitrage user, la majeure seule n'arme rien),
+     `probe-fail`/`error` → tag WARN, `info` → tag INFO (membre d'une famille sur
+     un provider **non surveillé** — `oai@`, ou nu : non sondé, non touché, une
+     ligne d'information, pas une action). Après relais, mettre à jour le watermark
+     avec le dernier `ts` relayé. **Ne JAMAIS tronquer ni vider le fichier** :
+     il est la seule trace durable des éditions automatiques de l'infra
+     partagée (post-mortem après incident), et une troncature détruirait les
+     événements arrivés pendant le relai.
 4. **Commit + PR AVANT le rapport** — ne jamais annoncer un travail non commité.
    `cd d:/Dev/claudish && git pull origin main` d'abord ; conventional commits.
 5. **Rapport [DONE] sur le dashboard workspace** — faits, métriques, décisions prises
@@ -31,10 +46,25 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
 
 ## Pièges du périmètre hub (vérifiés, ne pas réapprendre)
 
+- **Traces proxy → outil MCP `claudish_traffic`** (livré, #72), pas `traffic-live.ps1`.
+  Le MCP **refuse un verdict** quand `docker logs --since` a servi un corpus **roté**
+  (le fichier courant du conteneur va plus loin que ce que `--since` a rendu) et rend
+  l'histogramme **jusqu'à maintenant** — les buckets finaux vides SONT la réponse.
+  A/B mesuré le 04/10 sur le relais .46, même fenêtre 24 h : le MCP a rendu `UNKNOWN`
+  (corpus roté, fichier courant à 21:01Z vs `--since` arrêté à 19:18Z) là où
+  `traffic-live.ps1` a rendu un verdict sur ce corpus non validé **et fabriqué 2 faux
+  « HANG SUSPECTS »** à partir de lignes `[resp] capture write error: EIO` (un échec
+  d'écriture de capture, pas un stream resté ouvert). Le script reste pour la cadence
+  de surveillance 6 h ; ne pas lui ajouter de nouveaux appelants.
 - **`traffic-live.ps1 -Container`** : défaut = `claudish-proxy` (hub). Sur un sidecar,
-  passer `-Container claudish-sidecar` ou le script exit 1.
+  passer `-Container claudish-sidecar` ou le script exit 1. (L'outil MCP prend
+  `container` en argument.)
 - **`--since Nh`** : réévalué à chaque invocation → 1 seule invocation par fenêtre ;
-  snapshoter une fois, ancrer sur `^ *\[resp\] `. `--tail` = fallback sur signature
+  snapshoter une fois, ancrer sur `^ *\[resp\] `. ⚠ Sur po-203 le `--since` **tronque la
+  fin** (il s'arrête à l'arrêt précédent du conteneur et ignore le segment post-restart)
+  et `--tail` est **instable** (`--tail 45` a rendu 0 ligne là où `--tail 25` rendait le
+  segment) : mesurer par **filtrage timestamp** (`docker logs -t … | awk '$1 >= "…" && $1 <= "…"'`)
+  et **croiser avec les captures** (`/captures`). `--tail` = fallback sur signature
   GOTCHA #2 seulement.
 - **Comptage watchdog** : référence « 13 bannières » = PAR JOUR, pas cumulé. Scanner
   tout le fichier rend 111 et fabrique une fausse ALERTE. Ne compter que
@@ -81,6 +111,18 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
   un failover qui tourne déjà correctement (sonnet ARMED sur Mistral GLM 5.2 = attendu).
 - **Leak policy** : Opus/Fable/Sonnet = ai-01 uniquement. `traffic-anthropic.ps1` exige
   `pwsh`. Ne jamais grepper `cc_is_subagent` à la main.
+- **Ne JAMAIS suivre `drain.log` avec un handle de lecture bloquant** — `tail -f`,
+  `Get-Content -Wait`, ou toute boucle qui garde le fichier ouvert : sous Windows ce handle
+  **refuse les écritures**, et `Write-DrainLog` (`Add-Content` sans `-ErrorAction`) échoue
+  **ligne par ligne, non-terminant, sans tuer le run**. Mesuré hub po-2025, 05/10 : un
+  `tail -n 0 -f drain.log | grep` lancé pour suivre un recreate **n'est jamais sorti** et a
+  tenu le fichier **7 h 10** ; deux recreates réels et réussis (dont un déploiement de hub)
+  n'ont laissé **aucune trace** — `drain.log` figé à sa première ligne — et le moniteur
+  attendait un `OUTCOME` que **son propre verrou** empêchait d'écrire (auto-blocage, aucune
+  sortie possible). Surveiller `docker inspect`/`/health`, jamais le log du drain ; et
+  **vérifier qu'un moniteur est bien sorti** (`Get-Process tail`) — « j'ai arrêté le
+  moniteur » s'est révélé faux, il a survécu 7 h. Cf. #338 : le retry borné ferme la
+  fenêtre transitoire, pas un détenteur **continu**.
 
 ## Protocole affermi (mandat user 2026-09-12 — non négociable)
 
