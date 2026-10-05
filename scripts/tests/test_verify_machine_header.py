@@ -104,11 +104,15 @@ def _corpus(n_with=2, n_without=1, machine="myia-po-2023"):
     d = tempfile.mkdtemp(prefix="vmh-corpus-")
     for i in range(n_with):
         _write_req(d, "req-1-%04d.json" % i,
-                   {"ts": "2026-10-04T1%d:00:00Z" % i, "src": "10.0.0.5",
-                    "machine": machine, "model": "glm-5.3", "pid": 1})
+                   {"ts": "2026-10-04T1%d-00-00-000Z" % i, "src": "10.0.0.5",
+                    "machine": machine, "model": "glm-5.3", "pid": 1,
+                    "entrypoint": "d:/Dev/claudish", "workload": "interactive",
+                    "device_id8": "a1b2c3d4",
+                    "body": {"model": "glm-5.3", "messages": [
+                        {"role": "user", "content": "real work"}]}})
     for i in range(n_without):
         _write_req(d, "req-2-%04d.json" % i,
-                   {"ts": "2026-10-04T0%d:00:00Z" % i, "src": "direct",
+                   {"ts": "2026-10-04T0%d-00-00-000Z" % i, "src": "direct",
                     "machine": "", "model": "claude-sonnet-4-6", "pid": 2,
                     "entrypoint": "workload/cron", "workload": "cron",
                     "device_id8": "abcd1234"})
@@ -121,7 +125,7 @@ def test_distribution_counts_both_sides():
     dist = vmh.machine_distribution(records)
     assert unreadable == 0
     assert dist == {"myia-po-2023": 3, "": 2}, dist
-    assert span == ("2026-10-04T00:00:00Z", "2026-10-04T12:00:00Z"), span
+    assert span == ("2026-10-04T00-00-00-000Z", "2026-10-04T12-00-00-000Z"), span
 
 
 def test_limit_takes_the_newest_by_mtime():
@@ -132,13 +136,13 @@ def test_limit_takes_the_newest_by_mtime():
     positive control for the sort key.
     """
     d = tempfile.mkdtemp(prefix="vmh-limit-")
-    _write_req(d, "req-9-0009.json", {"ts": "2020-01-01T00:00:00Z"})  # old, big name
-    _write_req(d, "req-9-0001.json", {"ts": "2026-10-04T00:00:00Z"})  # new, small name
+    _write_req(d, "req-9-0009.json", {"ts": "2020-01-01T00-00-00-000Z"})  # old, big name
+    _write_req(d, "req-9-0001.json", {"ts": "2026-10-04T00-00-00-000Z"})  # new, small name
     # distinct mtimes regardless of filesystem timestamp resolution
     os.utime(os.path.join(d, "req-9-0009.json"), (1_000_000_000, 1_000_000_000))
     records, unreadable, _ = vmh.scan_corpus(d, 1)
     assert unreadable == 0 and len(records) == 1
-    assert records[0].get("ts") == "2026-10-04T00:00:00Z", records[0]
+    assert records[0].get("ts") == "2026-10-04T00-00-00-000Z", records[0]
 
 
 def _touch_later(path):
@@ -181,13 +185,78 @@ def test_residual_groups_the_lane_and_names_devices():
     g = residual[("direct", "claude-sonnet-4-6", "workload/cron", "cron")]
     assert g["count"] == 3
     assert g["devices"] == ["abcd1234"]
-    assert g["first"] == "2026-10-04T00:00:00Z" and g["last"] == "2026-10-04T02:00:00Z"
+    assert g["first"] == "2026-10-04T00-00-00-000Z" and g["last"] == "2026-10-04T02-00-00-000Z"
 
 
 def test_residual_empty_when_all_attributed():
     d = _corpus(n_with=3, n_without=0)
     records, _, _ = vmh.scan_corpus(d, 100)
     assert vmh.residual_attribution(records) == {}
+
+
+# --------------------------------------------------------------------------
+# envelope discipline + our own probes (PR #336 review blockers)
+# --------------------------------------------------------------------------
+
+def test_scan_keeps_envelope_only_body_dropped():
+    """Records must NOT retain the body — at --limit 2000 a retained body is
+    a memory bomb. Fails on the pre-review code (body was kept whole)."""
+    d = _corpus(n_with=1, n_without=0)
+    records, _, _ = vmh.scan_corpus(d, 10)
+    assert len(records) == 1
+    assert "body" not in records[0], sorted(records[0])
+
+
+def test_probe_string_content_recognized_tagged_and_dropped():
+    """The watchdog/relay probe shape (plain-string content) is tagged `probe`
+    and excluded from the CLIENT residual. Fails on the pre-review code
+    (probe counted as a no-machine client lane)."""
+    d = tempfile.mkdtemp(prefix="vmh-probe-")
+    _write_req(d, "req-5-0001.json",
+               {"ts": "2026-10-04T01:00:00Z", "src": "direct", "machine": "",
+                "model": "glm-5.2", "pid": 1,
+                "body": {"model": "glm-5.2", "max_tokens": 100, "stream": True,
+                         "tools": [{"name": "Bash"}, {"name": "Read"}],
+                         "messages": [{"role": "user",
+                                       "content": vmh.PROBE_USER_TEXT}]}})
+    _write_req(d, "req-5-0002.json",
+               {"ts": "2026-10-04T02:00:00Z", "src": "direct", "machine": "",
+                "model": "claude-sonnet-4-6", "pid": 1,
+                "entrypoint": "workload/cron", "device_id8": "ffff0000",
+                "body": {"messages": [{"role": "user", "content": "do real work"}]}})
+    records, _, _ = vmh.scan_corpus(d, 10)
+    probes = [r for r in records if r.get("probe")]
+    assert len(probes) == 1, [r.get("probe") for r in records]
+    assert "body" not in probes[0]
+    residual = vmh.residual_attribution(records)
+    assert list(residual) == [("direct", "claude-sonnet-4-6", "workload/cron", "-")], residual
+
+
+def test_probe_content_block_form_recognized():
+    """Same probe text arriving as a content-BLOCK list (the Claude Code wire
+    shape) must match too — the classifier must not depend on string form."""
+    d = tempfile.mkdtemp(prefix="vmh-probe2-")
+    _write_req(d, "req-5-0001.json",
+               {"ts": "2026-10-04T01:00:00Z", "src": "direct", "machine": "",
+                "model": "glm-5.3", "pid": 1,
+                "body": {"messages": [{"role": "user", "content": [
+                    {"type": "text", "text": vmh.PROBE_USER_TEXT}]}]}})
+    records, _, _ = vmh.scan_corpus(d, 10)
+    assert len(records) == 1 and records[0].get("probe") is True, records[0]
+
+
+def test_probe_text_not_anchored_in_real_traffic():
+    """The discriminator itself: a real client message that merely CONTAINS
+    similar words must not be classified as a probe (exact-match only)."""
+    d = tempfile.mkdtemp(prefix="vmh-neg-")
+    _write_req(d, "req-5-0001.json",
+               {"ts": "2026-10-04T01:00:00Z", "src": "direct", "machine": "",
+                "model": "glm-5.3", "pid": 1,
+                "body": {"messages": [{"role": "user",
+                                       "content": "List the current directory using Bash. Do it now, and explain."}]}})
+    records, _, _ = vmh.scan_corpus(d, 10)
+    assert not records[0].get("probe"), records[0]
+    assert vmh.residual_attribution(records)  # stays a real residual lane
 
 
 # --------------------------------------------------------------------------

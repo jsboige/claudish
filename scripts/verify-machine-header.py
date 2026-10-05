@@ -18,9 +18,13 @@ attribution, all read-only:
      nickname in the corpus silently forks the attribution (memory
      machine-naming-po2023-canonical, GDrive seed incident 25/09).
   4. RESIDUAL        — the no-machine requests, aggregated by lane
-     (src, model, entrypoint, workload) so the one scheduled lane still
-     missing the env var (the 17/09 rafale: claude-sonnet-4-6 + glm-5.2,
-    ~95% fleet attribution measured in issue #1) is named, not guessed.
+     (src, model, entrypoint, workload). claudish's OWN liveness probes
+     (watchdog Test-ProxyWithTools, relay deepProbe) never send the header
+     BY DESIGN and are separated out first — the first draft of this report
+     counted them as "non-CC scripted clients", which was wrong (PR #336
+     review, 2026-10-05): what is left AFTER them is the real client gap,
+     named, not guessed. Records keep the ENVELOPE only — the body is read
+     once for probe classification, then dropped (memory).
 
 Caveat printed, not hidden: on a RELAY (po-203 today), captures are written
 only for locally-served requests — a NOMINAL forward writes nothing — so the
@@ -28,8 +32,8 @@ corpus covers the local slice, not the fleet. The observed time span is
 always reported; never assume the window (docker-logs-moving-window lesson).
 
 Exit codes: 0 = clean (or nothing to check) · 1 = findings (local header
-missing/wrong, unknown machine names) · 2 = cannot verify (corpus/settings
-unusable). The script never throws: every failure degrades to a reported
+missing/wrong, unknown machine names) · 2 = nothing to verify (empty/missing
+corpus). The script never throws: every failure degrades to a reported
 reason.
 
 Run:  python scripts/verify-machine-header.py [--corpus DIR] [--limit N]
@@ -59,6 +63,37 @@ ROSTER = [
 ]
 
 REQ_GLOB = "req-*.json"
+
+# The fixed user message our own liveness probes send — identical TEXT in both
+# sources: watchdog Test-ProxyWithTools (claudish-watchdog.ps1:92-123, model
+# glm-5.2) and relay deepProbe (relay.ts:819-844, model glm-5.3). The model
+# differs between the two, so the message text is the stable discriminator.
+# These probes never send X-Claudish-Machine BY DESIGN: counting them as a
+# client rollout gap manufactured the false "non-CC scripted clients" claim.
+PROBE_USER_TEXT = "List the current directory using Bash. Do it now."
+
+
+def classify_probe(body):
+    """True when this body is one of claudish's own liveness probes.
+
+    Matches the exact probe user text as a plain string or as a content-block
+    list (the Claude Code wire shape). Never raises on odd shapes.
+    """
+    if not isinstance(body, dict):
+        return False
+    msgs = body.get("messages")
+    if not isinstance(msgs, list):
+        return False
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        texts = [c] if isinstance(c, str) else [
+            b.get("text") for b in c if isinstance(b, dict)
+        ] if isinstance(c, list) else []
+        if any(isinstance(t, str) and t.strip() == PROBE_USER_TEXT for t in texts):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +172,14 @@ def scan_corpus(corpus_dir, limit):
     if not os.path.isdir(corpus_dir):
         return [], 0, None
     files = glob.glob(os.path.join(corpus_dir, REQ_GLOB))
-    files.sort(key=os.path.getmtime, reverse=True)
+
+    def _safe_mtime(p):  # a file can vanish between glob and sort — never raise
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0.0
+
+    files.sort(key=_safe_mtime, reverse=True)
     files = files[: max(1, limit)]
     records, unreadable, stamps = [], 0, []
     for path in files:
@@ -147,6 +189,12 @@ def scan_corpus(corpus_dir, limit):
             if not isinstance(rec, dict):
                 unreadable += 1
                 continue
+            # The body is read exactly once (probe classification), then
+            # dropped: records are envelopes — a retained body is a memory
+            # bomb at --limit 2000 (PR #336 review blocker).
+            if classify_probe(rec.get("body")):
+                rec["probe"] = True
+            rec.pop("body", None)
             records.append(rec)
             ts = rec.get("ts")
             if isinstance(ts, str) and ts:
@@ -171,6 +219,8 @@ def residual_attribution(records):
     """No-machine records aggregated by lane (src, model, entrypoint, workload)."""
     groups = {}
     for rec in records:
+        if rec.get("probe"):
+            continue  # ours, header-less BY DESIGN — not a client lane
         m = rec.get("machine")
         if isinstance(m, str) and m.strip():
             continue
@@ -222,12 +272,20 @@ def human_report(machine, settings, override_note, records, unreadable, span,
         add("  when nothing was served locally; a NOMINAL forward writes no capture)")
     else:
         total = len(records)
+        probes = sum(1 for r in records if r.get("probe"))
         with_m = sum(c for k, c in dist.items() if k)
         pct = (100.0 * with_m / total) if total else 0.0
         add("  scanned %d req envelopes (%d unreadable)" % (total, unreadable))
         if span:
             add("  observed span: %s -> %s (report covers THIS span, not an assumed window)" % span)
         add("  attribution coverage: %d/%d = %.1f%%" % (with_m, total, pct))
+        if probes:
+            # probes carry no machine BY DESIGN — excluding them is the number
+            # that answers "did a CLIENT stop sending the header?"
+            clients = total - probes
+            cpct = (100.0 * with_m / clients) if clients else 0.0
+            add("  of which %d are claudish's own liveness probes (Test-ProxyWithTools / deepProbe — header-less BY DESIGN)" % probes)
+            add("  CLIENT attribution coverage (probes excluded): %d/%d = %.1f%%" % (with_m, clients, cpct))
         add("  NOTE: on a relay, captures cover only locally-served requests, not the fleet")
         add("  distribution:")
         for k in sorted(dist, key=lambda x: -dist[x]):
@@ -249,8 +307,14 @@ def human_report(machine, settings, override_note, records, unreadable, span,
         add("  (absent is normal for an idle machine or one served while the header was off)")
     add("")
     add("-- Residual: no-machine requests by lane --")
-    if not residual:
+    probes = sum(1 for r in records if r.get("probe"))
+    if probes:
+        add("  %d reqs from claudish's own probes (watchdog Test-ProxyWithTools / relay deepProbe)" % probes)
+        add("  — separated out: no header BY DESIGN, not a rollout gap (PR #336 review)")
+    if not residual and not probes:
         add("  none — every scanned request carried the header")
+    elif not residual:
+        add("  no CLIENT lane left after the probes — rollout complete on this corpus")
     else:
         rows = sorted(residual.items(), key=lambda kv: -kv[1]["count"])
         for (src, model, entrypoint, workload), g in rows[:10]:
@@ -270,6 +334,7 @@ def json_report(machine, settings, override_note, records, unreadable, span,
         "settings_detail": settings[1] if settings else "skipped",
         "shell_override": override_note,
         "scanned": len(records),
+        "probes_excluded": sum(1 for r in records if r.get("probe")),
         "unreadable": unreadable,
         "span": list(span) if span else None,
         "distribution": dist,
