@@ -128,3 +128,67 @@ describe("MiniMaxModelDialect — temperature clamp still applies", () => {
     expect(payload.thinking).toEqual({ type: "enabled", budget_tokens: 16000 });
   });
 });
+
+// #324 B1 — the inbound half of the #295 chain. Signature shapes below are
+// the PRODUCTION ones, not invented: M3's implicit signature is the SHA-256
+// of the empty string (fixtures minimax-m3-anthropic-implicit-signature
+// r10324/r10416), M2.5's varies but stays a 64-hex digest (m25-turn1), and
+// m25-turn2/3 carry no signature at all. An Anthropic signature is a long
+// opaque base64 blob and never 64-hex.
+const M3_SIG = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const M25_SIG = "7caa0d3cc2a449ac1cc68507504693f566245c7b5db3558f6041585e15a848f8";
+const ANTHROPIC_BLOB =
+  "Eo8BCpoKBgcKBWRvbGxhEgxPcmljZSB0b2tlbjKgAZf2hkh6gH0S2kJDZm9vYmFyYmF6cXV1eDNjdmJubWw4cHl0enIxOXF3dHFvcnN0dXYzeHl6MjBzdHJpbmdfZm9vYmFy";
+
+describe("MiniMaxModelDialect — preserveThinkingBlock (#324 B1 discriminant)", () => {
+  it("forced: M3's own digest signature (SHA-256 of the empty string) is preserved", () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced";
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…", signature: M3_SIG })).toBe(true);
+  });
+
+  it("forced: M2.5's varying 64-hex digest is preserved", () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced";
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…", signature: M25_SIG })).toBe(true);
+  });
+
+  it("forced: an unsigned block (m25 turns 2-3 shape) is preserved — Anthropic never emits unsigned thinking", () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced";
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…" })).toBe(true);
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…", signature: "" })).toBe(true);
+  });
+
+  it("forced: a foreign Anthropic blob signature is NOT preserved (cascade-switch shape: Opus session fell to a MiniMax step)", () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced";
+    expect(
+      dialect().preserveThinkingBlock({ type: "thinking", thinking: "…", signature: ANTHROPIC_BLOB })
+    ).toBe(false);
+  });
+
+  it("forced: any other non-digest signature shape is NOT preserved", () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced";
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…", signature: "sig-abc123" })).toBe(false);
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…", signature: "A".repeat(64) })).toBe(false);
+  });
+
+  it("passthrough: nothing is preserved — the strip-everything default stands", () => {
+    delete process.env.CLAUDISH_MINIMAX_THINKING;
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…", signature: M3_SIG })).toBe(false);
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…" })).toBe(false);
+  });
+
+  it("disabled: nothing is preserved (the model emits no block, nothing to round-trip)", () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "disabled";
+    expect(dialect().preserveThinkingBlock({ type: "thinking", thinking: "…", signature: M3_SIG })).toBe(false);
+  });
+
+  // Review #324 point 3 — pin WHY the fix is a per-block hook and not the
+  // boolean: preserveThinkingInHistory() ALSO feeds reasoningRoundtrip in
+  // ComposedHandler.convertMessages (OpenAI wire, reasoning_content
+  // echo-back). Flipping it true for MiniMax would emit reasoning_content on
+  // OpenAI-shaped routings the policy was never measured on. MiniMax lanes
+  // run anthropic-sse, where the per-block hook is the only consulted seam.
+  it("preserveThinkingInHistory() stays false — MiniMax must not opt into the OpenAI reasoning_content round-trip", () => {
+    process.env.CLAUDISH_MINIMAX_THINKING = "forced";
+    expect(dialect().preserveThinkingInHistory()).toBe(false);
+  });
+});

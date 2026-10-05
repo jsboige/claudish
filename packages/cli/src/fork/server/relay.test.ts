@@ -14,6 +14,9 @@ import {
   hopsContainSelf,
   requestLoopedBack,
   FORWARD_HEADERS_TIMEOUT_MS,
+  resolveForwardHeadersTimeoutMs,
+  MIN_FORWARD_HEADERS_TIMEOUT_MS,
+  MAX_FORWARD_HEADERS_TIMEOUT_MS,
   type RelayState,
 } from "./relay.js";
 import { getInstanceId } from "../../instance-id.js";
@@ -321,6 +324,69 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     expect(state.consecutiveFail).toBe(0);
   });
 
+  // ── #318: the hub's own drain admission freeze, marked ─────────────────────
+  // The #306 freeze answers new admissions with 503 + Retry-After while the hub
+  // is about to restart. A relay used to read that as a hub failure (markFail +
+  // local replay), fighting the drain it exists to survive. The marker header
+  // is the discriminator: an UNMARKED 503 keeps the fallthrough (a hub's own
+  // death is still a real 503), and only the hub writes the marker — real
+  // provider overloads emit an Anthropic-shaped overloaded_error body too, so
+  // the body alone could never tell them apart.
+  const DRAIN_FREEZE_503_BODY = JSON.stringify({
+    type: "error",
+    error: {
+      type: "overloaded_error",
+      message: "Proxy is draining for a restart (admission freeze). Retry shortly — in-flight streams are unaffected.",
+    },
+  });
+  const DRAIN_FREEZE_503_HEADERS = {
+    "content-type": "application/json",
+    "retry-after": "15",
+    "x-claudish-drain-freeze": "1",
+  };
+
+  it("a MARKED 503 is PASSED THROUGH — client gets 503 + body + Retry-After, no markFail, no local replay (#318)", async () => {
+    fetchImpl = async () => new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).not.toBeNull(); // non-null ⇒ forwarded to the client; null is the local-replay fallthrough
+    expect(r!.status).toBe(503);
+    expect(await r!.text()).toBe(DRAIN_FREEZE_503_BODY);
+    // The freeze's contract with the client survives the rebuild — it used to
+    // be dropped for every relayed non-streaming error.
+    expect(r!.headers.get("retry-after")).toBe("15");
+    // #318 review — the MARKER survives the hop too: in a chain A→B→hub, this
+    // response is what relay A receives, and A is itself a relay. Without the
+    // marker here, A reads a plain 503 and replays locally — exactly what
+    // #318 removes — so the property has to compose across hops (#279's
+    // x-claudish-hops exists because A→B chains are a supported topology).
+    expect(r!.headers.get("x-claudish-drain-freeze")).toBe("1");
+    expect(state.consecutiveFail).toBe(0);
+  });
+
+  it("a MARKED 503 passes through for a STREAMING request too, and two keep the relay NOMINAL (#318)", async () => {
+    fetchImpl = async () => new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
+    const state = deadState();
+    const r1 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+    const r2 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+    for (const r of [r1, r2]) {
+      expect(r).not.toBeNull();
+      expect(r!.status).toBe(503);
+      expect(await r!.text()).toBe(DRAIN_FREEZE_503_BODY);
+    }
+    expect(state.consecutiveFail).toBe(0); // a drain freeze never fed the hysteresis
+    expect(state.alive).toBe(true); // still NOMINAL after two consecutive freezes
+  });
+
+  it("an UNMARKED 503 keeps the fallthrough — a hub's own failure is NOT passed through (#318 control)", async () => {
+    fetchImpl = async () =>
+      new Response("hub boom", { status: 503, headers: { "content-type": "application/json" } });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).toBeNull(); // still the local-replay fallthrough
+    expect(state.consecutiveFail).toBe(1); // still a markFail
+  });
+
   it("success resets the failure streak", async () => {
     const state = deadState();
     state.consecutiveFail = 1; // one prior failure
@@ -478,14 +544,202 @@ describe("forwardToUpstream — a header deadline is not liveness evidence", () 
 });
 
 describe("FORWARD_HEADERS_TIMEOUT_MS — must sit above real hub header latency", () => {
-  it("is generous enough that ordinary upstream latency never forces a local fallthrough", () => {
-    // Measured ai-01 → models.myia.io on 2026-08-10, plain glm-5.2 streaming POSTs:
-    // first byte at 2.5s / 3.1s / 3.4s / 8.3s. A 5s bound sat inside that spread and
-    // silently demoted routine requests to the local pipeline (no central capture,
-    // double provider spend, and budget-model reroute on CLAUDISH_NO_ANTHROPIC hosts).
-    // Liveness is the prober's job, not this bound's — keep it well clear of the tail.
-    expect(FORWARD_HEADERS_TIMEOUT_MS).toBeGreaterThanOrEqual(20_000);
+  it("covers the hub's full header-phase contract, not just ordinary first-byte latency (#320)", () => {
+    // Two measurements set this pin, a decade apart in traffic shape:
+    // 1. Ordinary traffic (ai-01 → models.myia.io, 2026-08-10): first byte at
+    //    2.5/3.1/3.4/8.3s — why the old 5s bound was a bug (routine latency
+    //    silently demoted requests to the local pipeline; liveness is the
+    //    prober's job, not this bound's).
+    // 2. GLM bursts (2026-10-03/04, #320 AC1): the hub LEGITIMATELY holds
+    //    headers 35-92s in salves (queue to 221s), and its documented overload
+    //    contract is transport 60s + patient backoff ~305s ≈ 6 min. A relay
+    //    budget inside that contract amputates waits the hub is faithfully
+    //    holding — the 30s value did exactly that.
+    // The pin is the hub's own first-event watchdog (CLAUDISH_FIRST_EVENT_TIMEOUT_MS,
+    // 300s default): cutting before it means the relay aborts waits the hub itself
+    // has not yet given up on.
+    expect(FORWARD_HEADERS_TIMEOUT_MS).toBeGreaterThanOrEqual(300_000);
   });
+
+  it("stays under the client's documented 10-min timeout", () => {
+    // Past the client's own timeout the bound protects no one: the client has
+    // abandoned the turn while the local replay never happens. MAX pins the ceiling.
+    expect(FORWARD_HEADERS_TIMEOUT_MS).toBeLessThanOrEqual(600_000);
+  });
+});
+
+/** A fetch that accepts the POST and never sends headers — only an abort ends it.
+ * Models the #320 AC4 shape: a live connection, a hub that said nothing. */
+function muteFetchImpl(): (url: any, init: any) => Promise<Response> {
+  return (_url: any, init: any) =>
+    new Promise((_res, rej) => {
+      init?.signal?.addEventListener("abort", () => {
+        const e = new Error("The operation was aborted");
+        (e as any).name = "AbortError";
+        rej(e);
+      });
+    });
+}
+
+describe("#320 CLAUDISH_RELAY_HEADER_TIMEOUT_MS — configurable, empty-safe, bounded", () => {
+  const KEY = "CLAUDISH_RELAY_HEADER_TIMEOUT_MS";
+  let saved: string | undefined;
+
+  beforeEach(() => {
+    saved = process.env[KEY];
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env[KEY];
+    else process.env[KEY] = saved;
+  });
+
+  it("unset yields the default", () => {
+    delete process.env[KEY];
+    expect(resolveForwardHeadersTimeoutMs()).toBe(FORWARD_HEADERS_TIMEOUT_MS);
+  });
+
+  it('"" yields the default — the Number("") === 0 trap (#310 review)', () => {
+    // Compose injects every listed name as "" by default. A naive
+    // `raw ?? FORWARD_HEADERS_TIMEOUT_MS` passes "" through (not nullish),
+    // Number("") === 0, and an unclamped read returns 0 — an instant-timeout
+    // relay on every unconfigured container. This test is the AC2 pin: on that
+    // mutated shape (guard dropped AND range clamp dropped) it goes red; the
+    // range clamp below additionally pins "0" itself as out of range.
+    process.env[KEY] = "";
+    expect(resolveForwardHeadersTimeoutMs()).toBe(FORWARD_HEADERS_TIMEOUT_MS);
+  });
+
+  it('"0" yields the default — there is no "off": an unbounded header wait is the never-hang violation the bound exists to prevent', () => {
+    process.env[KEY] = "0";
+    expect(resolveForwardHeadersTimeoutMs()).toBe(FORWARD_HEADERS_TIMEOUT_MS);
+  });
+
+  it("garbage yields the default, never NaN", () => {
+    process.env[KEY] = "360s"; // plausible hand-edit typo
+    expect(resolveForwardHeadersTimeoutMs()).toBe(FORWARD_HEADERS_TIMEOUT_MS);
+  });
+
+  it("out-of-range values yield the default (below MIN re-creates the 5s bug class; above MAX outlives the client)", () => {
+    process.env[KEY] = String(MIN_FORWARD_HEADERS_TIMEOUT_MS - 1);
+    expect(resolveForwardHeadersTimeoutMs()).toBe(FORWARD_HEADERS_TIMEOUT_MS);
+    process.env[KEY] = String(MAX_FORWARD_HEADERS_TIMEOUT_MS + 1);
+    expect(resolveForwardHeadersTimeoutMs()).toBe(FORWARD_HEADERS_TIMEOUT_MS);
+  });
+
+  it("in-range values are honored, floored, boundaries inclusive", () => {
+    process.env[KEY] = "45000";
+    expect(resolveForwardHeadersTimeoutMs()).toBe(45_000);
+    process.env[KEY] = "6000.9";
+    expect(resolveForwardHeadersTimeoutMs()).toBe(6_000);
+    process.env[KEY] = String(MIN_FORWARD_HEADERS_TIMEOUT_MS);
+    expect(resolveForwardHeadersTimeoutMs()).toBe(MIN_FORWARD_HEADERS_TIMEOUT_MS);
+    process.env[KEY] = String(MAX_FORWARD_HEADERS_TIMEOUT_MS);
+    expect(resolveForwardHeadersTimeoutMs()).toBe(MAX_FORWARD_HEADERS_TIMEOUT_MS);
+  });
+
+  it("forwardToUpstream reads the env budget when no explicit one is passed (production wiring)", async () => {
+    // The route calls forwardToUpstream WITHOUT a budget — the env must reach the
+    // header phase through the parameter default. The env value here is MIN
+    // (5000ms) because the resolver clamps anything shorter to the default — an
+    // important property in itself (a sub-5s budget re-creates the 2026-08-10 bug
+    // class), but one that makes this wiring proof a 5s wait. If the env were not
+    // wired through the parameter default, this would wait the full 360s default
+    // and time out red.
+    process.env[KEY] = String(MIN_FORWARD_HEADERS_TIMEOUT_MS);
+    fetchImpl = muteFetchImpl();
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const t0 = Date.now();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
+    const dt = Date.now() - t0;
+    expect(r).toBeNull();
+    expect(dt).toBeGreaterThanOrEqual(4_000); // it was the TIMER that fired, not a fast error
+    expect(dt).toBeLessThan(10_000); // ...and it was MIN's timer, not the 360s default
+    // A header deadline is liveness-neutral (prober owns liveness): no markFail.
+    expect(state.consecutiveFail).toBe(0);
+  }, 15_000);
+
+  it("a mute upstream behind a live hub still ends the client turn within the budget — never-hang (#320 AC4)", async () => {
+    // The bound is a BACKSTOP (the hub's own /health stall detector owns the wedge
+    // verdict), but it must still bound: a black-holed connection can hang a request
+    // forever without it. Mutation pin: remove the bound (never arm the abort) and
+    // the await below never settles — this test times out red.
+    fetchImpl = muteFetchImpl();
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const t0 = Date.now();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m" }, state, 80);
+    expect(r).toBeNull(); // fell through to local — the turn continues, bounded
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("the NOMINAL→AUTONOMOUS flip releases in-flight header waits with their own label (#323 B1)", async () => {
+    // /health probes fail fast (the prober's evidence); /v1/messages stays mute,
+    // so the forward sits in the header phase when the flip lands. At a 360s
+    // budget the flip (~200s in production) is the FIRST thing that knows those
+    // waits are dead — without the abort, every forward dispatched inside the
+    // detection window sits out the full budget (review B1). Mutation pin: drop
+    // the abort loop in markFail and this test times out red (60s budget never
+    // fires inside the 20s window).
+    fetchImpl = (url: any, init: any) => {
+      if (String(url).endsWith("/health")) throw new Error("probe refused");
+      return muteFetchImpl()(url, init);
+    };
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const consoleLines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      consoleLines.push(a.join(" "));
+    };
+    try {
+      const t0 = Date.now();
+      const pending = forwardToUpstream(
+        mockForwardContext({}),
+        { model: "m" },
+        state,
+        60_000
+      );
+      await new Promise((r) => setTimeout(r, 30)); // reach the header wait
+      await proberTick(state); // heartbeat failure #1
+      await proberTick(state); // #2 → flip → the waiter is released
+      const r = await pending;
+      const dt = Date.now() - t0;
+      expect(r).toBeNull();
+      expect(dt).toBeLessThan(5_000); // released at the flip (~30ms), not the 60s budget
+      expect(state.alive).toBe(false);
+      // The two prober failures set consecutiveFail=2; the abort itself must not
+      // count as a third failure — the flip already spoke, it is not new evidence.
+      expect(state.consecutiveFail).toBe(2);
+      // Distinct label: not "header-timeout" (that reads as latency) and not
+      // "connect:" (that reads as transport and would feed the hysteresis).
+      expect(consoleLines.some((l) => l.includes("aborted-on-autonomous"))).toBe(true);
+      expect(consoleLines.some((l) => l.includes("header-timeout after"))).toBe(false);
+    } finally {
+      console.log = origLog;
+    }
+  }, 20_000);
+
+  it("a re-forward draws on the turn's ONE header deadline, not a fresh budget (#323 B2)", async () => {
+    // Original forward: headers arrive instantly, the body dies pre-visible
+    // (#170's trigger). The re-forward target is mute — only its abort ends it.
+    // With the turn-wide 600ms deadline: ladder delay 400ms + ~200ms remaining
+    // budget ≈ 600ms total. A fresh per-leg budget (the mutation) adds the full
+    // 600ms at the re-forward → ~1000ms; the pin sits between at 800ms.
+    let calls = 0;
+    fetchImpl = (_url: any, init: any) => {
+      calls++;
+      if (calls === 1) return Promise.resolve(sseDyingResponse());
+      return muteFetchImpl()(_url, init);
+    };
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const t0 = Date.now();
+    const out = await drainResponse(
+      await forwardToUpstream(mockForwardContext({}), { model: "m" }, state, 600)
+    );
+    const dt = Date.now() - t0;
+    expect(calls).toBeGreaterThanOrEqual(2); // the death did trigger a re-forward
+    expect(out).toContain("message_stop"); // finalized with the original death, not hung
+    expect(dt).toBeLessThan(800); // the ONE deadline bounded the whole turn's header legs
+  }, 20_000);
 });
 
 describe("forwardToUpstream — streaming (never-hang delegation)", () => {

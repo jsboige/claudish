@@ -61,7 +61,19 @@
 param(
   [string]$CaptureDir = "D:\claudish-captures",
   [string]$ArchiveDir = "",
-  [string]$SevenZip   = "D:\Apps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe",
+  # 7z binary. Empty (the default) = resolve from the built-in candidate list
+  # (#214): the historical single hardcoded default was wrong on this machine
+  # AND a second, different hardcoded value in the launcher was wrong too, so the
+  # 2026-09-22 night died with the binary sitting on disk under a third path. An
+  # explicit value that exists is used as-is; one that does not exist is warned
+  # about and the candidate list is tried instead.
+  [string]$SevenZip   = "",
+  # Kill the candidate fallback: an explicit (or absent) 7z that cannot be
+  # resolved is then a hard FATAL, which is what a caller that insists on one
+  # exact binary wants - and what the precondition pins exercise.
+  [switch]$NoSevenZipFallback,
+  # Extra 7z candidates, appended AFTER the built-ins (a fallback of last resort).
+  [string[]]$SevenZipCandidates = @(),
   [int]   $KeepDays   = 1,
   # Off-site backup via Google Drive Desktop (mounted drive, no API/auth).
   # Empty = skip GDrive entirely (local compaction only). The path is the local
@@ -112,7 +124,24 @@ if (-not $archivePolicy.Ok) { Log ("FATAL: {0}" -f $archivePolicy.Reason); exit 
 $MachineTag = $archivePolicy.MachineTag
 Log ("NAMESPACE {0}" -f $archivePolicy.Reason)
 
-if (-not (Test-Path -LiteralPath $SevenZip))   { Log "FATAL: 7z not found at $SevenZip"; exit 2 }
+# 7z resolution (#214): never a single hardcoded path. An explicit -SevenZip is
+# honoured when it exists; when it does not, the built-in candidates are tried
+# (and the miss is warned about) so a churned launcher cannot kill the night.
+# The failure path NAMES every path probed - a bare "7z not found at <path>" left
+# the 2026-09-22 operator guessing which of two hardcodes was the live one.
+$candidates = @(Get-SevenZipCandidates -Extra $SevenZipCandidates)
+$sevenZipOnPath = Get-Command 7z -ErrorAction SilentlyContinue
+if ($sevenZipOnPath -and $sevenZipOnPath.Source) { $candidates += $sevenZipOnPath.Source }
+$sevenZipResolved = Resolve-SevenZipPath -Explicit $SevenZip -Candidates $candidates -NoFallback:$NoSevenZipFallback
+if (-not $sevenZipResolved.Path) {
+  Log ("FATAL: 7z not found - tried: {0}" -f (($sevenZipResolved.Tried) -join '; ')); exit 2
+}
+if ($sevenZipResolved.ExplicitMissing) {
+  Log ("WARN  -SevenZip '{0}' does not exist -> resolved to {1}" -f $SevenZip, $sevenZipResolved.Path)
+}
+$SevenZip = $sevenZipResolved.Path
+Log ("SEVENZIP {0} (source={1})" -f $SevenZip, $sevenZipResolved.Source)
+
 if (-not (Test-Path -LiteralPath $CaptureDir)) { Log "FATAL: capture dir not found: $CaptureDir"; exit 2 }
 if (-not (Test-Path -LiteralPath $ArchiveDir)) { New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null }
 
@@ -220,6 +249,30 @@ foreach ($day in $daysToArchive) {
       }
     } else {
       $errors++
+      # #322: a failed pack leaves a PARTIAL archive on disk, and the re-upload
+      # pass below ships whatever carries the canonical name — measured 04/10:
+      # captures-2026-09-30.7z truncated mid-pack (93 MB standing in for 22 GB
+      # of input) went off-site as a valid archive, and the next nights kept
+      # retrying against the corpse. Quarantine the partial the moment the pack
+      # fails: rename (reversible, never delete), suffix AFTER ".7z" so the
+      # captures-*.7z filter, the day parser and every reader exclude it
+      # structurally. The loose files are kept below, so the next run re-packs
+      # the day from scratch instead of appending to a corpse. If the rename
+      # itself fails, the partial keeps its canonical name — but the re-upload
+      # pass now tests every archive with `7z t` before shipping it, so the two
+      # guards cover each other.
+      if (Test-Path -LiteralPath $archivePath) {
+        $qTs = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
+        $qPath = "$archivePath.partial-$qTs"
+        $n = 1
+        while (Test-Path -LiteralPath $qPath) { $n++; $qPath = "$archivePath.partial-$qTs-$n" }
+        try {
+          Rename-Item -LiteralPath $archivePath -NewName (Split-Path $qPath -Leaf) -ErrorAction Stop
+          Log ("QUARANTINE {0}: partial archive renamed to {1} (add rc={2} test rc={3}) - loose files kept for re-pack" -f $day, (Split-Path $qPath -Leaf), $addRc, $testRc)
+        } catch {
+          Log ("WARN  {0}: quarantine rename failed ({1}) - partial LEFT under canonical name, the 7z t re-upload gate must catch it" -f $day, $_.Exception.Message)
+        }
+      }
       Log ("ERROR {0}: 7z add rc={1} test rc={2} -> KEEPING loose files (not deleted)" -f $day, $addRc, $testRc)
     }
   }
@@ -252,6 +305,20 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
     }
     if ($verdict.Action -eq 'idempotent') {
       Log ("GDRIVE {0}: already current ({1} bytes), idempotent - no re-upload needed" -f $arch.BaseName, $arch.Length)
+      continue
+    }
+    # #322: the verdict only compares SIZES — it cannot know the local archive
+    # itself is unreadable (the 04/10 incident: a pack truncated mid-run, left
+    # under the canonical name, shipped off-site as valid). Whatever produced
+    # the file, it must pass its own integrity test before leaving the machine.
+    # Refuse + error (non-zero night for the scheduler), never rename here:
+    # for an OLD day the loose originals are long gone, so renaming its only
+    # copy on a possibly-transient test failure would hide the day from every
+    # reader without helping anyone — the log line is the escalation.
+    & $SevenZip t -bso0 -bsp0 "$($arch.FullName)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      $errors++
+      Log ("REFUSE {0}: local archive fails 7z t (rc={1}) -> NOT uploaded, kept local for review" -f $arch.BaseName, $LASTEXITCODE)
       continue
     }
     try {

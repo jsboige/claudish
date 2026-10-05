@@ -1799,6 +1799,84 @@ function Get-OffsiteWriteVerdict {
         Reason = ("destination exists with a DIFFERENT size (dest {0} bytes vs this run {1} bytes) - another producer owns this name; overwriting would destroy it" -f $DestBytes, $LocalBytes)
     }
 }
+# --- 7-Zip resolution (#214) -------------------------------------------------
+# The compaction night of 2026-09-22 died because the launcher hardcoded a path
+# that did not exist, and the script's own fallback hardcoded a DIFFERENT one
+# that did not exist either - two independent wrong values, neither resolved
+# dynamically. The remedy is a candidate LIST, and a failure that NAMES every
+# path tried, so the next occurrence is diagnosable from the log alone.
+
+function Get-SevenZipCandidates {
+    <#
+        The built-in candidate list, most-likely first. Pure (no filesystem), so
+        its order and contents are pinnable. `-Extra` appends caller-supplied
+        paths LAST: a path the caller names is a fallback of last resort, never a
+        priority that could displace a verified one.
+    #>
+    param(
+        [string]$PortableRoot = 'D:\PortableApps\PortableApps',
+        [string]$LegacyRoot   = 'D:\Apps\PortableApps',
+        [string[]]$Extra = @()
+    )
+    $list = @(
+        (Join-Path $PortableRoot '7-ZipPortable\App\7-Zip64\7z.exe'),
+        (Join-Path $LegacyRoot   '7-ZipPortable\App\7-Zip64\7z.exe'),
+        'C:\Program Files\7-Zip\7z.exe',
+        'C:\Program Files (x86)\7-Zip\7z.exe'
+    )
+    foreach ($e in @($Extra)) { if ($e) { $list += $e } }
+    return $list
+}
+
+function Resolve-SevenZipPath {
+    <#
+        Resolves the 7z binary from an optional explicit value plus a candidate
+        list, without ever touching the filesystem itself (the existence probe is
+        injected, so the whole decision is testable with no 7z installed).
+
+        Contract:
+          - An explicit value that EXISTS wins outright (source='explicit').
+          - An explicit value that is MISSING is not fatal: it is reported via
+            ExplicitMissing=$true and the candidates are tried. This is the c.33
+            outage class - a churned launcher hardcoding a stale path must not
+            kill the night when a verified binary sits right there.
+          - With -NoFallback, a missing explicit yields Path='' (the caller keeps
+            a reachable FATAL path).
+          - Nothing resolving yields Path='' with Tried naming EVERY path probed,
+            which is what the caller logs.
+    #>
+    param(
+        [AllowEmptyString()][string]$Explicit = '',
+        [AllowEmptyCollection()][string[]]$Candidates = @(),
+        [switch]$NoFallback,
+        [scriptblock]$Exists = $null
+    )
+    if ($null -eq $Exists) { $Exists = { param($p) Test-Path -LiteralPath $p } }
+
+    $tried = New-Object System.Collections.Generic.List[string]
+    $explicitMissing = $false
+
+    if ($Explicit) {
+        [void]$tried.Add($Explicit)
+        if (& $Exists $Explicit) {
+            return [pscustomobject]@{ Path = $Explicit; Source = 'explicit'; Tried = @($tried); ExplicitMissing = $false }
+        }
+        $explicitMissing = $true
+    }
+
+    if (-not $NoFallback) {
+        foreach ($c in @($Candidates)) {
+            if (-not $c) { continue }
+            if ($tried.Contains($c)) { continue }
+            [void]$tried.Add($c)
+            if (& $Exists $c) {
+                return [pscustomobject]@{ Path = $c; Source = 'candidate'; Tried = @($tried); ExplicitMissing = $explicitMissing }
+            }
+        }
+    }
+
+    return [pscustomobject]@{ Path = ''; Source = 'none'; Tried = @($tried); ExplicitMissing = $explicitMissing }
+}
 #endregion
 
 Export-ModuleMember -Function @(
@@ -1808,6 +1886,8 @@ Export-ModuleMember -Function @(
     'Get-CaptureArchiveMachineTag'
     'Get-CaptureArchivePolicy'
     'Get-OffsiteWriteVerdict'
+    'Get-SevenZipCandidates'
+    'Resolve-SevenZipPath'
     'Invoke-GitBounded'
     'ConvertFrom-DockerEventLine'
     'Get-DockerEventFingerprint'

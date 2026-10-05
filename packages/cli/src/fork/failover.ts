@@ -80,9 +80,16 @@ export interface FailoverStep {
   direction: FailoverDirection;
   /** Optional extra guidance appended to the notice line. */
   note?: string;
-  /** Operator-declared reset time (CLAUDISH_FAILOVER_<ROLE>_RESET): the step is not
-   * re-probed before this moment. For walls whose body carries no date (Mistral's
-   * subscription 402); body-parsed dates take precedence when both exist. */
+  /** Operator-declared reset time (CLAUDISH_FAILOVER_<ROLE>_RESET): while in the
+   * FUTURE it CLOSES a HEALTHY step — never selected by the walk, never the
+   * last-step fallback, and a dwell pin on it yields (#261; a closure gesture must
+   * bite on a step that never failed, not only extend the backoff of a walled one).
+   * A step that HAS failed is governed by its failure record's resetAt instead —
+   * body-parsed wins over this config date at mark time (the live body knew
+   * better); the two planes trade places only across a restart, whose
+   * initFailover wipe leaves every step healthy. Once the date passes, the step is
+   * probeable again, backoff deciding as for any other step. For walls whose body
+   * carries no date (Mistral's subscription 402). */
   resetAt?: Date;
 }
 
@@ -114,9 +121,12 @@ interface StepFailure {
   count: number;
   lastFailure: Date;
   /** Effective reset time for this failure episode: body-parsed wins over the
-   * config-declared step.resetAt. While set and in the future the step is skipped
-   * regardless of backoff — the wall cannot lift before its reset. Once it passes,
-   * the step is probed again (a reset step must be consumed, not avoided). */
+   * config-declared step.resetAt. While set and in the future the FAILED step
+   * stays skipped regardless of backoff — the wall cannot lift before its reset.
+   * Once it passes, the step is probed again (a reset step must be consumed, not
+   * avoided). Distinct from the config plane (#261): a future step.resetAt closes
+   * even a HEALTHY step (count===0); this record's resetAt only extends the
+   * backoff of a step that actually failed. */
   resetAt?: Date;
   /** #276: the LATEST failure was NON-quota — the STEP-ADVANCE class (the step is
    * broken or content-filtering; its provider's meter is NOT walled). Set only by
@@ -460,6 +470,19 @@ function parseRoleAliases(raw: string): { pattern: string; role: FailoverRole }[
  */
 export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   rules = loadRules(env);
+  // #261: attest every config closure at startup — one line per step closed by a
+  // future resetAt, the countable marker that the gesture bit. The 2026-09-25
+  // closure ran invisibly (865 responses on a closed step, nothing in the log
+  // said "closed"), which is exactly how an inert closure survives a weekend.
+  for (const rule of rules.values()) {
+    rule.steps.forEach((step, i) => {
+      if (step.resetAt && Date.now() < step.resetAt.getTime()) {
+        logStderr(
+          `[Failover] CLOSED ${rule.role}[${i}] (${step.label}) until ${step.resetAt.toISOString()} — operator-declared reset; the step is not selected before that instant (#261).`
+        );
+      }
+    });
+  }
   roleAliases = parseRoleAliases(env.CLAUDISH_FAILOVER_ROLE_MODELS || "");
   autoArmEnabled = /^(1|true|yes|on)$/i.test((env.CLAUDISH_FAILOVER_AUTO || "").trim());
   walled.clear();
@@ -681,7 +704,23 @@ function stepTtlMs(count: number): number {
   return BACKOFF_MS[idx];
 }
 
-function isStepTtlFailed(f: StepFailure | undefined): boolean {
+function isStepTtlFailed(f: StepFailure | undefined, step?: FailoverStep): boolean {
+  // #261: an operator-declared FUTURE step.resetAt CLOSES a HEALTHY step (no
+  // failure record) outright. Before this, the config value only entered the walk
+  // through markStepFailed — extending the backoff of an already-walled step — so a
+  // closure gesture on a healthy step silently did nothing, and initFailover's
+  // stepFailures wipe at startup meant the very recreate that deployed the _RESET
+  // also erased any failure state that would have made it bite. Measured on the hub
+  // 2026-09-25: 865 responses served on a Qwen step closed until Monday, the pool
+  // burning all weekend while `[Failover] DWELL … pinned to step 2` logged
+  // throughout. The two planes compose cleanly: a FAILED step's closure date is
+  // its RECORD's resetAt (body-parsed wins over the config date at mark time — the
+  // live body knew better; pinned by "body-parsed reset WINS"), and the config
+  // plane is what a fresh recreate evaluates, because the wipe leaves every step
+  // healthy. They can only trade places across a restart, never in one resolution.
+  if ((!f || f.count === 0) && step?.resetAt && Date.now() < step.resetAt.getTime()) {
+    return true;
+  }
   if (!f || f.count === 0) return false;
   // A known reset date EXTENDS the backoff, it never replaces it. Before the reset
   // instant the wall cannot lift, so the step stays failed however short the backoff
@@ -927,7 +966,10 @@ export function resolveFailoverTargetForSession(
     const pinnedStep = rule.steps[pin.stepIndex];
     const pinnedFailure = fails?.[pin.stepIndex];
     let pinnedStillServable =
-      pin.stepIndex < rule.steps.length && !isStepTtlFailed(pinnedFailure);
+      // The step (not just its failure record) is passed: a config-declared
+      // future resetAt closes the step outright (#261), so a pin holding on a
+      // step the operator just closed yields instead of riding out its dwell.
+      pin.stepIndex < rule.steps.length && !isStepTtlFailed(pinnedFailure, pinnedStep);
     if (pinnedStillServable && pinnedStep?.roleRef) {
       if (resolveRoleStep(role, pinnedStep) === null) {
         // The delegation can no longer serve (its own resolution went nominal,
@@ -1044,18 +1086,24 @@ function resolveSkippingFailed(
 ): { step: FailoverStep | null; stepIndex: number } {
   const fails = stepFailures.get(role);
   for (let i = 0; i < rule.steps.length; i++) {
-    if (isStepTtlFailed(fails?.[i])) continue;
     const step = rule.steps[i];
+    if (isStepTtlFailed(fails?.[i], step)) continue;
     if (step.roleRef && resolveRoleStep(role, step) === null) continue;
     return { step, stepIndex: i };
   }
   // Every step is TTL-failed: serve the LAST step anyway — a PAYG target should
-  // not wall, and its real error beats a synthetic one. A last step that is a
-  // role delegation is the exception: it is not a guaranteed-servable PAYG —
-  // when its delegation cannot resolve concrete, yielding nothing lets the raw
-  // refusal surface instead of routing to a placeholder.
+  // not wall, and its real error beats a synthetic one. Two exceptions, both
+  // yielding nothing so the raw refusal surfaces instead of a placeholder route:
+  // a last step that is a role delegation is not a guaranteed-servable PAYG, and
+  // a last step the OPERATOR closed with a future config resetAt (#261) — "PAYG
+  // always serves" is a liveness bet on the final step, and an explicit closure
+  // speaks more precisely than our bet. Serving it anyway is exactly the inert
+  // closure measured on the hub.
   const last = rule.steps.length - 1;
   const lastStep = rule.steps[last];
+  if (lastStep.resetAt && Date.now() < lastStep.resetAt.getTime()) {
+    return { step: null, stepIndex: -1 };
+  }
   if (lastStep.roleRef && resolveRoleStep(role, lastStep) === null) {
     return { step: null, stepIndex: -1 };
   }
