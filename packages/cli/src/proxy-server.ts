@@ -1208,8 +1208,10 @@ export async function createProxyServer(
         // attempts failing so, 2026-10-02): the client retried a dozen times
         // against the same overloaded provider and then dropped the turn.
         // Try the FIRST SERVABLE cascade step ONCE, for this request only,
-        // and change NO state — no arm, no stepFailures mark, no bucket wall,
-        // no dwell pin. The separation is the #170 re-forward's (`no
+        // and write no FAILURE state — no arm, no stepFailures mark, no
+        // bucket wall, no dwell pin (a SERVED attempt still mirrors the
+        // loop's success bookkeeping, which a wall never feeds). The
+        // separation is the #170 re-forward's (`no
         // markFail`): the moment the overload lifts, the very next request
         // re-probes the nominal instead of riding a cascade the role was
         // never exiled to.

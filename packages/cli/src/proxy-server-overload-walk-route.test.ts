@@ -1,6 +1,6 @@
 /**
  * #299 part B — a nominal's TRANSIENT OVERLOAD walks the role cascade once,
- * with NO state change, through the real `handleWithCascade` loop.
+ * writing no FAILURE state, through the real `handleWithCascade` loop.
  *
  * Measured driver (2026-10-02, hub, MiniMax-M3 = the haiku nominal): MiniMax
  * answered HTTP 529 `overloaded_error` on up to 30 % of attempts. A 529 is not
@@ -23,7 +23,14 @@
  *    W9 (400 connection_error) red, W7 (burst, negative control) stays green;
  *  - drop the native-bucket exclusion ⇒ W8 red (s0 called on a native 529);
  *  - walk to `steps[0]` instead of the first servable step ⇒ W10/W11 red
- *    (walk pays a dead step / routes a role name).
+ *    (walk pays a dead step / routes a role name);
+ *  - drop the walled-bucket skip (`isBucketWalled(providerBucketOf(concrete))
+ *    continue;`) ⇒ W12 red — the clause was written but unpinned until
+ *    review of #326 point 3 (mutation stayed 179/0);
+ *  - drop the step arg at the TTL check (`isStepTtlFailed(fails?.[i])` —
+ *    compiles, the param is optional) ⇒ W13 red — the #261 rebase hazard:
+ *    a HEALTHY step closed by a future config _RESET reads servable, the
+ *    closure living in the step's resetAt, not in the failure record.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -33,10 +40,12 @@ import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
 import { isOverloadWalkClass } from "./handlers/composed-handler.js";
 import {
+  armFailover,
   classifyNominalBucket,
   isBucketWalled,
   isFailoverActive,
   markStepFailed,
+  providerBucketOf,
   resetFailoverForTests,
   setRoleNominalResolver,
 } from "./fork/failover.js";
@@ -450,6 +459,57 @@ describe("#299 B — nominal transient overload walks the cascade once, zero sta
     expect(r1.status).toBe(200); // served by s1 — "fable" never hit the wire
     expect(calls.s0).toBe(0);
     expect(calls.s1).toBe(1);
+    expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 1"))).toBe(true);
+  }, 30_000);
+
+  // Review of #326 point 3 — the walled-bucket skip clause was written but
+  // UNPINNED: ai-01's mutation deleting `if (isBucketWalled(providerBucketOf(
+  // concrete))) continue;` ran 179/0. Distinct from W10, whose step 0 is dead
+  // on the BACKOFF plane (a stepFailures record): here the step is HEALTHY on
+  // that plane (no record, count 0) and dead on the WALL plane only — a
+  // weekly wall on its provider bucket, armed exactly as production arms one.
+  test("W12: step 0's provider bucket WALLED (healthy step, no failure record) → the walk serves step 1", async () => {
+    await spin();
+    resetWalk();
+    // Bucket computed the way the walk computes it (providerBucketOf of the
+    // concrete target), and the arm asserted so a silent no-op of the setup
+    // fails HERE rather than as a misleading s0 count below. Requires
+    // CLAUDISH_FAILOVER_AUTO=1 (WALK_ENV carries it — armFailover is a no-op
+    // without it).
+    const bucketOfStep0 = providerBucketOf("s0-ep@fake-s0");
+    expect(armFailover("sonnet", "test: weekly wall on step 0's provider", bucketOfStep0)).toBe(true);
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(1); // the nominal's OWN bucket is unwalled — still probed first (#275: no contagion)
+    expect(calls.s0).toBe(0); // skipped: walled bucket, exactly like the armed resolver
+    expect(calls.s1).toBe(1); // the first SERVABLE step served the walk
+    // The walk itself wrote no wall on the NOMINAL's bucket (the only wall
+    // live is the test's own, on step 0's provider).
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
+    expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 1"))).toBe(true);
+  }, 30_000);
+
+  // Review of #326 point 2 — the #261 rebase hazard: resolveTransientStep
+  // called isStepTtlFailed(fails?.[i]) WITHOUT the step. The param is
+  // optional so it compiles, and the #261 closure plane lives in the step's
+  // resetAt, not in the failure record — a HEALTHY step closed by a future
+  // config _RESET therefore read servable here while the armed resolver
+  // would never select it. No rebase conflict could ever surface this; only
+  // the pin can.
+  test("W13: step 0 CLOSED by a future _RESET (healthy, never failed) → the walk serves step 1 (#261 rebase)", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET_RESET: "2097-01-01T00:00:00Z" });
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(0); // closed by _RESET — never selected, failure-free or not
+    expect(calls.s1).toBe(1);
+    expect(isFailoverActive("sonnet")).toBe(false); // a closure is not a wall
+    // The #261 startup attestation fired — proves the env date parsed (an
+    // unparseable one would warn and fall back to open, and s0 would be 1).
+    expect(failoverLog.some((l) => l.includes("[Failover] CLOSED sonnet[0]"))).toBe(true);
     expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 1"))).toBe(true);
   }, 30_000);
 });

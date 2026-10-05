@@ -1123,9 +1123,12 @@ function resolveSkippingFailed(
  * recovery attempt, not a substitution, so walking into a step we know is
  * unservable is pure cost — null means "surface the original overload".
  *
- * Read-only in failover-STATE terms (no arm, no mark, no dwell pin). Two
- * benign touches remain, both the module's shared idiom rather than new
- * writes: `isBucketWalled`'s lazy TTL expiry drops an already-expired wall
+ * Read-only in FAILURE-state terms (no arm, no mark, no wall, no pin — review
+ * of #326, point 4): the walk writes no failure state, though its caller does
+ * mirror the loop's SUCCESS bookkeeping on a served attempt (`resetStepSuccess`,
+ * owner-side `onNominalSuccess` for delegations), which is state a wall never
+ * feeds. Two benign touches remain, both the module's shared idiom rather than
+ * new writes: `isBucketWalled`'s lazy TTL expiry drops an already-expired wall
  * exactly as the next ordinary resolution would, and `resolveConcreteTarget`
  * refreshes a role-step's `target` in place to the model actually serving it
  * — which is also what keeps the walk from ever routing the ROLE NAME as a
@@ -1137,8 +1140,14 @@ export function resolveTransientStep(
   if (!rule) return null;
   const fails = stepFailures.get(role);
   for (let i = 0; i < rule.steps.length; i++) {
-    if (isStepTtlFailed(fails?.[i])) continue;
     const step = rule.steps[i];
+    // The step MUST ride along (#261 rebase, review of #326 point 2): without
+    // it a HEALTHY step closed by a future config _RESET reads as servable
+    // here (the closure plane lives in the step's resetAt, not in the
+    // stepFailures record) and the walk pays a round-trip at a step the
+    // armed resolver would never select. Compiles either way — the param is
+    // optional — so no rebase conflict will ever surface this.
+    if (isStepTtlFailed(fails?.[i], step)) continue;
     const concrete = step.roleRef ? resolveConcreteTarget(role, step) : step.target;
     if (concrete === null) continue;
     if (isBucketWalled(providerBucketOf(concrete))) continue;
