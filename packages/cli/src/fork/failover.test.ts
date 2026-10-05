@@ -306,6 +306,112 @@ describe("resolveFailoverTarget — cascade walk", () => {
   });
 });
 
+// ── #261: a config-declared future resetAt CLOSES a healthy step ────────────────
+// The 2026-09-25 hub shape: an operator closed the Qwen subscription steps until
+// Monday via _RESET, deployed with a drained recreate — and the closure did
+// nothing, 865 responses served on the closed step. Root cause: the config value
+// only reached the walk through markStepFailed (extending an already-walled
+// step's backoff), never closing a healthy one — and the recreate's
+// initFailover wiped the very failure state that could have made it bite.
+// These tests pin the closure semantics on the config plane alone (count===0).
+
+describe("#261 — config resetAt closes a healthy step (closure gesture)", () => {
+  const realNow = Date.now;
+  // 1970-01-12: every ISO date below is deterministically future or past.
+  const FUTURE = "2097-01-01T00:00:00Z";
+  const PAST = "1970-01-01T00:00:00Z";
+  let clock = 1_000_000;
+
+  beforeEach(() => {
+    clock = 1_000_000;
+    Date.now = () => clock;
+  });
+  afterEach(() => {
+    Date.now = realNow;
+  });
+
+  it("skips a healthy closed step (count===0) — the recreate-wipe shape of 2026-09-25", () => {
+    initFailover({
+      ...OPUS_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+      CLAUDISH_FAILOVER_OPUS_RESET: `${FUTURE}>>`,
+    });
+    const r = resolveFailoverTarget("opus");
+    expect(r.stepIndex).toBe(1);
+    expect(r.step?.target).toBe("gc@glm-5.2");
+  });
+
+  it("does NOT fall back to the LAST step when the operator closed it", () => {
+    // "PAYG always serves" is a liveness bet; an explicit closure outranks it —
+    // serving a closed last step is exactly the inert-closure bug.
+    initFailover({
+      ...OPUS_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+      CLAUDISH_FAILOVER_OPUS_RESET: `${FUTURE}>${FUTURE}>${FUTURE}`,
+    });
+    expect(resolveFailoverTarget("opus")).toEqual({ step: null, stepIndex: -1 });
+  });
+
+  it("last-step fallback stands when only earlier steps are closed", () => {
+    initFailover({
+      ...OPUS_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+      CLAUDISH_FAILOVER_OPUS_RESET: `${FUTURE}>${FUTURE}>`,
+    });
+    const r = resolveFailoverTarget("opus");
+    expect(r.stepIndex).toBe(2);
+    expect(r.step?.target).toBe("deepseek@deepseek-payg");
+  });
+
+  it("a PASSED reset reopens the step (closure is not permanent)", () => {
+    initFailover({
+      ...OPUS_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+      CLAUDISH_FAILOVER_OPUS_RESET: `${PAST}>>`,
+    });
+    const r = resolveFailoverTarget("opus");
+    expect(r.stepIndex).toBe(0);
+    expect(r.step?.target).toBe("qwen-token-plan@qwen3.8-max");
+  });
+
+  it("the closure comes from config, not failure state — it survives the initFailover wipe", () => {
+    // The recreate shape: failure state recorded, then initFailover clears it.
+    // A closure that depended on failure state would reopen at every restart.
+    const env = {
+      ...OPUS_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+      CLAUDISH_FAILOVER_OPUS_RESET: `${FUTURE}>>`,
+    } as NodeJS.ProcessEnv;
+    initFailover(env);
+    markStepFailed("opus", 1, "step 1 wall"); // irrelevant step, just noise
+    initFailover(env); // the recreate: stepFailures wiped
+    const r = resolveFailoverTarget("opus");
+    expect(r.stepIndex).toBe(1); // step 0 STILL closed (config plane), step 1 fresh
+  });
+
+  it("startup attests the closure — one countable marker line per closed step", () => {
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as any).write = (chunk: any) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      initFailover({
+        ...OPUS_CASCADE,
+        CLAUDISH_FAILOVER_ACTIVE: "opus",
+        CLAUDISH_FAILOVER_OPUS_RESET: `${FUTURE}>>`,
+      });
+    } finally {
+      (process.stderr as any).write = realWrite;
+    }
+    const closed = lines.filter((l) => l.includes("[Failover] CLOSED opus[0]"));
+    expect(closed.length).toBe(1);
+    expect(closed[0]).toContain(new Date(FUTURE).toISOString());
+    expect(lines.some((l) => l.includes("CLOSED opus[1]"))).toBe(false);
+  });
+});
+
 // ── Per-step backoff ───────────────────────────────────────────────────────────
 
 describe("per-step backoff", () => {
