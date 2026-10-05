@@ -31,10 +31,11 @@ only for locally-served requests — a NOMINAL forward writes nothing — so the
 corpus covers the local slice, not the fleet. The observed time span is
 always reported; never assume the window (docker-logs-moving-window lesson).
 
-Exit codes: 0 = clean (or nothing to check) · 1 = findings (local header
+Exit codes: 0 = clean among CLIENT records · 1 = findings (local header
 missing/wrong, unknown machine names) · 2 = nothing to verify (empty/missing
-corpus). The script never throws: every failure degrades to a reported
-reason.
+corpus, or a corpus holding ONLY claudish's own probes — 0 client record
+proves nothing about the rollout either way). The script never throws: every
+failure degrades to a reported reason.
 
 Run:  python scripts/verify-machine-header.py [--corpus DIR] [--limit N]
                                              [--machine NAME] [--settings FILE]
@@ -76,24 +77,37 @@ PROBE_USER_TEXT = "List the current directory using Bash. Do it now."
 def classify_probe(body):
     """True when this body is one of claudish's own liveness probes.
 
-    Matches the exact probe user text as a plain string or as a content-block
-    list (the Claude Code wire shape). Never raises on odd shapes.
+    Anchored on the probe SHAPE, not the text alone: exactly one user message,
+    no system, tools exactly [Bash, Read], max_tokens 100 — and that message
+    is the exact probe text (string or content-block list, the CC wire shape).
+    Text alone is not enough: a real header-less session whose HISTORY quotes
+    the phrase would pass for a probe and silently leave the residual
+    (measured by review, 2026-10-05). Never raises on odd shapes.
     """
     if not isinstance(body, dict):
         return False
-    msgs = body.get("messages")
-    if not isinstance(msgs, list):
+    if body.get("system") not in (None, "", [], {}):
         return False
-    for m in msgs:
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        c = m.get("content")
-        texts = [c] if isinstance(c, str) else [
-            b.get("text") for b in c if isinstance(b, dict)
-        ] if isinstance(c, list) else []
-        if any(isinstance(t, str) and t.strip() == PROBE_USER_TEXT for t in texts):
-            return True
-    return False
+    if body.get("max_tokens") != 100:
+        return False
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    names = sorted(
+        t.get("name") for t in tools if isinstance(t, dict) and t.get("name"))
+    if names != ["Bash", "Read"]:
+        return False
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or len(msgs) != 1:
+        return False
+    m = msgs[0]
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return False
+    c = m.get("content")
+    texts = [c] if isinstance(c, str) else [
+        b.get("text") for b in c if isinstance(b, dict)
+    ] if isinstance(c, list) else []
+    return any(isinstance(t, str) and t.strip() == PROBE_USER_TEXT for t in texts)
 
 
 # ---------------------------------------------------------------------------
@@ -148,13 +162,19 @@ def read_settings_machine(settings_path, want_machine):
 
 
 def shell_env_override_note():
-    """A real shell env var overrides settings.json (issue #1 caveat)."""
+    """The shell env var, when present (issue #1 caveat).
+
+    A run launched from Claude Code inherits a copy of the SAME value the
+    settings hold — that is not an override, it is a mirror; only a shell
+    value that LACKS the header actually masks settings.json.
+    """
     v = os.environ.get("ANTHROPIC_CUSTOM_HEADERS")
     if v is None:
         return None
-    has = re.search(r"x-claudish-machine", v, re.I) is not None
+    has = re.search(r"x-claudish-machine\s*:\s*([\w-]+)", v, re.I)
     if has:
-        return "shell env ANTHROPIC_CUSTOM_HEADERS also sets X-Claudish-Machine (overrides settings.json)"
+        return ("shell env ANTHROPIC_CUSTOM_HEADERS also sets X-Claudish-Machine: %s "
+                "(inherited copy of the settings value, same effect — not an override)" % has.group(1))
     return "WARN: shell env ANTHROPIC_CUSTOM_HEADERS is set WITHOUT X-Claudish-Machine — it masks the settings.json value"
 
 
@@ -246,6 +266,52 @@ def residual_attribution(records):
     return groups
 
 
+def client_stats(records):
+    """(client_total, client_with_machine, probes) over client records.
+
+    CLIENTS and probes are disjoint populations; every coverage ratio built
+    from these three uses the SAME population on both sides — a probe that
+    carries the header (issue #345 will make that the norm) must never
+    inflate the client numerator above its denominator.
+    """
+    probes = sum(1 for r in records if r.get("probe"))
+    client_total = 0
+    client_with = 0
+    for r in records:
+        if r.get("probe"):
+            continue
+        client_total += 1
+        m = r.get("machine")
+        if isinstance(m, str) and m.strip():
+            client_with += 1
+    return client_total, client_with, probes
+
+
+def richness(records):
+    """device_id8 / entrypoint coverage, per side (attributed vs residual).
+
+    The header rollout is verified by `machine`; these two say whether the
+    RICHER attribution fields travelled with it (demand 2(a), PR #336 review).
+    """
+    out = {"attr": [0, 0, 0, 0], "resid": [0, 0, 0, 0]}  # [total, device_id8, entrypoint, both]
+    for r in records:
+        if r.get("probe"):
+            continue
+        m = r.get("machine")
+        side = "attr" if (isinstance(m, str) and m.strip()) else "resid"
+        s = out[side]
+        s[0] += 1
+        d = isinstance(r.get("device_id8"), str) and bool(r["device_id8"])
+        e = isinstance(r.get("entrypoint"), str) and bool(r["entrypoint"])
+        if d:
+            s[1] += 1
+        if e:
+            s[2] += 1
+        if d and e:
+            s[3] += 1
+    return out
+
+
 # ---------------------------------------------------------------------------
 # reporting
 # ---------------------------------------------------------------------------
@@ -272,21 +338,29 @@ def human_report(machine, settings, override_note, records, unreadable, span,
         add("  when nothing was served locally; a NOMINAL forward writes no capture)")
     else:
         total = len(records)
-        probes = sum(1 for r in records if r.get("probe"))
+        client_total, client_with, probes = client_stats(records)
         with_m = sum(c for k, c in dist.items() if k)
         pct = (100.0 * with_m / total) if total else 0.0
         add("  scanned %d req envelopes (%d unreadable)" % (total, unreadable))
         if span:
             add("  observed span: %s -> %s (report covers THIS span, not an assumed window)" % span)
-        add("  attribution coverage: %d/%d = %.1f%%" % (with_m, total, pct))
+        add("  attribution coverage (raw, all records): %d/%d = %.1f%%" % (with_m, total, pct))
         if probes:
-            # probes carry no machine BY DESIGN — excluding them is the number
-            # that answers "did a CLIENT stop sending the header?"
-            clients = total - probes
-            cpct = (100.0 * with_m / clients) if clients else 0.0
-            add("  of which %d are claudish's own liveness probes (Test-ProxyWithTools / deepProbe — header-less BY DESIGN)" % probes)
-            add("  CLIENT attribution coverage (probes excluded): %d/%d = %.1f%%" % (with_m, clients, cpct))
+            add("  of which %d are claudish's own liveness probes (Test-ProxyWithTools / deepProbe)" % probes)
+        if client_total:
+            # numerator and denominator on the SAME population: client records
+            # only — a header-carrying probe (issue #345) can never inflate it
+            cpct = 100.0 * client_with / client_total
+            add("  CLIENT attribution coverage: %d/%d = %.1f%%" % (client_with, client_total, cpct))
+        else:
+            add("  0 CLIENT record in corpus — only probes here, nothing to verify (exit 2)")
         add("  NOTE: on a relay, captures cover only locally-served requests, not the fleet")
+        rich = richness(records)
+        for side, label in (("attr", "attributed"), ("resid", "residual")):
+            t, d, e, b = rich[side]
+            if t:
+                add("  %-9s richness: device_id8 %d/%d · entrypoint %d/%d · both %d/%d"
+                    % (label, d, t, e, t, b, t))
         add("  distribution:")
         for k in sorted(dist, key=lambda x: -dist[x]):
             label = k if k else "(no machine header)"
@@ -308,13 +382,16 @@ def human_report(machine, settings, override_note, records, unreadable, span,
     add("")
     add("-- Residual: no-machine requests by lane --")
     probes = sum(1 for r in records if r.get("probe"))
+    client_total = sum(1 for r in records if not r.get("probe"))
     if probes:
         add("  %d reqs from claudish's own probes (watchdog Test-ProxyWithTools / relay deepProbe)" % probes)
-        add("  — separated out: no header BY DESIGN, not a rollout gap (PR #336 review)")
-    if not residual and not probes:
-        add("  none — every scanned request carried the header")
+        add("  — separated out: they carry no header by design, they are not a rollout gap")
+    if not records:
+        add("  (no corpus)")
+    elif client_total == 0:
+        add("  0 CLIENT request in this corpus — nothing to verify (exit 2), no rollout verdict")
     elif not residual:
-        add("  no CLIENT lane left after the probes — rollout complete on this corpus")
+        add("  none — every CLIENT request carried the header")
     else:
         rows = sorted(residual.items(), key=lambda kv: -kv[1]["count"])
         for (src, model, entrypoint, workload), g in rows[:10]:
@@ -328,13 +405,19 @@ def human_report(machine, settings, override_note, records, unreadable, span,
 
 def json_report(machine, settings, override_note, records, unreadable, span,
                 dist, unknown, residual):
+    client_total, client_with, probes = client_stats(records)
+    rich = richness(records)
     return json.dumps({
         "machine": machine,
         "settings_ok": settings[0] if settings else None,
         "settings_detail": settings[1] if settings else "skipped",
         "shell_override": override_note,
         "scanned": len(records),
-        "probes_excluded": sum(1 for r in records if r.get("probe")),
+        "probes_excluded": probes,
+        "client_total": client_total,
+        "client_with_machine": client_with,
+        "client_coverage": round(100.0 * client_with / client_total, 2) if client_total else None,
+        "richness": rich,
         "unreadable": unreadable,
         "span": list(span) if span else None,
         "distribution": dist,
@@ -380,7 +463,11 @@ def main(argv=None):
         findings.append("unknown-machine-names")
     if findings:
         return 1
-    if not records:
+    # "nothing to verify" includes the all-probe corpus: probes are ours and
+    # header-less by design — 0 CLIENT record proves nothing about the rollout
+    # either way, and must not read as "complete" (review blocker 2).
+    client_total, _, _ = client_stats(records)
+    if client_total == 0:
         return 2
     return 0
 
