@@ -114,6 +114,18 @@ class RoutingError extends Error {
  *   "Perform a web search for the query: <query>"
  * We intercept this, execute SearXNG, and return the results as text.
  */
+/**
+ * #348: the overload walk's remaining-patience budget, in ms. Default 300 s —
+ * see the walk branch for the 360 s relay-deadline / 600 s client-timeout
+ * arithmetic. Read per request like CLAUDISH_FAILOVER_OVERLOAD_WALK; only an
+ * explicit `0` disables the bound (the client-gone check is unconditional).
+ */
+const WALK_BUDGET_DEFAULT_MS = 300_000;
+function readWalkBudgetMs(): number {
+  const raw = Number.parseInt((process.env.CLAUDISH_FAILOVER_WALK_BUDGET_MS || "").trim(), 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : WALK_BUDGET_DEFAULT_MS;
+}
+
 async function interceptWebTools(c: any, body: any): Promise<Response | null> {
   const messages = body.messages || [];
   const isStreaming = body.stream === true;
@@ -1090,6 +1102,11 @@ export async function createProxyServer(
     requestedModel: string,
     nominalBucket?: string
   ): Promise<Response> => {
+    // #348: the walk's time budget is measured from HERE — the moment the
+    // request entered the cascade. The nominal attempt's full cost (transport
+    // retry ladder + patient backoff + its own latency) counts against it,
+    // because that is what the client already waited before the walk fires.
+    const cascadeStartedAtMs = Date.now();
     const role = roleFromModelName(requestedModel);
     const rule = role ? getFailoverRule(role) : undefined;
     // #275: the provider bucket THIS request's nominal draws on. Computed once
@@ -1236,13 +1253,52 @@ export async function createProxyServer(
           isOverloadWalkClass(response.status, errBody)
         ) {
           overloadWalked = true;
+          // #348: the walk is a recovery attempt paid out of the client's
+          // REMAINING patience. By the time a 429/503 overload reaches the
+          // walk it has already climbed the transport ladder (~60 s) and the
+          // patient backoff (~305 s) — ≈365 s, past the relay's 360 s header
+          // deadline (the sidecar fell through and served locally; the hub's
+          // walk output is unread) and leaving < 235 s of the 600 s client
+          // timeout for a direct client whose walk step is ALSO slow.
+          // CLAUDISH_FAILOVER_WALK_BUDGET_MS (default 300 s, 0 = off, read
+          // per request): keeps the direct-client sum under 600 s with the
+          // relayed 365 s class already excluded, while the measured driver
+          // (a direct MiniMax 529, seconds) still walks.
+          //
+          // NO client-gone skip: a client abort is UNDETECTABLE here on this
+          // stack (Bun + @hono/node-server, body already consumed — probe
+          // matrix in budget-failover.md §One-shot overload walk). The
+          // adapter's Request signal arms only at the first write;
+          // `incoming.destroyed` is true on every HEALTHY request too (Bun
+          // destroys the message once read); socket state and entry-time
+          // events are identical with and without abort. A predicate built on
+          // any of them would skip every walk or none — pin W16 guards this
+          // negative result; the budget alone bounds a walk into an abandoned
+          // request, and the walk is one attempt by construction.
+          const walkBudgetMs = readWalkBudgetMs();
+          const walkElapsedMs = Date.now() - cascadeStartedAtMs;
+          if (walkBudgetMs > 0 && walkElapsedMs > walkBudgetMs) {
+            log(
+              `[Failover] WALK ${role} skipped — budget ${walkElapsedMs}ms > ${walkBudgetMs}ms (HTTP ${response.status} on nominal ${requestedModel})`,
+              true
+            );
+            return response;
+          }
           // First SERVABLE step, read-only (a step in per-step backoff or a
           // walled bucket is skipped — walking there is a round-trip at a
           // target we already know is dead; a role-step whose delegation
           // cannot resolve concrete is skipped too, so the ROLE NAME can
           // never reach the wire as a model id). Null ⇒ no servable step:
           // surface the original overload rather than substitute blind.
-          const walk = resolveTransientStep(role);
+          // #348: the wall check buckets bare targets CANONICALLY (the
+          // injected async resolver — providerBucketOf reads `glm` where the
+          // wall lives on the route() primary `glm-coding`), and the
+          // NOMINAL's own bucket is skipped too (same bucket = same capacity
+          // the 529 just refused).
+          const walk = await resolveTransientStep(role, {
+            bucketOf: nominalBucketOfModel,
+            nominalBucket: bucket ?? undefined,
+          });
           if (walk) {
             const walkDelegation = walk.step.roleRef
               ? resolveDelegationOwner(role, walk.step)

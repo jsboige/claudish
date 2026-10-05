@@ -33,7 +33,16 @@
  *    a HEALTHY step closed by a future config _RESET reads servable, the
  *    closure living in the step's resetAt, not in the failure record;
  *  - rethrow in the walk's `catch` ⇒ W14 red — the client gets a terminal
- *    HTTP 400 routing error instead of the retryable 529 (review of #326).
+ *    HTTP 400 routing error instead of the retryable 529 (review of #326);
+ *  - drop the budget skip (#348) ⇒ W15 red — the walk fires into a request
+ *    whose patience is already spent; W16 pins the NEGATIVE result that no
+ *    client-gone skip exists (abort undetectable pre-write on this stack —
+ *    see the W16 comment's probe matrix; a `destroyed`-based predicate skips
+ *    every walk, measured 11/22 red the moment it shipped);
+ *  - drop the canonical bucketter for bare targets (#348) ⇒ W17 red — the
+ *    wall on the route()-primary bucket is invisible to providerBucketOf;
+ *  - drop the nominal-bucket skip (#348 part 3) ⇒ W18 red — the walk re-pays
+ *    the same bucket whose capacity the 529 just refused.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -73,7 +82,7 @@ const SANDBOX_ENV_KEYS = [
   "MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY", "LITELLM_API_KEY", "POE_API_KEY",
   "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
   "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
-  "CLAUDISH_FAILOVER_OVERLOAD_WALK",
+  "CLAUDISH_FAILOVER_OVERLOAD_WALK", "CLAUDISH_FAILOVER_WALK_BUDGET_MS",
   "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
 ];
@@ -92,6 +101,10 @@ const realConsoleLog = console.log.bind(console);
 
 /** Per-endpoint status override; unset ⇒ 200 healthy (s0/s1) or 529 (nm). */
 let endpointStatus: Record<string, number> = {};
+/** Per-endpoint artificial latency (ms) before answering — W15/W16 need the
+ *  nominal to answer LATE so the walk branch can observe a spent budget or a
+ *  client that left while the nominal was still working. */
+let endpointDelay: Record<string, number> = {};
 /** Endpoints whose 429 body is a BURST (no overload wording) rather than an
  *  overload-shaped 429 — W7's negative control needs both spellings. */
 let burst429: Record<string, boolean> = {};
@@ -196,9 +209,38 @@ function resetWalk(extra: Record<string, string> = {}): void {
   setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
 }
 
-async function postMessage(model: string, extraHeaders: Record<string, string> = {}): Promise<Response> {
+/** The three fake custom endpoints every test gets. Module scope so a test can
+ *  rewrite the config BEFORE spin() with extra top-level fields — routing rules
+ *  and endpoints both load at proxy startup, not per request (W17). */
+function writeTestConfig(extra: Record<string, unknown> = {}): void {
+  const ep = (name: string) => ({
+    kind: "simple",
+    url: `${UPSTREAM_BASE}/${name}/v1`,
+    format: "openai",
+    apiKey: "test-key",
+  });
+  writeFileSync(
+    REAL_CONFIG_PATH,
+    JSON.stringify({
+      customEndpoints: {
+        "nom-ep": ep("nm"),
+        "s0-ep": ep("s0"),
+        "s1-ep": ep("s1"),
+      },
+      ...extra,
+    }),
+    "utf-8"
+  );
+}
+
+async function postMessage(
+  model: string,
+  extraHeaders: Record<string, string> = {},
+  signal?: AbortSignal
+): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
+    signal,
     headers: {
       "Content-Type": "application/json",
       "anthropic-version": "2023-06-01",
@@ -217,27 +259,12 @@ beforeEach(() => {
   calls = { nm: 0, s0: 0, s1: 0, native: 0 };
   failoverLog = [];
   endpointStatus = {};
+  endpointDelay = {};
   burst429 = {};
   configExisted = existsSync(REAL_CONFIG_PATH);
   configBackup = configExisted ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
   mkdirSync(CONFIG_DIR, { recursive: true });
-  const ep = (name: string) => ({
-    kind: "simple",
-    url: `${UPSTREAM_BASE}/${name}/v1`,
-    format: "openai",
-    apiKey: "test-key",
-  });
-  writeFileSync(
-    REAL_CONFIG_PATH,
-    JSON.stringify({
-      customEndpoints: {
-        "nom-ep": ep("nm"),
-        "s0-ep": ep("s0"),
-        "s1-ep": ep("s1"),
-      },
-    }),
-    "utf-8"
-  );
+  writeTestConfig();
   for (const k of SANDBOX_ENV_KEYS) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
@@ -253,6 +280,7 @@ beforeEach(() => {
     if (!url.startsWith(UPSTREAM_BASE)) return realFetch(input, init);
     const which = url.slice(UPSTREAM_BASE.length + 1, UPSTREAM_BASE.length + 3);
     calls[which] = (calls[which] ?? 0) + 1;
+    if (endpointDelay[which]) await new Promise((r) => setTimeout(r, endpointDelay[which]));
     const status = endpointStatus[which] ?? (which === "nm" ? 529 : 200);
     if (status === 402) return quotaWall();
     if (status === 529) return overload529();
@@ -531,6 +559,115 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
     expect(calls.native).toBe(0);
     expect(isFailoverActive("sonnet")).toBe(false);
     expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 0"))).toBe(true);
+  }, 30_000);
+
+  // ─── #348 — the walk is paid out of the client's REMAINING patience ──────────
+
+  // A 429/503 overload reaches the walk only after the transport ladder and the
+  // patient backoff have spent ~365 s; the relay's 360 s header deadline has
+  // already expired under it and a direct client has < 235 s of its 600 s
+  // budget left. The walk is therefore BOUNDED: past
+  // CLAUDISH_FAILOVER_WALK_BUDGET_MS (default 300 s, read per request, 0=off)
+  // the original overload surfaces instead of a walk nobody can wait for.
+  test("W15: nominal 529 arriving PAST the walk budget → skip, original surfaces (one skip marker)", async () => {
+    await spin();
+    resetWalk();
+    // Read per request like the kill switch — set directly on process.env.
+    // 500 ms budget vs a nominal that takes 700 ms to answer its 529.
+    process.env.CLAUDISH_FAILOVER_WALK_BUDGET_MS = "500";
+    endpointDelay.nm = 700;
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(529); // the original overload, not a late walk
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(0); // never walked — the budget was spent
+    expect(calls.s1).toBe(0);
+    expect(
+      failoverLog.some((l) => l.includes("[Failover] WALK sonnet skipped") && l.includes("budget"))
+    ).toBe(true);
+    expect(failoverLog.some((l) => l.includes("WALK sonnet one-shot"))).toBe(false);
+    expect(isFailoverActive("sonnet")).toBe(false); // the skip writes no state either
+  }, 30_000);
+
+  // #348 NEGATIVE RESULT, pinned — a client abort is UNDETECTABLE at the walk
+  // branch on this stack, so there is NO client-gone skip and this pin guards
+  // against re-adding one. The proxy serves through @hono/node-server on
+  // Bun's node:http, and by the cascade the body is consumed. Probe matrix
+  // (2x2 healthy/aborted, body read, checked 400 ms after the abort):
+  //  - adapter Request signal: false in BOTH (it arms only at the first
+  //    write — and a first probe on raw Bun.serve, where it DOES flip, was
+  //    the wrong stack; caught by this test before merge);
+  //  - incoming.destroyed/close/complete: true in BOTH (Bun destroys the
+  //    message once read — a predicate on `destroyed` skips EVERY walk,
+  //    measured: 11/22 red the moment it shipped);
+  //  - incoming.socket/outgoing.socket {destroyed, readyState}: open in BOTH;
+  //  - events subscribed at entry (inc "aborted"/"close", socket "close",
+  //    out "close"): identical in BOTH.
+  // Consequence: the walk FIRES into an abandoned request (bounded by the
+  // budget alone, one attempt by construction). If someone re-adds a
+  // client-gone predicate, it must discriminate THIS test's aborted client
+  // from a healthy one — no current signal does.
+  test("W16: client abort is UNDETECTABLE pre-write → the walk proceeds (no client-gone skip exists)", async () => {
+    await spin();
+    resetWalk();
+    endpointDelay.nm = 400; // the nominal is still working when the client leaves
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 150);
+    try {
+      await postMessage("claude-sonnet-5", {}, ac.signal);
+    } catch {
+      // expected — the client-side fetch rejects on abort; the SERVER handler
+      // continues (that asymmetry is the point of this pin).
+    }
+    // Let the handler reach the walk branch after its late 529.
+    await new Promise((r) => setTimeout(r, 600));
+    expect(calls.nm).toBe(1); // the nominal attempt was already in flight
+    expect(calls.s0).toBe(1); // the walk FIRED — no skip predicate may suppress it here
+    expect(failoverLog.some((l) => l.includes("WALK sonnet one-shot"))).toBe(true);
+    expect(failoverLog.some((l) => l.includes("WALK sonnet skipped"))).toBe(false);
+  }, 30_000);
+
+  // #348 part 2 — the W12 gap on the BARE-NAME plane: providerBucketOf("glm-5.3")
+  // reads `glm`, but the wall production arms sits on the route() primary the
+  // routing chain actually serves (the `glm-coding` plan bucket — here the
+  // custom endpoint a user routing rule sends glm-5.3 to). The walk buckets
+  // steps through the SAME canonical resolver as the nominal
+  // (nominalBucketOfModel, injected), or the wall is invisible to it.
+  test("W17: bare step-0 target WALLED on its route()-primary bucket → skipped, step 1 serves", async () => {
+    // The routing rule must be in config.json BEFORE spin(): rules load at
+    // startup. It sends bare glm-5.3 to s0-ep, making the canonical bucket of
+    // the step `s0-ep` — providerBucketOf still reads `glm`.
+    writeTestConfig({ routing: { "glm-5.3": ["s0-ep"] } });
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "glm-5.3>s1-ep@fake-s1" });
+    // Wall the CANONICAL bucket of the bare step — armed exactly as production
+    // arms a plan wall. Asserted so a silent no-op of the setup fails here,
+    // not as a misleading s0 count below.
+    expect(armFailover("sonnet", "test: wall on the bare step's canonical bucket", "s0-ep")).toBe(true);
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(1); // the nominal's own bucket (nom-ep) is unwalled — probed (#275: no contagion)
+    expect(calls.s0).toBe(0); // skipped: its canonical bucket is walled, `glm` is not what serves it
+    expect(calls.s1).toBe(1); // the first canonically-servable step
+    expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 1"))).toBe(true);
+  }, 30_000);
+
+  // #348 part 3 — a step on the NOMINAL's own bucket re-pays the exact
+  // capacity the 529 just refused: same endpoint, same meter, same overload.
+  // The walk skips it (nominalBucket injected) and takes the next step.
+  test("W18: step 0 on the NOMINAL's own bucket → skipped, step 1 serves (the 529 already refused that capacity)", async () => {
+    // The nominal IS s0 (bucket `s0-ep`); the cascade's step 0 sits on the
+    // same bucket under a second model id — healthy, unwalled, and useless.
+    await spin({ sonnet: "s0-ep@fake-nom" });
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-b>s1-ep@fake-s1" });
+    endpointStatus.s0 = 529; // the bucket's capacity is the overloaded thing
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(0);
+    expect(calls.s0).toBe(1); // the nominal's OWN attempt — exactly once, never re-paid by the walk
+    expect(calls.s1).toBe(1); // step 0 skipped on the bucket plane; step 1 served
+    expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 1"))).toBe(true);
   }, 30_000);
 });
 

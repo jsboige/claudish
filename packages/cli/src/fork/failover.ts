@@ -1118,8 +1118,11 @@ function resolveSkippingFailed(
  * a concrete target — plus one exclusion of the walk's own: a step whose
  * provider bucket is WALLED (a weekly OpenAI wall on step 0 must not turn
  * every nominal 529 into a round-trip at a step we already know is dead while
- * a healthy step waits behind it — review of #326, point 3). Unlike
- * `resolveSkippingFailed` there is NO last-step fallback: the walk is a
+ * a healthy step waits behind it — review of #326, point 3; #348 makes the
+ * bucket CANONICAL for bare targets via the injected async resolver, and adds
+ * the nominal's own bucket to the skip — a 529 is that bucket's capacity
+ * saying no, so a sibling model on the same bucket re-pays the overload).
+ * Unlike `resolveSkippingFailed` there is NO last-step fallback: the walk is a
  * recovery attempt, not a substitution, so walking into a step we know is
  * unservable is pure cost — null means "surface the original overload".
  *
@@ -1133,9 +1136,30 @@ function resolveSkippingFailed(
  * refreshes a role-step's `target` in place to the model actually serving it
  * — which is also what keeps the walk from ever routing the ROLE NAME as a
  * model id (the pre-refresh `target` can still be `roleRef`). */
-export function resolveTransientStep(
-  role: FailoverRole
-): { step: FailoverStep; stepIndex: number; concrete: string } | null {
+export async function resolveTransientStep(
+  role: FailoverRole,
+  opts?: {
+    /**
+     * #348: canonical bucket for a step target. BARE targets are the reason
+     * this exists: `providerBucketOf("glm-5.3")` says `glm`, but a bare
+     * nominal's wall is armed on its credential-filtered `route()` primary
+     * (`glm-coding`) — the same canonicalization `classifyNominalBucket`
+     * applies to the nominal (failover.ts:645's "the failover module must
+     * not make a proxy-side route() call" stance still holds for the SYNC
+     * armed walk; here the ASYNC call site injects the resolver, so the
+     * module itself stays route-free). Absent (unit callers): bare targets
+     * fall back to `providerBucketOf` — the pre-#348 behavior.
+     */
+    bucketOf?: (target: string) => Promise<string>;
+    /**
+     * #348 part 3: the overloaded NOMINAL's own bucket. A 529 is the bucket's
+     * plan/provider saying "overloaded" — another model drawing on the SAME
+     * bucket shares that capacity, so walking there re-pays the overload. A
+     * different bucket is a different meter and a legitimate landing.
+     */
+    nominalBucket?: string;
+  }
+): Promise<{ step: FailoverStep; stepIndex: number; concrete: string } | null> {
   const rule = rules.get(role);
   if (!rule) return null;
   const fails = stepFailures.get(role);
@@ -1150,7 +1174,9 @@ export function resolveTransientStep(
     if (isStepTtlFailed(fails?.[i], step)) continue;
     const concrete = step.roleRef ? resolveConcreteTarget(role, step) : step.target;
     if (concrete === null) continue;
-    if (isBucketWalled(providerBucketOf(concrete))) continue;
+    const stepBucket = opts?.bucketOf ? await opts.bucketOf(concrete) : providerBucketOf(concrete);
+    if (isBucketWalled(stepBucket)) continue;
+    if (opts?.nominalBucket !== undefined && stepBucket === opts.nominalBucket) continue;
     return { step, stepIndex: i, concrete };
   }
   return null;
