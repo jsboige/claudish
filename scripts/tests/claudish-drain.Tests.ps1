@@ -683,6 +683,26 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
             $parts = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Fixture) + $ExtraArgs
             Join-DrainDetachArguments $parts
         }
+
+        # Write-friendly read for the e2e wait loops: a plain Get-Content -Raw
+        # poll can hold the log in a state that makes the CHILD's Add-Content
+        # fail once with a sharing violation (measured under 5.1: log ended on
+        # RECREATE REFUSED, no OUTCOME, 20 s wait) — read with FileShare
+        # Read|Write so the poller never blocks the writer.
+        function Read-LenientRaw {
+            param([string]$Path)
+            if (-not (Test-Path -LiteralPath $Path)) { return $null }
+            $fs = $null
+            try {
+                $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $sr = New-Object System.IO.StreamReader($fs)
+                return $sr.ReadToEnd()
+            } catch {
+                return $null
+            } finally {
+                if ($fs) { $fs.Dispose() }
+            }
+        }
     }
 
     It 'a spaced argument binds through the detached path (AC1/AC3a)' {
@@ -807,15 +827,94 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         # ~1.5 s, measured in review of #338).
         $deadline = (Get-Date).AddSeconds(20)
         while ((Get-Date) -lt $deadline) {
-            if ((Test-Path -LiteralPath $log) -and ((Get-Content -LiteralPath $log -Raw) -match 'OUTCOME ')) { break }
+            if ((Read-LenientRaw -Path $log) -match 'OUTCOME ') { break }
             Start-Sleep -Milliseconds 250
         }
-        $logRaw = Get-Content -LiteralPath $log -Raw
+        $logRaw = Read-LenientRaw -Path $log
         # The alive claim is backed by THAT child's own START line.
         $logRaw | Should -Match ('START pid {0}\b' -f $m.Groups[1].Value)
         # The child really ran the refuse path (docker-free) and terminated.
         $logRaw | Should -Match 'RECREATE REFUSED'
         $logRaw | Should -Match 'OUTCOME '
+    }
+
+    It 'the real entry point: a child mute within the startup window returns exit 4 + PID + do-NOT-relaunch (re-review, bloquant 2)' {
+        # The exit-4 contract existed only in prose: a mutation at the entry
+        # block (timeout -> exit 3, PID and notice stripped) left the file at
+        # 37/0. -DetachStartupTimeoutSec 0 gives a degenerate-but-
+        # deterministic window: the loop never runs, the single post-loop
+        # check fires within ~100 ms of the launch, and the child's
+        # powershell.exe cold start cannot have written START yet.
+        $e2eHome = Join-Path $script:DetachDir 'e2e-timeout-home'
+        New-Item -ItemType Directory -Path $e2eHome -Force | Out-Null
+        $log = Join-Path $e2eHome 'drain.log'
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File $script:DrainScript -Detach -Reason 'pester-e2e-to' `
+            -ClaudishHome $e2eHome -LogPath $log -ProxyUrl 'http://127.0.0.1:59999' `
+            -MaxWaitSec 5 -Recreate -DetachStartupTimeoutSec 0 2>&1
+        $rc = $LASTEXITCODE
+        $text = $out -join "`n"
+        $rc | Should -Be 4
+        $text | Should -Match 'do NOT relaunch'
+        $text | Should -Match 'PID \d+ still running but wrote no START line'
+        # Exit 4 means the child may STILL be running, and here it really is:
+        # the same detached child eventually writes its own handshake and the
+        # refuse-path OUTCOME — the caller was told to wait, not to relaunch.
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline) {
+            if ((Read-LenientRaw -Path $log) -match 'OUTCOME ') { break }
+            Start-Sleep -Milliseconds 250
+        }
+        (Read-LenientRaw -Path $log) | Should -Match 'OUTCOME '
+    }
+
+    It 'an OLD START line naming the child pid cannot fake life (re-review, bloquant 1)' {
+        # drain.log is never rotated and gains a START line per launch, and
+        # Windows reuses pids: with a whole-file scan, an old line naming the
+        # CURRENT child's pid reports a binding-death child as alive. The fix
+        # reads only bytes appended after the launch. The pin needs the old
+        # line to carry exactly the child's pid — unknowable before launch
+        # and NOT derivable after (pid allocation measured random on this
+        # box: frontier probe and next-child pids decorrelated across 10
+        # attempts; band and occupy-then-free shapes both fail to cover). So
+        # pre-fill the ENTIRE pid space with stale lines: whatever pid the
+        # child draws, an old line names it — full coverage, no lottery, and
+        # the ~3.5 MB throwaway file makes the bounded read visible in the
+        # timing too. The child dies at binding; its only trace is the
+        # binding error in stderr.
+        $watch = Join-Path $script:DetachDir 'watch-collide.log'
+        $band = for ($n = 4; $n -le 65535; $n++) {
+            "[2026-10-05 00:00:00] START pid $n — drained restart begins (reason: old run)"
+        }
+        Set-Content -LiteralPath $watch -Value $band
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-bindfail.ps1') `
+            -ExtraArgs @('-MustBeInt', 'not an int', '-WatchLog', $watch)
+        $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
+        # Coverage is assertable, not assumed: outside 4..65535 the pre-fill
+        # would not name the child and the pin would prove nothing.
+        $r.ChildPid | Should -BeGreaterOrEqual 4
+        $r.ChildPid | Should -BeLessOrEqual 65535
+        # With the offset-bounded read, the stale space is invisible and the
+        # verdict is exited — never a falsified alive.
+        $r.Ok | Should -BeFalse
+        $r.Status | Should -Be 'exited'
+        ($r.StderrTail -join "`n") | Should -Match 'ParameterArgumentTransformationError'
+        Remove-Item -LiteralPath $watch -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'a backslash run before an embedded quote round-trips exactly (re-review B3 residue)' {
+        # The two-pass escape double-escaped `\"` (`a\\"b` became garbage or
+        # a binding death): the one-pass rule must carry mixed
+        # backslash+quote values through a REAL 5.1 child byte-for-byte.
+        $watch = Join-Path $script:DetachDir 'watch-b3c.log'
+        $reasonVal = 'a\\"b "still quoted"'      # 2-backslash run + quote, then a bare quote pair
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-dump-params.ps1') `
+            -ExtraArgs @('-Reason', $reasonVal, '-EnvFile', 'D:\claudish shadow\.env', '-WatchLog', $watch)
+        $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
+        $r.Ok | Should -BeTrue
+        $raw = Get-Content -LiteralPath $watch -Raw
+        $raw | Should -Match ('reason=\[{0}\]' -f [regex]::Escape($reasonVal))
+        $raw | Should -Match ([regex]::Escape('env=[D:\claudish shadow\.env]'))
     }
 
     It 'old drain-detach captures are pruned, fresh ones kept (review retention)' {
@@ -885,7 +984,7 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
     It 'zero-actuator: the detach functions AND entry branch launch no docker/Restart/Stop of their own (AC5 + review)' {
         $tokens = $null; $errors = $null
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:DrainScript, [ref]$tokens, [ref]$errors)
-        $names = @('Join-DrainDetachArguments', 'Start-DrainDetached', 'Get-DrainDetachForwardedArguments', 'Test-WatchLogHasLine')
+        $names = @('Join-DrainDetachArguments', 'Start-DrainDetached', 'Get-DrainDetachForwardedArguments', 'Get-WatchLogAddition')
         $bodies = @($ast.FindAll({ param($n)
                 $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name
             }, $true))
@@ -901,18 +1000,29 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         # covered only the functions, never the entry block). The branch is
         # delimited by markers; a missing marker fails the test rather than
         # silently scanning nothing.
+        function Get-MarkedSliceText {
+            # Same extraction the assertion uses, factored out so the
+            # positive control exercises the EXTRACTION, not just the regex.
+            param([string]$Text, [string]$BeginMarker, [string]$EndMarker)
+            $b = $Text.IndexOf($BeginMarker)
+            $e = $Text.IndexOf($EndMarker)
+            if ($b -lt 0 -or $e -le $b) { return $null }
+            return $Text.Substring($b, $e - $b)
+        }
         $raw = [System.IO.File]::ReadAllText($script:DrainScript)
-        $begin = $raw.IndexOf('# <drain-detach-entry>')
-        $end = $raw.IndexOf('# </drain-detach-entry>')
-        $begin | Should -BeGreaterOrEqual 0
-        $end | Should -BeGreaterThan $begin
-        $slice = $raw.Substring($begin, $end - $begin)
+        $slice = Get-MarkedSliceText -Text $raw -BeginMarker '# <drain-detach-entry>' -EndMarker '# </drain-detach-entry>'
+        $slice | Should -Not -BeNullOrEmpty   # markers missing -> guard scanned nothing
         $slice | Should -Not -Match $forbidden
-        # Positive controls: the predicate fires on an actuator — including
-        # a plain container-engine call (the class \bdocker\b adds) and the
-        # entry-slice scanner itself on a doctored slice.
+        # Positive controls. The regex fires on actuators of every class —
+        # and the EXTRACTION itself is proven by a doctored text: an actuator
+        # INSIDE the markers must surface in the slice, one OUTSIDE must not
+        # (the slice boundary is what the control checks).
         'function f { Stop-Service -Name x }' | Should -Match $forbidden
         'if ($Detach) { docker ps }' | Should -Match $forbidden
-        'if ($Detach) { Start-Process x } docker ps' | Should -Match $forbidden
+        $doctored = 'pre # <drain-detach-entry> harmless # </drain-detach-entry> post docker ps'
+        $doctoredSlice = Get-MarkedSliceText -Text $doctored -BeginMarker '# <drain-detach-entry>' -EndMarker '# </drain-detach-entry>'
+        $doctoredSlice | Should -Not -Match $forbidden                 # outside the slice -> invisible
+        $doctored2 = 'pre # <drain-detach-entry> docker ps # </drain-detach-entry> post'
+        (Get-MarkedSliceText -Text $doctored2 -BeginMarker '# <drain-detach-entry>' -EndMarker '# </drain-detach-entry>') | Should -Match $forbidden   # inside -> caught
     }
 }
