@@ -16,38 +16,70 @@ more painfully"). This instrument measures the two sides of that:
 
 The trap this script exists to avoid: (1) alone proves nothing. The coordinator
 writes a lot in both months, so any claim is likely to have SOME earlier message
-naming its number. The share is therefore reported next to a PERMUTATION
-CONTROL — the same statistic computed against randomly drawn times in the same
-month. Only the gap between measured and control is interpretable, and the
-control is K draws (default 200, fixed seed) with its 2.5-97.5% band: a single
-draw (the pre-CR form) is one sample of that band, and ratios built on it are
-noise (CR 5985488019 B2).
+naming its number. The share is therefore reported next to TWO permutation
+controls, because they answer different objections:
+
+  - NULL-A "random times": every claim time is redrawn uniformly in the month.
+    This controls for volume alone — it does NOT control for co-activity (the
+    coordinator posts long numbered lists while lanes work).
+  - NULL-B "number shuffle": claim TIMES are kept, the NUMBERS are permuted
+    among them. This keeps the co-activity structure and breaks only the
+    number->response pairing.
+
+Each null is K draws (default 200) with its 2.5-97.5% band, seeded PER CELL
+(workspace, month) so the result cannot depend on argument order. A ratio
+against a null is secondary to the raw share and must name its null.
 
 Second trap, flag-don't-assert: `[CLAIMED]` is a PROTOCOL MARKER, and a change
-in its prevalence is not a change in behaviour. July shows 15.2% of all messages
-carrying the marker against 4.7% in September; that can be a reporting-convention
-shift rather than more grains claimed. The script prints it, it does not
-interpret it.
+in its prevalence is not a change in behaviour. On the scoped corpus CoursIA
+alone shows 13.8% of messages carrying the marker in July against 7.1% in
+September (the pre-scope mixed-corpus figures 15.2%/4.7% covered three
+workspaces); that can be a reporting-convention shift rather than more grains
+claimed. The script prints it, it does not interpret it.
 
-Third trap, scope (same CR, B1): the glob `workspace-CoursIA-*.md` matches
+Third trap, claim selection. Not every `[CLAIMED]` is a lane picking a grain:
+about a hundred July mentions are PROTOCOL QUOTES inside backticks (rule text
+like `` `[CLAIMED] #3968 <notebook-exact>` ``), the coordinator itself echoes
+claims, and a lane re-mentions a number it already claimed (an ACK or a
+report, not a dispatch answer). The script therefore reports TWO selections and
+names the drops:
+
+  - raw: every numbered claim (the pre-CR definition, kept for continuity);
+  - first: protocol quotes (backticked marker), the coordinator's own claims
+    and later repeats dropped — the FIRST claim per (machine, #NN) is the
+    dispatch answer.
+
+Fourth trap, scope (CR B1): the glob `workspace-CoursIA-*.md` matches
 CoursIA, CoursIA-2 AND CoursIA-3 — three workspaces with distinct lane
 dynamics — plus annex tables (`-issue-debt-ledger`, `-forks-retrait`) that name
 issue numbers by construction, and Drive-duplicate ` (1)` names. File selection
 is an exact-anchored regex instead, and EVERY output is ventilated per
 workspace; the headline workspace is CoursIA alone (the user's scope).
 
-Fourth trap, the cache (same CR, B3): a key on months alone freezes a month
+Fifth trap, the cache (same CR, B3): a key on months alone freezes a month
 still being written and serves the first corpus silently after any re-scope.
-The key is therefore the retained file list (name + size), and the header
-prints the provenance (cache or disk) and the file count.
+The key is therefore the parser version + the retained file list (name + size),
+the header prints the provenance (cache or disk) and the file count, and a run
+that failed to read ANY file is never cached — a partial corpus must not be
+served silently on the next run (same rule as test_qwen_guard.py).
+
+Coverage caveats, declared rather than hidden: ~38 message headers in the
+corpus use `HH:MMZ` / `~HH:MMxZ` forms that the strict ISO parser refuses and
+skips; and each month loses its last ~2 hours, which live in the next month's
+archive — minor and symmetric across months.
 
 Usage:
-  python scripts/coursia-dispatch-form.py [month ...] [--no-cache]
+  python scripts/coursia-dispatch-form.py [YYYY-MM ...] [--no-cache]
                                           # default 2026-07 2026-09
   COURSIA_ARCHIVE=<dir> python scripts/coursia-dispatch-form.py
+
+Exit codes: 0 clean · 2 usage/empty corpus · 3 some archive file was
+unreadable (results are partial and were NOT cached).
 """
+import argparse
 import glob
 import json
+import math
 import os
 import random
 import re
@@ -63,6 +95,7 @@ CACHE = os.path.join(tempfile.gettempdir(), "coursia-dispatch-msgs-cache.json")
 MSG_RE = re.compile(r"^### \[(.+?)\] (\S+)\|(\S+)\s*$", re.M)
 NUM_RE = re.compile(r"#(\d{3,6})\b")
 CLAIM_RE = re.compile(r"\[CLAIMED\]\s*#?(\d{3,6})?", re.I)
+BT_RE = re.compile(r"`[^`]+`")
 COORD = "myia-ai-01"
 # Exact workspace scope (CR B1): the three real workspaces only. `(?:-2|-3)?`
 # refuses every other suffix (`-issue-debt-ledger`, `-forks-retrait`), and
@@ -74,6 +107,23 @@ WINDOWS = [30, 120, 360, 1440]
 MONTHS = ["2026-07", "2026-09"]
 SEED = 20261005
 K_DRAWS = 200
+# Bump when the parser or the selection changes so no stale corpus is served.
+CACHE_VERSION = 3
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        description="CoursIA dispatch-form measurement (#328 G2)")
+    p.add_argument("months", nargs="*",
+                   help="months to measure, YYYY-MM (default 2026-07 2026-09)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="re-read the archive even on a cache hit")
+    a = p.parse_args(argv)
+    months = a.months or list(MONTHS)
+    bad = [m for m in months if not re.fullmatch(r"\d{4}-\d{2}", m)]
+    if bad:
+        p.error(f"malformed month(s) {bad} — expected YYYY-MM")
+    return months, a.no_cache
 
 
 def month_of(name):
@@ -115,26 +165,33 @@ def parse(path, ws):
     return out
 
 
-def load(months, use_cache=True):
-    """Returns (msgs, provenance, n_files). The cache key is the RETAINED file
-    list (name + size), not the months: a month still being written or a
-    re-scoped glob must not serve a stale corpus silently (CR B3)."""
-    files = select_files(ARCH, months)
-    key = {"months": list(months),
+def load(months, use_cache=True, arch=None, cache=None):
+    """Returns (msgs, provenance, n_files, n_failed). The cache key is the
+    parser version + the RETAINED file list (name + size), not the months: a
+    month still being written or a re-scoped glob must not serve a stale
+    corpus silently (CR B3). A run with ANY unreadable file is never cached."""
+    arch = arch or ARCH
+    cache = cache or CACHE
+    files = select_files(arch, months)
+    if not files:
+        print(f"no archive files matched under {arch} for {sorted(months)} "
+              f"(set COURSIA_ARCHIVE?)", file=sys.stderr)
+        raise SystemExit(2)
+    key = {"v": CACHE_VERSION, "months": list(months),
            "files": [[os.path.basename(f), os.path.getsize(f)] for f in files]}
-    if use_cache and os.path.exists(CACHE):
+    if use_cache and os.path.exists(cache):
         try:
-            cached = json.load(open(CACHE, encoding="utf-8"))
+            cached = json.load(open(cache, encoding="utf-8"))
         except (OSError, ValueError):
             cached = None
         if cached and cached.get("key") == key:
-            return cached["msgs"], "cache", len(files)
-    raw = []
+            return cached["msgs"], "cache", len(files), 0
+    raw, failed = [], 0
     for f in files:
         try:
             raw.extend(parse(f, FILE_RE.match(os.path.basename(f)).group("ws")))
         except OSError:
-            pass
+            failed += 1
     # The same message reappears in overlapping archives; key it by content.
     seen, uniq = set(), []
     for m in raw:
@@ -143,11 +200,13 @@ def load(months, use_cache=True):
             continue
         seen.add(k)
         uniq.append(m)
-    try:
-        json.dump({"key": key, "msgs": uniq}, open(CACHE, "w", encoding="utf-8"))
-    except OSError:
-        pass
-    return uniq, "disk", len(files)
+    if failed == 0:  # a partial corpus is never cached (CR #333 B3)
+        try:
+            json.dump({"key": key, "msgs": uniq},
+                      open(cache, "w", encoding="utf-8"))
+        except OSError:
+            pass
+    return uniq, "disk", len(files), failed
 
 
 def format_dist(dist):
@@ -160,24 +219,51 @@ def format_dist(dist):
     return line
 
 
-def control_rates(pairs, coord_nums, lo, span, rng, k_draws, windows):
-    """K-draw permutation control (CR B2): for each draw, every claim time is
-    replaced by a uniform random time in the same span and the SAME coverage
-    statistic is computed. Returns {window: [rate per draw]} — report the mean
-    with the 2.5-97.5 percentiles; one draw is one sample of that band."""
+def coverage(pairs, coord_nums, windows):
+    """THE coverage statistic, computed once and reused by the measured pass
+    and both nulls — the null is the same predicate or it is not a control."""
+    cov = {w: 0 for w in windows}
+    delays = []
+    for num, t in pairs:
+        prior = [x for x in coord_nums.get(num, []) if x < t]
+        if not prior:
+            continue
+        d = (t - max(prior)).total_seconds() / 60
+        delays.append(d)
+        for w in windows:
+            if d <= w:
+                cov[w] += 1
+    return cov, delays
+
+
+def null_random_times(pairs, coord_nums, lo, span, rng, k_draws, windows):
+    """NULL-A: each claim time redrawn uniformly in the month. Controls volume
+    only — NOT co-activity (the coordinator posts while lanes work). Returns
+    {window: [RATE per draw]} — coverage() yields counts; a null reporting
+    counts above 100% on a small corpus is exactly the drift this comment
+    prevents."""
     n = max(len(pairs), 1)
     out = {w: [] for w in windows}
     for _ in range(k_draws):
-        cov = {w: 0 for w in windows}
-        for num, t in pairs:
-            t2 = lo + timedelta(seconds=rng.random() * span)
-            prior = [x for x in coord_nums.get(num, []) if x < t2]
-            if not prior:
-                continue
-            d = (t2 - max(prior)).total_seconds() / 60
-            for w in windows:
-                if d <= w:
-                    cov[w] += 1
+        drawn = [(num, lo + timedelta(seconds=rng.random() * span))
+                 for num, _ in pairs]
+        cov, _ = coverage(drawn, coord_nums, windows)
+        for w in windows:
+            out[w].append(cov[w] / n)
+    return out
+
+
+def null_number_shuffle(pairs, coord_nums, rng, k_draws, windows):
+    """NULL-B: claim times kept, numbers permuted among them. Keeps the
+    co-activity structure, breaks the number->response pairing."""
+    n = max(len(pairs), 1)
+    nums = [num for num, _ in pairs]
+    times = [t for _, t in pairs]
+    out = {w: [] for w in windows}
+    for _ in range(k_draws):
+        perm = nums[:]
+        rng.shuffle(perm)
+        cov, _ = coverage(list(zip(perm, times)), coord_nums, windows)
         for w in windows:
             out[w].append(cov[w] / n)
     return out
@@ -187,40 +273,96 @@ def pct(sorted_vals, q):
     return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * q))]
 
 
-def ratio_suffix(m_rate, mean, blo, bhi):
+def wilson(k, n, z=1.96):
+    """Wilson 95% interval for k/n, in percent — the measured share carries
+    sampling noise the permutation band knows nothing about."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (100 * max(0.0, c - h), 100 * min(1.0, c + h))
+
+
+def ratio_suffix(m_rate, mean, blo, bhi, n):
     """measured/control ratio with its interval. The control band can TOUCH 0
     (most draws find no prior dispatch at <=30m) while its mean is positive:
     dividing by the 0 endpoint would crash — the real 2026-07 CoursIA corpus
     hit exactly that on first run — so the upper bound becomes an open '>'.
     Endpoints are inverted on purpose: a HIGH control bound gives the LOW
-    ratio bound."""
+    ratio bound. A thin corpus (n < 10) says so: a 100.0 ratio on n=1 is a
+    coin flip, not a finding."""
     if mean <= 0:
         return " -> ratio n/a (control 0)"
     r = m_rate / mean
+    thin = f" [n={n} thin]" if n < 10 else ""
     if blo > 0 and bhi > 0:
-        return f" -> ratio {r:.1f} [{m_rate/bhi:.1f}-{m_rate/blo:.1f}]"
+        return f" -> ratio {r:.1f} [{m_rate/bhi:.1f}-{m_rate/blo:.1f}]{thin}"
     if bhi > 0:
-        return f" -> ratio {r:.1f} [>{m_rate/bhi:.1f}] (control band touches 0)"
+        return (f" -> ratio {r:.1f} [>{m_rate/bhi:.1f}]"
+                f"{thin} (control band touches 0)")
     # Thin-corpus shape (real: CoursIA-2 2026-09, n=25): even the 97.5th
     # percentile of the control is 0 — the ratio against the mean is the only
     # figure left and its interval is unbounded on both ends.
-    return f" -> ratio {r:.1f} (control band ~0: p97.5=0)"
+    return f" -> ratio {r:.1f}{thin} (control band ~0: p97.5=0)"
 
 
-def main():
-    args = sys.argv[1:]
-    use_cache = "--no-cache" not in args
-    months = [a for a in args if not a.startswith("-")] or list(MONTHS)
-    msgs, provenance, n_files = load(months, use_cache)
+def claim_events(claims):
+    """Claim messages -> (num, dt, machine) events, dropping protocol quotes:
+    a marker hit inside a backtick span is rule text, not a lane claiming."""
+    out = []
+    for c in claims:
+        m = CLAIM_RE.search(c["body"])
+        if not m or not m.group(1):
+            continue
+        if any(b.start() < m.start() < b.end() for b in BT_RE.finditer(c["body"])):
+            continue
+        out.append((int(m.group(1)), c["dt"], c["machine"]))
+    return out
+
+
+def select_pairs(events):
+    """Events -> (raw_pairs, first_pairs, drops). raw keeps every numbered
+    claim (pre-CR definition, continuity of the published share); first keeps
+    only the FIRST claim per (machine, #NN) from non-coordinator machines —
+    later repeats are ACKs/reports, not dispatch answers. `events` must be
+    chronologically sorted."""
+    raw = [(num, dt) for num, dt, _ in events]
+    seen, first, drops = set(), [], {"coord": 0, "repeat": 0}
+    for num, dt, machine in events:
+        if machine == COORD:
+            drops["coord"] += 1
+            continue
+        k = (machine, num)
+        if k in seen:
+            drops["repeat"] += 1
+            continue
+        seen.add(k)
+        first.append((num, dt))
+    return raw, first, drops
+
+
+def main(argv=None, arch=None, cache=None):
+    months, no_cache = parse_args(
+        sys.argv[1:] if argv is None else argv)
+    msgs, provenance, n_files, failed = load(
+        months, not no_cache, arch=arch, cache=cache)
     print(f"corpus: {n_files} files, "
           f"{'cache hit' if provenance == 'cache' else 'read from disk'} "
-          f"(COURSIA_ARCHIVE={ARCH})")
+          f"(COURSIA_ARCHIVE={arch or ARCH})")
+    if failed:
+        print(f"WARNING: {failed} archive file(s) unreadable — results are "
+              f"PARTIAL and were not cached", file=sys.stderr)
+    if not msgs:
+        print("0 messages parsed — refusing to measure nothing",
+              file=sys.stderr)
+        raise SystemExit(2)
     for m in msgs:
         m["dt"] = datetime.fromisoformat(m["ts"])
     per = defaultdict(list)
     for m in msgs:
         per[(m["ws"], m["dt"].strftime("%Y-%m"))].append(m)
-    rng = random.Random(SEED)
 
     for ws in WORKSPACES:
         for mo in months:
@@ -228,6 +370,9 @@ def main():
             if not mm:
                 print(f"=== {ws} | {mo}: no messages ===")
                 continue
+            # Seed PER CELL (CR #333 B2): the draws of one cell must not
+            # depend on which other cells ran before it.
+            rng = random.Random(f"{SEED}|{ws}|{mo}")
             lo, hi = mm[0]["dt"], mm[-1]["dt"]
             span = (hi - lo).total_seconds()
             coord = [x for x in mm if x["machine"] == COORD]
@@ -247,37 +392,56 @@ def main():
             lane_claims = Counter(x["machine"] for x in claims)
             print("  claims by lane: " + ", ".join(f"{k}:{v}" for k, v in lane_claims.most_common(6)))
 
-            pairs = [(int(CLAIM_RE.search(c["body"]).group(1)), c["dt"])
-                     for c in claims if CLAIM_RE.search(c["body"]).group(1)]
-            cov, delays = {w: 0 for w in WINDOWS}, []
-            for num, t in pairs:
-                prior = [x for x in coord_nums.get(num, []) if x < t]
-                if not prior:
-                    continue
-                d = (t - max(prior)).total_seconds() / 60
-                delays.append(d)
-                for w in WINDOWS:
-                    if d <= w:
-                        cov[w] += 1
-            n = max(len(pairs), 1)
-            print(f"  [measured] n={len(pairs)}: " +
-                  "  ".join(f"<={w}m {100*cov[w]/n:.1f}%" for w in WINDOWS))
+            events = claim_events(claims)
+            raw_pairs, first_pairs, drops = select_pairs(events)
+            nq = len([c for c in claims if CLAIM_RE.search(c["body"]).group(1)])
+            n_bt = nq - len(events)
+            print(f"  selection: raw {len(raw_pairs)} numbered claims -> "
+                  f"first {len(first_pairs)} (dropped: {n_bt} backquoted "
+                  f"protocol quotes, {drops['coord']} coordinator, "
+                  f"{drops['repeat']} repeats)")
+
+            cov_raw, delays = coverage(raw_pairs, coord_nums, WINDOWS)
+            n_raw = max(len(raw_pairs), 1)
+            w30 = wilson(cov_raw[30], len(raw_pairs))
+            print(f"  [measured raw] n={len(raw_pairs)}: " +
+                  "  ".join(f"<={w}m {100*cov_raw[w]/n_raw:.1f}%" for w in WINDOWS) +
+                  f"  (<=30m Wilson 95% [{w30[0]:.1f}-{w30[1]:.1f}])")
+            cov_first, delays_first = coverage(first_pairs, coord_nums, WINDOWS)
+            n_first = max(len(first_pairs), 1)
+            wf30 = wilson(cov_first[30], len(first_pairs))
+            print(f"  [measured first] n={len(first_pairs)}: " +
+                  "  ".join(f"<={w}m {100*cov_first[w]/n_first:.1f}%" for w in WINDOWS) +
+                  f"  (<=30m Wilson 95% [{wf30[0]:.1f}-{wf30[1]:.1f}])")
             if delays:
                 delays.sort()
                 print(f"    delay claim-after-dispatch p50={pct(delays,.5):.0f}m "
                       f"p90={pct(delays,.9):.0f}m")
 
-            ctrl = control_rates(pairs, coord_nums, lo, span, rng, K_DRAWS, WINDOWS)
-            parts = []
-            for w in WINDOWS:
-                v = sorted(ctrl[w])
-                mean = sum(v) / len(v)
-                blo, bhi = pct(v, .025), pct(v, .975)
-                s = f"<={w}m {100*mean:.1f}% [{100*blo:.1f}-{100*bhi:.1f}]"
-                s += ratio_suffix(cov[w] / n, mean, blo, bhi)
-                parts.append(s)
-            print(f"  [CONTROL random times, {K_DRAWS} draws] " + "  ".join(parts))
+            # Both nulls draw from the same per-cell rng, in a fixed order.
+            nulls = [
+                ("random times",
+                 null_random_times(raw_pairs, coord_nums, lo, span, rng,
+                                   K_DRAWS, WINDOWS)),
+                ("number shuffle",
+                 null_number_shuffle(raw_pairs, coord_nums, rng,
+                                     K_DRAWS, WINDOWS)),
+            ]
+            for label, ctrl in nulls:
+                parts = []
+                for w in WINDOWS:
+                    v = sorted(ctrl[w])
+                    mean = sum(v) / len(v)
+                    blo, bhi = pct(v, .025), pct(v, .975)
+                    s = f"<={w}m {100*mean:.1f}% [{100*blo:.1f}-{100*bhi:.1f}]"
+                    s += ratio_suffix(cov_raw[w] / n_raw, mean, blo, bhi,
+                                      len(raw_pairs))
+                    parts.append(s)
+                print(f"  [NULL-{label[0].upper()}: {label}, {K_DRAWS} draws, "
+                      f"ratio vs RAW] " + "  ".join(parts))
             print()
+    if failed:
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
