@@ -30,9 +30,16 @@ import { isMcpSearxngAvailable, mcpWebSearch, mcpUrlRead } from "./mcp-searxng-c
  * stop external scraping); LAN deployments use a credless URL and send no
  * Authorization header. Credentials never appear in logs — only the
  * stripped base URL does.
+ *
+ * SEARXNG_URL has NO built-in default (removed from the pre-sync branch,
+ * #26): the old `|| "http://search.myia.io"` fallback could only 401 once
+ * that host grew Basic Auth (a working setup MUST carry its creds in the
+ * userinfo, i.e. it sets the full URL anyway). Unset now means "direct
+ * HTTP search disabled" — a loud log at the call site, never a silent
+ * ship-to-an-endpoint-that-refuses. base is "" when unset.
  */
 export function searxngConfig(): { base: string; authHeaders: Record<string, string> } {
-  const raw = process.env.SEARXNG_URL || "http://search.myia.io";
+  const raw = process.env.SEARXNG_URL || "";
   try {
     const u = new URL(raw);
     if (u.username) {
@@ -138,6 +145,15 @@ async function fetchFromSearXNG(
   timeoutMs = DEFAULT_ATTEMPT_TIMEOUT_MS
 ): Promise<SearchResult[]> {
   const { base, authHeaders } = searxngConfig();
+  // Unset SEARXNG_URL: disabled, not defaulted (#26 port of the pre-sync
+  // 1fffab8 fix). [] (the "server answered" shape), never a throw — the
+  // caller's retry loop must not re-spend the budget on a disabled backend.
+  if (!base) {
+    log(
+      `[WebSearch] SEARXNG_URL not configured — direct HTTP search disabled (no built-in default). Set SEARXNG_URL (basic-auth creds may ride the userinfo) or SEARXNG_MCP_URL for the MCP path.`
+    );
+    return [];
+  }
   const url = `${base}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
   log(`[WebSearch] Executing: "${query}" via ${base} (attempt timeout ${timeoutMs}ms)`);
 

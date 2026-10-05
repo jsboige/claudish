@@ -29,7 +29,7 @@ The MCP client (`handlers/shared/mcp-searxng-client.ts`) is a minimal JSON-RPC s
 
 - **`SEARXNG_MCP_URL`** env var (optional): URL of the MCP searxng endpoint (e.g. `https://mcp-tools.myia.io/searxng/mcp`). When unset, the MCP layer is skipped entirely — zero behavior change for existing deployments.
 - **`MCP_AUTH`** or **`SEARXNG_MCP_TOKEN`** env var: bearer token for the MCP endpoint. Never hardcode; provisioned via RooSync.
-- **`SEARXNG_URL`** env var: URL of the SearXNG instance (e.g. `http://search.myia.io`) for the direct HTTP fallback. When unset, interception falls through gracefully with a fallback message.
+- **`SEARXNG_URL`** env var: URL of the SearXNG instance (e.g. `http://search.myia.io`) for the direct HTTP fallback. **No built-in default** (#26 port of the pre-sync `1fffab8` fix): the old `|| "http://search.myia.io"` fallback was removed because the host has required Basic Auth since 2026-08-19 — the default could only 401. When unset, direct HTTP search is disabled (one loud log per attempt, zero network calls) and interception falls through gracefully with a fallback message.
 - **Deadlines**: MCP search ≥ 5s, MCP fetch 12s, direct HTTP search 5s/attempt × 2 attempts inside an 8s total budget (both call paths; `SEARXNG_ATTEMPT_TIMEOUT_MS` overrides the per-attempt value), direct fetch 10s. Non-blocking — every call is bounded. Attempt durations are recorded in a rolling 50-sample window; p50/p95 are logged every 10th sample (`[WebSearch] latency window: n=… p50=…ms p95=…ms`) to quantify drift (roo-extensions #3388 — measured p50 0.92s / p95 2.97s on the LAN endpoint 2026-09-03, 20 samples mixed warm/cold).
 
 ## Components
@@ -47,8 +47,9 @@ The MCP client (`handlers/shared/mcp-searxng-client.ts`) is a minimal JSON-RPC s
 Merged from `CLAUDE.md` on 2026-08-23. Source: `78addbe`.
 
 `SEARXNG_URL` names the SearXNG instance used by the direct-HTTP fallback (for example
-`http://search.myia.io`). When unset, interception falls through gracefully with a fallback message —
-never a throw, never a hung stream.
+`http://search.myia.io`). When unset, the direct-HTTP backend is disabled — no built-in default, one
+loud log per attempt, zero network calls — and interception falls through gracefully with a fallback
+message — never a throw, never a hung stream.
 
 **Basic-auth credentials go in the URL userinfo**, the standard curl form:
 

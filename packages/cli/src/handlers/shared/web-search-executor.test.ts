@@ -56,10 +56,12 @@ describe("searxngConfig — userinfo parsing", () => {
     );
   });
 
-  test("unset → default public URL, no auth", () => {
+  test("unset → NO default base (the old search.myia.io fallback is gone — #26 port of pre-sync 1fffab8)", () => {
     delete process.env.SEARXNG_URL;
     const c = searxngConfig();
-    expect(c.base).toBe("http://search.myia.io");
+    // The default could only 401 once the host grew Basic Auth (2026-08-19):
+    // a working setup carries creds in the userinfo and sets the full URL.
+    expect(c.base).toBe("");
     expect(c.authHeaders).toEqual({});
   });
 
@@ -112,6 +114,28 @@ describe("executeWebSearch — Basic auth end-to-end (local mock)", () => {
       expect(out).toMatch(/no results|unavailable/i);
     } finally {
       server.stop(true);
+    }
+  });
+
+  test("SEARXNG_URL unset → direct HTTP disabled: ZERO network calls, graceful text (#26 port)", async () => {
+    delete process.env.SEARXNG_MCP_URL;
+    delete process.env.SEARXNG_URL;
+    // The pre-port defect this pins: the silent `|| "http://search.myia.io"`
+    // default shipped every search of a misconfigured deployment to a host
+    // that 401s — wasted attempt budget, confusing log, no signal that the
+    // CONFIG is the problem. Unset must be loud AND offline.
+    const realFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (async (_input?: unknown, _init?: unknown): Promise<Response> => {
+      fetchCalls++;
+      throw new Error("must not fetch when SEARXNG_URL is unset");
+    }) as typeof fetch;
+    try {
+      const out = await executeWebSearch("lean", 2000);
+      expect(fetchCalls).toBe(0); // disabled ≠ shipped-to-default
+      expect(out).toMatch(/no results|unavailable|disabled/i);
+    } finally {
+      globalThis.fetch = realFetch;
     }
   });
 });
