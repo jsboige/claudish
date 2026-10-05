@@ -73,13 +73,25 @@
 # WORST-CASE WALL TIME (#233 AC4)
 # ObserveSec 300 + adaptive up to 300 + compose stop grace 120 + settle 20
 # ≈ 12.5 min — beyond a typical agent tool-call cap (10 min). Agent callers
-# MUST run this DETACHED (scheduled task or Start-Process) and poll drain.log
-# for the OUTCOME line, never inline inside a capped tool call: a caller
-# killed mid-compose leaves the old container stopped with no rename/start
-# ever issued — the 2026-09-23 09:35Z gap (16 min) is exactly that shape
-# (#233). Every exit now writes a terminal `OUTCOME` line, and a later run
-# that finds a RECREATE with no OUTCOME after it logs
-# `PREVIOUS RUN INTERRUPTED`.
+# MUST run this DETACHED via -Detach, never inline inside a capped tool call:
+# a caller killed mid-compose leaves the old container stopped with no
+# rename/start ever issued — the 2026-09-23 09:35Z gap (16 min) is exactly
+# that shape (#233). Full invocation:
+#
+#   powershell -ExecutionPolicy Bypass -File scripts\claudish-drain.ps1 `
+#       -Detach -Reason <why> [-Recreate -EnvFile <path>] [-ClaudishHome <dir>]
+#
+# -Detach relaunches this script as a hidden child (always powershell.exe,
+# the interpreter the scheduled tasks run) with every argument quoted,
+# captures the child's stdout+stderr to drain-detach-*.log under the Claudish
+# home, and returns on the child's own `START pid <pid>` line in drain.log:
+#   exit 0 = child alive (then poll drain.log for the OUTCOME line),
+#   exit 3 = child died (rc + stdout/stderr tails printed),
+#   exit 4 = no START line within -DetachStartupTimeoutSec while the child
+#            may STILL be running — do NOT relaunch, inspect the stderr
+#            capture named in the output.
+# Every child exit writes a terminal `OUTCOME` line, and a later run that
+# finds a RECREATE with no OUTCOME after it logs `PREVIOUS RUN INTERRUPTED`.
 
 param(
     [string]$ContainerName = "claudish-proxy",
@@ -103,15 +115,23 @@ param(
     [switch]$RemoveCreatedTwins,
     # #312 — detached launch for agent callers: re-launch this script as a
     # hidden child with EVERY argument quoted, stdout+stderr captured to
-    # per-run files under $ClaudishHome, and return once the child proves it
-    # is alive (its first drain.log line) or dead (exit / timeout, stderr
-    # evidence printed). Replaces the hand-rolled `Start-Process` that died
-    # silently on 3 machines on 02/10 (unquoted -ArgumentList join).
+    # per-run files under $ClaudishHome, and return on the child's proof of
+    # life (its `START pid` line: exit 0), death (exit 3), or silence past
+    # the startup window (exit 4 — the child may still be running; do NOT
+    # relaunch, a second drain would race the first). Replaces the
+    # hand-rolled `Start-Process` whose unquoted -ArgumentList join killed a
+    # detached launch silently on 02/10 (measured on one machine; two others
+    # suspected the same shape, unconfirmed — #312).
+    # NOTE: dot-sourcing this file (the watchdog does) injects $Detach and
+    # $DetachStartupTimeoutSec into the caller's scope — keep the caller's
+    # own variables off those names (a $detach assignment IS the switch and
+    # throws on conversion; review #338 B1).
     [switch]$Detach,
-    # How long -Detach waits for the child's first drain.log line before
-    # declaring the launch dead. The child logs within seconds when healthy;
-    # the whole point is that the caller learns fast instead of polling
-    # drain.log against a launch that never happened.
+    # How long -Detach waits for the child's `START pid` line before
+    # reporting a mute child. The child writes that line BEFORE any network
+    # or container call, so a healthy child reports in ~1-2 s even when the
+    # proxy is busy — a busy proxy delays every other drain.log line until
+    # the first zero sample, up to the whole observe window (review #338 B2).
     [int]$DetachStartupTimeoutSec = 45
 )
 
@@ -701,32 +721,74 @@ function Invoke-ClaudishDrainedRestart {
 
 function Join-DrainDetachArguments {
     <#
-        #312 AC1/AC3. Quote EVERY argument and join with single spaces.
-        Windows PowerShell 5.1 joins a -ArgumentList ARRAY on spaces without
-        quoting anything, so a value with a space splits into N parameter
-        bindings — the established cause of the 02/10 silent deaths. Building
-        ONE pre-quoted string carries the quoting through. Embedded double
-        quotes are doubled (the -File escape form).
-        Mutation target for the Pester pin: reverting to a bare -join must
-        turn the spaced-argument test red.
+        #312 AC1/AC3, #338 review B3. Quote EVERY argument and join with
+        single spaces. Windows PowerShell 5.1 joins a -ArgumentList ARRAY on
+        spaces without quoting anything, so a value with a space splits into
+        N parameter bindings — the established cause of the 02/10 silent
+        deaths. Building ONE pre-quoted string carries the quoting through.
+        Inside the quotes, the Windows argument rule (CommandLineToArgvW):
+        a backslash is special only before a double quote or at the closing
+        quote, so those runs are doubled, and every double quote is escaped
+        as \". Doubling quotes (the old claim, "the -File escape form") is
+        NOT the rule the child's parser applies: a trailing backslash
+        merged with the closing quote and swallowed the NEXT parameter
+        (ClaudishHome), and an embedded quote swallowed everything after it
+        (Recreate lost) — both measured in review of #338.
+        Mutation target for the Pester pin: reverting to a bare -join or to
+        the doubling form must turn the real-child B3 tests red.
     #>
     param([string[]]$Arguments)
-    ($Arguments | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }) -join ' '
+    ($Arguments | ForEach-Object {
+        $a = $_
+        # Backslash runs that precede an embedded quote: double the run,
+        # escape the quote (one pass, so the quote is not re-escaped below).
+        $a = $a -replace '(\\+)"', '$1$1\"'
+        # Trailing backslashes sit against OUR closing quote: double them.
+        $a = $a -replace '(\\+)$', '$1$1'
+        # Any remaining bare quotes (none adjacent to a backslash).
+        $a = $a -replace '"', '\"'
+        '"' + $a + '"'
+    }) -join ' '
+}
+
+function Test-WatchLogHasLine {
+    <#
+        #338 review B2. True when $WatchLogPath contains $Pattern. Pure read:
+        # missing file, locked file, empty content — all $false, never a
+        throw, so the detach poll loop cannot die on a log mid-rotation.
+    #>
+    param([string]$WatchLogPath, [string]$Pattern)
+    if (-not (Test-Path -LiteralPath $WatchLogPath)) { return $false }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try { $raw = Get-Content -LiteralPath $WatchLogPath -Raw } finally { $ErrorActionPreference = $prev }
+    if (-not $raw) { return $false }
+    return $raw -match $Pattern
 }
 
 function Start-DrainDetached {
     <#
-        #312 AC1/AC2. Launch a child with stdout+stderr captured to per-run
-        files under the Claudish home, then return once the child proves
-        itself:
-          (a) a NEW line appeared in the watch log -> Ok, ChildPid set;
-          (b) the child exited, or $TimeoutSec passed with no line
-              -> not Ok, StderrPath + a tail of that file in StderrTail.
+        #312 AC1/AC2, #338 review B2. Launch a child with stdout+stderr
+        captured to per-run files under the Claudish home, then return once
+        the child proves itself by writing `START pid <child pid>` to the
+        watch log — matched on THIS child's pid, so any other drain.log
+        writer inside the window (the 04:00 scheduled drain, the watchdog)
+        is never mistaken for it:
+          (a) the START line for THIS pid is seen   -> Ok, Status alive;
+          (b) the child exits first                 -> Status exited (+ ExitCode);
+          (c) $TimeoutSec with no line: child dead  -> exited;
+              child alive -> timeout (the child may be slow to its first
+              write — the caller must NOT relaunch, a second drain would
+              race the first; the entry block says so);
+          (d) the launch itself threw               -> Status start-failed.
         The log is checked BEFORE the exit status each poll: a child that
-        wrote its line and then died still got past parameter binding — the
+        proved life and then died still got past parameter binding — the
         launch succeeded, which is the only thing this function judges.
+        $FilePath stays powershell.exe (5.1) even under a pwsh 7 parent, on
+        purpose: production scheduled tasks run 5.1 and the child must
+        exercise that interpreter.
         Zero actuator (#312 AC5): this function starts $FilePath and reads
-        files. No docker, no Restart-*, no Stop-*.
+        files. No container-engine call, no Restart-*, no Stop-*.
     #>
     param(
         [string]$FilePath = 'powershell.exe',
@@ -737,29 +799,43 @@ function Start-DrainDetached {
         [int]$PollMs = 400
     )
     if (-not (Test-Path $ClaudishHomeDir)) { New-Item -ItemType Directory -Path $ClaudishHomeDir -Force | Out-Null }
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    # Retention (#338 review): the per-run capture files accumulate without
+    # bound otherwise. 7 days, best-effort, never a launch blocker.
+    Get-ChildItem -Path $ClaudishHomeDir -Filter 'drain-detach-*.log' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    # Two launches inside one second would share a second-resolution stamp
+    # and one redirection set: add the launching process's pid (#338 review).
+    $stamp = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $PID
     $outPath = Join-Path $ClaudishHomeDir "drain-detach-$stamp.out.log"
     $errPath = Join-Path $ClaudishHomeDir "drain-detach-$stamp.err.log"
-    $baseline = if (Test-Path $WatchLogPath) { (Get-Item $WatchLogPath).Length } else { 0 }
-    $child = Start-Process -FilePath $FilePath -ArgumentList $ArgumentString `
-        -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+    try {
+        $child = Start-Process -FilePath $FilePath -ArgumentList $ArgumentString `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+    } catch {
+        return [pscustomobject]@{
+            Ok = $false; Status = 'start-failed'; ChildPid = $null; ExitCode = $null
+            StdoutPath = $outPath; StderrPath = $errPath
+            StdoutTail = @(); StderrTail = @(); FailureReason = $_.Exception.Message
+        }
+    }
     # 5.1 quirk (measured, parent powershell.exe): the -PassThru object does
     # not retain the process handle, so .ExitCode reads EMPTY after the child
     # dies — pwsh 7 parents are unaffected, which is why probes there lie.
     # Touching .Handle while the child is young caches it in the object.
     $null = $child.Handle
+    $startPattern = 'START pid {0}\b' -f [regex]::Escape($child.Id)
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     $status = 'timeout'
     while ((Get-Date) -lt $deadline) {
-        $size = if (Test-Path $WatchLogPath) { (Get-Item $WatchLogPath).Length } else { 0 }
-        if ($size -gt $baseline) { $status = 'alive'; break }
+        if (Test-WatchLogHasLine -WatchLogPath $WatchLogPath -Pattern $startPattern) { $status = 'alive'; break }
         if ($child.HasExited) { $status = 'exited'; break }
         Start-Sleep -Milliseconds $PollMs
     }
     # Post-loop re-check: the line and the exit can land inside one poll window.
-    $finalSize = if (Test-Path $WatchLogPath) { (Get-Item $WatchLogPath).Length } else { 0 }
-    if ($finalSize -gt $baseline) { $status = 'alive' }
+    if ($status -ne 'alive' -and (Test-WatchLogHasLine -WatchLogPath $WatchLogPath -Pattern $startPattern)) { $status = 'alive' }
+    elseif ($status -eq 'timeout' -and $child.HasExited) { $status = 'exited' }
     # ExitCode needs the handle synchronized: HasExited alone can race the
     # object's internal state and read empty (measured on 5.1 — the smoke run
     # printed EXIT= for a child that had just exited 7).
@@ -771,10 +847,12 @@ function Start-DrainDetached {
         ExitCode   = if ($child.HasExited) { $child.ExitCode } else { $null }
         StdoutPath = $outPath
         StderrPath = $errPath
+        StdoutTail = @()
         StderrTail = @()
     }
-    if (-not $result.Ok -and (Test-Path $errPath)) {
-        $result.StderrTail = @(Get-Content -Path $errPath -Tail 12 -ErrorAction SilentlyContinue)
+    if (-not $result.Ok) {
+        if (Test-Path $errPath) { $result.StderrTail = @(Get-Content -Path $errPath -Tail 12 -ErrorAction SilentlyContinue) }
+        if (Test-Path $outPath) { $result.StdoutTail = @(Get-Content -Path $outPath -Tail 6 -ErrorAction SilentlyContinue) }
     }
     return $result
 }
@@ -813,24 +891,48 @@ function Get-DrainDetachForwardedArguments {
 
 # Standalone mode: run the restart. Dot-sourced, define the functions only.
 if ($MyInvocation.InvocationName -ne '.') {
+    # <drain-detach-entry> — the slice the zero-actuator Pester guard scans
+    # (the detach branch must launch and read, nothing else).
     if ($Detach) {
-        # #312 — detached launch: judge only that the child STARTED. The
-        # drain's own outcome keeps living in drain.log (OUTCOME line), which
-        # the caller polls as before — now guaranteed to exist.
+        # #312 — detached launch: judge only that the child STARTED, proven
+        # by the child's own `START pid <pid>` line (written below, before
+        # any network or container call). The drain's own outcome keeps
+        # living in drain.log (OUTCOME line), which the caller polls as
+        # before — now guaranteed to exist. The result is named
+        # $detachResult, NOT $detach: PowerShell variables are
+        # case-insensitive and $detach IS the [switch] parameter above —
+        # assigning a pscustomobject to it throws a conversion error, the
+        # result is lost, and EVERY launch then reports failure (review B1
+        # of #338: a caller that believes the failure relaunches, and two
+        # drains race — the 23/09 twin shape).
         $detachParts = Get-DrainDetachForwardedArguments -ScriptPath $PSCommandPath `
             -Reason $Reason -ContainerName $ContainerName -ProxyUrl $ProxyUrl `
             -MaxWaitSec $MaxWaitSec -LogPath $LogPath -ClaudishHome $ClaudishHome `
             -EnvFile $EnvFile -Recreate:$Recreate -RemoveCreatedTwins:$RemoveCreatedTwins
-        $detach = Start-DrainDetached -ArgumentString (Join-DrainDetachArguments $detachParts) `
+        $detachResult = Start-DrainDetached -ArgumentString (Join-DrainDetachArguments $detachParts) `
             -ClaudishHomeDir $ClaudishHome -WatchLogPath $LogPath -TimeoutSec $DetachStartupTimeoutSec
-        if ($detach.Ok) {
-            Write-Host ("[DrainDetach] child PID {0} alive — first line present in {1}" -f $detach.ChildPid, $LogPath)
+        if ($detachResult.Ok) {
+            Write-Host ("[DrainDetach] child PID {0} alive — START line present in {1}; poll it for the OUTCOME line" -f $detachResult.ChildPid, $LogPath)
             exit 0
         }
-        Write-Host ("[DrainDetach] child {0} — stderr evidence: {1}" -f $detach.Status, $detach.StderrPath)
-        foreach ($l in $detach.StderrTail) { Write-Host "  $l" }
-        exit $(if ($detach.Status -eq 'exited') { 3 } else { 4 })
+        if ($detachResult.Status -eq 'exited') {
+            Write-Host ("[DrainDetach] child PID {0} EXITED rc={1} — launch FAILED" -f $detachResult.ChildPid, $detachResult.ExitCode)
+        } elseif ($detachResult.Status -eq 'start-failed') {
+            Write-Host ("[DrainDetach] launch FAILED to start — {0}" -f $detachResult.FailureReason)
+        } else {
+            Write-Host ("[DrainDetach] child PID {0} still running but wrote no START line within {1}s — do NOT relaunch (a second drain would race the first); inspect {2}" -f $detachResult.ChildPid, $DetachStartupTimeoutSec, $detachResult.StderrPath)
+        }
+        foreach ($l in $detachResult.StdoutTail) { Write-Host "  stdout: $l" }
+        foreach ($l in $detachResult.StderrTail) { Write-Host "  stderr: $l" }
+        exit $(if ($detachResult.Status -eq 'exited') { 3 } else { 4 })
     }
+    # </drain-detach-entry>
+    # #338 review B2 — the proof-of-life handshake, written BEFORE any
+    # network or container call: a busy proxy (activeStreams > 0) writes no
+    # other drain.log line until the first zero sample — up to the whole
+    # observe window — and the -Detach parent above treats this line (matched
+    # on this child's pid) as the only proof that the launch worked.
+    Write-DrainLog "START pid $PID — drained restart begins (reason: $Reason)"
     $ok = Invoke-ClaudishDrainedRestart -Reason $Reason -Recreate:$Recreate -EnvFile $EnvFile -RemoveCreatedTwins:$RemoveCreatedTwins
     exit $(if ($ok) { 0 } else { 1 })
 }

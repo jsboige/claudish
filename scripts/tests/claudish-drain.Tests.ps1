@@ -624,11 +624,45 @@ Describe 'drain -Detach — quoted detached launch (#312)' {
         New-Item -ItemType Directory -Path $script:DetachDir -Force | Out-Null
         $utf8 = New-Object System.Text.UTF8Encoding($false)
 
+        # #338 review B2: the real child's contract is a `START pid <pid>`
+        # handshake line BEFORE anything else — fixtures write it too, so the
+        # alive path is proven through the pid match, not through any growth.
         $okBody = @'
 param([string]$SpacedValue, [string]$WatchLog)
+Add-Content -LiteralPath $WatchLog -Value ("START pid {0}" -f $PID)
 Add-Content -LiteralPath $WatchLog -Value "bound:[$SpacedValue]"
 '@
         [System.IO.File]::WriteAllText((Join-Path $script:DetachDir 'child-ok.ps1'), $okBody, $utf8)
+
+        # B3: binds the nastiest real-world values and reports what the
+        # child's OWN parameter binding reassembled — the only oracle that
+        # can see a broken quoting rule (a textual assert on the joined
+        # string passes on both broken forms; review of #338).
+        $dumpBody = @'
+param([string]$Reason, [string]$EnvFile, [switch]$Recreate, [string]$HomeDir, [string]$WatchLog)
+Add-Content -LiteralPath $WatchLog -Value ("START pid {0}" -f $PID)
+Add-Content -LiteralPath $WatchLog -Value ("reason=[$Reason] env=[$EnvFile] recreate=[$Recreate] home=[$HomeDir]")
+'@
+        [System.IO.File]::WriteAllText((Join-Path $script:DetachDir 'child-dump-params.ps1'), $dumpBody, $utf8)
+
+        # B2: a child that stays alive but writes NOTHING — the review's
+        # measured case (busy proxy: no drain.log line for the whole observe
+        # window while the child works).
+        $silentBody = @'
+param([int]$SleepSec)
+Start-Sleep -Seconds $SleepSec
+'@
+        [System.IO.File]::WriteAllText((Join-Path $script:DetachDir 'child-silent.ps1'), $silentBody, $utf8)
+
+        # B2: an unrelated drain.log writer — writes a START line for a pid
+        # that is NOT the watched child (the 04:00 task / watchdog shape).
+        $polluteBody = @'
+param([string]$WatchLog)
+Start-Sleep -Milliseconds 800
+Add-Content -LiteralPath $WatchLog -Value "START pid 999999 — someone else entirely"
+Start-Sleep -Seconds 20
+'@
+        [System.IO.File]::WriteAllText((Join-Path $script:DetachDir 'child-pollute.ps1'), $polluteBody, $utf8)
 
         $exitBody = @'
 param([string]$WatchLog)
@@ -666,8 +700,141 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         # "[regex]::Escape" (first run of this test, measured).
         $expectedSpaced = [regex]::Escape('a value with  spaces')
         (Get-Content -LiteralPath $watch -Raw) | Should -Match $expectedSpaced
+        # B2: alive is proven by the pid handshake, and the pid in the file
+        # IS the pid the parent reports — not just any growth.
+        (Get-Content -LiteralPath $watch -Raw) | Should -Match ('START pid {0}\b' -f $r.ChildPid)
         # Evidence files exist under the Claudish home, per-run named (AC1).
         (Get-ChildItem -LiteralPath $script:DetachDir -Filter 'drain-detach-*.out.log' | Measure-Object).Count | Should -BeGreaterOrEqual 1
+    }
+
+    It 'a live but silent child is a bounded timeout, never a false alive (review B2)' {
+        # The review's measured case: busy proxy, child alive and working,
+        # no drain.log line for the whole observe window. The parent must
+        # return timeout (not-Ok) WITH the pid — the caller is told the child
+        # may still be running, and must not relaunch.
+        $watch = Join-Path $script:DetachDir 'watch-silent.log'
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-silent.ps1') `
+            -ExtraArgs @('-SleepSec', '25')
+        try {
+            $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 3 -PollMs 200
+            $r.Ok | Should -BeFalse
+            $r.Status | Should -Be 'timeout'
+            $r.ChildPid | Should -BeGreaterThan 0
+            # The distinction the review asked for: timeout is NOT exited.
+            $r.ExitCode | Should -BeNullOrEmpty
+            Test-Path -LiteralPath $watch | Should -BeFalse
+        } finally {
+            if ($r -and $r.ChildPid) { Stop-Process -Id $r.ChildPid -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'a foreign drain.log writer is never taken for the child (review B2)' {
+        # Another writer (04:00 task, watchdog) drops a START line for a
+        # DIFFERENT pid inside the window while the watched child stays
+        # silent: growth alone would read alive — the pid match must not.
+        $watch = Join-Path $script:DetachDir 'watch-foreign.log'
+        $polluter = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $script:DetachDir 'child-pollute.ps1'), '-WatchLog', $watch) `
+            -WindowStyle Hidden -PassThru
+        try {
+            $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-silent.ps1') `
+                -ExtraArgs @('-SleepSec', '25')
+            $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 4 -PollMs 200
+            $r.Ok | Should -BeFalse
+            $r.Status | Should -Be 'timeout'
+            # The foreign line IS in the file (growth happened) — proving the
+            # red would fire on the old any-growth rule.
+            (Get-Content -LiteralPath $watch -Raw) | Should -Match 'START pid 999999'
+        } finally {
+            if ($r -and $r.ChildPid) { Stop-Process -Id $r.ChildPid -Force -ErrorAction SilentlyContinue }
+            if ($polluter) { Stop-Process -Id $polluter.Id -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'a trailing backslash before the closing quote survives the join (review B3)' {
+        # Review's case 1: `-ClaudishHome '…\home sp\'` — the trailing
+        # backslash merges with the closing quote, the child loses the NEXT
+        # parameter. Real 5.1 child, oracle = the child's own binding.
+        $watch = Join-Path $script:DetachDir 'watch-b3a.log'
+        $homeVal = Join-Path $script:DetachDir 'home sp\'
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-dump-params.ps1') `
+            -ExtraArgs @('-Reason', 'b3a', '-EnvFile', 'D:\claudish shadow\.env', '-HomeDir', $homeVal, '-WatchLog', $watch)
+        $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
+        $r.Ok | Should -BeTrue
+        $raw = Get-Content -LiteralPath $watch -Raw
+        # All four bound: the backslash case kills the parameters AFTER it.
+        $raw | Should -Match ('home=\[{0}\]' -f [regex]::Escape($homeVal))
+        $raw | Should -Match ([regex]::Escape('env=[D:\claudish shadow\.env]'))
+    }
+
+    It 'an embedded double quote in -Reason does not swallow the rest (review B3)' {
+        # Review's case 2: `-Reason 'deploy "v2" now'` — the unescaped quote
+        # made the child bind Recreate=false and a garbled ContainerName.
+        # Real 5.1 child, oracle = the child's own binding.
+        $watch = Join-Path $script:DetachDir 'watch-b3b.log'
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-dump-params.ps1') `
+            -ExtraArgs @('-Reason', 'deploy "v2" now', '-EnvFile', 'D:\claudish shadow\.env', '-Recreate', '-WatchLog', $watch)
+        $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
+        $r.Ok | Should -BeTrue
+        $raw = Get-Content -LiteralPath $watch -Raw
+        $raw | Should -Match ([regex]::Escape('reason=[deploy "v2" now]'))
+        $raw | Should -Match ([regex]::Escape('env=[D:\claudish shadow\.env]'))
+        $raw | Should -Match 'recreate=\[True\]'
+    }
+
+    It 'the real entry point: -Detach exits 0 with the child PID on the docker-free refuse path (review B1)' {
+        # The functions were green while the entry block was broken (B1: the
+        # $detach/[switch]$Detach collision made EVERY real launch exit 4).
+        # This test goes through the actual operator entry point: -Recreate
+        # without -EnvFile refuses BEFORE any docker call, so the run is
+        # docker-free end to end, and the child's START handshake is the
+        # proof the parent's exit 0 leans on.
+        $e2eHome = Join-Path $script:DetachDir 'e2e-home'
+        New-Item -ItemType Directory -Path $e2eHome -Force | Out-Null
+        $log = Join-Path $e2eHome 'drain.log'
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File $script:DrainScript -Detach -Reason 'pester-e2e' `
+            -ClaudishHome $e2eHome -LogPath $log -ProxyUrl 'http://127.0.0.1:59999' `
+            -MaxWaitSec 5 -Recreate 2>&1
+        $rc = $LASTEXITCODE
+        $text = $out -join "`n"
+        $rc | Should -Be 0
+        $m = [regex]::Match($text, 'child PID (\d+) alive')
+        $m.Success | Should -BeTrue
+        # The parent returns on the START handshake while the detached child
+        # is still running: the REFUSED/OUTCOME lines land AFTER the parent's
+        # exit. Bounded wait before asserting them (the child refuses in
+        # ~1.5 s, measured in review of #338).
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline) {
+            if ((Test-Path -LiteralPath $log) -and ((Get-Content -LiteralPath $log -Raw) -match 'OUTCOME ')) { break }
+            Start-Sleep -Milliseconds 250
+        }
+        $logRaw = Get-Content -LiteralPath $log -Raw
+        # The alive claim is backed by THAT child's own START line.
+        $logRaw | Should -Match ('START pid {0}\b' -f $m.Groups[1].Value)
+        # The child really ran the refuse path (docker-free) and terminated.
+        $logRaw | Should -Match 'RECREATE REFUSED'
+        $logRaw | Should -Match 'OUTCOME '
+    }
+
+    It 'old drain-detach captures are pruned, fresh ones kept (review retention)' {
+        $retHome = Join-Path $script:DetachDir 'retention'
+        New-Item -ItemType Directory -Path $retHome -Force | Out-Null
+        $oldOut = Join-Path $retHome 'drain-detach-20200101-000000-1.out.log'
+        $oldErr = Join-Path $retHome 'drain-detach-20200101-000000-1.err.log'
+        'x' | Set-Content -LiteralPath $oldOut
+        'x' | Set-Content -LiteralPath $oldErr
+        (Get-Item -LiteralPath $oldOut).LastWriteTime = (Get-Date).AddDays(-10)
+        (Get-Item -LiteralPath $oldErr).LastWriteTime = (Get-Date).AddDays(-10)
+        $watch = Join-Path $script:DetachDir 'watch-retention.log'
+        $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-ok.ps1') `
+            -ExtraArgs @('-SpacedValue', 'v', '-WatchLog', $watch)
+        $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $retHome -WatchLogPath $watch -TimeoutSec 25
+        $r.Ok | Should -BeTrue
+        Test-Path -LiteralPath $oldOut | Should -BeFalse
+        Test-Path -LiteralPath $oldErr | Should -BeFalse
+        (Get-ChildItem -LiteralPath $retHome -Filter 'drain-detach-*.out.log' | Measure-Object).Count | Should -BeGreaterOrEqual 1
     }
 
     It 'an immediately-exiting child returns not-Ok with its stderr tail (AC1b/AC3c)' {
@@ -715,20 +882,37 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         }
     }
 
-    It 'zero-actuator: the detach functions launch no docker/Restart/Stop of their own (AC5)' {
+    It 'zero-actuator: the detach functions AND entry branch launch no docker/Restart/Stop of their own (AC5 + review)' {
         $tokens = $null; $errors = $null
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:DrainScript, [ref]$tokens, [ref]$errors)
-        $names = @('Join-DrainDetachArguments', 'Start-DrainDetached', 'Get-DrainDetachForwardedArguments')
+        $names = @('Join-DrainDetachArguments', 'Start-DrainDetached', 'Get-DrainDetachForwardedArguments', 'Test-WatchLogHasLine')
         $bodies = @($ast.FindAll({ param($n)
                 $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $names -contains $n.Name
             }, $true))
-        # A filter that matched nothing would prove nothing: all three must be found.
-        $bodies.Count | Should -Be 3
-        $forbidden = 'Restart-\w|Stop-\w|docker\s+(stop|restart|kill)|-Verb\s+RunAs'
+        # A filter that matched nothing would prove nothing: all four must be found.
+        $bodies.Count | Should -Be 4
+        # Review of #338: \bdocker\b, not just docker stop|restart|kill — AC5
+        # says NO container-engine call at all, of any verb.
+        $forbidden = 'Restart-\w|Stop-\w|\bdocker\b|-Verb\s+RunAs'
         foreach ($b in $bodies) {
             $b.Extent.Text | Should -Not -Match $forbidden
         }
-        # Positive control: the same predicate must fire on an actuator.
+        # The operator-facing if ($Detach) branch too (review: the guard
+        # covered only the functions, never the entry block). The branch is
+        # delimited by markers; a missing marker fails the test rather than
+        # silently scanning nothing.
+        $raw = [System.IO.File]::ReadAllText($script:DrainScript)
+        $begin = $raw.IndexOf('# <drain-detach-entry>')
+        $end = $raw.IndexOf('# </drain-detach-entry>')
+        $begin | Should -BeGreaterOrEqual 0
+        $end | Should -BeGreaterThan $begin
+        $slice = $raw.Substring($begin, $end - $begin)
+        $slice | Should -Not -Match $forbidden
+        # Positive controls: the predicate fires on an actuator — including
+        # a plain container-engine call (the class \bdocker\b adds) and the
+        # entry-slice scanner itself on a doctored slice.
         'function f { Stop-Service -Name x }' | Should -Match $forbidden
+        'if ($Detach) { docker ps }' | Should -Match $forbidden
+        'if ($Detach) { Start-Process x } docker ps' | Should -Match $forbidden
     }
 }
