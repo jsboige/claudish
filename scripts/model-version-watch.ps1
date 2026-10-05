@@ -16,8 +16,10 @@
 #     family it already tracks -> event 'role-alias-ask' (report-only). This is
 #     the hole the routing repin leaves behind: parseRoleAliases matches a
 #     lowercased SUBSTRING, so 'gpt-6-sol' does not cover 'gpt-6.1-sol' and a
-#     client naming the current id loses the cascade entirely. Checked on every
-#     run, including runs where routing needs no change (2026-10-05 driver).
+#     client naming the current id loses the cascade entirely. The check runs
+#     BEFORE the network phase (it needs only config + env) and dedupes its
+#     asks by (id, suggested alias) against the events log — one ask per hole,
+#     not two every 6 hours (CR #344).
 #   - nothing new -> one info line, zero writes.
 #
 # Phase 1 provider: Codex / ChatGPT backend (where minor churn bites — the
@@ -69,7 +71,70 @@ if (-not (Test-ClaudishOptIn -ClaudishHome $ClaudishHome -Token 'enabled')) {
     exit 0
 }
 
-# --- 1. Available versions (Codex backend, OAuth; token never logged) -------
+# --- 1. Config (needed by BOTH the alias check and the routing diff) --------
+
+if (-not (Test-Path -LiteralPath $ConfigPath)) { & $logTs "no config at $ConfigPath"; exit 0 }
+try { $config = [System.IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json } catch {
+    & $logTs "FATAL config parse: $($_.Exception.Message)"
+    Write-VersionEvent -EventsPath $eventsPath -Kind error -Family config -Detail "config parse failed — refusing to touch anything"
+    exit 1
+}
+
+# --- 2. Role-alias drift (needs NO network — runs before every network exit) -
+#
+# PLACEMENT IS LOAD-BEARING TWICE: the drift is the STEADY STATE (routing
+# already current, alias table left behind by an earlier bump — measured
+# 2026-10-05: gpt-6.1-sol repinned 02/10, ROLE_MODELS stale for three days),
+# AND the check needs only config + env — an expired OAuth token or a
+# chatgpt.com outage must not disable it (CR #344: six early exits used to sit
+# in front of it, so a network hiccup silently skipped the check).
+#
+# REPORT-ONLY, deliberately: ROLE_MODELS lives in the hub's env, and changing
+# it needs a drained recreate — an operator act, exactly like the cascades.
+# The detector reads the ENV FILE, not the live container: after an edit
+# without recreate it reports no drift while the running proxy still has the
+# hole — the #141 drain guard owns that comparison at the next recreate.
+$roleModels = ''
+if (Test-Path -LiteralPath $EnvFile) {
+    try {
+        $envText = [System.IO.File]::ReadAllText($EnvFile)
+        foreach ($line in @($envText -split "`n")) {
+            $t = $line.Trim()
+            if ($t -like 'export CLAUDISH_FAILOVER_ROLE_MODELS=*') { $t = $t.Substring(7) }
+            if ($t -like 'CLAUDISH_FAILOVER_ROLE_MODELS=*') {
+                $roleModels = $t.Substring($t.IndexOf('=') + 1).Trim()
+                if ($roleModels.Length -ge 2 -and $roleModels[0] -eq $roleModels[$roleModels.Length - 1] -and
+                    ($roleModels[0] -eq '"' -or $roleModels[0] -eq "'")) {
+                    $roleModels = $roleModels.Substring(1, $roleModels.Length - 2)
+                }
+                break
+            }
+        }
+    } catch { & $logTs "role-models read failed (non-fatal, check skipped): $($_.Exception.Message)" }
+}
+if ($roleModels) {
+    $drift = @(Compare-RoleModelsToRouting -Routing $config.routing -RoleModels $roleModels)
+    if ($drift.Count -eq 0) {
+        & $logTs "role aliases: no drift — every tracked-family name a client can send resolves to a role"
+    } else {
+        foreach ($r in $drift) {
+            & $logTs "ROLE-ALIAS DRIFT: a client naming '$($r.Id)' resolves to NO role (no keyword, no alias pattern covers it) and gets no cascade — suggest '$($r.Suggested)'"
+            if (-not $DryRun) {
+                if (Test-RoleAliasAskEmitted -EventsPath $eventsPath -Id $r.Id -Suggested $r.Suggested) {
+                    & $logTs "role-alias-ask for '$($r.Id)' already emitted with the same suggestion — not re-asking (events log is the dedupe state)"
+                } else {
+                    Write-VersionEvent -EventsPath $eventsPath -Kind role-alias-ask -Family $r.Family `
+                        -From $r.Suggested -To $r.Id `
+                        -Detail "CLAUDISH_FAILOVER_ROLE_MODELS has no pattern covering the client-nameable id '$($r.Id)': roleFromModelName falls through keywords and aliases to null, so a client naming it loses the cascade entirely. Suggested addition: $($r.Suggested) — env change + drained recreate, operator act."
+                }
+            }
+        }
+    }
+} else {
+    & $logTs "role aliases: no CLAUDISH_FAILOVER_ROLE_MODELS line in $EnvFile (absent or unreadable) — drift check skipped"
+}
+
+# --- 3. Available versions (Codex backend, OAuth; token never logged) -------
 
 if (-not (Test-Path -LiteralPath $OAuthPath)) {
     & $logTs "no OAuth file at $OAuthPath — provider skipped, nothing to compare"
@@ -115,62 +180,12 @@ if ($available.Count -eq 0) {
 }
 & $logTs "provider lists $($available.Count) ids: $($available -join ', ')"
 
-# --- 2. Diff against routing ------------------------------------------------
-
-if (-not (Test-Path -LiteralPath $ConfigPath)) { & $logTs "no config at $ConfigPath"; exit 0 }
-try { $config = [System.IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json } catch {
-    & $logTs "FATAL config parse: $($_.Exception.Message)"
-    Write-VersionEvent -EventsPath $eventsPath -Kind error -Family config -Detail "config parse failed — refusing to touch anything"
-    exit 1
-}
+# --- 4. Diff against routing ------------------------------------------------
 
 $watchedProviders = @('cx@', 'codex@')
 $decisions = Compare-RoutingToFamilies -Routing $config.routing -AvailableIds $available -WatchedProviders $watchedProviders
 $pending = @($decisions | Where-Object { $_.Action -ne 'current' })
 & $logTs ("decisions: " + (($decisions | ForEach-Object { "$($_.Family)/$($_.Action)[$($_.Spelling): $($_.CurrentId)->$($_.LatestId)]" }) -join ' ; '))
-
-# --- 2b. Role-alias drift (runs even when routing is already current) --------
-#
-# PLACEMENT IS LOAD-BEARING: this block sits ABOVE the `pending.Count -eq 0`
-# exit. The drift it hunts is precisely the STEADY STATE — routing already
-# current, the alias table left behind by an earlier bump — so a check placed
-# after that exit would never fire on the one case it exists for. Measured
-# 2026-10-05: gpt-6.1-sol was repinned in routing on 02/10, ROLE_MODELS still
-# carried only gpt-6-sol/gpt-5.6-sol, and the gap went unseen for three days
-# while a single session burned the OpenAI plan on the unprotected id.
-#
-# REPORT-ONLY, deliberately: ROLE_MODELS lives in the hub's env, and changing it
-# needs a drained recreate — an operator act, exactly like the cascades. The
-# event names the alias to add; nothing here writes to the env.
-$roleModels = ''
-if (Test-Path -LiteralPath $EnvFile) {
-    try {
-        $envText = [System.IO.File]::ReadAllText($EnvFile)
-        foreach ($line in @($envText -split "`n")) {
-            if ($line -like 'CLAUDISH_FAILOVER_ROLE_MODELS=*') {
-                $roleModels = $line.Substring($line.IndexOf('=') + 1).Trim()
-                break
-            }
-        }
-    } catch { & $logTs "role-models read failed (non-fatal, check skipped): $($_.Exception.Message)" }
-}
-if ($roleModels) {
-    $drift = @(Compare-RoleModelsToRouting -Routing $config.routing -RoleModels $roleModels)
-    if ($drift.Count -eq 0) {
-        & $logTs "role aliases: no drift — every tracked family member is covered by a pattern"
-    } else {
-        foreach ($r in $drift) {
-            & $logTs "ROLE-ALIAS DRIFT: routing serves '$($r.Id)' (spelling $($r.Spelling)) but no ROLE_MODELS pattern covers it — a client naming that id resolves to no role and gets NO cascade; suggest '$($r.Suggested)'"
-            if (-not $DryRun) {
-                Write-VersionEvent -EventsPath $eventsPath -Kind role-alias-ask -Family $r.Family `
-                    -To $r.Id `
-                    -Detail "CLAUDISH_FAILOVER_ROLE_MODELS has no pattern covering '$($r.Id)' (routing spelling '$($r.Spelling)'): parseRoleAliases matches a lowercased SUBSTRING, so the older spelling's alias does not cover it. A client naming the current id resolves to no role and loses the cascade entirely. Suggested addition: $($r.Suggested) — env change + drained recreate, operator act."
-            }
-        }
-    }
-} else {
-    & $logTs "role aliases: no CLAUDISH_FAILOVER_ROLE_MODELS line in $EnvFile (absent or unreadable) — drift check skipped"
-}
 
 if ($pending.Count -eq 0) { exit 0 }
 

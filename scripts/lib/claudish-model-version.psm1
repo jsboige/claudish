@@ -139,83 +139,125 @@ function Compare-RoutingToFamilies {
 function Compare-RoleModelsToRouting {
     # CLAUDISH_FAILOVER_ROLE_MODELS maps a REQUESTING-model pattern to a role so
     # a client that names the nominal model (instead of a role keyword) still
-    # gets cascade protection. fork/failover.ts `parseRoleAliases` matches the
-    # pattern as a LOWERCASE SUBSTRING of the requested id — so an alias written
-    # for an older spelling does NOT cover the newer one: 'gpt-6-sol' is not a
-    # substring of 'gpt-6.1-sol' (the '.1' sits between).
+    # gets cascade protection. Measured 2026-10-05: routing was repinned to
+    # gpt-6.1-sol while ROLE_MODELS still carried the older spellings, so every
+    # client naming the CURRENT id resolved to no role and had NO cascade.
     #
-    # Measured 2026-10-05: routing was repinned to gpt-6.1-sol on 02/10 while
-    # ROLE_MODELS still carried only gpt-6-sol/gpt-5.6-sol, so every client
-    # naming the CURRENT id resolved to no role and had NO cascade at all. The
-    # routing watcher could not see this — it repins ROUTING, not the alias
-    # table — so the hole reopened at every id bump.
+    # CRITICAL (CR #344, c.5993885265): the proxy derives the role from what
+    # the CLIENT asked for — roleFromModelName (failover.ts) checks the role
+    # KEYWORDS first ('opus','sonnet','haiku','fable' as substrings, lowercased)
+    # and only then the alias patterns, FIRST match wins, invalid-role entries
+    # skipped at parse (parseRoleAliases). This detector therefore reasons on
+    # the CLIENT-NAMEABLE names — the routing KEYS — in that exact order:
     #
-    # Emits a row ONLY when the alias table already tracks the id's family (some
-    # alias names an older member of it) and this member is uncovered: the table
-    # clearly intends to cover that family, so a missing member is a real gap.
-    # A family with no alias at all is not tracked and stays silent — the check
-    # can never invent work. Role is inherited from the family's existing alias.
-    #   @{ Spelling; Id; Family; Suggested }
+    #   keyword in name  -> covered (a keyword-bearing name needs no alias);
+    #   alias pattern is a substring of the name -> covered;
+    #   otherwise       -> drift, but ONLY when the alias table already tracks
+    #                       the name's family (an untracked family is not work
+    #                       this check may invent).
+    #
+    # The pre-CR shape iterated the routing TARGETS instead, which missed a
+    # drift behind a remap (C2: key gpt-6.1-sol -> cx@gpt-6-sol, alias covers
+    # only the target spelling), invented one behind a keyword key (C3: a
+    # claude-haiku-* key aimed at an unrelated model suggested the wrong
+    # role), missed provider-only entries (C4: value 'gc' with no model), and
+    # picked its suggested role by hashtable iteration order — interpreter-
+    # dependent under PS 5.1 (C6). Duplicate patterns keep the FIRST entry,
+    # like roleFromModelName; a provider-prefixed pattern ('cx@gpt-6.1-sol')
+    # is a legitimate pattern that only ever matches an equally prefixed name
+    # (C7) — exactly what the proxy does with it.
+    #   @{ Spelling; Id; Family; Suggested }  — one row per uncovered key.
     param(
         [Parameter(Mandatory = $true)]$Routing,
         [AllowEmptyString()][string]$RoleModels = ''
     )
 
-    $aliasRole = @{}
+    # Parse aliases IN ORDER, mirroring parseRoleAliases: split ',', trim, drop
+    # empties, split ':' once, lowercase both sides, skip anything malformed —
+    # including a role outside opus/sonnet/haiku/fable (C1: the entry does not
+    # exist for the proxy either). FIRST occurrence of a pattern wins.
+    $keywords = @('opus', 'sonnet', 'haiku', 'fable')
+    $aliases = @()
+    $seenPat = @{}
     foreach ($piece in @($RoleModels -split ',')) {
         $p = ([string]$piece).Trim()
         if (-not $p) { continue }
-        $parts = $p -split ':'
+        $parts = $p -split ':', 2
         if ($parts.Count -lt 2) { continue }
         $pat = $parts[0].Trim().ToLower()
         $role = $parts[1].Trim().ToLower()
         if (-not $pat -or -not $role) { continue }
-        $aliasRole[$pat] = $role
+        if ($keywords -notcontains $role) { continue }
+        if ($seenPat.ContainsKey($pat)) { continue }
+        $seenPat[$pat] = $true
+        $aliases += , @{ Pattern = $pat; Role = $role }
     }
 
-    # Which families does the alias table actually track, and under which role?
+    # Family -> role from the FIRST alias of that family in ROLE_MODELS order
+    # (deterministic under both interpreters; a hashtable key order is not).
+    # A provider-prefixed pattern ('cx@gpt-6.1-sol') tracks the family of its
+    # MODEL portion — the pattern only ever matches prefixed names, but the
+    # family intent is the same, and the bare key needs it to get a suggestion.
     $familyRole = @{}
-    foreach ($pat in @($aliasRole.Keys)) {
-        $v = ConvertTo-ModelVersion -Id $pat
-        if ($null -ne $v) { $familyRole[$v.Family] = $aliasRole[$pat] }
+    foreach ($a in $aliases) {
+        $candidate = $a.Pattern
+        if ($candidate.Contains('@')) { $candidate = ($candidate -split '@', 2)[1] }
+        $v = ConvertTo-ModelVersion -Id $candidate
+        if ($null -eq $v) { continue }
+        if (-not $familyRole.ContainsKey($v.Family)) { $familyRole[$v.Family] = $a.Role }
     }
 
-    # One row per DISTINCT served id, never per spelling: several spellings
-    # routinely resolve to the same target (gpt-6-sol / gpt-5.6-sol /
-    # gpt-6.1-sol all -> cx@gpt-6.1-sol here), and the fix is ONE alias — three
-    # rows for it would read as three problems. When one of the spellings IS the
-    # id, prefer it, so the report names the spelling a client would actually
-    # type rather than an older alias that happens to point at the same target.
-    $byId = [ordered]@{}
-    foreach ($prop in $Routing.PSObject.Properties) {
-        foreach ($target in @($prop.Value)) {
-            $model = ([string]$target -split '@')[-1]
-            $low = $model.ToLower()
-            $covered = $false
-            foreach ($pat in @($aliasRole.Keys)) {
-                if ($low.Contains($pat)) { $covered = $true; break }
-            }
-            if ($covered) { continue }
-            $v = ConvertTo-ModelVersion -Id $model
-            if ($null -eq $v) { continue }
-            if (-not $familyRole.ContainsKey($v.Family)) { continue }
-            $spelling = $prop.Name
-            if ($byId.Contains($model)) {
-                $prev = $byId[$model]
-                if ($spelling -eq $model -and $prev.Spelling -ne $model) { $prev.Spelling = $spelling }
-                continue
-            }
-            $byId[$model] = @{
-                Spelling  = $spelling
-                Id        = $model
-                Family    = $v.Family
-                Suggested = ($model + ':' + $familyRole[$v.Family])
-            }
+    $rows = @()
+    foreach ($key in @($Routing.PSObject.Properties.Name)) {
+        $low = $key.ToLower()
+        # 1. role keywords, in roleFromModelName order.
+        $hasKeyword = $false
+        foreach ($kw in $keywords) {
+            if ($low.Contains($kw)) { $hasKeyword = $true; break }
+        }
+        if ($hasKeyword) { continue }
+        # 2. alias patterns, substring, first wins.
+        $covered = $false
+        foreach ($a in $aliases) {
+            if ($low.Contains($a.Pattern)) { $covered = $true; break }
+        }
+        if ($covered) { continue }
+        # 3. no role at all: a drift iff the family is tracked.
+        $v = ConvertTo-ModelVersion -Id $key
+        if ($null -eq $v) { continue }
+        if (-not $familyRole.ContainsKey($v.Family)) { continue }
+        $rows += @{
+            Spelling  = $key
+            Id        = $key
+            Family    = $v.Family
+            Suggested = ($key + ':' + $familyRole[$v.Family])
         }
     }
-    $rows = @()
-    foreach ($k in $byId.Keys) { $rows += $byId[$k] }
     return $rows
+}
+
+function Test-RoleAliasAskEmitted {
+    # Dedupe state for the 6h ask cadence: the events log itself. Without this,
+    # every run re-emits one role-alias-ask per uncovered id and the worker
+    # relays it — 2 asks every 6 hours, forever, for a hole the operator has
+    # already seen (CR #344). One ask per (id, suggested alias) until the log
+    # is cleared; a DIFFERENT suggestion for the same id (family role edited)
+    # is a new question and does ask again.
+    param(
+        [Parameter(Mandatory = $true)][string]$EventsPath,
+        [Parameter(Mandatory = $true)][string]$Id,
+        [Parameter(Mandatory = $true)][string]$Suggested
+    )
+    if (-not (Test-Path -LiteralPath $EventsPath)) { return $false }
+    foreach ($line in @([System.IO.File]::ReadAllLines($EventsPath))) {
+        $t = $line.Trim()
+        if (-not $t) { continue }
+        try { $evt = $t | ConvertFrom-Json } catch { continue }
+        if ($evt.kind -eq 'role-alias-ask' -and $evt.to -eq $Id -and $evt.from -eq $Suggested) {
+            return $true
+        }
+    }
+    return $false
 }
 
 # --- Config surgery ---------------------------------------------------------
@@ -383,6 +425,6 @@ function Get-ReloadMode {
 
 Export-ModuleMember -Function `
     ConvertTo-ModelVersion, Get-LatestFamilyVersion, Compare-RoutingToFamilies, `
-    Compare-RoleModelsToRouting, `
+    Compare-RoleModelsToRouting, Test-RoleAliasAskEmitted, `
     Edit-RoutingForMinor, Write-VersionEvent, Test-ClaudishOptIn, `
     Test-ProbeAccepted, Test-ModelRetired, Get-ReloadMode
