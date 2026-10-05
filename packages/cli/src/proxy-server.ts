@@ -1102,15 +1102,18 @@ export async function createProxyServer(
     const armGraceMs = getArmGraceMs();
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
     let graceRetried = false; // #91: one wait-and-retry on the nominal per request
-    // #263: steps this request already saw fail. A concurrent nominal success
-    // (onNominalSuccess → resetAllStepFailures) can clear their marks mid-request —
-    // routine once ROLE_MODELS folds several nominals into one role — and the next
-    // resolution then re-selects a step this request just watched wall. Re-paying
-    // it burned the attempt budget and surfaced its raw error (hub 2026-09-25:
-    // Sol → Mistral 402 twice, never reaching the healthy last step). Re-mark and
-    // re-resolve instead, without calling the handler or consuming an attempt;
-    // `revisits` is capped at the step count, so the loop stays bounded.
-    const triedSteps = new Set<number>();
+    // #263/#331: concretes this request already paid, per step index. A
+    // concurrent nominal success (onNominalSuccess → resetAllStepFailures) can
+    // clear step marks mid-request — routine once ROLE_MODELS folds several
+    // nominals into one role — and the next resolution then re-selects a step
+    // this request just watched wall. Re-paying it burned the attempt budget
+    // and surfaced its raw error (hub 2026-09-25: Sol → Mistral 402 twice,
+    // never reaching the healthy last step). Re-mark and re-resolve instead,
+    // without calling the handler or consuming an attempt; `revisits` is capped
+    // at the step count, so the loop stays bounded. #331 keys the guard by the
+    // CONCRETE paid (a delegation that advanced serves a different concrete —
+    // not a re-payment); the index-keyed Set would re-freeze it (see the loop).
+    const triedConcretes = new Map<number, Set<string>>();
     let revisits = 0;
     let response: Response | undefined;
     // #299-B: one-shot bounded — a nominal transient overload walks to the
@@ -1123,13 +1126,6 @@ export async function createProxyServer(
         ? resolveFailoverTargetForSession(role, sessionKey, bucket)
         : { step: null, stepIndex: -1 };
       const { stepIndex } = resolved;
-      if (role && stepIndex >= 0 && triedSteps.has(stepIndex) && revisits < (rule?.steps.length ?? 0)) {
-        revisits++;
-        markStepFailed(role, stepIndex, `re-selected after a concurrent clear — already failed in this request`);
-        attempt--;
-        continue;
-      }
-      if (stepIndex >= 0) triedSteps.add(stepIndex);
       // #274 (review 29/09): when this attempt serves a role-step's DELEGATION,
       // the concrete model belongs to another cascade, and failover bookkeeping
       // must reach the OWNING side — a delegated wall of the target's nominal
@@ -1143,6 +1139,36 @@ export async function createProxyServer(
       // the nominal attempt — no owning side to record.
       const delegation =
         role && resolved.step?.roleRef ? resolveDelegationOwner(role, resolved.step) : null;
+      // #331: the #263 revisit guard is keyed by the CONCRETE this request
+      // already paid on that step, not by the step index alone. A role-step
+      // whose delegation has ADVANCED resolves a different concrete — serving
+      // it is not a re-payment of the wall this request watched (the index-keyed
+      // form re-marked such a step WITHOUT a concrete, re-freezing it for the
+      // full backoff — the intra-request half of the 24 h freeze). The same
+      // concrete re-selected after a concurrent clear keeps the #263 semantics
+      // exactly: re-mark (conservative, binds) and re-resolve without consuming
+      // an attempt.
+      const attemptConcreteNow = delegation?.concrete ?? resolved.step?.target;
+      if (
+        role &&
+        stepIndex >= 0 &&
+        attemptConcreteNow !== undefined &&
+        triedConcretes.get(stepIndex)?.has(attemptConcreteNow) &&
+        revisits < (rule?.steps.length ?? 0)
+      ) {
+        revisits++;
+        markStepFailed(role, stepIndex, `re-selected after a concurrent clear — already failed in this request`);
+        attempt--;
+        continue;
+      }
+      if (stepIndex >= 0 && attemptConcreteNow !== undefined) {
+        let paid = triedConcretes.get(stepIndex);
+        if (!paid) {
+          paid = new Set<string>();
+          triedConcretes.set(stepIndex, paid);
+        }
+        paid.add(attemptConcreteNow);
+      }
       // Native-lane version pin. Applied HERE rather than at the route, because the
       // cascade re-resolves the handler every attempt: only the attempt that actually
       // lands on NativeHandler may carry a bare Anthropic id, and a later attempt is a
@@ -1312,10 +1338,17 @@ export async function createProxyServer(
         // re-pinned DEEPER by this advance: the step is broken, not walled, so the
         // session's dwell is forfeited (it rejoins the general resolution each
         // request) instead of riding this step's successor past a recovered nominal.
-        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody), { nonQuota: true });
+        // #331: every mark carries the CONCRETE this attempt served — a role
+        // step's TTL binds only while its delegation keeps resolving there.
+        const attemptConcrete = delegation?.concrete ?? resolved.step?.target;
+        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody), {
+          nonQuota: true,
+          concrete: attemptConcrete,
+        });
         if (delegation && !delegation.owner.nominal) {
           markStepFailed(delegation.owner.role, delegation.owner.stepIndex, why, parseResetAtFromBody(errBody), {
             nonQuota: true,
+            concrete: delegation.concrete,
           });
         }
         continue;
@@ -1360,13 +1393,19 @@ export async function createProxyServer(
         // each side (the first cut double-marked the delegating step: 10→30min
         // off a single wall).
         if (delegation?.owner.nominal) {
-          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody));
+          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody), {
+            concrete: delegation.concrete,
+          });
           const ownerBucket = await nominalBucketOfModel(delegation.concrete);
           onNominalRefusal(delegation.owner.role, reason, response.headers.get("retry-after"), errBody, ownerBucket);
         } else {
-          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody));
+          markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody), {
+            concrete: delegation?.concrete ?? resolved.step?.target,
+          });
           if (delegation && delegation.owner.nominal === false) {
-            markStepFailed(delegation.owner.role, delegation.owner.stepIndex, reason, parseResetAtFromBody(errBody));
+            markStepFailed(delegation.owner.role, delegation.owner.stepIndex, reason, parseResetAtFromBody(errBody), {
+              concrete: delegation.concrete,
+            });
           }
         }
         if (rule && stepIndex === rule.steps.length - 1) return response; // last step also walled

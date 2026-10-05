@@ -139,6 +139,20 @@ interface StepFailure {
    * the next step. The record is replaced whole on each mark, so the flag always
    * reflects the most recent death, never an older episode. */
   nonQuota?: true;
+  /** #331: the CONCRETE target this failure was recorded against. For a
+   * `role:` step the backoff measures one concrete the delegation happened to
+   * resolve to — the delegation itself may have since ADVANCED (the target
+   * role's own resolution moved on), and freezing the step for that old
+   * concrete's wall kept a role with no other path dead up to the 24 h cap
+   * while the target served healthily (hub po-2025, 2026-10-04: `haiku[1]` =
+   * `role:sonnet`, 408 walls, TTL escalated to 1440 min). While set and the
+   * delegation still resolves to THIS concrete, the TTL binds; once
+   * `resolveRoleStep` yields a different concrete the step is probeable again.
+   * For model steps the field is inert (their TTL is about the step itself —
+   * a model step's target never moves). Absent = binds (a record without a
+   * concrete — the pre-#331 shape, e.g. the #263 revisit re-mark — keeps the
+   * freeze; conservative, and intra-request advancement relies on it). */
+  concrete?: string;
 }
 
 interface RecoveryState {
@@ -738,6 +752,42 @@ function isStepTtlFailed(f: StepFailure | undefined, step?: FailoverStep): boole
   return Date.now() - f.lastFailure.getTime() < stepTtlMs(f.count);
 }
 
+/** #331: does this step's TTL failure still BIND? A `role:` step's backoff was
+ * recorded against ONE concrete the delegation happened to resolve to
+ * (`StepFailure.concrete`); the target role's own resolution may have advanced
+ * since (its bucket walled, its step marked — the #274 walk state is shared),
+ * and the delegating step must follow it instead of staying frozen for up to
+ * the 24 h cap on a concrete the delegation has left. The TTL therefore binds
+ * a role-step only while `resolveRoleStep` keeps resolving to the SAME
+ * concrete; the moment it yields a different one, the step is probeable.
+ *
+ * Non-negotiables this predicate preserves (decision of record, issue #331):
+ *  - INTRA-REQUEST advancement: within one request the resolution cannot move
+ *    (nothing succeeds in between), so the same concrete stays skipped.
+ *  - The #274 two-level bookkeeping is untouched — this only reads it.
+ *  - A MODEL step's TTL is about the step itself (its target never moves):
+ *    binds whenever TTL-failed. A record without a concrete (the #263 revisit
+ *    re-mark, any pre-#331 shape) binds — conservative, and exactly what the
+ *    revisit guard needs.
+ *  - The #261 closure plane (healthy step, future config resetAt) binds a
+ *    role-step regardless of the delegation: an operator closure speaks
+ *    louder than where the delegation points today.
+ *
+ * The `resolveRoleStep` call re-resolves the delegation — its two side effects
+ * are the module's shared idiom (a `step.target` refresh in place, and the
+ * arm-when-walled-nominal-has-no-cascade guard) and both are what the ordinary
+ * probeable path already does one line later in every caller. */
+function stepTtlBinds(
+  role: FailoverRole,
+  f: StepFailure | undefined,
+  step: FailoverStep | undefined
+): boolean {
+  if (!step || !isStepTtlFailed(f, step)) return false;
+  if (!step.roleRef) return true;
+  if (f?.concrete === undefined) return true;
+  return resolveConcreteTarget(role, step) === f.concrete;
+}
+
 function stepFailuresFor(role: FailoverRole): StepFailure[] {
   let arr = stepFailures.get(role);
   if (!arr) {
@@ -754,24 +804,29 @@ function stepFailuresFor(role: FailoverRole): StepFailure[] {
  * step is broken, not walled — different log verb, and a dwell pin on it yields
  * without re-pinning, #276). `bodyResetAt` is the reset time parsed from the
  * provider's own error body (most accurate at wall time); when absent, the
- * operator-declared step.resetAt applies if configured. */
+ * operator-declared step.resetAt applies if configured. `opts.concrete` is the
+ * concrete target the failed attempt served (#331): for a `role:` step it is
+ * what the delegation resolved to, and the step's TTL binds only while the
+ * delegation keeps resolving there. */
 export function markStepFailed(
   role: FailoverRole,
   idx: number,
   reason: string,
   bodyResetAt?: Date,
-  opts?: { nonQuota?: boolean }
+  opts?: { nonQuota?: boolean; concrete?: string }
 ): void {
   const rule = rules.get(role);
   if (!rule || idx < 0 || idx >= rule.steps.length) return;
   const arr = stepFailuresFor(role);
   const resetAt = bodyResetAt ?? rule.steps[idx].resetAt;
   const nonQuota = opts?.nonQuota === true;
+  const concrete = opts?.concrete;
   arr[idx] = {
     count: arr[idx].count + 1,
     lastFailure: new Date(Date.now()),
     resetAt,
     ...(nonQuota ? { nonQuota: true } : {}),
+    ...(concrete !== undefined ? { concrete } : {}),
   };
   const ttlText = resetAt ? `until ${resetAt.toISOString()}` : `${Math.round(stepTtlMs(arr[idx].count) / 60000)}min`;
   logStderr(
@@ -969,7 +1024,11 @@ export function resolveFailoverTargetForSession(
       // The step (not just its failure record) is passed: a config-declared
       // future resetAt closes the step outright (#261), so a pin holding on a
       // step the operator just closed yields instead of riding out its dwell.
-      pin.stepIndex < rule.steps.length && !isStepTtlFailed(pinnedFailure, pinnedStep);
+      // #331: stepTtlBinds, not bare isStepTtlFailed — a pinned `role:` step
+      // whose TTL was recorded against a concrete the delegation has LEFT is
+      // still servable (it rides the target's current resolution); only a
+      // freeze on the CURRENT concrete is a genuine advancement-past-the-pin.
+      pin.stepIndex < rule.steps.length && !stepTtlBinds(role, pinnedFailure, pinnedStep);
     if (pinnedStillServable && pinnedStep?.roleRef) {
       if (resolveRoleStep(role, pinnedStep) === null) {
         // The delegation can no longer serve (its own resolution went nominal,
@@ -1087,7 +1146,12 @@ function resolveSkippingFailed(
   const fails = stepFailures.get(role);
   for (let i = 0; i < rule.steps.length; i++) {
     const step = rule.steps[i];
-    if (isStepTtlFailed(fails?.[i], step)) continue;
+    // #331: stepTtlBinds, not bare isStepTtlFailed — a `role:` step frozen on a
+    // concrete its delegation has LEFT is probeable again (the freeze was
+    // measured holding a dead role for 24 h while the target served: hub
+    // 2026-10-04, `haiku[1]` = `role:sonnet`, 408 walls). Within one request
+    // the resolution cannot move, so intra-request advancement is unchanged.
+    if (stepTtlBinds(role, fails?.[i], step)) continue;
     if (step.roleRef && resolveRoleStep(role, step) === null) continue;
     return { step, stepIndex: i };
   }
@@ -1102,6 +1166,16 @@ function resolveSkippingFailed(
   const last = rule.steps.length - 1;
   const lastStep = rule.steps[last];
   if (lastStep.resetAt && Date.now() < lastStep.resetAt.getTime()) {
+    return { step: null, stepIndex: -1 };
+  }
+  // #331: a role-step LAST step whose TTL still binds its current concrete
+  // surfaces the refusal instead of re-paying it. Pre-#331 this fallback
+  // re-served the delegation every request while its concrete sat walled, and
+  // every refusal re-marked the SAME step — the measured 408-wall/24 h-TTL
+  // shape on `haiku[1]` (hub 2026-10-04). A MODEL-step last step keeps the
+  // "PAYG always serves" bet exactly as before: its TTL is about itself, and
+  // serving it is how the operator sees the real error.
+  if (lastStep.roleRef && stepTtlBinds(role, fails?.[last], lastStep)) {
     return { step: null, stepIndex: -1 };
   }
   if (lastStep.roleRef && resolveRoleStep(role, lastStep) === null) {

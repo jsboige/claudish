@@ -399,13 +399,16 @@ describe("#276 — non-quota step death does not deepen the dwell pin", () => {
     // R2: an opus request (config-armed, step 0 = role:sonnet) is delegated
     // into sonnet's walk → s0 dies NON-quota. opus[0] is intermediate, so the
     // loop marks BOTH sides — opus[0] and, via delegation.owner, sonnet[0]
-    // NON-QUOTA — then fail-forwards to opus[1] (or-ep; the delegated step is
-    // backoffed, so the opus walk skips it).
+    // NON-QUOTA — then fail-forwards. #331 changed WHERE it lands: the
+    // delegating step's backoff binds its walled CONCRETE (s0), and the
+    // delegation has advanced to sonnet[1] — so the request follows it to s1
+    // instead of skipping to opus[1]'s PAYG tail (pre-#331: or=1, s1=0).
     nonQuotaEndpoints.add("s0");
     const r2 = await postMessage("claude-opus-5", "sess-del");
     expect(r2.status).toBe(200);
     expect(calls.s0).toBe(2);
-    expect(calls.or).toBe(1);
+    expect(calls.s1).toBe(1); // the delegation followed sonnet's advance
+    expect(calls.or).toBe(0); // the PAYG tail never paid — a healthy delegate came first
     expect(failoverLog.some((l) => l.includes("step sonnet[0]") && l.includes("failed (non-quota)"))).toBe(true);
 
     // R3: s0 healthy again. The sonnet session's next resolution sees its pin
@@ -413,17 +416,17 @@ describe("#276 — non-quota step death does not deepen the dwell pin", () => {
     nonQuotaEndpoints.delete("s0");
     const r3 = await postMessage("claude-sonnet-5", "sess-owner");
     expect(r3.status).toBe(200);
-    expect(calls.s1).toBe(1);
+    expect(calls.s1).toBe(2); // R2's delegated attempt + this one
     expect(failoverLog.some((l) => l.includes("DWELL sonnet session") && l.includes("died non-quota"))).toBe(true);
 
     // R4: the wall lapses (the pre-wall never cost nm a fetch — R1 went
     // straight to s0); the nominal is healthy from here. Unpinned, the owner's
     // session returns to it. Under the Md mutation, R3's resolution re-pinned
-    // s1 (the plain fall-through) and R4 would serve s1 again — s1=2, nm=0.
+    // s1 (the plain fall-through) and R4 would serve s1 again — s1=3, nm=0.
     wallEndpoints.delete("nm");
     const r4 = await pastWallExpiry("claude-sonnet-5", "sess-owner");
     expect(r4.status).toBe(200);
     expect(calls.nm).toBe(1);
-    expect(calls.s1).toBe(1);
+    expect(calls.s1).toBe(2);
   }, 30_000);
 });
