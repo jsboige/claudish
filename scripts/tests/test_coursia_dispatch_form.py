@@ -160,9 +160,26 @@ def test_control_rates():
           0.15 < mean30 < 0.45, f"-> {mean30:.3f}")
 
 
+def test_ratio_suffix():
+    print("ratio_suffix (real-corpus shape: control band touches 0)")
+    # The exact shape the 2026-07 CoursIA corpus hit on first run: mean > 0
+    # but the 2.5th percentile is 0.0 — division by the 0 endpoint crashed.
+    s = cdf.ratio_suffix(0.219, 0.03, 0.0, 0.06)
+    check("band touching 0 does not crash", "ratio" in s and "touches 0" in s, s)
+    check("open upper bound expressed", "[>" in s, s)
+    s2 = cdf.ratio_suffix(0.219, 0.03, 0.01, 0.06)
+    check("closed interval when blo > 0", "[2" in s2 or "[" in s2 and "-" in s2.split("[")[1].split("]")[0], s2)
+    # Thin-corpus shape (real: CoursIA-2 2026-09, n=25 claims): p97.5 of the
+    # control is ALSO 0 while the mean stays positive — second crash shape.
+    s3 = cdf.ratio_suffix(0.04, 0.002, 0.0, 0.0)
+    check("p97.5=0 does not crash", "p97.5=0" in s3, s3)
+    check("control 0 -> n/a", "n/a" in cdf.ratio_suffix(0.2, 0.0, 0.0, 0.0))
+
+
 def main():
     tests = [test_file_re_scope, test_month_of, test_format_dist,
-             test_select_files, test_load_cache_key, test_control_rates]
+             test_select_files, test_load_cache_key, test_control_rates,
+             test_ratio_suffix]
     for t in tests:
         t()
     print()

@@ -187,6 +187,26 @@ def pct(sorted_vals, q):
     return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * q))]
 
 
+def ratio_suffix(m_rate, mean, blo, bhi):
+    """measured/control ratio with its interval. The control band can TOUCH 0
+    (most draws find no prior dispatch at <=30m) while its mean is positive:
+    dividing by the 0 endpoint would crash — the real 2026-07 CoursIA corpus
+    hit exactly that on first run — so the upper bound becomes an open '>'.
+    Endpoints are inverted on purpose: a HIGH control bound gives the LOW
+    ratio bound."""
+    if mean <= 0:
+        return " -> ratio n/a (control 0)"
+    r = m_rate / mean
+    if blo > 0 and bhi > 0:
+        return f" -> ratio {r:.1f} [{m_rate/bhi:.1f}-{m_rate/blo:.1f}]"
+    if bhi > 0:
+        return f" -> ratio {r:.1f} [>{m_rate/bhi:.1f}] (control band touches 0)"
+    # Thin-corpus shape (real: CoursIA-2 2026-09, n=25): even the 97.5th
+    # percentile of the control is 0 — the ratio against the mean is the only
+    # figure left and its interval is unbounded on both ends.
+    return f" -> ratio {r:.1f} (control band ~0: p97.5=0)"
+
+
 def main():
     args = sys.argv[1:]
     use_cache = "--no-cache" not in args
@@ -254,12 +274,7 @@ def main():
                 mean = sum(v) / len(v)
                 blo, bhi = pct(v, .025), pct(v, .975)
                 s = f"<={w}m {100*mean:.1f}% [{100*blo:.1f}-{100*bhi:.1f}]"
-                if mean > 0:
-                    # ratio interval: measured/control, endpoints inverted on
-                    # purpose (a HIGH control bound gives the LOW ratio bound).
-                    s += f" -> ratio {cov[w]/n/mean:.1f} [{cov[w]/n/bhi:.1f}-{cov[w]/n/blo:.1f}]"
-                else:
-                    s += " -> ratio n/a (control 0)"
+                s += ratio_suffix(cov[w] / n, mean, blo, bhi)
                 parts.append(s)
             print(f"  [CONTROL random times, {K_DRAWS} draws] " + "  ".join(parts))
             print()
