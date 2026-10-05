@@ -101,6 +101,23 @@ This produces *implicit* aggregate self-throttling: under a storm, more requests
 
 ---
 
+## Signature-based role routing — MultiConnector absorption (#82)
+
+Status: design proposition, not arbitrated. No code.
+
+A per-signature offload policy: compute a prompt-shape signature (tools + system prefix + client model) once at the `/v1/messages` route, and when an operator-armed table (`CLAUDISH_SIGNATURE_ROUTING=1` + bind-mounted `CLAUDISH_SIGNATURE_TABLE`) matches, route by the table's role instead of the client's named model — one `effectiveModel` for every downstream consumer (bucket, cascade, dwell, handler), never at failover depth > 0, never onto a native lane the client didn't name. Tables are produced by offline vetting campaigns against the capture corpus (oracle: Opus on ai-01, post-reset) and proposed, never auto-applied. Full design, measured ground and invariants: `docs/reference/signature-routing.md`.
+
+**Trigger conditions** (all must hold):
+- Explicit arbitration GO from the user on the design doc (routing changes get specified, arbitrated, then built — #79/#21 precedent).
+- Gate M1 measured: per-session signature stability on one archived capture day (the sigres exports carry no session key, so this needs a re-run keyed by `sessionKey`); if the p90 session carries > 1 signature, the per-session pin variant is the design that gets built.
+- The extractor is unified (one module serving the online route and the offline measurer) before any table is trusted — a drift silently orphans entries.
+
+**Effort**: medium — route-level signature read + table load + pins; the vetting campaign machinery is the larger half and is owned with CoursIA (semantic-fleet side, `IChatClient` over `/v1/chat/completions`).
+
+**Reference**: `docs/reference/signature-routing.md`; capability map + concentration measurements in issue #82; coordinator review of the first draft in PR #339.
+
+---
+
 ## Adding a new roadmap item
 
 Each item should follow the structure above:
