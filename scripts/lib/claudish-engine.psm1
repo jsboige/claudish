@@ -1877,6 +1877,132 @@ function Resolve-SevenZipPath {
 
     return [pscustomobject]@{ Path = ''; Source = 'none'; Tried = @($tried); ExplicitMissing = $explicitMissing }
 }
+
+#region failover-events collector (#347, pure logic)
+# Companion of the docker-events block above, for the proxy's own [Failover]
+# log lines (ARMED / DISARMED / walled / failed / DWELL / CLOSED / RECOVERED).
+# Same doctrine: a window watermark, a dedup ring, an allowlist at the SINK,
+# and zero actuator anywhere. The glue is scripts/failover-events-collect.ps1.
+
+function ConvertFrom-DockerLogLine {
+    <#
+    .SYNOPSIS
+        Split a `docker logs --timestamps` line into its instant and its text.
+    .DESCRIPTION
+        With --timestamps, docker prefixes every line (stdout AND stderr of the
+        container) with an RFC3339 instant: `2026-10-05T19:20:31.123456789Z …`.
+        Lines without the prefix (docker's own errors, blank lines) yield $null
+        — they are not container log lines and must never reach the sink.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Line)
+    if ($Line -match '^(?<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+(?<rest>.*)$') {
+        return @{ Ts = $Matches['ts']; Rest = $Matches['rest'] }
+    }
+    return $null
+}
+
+function Select-FailoverLines {
+    <#
+    .SYNOPSIS
+        ALLOWLIST sink guard: keep only parsed log lines carrying the exact
+        `[Failover]` token, drop everything else. PURE.
+    .DESCRIPTION
+        The #192 lesson applied from the start: a filter that admits more than
+        it needs ends up persisting what must never be written down. A `docker
+        logs` window contains request lines, body previews with user text, and
+        Authorization-looking strings; NONE of it may reach a persisted,
+        rotated file. The marker token is the allowlist — a line without it is
+        dropped unconditionally, whatever it looks like. Consumes the OUTPUT of
+        ConvertFrom-DockerLogLine ({Ts, Rest} records) so the kept lines keep
+        their own timestamps.
+    #>
+    param([Parameter(Mandatory = $true)]$Events)
+    $kept = @()
+    $dropped = 0
+    foreach ($e in @($Events)) {
+        if ($null -ne $e -and ([string]$e.Rest).IndexOf('[Failover]') -ge 0) {
+            $kept += $e
+        } else {
+            $dropped++
+        }
+    }
+    return @{ Kept = $kept; Dropped = $dropped }
+}
+
+function Get-FailoverLineFingerprint {
+    # (ts, line) — the pair AC4 of #347 names. Two windows that overlap
+    # re-request the boundary line; the fingerprint makes the re-read a skip.
+    param([Parameter(Mandatory = $true)]$Event)
+    return ('{0}|{1}' -f $Event.Ts, $Event.Rest)
+}
+
+function Select-NewFailoverLines {
+    <#
+    .SYNOPSIS
+        Drop lines already written in a previous window, carry a bounded ring
+        of fingerprints forward. PURE.
+    .DESCRIPTION
+        Same window-boundary reasoning as Select-NewDockerEvents: the watermark
+        is the instant the docker-logs process EXITED, so a line the daemon
+        flushed after that instant is re-requested next tick and arrives twice.
+        Without this, one wall reads as two.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Events,
+        $Seen = @(),
+        [int]$SeenCap = 200
+    )
+    $ring = @()
+    foreach ($s in @($Seen)) { if ($null -ne $s) { $ring += [string]$s } }
+    $kept = @()
+    $skipped = @()
+    foreach ($e in @($Events)) {
+        $fp = Get-FailoverLineFingerprint -Event $e
+        if ($ring -contains $fp) { $skipped += $fp; continue }
+        $kept += $e
+        $ring += $fp
+    }
+    if ($ring.Count -gt $SeenCap) {
+        $ring = $ring[($ring.Count - $SeenCap)..($ring.Count - 1)]
+    }
+    return @{ Kept = $kept; Skipped = $skipped; Seen = $ring }
+}
+
+function Get-FailoverNextSince {
+    <#
+    .SYNOPSIS
+        The watermark for the next window — and NEVER backwards. PURE.
+    .DESCRIPTION
+        The watermark is the instant the CURRENT window was opened (measured
+        BEFORE the docker call), NOT the instant it returned. The difference is
+        load-bearing: `docker logs --since` snapshots the log when the daemon is
+        asked but returns seconds later while it streams the dump, so a line
+        written in between is absent from this window AND earlier than a
+        return-instant watermark — read by neither, ever (measured on the live
+        hub 05/10: 22 markers at 15:57:18-25Z, tick opened 15:57:16.5 and
+        returned 15:57:29). Anchoring on the open instant makes the next window
+        overlap this one by the call's own latency; the dedup ring drops the
+        re-read.
+        A FAILED invocation holds the previous watermark (AC3 of #347): a
+        collector that advances over a window it did not read silently writes
+        off the unread range. Never-backwards guards a clock skew between the
+        host and whatever wrote the previous state.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][bool]$InvocationOk,
+        [string]$WindowStartUtc = '',
+        [string]$PreviousSinceUtc = ''
+    )
+    if (-not $InvocationOk) { return @{ SinceUtc = $PreviousSinceUtc; Reason = 'held-not-measured' } }
+    if ([string]::IsNullOrWhiteSpace($WindowStartUtc)) {
+        return @{ SinceUtc = $PreviousSinceUtc; Reason = 'held-no-window-start' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PreviousSinceUtc) -and
+        $WindowStartUtc -lt $PreviousSinceUtc) {
+        return @{ SinceUtc = $PreviousSinceUtc; Reason = 'held-never-backwards' }
+    }
+    return @{ SinceUtc = $WindowStartUtc; Reason = 'window-start' }
+}
 #endregion
 
 Export-ModuleMember -Function @(
@@ -1903,6 +2029,12 @@ Export-ModuleMember -Function @(
     'Get-DockerEventsRotationPlan'
     'Add-DockerEventsTickRecord'
     'Invoke-DockerEventsBounded'
+
+    'ConvertFrom-DockerLogLine'
+    'Select-FailoverLines'
+    'Get-FailoverLineFingerprint'
+    'Select-NewFailoverLines'
+    'Get-FailoverNextSince'
     'Get-ClaudishServingBase'
     'Resolve-ClaudishProbeUrl'
     'Get-LoopbackProbeUrl'
