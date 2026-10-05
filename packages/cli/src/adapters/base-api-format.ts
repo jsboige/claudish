@@ -317,6 +317,23 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
   }
 
   /**
+   * Whether ONE history thinking block is exempt from the strip
+   * ComposedHandler runs when preserveThinkingInHistory() is false.
+   *
+   * The boolean above is all-or-nothing (DeepSeek needs every block); this
+   * per-block hook exists for the case where a provider must keep its OWN
+   * thinking blocks while foreign ones (an Anthropic signature carried in by
+   * a session that switched models mid-conversation) must still be stripped —
+   * MiniMax under a `forced` policy (#324 B1). Consulted ONLY inside the
+   * strip loop, so it has no effect on the reasoningRoundtrip conversion
+   * (which reads the boolean, not this). Default false: every block is
+   * stripped, exactly the behavior before this hook existed.
+   */
+  preserveThinkingBlock(_block: unknown): boolean {
+    return false;
+  }
+
+  /**
    * Rewrite every tool name in this payload into what the wire accepts, and
    * record the way back.
    *
