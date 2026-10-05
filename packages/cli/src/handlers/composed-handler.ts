@@ -1666,6 +1666,31 @@ export function isTransientOverload(status: number, errorText: string): boolean 
 }
 
 /**
+ * #299-B — the class the cascade's one-shot overload walk answers to: a
+ * provider overload in either of its wire shapes. A bare 529 is the shape the
+ * proxy itself surfaces once the patient backoff is exhausted (the 429/503
+ * overload forms convert to 529 above); `isTransientOverload` covers the
+ * 429-with-overloaded-body and 503 forms that reach the cascade directly.
+ * #298 A adds the third shape: HTTP 400 + `"connection_error"` — the proxy's
+ * own synthesis of a transport failure to the nominal (#302, credit po-2025).
+ *
+ * Deliberately NOT folded into isTransientOverload: that predicate also gates
+ * the ~5-minute patient backoff, and a 529 entering it would delay every
+ * overloaded turn by minutes before the walk could run — the 2026-10-02 hub
+ * measurement shows sustained 529s, where a fast walk to a healthy step beats
+ * a patient wait on a provider already refusing ~30 % of attempts.
+ */
+export function isOverloadWalkClass(status: number, errorText: string): boolean {
+  // #298 A (clause carried over from #302, credit po-2025): a connection
+  // failure TO the nominal provider is synthesized as HTTP 400 with a
+  // `"connection_error"` code in the body (`connection-error.ts`) — same
+  // "unreachable, not walled" class as an overload, and the client cannot
+  // retry its way out of it any better than a 529.
+  if (status === 400 && errorText.includes('"connection_error"')) return true;
+  return status === 529 || isTransientOverload(status, errorText);
+}
+
+/**
  * Return a human-readable recovery hint based on HTTP status and error body.
  *
  * Exported for tests: this hint is the line an operator reads first, and a wrong
