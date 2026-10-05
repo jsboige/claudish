@@ -12,6 +12,12 @@
 #     which of the two happened.
 #   - major bump available -> NO edit; event 'major-ask' (worker relays ASK on
 #     the dashboard + registers the user question — the user arbitrates).
+#   - routing CURRENT but CLAUDISH_FAILOVER_ROLE_MODELS missing a pattern for a
+#     family it already tracks -> event 'role-alias-ask' (report-only). This is
+#     the hole the routing repin leaves behind: parseRoleAliases matches a
+#     lowercased SUBSTRING, so 'gpt-6-sol' does not cover 'gpt-6.1-sol' and a
+#     client naming the current id loses the cascade entirely. Checked on every
+#     run, including runs where routing needs no change (2026-10-05 driver).
 #   - nothing new -> one info line, zero writes.
 #
 # Phase 1 provider: Codex / ChatGPT backend (where minor churn bites — the
@@ -38,6 +44,10 @@ param(
     [string]$ClaudishHome = 'C:\Users\jsboi\.claudish',
     [string]$OAuthPath = 'D:\claudish-shadow\config\codex-oauth.json',
     [string]$DrainScript = 'D:\dev\claudish\scripts\claudish-drain.ps1',
+    # Hub env file — read ONLY for the CLAUDISH_FAILOVER_ROLE_MODELS line (never
+    # logged beyond that value, which carries no secret; the file itself holds
+    # CLAUDISH_PROXY_KEY and must never be dumped).
+    [string]$EnvFile = 'D:\claudish-shadow\.env',
     [switch]$DryRun
 )
 
@@ -118,6 +128,49 @@ $watchedProviders = @('cx@', 'codex@')
 $decisions = Compare-RoutingToFamilies -Routing $config.routing -AvailableIds $available -WatchedProviders $watchedProviders
 $pending = @($decisions | Where-Object { $_.Action -ne 'current' })
 & $logTs ("decisions: " + (($decisions | ForEach-Object { "$($_.Family)/$($_.Action)[$($_.Spelling): $($_.CurrentId)->$($_.LatestId)]" }) -join ' ; '))
+
+# --- 2b. Role-alias drift (runs even when routing is already current) --------
+#
+# PLACEMENT IS LOAD-BEARING: this block sits ABOVE the `pending.Count -eq 0`
+# exit. The drift it hunts is precisely the STEADY STATE — routing already
+# current, the alias table left behind by an earlier bump — so a check placed
+# after that exit would never fire on the one case it exists for. Measured
+# 2026-10-05: gpt-6.1-sol was repinned in routing on 02/10, ROLE_MODELS still
+# carried only gpt-6-sol/gpt-5.6-sol, and the gap went unseen for three days
+# while a single session burned the OpenAI plan on the unprotected id.
+#
+# REPORT-ONLY, deliberately: ROLE_MODELS lives in the hub's env, and changing it
+# needs a drained recreate — an operator act, exactly like the cascades. The
+# event names the alias to add; nothing here writes to the env.
+$roleModels = ''
+if (Test-Path -LiteralPath $EnvFile) {
+    try {
+        $envText = [System.IO.File]::ReadAllText($EnvFile)
+        foreach ($line in @($envText -split "`n")) {
+            if ($line -like 'CLAUDISH_FAILOVER_ROLE_MODELS=*') {
+                $roleModels = $line.Substring($line.IndexOf('=') + 1).Trim()
+                break
+            }
+        }
+    } catch { & $logTs "role-models read failed (non-fatal, check skipped): $($_.Exception.Message)" }
+}
+if ($roleModels) {
+    $drift = @(Compare-RoleModelsToRouting -Routing $config.routing -RoleModels $roleModels)
+    if ($drift.Count -eq 0) {
+        & $logTs "role aliases: no drift — every tracked family member is covered by a pattern"
+    } else {
+        foreach ($r in $drift) {
+            & $logTs "ROLE-ALIAS DRIFT: routing serves '$($r.Id)' (spelling $($r.Spelling)) but no ROLE_MODELS pattern covers it — a client naming that id resolves to no role and gets NO cascade; suggest '$($r.Suggested)'"
+            if (-not $DryRun) {
+                Write-VersionEvent -EventsPath $eventsPath -Kind role-alias-ask -Family $r.Family `
+                    -To $r.Id `
+                    -Detail "CLAUDISH_FAILOVER_ROLE_MODELS has no pattern covering '$($r.Id)' (routing spelling '$($r.Spelling)'): parseRoleAliases matches a lowercased SUBSTRING, so the older spelling's alias does not cover it. A client naming the current id resolves to no role and loses the cascade entirely. Suggested addition: $($r.Suggested) — env change + drained recreate, operator act."
+            }
+        }
+    }
+} else {
+    & $logTs "role aliases: no CLAUDISH_FAILOVER_ROLE_MODELS line in $EnvFile (absent or unreadable) — drift check skipped"
+}
 
 if ($pending.Count -eq 0) { exit 0 }
 

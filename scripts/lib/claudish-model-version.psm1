@@ -136,6 +136,88 @@ function Compare-RoutingToFamilies {
     return $decisions
 }
 
+function Compare-RoleModelsToRouting {
+    # CLAUDISH_FAILOVER_ROLE_MODELS maps a REQUESTING-model pattern to a role so
+    # a client that names the nominal model (instead of a role keyword) still
+    # gets cascade protection. fork/failover.ts `parseRoleAliases` matches the
+    # pattern as a LOWERCASE SUBSTRING of the requested id — so an alias written
+    # for an older spelling does NOT cover the newer one: 'gpt-6-sol' is not a
+    # substring of 'gpt-6.1-sol' (the '.1' sits between).
+    #
+    # Measured 2026-10-05: routing was repinned to gpt-6.1-sol on 02/10 while
+    # ROLE_MODELS still carried only gpt-6-sol/gpt-5.6-sol, so every client
+    # naming the CURRENT id resolved to no role and had NO cascade at all. The
+    # routing watcher could not see this — it repins ROUTING, not the alias
+    # table — so the hole reopened at every id bump.
+    #
+    # Emits a row ONLY when the alias table already tracks the id's family (some
+    # alias names an older member of it) and this member is uncovered: the table
+    # clearly intends to cover that family, so a missing member is a real gap.
+    # A family with no alias at all is not tracked and stays silent — the check
+    # can never invent work. Role is inherited from the family's existing alias.
+    #   @{ Spelling; Id; Family; Suggested }
+    param(
+        [Parameter(Mandatory = $true)]$Routing,
+        [AllowEmptyString()][string]$RoleModels = ''
+    )
+
+    $aliasRole = @{}
+    foreach ($piece in @($RoleModels -split ',')) {
+        $p = ([string]$piece).Trim()
+        if (-not $p) { continue }
+        $parts = $p -split ':'
+        if ($parts.Count -lt 2) { continue }
+        $pat = $parts[0].Trim().ToLower()
+        $role = $parts[1].Trim().ToLower()
+        if (-not $pat -or -not $role) { continue }
+        $aliasRole[$pat] = $role
+    }
+
+    # Which families does the alias table actually track, and under which role?
+    $familyRole = @{}
+    foreach ($pat in @($aliasRole.Keys)) {
+        $v = ConvertTo-ModelVersion -Id $pat
+        if ($null -ne $v) { $familyRole[$v.Family] = $aliasRole[$pat] }
+    }
+
+    # One row per DISTINCT served id, never per spelling: several spellings
+    # routinely resolve to the same target (gpt-6-sol / gpt-5.6-sol /
+    # gpt-6.1-sol all -> cx@gpt-6.1-sol here), and the fix is ONE alias — three
+    # rows for it would read as three problems. When one of the spellings IS the
+    # id, prefer it, so the report names the spelling a client would actually
+    # type rather than an older alias that happens to point at the same target.
+    $byId = [ordered]@{}
+    foreach ($prop in $Routing.PSObject.Properties) {
+        foreach ($target in @($prop.Value)) {
+            $model = ([string]$target -split '@')[-1]
+            $low = $model.ToLower()
+            $covered = $false
+            foreach ($pat in @($aliasRole.Keys)) {
+                if ($low.Contains($pat)) { $covered = $true; break }
+            }
+            if ($covered) { continue }
+            $v = ConvertTo-ModelVersion -Id $model
+            if ($null -eq $v) { continue }
+            if (-not $familyRole.ContainsKey($v.Family)) { continue }
+            $spelling = $prop.Name
+            if ($byId.Contains($model)) {
+                $prev = $byId[$model]
+                if ($spelling -eq $model -and $prev.Spelling -ne $model) { $prev.Spelling = $spelling }
+                continue
+            }
+            $byId[$model] = @{
+                Spelling  = $spelling
+                Id        = $model
+                Family    = $v.Family
+                Suggested = ($model + ':' + $familyRole[$v.Family])
+            }
+        }
+    }
+    $rows = @()
+    foreach ($k in $byId.Keys) { $rows += $byId[$k] }
+    return $rows
+}
+
 # --- Config surgery ---------------------------------------------------------
 
 function Edit-RoutingForMinor {
@@ -221,7 +303,7 @@ function Write-VersionEvent {
     # workspace dashboard — a scheduled task cannot call the MCP itself.
     param(
         [Parameter(Mandatory = $true)][string]$EventsPath,
-        [Parameter(Mandatory = $true)][ValidateSet('minor-applied', 'major-ask', 'probe-fail', 'error', 'info')][string]$Kind,
+        [Parameter(Mandatory = $true)][ValidateSet('minor-applied', 'major-ask', 'role-alias-ask', 'probe-fail', 'error', 'info')][string]$Kind,
         [Parameter(Mandatory = $true)][string]$Family,
         [string]$From = '',
         [string]$To = '',
@@ -301,5 +383,6 @@ function Get-ReloadMode {
 
 Export-ModuleMember -Function `
     ConvertTo-ModelVersion, Get-LatestFamilyVersion, Compare-RoutingToFamilies, `
+    Compare-RoleModelsToRouting, `
     Edit-RoutingForMinor, Write-VersionEvent, Test-ClaudishOptIn, `
     Test-ProbeAccepted, Test-ModelRetired, Get-ReloadMode

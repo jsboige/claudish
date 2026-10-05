@@ -352,3 +352,73 @@ Describe 'Write-VersionEvent / Test-ClaudishOptIn' {
         (Test-ClaudishOptIn -ClaudishHome $script:dir -Token 'enabled') | Should -Be $true
     }
 }
+
+Describe 'Compare-RoleModelsToRouting (role-alias drift, 2026-10-05)' {
+    # The drift this hunts: routing repinned to a newer MINOR while
+    # CLAUDISH_FAILOVER_ROLE_MODELS kept the older spelling. parseRoleAliases
+    # matches a lowercased SUBSTRING, so the old pattern does NOT cover the new
+    # id and a client naming the current id gets no cascade at all.
+    BeforeAll {
+        $script:routing = [pscustomobject]@{
+            'gpt-6-sol'   = @('cx@gpt-6.1-sol')   # spelling old, served id NEW
+            'gpt-5.6-sol' = @('cx@gpt-6.1-sol')
+            'gpt-6.1-sol' = @('cx@gpt-6.1-sol')
+            'gpt-6-astra' = @('cx@gpt-6-astra')
+            'glm-5.3'     = @('gc@glm-5.3')
+        }
+        # The live hub value on 2026-10-05, BEFORE the fix.
+        $script:staleRoles = 'glm-5.2:sonnet,glm-5.3:sonnet,minimax-m3:haiku,gpt-6-sol:opus,gpt-5.6-sol:opus,gpt-6-astra:fable'
+        $script:aliasDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mvalias-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:aliasDir -Force | Out-Null
+        # Build the file path HERE, not inside the It: under Pester 6 a
+        # Describe's BeforeAll and its It blocks do not share the same script
+        # scope for a variable first assigned inside an It, so a path made in
+        # the It reached Write-VersionEvent as $null and the assert then read an
+        # empty file (measured — the file header warns about exactly this shape
+        # for fixtures; it applies to paths too).
+        $script:aliasEv = Join-Path $script:aliasDir 'evt-alias.log'
+    }
+    It 'THE INCIDENT: gpt-6-sol does not cover gpt-6.1-sol (substring semantics) — drift reported with a concrete suggestion' {
+        $d = @(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels $script:staleRoles)
+        $ids = @($d | ForEach-Object { $_.Id })
+        ($ids -contains 'gpt-6.1-sol') | Should -Be $true
+        $row = @($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' })[0]
+        $row.Family | Should -Be 'gpt-sol'
+        # Role inherited from the family's existing alias (gpt-6-sol:opus)
+        $row.Suggested | Should -Be 'gpt-6.1-sol:opus'
+    }
+    It 'POSITIVE CONTROL: adding the exact suggested alias silences it' {
+        $fixed = $script:staleRoles + ',gpt-6.1-sol:opus'
+        $d = @(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels $fixed)
+        (@($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' }).Count) | Should -Be 0
+    }
+    It 'says nothing about families the alias table does not track (no invented work)' {
+        # glm-5.3 IS tracked (glm-5.3:sonnet); gpt-6-astra IS tracked (fable).
+        # A routing entry for an untracked family must stay silent.
+        $r = [pscustomobject]@{ 'mistral-medium-latest' = @('mm@mistral-medium-latest') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels $script:staleRoles).Count) | Should -Be 0
+    }
+    It 'reports once per family member, not once per spelling (3 spellings of one id -> 1 row)' {
+        $d = @(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels $script:staleRoles)
+        (@($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' }).Count) | Should -Be 1
+    }
+    It 'unreadable/empty alias string is not a drift signal (fail safe, never a false report)' {
+        (@(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels '').Count) | Should -Be 0
+        (@(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels ',:,:bogus,').Count) | Should -Be 0
+    }
+    It 'a pattern covering an unrelated id does not silence a gap (each id judged on its own substring)' {
+        # 'glm-5.3:sonnet' must not be read as covering anything but glm-5.3.
+        $r = [pscustomobject]@{ 'glm-5.4' = @('gc@glm-5.4') }
+        $roles = 'glm-5.3:sonnet'
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels $roles).Count) | Should -Be 1
+    }
+    It 'role-alias-ask is an accepted event kind (consumer parity with major-ask)' {
+        Write-VersionEvent -EventsPath $script:aliasEv -Kind role-alias-ask -Family gpt-sol -To gpt-6.1-sol -Detail 'suggest gpt-6.1-sol:opus'
+        # @() is load-bearing: Get-Content on a ONE-LINE file returns a STRING,
+        # and indexing a string yields its first character ('{'), which
+        # ConvertFrom-Json reports as "Unexpected end when reading JSON" — a
+        # misleading failure that costs a debug cycle. The sibling block gets
+        # away with (Get-Content ...)[0] only because it writes TWO lines.
+        (@(Get-Content $script:aliasEv)[0] | ConvertFrom-Json).kind | Should -Be 'role-alias-ask'
+    }
+}

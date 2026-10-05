@@ -29,6 +29,10 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      champ `detail` dit si le reload a été différé au restart quotidien ou
      déclenché immédiatement : ancien id retiré amont), `major-ask` → tag
      **ASK** (arbitrage user, la majeure seule n'arme rien),
+     `role-alias-ask` → tag **ASK** (le routage sert un id qu'aucun alias de
+     `CLAUDISH_FAILOVER_ROLE_MODELS` ne couvre : un client nommant cet id
+     résout **aucun rôle** et perd toute cascade — le `detail` porte l'alias
+     exact à ajouter ; geste opérateur = env + recreate drainé, à grouper),
      `probe-fail`/`error` → tag WARN, `info` → tag INFO (membre d'une famille sur
      un provider **non surveillé** — `oai@`, ou nu : non sondé, non touché, une
      ligne d'information, pas une action). Après relais, mettre à jour le watermark
