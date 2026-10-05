@@ -20,6 +20,10 @@ const TEMPERATURE_RANGE = { min: 0.01, max: 1.0 } as const;
 
 const DEFAULT_FORCED_BUDGET = 16000;
 
+/** MiniMax emits SHA-256-digest-shaped thinking signatures (64 lowercase hex);
+ *  an Anthropic signature is a long opaque base64 blob and never matches. */
+const MINIMAX_OWN_SIGNATURE = /^[0-9a-f]{64}$/;
+
 type MiniMaxThinkingPolicy =
   | { kind: "passthrough" }
   | { kind: "disabled" }
@@ -161,9 +165,62 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    * stream — the parser consults this only when the client did NOT itself
    * request thinking (anthropic-sse opts.clientRequestedThinking), so a
    * client that asks for thinking still receives its blocks.
+   *
+   * #295 — EXCEPT under a `forced` policy. M3 only (re)starts thinking on a
+   * tool-continuation turn when the preceding assistant turn carries its
+   * preserved thinking block (live bisect T4a/T4c), and `forced` is exactly
+   * the state "model thinks, client did not ask": filtering there strips every
+   * thinking block from every forced response, so the client never holds one,
+   * never echoes one, and the chain mutes on every continuation turn (the
+   * 1/30 production shape). Under `forced` the blocks pass through — the cost
+   * of them appearing in CC is the one the issue accepts. The leak this filter
+   * exists for (passthrough policy, unrequested thinking) is unchanged.
+   *
+   * Re-read per call like readThinkingPolicy(): the fleet flips this knob
+   * mid-flight. The forced-but-budget-doesn't-fit request also lands here
+   * unfiltered — harmless: no injection means M3 emits no thinking block,
+   * so there is nothing to pass through anyway.
    */
   override shouldFilterThinking(): boolean {
-    return true;
+    return readThinkingPolicy().kind !== "forced";
+  }
+
+  /**
+   * #324 B1 — the SECOND filter of the #295 chain, inbound side. The outgoing
+   * fix (shouldFilterThinking above) lets a `forced` response carry its
+   * thinking block to the client; this one lets the block survive the RETURN
+   * trip. ComposedHandler strips every history thinking block for non-native
+   * providers (composed-handler.ts, the preserveThinkingInHistory gate), so
+   * without this override the block the client dutifully echoes back is
+   * removed before it reaches M3, and the model falls back to the mute T4a
+   * shape on every continuation turn — the chain repaired on one wire and
+   * broken again on the other.
+   *
+   * Discriminant, from the production fixtures (not supposition): MiniMax
+   * signatures are SHA-256-digest-shaped — 64 lowercase hex chars. M3's
+   * implicit-signature shape is literally the SHA-256 of the empty string
+   * (`e3b0c442…b855`, fixtures minimax-m3-anthropic-implicit-signature
+   * r10324/r10416), M2.5's vary but stay 64-hex, and M2.5 also emits
+   * unsigned blocks (turns 2-3 of the m25 captures). An Anthropic signature
+   * is none of these: a long opaque base64 blob, always present. So under
+   * `forced`: unsigned or 64-hex ⇒ MiniMax's own, preserved (signature
+   * included — the chain needs it intact); anything else ⇒ foreign (an Opus
+   * block carried in by a session that fell to a MiniMax cascade step),
+   * still stripped — the strip's original raison d'être stands.
+   *
+   * NOT preserveThinkingInHistory(): that boolean also feeds
+   * reasoningRoundtrip in ComposedHandler's convertMessages (OpenAI wire,
+   * `reasoning_content` echo-back). MiniMax lanes run anthropic-sse, where
+   * this per-block hook is the only consulted seam, and flipping the boolean
+   * would force reasoning_content onto OpenAI-shaped MiniMax routings the
+   * policy was never measured on. Re-read per call, same rationale as
+   * readThinkingPolicy().
+   */
+  override preserveThinkingBlock(block: unknown): boolean {
+    if (readThinkingPolicy().kind !== "forced") return false;
+    const sig = (block as { signature?: unknown } | null)?.signature;
+    if (typeof sig !== "string" || sig === "") return true; // M2.5 unsigned shape
+    return MINIMAX_OWN_SIGNATURE.test(sig);
   }
 
   shouldHandle(modelId: string): boolean {

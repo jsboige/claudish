@@ -1,4 +1,19 @@
 #!/usr/bin/env pwsh
+#
+# ⚠ DEPRECATED (2026-10-04, #72) — prefer the MCP tool `claudish_traffic`.
+#
+# Measured A/B on the same 24h window of the po-2023 relay (2026-10-04):
+#   - `claudish_traffic` detected that `docker logs --since 24h` had served a
+#     ROTATED corpus (the container's current log file ends at 21:01:12Z while
+#     `--since` stopped at 19:18:27Z) and returned UNKNOWN — no verdict — with
+#     the reason. It also renders the histogram to NOW (empty trailing buckets
+#     ARE the answer) and splits cron/interactive per machine.
+#   - this script rendered a verdict on that same un-validated corpus AND
+#     emitted 2 FALSE "HANG SUSPECTS" out of `[resp] capture write error: EIO`
+#     lines — a capture-write failure (disk), not an unclosed response.
+# Keep using it only for the shapes the MCP tool does not cover (the 6h
+# surveillance cron reads this path today). Do not add new callers.
+#
 <#
 .SYNOPSIS
   Live traffic analysis from claudish-proxy docker logs.
