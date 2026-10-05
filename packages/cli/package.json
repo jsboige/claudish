@@ -18,7 +18,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "test": "bun test",
+    "test": "bun test --isolate",
     "smoke": "bun run scripts/smoke-test.ts"
   },
   "dependencies": {
