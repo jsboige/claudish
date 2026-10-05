@@ -1113,8 +1113,9 @@ export async function createProxyServer(
     const triedSteps = new Set<number>();
     let revisits = 0;
     let response: Response | undefined;
-    // #299-B: one-shot bounded — a nominal transient overload walks to step 0
-    // at most ONCE per request, whatever the loop does afterwards.
+    // #299-B: one-shot bounded — a nominal transient overload walks to the
+    // first servable cascade step at most ONCE per request, whatever the loop
+    // does afterwards.
     let overloadWalked = false;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const handler = await getHandlerForRequest(requestedModel, 0, sessionKey, bucket);

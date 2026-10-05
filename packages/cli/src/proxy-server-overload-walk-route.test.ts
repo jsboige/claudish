@@ -9,18 +9,19 @@
  * overloaded provider, then dropped. Part A (already merged) makes a relay
  * pass a hub 529 through instead of replaying it locally; part B is the hub's
  * own local serving: when the resolved target is the role's NOMINAL and it
- * fails with a transient-overload class, try the NEXT cascade step ONCE for
- * this request only — no arm, no stepFailures mark, no bucket wall, no dwell
- * pin. Same separation as the #170 re-forward (`no markFail`).
+ * fails with a transient-overload class, try the FIRST SERVABLE cascade step
+ * ONCE for this request only — no arm, no stepFailures mark, no bucket wall,
+ * no dwell pin. Same separation as the #170 re-forward (`no markFail`).
  *
  * Mutation proof (one per branch — each comment names its branch):
- *  - remove the walk (delete the `#299-B` block) ⇒ W1/W2/W5/W6/W9 go red
+ *  - remove the walk (predicate forced false) ⇒ W1/W2/W9-W14 red (measured 10/8)
  *    (client gets the original refusal, step never called);
  *  - let the walk arm (`onNominalRefusal` on the overload) ⇒ W1 red at exactly
  *    `expect(isFailoverActive("sonnet")).toBe(false)`;
  *  - drop the kill-switch read ⇒ W3 red (s0 called with the walk off);
- *  - shrink the predicate to `s === 529` ⇒ W5 (503) + W6 (429-overloaded) +
- *    W9 (400 connection_error) red, W7 (burst, negative control) stays green;
+ *  - shrink the predicate to `s === 529` ⇒ P2 (503) + P3 (429-overloaded) +
+ *    P5/W9 (400 connection_error) red, P4/W7 (burst, negative control) stay
+ *    green — the 503/429 forms are pinned on the predicate, see the P block;
  *  - drop the native-bucket exclusion ⇒ W8 red (s0 called on a native 529);
  *  - walk to `steps[0]` instead of the first servable step ⇒ W10/W11 red
  *    (walk pays a dead step / routes a role name);
@@ -30,7 +31,9 @@
  *  - drop the step arg at the TTL check (`isStepTtlFailed(fails?.[i])` —
  *    compiles, the param is optional) ⇒ W13 red — the #261 rebase hazard:
  *    a HEALTHY step closed by a future config _RESET reads servable, the
- *    closure living in the step's resetAt, not in the failure record.
+ *    closure living in the step's resetAt, not in the failure record;
+ *  - rethrow in the walk's `catch` ⇒ W14 red — the client gets a terminal
+ *    HTTP 400 routing error instead of the retryable 529 (review of #326).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -320,7 +323,7 @@ async function spin(
 
 // ---- the pins -------------------------------------------------------------------
 
-describe("#299 B — nominal transient overload walks the cascade once, zero state", () => {
+describe("#299 B — nominal transient overload walks the cascade once, zero failure state", () => {
   test("W1: nominal 529 → step 0 serves; no arm, no bucket wall, one WALK marker", async () => {
     await spin();
     resetWalk();
@@ -511,6 +514,23 @@ describe("#299 B — nominal transient overload walks the cascade once, zero sta
     // unparseable one would warn and fall back to open, and s0 would be 1).
     expect(failoverLog.some((l) => l.includes("[Failover] CLOSED sonnet[0]"))).toBe(true);
     expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 1"))).toBe(true);
+  }, 30_000);
+
+  // The walk's `catch` is load-bearing, not defensive: a step whose provider
+  // has no credential makes getHandlerForRequest THROW a RoutingError. Without
+  // the catch that throw becomes HTTP 400 "could not be routed" — terminal for
+  // Claude Code — where the original 529 would have been retried. The kimi
+  // key vars are in SANDBOX_ENV_KEYS, so the throw is guaranteed and hermetic.
+  test("W14: the walk step THROWS (no credential) → the ORIGINAL 529, no state", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "kimi@fake-kimi>s1-ep@fake-s1" });
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(529);
+    expect(calls.nm).toBe(1);
+    expect(calls.s1).toBe(0); // bounded — the throw does not walk deeper
+    expect(calls.native).toBe(0);
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 0"))).toBe(true);
   }, 30_000);
 });
 
