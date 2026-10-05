@@ -410,6 +410,26 @@ describe("#261 — config resetAt closes a healthy step (closure gesture)", () =
     expect(closed[0]).toContain(new Date(FUTURE).toISOString());
     expect(lines.some((l) => l.includes("CLOSED opus[1]"))).toBe(false);
   });
+
+  it("a dwell pin holding on a step the operator just closed yields (live closure, no recreate)", () => {
+    // The env-driven harness cannot deliver a closure to a LIVE pin (re-initing
+    // wipes the pins), so the closure is applied to the live rule object — the
+    // same in-place mutation a config reload would conceptually carry. The pin
+    // must yield: serving the pinned step would route around the closure.
+    resetFailoverForTests();
+    initFailover({
+      ...OPUS_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+      CLAUDISH_FAILOVER_SESSION_DWELL_MS: "600000",
+    });
+    const first = resolveFailoverTargetForSession("opus", "sess-closure", undefined);
+    expect(first.stepIndex).toBe(0); // pinned to step 0
+    expect(getSessionDwellPinForTests("opus", "sess-closure")).toBeDefined();
+    // The operator closes step 0 mid-session.
+    getFailoverRule("opus")!.steps[0].resetAt = new Date(FUTURE);
+    const second = resolveFailoverTargetForSession("opus", "sess-closure", undefined);
+    expect(second.stepIndex).toBe(1); // pin yielded — never route around a closure
+  });
 });
 
 // ── Per-step backoff ───────────────────────────────────────────────────────────
