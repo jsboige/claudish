@@ -908,6 +908,47 @@ describe("deep probe: quota wall vs hub death", () => {
     }
   });
 
+  // #298 b1: the success line is the only evidence that names WHERE recovery
+  // was measured (a direct upstream fetch, never the local cascade). Without
+  // it, "probe ran, silently" and "recovery without a probe" read identical —
+  // the false reading retracted on 06/10. One line per probe, success side
+  // only; failures keep their existing per-reason lines.
+  it("emits exactly one OK line on a SUCCESSFUL probe (#298 b1)", async () => {
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.join(" "));
+    };
+    try {
+      fetchImpl = async () =>
+        sseResponse(
+          'event: message_start\ndata: {"type":"message_start"}\n\n' +
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        );
+      expect(await deepProbe(state())).toBe(true);
+    } finally {
+      console.log = origLog;
+    }
+    const ok = lines.filter((l) => l.includes("[Relay] deep probe OK — message_stop after"));
+    expect(ok.length).toBe(1);
+  });
+
+  it("emits NO OK line on a failed probe — the failure line speaks (#298 b1)", async () => {
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.join(" "));
+    };
+    try {
+      fetchImpl = async () => new Response("nope", { status: 500 });
+      expect(await deepProbe(state())).toBe(false);
+    } finally {
+      console.log = origLog;
+    }
+    expect(lines.some((l) => l.includes("deep probe OK"))).toBe(false);
+    expect(lines.some((l) => l.includes("deep probe failed"))).toBe(true);
+  });
+
   it("sends NO machine header when CLAUDISH_MACHINE is unset or empty (#345)", async () => {
     const prev = process.env.CLAUDISH_MACHINE;
     try {
