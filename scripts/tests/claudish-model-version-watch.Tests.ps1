@@ -322,6 +322,20 @@ Describe 'model-version-watch.ps1 runner wiring (B1/B3)' {
         $text | Should -Match '-ProviderPrefixes \$watchedProviders'
         $text | Should -Match 'REPORT-ONLY'
     }
+    It 'role-alias drift check runs BEFORE the first OAuth early-exit - checked on every run (CR c.6005492851 M1)' {
+        # The check needs only config + env. If its call sat after the OAuth /
+        # probe / pending exits, an expired Codex OAuth or a chatgpt.com outage
+        # would silently disable a check that needs neither network nor token
+        # (CR #344 "checked on every run"). Textual order pin: the call must
+        # precede the first OAuthPath TEST — red under the M1 mutation that
+        # moves the block past the pending exit.
+        $text = Get-Content -LiteralPath $script:RunnerPath -Raw
+        $callIdx = $text.IndexOf('Compare-RoleModelsToRouting -Routing')
+        $oauthTestIdx = $text.IndexOf('Test-Path -LiteralPath $OAuthPath')
+        ($callIdx -ge 0) | Should -Be $true
+        ($oauthTestIdx -ge 0) | Should -Be $true
+        ($oauthTestIdx -gt $callIdx) | Should -Be $true
+    }
 }
 
 Describe 'Write-VersionEvent / Test-ClaudishOptIn' {
@@ -482,6 +496,23 @@ Describe 'Compare-RoleModelsToRouting (role-alias drift, 2026-10-05, reworked CR
         # requested name; the live routing key is spelled MiniMax-M3 (CR M5).
         $r = [pscustomobject]@{ 'MiniMax-M3' = @('mmc@MiniMax-M3') }
         (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'minimax-m3:haiku').Count) | Should -Be 0
+    }
+    It 'CR c.6005492851 M2: a pattern that is a substring WITHOUT the family prefix still covers the name (substring, not equality)' {
+        # The two fixtures the re-review refuted as "non-constructible". The
+        # proxy covers gpt-6.1-sol here via requested.toLowerCase().includes
+        # ('6.1-sol'). Under the equality mutant ($low -eq $a.Pattern) neither
+        # 'gpt-6-sol' nor '6.1-sol' EQUALS the key, the family guard does not
+        # save it (gpt-sol is tracked by gpt-6-sol) and a FALSE drift row gets
+        # through — replayed by the coordinator on both interpreters.
+        $r = [pscustomobject]@{ 'gpt-6.1-sol' = @('cx@gpt-6.1-sol') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'gpt-6-sol:opus,6.1-sol:opus').Count) | Should -Be 0
+    }
+    It 'CR c.6005492851 M5: an UPPERCASE routing key is covered by the lowercase alias (the key is lowercased BEFORE matching)' {
+        # Under the no-lowercase mutant ($low = $key) the .Contains comparisons
+        # turn case-sensitive, 'GPT-6.1-SOL' matches neither alias pattern, and
+        # the tracked family lets a FALSE drift ('GPT-6.1-SOL:opus') through.
+        $r = [pscustomobject]@{ 'GPT-6.1-SOL' = @('cx@gpt-6.1-sol') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'gpt-6-sol:opus,gpt-6.1-sol:opus').Count) | Should -Be 0
     }
     It 'reports once per family member, not once per spelling (3 spellings of one id -> 1 row)' {
         $d = @(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels $script:staleRoles)
