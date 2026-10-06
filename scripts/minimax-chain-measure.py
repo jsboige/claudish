@@ -18,11 +18,18 @@ pre-#324 day to validate the instrument against the known 1/30 baseline
 (negative control), then on the window archives once they land.
 
 Traps (each inherited from a sibling script or measured here):
-  1. Solid 7z archives make per-file selective reads brutal -- extract the
-     whole archive once to a scratch dir, then scan plain files.
+  1. Solid 7z archives make per-FILE selective reads brutal -- but ONE
+     targeted extraction is cheap: list first (py7zr.getnames()), compute the
+     targets from the NAMES (the model rides the resp filename; reqN and ts
+     ride both), then extract(targets=...) once -- the solid blocks are
+     decompressed once and only the ~1 GB useful set is written (measured
+     2026-10-04: 75 726 files / 26.4 GB in the archive, 1 383 MiniMax resps
+     (7.3 MB) + ~0.9 GB of pairable reqs). A full extractall costs 26 GB of
+     scratch per day of archive and a kill leaves it behind (the finally
+     never runs). --scratch picks the disk.
   2. On the containerized hub pid is ALWAYS 1 and every restart resets reqN
-     under the same pid: pair per FILE with a 35-minute timestamp window
-     (compaction-trend.py trap #2), never by (pid, reqN) alone.
+     under the same pid: pair per FILE, never by (pid, reqN) alone. See
+     trap 8 for the window.
   3. The served model rides the resp FILENAME (...-anthropic-MiniMax-M3.sse)
      and the resp header line (# parser=... model=... reqN=N pid=P); req
      filenames carry no model -- lane attribution is by pairing only.
@@ -42,10 +49,23 @@ Traps (each inherited from a sibling script or measured here):
      timeout + margin): the hub's reqN resets per restart while pid stays 1,
      so symmetric windows mis-pair a foreign-lane continuation onto a MiniMax
      resp and pollute (b) with thinking the client DID receive elsewhere.
+     And the pairing is ONE-FOR-ONE (each resp consumed once, by the CLOSEST
+     preceding req) with an `ambiguous_pair` counter: a bare any() lets both
+     reqs of a 2-candidate resp enter the denominator -- measured on the
+     04/10 listing: 1 353 resps with exactly 1 candidate, 30 with 2, 0 with
+     0 (the reqN counter reset 5x that day). Also: 1 352/1 383 = 97.8% of
+     MiniMax resps pair to a tool-continuation -- the shape of an agentic
+     role; do NOT read that share against the all-lane continuation rate.
+  9. Targeted extraction changes what the req-side gate counters MEAN: only
+     reqs that COULD pair a selected resp are extracted, so
+     `req_out_of_window` / `req_continuation_unpaired` count within the
+     extracted (pre-filtered) set, not the archive's full req population.
+     `--dir` on a full extraction restores the population-wide counts.
 
 Usage:
   python scripts/minimax-chain-measure.py --archive "G:\\...\\captures-2026-10-04.7z" \
-      [--since 2026-10-05T09:46:24Z] [--until ...] [--model-substr MiniMax] [--json out.json]
+      [--since 2026-10-05T09:46:24Z] [--until ...] [--model-substr MiniMax] [--json out.json] \
+      [--scratch D:\\big-disk-temp]
   # or point straight at an extracted/loose capture dir:
   python scripts/minimax-chain-measure.py --dir D:\\claudish-captures --since ...
 """
@@ -67,7 +87,6 @@ REQ_RE = re.compile(r"^req-(\d+)-(\d+)-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-\d+
 RESP_RE = re.compile(r"^resp-(\d+)-r(\d+)-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-\d+Z-(\w+)-(.+)\.sse$")
 TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})")
 RESP_HDR_REQN = re.compile(r"reqN=(\d+)")
-PAIR_WINDOW = timedelta(minutes=35)
 # resp ts = stream close: a resp can only follow its req, and the client's
 # 600s timeout caps the stream -- 11 min covers the cap with margin.
 PAIR_FORWARD = timedelta(minutes=11)
@@ -87,8 +106,15 @@ def parse_iso(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
-def extract_archives(archives, scratch_root):
-    """Extract each archive to scratch_root/<basename>; return the list of dirs."""
+def extract_archives(archives, scratch_root, since, until, model_substr):
+    """Targeted extraction: LIST first, compute the targets from the NAMES
+    (the model rides the resp filename; reqN + ts ride both), then one
+    extract(targets=...) per archive -- the solid blocks decompress once and
+    only the useful set is written (measured 2026-10-04: 26.4 GB packed vs
+    ~1 GB useful). A req name is a target iff it COULD pair a selected resp:
+    same reqN, ts in [resp_ts - PAIR_FORWARD, resp_ts] (11 min backwards --
+    the lane map is built from the listing, so pairing is pre-computed from
+    names alone)."""
     try:
         import py7zr
     except ImportError:
@@ -101,7 +127,40 @@ def extract_archives(archives, scratch_root):
             continue
         os.makedirs(dest, exist_ok=True)
         with py7zr.SevenZipFile(a, mode="r") as z:
-            z.extractall(path=dest)
+            names = z.getnames()
+            # selected resps: lane filter + window, from names alone
+            resp_sel = []  # (reqn, ts)
+            for n in names:
+                base = os.path.basename(n)
+                m = RESP_RE.match(base)
+                if not m or model_substr.lower() not in base.lower():
+                    continue
+                ts = parse_ts(m.group(3))
+                if ts is None or (since and ts < since) or (until and ts > until):
+                    continue
+                resp_sel.append(((m.group(2) or "0").lstrip("0") or "0", ts))
+            targets = set()
+            for n in names:
+                base = os.path.basename(n)
+                rm = RESP_RE.match(base)
+                if rm and model_substr.lower() in base.lower():
+                    ts = parse_ts(rm.group(3))
+                    if ts and (not since or ts >= since) and (not until or ts <= until):
+                        targets.add(n)
+                    continue
+                qm = REQ_RE.match(base)
+                if not qm:
+                    continue
+                qts = parse_ts(qm.group(3))
+                if qts is None or (since and qts < since) or (until and qts > until):
+                    continue
+                reqn = (qm.group(2) or "0").lstrip("0") or "0"
+                for rreqn, rts in resp_sel:
+                    if rreqn == reqn and 0 <= (rts - qts).total_seconds() <= PAIR_FORWARD.total_seconds():
+                        targets.add(n)
+                        break
+            print("extracting %d target files of %d ..." % (len(targets), len(names)))
+            z.extract(path=dest, targets=sorted(targets))
         dirs.append(dest)
     return dirs
 
@@ -139,6 +198,16 @@ def scan(dirs, since, until, model_substr):
 
     total_cont = cont_with_thinking = unpaired_cont = unparsed_req = 0
     cont_sig64 = cont_sig_unsigned = cont_sig_foreign = 0
+    ambiguous_pair = 0
+    # ONE-FOR-ONE pairing: each resp is consumed ONCE, by the CLOSEST
+    # preceding req of its reqN. A bare any() let BOTH reqs of a 2-candidate
+    # resp enter (b)'s denominator -- measured on the 04/10 listing: 1 353
+    # resps with exactly 1 candidate, 30 with 2, 0 with 0 (the hub's reqN
+    # counter reset 5x that day; a collision needs two epochs within 11 min).
+    # The consumed set is keyed by the resp's (reqN, ts) -- a resp's own ts
+    # identifies it within its reqN list.
+    consumed_resp = set()
+    # lane map for pairing: reqN -> sorted [resp ts]
     # gate counters: every skip path is COUNTED, never silent -- a 0/0 (b) that
     # is really "the parser never saw a continuation" must be loud (the exact
     # defect this field set catches: the first baseline run printed (b) 0/0 with
@@ -189,18 +258,28 @@ def scan(dirs, since, until, model_substr):
                 req_shape_skip += 1
                 continue
             # tool-continuation shape confirmed -- lane attribution by pairing.
-            # Directional: the resp ts is the stream CLOSE, so it always lands
-            # AFTER its request, bounded by the client's 600s timeout (+margin).
-            # A symmetric +/-35min window mis-attributes on reqN collisions --
-            # the hub counter resets per restart while pid stays 1 (two
-            # req-1-0001 captures 14 min apart in the 2026-10-04 sample), and a
-            # GLM-lane continuation (whose history legitimately carries thinking
-            # the client DID receive) then counts as a MiniMax one.
+            # Directional AND one-for-one: the resp ts is the stream CLOSE, so
+            # it always lands AFTER its request, bounded by the client's 600s
+            # timeout (+margin); and each resp is consumed ONCE, by the closest
+            # preceding req of its reqN (a second candidate of an already-taken
+            # resp counts as ambiguous_pair, never in the denominator -- the
+            # any() form let both in: up to 30/1352 ~= 2.2% on the 04/10 day).
             reqn = (m.group(2) or "0").lstrip("0") or "0"
             resp_ts_list = lane_reqn_ts.get(reqn)
-            if not resp_ts_list or not any(0 <= (rts - ts).total_seconds() <= PAIR_FORWARD.total_seconds() for rts in resp_ts_list):
+            best = None
+            if resp_ts_list:
+                for rts in resp_ts_list:
+                    dt = (rts - ts).total_seconds()
+                    if 0 <= dt <= PAIR_FORWARD.total_seconds() and (best is None or dt < (best - ts).total_seconds()):
+                        best = rts
+            if best is None:
                 unpaired_cont += 1
                 continue
+            key = (reqn, best)
+            if key in consumed_resp:
+                ambiguous_pair += 1
+                continue
+            consumed_resp.add(key)
             total_cont += 1
             # the preceding assistant turn: last assistant message before the
             # final user turn
@@ -239,6 +318,7 @@ def scan(dirs, since, until, model_substr):
         "resp_thinking_carriers": carriers,
         "resp_unparsed": unparsed_resp,
         "req_tool_continuation_paired": total_cont,
+        "req_continuation_ambiguous_pair": ambiguous_pair,
         "req_continuation_prev_asst_thinking": cont_with_thinking,
         "req_continuation_unpaired": unpaired_cont,
         "req_continuation_prev_asst_thinking_sig64_minimax": cont_sig64,
@@ -260,6 +340,7 @@ def main():
     ap.add_argument("--until", help="ISO 8601 upper bound")
     ap.add_argument("--model-substr", default="MiniMax", help="lane filter on the resp filename (default MiniMax)")
     ap.add_argument("--json", help="write the result JSON here")
+    ap.add_argument("--scratch", help="scratch disk/dir for the extraction (default: system temp)")
     ap.add_argument("--keep", action="store_true", help="keep the extraction scratch dir (default: removed)")
     args = ap.parse_args()
 
@@ -271,8 +352,8 @@ def main():
     dirs = list(args.dir)
     try:
         if args.archive:
-            scratch = tempfile.mkdtemp(prefix="mm-chain-")
-            dirs.extend(extract_archives(args.archive, scratch))
+            scratch = tempfile.mkdtemp(prefix="mm-chain-", dir=args.scratch)
+            dirs.extend(extract_archives(args.archive, scratch, since, until, args.model_substr))
         res = scan(dirs, since, until, args.model_substr)
     finally:
         if scratch and not args.keep:
@@ -293,8 +374,8 @@ def main():
         res["req_continuation_prev_asst_thinking_sig64_minimax"],
         res["req_continuation_prev_asst_thinking_sig_unsigned_ambiguous"],
         res["req_continuation_prev_asst_thinking_sig_foreign_base64"]))
-    print("    unpaired continuations (no MiniMax resp to attribute the lane): %d ; unparsed req/resp: %d/%d" % (
-        res["req_continuation_unpaired"], res["req_unparsed"], res["resp_unparsed"]))
+    print("    unpaired continuations (no MiniMax resp to attribute the lane): %d ; ambiguous (resp already consumed, 2-candidate): %d ; unparsed req/resp: %d/%d" % (
+        res["req_continuation_unpaired"], res["req_continuation_ambiguous_pair"], res["req_unparsed"], res["resp_unparsed"]))
     print("    req gate skips: name_mismatch=%d out_of_window=%d no_toolresult=%d shape=%d (all paths counted, none silent)" % (
         res["req_name_mismatch"], res["req_out_of_window"], res["req_no_toolresult"], res["req_shape_skip"]))
     print("(c) [ComposedHandler] Preserved lines: docker logs only -- not in captures (hub owner greps)")
