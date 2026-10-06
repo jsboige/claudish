@@ -1877,6 +1877,275 @@ function Resolve-SevenZipPath {
 
     return [pscustomobject]@{ Path = ''; Source = 'none'; Tried = @($tried); ExplicitMissing = $explicitMissing }
 }
+
+#region failover-events collector (#347, pure logic)
+# Companion of the docker-events block above, for the proxy's own [Failover]
+# log lines (ARMED / DISARMED / walled / failed / DWELL / CLOSED / RECOVERED).
+# Same doctrine: a window watermark, a dedup ring, an allowlist at the SINK,
+# and zero actuator anywhere. The glue is scripts/failover-events-collect.ps1.
+
+function ConvertFrom-DockerLogLine {
+    <#
+    .SYNOPSIS
+        Split a `docker logs --timestamps` line into its instant and its text.
+    .DESCRIPTION
+        With --timestamps, docker prefixes every line (stdout AND stderr of the
+        container) with an RFC3339 instant: `2026-10-05T19:20:31.123456789Z …`.
+        Lines without the prefix (docker's own errors, blank lines) yield $null
+        — they are not container log lines and must never reach the sink.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Line)
+    if ($Line -match '^(?<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+(?<rest>.*)$') {
+        return @{ Ts = $Matches['ts']; Rest = $Matches['rest'] }
+    }
+    return $null
+}
+
+function Select-FailoverLines {
+    <#
+    .SYNOPSIS
+        ALLOWLIST sink guard: keep only parsed log lines carrying the exact
+        `[Failover]` token, drop everything else. PURE.
+    .DESCRIPTION
+        The #192 lesson applied from the start: a filter that admits more than
+        it needs ends up persisting what must never be written down. A `docker
+        logs` window contains request lines, body previews with user text, and
+        Authorization-looking strings; NONE of it may reach a persisted,
+        rotated file. The marker token is the allowlist — a line without it is
+        dropped unconditionally, whatever it looks like. Consumes the OUTPUT of
+        ConvertFrom-DockerLogLine ({Ts, Rest} records) so the kept lines keep
+        their own timestamps.
+    #>
+    param([Parameter(Mandatory = $true)]$Events)
+    $kept = @()
+    $dropped = 0
+    foreach ($e in @($Events)) {
+        if ($null -ne $e -and ([string]$e.Rest).IndexOf('[Failover]') -ge 0) {
+            $kept += $e
+        } else {
+            $dropped++
+        }
+    }
+    return @{ Kept = $kept; Dropped = $dropped }
+}
+
+function Get-FailoverLineFingerprint {
+    # (ts, line) — the pair AC4 of #347 names. Two windows that overlap
+    # re-request the boundary line; the fingerprint makes the re-read a skip.
+    param([Parameter(Mandatory = $true)]$Event)
+    return ('{0}|{1}' -f $Event.Ts, $Event.Rest)
+}
+
+function Select-NewFailoverLines {
+    <#
+    .SYNOPSIS
+        Drop lines already written in a previous window, carry a bounded ring
+        of fingerprints forward. PURE.
+    .DESCRIPTION
+        Same window-boundary reasoning as Select-NewDockerEvents, with the
+        semantics the #347 live fix actually installed: the watermark is the
+        instant the current window was OPENED (measured BEFORE the docker call
+        — see Get-FailoverNextSince), NOT the instant the docker-logs process
+        returned. The overlap of the call's own latency is therefore DELIBERATE:
+        the next window re-requests every line flushed after the snapshot but
+        before the return, and this function is what makes the re-read a skip —
+        a line written once is written to the file exactly once. Without it one
+        wall reads as two, and without the open-instant anchor the same lines
+        would be read by neither window (the hole measured live 05/10: 22
+        markers lost at 15:57:18-25Z, fixed the same day). The ring is bounded
+        (SeenCap) so the state file carries a window's worth of fingerprints,
+        not the whole history.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Events,
+        $Seen = @(),
+        [int]$SeenCap = 200
+    )
+    $ring = @()
+    foreach ($s in @($Seen)) { if ($null -ne $s) { $ring += [string]$s } }
+    $kept = @()
+    $skipped = @()
+    foreach ($e in @($Events)) {
+        $fp = Get-FailoverLineFingerprint -Event $e
+        if ($ring -contains $fp) { $skipped += $fp; continue }
+        $kept += $e
+        $ring += $fp
+    }
+    if ($ring.Count -gt $SeenCap) {
+        $ring = $ring[($ring.Count - $SeenCap)..($ring.Count - 1)]
+    }
+    return @{ Kept = $kept; Skipped = $skipped; Seen = $ring }
+}
+
+function Get-FailoverNextSince {
+    <#
+    .SYNOPSIS
+        The watermark for the next window — and NEVER backwards. PURE.
+    .DESCRIPTION
+        The watermark is the instant the CURRENT window was opened (measured
+        BEFORE the docker call), NOT the instant it returned. The difference is
+        load-bearing: `docker logs --since` snapshots the log when the daemon is
+        asked but returns seconds later while it streams the dump, so a line
+        written in between is absent from this window AND earlier than a
+        return-instant watermark — read by neither, ever (measured on the live
+        hub 05/10: 22 markers at 15:57:18-25Z, tick opened 15:57:16.5 and
+        returned 15:57:29). Anchoring on the open instant makes the next window
+        overlap this one by the call's own latency; the dedup ring drops the
+        re-read.
+        A FAILED invocation holds the previous watermark (AC3 of #347): a
+        collector that advances over a window it did not read silently writes
+        off the unread range. Never-backwards guards a clock skew between the
+        host and whatever wrote the previous state.
+        A window the coherence probe (Test-DockerLogsSinceCoherence) ruled
+        INCOHERENT holds the watermark too, under a DISTINCT reason
+        (`held-since-served-stale-segment`): the tick is not measured, the
+        range stays unread for the next tick — a stale segment is a hole the
+        file must not certify as quiet. The stale verdict is FATAL (never
+        swallowed): a "measured" tick built on the previous rotation's segment
+        is strictly worse than a held one — it certifies a window nobody read.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][bool]$InvocationOk,
+        [string]$WindowStartUtc = '',
+        [string]$PreviousSinceUtc = '',
+        [string]$CoherenceVerdict = 'untested'
+    )
+    if ($CoherenceVerdict -eq 'stale') {
+        return @{ SinceUtc = $PreviousSinceUtc; Reason = 'held-since-served-stale-segment' }
+    }
+    if (-not $InvocationOk) { return @{ SinceUtc = $PreviousSinceUtc; Reason = 'held-not-measured' } }
+    if ([string]::IsNullOrWhiteSpace($WindowStartUtc)) {
+        return @{ SinceUtc = $PreviousSinceUtc; Reason = 'held-no-window-start' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PreviousSinceUtc) -and
+        $WindowStartUtc -lt $PreviousSinceUtc) {
+        return @{ SinceUtc = $PreviousSinceUtc; Reason = 'held-never-backwards' }
+    }
+    return @{ SinceUtc = $WindowStartUtc; Reason = 'window-start' }
+}
+
+function Test-DockerLogsSinceCoherence {
+    <#
+    .SYNOPSIS
+        Refuse to certify a `--since` window that docker served from a stale
+        (pre-rotation) segment. PURE.
+    .DESCRIPTION
+        The third hole in the "collector dead / proxy calm" ambiguity AC5 was
+        written to close — this one measured, not supposed: on the json-file
+        driver after a rotation, `docker logs --since` can serve the PREVIOUS
+        segment instead of the current one, with no error and no warning
+        (measured on ai-01 and po-2025 on 06-07/09, three epochs, three times;
+        reproduced on .46 on 04/10; po-203 does NOT have the defect;
+        traffic-live.ps1 carries a tail-depth fallback against the same
+        signature, GOTCHA #2). In that case the collector receives old lines
+        or nothing: Invoke-DockerEventsBounded returns Ok, an open-instant
+        watermark ADVANCES, and the tick records itself as a healthy quiet
+        window — the range is lost forever, by a third path.
+
+        The discriminator is the one traffic-live.ps1 measured reliable:
+        a SHORT tail probe. `docker logs <c> --tail 1 --timestamps` answers
+        "what is the newest line the container REALLY holds?" — tail never
+        lies where --since can. Fed HERE as injected data, so the verdict is
+        testable with no docker at all:
+
+          - the tail probe's newest instant is at-or-after SinceUtc, AND the
+            --since window holds NO parsed line at-or-after SinceUtc
+            (ToleranceSec of slack, for the photograph skew between the two
+            calls),          -> 'stale'   : NOT MEASURED, watermark held;
+          - newest instant BEFORE SinceUtc -> 'coherent-silent': a genuinely
+            quiet window — the right answer, traffic-live measured exactly
+            this (a `--since 1h` returning 0 lines against a newest line 4.5 h
+            old is correct, not a defect);
+          - the window itself holds a line at-or-after SinceUtc -> 'coherent':
+            the segment is the current one, stale is impossible;
+          - the probe itself failed, or the tail line cannot be parsed ->
+            'untested': hold the watermark too. A tick not measured costs one
+            tick; a swallowed window costs the history — so an inconclusive
+            probe is NEVER read as coherent.
+
+        TRANSPORT TRUTH IS THE EXIT CODE, NOT Invoke-DockerEventsBounded's
+        verdict Ok. That verdict was built for `docker events`, where error
+        text means docker refused; `docker logs` DEMUXES the container's
+        stderr to the CLI's stderr (the traffic-live GOTCHA — and the hub's
+        [Failover] markers are stderr-class), so a perfectly healthy one-line
+        tail probe can return Lines=@(), ErrorText=<the marker line> and a
+        verdict of "docker refused or could not run". Gating the probe on the
+        verdict would wedge the collector permanently: whenever the log's
+        newest line is a stderr line, every tick would be 'untested' and the
+        watermark would never advance again. Exited + Code 0 IS the transport
+        truth here; both probe streams are merged before parsing, and the
+        NEWEST parseable instant wins (docker gives no cross-stream ordering
+        guarantee). WindowLines must be the MERGED window (stdout + stderr):
+        the hub's markers are stderr-class, so adjudicating stdout alone
+        would call a window that legitimately holds them 'stale'.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$TailProbe,   # the RAW Invoke-DockerEventsBounded result of `logs --tail 1 --timestamps` (@{ Exited; Code; Lines; ErrorText })
+        [Parameter(Mandatory = $true)]$WindowLines, # string[] — the MERGED raw lines of the --since window (stdout + stderr, pre-parse)
+        [Parameter(Mandatory = $true)][string]$SinceUtc,
+        [int]$ToleranceSec = 3
+    )
+
+    if ($null -eq $TailProbe) {
+        return @{ Verdict = 'untested'; Reason = 'tail probe absent — treated as not measured' }
+    }
+    $transportOk = $false
+    try { $transportOk = ([bool]$TailProbe.Exited -and [int]$TailProbe.Code -eq 0) } catch { $transportOk = $false }
+    if (-not $transportOk) {
+        return @{ Verdict = 'untested'; Reason = 'tail probe failed (not exited or non-zero) — treated as not measured' }
+    }
+    $tailPool = @($TailProbe.Lines)
+    $tailErr = ''
+    try { $tailErr = [string]$TailProbe.ErrorText } catch { $tailErr = '' }
+    if (-not [string]::IsNullOrWhiteSpace($tailErr)) {
+        $tailPool += @($tailErr -split "`r?`n" | Where-Object { $_ })
+    }
+    $tailParsed = $null
+    $tailParsedDt = $null
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    foreach ($l in @($tailPool)) {
+        $p = ConvertFrom-DockerLogLine -Line ([string]$l)
+        if ($null -eq $p) { continue }
+        $dt = $null
+        try { $dt = [datetime]::Parse($p.Ts, $inv, $styles) } catch { $dt = $null }
+        if ($null -eq $dt) { continue }
+        if ($null -eq $tailParsedDt -or $dt -gt $tailParsedDt) { $tailParsed = $p; $tailParsedDt = $dt }
+    }
+    if ($null -eq $tailParsed) {
+        return @{ Verdict = 'untested'; Reason = 'tail probe line not parseable — treated as not measured' }
+    }
+
+    $sinceDt = $null
+    try { $sinceDt = [datetime]::Parse($SinceUtc, $inv, $styles) } catch { $sinceDt = $null }
+    if ($null -eq $sinceDt) {
+        return @{ Verdict = 'untested'; Reason = 'since instant not parseable — treated as not measured' }
+    }
+
+    $tailDt = $null
+    try { $tailDt = [datetime]::Parse($tailParsed.Ts, $inv, $styles) } catch { $tailDt = $null }
+    if ($null -eq $tailDt) {
+        return @{ Verdict = 'untested'; Reason = 'tail instant not parseable — treated as not measured' }
+    }
+
+    $threshold = $sinceDt.AddSeconds(-1 * [Math]::Abs($ToleranceSec))
+
+    if ($tailDt -lt $sinceDt) {
+        return @{ Verdict = 'coherent-silent'; Reason = ('newest container line {0} predates --since {1} — a genuinely quiet window' -f $tailParsed.Ts, $SinceUtc) }
+    }
+
+    foreach ($l in @($WindowLines)) {
+        $p = ConvertFrom-DockerLogLine -Line $l
+        if ($null -eq $p) { continue }
+        $dt = $null
+        try { $dt = [datetime]::Parse($p.Ts, $inv, $styles) } catch { $dt = $null }
+        if ($null -ne $dt -and $dt -ge $threshold) {
+            return @{ Verdict = 'coherent'; Reason = ('window holds a line at {0} at-or-after --since {1}' -f $p.Ts, $SinceUtc) }
+        }
+    }
+
+    return @{ Verdict = 'stale'; Reason = ('newest container line {0} is at-or-after --since {1}, but the --since window holds no such line — the pre-rotation segment was served' -f $tailParsed.Ts, $SinceUtc) }
+}
 #endregion
 
 Export-ModuleMember -Function @(
@@ -1903,6 +2172,13 @@ Export-ModuleMember -Function @(
     'Get-DockerEventsRotationPlan'
     'Add-DockerEventsTickRecord'
     'Invoke-DockerEventsBounded'
+
+    'ConvertFrom-DockerLogLine'
+    'Select-FailoverLines'
+    'Get-FailoverLineFingerprint'
+    'Select-NewFailoverLines'
+    'Get-FailoverNextSince'
+    'Test-DockerLogsSinceCoherence'
     'Get-ClaudishServingBase'
     'Resolve-ClaudishProbeUrl'
     'Get-LoopbackProbeUrl'
