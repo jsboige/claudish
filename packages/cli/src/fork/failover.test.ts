@@ -2427,6 +2427,112 @@ describe("#274 — role-step resolution", () => {
   });
 });
 
+// ── #331 — a role: step's TTL binds only its walled CONCRETE ───────────────────
+// Measured freeze (hub po-2025, 2026-10-04): `haiku[1]` = `role:sonnet` walled
+// 408 times, TTL escalated to the 24 h cap, while sonnet's own resolution had
+// long advanced — the delegating step's backoff measured ONE concrete the
+// delegation happened to resolve to, and `resolveSkippingFailed` tested it
+// BEFORE ever re-resolving the delegation. The fix (decision of record, issue
+// #331): markStepFailed records the concrete (`StepFailure.concrete`) and the
+// TTL of a `role:` step binds only while the delegation keeps resolving to
+// that same concrete — at the walk, at the dwell pin's servable test, and at
+// the last-step fallback. Intra-request advancement is unchanged: within one
+// request the resolution cannot move.
+describe("#331 — a role: step's TTL binds only its walled concrete", () => {
+  const env331 = (extra: Record<string, string> = {}): NodeJS.ProcessEnv =>
+    ({
+      CLAUDISH_FAILOVER_HAIKU: "mm@minimax-m3>role:sonnet>ds@deepseek-payg",
+      CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3>kimi@kimi-k3",
+      CLAUDISH_FAILOVER_ACTIVE: "haiku",
+      CLAUDISH_FAILOVER_AUTO: "1",
+      ...extra,
+    } as NodeJS.ProcessEnv);
+  // No setRoleNominalResolver: the hub shape (modelMap absent) — the
+  // delegation resolves straight into sonnet's cascade steps.
+
+  it("T1: delegation ADVANCED past the walled concrete → the delegating step is probeable again (the 24 h freeze)", () => {
+    initFailover(env331());
+    markStepFailed("haiku", 0, "minimax walled");
+    // The measured shape: the delegated attempt on mistral walled BOTH sides —
+    // the delegating step (with its concrete) and sonnet's own step 0.
+    markStepFailed("haiku", 1, "HTTP 429 from mistral via delegation", undefined, {
+      concrete: "mistral@glm-5.3",
+    });
+    markStepFailed("sonnet", 0, "mistral walled");
+    const { step, stepIndex } = resolveFailoverTarget("haiku");
+    expect(stepIndex).toBe(1); // NOT frozen, NOT the last-step fallback — probeable in the walk
+    expect(step!.target).toBe("kimi@kimi-k3"); // the delegation re-resolved to sonnet's step 1
+  });
+
+  it("T2: delegation still on the walled concrete → the freeze holds (advancement unchanged)", () => {
+    initFailover(env331());
+    markStepFailed("haiku", 0, "minimax walled");
+    markStepFailed("haiku", 1, "HTTP 429 from kimi via delegation", undefined, {
+      concrete: "kimi@kimi-k3",
+    });
+    markStepFailed("sonnet", 0, "mistral walled"); // sonnet's own walk state: resolves kimi
+    const { step, stepIndex } = resolveFailoverTarget("haiku");
+    expect(stepIndex).toBe(2); // frozen on its CURRENT concrete — the PAYG tail serves
+    expect(step!.target).toBe("ds@deepseek-payg");
+  });
+
+  it("T3: a record WITHOUT a concrete keeps the freeze (pre-#331 shape, #263 revisit re-mark)", () => {
+    initFailover(env331());
+    markStepFailed("haiku", 0, "minimax walled");
+    markStepFailed("haiku", 1, "re-selected after a concurrent clear"); // no concrete
+    markStepFailed("sonnet", 0, "mistral walled");
+    const { stepIndex } = resolveFailoverTarget("haiku");
+    expect(stepIndex).toBe(2); // conservative: absent concrete binds
+  });
+
+  it("T4: a dwell pin on a role-step whose walled concrete the delegation LEFT holds (still servable)", () => {
+    initFailover(env331({ CLAUDISH_FAILOVER_SESSION_DWELL_MS: "600000" }));
+    markStepFailed("haiku", 0, "minimax walled");
+    // Pin: the delegation resolves sonnet[0] (mistral) — the session dwells on
+    // the delegating step riding it.
+    const first = resolveFailoverTargetForSession("haiku", "sess-331");
+    expect(first.stepIndex).toBe(1);
+    expect(first.step!.target).toBe("mistral@glm-5.3");
+    // The mistral wall lands on both sides; sonnet advances to kimi.
+    markStepFailed("haiku", 1, "HTTP 429 from mistral via delegation", undefined, {
+      concrete: "mistral@glm-5.3",
+    });
+    markStepFailed("sonnet", 0, "mistral walled");
+    const second = resolveFailoverTargetForSession("haiku", "sess-331");
+    expect(second.stepIndex).toBe(1); // the pin HOLDS…
+    expect(second.step!.target).toBe("kimi@kimi-k3"); // …riding the delegation's NEW concrete
+  });
+
+  it("T5: a LAST-step delegation frozen on its current concrete surfaces the refusal (the 408-retry shape)", () => {
+    initFailover({
+      CLAUDISH_FAILOVER_HAIKU: "role:sonnet", // the production cascade shape
+      CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3>kimi@kimi-k3",
+      CLAUDISH_FAILOVER_ACTIVE: "haiku",
+      CLAUDISH_FAILOVER_AUTO: "1",
+    } as NodeJS.ProcessEnv);
+    // The refusal came through the delegation while it resolved mistral, and
+    // the delegation STILL resolves mistral (the owner-side mark landed on the
+    // nominal plane, not on sonnet[0] — mechanism (a) of the issue). Pre-#331
+    // the fallback re-served this step on EVERY request, each refusal
+    // re-marking it: the 408-wall counter. Now the refusal surfaces once.
+    markStepFailed("haiku", 0, "HTTP 429 from mistral via delegation", undefined, {
+      concrete: "mistral@glm-5.3",
+    });
+    const { step, stepIndex } = resolveFailoverTarget("haiku");
+    expect(step).toBeNull();
+    expect(stepIndex).toBe(-1);
+  });
+
+  it("T6: a #261 config closure still binds a role-step regardless of the delegation", () => {
+    // Close ONLY step 1 (position-preserved: one empty entry then the date).
+    initFailover(env331({ CLAUDISH_FAILOVER_HAIKU_RESET: ">2097-01-01T00:00:00Z" }));
+    markStepFailed("haiku", 0, "minimax walled");
+    const { step, stepIndex } = resolveFailoverTarget("haiku");
+    expect(stepIndex).toBe(2); // the operator closure speaks louder than the delegation
+    expect(step!.target).toBe("ds@deepseek-payg");
+  });
+});
+
 describe("#274 — dwell pin pins the concrete step, never the role reference", () => {
   const envDwell = (): NodeJS.ProcessEnv =>
     ({

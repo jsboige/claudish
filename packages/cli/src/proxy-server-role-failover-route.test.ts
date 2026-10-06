@@ -335,6 +335,99 @@ describe("#274 review — delegated bookkeeping through the real cascade loop", 
   }, 30_000);
 });
 
+// ── #331 — the delegating step's TTL binds only its walled CONCRETE ────────────
+// The measured freeze (hub po-2025, 2026-10-04): `haiku[1]` = `role:sonnet`
+// accumulated 408 walls with its TTL escalated to the 24 h cap, while sonnet's
+// own resolution had long advanced — the delegating step's backoff measured ONE
+// concrete the delegation happened to serve, and nothing ever re-resolved it.
+// The fix threads the failed attempt's CONCRETE into markStepFailed and makes
+// the TTL bind only while the delegation keeps resolving there. This pin runs
+// the incident through the real cascade loop, hub shape (no nominal resolver:
+// the delegation resolves straight into the target's cascade).
+describe("#331 — the delegation follows the target's advance, no 24 h freeze", () => {
+  test("R1: haiku's role:sonnet step walled on sonnet's s0 → the NEXT request follows sonnet's advance to s1 (not the direct tail)", async () => {
+    await spin();
+    // haiku: delegation first, a direct PAYG tail behind it (the post-incident
+    // mitigation shape). No sonnet nominal: the delegation lands on sonnet[0].
+    resetDelegation(
+      {
+        CLAUDISH_FAILOVER_ACTIVE: "haiku",
+        CLAUDISH_FAILOVER_HAIKU: "role:sonnet>or-ep@fake-or",
+      },
+      {}
+    );
+    wallEndpoints.add("s0"); // sonnet's s0 walls — the trigger of the incident
+
+    // Request 1: haiku → delegation → sonnet s0 → 402, marked BOTH sides with
+    // the concrete. In-request re-resolution: the delegation now resolves s1
+    // (sonnet[0] was owner-marked) — with #331 the step is probeable and the
+    // loop follows it; pre-#331 the step froze on the s0 wall and the request
+    // fell through to the direct tail instead.
+    const r1 = await postMessage("claude-haiku-4-5");
+    expect(r1.status).toBe(200);
+    expect(calls.s0).toBe(1); // paid exactly once
+    expect(calls.s1).toBe(1); // the delegation followed sonnet's advance IN-request
+    expect(calls.or).toBe(0); // the direct tail never paid — the freeze never engaged
+    // The delegating step's wall line exists (the mark that USED to freeze it).
+    expect(wallLog.some((l) => l.includes("step haiku[0]") && l.includes("count=1"))).toBe(true);
+
+    // Request 2: same session-less resolution — the delegation still resolves
+    // s1 and serves it; the direct tail stays untouched across requests.
+    const r2 = await postMessage("claude-haiku-4-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s1).toBe(2); // the delegation kept following sonnet's walk
+    expect(calls.or).toBe(0); // pre-#331: 2 (every request paid the tail)
+  }, 30_000);
+
+  // Review of #331 (06/10) point 2 — the #263 revisit re-mark used to carry
+  // NO concrete, so a role-step re-marked on that path bound for its whole
+  // backoff (count++ ⇒ up to 24 h) however far the delegation advanced later.
+  // The fix passes `{ concrete: attemptConcreteNow }`; this pin exercises the
+  // delegation-advance state that fix protects (R1's driver, walked one
+  // request further): a role-step marked against the delegation's concrete
+  // must NOT keep binding once the delegation serves a different one. The
+  // concrete-less mutation re-freezes the step: the delegation is skipped at
+  // EVERY later resolution and the direct tail pays instead (calls.or grows).
+  // The dedicated revisit drive (a mid-request TTL expiry of the delegation's
+  // wall) is NOT pinned: its scheduling is real-clock — said so on the PR.
+  test("V1: a role-step marked against the delegation's OLD concrete serves the NEW one once the delegation advanced", async () => {
+    await spin();
+    resetDelegation(
+      {
+        CLAUDISH_FAILOVER_ACTIVE: "haiku",
+        CLAUDISH_FAILOVER_HAIKU: "role:sonnet>or-ep@fake-or",
+      },
+      {}
+    );
+    wallEndpoints.add("s0"); // sonnet's s0 walls — R1's trigger
+    // Request 1 = R1's: haiku[0] (role:sonnet) pays s0's wall once — marked
+    // BOTH sides WITH the concrete (every mark site now carries it) — and the
+    // in-request re-resolution follows the advance: s1 serves.
+    const r1 = await postMessage("claude-haiku-4-5");
+    expect(r1.status).toBe(200);
+    expect(calls.s0).toBe(1); // paid exactly once
+    expect(calls.s1).toBe(1); // the in-request follow
+    expect(calls.or).toBe(0);
+    expect(wallLog.some((l) => l.includes("step haiku[0]") && l.includes("count=1"))).toBe(true);
+    // Request 2 is THE PIN: the delegation sits on s1 ≠ the record's s0, so
+    // stepTtlBinds must NOT bind haiku[0] — s1 is served again. Under the
+    // pre-fix revisit re-mark (no concrete — T3's shape) the record binds
+    // unconditionally: haiku[0] is skipped for its whole backoff and the
+    // direct tail pays (calls.or = 1). R1 stops one request earlier, so this
+    // is the seam its two-request version cannot reach.
+    const r2 = await postMessage("claude-haiku-4-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s1).toBe(2);
+    expect(calls.or).toBe(0);
+    // And request 3 keeps it true — a one-request remission would be a dwell
+    // artifact, not the binding predicate.
+    const r3 = await postMessage("claude-haiku-4-5");
+    expect(r3.status).toBe(200);
+    expect(calls.s1).toBe(3);
+    expect(calls.or).toBe(0);
+  }, 30_000);
+});
+
 // ---- re-review 01/10: the three unpinned branches --------------------------------
 //
 // (i) the SUCCESS path of a delegation. The wall path is pinned by S1-S4 above;
