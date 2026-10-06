@@ -75,7 +75,7 @@ PR_QUERY = ("query($q: String!, $cursor: String) { search(type: ISSUE, query: $q
 # PRs; REST per PR would burn the hourly budget before the month is read).
 DAILY_PR_QUERY = ("query($q: String!, $cursor: String) { search(type: ISSUE, query: $q, first: 100, "
                   "after: $cursor) { issueCount pageInfo { endCursor hasNextPage } nodes { ... on "
-                  "PullRequest { number createdAt mergedAt title body author { login } "
+                  "PullRequest { number createdAt mergedAt title body "
                   "commits(last: 100) { totalCount nodes { commit { checkSuites { totalCount } } } } "
                   "closingIssuesReferences { totalCount } } } } }")
 
@@ -211,7 +211,6 @@ def cost_metrics(prs):
     return {
         "n": n,
         "delay_median_h": _median(delays) if delays else 0.0,
-        "delay_p90_h": (sorted(delays)[int(0.9 * (len(delays) - 1))] if delays else 0.0),
         "commits_mean": (sum(commit_counts) / float(n)) if n else 0.0,
         "commits_median": _median(commit_counts) if commit_counts else 0.0,
         "ci_mean": (sum(suites) / float(n)) if n else 0.0,
@@ -356,7 +355,7 @@ def day_prs(repo, day, fetch=None):
             prs.append({"number": x["number"], "createdAt": x.get("createdAt"),
                         "mergedAt": x["mergedAt"], "closing": x["closingIssuesReferences"]["totalCount"],
                         "title_nums": t, "see_nums": see, "other_nums": other,
-                        "lane": lane_of(x.get("body")), "author": (x.get("author") or {}).get("login"),
+                        "lane": lane_of(x.get("body")),
                         "commits": x.get("commits")})
         if not s["pageInfo"]["hasNextPage"]:
             if s["issueCount"] > len(prs):
@@ -368,10 +367,15 @@ def day_prs(repo, day, fetch=None):
 
 
 def day_closed_issues(repo, day, fetch=None):
-    """Issues closed that day (any reason) — {closedAt, stateReason} dicts."""
+    """Issues closed that day (any reason) — ({closedAt, stateReason} dicts, cap).
+
+    Cap-aware exactly like day_prs (returns the cap bit): an issues search that
+    hit the 1000 cap must fail the run (exit 1), not silently undercount —
+    asymmetric treatment of the two searches of the same day was CR #366.
+    """
     fetch = fetch or gh_graphql
     q = "repo:%s is:issue closed:%s..%s" % (repo, day, day)
-    out, cursor = [], None
+    out, cursor, cap = [], None, False
     while True:
         s = fetch(ISSUE_QUERY, {"q": q, "cursor": cursor})["search"]
         for x in s["nodes"]:
@@ -379,13 +383,16 @@ def day_closed_issues(repo, day, fetch=None):
         if not s["pageInfo"]["hasNextPage"]:
             if s["issueCount"] > len(out):
                 sys.stderr.write("CAP(issues): %s reports %d, got %d\n" % (day, s["issueCount"], len(out)))
-            return out
+                cap = True
+            return out, cap
         cursor = s["pageInfo"]["endCursor"]
 
 
-def daily_series(repo, d0, d1):
+def daily_series(repo, d0, d1, fetch=None):
     """The G8 series: one row per day per workspace + an issues line per day
-    + a month summary per workspace. Ventilated by lane marker, never mixed."""
+    + a month summary per workspace. Ventilated by lane marker, never mixed.
+    `fetch` propagates to every network call — the orchestrator is pinned by
+    test (CR #366: a mutation venting every PR to UNATTRIBUTED must go red)."""
     cache, any_cap = {}, False
     month_by_ws = {}
     print("== %s — daily %s..%s (UTC merged) ==" % (repo, d0, d1))
@@ -398,14 +405,15 @@ def daily_series(repo, d0, d1):
     while d <= end:
         day = d.isoformat()
         d += timedelta(days=1)
-        prs, cap = day_prs(repo, day)
+        prs, cap = day_prs(repo, day, fetch)
         any_cap = any_cap or cap
-        closed = day_closed_issues(repo, day)
+        closed, cap = day_closed_issues(repo, day, fetch)
+        any_cap = any_cap or cap
         total, hors, swept = sweep_split(closed)
         numbers = set()
         for p in prs:
             numbers |= p["title_nums"] | p["see_nums"] | p["other_nums"]
-        types = resolve_types(repo, numbers, cache) if numbers else {}
+        types = resolve_types(repo, numbers, cache, fetch) if numbers else {}
         groups = {}
         for p in prs:
             groups.setdefault(p["lane"][1] if p["lane"] else "UNATTRIBUTED", []).append(p)
@@ -423,7 +431,7 @@ def daily_series(repo, d0, d1):
         numbers = set()
         for p in g:
             numbers |= p["title_nums"] | p["see_nums"] | p["other_nums"]
-        types = resolve_types(repo, numbers, cache) if numbers else {}
+        types = resolve_types(repo, numbers, cache, fetch) if numbers else {}
         cm, wm = cost_metrics(g), week_metrics(g, types)
         print("   %-14s n=%5d  cite=%5.1f%%  pr/title-issue mean=%.2f med=%.1f max=%d"
               % (ws, cm["n"], 100.0 * wm["any_issue_prs"] / max(1, wm["n"]),
@@ -482,6 +490,10 @@ def main():
     args = ap.parse_args()
 
     if args.daily:
+        if args.week:
+            sys.stderr.write("ERROR: --daily and --week are exclusive — --daily renders the "
+                             "whole range itself; drop --week\n")
+            return 2
         try:
             d0, _, d1 = args.daily.partition("..")
             a, b = date.fromisoformat(d0), date.fromisoformat(d1)
