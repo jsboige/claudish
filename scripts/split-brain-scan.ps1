@@ -12,16 +12,22 @@
        DUPLICATE — the one shape a split brain leaves behind at rest, since a
        single live session owns exactly one transcript.
 
-    2. Which processes are behind them, and is anything bursting?
+    2. Which processes are behind them, and did anything double-fire?
        Source: ONE unfiltered Win32_Process snapshot (CIM, not Get-Process —
        the latter fails silently on VS Code "utility-node" parents and invents
        ghost parents, measured 2026-10-04 po-2024). A claude.exe carries NO
        session id in its command line when VS Code spawns it (--output-format
        stream-json stdio), so process->session mapping is impossible by
-       design: the session check is (1), the process check is bursts and
-       orphaned ancestors. The single snapshot also serves root-ancestor
-       resolution — a per-process filtered query costs ~1.5 s each and a
-       40-process scan spent a minute on them (review #342).
+       design: the session check is (1), the process check is the double-fire
+       signature — THE SAME COMMAND STARTED TWICE in the window — never a
+       same-name burst: one Claude Code session legitimately launches several
+       MCP servers at once (launcher+server node.exe each, DISTINCT command
+       lines), so any name/threshold burst is in permanent alarm on a real
+       host (measured on ai-01, review #342: rc=1, 20 PROCESS-BURST flags on a
+       healthy machine — 21:06:27Z session start, 3 MCPs = 6 node.exe under
+       explorer.exe). The single snapshot also serves root-ancestor
+       resolution for the display — a per-process filtered query costs
+       ~1.5 s each and a 40-process scan spent a minute on them (review #342).
 
     3. Are the scheduled launchers sane?
        Source: Get-ScheduledTask, EVERY action of each task (a task with
@@ -55,20 +61,21 @@
   flag" there is a non-verdict. 2 outranks 1: a cron wrapper must never
   mistake blindness for clean.
 
+  PROCESS-BURST flags a DOUBLE-FIRE only — the same command line started
+  twice within BurstWindowSec — because a burst of DISTINCT commands is what
+  every healthy session start looks like (review #342).
+
   Flags carry ISO 8601 UTC timestamps (machine-local times drift across hosts
   and against the hub's UTC logs).
 
 .PARAMETER ActiveMinutes
   Transcript mtime window that counts as "live". Default 30.
 
-.PARAMETER BurstMin
-  Flag when this many processes of one family are born within BurstWindowSec
-  under the same root ancestor. Default 5: VS Code and MCP servers legitimately
-  spawn 2-3 children together on load, so a lower threshold is pure noise
-  (measured 2026-10-05: 3 node.exe in one second under one Code.exe is routine;
-  11 across the machine in one second is a reload). A machine-wide co-birth
-  count is ALSO printed unconditionally — the per-root grouping hides a
-  double-fire that lands under two different roots in the same second.
+.PARAMETER BurstWindowSec
+  Birth window for the PROCESS-BURST double-fire signature: two or more
+  processes launched with an IDENTICAL command line within this many seconds.
+  Default 3. A machine-wide co-birth count is ALSO printed unconditionally —
+  raw visibility, no threshold.
 
 .EXAMPLE
   pwsh -File scripts/split-brain-scan.ps1
@@ -78,8 +85,7 @@
 param(
     [int]$ActiveMinutes = 30,
     [string]$ProjectsRoot = (Join-Path $env:USERPROFILE '.claude\projects'),
-    [int]$BurstWindowSec = 3,
-    [int]$BurstMin = 5
+    [int]$BurstWindowSec = 3
 )
 
 $ErrorActionPreference = 'Continue'
@@ -164,25 +170,41 @@ foreach ($p in $procs) {
         Pid     = [int]$p.ProcessId
         Name    = $p.Name
         Started = $p.CreationDate
+        Cmd     = ("" + $p.CommandLine).Trim()
         Root    = (Get-RootAncestor ([int]$p.ProcessId))
     }
 }
 $rows | Sort-Object Started | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
 Write-Output ("  total: {0}" -f $rows.Count)
 
-foreach ($g in ($rows | Group-Object Root, Name)) {
+# PROCESS-BURST = what a double-fire IS: THE SAME COMMAND STARTED TWICE in the
+# window (review #342, ai-01 live). The earlier signature — N same-NAME
+# processes under one ROOT — flagged every Claude Code session start: one
+# session launches several MCP servers, each as launcher+server node.exe with
+# DISTINCT command lines, and Get-RootAncestor clusters the whole VS Code tree
+# under explorer.exe, so "6 node.exe in 3s" is routine, not a split-brain.
+# Signature: group by (Name, normalized command line — the arguments are kept
+# in the FLAG, exactly as DIRECT does; only equality is tested), no ancestry
+# grouping at all: a double-fire under two different roots flags too, and the
+# same MCP server armed by two sessions is a co-launch the operator wants to
+# see (a SAME-session double-spawn of one server is itself the failure).
+# Threshold 2: any second launch of an identical command inside the window is
+# a duplication, never a burst of distinct commands.
+foreach ($g in ($rows | Group-Object Name, Cmd)) {
     $sorted = $g.Group | Sort-Object Started
     for ($i = 0; $i -lt $sorted.Count; $i++) {
         $j = $i
         while (($j + 1) -lt $sorted.Count -and (($sorted[$j + 1].Started - $sorted[$i].Started).TotalSeconds -le $BurstWindowSec)) { $j++ }
-        if (($j - $i + 1) -ge $BurstMin) {
+        if (($j - $i + 1) -ge 2) {
             # UTC ISO timestamp: machine-local times drift across hosts and
             # against the hub's UTC logs (review #342). The message is built
             # before Add(): `"..." -f a, b, c` inside a method call parses as
             # several Add() arguments and -f gets one arg for four
             # placeholders (measured 2026-10-05).
             $ts = ([datetime]$sorted[$i].Started).ToUniversalTime().ToString('o')
-            $msg = "PROCESS-BURST: {0} x {1} born within {2}s under {3} (first {4})" -f (($j - $i + 1), $sorted[$i].Name, $BurstWindowSec, $sorted[$i].Root, $ts)
+            $cmd = $sorted[$i].Cmd
+            if ([string]::IsNullOrEmpty($cmd)) { $cmd = "(command line unavailable)" }
+            $msg = "PROCESS-BURST: {0} x identical {1} command born within {2}s (first {3}) -> {4}" -f (($j - $i + 1), $sorted[$i].Name, $BurstWindowSec, $ts, $cmd)
             $flags.Add($msg)
             $i = $j
         }
@@ -240,8 +262,11 @@ foreach ($t in $tasks) {
     }
 }
 # The table shows the EXECUTABLE and working directory, not the full target:
-# arguments can carry tokens verbatim (the #192 healthcheck lesson), and the
-# detail a dup/direct flag needs is never the arguments.
+# arguments can carry tokens verbatim (the #192 healthcheck lesson). The
+# PROCESS-BURST flag DOES echo the full command line — that is what the
+# double-fire signature requires (review #342); a redaction seam here would
+# have to be owned by the launcher conventions, which never embed secrets
+# (the DirectSecretArg pin lives in the task section's tests).
 $info | Sort-Object Name | Format-Table Name, State, Triggers, LastRes, Execute, WorkDir -AutoSize | Out-String -Width 220 | Write-Output
 Write-Output ("  launcher-shaped actions visible: {0}   (a NON-ELEVATED run cannot see SYSTEM tasks)" -f $info.Count)
 
@@ -290,7 +315,7 @@ if ($incomplete.Count -gt 0) {
 if ($flags.Count -eq 0) {
     # Scoped claim: this scan checks defined signatures; absence of a flag is
     # absence OF THOSE SIGNATURES, never proof that no split-brain exists.
-    Write-Output "  OK - none of the checked signatures found (duplicate session, process burst, duplicate/direct launcher, failing task result)."
+    Write-Output "  OK - none of the checked signatures found (duplicate session, double-fired command, duplicate/direct launcher, failing task result)."
 }
 Write-Output ""
 Write-Output "  Sources: transcripts (live sessions), Win32_Process (bursts), Get-ScheduledTask (launchers)."

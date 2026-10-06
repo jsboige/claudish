@@ -45,8 +45,9 @@ BeforeAll {
         [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
     }
 
-    function New-Proc([int]$procId, [int]$parentId, [string]$name, [datetime]$created) {
-        [pscustomobject]@{ ProcessId = $procId; ParentProcessId = $parentId; Name = $name; CreationDate = $created }
+    function New-Proc([int]$procId, [int]$parentId, [string]$name, [datetime]$created, [string]$cmd = '') {
+        if (-not $cmd) { $cmd = $name }
+        [pscustomobject]@{ ProcessId = $procId; ParentProcessId = $parentId; Name = $name; CreationDate = $created; CommandLine = $cmd }
     }
 
     function New-Action([string]$execute, [string]$arguments, [string]$workdir = '') {
@@ -148,35 +149,101 @@ Describe 'split-brain-scan' {
         }
     }
 
-    Context 'process bursts' {
-        It 'flags PROCESS-BURST with a UTC ISO timestamp when one root births BurstMin in the window' {
+    Context 'process bursts (double-fire signature)' {
+        It 'flags PROCESS-BURST on TWO identical commands in the window, arguments kept in the flag' {
             $base = (Get-Date).AddMinutes(-1)
             $global:SBScanState.Procs = @(
-                (New-Proc 900 899 'explorer.exe' $base.AddHours(-6))
-                (New-Proc 901 900 'Code.exe' $base.AddHours(-3))
-                (New-Proc 1101 901 'node.exe' $base.AddSeconds(-60))
-                (New-Proc 1102 901 'node.exe' $base.AddSeconds(-59.8))
-                (New-Proc 1103 901 'node.exe' $base.AddSeconds(-59.6))
-                (New-Proc 1104 901 'node.exe' $base.AddSeconds(-59.4))
-                (New-Proc 1105 901 'node.exe' $base.AddSeconds(-59.2))
-                (New-Proc 1106 901 'node.exe' $base.AddSeconds(-59.0))
+                (New-Proc 900 899 'explorer.exe' $base.AddHours(-6) 'explorer')
+                (New-Proc 901 900 'claude.exe' $base.AddSeconds(-60) 'claude.exe --resume sess-1 --print')
+                (New-Proc 902 900 'claude.exe' $base.AddSeconds(-59.5) 'claude.exe --resume sess-1 --print')
             )
             $r = Invoke-Scan (New-ScanRoot)
 
-            $r.Out | Should -Match 'PROCESS-BURST: 6 x node\.exe born within 3s under explorer\.exe\(900\)'
+            $r.Out | Should -Match 'PROCESS-BURST: 2 x identical claude\.exe command born within 3s'
             # ISO 8601 UTC (review #342): machine-local drift must not survive into the flag
             $r.Out | Should -Match 'PROCESS-BURST: .*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z'
+            # arguments kept in output, as DIRECT does (review #342): the command
+            # line IS the evidence a double-fire needs
+            $r.Out | Should -Match ([regex]::Escape('claude.exe --resume sess-1 --print'))
             $r.Code | Should -Be 1
         }
 
-        It 'does NOT flag a routine VS Code load (3 children in 1s)' {
+        It 'does NOT flag a normal session start: 6 node.exe with DISTINCT commands in the window (ai-01 live shape, review #342)' {
+            # Measured live 2026-10-05 21:06:27Z on ai-01: ONE Claude Code session
+            # launching three MCP servers, launcher+server node.exe each — under the
+            # OLD signature (same name, one root, threshold) this was a permanent
+            # rc=1 alarm on a healthy machine. Distinct commands = no double-fire.
+            $base = (Get-Date).AddMinutes(-1)
+            $global:SBScanState.Procs = @(
+                (New-Proc 900 899 'explorer.exe' $base.AddHours(-6) 'explorer')
+                (New-Proc 901 900 'Code.exe' $base.AddHours(-3) 'Code.exe')
+                (New-Proc 1101 901 'node.exe' $base.AddSeconds(-60.0) 'node roo-state-manager\mcp-wrapper.cjs')
+                (New-Proc 1102 901 'node.exe' $base.AddSeconds(-59.9) 'node roo-state-manager\build\index.js')
+                (New-Proc 1103 901 'node.exe' $base.AddSeconds(-59.8) 'npx -y @playwright/mcp')
+                (New-Proc 1104 901 'node.exe' $base.AddSeconds(-59.7) 'node @playwright\mcp\cli.js')
+                (New-Proc 1105 901 'node.exe' $base.AddSeconds(-59.6) 'npx -y mcp-searxng')
+                (New-Proc 1106 901 'node.exe' $base.AddSeconds(-59.5) 'node mcp-searxng\dist\index.js')
+            )
+            $r = Invoke-Scan (New-ScanRoot)
+            # anti-vacuous: all 6 family processes must have been SEEN
+            $r.Out | Should -Match 'total: 6'
+            $r.Out | Should -Match 'machine-wide max co-births within 3s \(all roots\): 6'
+            $r.Out | Should -Not -Match 'PROCESS-BURST'
+            $r.Code | Should -Be 0
+        }
+
+        It 'flags two identical commands under DIFFERENT roots (double-fire needs no common ancestor)' {
+            # review #342: grouping by root ancestor was the defect — a double-fire
+            # landing under two different roots must flag just the same.
+            $t = (Get-Date).AddMinutes(-2)
+            $global:SBScanState.Procs = @(
+                (New-Proc 900 899 'explorer.exe' $t.AddHours(-6) 'explorer')
+                (New-Proc 800 799 'svchost.exe' $t.AddHours(-6) 'svchost -k netsvcs')
+                (New-Proc 1101 900 'claude.exe' $t 'claude.exe -p --resume same-uuid')
+                (New-Proc 1102 800 'claude.exe' $t.AddSeconds(1.5) 'claude.exe -p --resume same-uuid')
+            )
+            $r = Invoke-Scan (New-ScanRoot)
+            $r.Out | Should -Match 'total: 2'   # anti-vacuous
+            $r.Out | Should -Match 'PROCESS-BURST: 2 x identical claude\.exe'
+            $r.Code | Should -Be 1
+        }
+
+        It 'does NOT flag two identical commands OUTSIDE the window' {
+            $t = (Get-Date).AddMinutes(-2)
+            $global:SBScanState.Procs = @(
+                (New-Proc 900 899 'explorer.exe' $t.AddHours(-6) 'explorer')
+                (New-Proc 1101 900 'claude.exe' $t 'claude.exe -p --resume same-uuid')
+                (New-Proc 1102 900 'claude.exe' $t.AddSeconds(7) 'claude.exe -p --resume same-uuid')
+            )
+            $r = Invoke-Scan (New-ScanRoot)
+            $r.Out | Should -Match 'total: 2'   # anti-vacuous
+            $r.Out | Should -Not -Match 'PROCESS-BURST'
+            $r.Code | Should -Be 0
+        }
+
+        It 'flags THREE identical commands as ONE burst, not three' {
+            $t = (Get-Date).AddMinutes(-2)
+            $global:SBScanState.Procs = @(
+                (New-Proc 900 899 'explorer.exe' $t.AddHours(-6) 'explorer')
+                (New-Proc 1101 900 'claude.exe' $t 'claude.exe -p --resume triple')
+                (New-Proc 1102 900 'claude.exe' $t.AddSeconds(1) 'claude.exe -p --resume triple')
+                (New-Proc 1103 900 'claude.exe' $t.AddSeconds(2) 'claude.exe -p --resume triple')
+            )
+            $r = Invoke-Scan (New-ScanRoot)
+            $r.Out | Should -Match 'total: 3'   # anti-vacuous
+            $r.Out | Should -Match 'PROCESS-BURST: 3 x identical claude\.exe'
+            ([regex]::Matches($r.Out, 'PROCESS-BURST')).Count | Should -Be 1
+            $r.Code | Should -Be 1
+        }
+
+        It 'does NOT flag a routine VS Code load (3 children in 1s, distinct commands)' {
             $t = (Get-Date).AddSeconds(-30)
             $global:SBScanState.Procs = @(
-                (New-Proc 900 899 'explorer.exe' $t.AddHours(-6))
-                (New-Proc 901 900 'Code.exe' $t.AddHours(-3))
-                (New-Proc 1101 901 'node.exe' $t)
-                (New-Proc 1102 901 'node.exe' $t.AddMilliseconds(200))
-                (New-Proc 1103 901 'node.exe' $t.AddMilliseconds(400))
+                (New-Proc 900 899 'explorer.exe' $t.AddHours(-6) 'explorer')
+                (New-Proc 901 900 'Code.exe' $t.AddHours(-3) 'Code.exe')
+                (New-Proc 1101 901 'node.exe' $t 'node extension-host\main.js')
+                (New-Proc 1102 901 'node.exe' $t.AddMilliseconds(200) 'node utility\search.js')
+                (New-Proc 1103 901 'node.exe' $t.AddMilliseconds(400) 'node watcher.js')
             )
             $r = Invoke-Scan (New-ScanRoot)
             # anti-vacuous: the fixture must have been visible at all
@@ -200,8 +267,11 @@ Describe 'split-brain-scan' {
         It 'terminates on a parent cycle instead of looping' {
             $t = (Get-Date).AddMinutes(-5)
             $global:SBScanState.Procs = @(
-                (New-Proc 1 2 'node.exe' $t)
-                (New-Proc 2 1 'node.exe' $t)
+                # distinct commands: the pin exercises the CYCLE, not the burst —
+                # the double-fire signature would (correctly) flag two identical
+                # bare command lines
+                (New-Proc 1 2 'node.exe' $t 'node loop-a.js')
+                (New-Proc 2 1 'node.exe' $t 'node loop-b.js')
             )
             $r = Invoke-Scan (New-ScanRoot)
             $r.Out | Should -Match 'total: 2'      # anti-vacuous
