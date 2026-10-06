@@ -306,7 +306,10 @@ def test_probe_text_wrong_max_tokens_or_tools_is_not_a_probe():
                    {"ts": "2026-10-04T02-00-00-000Z", "machine": "", "model": "glm-5.2", "pid": 1,
                     "body": body})
         records, _, _ = vmh.scan_corpus(d, 10)
-        flags = [bool(r.get("probe")) for r in records]
+        # scan_corpus returns newest-mtime first; two files written back to back
+        # share an mtime only on a coarse-resolution filesystem. Order by the
+        # envelope ts, never by return order (red 5/5 on ai-01 NTFS otherwise).
+        flags = [bool(r.get("probe")) for r in sorted(records, key=lambda r: r["ts"])]
         assert flags == [True, False], flags
 
 
