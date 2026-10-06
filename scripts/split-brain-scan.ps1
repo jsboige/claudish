@@ -305,16 +305,27 @@ foreach ($t in $info) {
         # a credential in clear (review #342, the #192 healthcheck class).
         $flags.Add("DIRECT-CLAUDE-TASK: $($t.Name) launches the claude binary without the VBS/PowerShell indirection -> $($t.Execute) (arguments withheld — verify manually)")
     }
-    # Task result codes are INTERPRETED, never tested by `!= 0` — two benign
-    # codes print a non-zero LastTaskResult on a perfectly healthy task (both
-    # measured 2026-10-05, po-2025):
+    # Task result codes are INTERPRETED, never tested by `!= 0` — benign
+    # codes print a non-zero LastTaskResult on a perfectly healthy task
+    # (0x800710E0 + 0x41301 measured 2026-10-05, po-2025; the SCHED_S_*
+    # status family added on review #342, measured on ai-01: 82 tasks carry
+    # 0x41303 — every freshly registered task flags until its first run):
     #   2147946720 = 0x800710E0  MultipleInstances=IgnoreNew refused a second
     #                            start while the previous instance still runs
     #                            (#199/#205) — the healthy overlap shape.
+    #   267008     = 0x41300     SCHED_S_TASK_READY — a status, not a failure.
     #   267009     = 0x41301     SCHED_S_TASK_RUNNING = "still running".
-    # Any OTHER non-zero flags in ANY state (review #342): the Running-only
-    # test was blind to a Ready task failing on every tick.
-    $benign = 0, 2147946720, 267009
+    #   267010     = 0x41302     SCHED_S_TASK_DISABLED.
+    #   267011     = 0x41303     SCHED_S_TASK_HAS_NOT_RUN — LastRunTime holds
+    #                            the 1999 sentinel; not a ghost, not a failure.
+    #   267012     = 0x41304     SCHED_S_TASK_NO_MORE_RUNS.
+    #   267013     = 0x41305     SCHED_S_TASK_NOT_SCHEDULED.
+    #   267045     = 0x41325     SCHED_S_TASK_QUEUED.
+    # 0x41306 (267014) SCHED_S_TASK_TERMINATED is deliberately NOT benign —
+    # a killed task is a signal. Any OTHER non-zero flags in ANY state
+    # (review #342): the Running-only test was blind to a Ready task failing
+    # on every tick.
+    $benign = 0, 2147946720, 267008, 267009, 267010, 267011, 267012, 267013, 267045
     if (($null -ne $t.LastRes) -and ($benign -notcontains [long]$t.LastRes)) {
         $flags.Add(("TASK-NONZERO-RESULT: {0} State={1} LastTaskResult={2} (0x{3:X8})" -f $t.Name, $t.State, $t.LastRes, [long]$t.LastRes))
     }

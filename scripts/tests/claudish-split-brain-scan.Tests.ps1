@@ -387,6 +387,27 @@ Describe 'split-brain-scan' {
             $r.Code | Should -Be 0
         }
 
+        It 'interprets the SCHED_S_* status family as benign; a never-run Ready task (0x41303) stays unflagged' {
+            # review #342, measured on ai-01: 82 tasks carry 0x41303 — a freshly
+            # registered task cried TASK-NONZERO-RESULT on a healthy machine
+            # until its first run. Mutation proof (267011 removed from $benign):
+            # only the never-ran assertion below fails — quoted in the PR thread.
+            $global:SBScanState.Tasks = @(
+                (New-Task 'never-ran' '\Claudish\' 'Ready' 1 @((New-Action 'wscript.exe' '"D:\ops\claude-hidden-launchers.vbs"')) 267011),
+                (New-Task 'disabled-tick' '\Claudish\' 'Disabled' 1 @((New-Action 'wscript.exe' '"D:\ops\compress-captures.vbs"')) 267010),
+                (New-Task 'queued-tick' '\Claudish\' 'Ready' 1 @((New-Action 'wscript.exe' '"D:\ops\compress-captures.vbs"')) 267045),
+                (New-Task 'terminated-tick' '\Claudish\' 'Ready' 1 @((New-Action 'wscript.exe' '"D:\ops\claude-hidden-launchers.vbs"')) 267014)
+            )
+            $r = Invoke-Scan (New-ScanRoot)
+            $r.Out | Should -Match 'launcher-shaped actions visible: 4'   # anti-vacuous
+            $r.Out | Should -Not -Match ('TASK-NONZERO-RESULT: ' + [regex]::Escape('\Claudish\never-ran'))
+            $r.Out | Should -Not -Match ('TASK-NONZERO-RESULT: ' + [regex]::Escape('\Claudish\disabled-tick'))
+            $r.Out | Should -Not -Match ('TASK-NONZERO-RESULT: ' + [regex]::Escape('\Claudish\queued-tick'))
+            # 0x41306 TERMINATED deliberately stays a flag — a killed task is a signal
+            $r.Out | Should -Match ('TASK-NONZERO-RESULT: ' + [regex]::Escape('\Claudish\terminated-tick') + ' State=Ready LastTaskResult=267014 \(0x00041306\)')
+            $r.Code | Should -Be 1
+        }
+
         It 'flags a FAILING LastTaskResult even outside State=Running (ghost cron dying every tick)' {
             $global:SBScanState.Tasks = @(
                 (New-Task 'zombie-tick' '\Claudish\' 'Ready' 1 @((New-Action 'wscript.exe' '"D:\ops\claude-hidden-launchers.vbs"')) 1)
