@@ -1245,7 +1245,12 @@ export async function createProxyServer(
           // the TARGET's step otherwise.
           if (delegation) {
             if (delegation.owner.nominal) {
-              const ownerBucket = await nominalBucketOfModel(delegation.concrete);
+              // #367: the target is ALREADY CONCRETE — classify it, never
+              // re-map it (nominalBucketOfModel runs the request-side
+              // mapping: with a --model default, a keyword-free concrete
+              // booked the DEFAULT's bucket; a role-keyworded concrete booked
+              // the nominal's).
+              const ownerBucket = await concreteStepBucketOf(delegation.concrete);
               onNominalSuccess(delegation.owner.role, ownerBucket);
             } else {
               resetStepSuccess(delegation.owner.role, delegation.owner.stepIndex);
@@ -1394,7 +1399,10 @@ export async function createProxyServer(
                 if (!walk.step.roleRef) resetStepSuccess(role, walk.stepIndex);
                 if (walkDelegation) {
                   if (walkDelegation.owner.nominal) {
-                    const ownerBucket = await nominalBucketOfModel(walkDelegation.concrete);
+                    // #367 (same class as the W19 bucketer): the walk's
+                    // delegated concrete is already concrete — classify, no
+                    // request-side re-mapping.
+                    const ownerBucket = await concreteStepBucketOf(walkDelegation.concrete);
                     onNominalSuccess(walkDelegation.owner.role, ownerBucket);
                   } else {
                     resetStepSuccess(walkDelegation.owner.role, walkDelegation.owner.stepIndex);
@@ -1496,7 +1504,10 @@ export async function createProxyServer(
           markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody), {
             concrete: delegation.concrete,
           });
-          const ownerBucket = await nominalBucketOfModel(delegation.concrete);
+          // #367: already-concrete delegation target — concreteStepBucketOf
+          // (classify + route), not the request-side mapping: the delegated
+          // wall must arm the bucket the target ACTUALLY draws on.
+          const ownerBucket = await concreteStepBucketOf(delegation.concrete);
           onNominalRefusal(delegation.owner.role, reason, response.headers.get("retry-after"), errBody, ownerBucket);
         } else {
           markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody), {

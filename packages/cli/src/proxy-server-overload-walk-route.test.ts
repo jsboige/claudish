@@ -84,6 +84,7 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
   "CLAUDISH_FAILOVER_OVERLOAD_WALK", "CLAUDISH_FAILOVER_WALK_BUDGET_MS",
   "CLAUDISH_FAILOVER_SONNET", "CLAUDISH_FAILOVER_OPUS",
+  "CLAUDISH_FAILOVER_HAIKU",
   "CLAUDISH_FAILOVER_AUTO", "CLAUDISH_FAILOVER_ARM_AFTER",
   "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
@@ -232,6 +233,12 @@ function writeTestConfig(extra: Record<string, unknown> = {}): void {
         // and its own cascade step); the fetch stub checks these FIRST.
         "tr-ep": ep("tr"),
         "t2-ep": ep("t2"),
+        // W21 (#367): kw = the delegation's KEYWORD-BEARING concrete target
+        // (its own bucket kw-ep), d0 = the prefill divert target, h5 = the
+        // walking role's 529 nominal.
+        "kw-ep": ep("kw"),
+        "d0-ep": ep("d0"),
+        "h5-ep": ep("h5"),
       },
       ...extra,
     }),
@@ -622,6 +629,63 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
     } finally {
       Date.now = realNow;
     }
+  }, 30_000);
+
+  // #367 — the walk's delegated SUCCESS books the owner bucket from an
+  // ALREADY-CONCRETE target. The site used nominalBucketOfModel, whose
+  // request-side mapping re-maps a role-keyworded concrete onto
+  // modelMap[role] — here the delegation's concrete `kw-ep@fake-sonnet-kw`
+  // (its OWN bucket: kw-ep) re-mapped onto modelMap.sonnet = nom-ep@fake-nom
+  // (keyword-free) — the same defect class as the #348 walk bucketer (W19),
+  // on the walk's DELEGATED-success branch this time. The observable: a
+  // pending (opus|nom-ep) recovery seeded by a direct opus divert under a
+  // nom-ep wall gets consumed by a walk success that drew on kw-ep — a
+  // FALSE "RECOVERED opus (nom-ep)" announced while the wall is live.
+  // RED under nominalBucketOfModel-as-bucketer.
+  test("W21: a role-keyworded delegation CONCRETE books the owner bucket as ITSELF (walk success)", async () => {
+    // Proxy modelMap: sonnet/opus map to nom-ep (so the request-side bucket
+    // of a claude-opus-* request IS nom-ep), haiku maps to a dedicated 529
+    // nominal. The FAILOVER-side nominals come from the injected resolver
+    // below — opus's is keyword-bearing, the divergence #367 pins.
+    await spin({ sonnet: "nom-ep@fake-nom", opus: "nom-ep@fake-nom", haiku: "h5-ep@fake-h5" });
+    resetWalk({
+      CLAUDISH_FAILOVER_HAIKU: "role:opus",   // the walk's delegated step
+      CLAUDISH_FAILOVER_OPUS: "role:sonnet",  // the prefill divert's step
+    });
+    setRoleNominalResolver((r) =>
+      r === "opus" ? "kw-ep@fake-sonnet-kw"
+      : r === "sonnet" ? "d0-ep@fake-d0"
+      : r === "haiku" ? "h5-ep@fake-h5"
+      : undefined
+    );
+    endpointStatus.h5 = 529; // the walking role's nominal overloads
+    // opus's REQUEST-side nominal bucket (nom-ep, via the proxy modelMap)
+    // walled: a direct opus request diverts and seeds a pending recovery.
+    expect(armFailover("opus", "test: request-side nominal bucket walled", "nom-ep")).toBe(true);
+
+    // Request 1 (prefill): opus diverts under the nom-ep wall → its step
+    // role:sonnet → sonnet's (failover-side) nominal d0 → 200. Seeds
+    // servedUnderWall(opus|nom-ep).
+    const r1 = await postMessage("claude-opus-5");
+    expect(r1.status).toBe(200);
+    expect(calls.d0).toBe(1);
+
+    // Request 2 (THE PIN): haiku's nominal 529s → the walk takes the first
+    // servable step (role:opus → kw, healthy, bucket kw-ep ≠ the walled
+    // nom-ep) → delegated success → owner-side onNominalSuccess on the
+    // target's OWN bucket (kw-ep) — nothing pending there.
+    const r2 = await postMessage("claude-haiku-5");
+    expect(r2.status).toBe(200);
+    expect(calls.kw).toBe(1);
+    expect(failoverLog.some((l) => l.includes("[Failover] WALK haiku one-shot") && l.includes("kw-ep@fake-sonnet-kw"))).toBe(true);
+    expect(failoverLog.find((l) => l.includes("RECOVERED opus"))).toBeUndefined(); // no false recovery
+    expect(isBucketWalled("nom-ep")).toBe(true); // the wall is untouched
+
+    // Control: opus still diverts — nothing really recovered.
+    const r3 = await postMessage("claude-opus-5");
+    expect(r3.status).toBe(200);
+    expect(calls.d0).toBe(2);
+    expect(calls.kw).toBe(1); // the walk target is not re-paid either
   }, 30_000);
 
   // ─── #348 — the walk is paid out of the client's REMAINING patience ──────────

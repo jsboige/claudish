@@ -151,7 +151,7 @@ async function postMessage(model: string): Promise<Response> {
 }
 
 beforeEach(() => {
-  calls = { nm: 0, s0: 0, s1: 0, or: 0 };
+  calls = { nm: 0, s0: 0, s1: 0, or: 0, mm: 0 };
   wallLog = [];
   wallEndpoints = new Set(["nm"]);
   configExisted = existsSync(REAL_CONFIG_PATH);
@@ -171,6 +171,8 @@ beforeEach(() => {
         "s0-ep": ep("s0"),
         "s1-ep": ep("s1"),
         "or-ep": ep("or"),
+        // #367: the `--model` default's bucket -- never called, only bucketed.
+        "mm-ep": ep("mm"),
       },
     }),
     "utf-8"
@@ -223,11 +225,11 @@ afterEach(async () => {
   resetFailoverForTests();
 });
 
-async function spin(): Promise<void> {
+async function spin(defaultModel?: string): Promise<void> {
   activeProxy = await createProxyServer(
     PROXY_PORT,
     undefined,
-    undefined,
+    defaultModel,
     false,
     undefined,
     undefined,
@@ -544,5 +546,86 @@ describe("#274 re-review — delegated success and nested delegation", () => {
     expect(r2.status).toBe(200);
     expect(calls.s0).toBe(1);
     expect(calls.s1).toBe(1);
+  }, 30_000);
+});
+
+// ── #367 — the owner-side bucket of an ALREADY-CONCRETE delegation target ─────
+//
+// The delegated bookkeeping computed `ownerBucket` through
+// nominalBucketOfModel(delegation.concrete) — which runs the REQUEST-side
+// mapping (resolveNominalTarget) FIRST. With a `--model` default configured
+// and no proxy modelMap, a keyword-free concrete (the resolver-injected
+// nominal `nom-ep@fake-nom`) re-maps onto the DEFAULT model: the refusal
+// armed `mm-ep` and the success consumed a pending (sonnet|mm-ep) recovery
+// instead of the target's own bucket (`nom-ep`). Same defect class as the
+// #348 walk bucketer (W19): the target is already concrete — classify it,
+// don't re-map it. RED under nominalBucketOfModel-as-bucketer.
+describe("#367 — owner-side buckets of concrete delegation targets", () => {
+  // The shape both pins share: NO proxy modelMap, a `--model` default on
+  // mm-ep@fake-mm, and the delegation target = the resolver's sonnet nominal
+  // (nom-ep@fake-nom, keyword-free). Buggy nominalBucketOfModel maps it to
+  // mm-ep; the concrete bucket is nom-ep.
+  test("B1: a delegated REFUSAL arms the target's OWN bucket (nom-ep), not the --model default's (mm-ep)", async () => {
+    await spin("mm-ep@fake-mm");
+    resetDelegation({ CLAUDISH_FAILOVER_ACTIVE: "opus" });
+    // nm walls by default (beforeEach) — the delegated refusal surface.
+
+    // Request 1: opus (config-armed) → role:sonnet → sonnet's nominal (nm)
+    // walls 402. opus[0] is the last step, so the 402 surfaces.
+    const r1 = await postMessage("claude-opus-5");
+    expect(r1.status).toBe(402);
+    expect(calls.nm).toBe(1);
+    expect(calls.mm).toBe(0); // the default model is never CALLED — only mis-bucketed
+
+    // THE PIN: the delegated wall armed the TARGET's own bucket. Under
+    // nominalBucketOfModel it armed mm-ep instead — and every later opus
+    // request re-paid the walled nominal forever (the S1 failure mode,
+    // relocated to the wrong bucket).
+    expect(isBucketWalled(bucketOfNominal())).toBe(true); // nom-ep
+    expect(isBucketWalled("mm-ep")).toBe(false); // an innocent bucket, never armed
+
+    // Control (S1's second half): the NEXT opus request joins sonnet's
+    // cascade instead of hammering the walled nominal.
+    wallEndpoints.delete("nm");
+    const r2 = await postMessage("claude-opus-5");
+    expect(r2.status).toBe(200);
+    expect(calls.nm).toBe(1); // never re-paid
+    expect(calls.s0).toBe(1); // the delegation walked into the target's cascade
+  }, 30_000);
+
+  test("B2: a delegated SUCCESS must not consume a pending recovery on a bucket the target never drew on", async () => {
+    await spin("mm-ep@fake-mm");
+    resetDelegation({ CLAUDISH_FAILOVER_ACTIVE: "opus" });
+    // Sonnet's REQUEST-side nominal bucket is mm-ep (the --model default maps
+    // every name to it): wall it, so a direct sonnet request diverts to s0
+    // and seeds servedUnderWall(sonnet|mm-ep) — a pending recovery.
+    armFailover("sonnet", "test: request-side nominal bucket walled", "mm-ep");
+    wallEndpoints = new Set([]);
+
+    // Request 1 (prefill): sonnet diverts under the mm-ep wall → s0 → 200.
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(calls.s0).toBe(1);
+
+    // Request 2: opus (config-armed) → role:sonnet → sonnet's FAILOVER-side
+    // nominal (nm) is healthy → the delegation serves it → owner-side
+    // onNominalSuccess fires on the target's bucket.
+    const r2 = await postMessage("claude-opus-5");
+    expect(r2.status).toBe(200);
+    expect(calls.nm).toBe(1);
+
+    // THE PIN: the success booked against nom-ep (nothing pending there) —
+    // NO "RECOVERED sonnet" line. Under nominalBucketOfModel the owner
+    // bucket is mm-ep: the pending (sonnet|mm-ep) recovery is consumed and
+    // a FALSE "RECOVERED sonnet (mm-ep)" is announced while the wall is
+    // still live.
+    expect(wallLog.find((l) => l.includes("RECOVERED sonnet"))).toBeUndefined();
+    expect(isBucketWalled("mm-ep")).toBe(true); // the wall is untouched
+
+    // Control: sonnet's own traffic still diverts — nothing really recovered.
+    const r3 = await postMessage("claude-sonnet-5");
+    expect(r3.status).toBe(200);
+    expect(calls.s0).toBe(2);
+    expect(calls.nm).toBe(1); // the walled request-side bucket is never re-paid
   }, 30_000);
 });
