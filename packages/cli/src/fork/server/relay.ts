@@ -866,6 +866,7 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
       ],
       messages: [{ role: "user", content: "List the current directory using Bash. Do it now." }],
     });
+    const startedAt = Date.now();
     const res = await fetch(`${state.upstream}/v1/messages`, {
       method: "POST",
       headers,
@@ -897,6 +898,13 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
       if (done) break;
       acc += decoder.decode(value, { stream: true });
       if (acc.includes("message_stop")) {
+        // #298 b1: a SUCCESSFUL probe used to leave no trace — its only
+        // evidence was the "healthy again" line a cooldown later, so "the
+        // probe ran, silently" was indistinguishable from "recovery happened
+        // without a probe" (that silence produced a retracted false reading
+        // about where the probe is served, 06/10). One bounded line per
+        // probe, on the deep-probe path only — never per heartbeat.
+        log(`[Relay] deep probe OK — message_stop after ${Date.now() - startedAt}ms`, true);
         try {
           await reader.cancel();
         } catch {
