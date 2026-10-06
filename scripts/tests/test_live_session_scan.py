@@ -25,7 +25,6 @@ Or under pytest: pytest scripts/tests/test_live_session_scan.py
 import importlib.util
 import json
 import os
-import sys
 import tempfile
 import time
 
@@ -35,15 +34,14 @@ _SPEC = importlib.util.spec_from_file_location(
 lss = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(lss)
 
-FAILS = []
-
-
 def check(name, cond, detail=""):
+    """Raise on failure (repo rule, #333): a check that only records leaves the
+    pytest suite green whatever the code does — stdout is captured there, so the
+    FAIL line is never seen and no assert ever fires."""
     if cond:
         print(f"  ok   {name}")
     else:
-        print(f"  FAIL {name} {detail}")
-        FAILS.append(name)
+        raise AssertionError(f"{name} {detail}")
 
 
 def capture(model="glm-5.3", machine="myia-po-2025",
@@ -221,7 +219,4 @@ if __name__ == "__main__":
     test_end_to_end_report()
     test_deep_workdir_hint()
     print()
-    if FAILS:
-        print("FAILED: %d" % len(FAILS))
-        sys.exit(1)
     print("all checks passed")

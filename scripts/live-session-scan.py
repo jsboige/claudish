@@ -30,7 +30,10 @@ Two traps about the capture envelope, both measured on D:\claudish-captures
    from the ENVELOPE `machine` field (byte ~30, always in the head read), and
    the session uuid from `metadata.session_id` or the session_id embedded in
    the user_id string. The aggregation key stays user_id+session_id as captured,
-   whatever shape the client sent.
+   whatever shape the client sent. KNOWN LIMIT (proven on fixture, never seen on
+   the live wire): a same session whose metadata.session_id is present on some
+   requests and absent on others aggregates as TWO rows (the key is the pair as
+   captured), and the digest's session count over-counts by one per such session.
 
 Anti-echo discipline (repo rule): the DEEP pass is a real JSON parse of the
 whole file. The FAST pass never greps the message body — it reads a 6 KiB head
@@ -192,21 +195,6 @@ def session_key(rec):
     if rec["user_id"] is None and rec["session_id"] is None:
         return (UNATTRIBUTED, rec["machine"] or "?")
     return (rec["user_id"] or "", rec["session_id"] or "")
-
-
-def short_session(rec):
-    """Short display id: the uuid embedded in user_id when metadata.session_id
-    is absent (the measured hub shape keeps it inside the user_id JSON)."""
-    sid = rec["session_id"]
-    if not sid and rec["user_id"]:
-        m = re.search(r'"session_id"\s*:\s*"([0-9a-f-]{8,36})"', rec["user_id"])
-        if m:
-            sid = m.group(1)
-    if sid:
-        return sid[:8]
-    if rec["user_id"]:
-        return rec["user_id"][:12]
-    return UNATTRIBUTED
 
 
 def full_session_id(rec):
