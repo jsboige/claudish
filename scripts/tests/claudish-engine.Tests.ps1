@@ -44,6 +44,41 @@ BeforeAll {
     $script:Pwsh7OnlyScripts = @('CaptureUtils.psm1')
 }
 
+Describe 'Get-ClaudishMachineName (#345: probes must not arrive header-less)' {
+    # The producer half of the X-Claudish-Machine contract. verify-machine-header.py
+    # is the reader half and rejects any name outside the canonical roster — so
+    # these cases mirror detect_local_machine() in that script exactly. A producer
+    # that disagrees with the reader would emit an "unknown machine" finding.
+
+    It 'normalizes a real COMPUTERNAME to the canonical roster id' {
+        Get-ClaudishMachineName 'MYIA-PO-2023' | Should -Be 'myia-po-2023'
+    }
+
+    It 'is case-insensitive' {
+        Get-ClaudishMachineName 'myia-po-2023' | Should -Be 'myia-po-2023'
+    }
+
+    It 'does not double-prefix a name that already carries myia-' {
+        Get-ClaudishMachineName 'myia-ai-01' | Should -Be 'myia-ai-01'
+    }
+
+    It 'prefixes a bare hostname' {
+        Get-ClaudishMachineName 'WEB1' | Should -Be 'myia-web1'
+    }
+
+    It 'trims surrounding whitespace' {
+        Get-ClaudishMachineName '  MYIA-PO-2025  ' | Should -Be 'myia-po-2025'
+    }
+
+    It 'returns $null for an absent or blank hostname — never a wrong id' {
+        # A wrong value forks attribution, which is worse than no header at all:
+        # the caller sends NOTHING when this is $null.
+        Get-ClaudishMachineName $null     | Should -BeNullOrEmpty
+        Get-ClaudishMachineName ''        | Should -BeNullOrEmpty
+        Get-ClaudishMachineName '   '     | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Get-ClaudishServingBase' {
     It 'returns $null when no base-url.txt exists (the fleet-wide default)' {
         Get-ClaudishServingBase -ClaudishHome $TestDrive | Should -BeNullOrEmpty

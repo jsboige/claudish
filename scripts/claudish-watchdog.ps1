@@ -136,6 +136,13 @@ function Test-ProxyWithTools {
     } catch {}
     $headers = @{}
     if ($proxyKey) { $headers["x-proxy-key"] = $proxyKey }
+    # #345: identify this probe to the hub so central attribution files it under
+    # THIS machine instead of a header-less phantom lane. COMPUTERNAME is
+    # 'MYIA-PO-2023'; Get-ClaudishMachineName normalizes it to the canonical
+    # roster id. $null -> send nothing at all, never a wrong id (a wrong one
+    # forks attribution, which is worse than a missing one).
+    $machineId = Get-ClaudishMachineName $env:COMPUTERNAME
+    if ($machineId) { $headers["X-Claudish-Machine"] = $machineId }
 
     # Wall-clock bound — and why this is NOT `Invoke-WebRequest -TimeoutSec`.
     # That parameter bounds only *establishing* the response; it does not bound

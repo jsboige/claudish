@@ -891,6 +891,46 @@ describe("deep probe: quota wall vs hub death", () => {
     expect(lastFetch!.init.headers["x-proxy-key"]).toBe("k");
     expect(lastFetch!.init.headers["x-api-key"]).toBeUndefined();
   });
+
+  // #345: the probe is claudish's OWN traffic and must not arrive header-less —
+  // it read as a phantom attribution lane until verify-machine-header.py learned
+  // to separate it by shape.
+  it("identifies itself with X-Claudish-Machine when CLAUDISH_MACHINE is set (#345)", async () => {
+    const prev = process.env.CLAUDISH_MACHINE;
+    try {
+      process.env.CLAUDISH_MACHINE = "myia-po-2023";
+      fetchImpl = async () => new Response("nope", { status: 500 });
+      await deepProbe(state());
+      expect(lastFetch!.init.headers["X-Claudish-Machine"]).toBe("myia-po-2023");
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDISH_MACHINE;
+      else process.env.CLAUDISH_MACHINE = prev;
+    }
+  });
+
+  it("sends NO machine header when CLAUDISH_MACHINE is unset or empty (#345)", async () => {
+    const prev = process.env.CLAUDISH_MACHINE;
+    try {
+      // compose injects every listed name as at least "", and "" is NOT nullish
+      // (#310) — an unset/empty name must yield NO header, never a `X-Claudish-
+      // Machine: ` that the hub would file as a nameless machine.
+      delete process.env.CLAUDISH_MACHINE;
+      fetchImpl = async () => new Response("nope", { status: 500 });
+      await deepProbe(state());
+      expect(lastFetch!.init.headers["X-Claudish-Machine"]).toBeUndefined();
+
+      process.env.CLAUDISH_MACHINE = "";
+      await deepProbe(state());
+      expect(lastFetch!.init.headers["X-Claudish-Machine"]).toBeUndefined();
+
+      process.env.CLAUDISH_MACHINE = "   ";
+      await deepProbe(state());
+      expect(lastFetch!.init.headers["X-Claudish-Machine"]).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDISH_MACHINE;
+      else process.env.CLAUDISH_MACHINE = prev;
+    }
+  });
 });
 
 // ── relayHealthFields (#157): /health must say the ROLE, origin-only ──

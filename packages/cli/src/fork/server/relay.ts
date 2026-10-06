@@ -781,6 +781,24 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
 }
 
 /**
+ * Canonical fleet id for THIS process, or `""` when unknown (#345).
+ *
+ * Sourced from `CLAUDISH_MACHINE`, which `install-sidecar.ps1 -Machine` writes
+ * into the per-machine `.env` (compose injects it — a name absent from the
+ * compose list never reaches the container, #304). Deliberately NOT derived
+ * from the host: inside a container `os.hostname()`/`HOSTNAME` is the container
+ * id and `COMPUTERNAME` is the engine's, never the machine's — a WRONG value
+ * here is worse than none, because it forks attribution (the exact defect
+ * `verify-machine-header.py` exists to catch). Read per call, like every
+ * runtime knob here; empty = send no header (= the hub, where the relay branch —
+ * and therefore this probe — never runs).
+ */
+function machineName(): string {
+  const v = process.env.CLAUDISH_MACHINE;
+  return typeof v === "string" ? v.trim() : "";
+}
+
+/**
  * Deep probe (port of scripts/claudish-watchdog.ps1 Test-ProxyWithTools): a real
  * tool-call stream must complete with a terminal `message_stop`. Confirms the
  * WHOLE pipeline works — not just that /health answers — before returning to
@@ -816,6 +834,12 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (state.proxyKey) headers["x-proxy-key"] = state.proxyKey;
+    // #345: identify ourselves so the hub attributes this probe to its machine
+    // instead of filing it as a header-less phantom lane. Only when the name is
+    // known — an unset CLAUDISH_MACHINE keeps the request byte-identical to
+    // before, which is the hub's case (no relay branch, so no probe at all).
+    const machine = machineName();
+    if (machine) headers["X-Claudish-Machine"] = machine;
     const body = JSON.stringify({
       model: "glm-5.3",
       max_tokens: 100,

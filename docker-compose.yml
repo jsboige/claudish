@@ -79,6 +79,14 @@ services:
       - CLAUDISH_RELAY_COMPRESS=${CLAUDISH_RELAY_COMPRESS:-}
       - CLAUDISH_RELAY_HEADER_TIMEOUT_MS=${CLAUDISH_RELAY_HEADER_TIMEOUT_MS:-}
       - CLAUDISH_NO_ANTHROPIC=${CLAUDISH_NO_ANTHROPIC:-}
+      # Canonical fleet id (e.g. myia-po-2024), written into the sidecar .env by
+      # `install-sidecar.ps1 -Machine`. Attached to THIS process's own liveness
+      # probe (relay deepProbe) so hub attribution files it as the machine's
+      # traffic instead of a header-less phantom lane (#345). Empty = probes stay
+      # header-less — the hub's own case, where the relay branch (and therefore
+      # the probe) never runs. Listed here because the env file only
+      # interpolates: a name absent from this list never reaches the container.
+      - CLAUDISH_MACHINE=${CLAUDISH_MACHINE:-}
       # Native credential guard kill switch (#296): only an explicit "0" disarms;
       # empty = guard on. Listed here because the env file only interpolates —
       # a name absent from this list never reaches the container.
