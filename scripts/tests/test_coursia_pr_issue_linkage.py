@@ -227,6 +227,187 @@ def test_valid_ranges_rejects_impossible_date():
     assert raised, "2026-09-31 must be rejected, not silently measured"
 
 
+# --------------------------------------------------------------------------
+# G8 — lane marker, cost proxies, sweep split
+# --------------------------------------------------------------------------
+
+def test_lane_of_parses_fleet_convention():
+    assert cpl.lane_of("Grain: MED/docs — lane myia-po-2024:CoursIA-2 — prev: x") == \
+        ("myia-po-2024", "CoursIA-2")
+    assert cpl.lane_of("## Grain\nGrain: LIGHT/notebook — lane myia-po-2023:CoursIA") == \
+        ("myia-po-2023", "CoursIA")
+
+
+def test_lane_of_none_without_marker_never_guessed():
+    """A PR without the marker is UNATTRIBUTED — attributing by author would
+    guess the workspace (jsboige-authored PRs came from po-2024's lane)."""
+    assert cpl.lane_of("## Summary\nFix the accents.") is None
+    assert cpl.lane_of(None) is None
+    assert cpl.lane_of("") is None
+
+
+def test_merge_delay_hours_normal_and_garbage():
+    assert cpl.merge_delay_hours("2026-08-14T10:00:00Z", "2026-08-14T22:00:00Z") == 12.0
+    assert cpl.merge_delay_hours(None, "2026-08-14T22:00:00Z") is None
+    assert cpl.merge_delay_hours("garbage", "2026-08-14T22:00:00Z") is None
+
+
+def test_ci_suites_sums_over_commits_and_zero_on_absent():
+    pr = {"commits": {"totalCount": 2, "nodes": [
+        {"commit": {"checkSuites": {"totalCount": 26}}},
+        {"commit": {"checkSuites": {"totalCount": 43}}}]}}
+    assert cpl.ci_suites_of(pr) == 69
+    assert cpl.ci_suites_of({"commits": {"totalCount": 1, "nodes": [{"commit": {}}]}}) == 0
+    assert cpl.ci_suites_of({}) == 0
+
+
+def test_cost_metrics_shapes():
+    def cpr(created, merged, commits, suites):
+        return {"createdAt": created, "mergedAt": merged,
+                "commits": {"totalCount": commits, "nodes": [
+                    {"commit": {"checkSuites": {"totalCount": s}}} for s in suites]}}
+    m = cpl.cost_metrics([cpr("2026-08-14T10:00:00Z", "2026-08-14T22:00:00Z", 1, [26]),
+                          cpr("2026-08-14T08:00:00Z", "2026-08-14T12:00:00Z", 2, [43, 43])])
+    assert m["n"] == 2 and m["delay_median_h"] == 8.0
+    assert m["commits_mean"] == 1.5 and m["commits_median"] == 1.5
+    assert m["ci_mean"] == 56.0 and m["ci_median"] == 56.0  # 26 and 86
+
+
+def test_sweep_split_marks_bulk_minutes():
+    """THE G5 lot filter proxy: 9 closures in one minute = sweep, whatever
+    the stateReason; 3 spread closures = organic."""
+    closed = (["2026-08-14T10:00:%02dZ" % s for s in range(9)] +
+              ["2026-08-14T11:0%d:00Z" % m for m in (1, 2, 3)])
+    items = [{"closedAt": c, "stateReason": "completed"} for c in closed]
+    total, hors, swept = cpl.sweep_split(items)
+    assert total == 12 and swept == 9 and hors == 3, (total, hors, swept)
+
+
+def test_sweep_split_empty():
+    assert cpl.sweep_split([]) == (0, 0, 0)
+
+
+def _daily_page(prs, issue_count=None):
+    return {"search": {"issueCount": issue_count if issue_count is not None else len(prs),
+                       "pageInfo": {"endCursor": None, "hasNextPage": False},
+                       "nodes": [
+                           {"number": p["number"], "createdAt": p["createdAt"], "mergedAt": p["mergedAt"],
+                            "title": p.get("title", ""), "body": p.get("body", ""),
+                            "commits": p.get("commits", {"totalCount": 1, "nodes": []}),
+                            "closingIssuesReferences": {"totalCount": p.get("closing", 0)}}
+                           for p in prs]}}
+
+
+def test_day_prs_extracts_lane_and_cost_fields():
+    def fake_fetch(query, variables):
+        assert "commits(last: 100)" in query  # the daily query, not the weekly one
+        return _daily_page([{"number": 11151, "createdAt": "2026-08-14T09:00:00Z",
+                             "mergedAt": "2026-08-14T21:00:00Z",
+                             "title": "fix(a,#1)",
+                             "body": "Grain: LIGHT/docs — lane myia-po-2024:CoursIA-2 — prev: x"}])
+    prs, cap = cpl.day_prs("r", "2026-08-14", fetch=fake_fetch)
+    assert cap is False and len(prs) == 1
+    assert prs[0]["lane"] == ("myia-po-2024", "CoursIA-2")
+    assert prs[0]["title_nums"] == {"1"}  # extraction still runs
+
+
+def _series_fetch(days, issues, types, pr_issue_count=None):
+    """A fetch faking all three daily_series queries: PR search by day,
+    issues search by day, and the aliased issueOrPullRequest resolution."""
+    import re as _re
+
+    def fake_fetch(query, variables):
+        q = variables.get("q") or ""
+        m = _re.search(r"merged:(\d{4}-\d{2}-\d{2})\.\.", q)
+        if m:  # daily PR search
+            return _daily_page(days.get(m.group(1), []),
+                               issue_count=pr_issue_count if pr_issue_count else None)
+        m = _re.search(r"closed:(\d{4}-\d{2}-\d{2})\.\.", q)
+        if m:  # issues search
+            nodes = issues.get(m.group(1), [])
+            return {"search": {"issueCount": len(nodes), "pageInfo": {"endCursor": None, "hasNextPage": False},
+                               "nodes": nodes}}
+        # repository alias resolution (resolve_types)
+        return {"repository": {"n%d" % n: {"__typename": t} for n, t in types.items()}}
+    return fake_fetch
+
+
+_SERIES_DAYS = {
+    "2026-08-01": [
+        {"number": 1, "createdAt": "2026-08-01T08:00:00Z", "mergedAt": "2026-08-01T20:00:00Z",
+         "title": "fix(a,#11)", "body": "lane m1:CoursIA",
+         "commits": {"totalCount": 1, "nodes": [{"commit": {"checkSuites": {"totalCount": 3}}}]}},
+        {"number": 2, "createdAt": "2026-08-01T08:00:00Z", "mergedAt": "2026-08-01T20:00:00Z",
+         "title": "fix(b,#22)", "body": "lane m2:CoursIA-2",
+         "commits": {"totalCount": 4, "nodes": []}},
+        {"number": 3, "createdAt": "2026-08-01T08:00:00Z", "mergedAt": "2026-08-01T20:00:00Z",
+         "title": "fix(c,#33)", "body": "no marker here"},
+    ],
+    "2026-08-02": [],  # a 0-PR day: the issues line must still print
+}
+_SERIES_ISSUES = {"2026-08-01": [],
+                  "2026-08-02": [{"closedAt": "2026-08-02T10:00:00Z", "stateReason": "completed"},
+                                 {"closedAt": "2026-08-02T10:05:00Z", "stateReason": "completed"}]}
+_SERIES_TYPES = {11: "Issue", 22: "Issue", 33: "Issue"}
+
+
+def _run_series(fetch):
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cpl.daily_series("r", "2026-08-01", "2026-08-02", fetch=fetch)
+    return rc, buf.getvalue()
+
+
+def test_daily_series_two_workspaces_never_mixed():
+    """CR #366 bloquant: the orchestrator is pinned — a mutation venting
+    every PR to UNATTRIBUTED collapses the three rows into one and goes red."""
+    rc, out = _run_series(_series_fetch(_SERIES_DAYS, _SERIES_ISSUES, _SERIES_TYPES))
+    assert rc == 0, rc
+    rows = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 8 and parts[0].count("-") == 2 and parts[0][0].isdigit():
+            rows[(parts[0], parts[1])] = parts
+    assert rows[("2026-08-01", "CoursIA")][2] == "1", rows
+    assert rows[("2026-08-01", "CoursIA")][4] == "1.0", rows        # its own commits/PR
+    assert rows[("2026-08-01", "CoursIA-2")][2] == "1", rows
+    assert rows[("2026-08-01", "CoursIA-2")][4] == "4.0", rows      # NOT mixed with CoursIA
+    assert rows[("2026-08-01", "UNATTRIBUTED")][2] == "1", rows
+    # month summary: one line per workspace, n=1 each — never one n=3 blob
+    import re as _re2
+    assert any(_re2.match(r"\s*CoursIA\s+n=\s*1\b", l) for l in out.splitlines()), out
+    assert any(_re2.match(r"\s*CoursIA-2\s+n=\s*1\b", l) for l in out.splitlines()), out
+
+
+def test_daily_series_issues_line_prints_at_zero_prs():
+    rc, out = _run_series(_series_fetch(_SERIES_DAYS, _SERIES_ISSUES, _SERIES_TYPES))
+    assert rc == 0, rc
+    line = [l for l in out.splitlines() if l.startswith("   2026-08-02  issues closed")]
+    assert line and "2" in line[0], out  # 0 PRs that day, the issues row still renders
+
+
+def test_daily_series_exit_1_on_pr_cap():
+    fetch = _series_fetch(_SERIES_DAYS, _SERIES_ISSUES, _SERIES_TYPES, pr_issue_count=500)
+    rc, _ = _run_series(fetch)
+    assert rc == 1, rc  # the cap bit must reach the exit code
+
+
+def test_daily_series_exit_1_on_issues_cap():
+    import re as _re
+    base = _series_fetch(_SERIES_DAYS, _SERIES_ISSUES, _SERIES_TYPES)
+
+    def capped_issues(query, variables):
+        res = base(query, variables)
+        if "is:issue" in (variables.get("q") or ""):
+            res["search"]["issueCount"] = 42  # > returned: cap on the ISSUES side
+        return res
+
+    rc, _ = _run_series(capped_issues)
+    assert rc == 1, rc  # CR #366 minor: symmetric cap treatment, both sides exit 1
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

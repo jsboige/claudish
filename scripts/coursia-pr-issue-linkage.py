@@ -31,6 +31,20 @@ collapse is a change of close mechanism" — a title-scope closes nothing on
 GitHub and this script measures no closing mechanism. H4 is about grain
 size; the citation and closure shares are its inputs, not its conclusion.
 
+G8 DAILY MODE (claudish #328 G8, 2026-10-06): `--daily FROM..TO` renders one
+row per UTC day per WORKSPACE, ventilated by the `lane <machine>:<workspace>`
+provenance marker in the PR body (CoursIA's own convention — never mixed, the
+coordinator's explicit ask) plus an UNATTRIBUTED bucket. Per row: merged PRs,
+median creation→merge delay, commits/PR, CI check-suites/PR (the two allers-
+retours proxies), verified-issue citation share, PRs per title-cited issue.
+Also one line per day of issues closed split organic vs balayage (bulk
+sweep = any minute holding >= 8 closures — a self-contained proxy for G5's
+lot filter, stated here because their exact filter is theirs). The series
+discriminates: a débit break at 14-20/08 without a per-PR cost jump points
+at gesture ORDER (tirage first); a per-PR cost jump at 10/08 or ~18/08
+points at the GATES (lane-claim required, `Grain:` required). Both may be
+true — the series says in what proportions.
+
 ⚠ GitHub's search caps at 1000 results/query: the July week needs the
 built-in half-week split or the count silently reads 1000 with 13 PRs
 dropped. A cap hit prints CAP on stderr and exits 1. The cap check runs
@@ -39,6 +53,7 @@ AFTER dedup (issueCount vs distinct PRs).
 Read-only, replayable:
     python scripts/coursia-pr-issue-linkage.py                 # default weeks
     python scripts/coursia-pr-issue-linkage.py --week 2026-09-28..2026-09-28
+    python scripts/coursia-pr-issue-linkage.py --daily 2026-08-01..2026-08-31   # G8 series
 Exit codes: 0 = measured · 1 = search cap hit (split the range) · 2 = query
 error (bad repo/date, gh failure) — distinct from the cap on purpose.
 """
@@ -48,11 +63,30 @@ import json
 import re
 import subprocess
 import sys
-from datetime import date, timedelta
+from collections import Counter
+from datetime import date, datetime, timedelta
 
 PR_QUERY = ("query($q: String!, $cursor: String) { search(type: ISSUE, query: $q, first: 100, "
             "after: $cursor) { issueCount pageInfo { endCursor hasNextPage } nodes { ... on "
             "PullRequest { number mergedAt title body closingIssuesReferences { totalCount } } } } }")
+
+# G8: cost fields + the lane provenance marker live on the same search — one
+# pass per day instead of week+PR-per-PR REST (August alone holds 3 287 merged
+# PRs; REST per PR would burn the hourly budget before the month is read).
+DAILY_PR_QUERY = ("query($q: String!, $cursor: String) { search(type: ISSUE, query: $q, first: 100, "
+                  "after: $cursor) { issueCount pageInfo { endCursor hasNextPage } nodes { ... on "
+                  "PullRequest { number createdAt mergedAt title body "
+                  "commits(last: 100) { totalCount nodes { commit { checkSuites { totalCount } } } } "
+                  "closingIssuesReferences { totalCount } } } } }")
+
+ISSUE_QUERY = ("query($q: String!, $cursor: String) { search(type: ISSUE, query: $q, first: 100, "
+               "after: $cursor) { issueCount pageInfo { endCursor hasNextPage } nodes { ... on "
+               "Issue { number closedAt stateReason } } } }")
+
+LANE_RE = re.compile(r"\blane\s+([A-Za-z0-9][A-Za-z0-9_.-]*):([A-Za-z0-9][A-Za-z0-9_.-]*)")
+# A minute holding this many closures is a bulk sweep, not per-grain organic
+# closing — a human closing by hand never lands 8 in 60 s.
+SWEEP_MIN_CLOSURES = 8
 
 # (label, [merged: ranges]) — a week split into sub-ranges each under the
 # 1000-result search cap; sub-ranges are summed and deduped by PR number.
@@ -121,6 +155,77 @@ def week_metrics(prs, types):
         "cited_pr_numbers": len(num_split.get("PullRequest", ())),
         "cited_unresolved": len(num_split.get(None, ())),
     }
+
+
+# ---------------------------------------------------------------------------
+# G8 daily mode — lane ventilation, per-PR cost proxies, sweep split
+# ---------------------------------------------------------------------------
+
+def lane_of(body):
+    """(machine, workspace) from the `lane <machine>:<workspace>` provenance
+    marker — the fleet's own convention, e.g. `Grain: MED/docs — lane
+    myia-po-2024:CoursIA-2 — prev: …`. None when the body carries none
+    (pre-marker convention: those PRs are UNATTRIBUTED, never guessed)."""
+    m = LANE_RE.search(body or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _median(values):
+    v = sorted(values)
+    return v[len(v) // 2] if len(v) % 2 else (v[len(v) // 2 - 1] + v[len(v) // 2]) / 2.0
+
+
+def merge_delay_hours(created_at, merged_at):
+    """Creation→merge in hours, or None when either stamp is unusable —
+    a missing delay never enters the median."""
+    def parse(s):
+        return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+    try:
+        a, b = parse(created_at), parse(merged_at)
+        if a is None or b is None:
+            return None
+        return (b - a).total_seconds() / 3600.0
+    except ValueError:
+        return None
+
+
+def ci_suites_of(pr):
+    """Check suites summed across the PR's commits — the CI-runs proxy.
+    The commits list is capped at 100 by the query; a >100-commit PR
+    undercounts suites (commits totalCount stays exact)."""
+    commits = pr.get("commits") or {}
+    total = 0
+    for c in commits.get("nodes") or []:
+        suites = (c.get("commit") or {}).get("checkSuites") or {}
+        total += suites.get("totalCount") or 0
+    return total
+
+
+def cost_metrics(prs):
+    """Per-group cost/débit proxies for one day × workspace."""
+    n = len(prs)
+    delays = [d for d in (merge_delay_hours(p.get("createdAt"), p.get("mergedAt")) for p in prs)
+              if d is not None]
+    commit_counts = [(p.get("commits") or {}).get("totalCount") or 0 for p in prs]
+    suites = [ci_suites_of(p) for p in prs]
+    return {
+        "n": n,
+        "delay_median_h": _median(delays) if delays else 0.0,
+        "commits_mean": (sum(commit_counts) / float(n)) if n else 0.0,
+        "commits_median": _median(commit_counts) if commit_counts else 0.0,
+        "ci_mean": (sum(suites) / float(n)) if n else 0.0,
+        "ci_median": _median(suites) if suites else 0.0,
+    }
+
+
+def sweep_split(closed):
+    """(total, hors_balayage, swept) — every closure landing in a minute that
+    holds >= SWEEP_MIN_CLOSURES is a bulk sweep. Self-contained proxy for G5's
+    lot filter (stated in the output header): organic per-grain closing never
+    clusters 8 in one minute."""
+    per_minute = Counter((i.get("closedAt") or "")[:16] for i in closed)
+    swept = sum(1 for i in closed if per_minute[(i.get("closedAt") or "")[:16]] >= SWEEP_MIN_CLOSURES)
+    return len(closed), len(closed) - swept, swept
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +342,106 @@ def resolve_types(repo, numbers, cache, fetch=None, batch=80):
     return {int(n): cache[int(n)] for n in numbers}
 
 
+def day_prs(repo, day, fetch=None):
+    """Merged PRs of ONE day with cost fields + lane marker; cap-aware
+    (same contract as range_prs — August's worst day stays far under 1000)."""
+    fetch = fetch or gh_graphql
+    q = "repo:%s is:pr is:merged merged:%s..%s" % (repo, day, day)
+    prs, cursor, cap = [], None, False
+    while True:
+        s = fetch(DAILY_PR_QUERY, {"q": q, "cursor": cursor})["search"]
+        for x in s["nodes"]:
+            t, see, other = cited_numbers(x.get("title"), x.get("body"))
+            prs.append({"number": x["number"], "createdAt": x.get("createdAt"),
+                        "mergedAt": x["mergedAt"], "closing": x["closingIssuesReferences"]["totalCount"],
+                        "title_nums": t, "see_nums": see, "other_nums": other,
+                        "lane": lane_of(x.get("body")),
+                        "commits": x.get("commits")})
+        if not s["pageInfo"]["hasNextPage"]:
+            if s["issueCount"] > len(prs):
+                sys.stderr.write("CAP: %s reports issueCount=%d but search returned %d\n"
+                                 % (day, s["issueCount"], len(prs)))
+                cap = True
+            return prs, cap
+        cursor = s["pageInfo"]["endCursor"]
+
+
+def day_closed_issues(repo, day, fetch=None):
+    """Issues closed that day (any reason) — ({closedAt, stateReason} dicts, cap).
+
+    Cap-aware exactly like day_prs (returns the cap bit): an issues search that
+    hit the 1000 cap must fail the run (exit 1), not silently undercount —
+    asymmetric treatment of the two searches of the same day was CR #366.
+    """
+    fetch = fetch or gh_graphql
+    q = "repo:%s is:issue closed:%s..%s" % (repo, day, day)
+    out, cursor, cap = [], None, False
+    while True:
+        s = fetch(ISSUE_QUERY, {"q": q, "cursor": cursor})["search"]
+        for x in s["nodes"]:
+            out.append({"closedAt": x.get("closedAt"), "stateReason": x.get("stateReason")})
+        if not s["pageInfo"]["hasNextPage"]:
+            if s["issueCount"] > len(out):
+                sys.stderr.write("CAP(issues): %s reports %d, got %d\n" % (day, s["issueCount"], len(out)))
+                cap = True
+            return out, cap
+        cursor = s["pageInfo"]["endCursor"]
+
+
+def daily_series(repo, d0, d1, fetch=None):
+    """The G8 series: one row per day per workspace + an issues line per day
+    + a month summary per workspace. Ventilated by lane marker, never mixed.
+    `fetch` propagates to every network call — the orchestrator is pinned by
+    test (CR #366: a mutation venting every PR to UNATTRIBUTED must go red)."""
+    cache, any_cap = {}, False
+    month_by_ws = {}
+    print("== %s — daily %s..%s (UTC merged) ==" % (repo, d0, d1))
+    print("   proxies: commits/PR exact (totalCount) · CI suites summed over the last<=100 commits")
+    print("   balayage = any minute holding >=%d closures · UNATTRIBUTED = no lane marker in body"
+          % SWEEP_MIN_CLOSURES)
+    print("   %-10s  %-14s %5s  %11s  %8s  %6s  %6s  %5s" %
+          ("day", "workspace", "n", "delay_med_h", "comm/PR", "ci/PR", "cite%", "pr/iss"))
+    d, end = date.fromisoformat(d0), date.fromisoformat(d1)
+    while d <= end:
+        day = d.isoformat()
+        d += timedelta(days=1)
+        prs, cap = day_prs(repo, day, fetch)
+        any_cap = any_cap or cap
+        closed, cap = day_closed_issues(repo, day, fetch)
+        any_cap = any_cap or cap
+        total, hors, swept = sweep_split(closed)
+        numbers = set()
+        for p in prs:
+            numbers |= p["title_nums"] | p["see_nums"] | p["other_nums"]
+        types = resolve_types(repo, numbers, cache, fetch) if numbers else {}
+        groups = {}
+        for p in prs:
+            groups.setdefault(p["lane"][1] if p["lane"] else "UNATTRIBUTED", []).append(p)
+        for ws in sorted(groups):
+            g = groups[ws]
+            cm, wm = cost_metrics(g), week_metrics(g, types)
+            month_by_ws.setdefault(ws, []).append(g)
+            print("   %-10s  %-14s %5d  %11.1f  %8.1f  %6.1f  %5.0f%%  %5.2f"
+                  % (day, ws, cm["n"], cm["delay_median_h"], cm["commits_mean"], cm["ci_mean"],
+                     100.0 * wm["any_issue_prs"] / max(1, wm["n"]), wm["pr_per_issue_mean"]))
+        print("   %-10s  issues closed %d (hors-balayage %d · balayage %d)" % (day, total, hors, swept))
+    print("== month summary per workspace ==")
+    for ws in sorted(month_by_ws):
+        g = [p for part in month_by_ws[ws] for p in part]
+        numbers = set()
+        for p in g:
+            numbers |= p["title_nums"] | p["see_nums"] | p["other_nums"]
+        types = resolve_types(repo, numbers, cache, fetch) if numbers else {}
+        cm, wm = cost_metrics(g), week_metrics(g, types)
+        print("   %-14s n=%5d  cite=%5.1f%%  pr/title-issue mean=%.2f med=%.1f max=%d"
+              % (ws, cm["n"], 100.0 * wm["any_issue_prs"] / max(1, wm["n"]),
+                 wm["pr_per_issue_mean"], wm["pr_per_issue_median"], wm["pr_per_issue_max"]))
+        print("   %-14s delay_med=%6.1fh  comm/PR mean=%.2f med=%.1f  ci/PR mean=%.1f med=%.1f"
+              % ("", cm["delay_median_h"], cm["commits_mean"], cm["commits_median"],
+                 cm["ci_mean"], cm["ci_median"]))
+    return 1 if any_cap else 0
+
+
 # ---------------------------------------------------------------------------
 # reporting
 # ---------------------------------------------------------------------------
@@ -279,7 +484,29 @@ def main():
     ap.add_argument("--week", action="append", default=None, metavar="FROM..TO",
                     help="UTC merged range (repeatable) — replaces the default weeks, e.g. "
                          "--week 2026-09-28..2026-09-28 for a single G6 day")
+    ap.add_argument("--daily", default=None, metavar="FROM..TO",
+                    help="G8: one row per UTC day per workspace (lane marker), cost proxies "
+                         "+ issues closed vs balayage — e.g. --daily 2026-08-01..2026-08-31")
     args = ap.parse_args()
+
+    if args.daily:
+        if args.week:
+            sys.stderr.write("ERROR: --daily and --week are exclusive — --daily renders the "
+                             "whole range itself; drop --week\n")
+            return 2
+        try:
+            d0, _, d1 = args.daily.partition("..")
+            a, b = date.fromisoformat(d0), date.fromisoformat(d1)
+            if not d1 or a > b:
+                raise ValueError
+        except ValueError:
+            sys.stderr.write("ERROR: --daily wants FROM..TO ISO dates, got %r\n" % args.daily)
+            return 2
+        try:
+            return daily_series(args.repo, d0, d1)
+        except RuntimeError as e:
+            sys.stderr.write("ERROR on %s: %s\n" % (args.repo, e))
+            return 2
 
     weeks = [(w, [w]) for w in args.week] if args.week else DEFAULT_WEEKS
     try:
