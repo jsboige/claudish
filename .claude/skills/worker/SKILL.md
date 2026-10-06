@@ -111,6 +111,18 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
   un failover qui tourne déjà correctement (sonnet ARMED sur Mistral GLM 5.2 = attendu).
 - **Leak policy** : Opus/Fable/Sonnet = ai-01 uniquement. `traffic-anthropic.ps1` exige
   `pwsh`. Ne jamais grepper `cc_is_subagent` à la main.
+- **Ne JAMAIS suivre `drain.log` avec un handle de lecture bloquant** — `tail -f`,
+  `Get-Content -Wait`, ou toute boucle qui garde le fichier ouvert : sous Windows ce handle
+  **refuse les écritures**, et `Write-DrainLog` (`Add-Content` sans `-ErrorAction`) échoue
+  **ligne par ligne, non-terminant, sans tuer le run**. Mesuré hub po-2025, 05/10 : un
+  `tail -n 0 -f drain.log | grep` lancé pour suivre un recreate **n'est jamais sorti** et a
+  tenu le fichier **7 h 10** ; deux recreates réels et réussis (dont un déploiement de hub)
+  n'ont laissé **aucune trace** — `drain.log` figé à sa première ligne — et le moniteur
+  attendait un `OUTCOME` que **son propre verrou** empêchait d'écrire (auto-blocage, aucune
+  sortie possible). Surveiller `docker inspect`/`/health`, jamais le log du drain ; et
+  **vérifier qu'un moniteur est bien sorti** (`Get-Process tail`) — « j'ai arrêté le
+  moniteur » s'est révélé faux, il a survécu 7 h. Cf. #338 : le retry borné ferme la
+  fenêtre transitoire, pas un détenteur **continu**.
 
 ## Protocole affermi (mandat user 2026-09-12 — non négociable)
 
