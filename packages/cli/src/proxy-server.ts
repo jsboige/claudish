@@ -118,7 +118,9 @@ class RoutingError extends Error {
  * #348: the overload walk's remaining-patience budget, in ms. Default 300 s —
  * see the walk branch for the 360 s relay-deadline / 600 s client-timeout
  * arithmetic. Read per request like CLAUDISH_FAILOVER_OVERLOAD_WALK; only an
- * explicit `0` disables the bound (the client-gone check is unconditional).
+ * explicit `0` disables the bound. NO client-gone check exists — a client
+ * abort is undetectable on this stack pre-write (W16 pins the negative
+ * result; the budget alone bounds a walk into an abandoned request).
  */
 const WALK_BUDGET_DEFAULT_MS = 300_000;
 function readWalkBudgetMs(): number {
@@ -827,6 +829,31 @@ export async function createProxyServer(
     return providerBucketOf(target);
   };
 
+  /**
+   * #348 (review 06/10, bloquant): bucket for an ALREADY-CONCRETE cascade
+   * step target — classifyNominalBucket + catalog + route(), WITHOUT
+   * resolveNominalTarget. The walk's injected bucketer used to be
+   * nominalBucketOfModel, which runs the REQUEST-side mapping first: a step
+   * target whose id contains a role keyword (`or@anthropic/claude-sonnet-*`)
+   * re-mapped onto modelMap[role] — i.e. onto the NOMINAL's bucket — and the
+   * new "same bucket as the nominal" skip then jumped a healthy step drawing
+   * on a different meter (probe-proven: s0 healthy, bucket ≠ nominal's,
+   * skipped). With a `--model` default configured, EVERY keyword-free step
+   * target bucketed as the default model instead of itself. A step target is
+   * already concrete: classify it, route it, done. `nominalBucketOfModel`
+   * stays what it is — the bucket of the name the client ASKED for.
+   */
+  const concreteStepBucketOf = async (stepTarget: string): Promise<string> => {
+    const decision = classifyNominalBucket(stepTarget, (m) =>
+      matchUserRoutingOverride(m, userRoutingRules)
+    );
+    if ("bucket" in decision) return decision.bucket;
+    await ensureCatalogReady("openrouter", 5000);
+    const plan = route(decision.routeModel, effectiveRoutingRules);
+    if (plan.kind === "ok" && plan.primary) return plan.primary.provider;
+    return providerBucketOf(stepTarget);
+  };
+
   const getHandlerForRequest = async (
     requestedModel: string,
     depth = 0,
@@ -1294,11 +1321,22 @@ export async function createProxyServer(
           // injected async resolver — providerBucketOf reads `glm` where the
           // wall lives on the route() primary `glm-coding`), and the
           // NOMINAL's own bucket is skipped too (same bucket = same capacity
-          // the 529 just refused).
+          // the 529 just refused). The bucketer is concreteStepBucketOf, NOT
+          // nominalBucketOfModel: a step target is already concrete, and the
+          // request-side mapping would re-map a role-keyworded step id onto
+          // the nominal's bucket (review 06/10 bloquant — probe-measured).
+          //
+          // A rejection here must NOT escape the try contract of the walk:
+          // before #348 the call was sync and pure; it now awaits catalog +
+          // route(). W14 made the catch load-bearing (a throw becomes a
+          // terminal 400 instead of the retryable 529) — .catch(() => null)
+          // keeps a resolver failure on the "no servable step" path: surface
+          // the original overload. (Not pinned: no injection seam — named in
+          // the PR body.)
           const walk = await resolveTransientStep(role, {
-            bucketOf: nominalBucketOfModel,
+            bucketOf: concreteStepBucketOf,
             nominalBucket: bucket ?? undefined,
-          });
+          }).catch(() => null);
           if (walk) {
             const walkDelegation = walk.step.roleRef
               ? resolveDelegationOwner(role, walk.step)

@@ -669,6 +669,27 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
     expect(calls.s1).toBe(1); // step 0 skipped on the bucket plane; step 1 served
     expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 1"))).toBe(true);
   }, 30_000);
+
+  // Review of #348 (06/10) — BLOQUANT. The walk's injected bucketer was
+  // nominalBucketOfModel, which runs resolveNominalTarget FIRST: a concrete
+  // step target whose id carries a role keyword re-mapped onto
+  // modelMap[role] — the NOMINAL's bucket — and the "same bucket as the
+  // nominal" skip then jumped a healthy step drawing on a different meter.
+  // Probe (ai-01, the harness's own shape): cascade `s0-ep@fake-sonnet-b >
+  // s1-ep@fake-s1`, nominal nm → 529 — main served step 0 (s0=1), #354's
+  // first cut served step 1 (s0 SKIPPED on a bucket it never drew on). The
+  // fix buckets step targets through concreteStepBucketOf: classify + route,
+  // no request-side mapping. RED under nominalBucketOfModel-as-bucketOf.
+  test("W19: a role-keyworded STEP target buckets as ITSELF, not as the role's nominal (concrete-step bucketer)", async () => {
+    await spin(); // modelMap.sonnet = nom-ep@fake-nom (the spin default)
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-sonnet-b>s1-ep@fake-s1" });
+    const r1 = await postMessage("claude-sonnet-5"); // nominal nm answers 529 (default)
+    expect(r1.status).toBe(200);
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(1); // step 0 SERVED — its own bucket (s0-ep) ≠ the nominal's (nom-ep)
+    expect(calls.s1).toBe(0);
+    expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 0"))).toBe(true);
+  }, 30_000);
 });
 
 // ─── predicate pins ───────────────────────────────────────────────────────────
