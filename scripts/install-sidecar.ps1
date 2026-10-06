@@ -195,8 +195,13 @@ if ($RebuildEnvFromContainer) {
         if ($contMap[$k] -ne '' -or $k -eq 'CLAUDISH_CAPTURE_DIR') { $merged[$k] = $contMap[$k] }
     }
 
+    # #345: the machine id is operator knowledge (-Machine), not a container
+    # value to recover — a container that predates this var has none, and the
+    # rebuild must not silently drop it. Write it from the parameter, always.
+    $merged['CLAUDISH_MACHINE'] = $Machine
+
     # Stable order: installer base vars first, then everything else sorted.
-    $baseOrder = @('CLAUDISH_PROXY_KEY','CLAUDISH_RELAY_UPSTREAM','CLAUDISH_RELAY_COMPRESS','CLAUDISH_NO_ANTHROPIC',
+    $baseOrder = @('CLAUDISH_PROXY_KEY','CLAUDISH_RELAY_UPSTREAM','CLAUDISH_MACHINE','CLAUDISH_RELAY_COMPRESS','CLAUDISH_NO_ANTHROPIC',
                    'CLAUDISH_CONFIG_DIR','CLAUDISH_CAPTURE_HOST_DIR','CLAUDISH_HOST_PORT','CLAUDISH_CONTAINER_NAME','CLAUDISH_CAPTURE_DIR')
     $out = [System.Collections.Generic.List[string]]::new()
     $out.Add("# Rebuilt from live container '$ContainerName' by install-sidecar.ps1 -RebuildEnvFromContainer for $Machine")
@@ -296,6 +301,11 @@ $lines = @(
     "CLAUDISH_PROXY_KEY=$ClusterKey",
     "CLAUDISH_RELAY_UPSTREAM=$Upstream"
 )
+# #345: the canonical machine id, so the relay's own liveness probe identifies
+# itself to the hub instead of arriving header-less (a phantom attribution lane).
+# It is operator knowledge (`-Machine`), not something the container can derive:
+# inside it, hostname/COMPUTERNAME are the container's and the engine's.
+$lines += "CLAUDISH_MACHINE=$Machine"
 if ($Compress)    { $lines += "CLAUDISH_RELAY_COMPRESS=1" }
 if ($NoAnthropic) { $lines += "CLAUDISH_NO_ANTHROPIC=1" }
 $lines += "CLAUDISH_CONFIG_DIR=$ConfigDir"

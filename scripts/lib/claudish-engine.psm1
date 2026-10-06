@@ -57,6 +57,25 @@ function Get-ClaudishOptInFileName { return $script:OptInFileName }
 function Get-ClaudishOptInToken    { return $script:OptInToken }
 function Get-RelaunchPreflightOptInFileName { return $script:RelaunchPreflightOptInFileName }
 
+function Get-ClaudishMachineName {
+    <#
+        Canonical fleet id for a raw hostname (#345): 'MYIA-PO-2023' -> 'myia-po-2023'.
+        Lowercased and prefixed with 'myia-' unless the name already carries it.
+
+        Mirrors verify-machine-header.py's detect_local_machine() EXACTLY — the
+        reader and the producer must agree, or the header we now send would land
+        as an unknown name and fork attribution (the very defect that script
+        catches). Returns $null for anything unusable, and the caller then sends
+        NO header rather than a wrong one: a wrong machine id is worse than none.
+    #>
+    param([string]$Name)
+    if (-not $Name) { return $null }
+    $n = $Name.Trim().ToLowerInvariant()
+    if (-not $n) { return $null }
+    if ($n.StartsWith('myia-')) { return $n }
+    return "myia-$n"
+}
+
 function Get-ClaudishServingBase {
     <#
         Reads the per-machine serving base URL from <ClaudishHome>\base-url.txt,
@@ -2197,4 +2216,5 @@ Export-ModuleMember -Function @(
     'Get-WedgeDecision'
     'Get-ClaudishOptInFileName'
     'Get-ClaudishOptInToken'
+    'Get-ClaudishMachineName'
 )

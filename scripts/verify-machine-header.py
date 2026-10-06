@@ -19,12 +19,13 @@ attribution, all read-only:
      machine-naming-po2023-canonical, GDrive seed incident 25/09).
   4. RESIDUAL        — the no-machine requests, aggregated by lane
      (src, model, entrypoint, workload). claudish's OWN liveness probes
-     (watchdog Test-ProxyWithTools, relay deepProbe) never send the header
-     BY DESIGN and are separated out first — the first draft of this report
-     counted them as "non-CC scripted clients", which was wrong (PR #336
-     review, 2026-10-05): what is left AFTER them is the real client gap,
-     named, not guessed. Records keep the ENVELOPE only — the body is read
-     once for probe classification, then dropped (memory).
+     (watchdog Test-ProxyWithTools, relay deepProbe) are separated out FIRST,
+     by SHAPE rather than by the header: since #345 they DO carry
+     X-Claudish-Machine, and they are still not a client lane. The first
+     draft of this report counted them as "non-CC scripted clients", which
+     was wrong (PR #336 review, 2026-10-05): what is left AFTER them is the
+     real client gap, named, not guessed. Records keep the ENVELOPE only —
+     the body is read once for probe classification, then dropped (memory).
 
 Caveat printed, not hidden: on a RELAY (po-203 today), captures are written
 only for locally-served requests — a NOMINAL forward writes nothing — so the
@@ -69,8 +70,9 @@ REQ_GLOB = "req-*.json"
 # sources: watchdog Test-ProxyWithTools (claudish-watchdog.ps1:92-123, model
 # glm-5.2) and relay deepProbe (relay.ts:819-844, model glm-5.3). The model
 # differs between the two, so the message text is the stable discriminator.
-# These probes never send X-Claudish-Machine BY DESIGN: counting them as a
-# client rollout gap manufactured the false "non-CC scripted clients" claim.
+# Since #345 these probes DO carry X-Claudish-Machine; they are still separated
+# by SHAPE because a probe is not a client — counting one as a client rollout
+# gap manufactured the false "non-CC scripted clients" claim.
 PROBE_USER_TEXT = "List the current directory using Bash. Do it now."
 
 
@@ -240,7 +242,7 @@ def residual_attribution(records):
     groups = {}
     for rec in records:
         if rec.get("probe"):
-            continue  # ours, header-less BY DESIGN — not a client lane
+            continue  # ours — a probe is not a client lane, whatever header it carries (#345)
         m = rec.get("machine")
         if isinstance(m, str) and m.strip():
             continue
@@ -385,7 +387,7 @@ def human_report(machine, settings, override_note, records, unreadable, span,
     client_total = sum(1 for r in records if not r.get("probe"))
     if probes:
         add("  %d reqs from claudish's own probes (watchdog Test-ProxyWithTools / relay deepProbe)" % probes)
-        add("  — separated out: they carry no header by design, they are not a rollout gap")
+        add("  — separated out by SHAPE (they carry the header since #345); not a rollout gap")
     if not records:
         add("  (no corpus)")
     elif client_total == 0:

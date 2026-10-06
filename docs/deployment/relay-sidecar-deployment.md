@@ -118,6 +118,7 @@ The installer is **idempotent**: it pulls latest `main`, (re)writes the `.env`, 
 What it sets (in `<RepoDir>/.env`, consumed by `docker-compose.yml`):
 - `CLAUDISH_PROXY_KEY` — the cluster gate key (same everywhere).
 - `CLAUDISH_RELAY_UPSTREAM` — the hub URL.
+- `CLAUDISH_MACHINE` (`-Machine`) — the canonical fleet id (e.g. `myia-po-2024`). Since #345 the relay's own liveness probe sends it as `X-Claudish-Machine` so the hub attributes that probe to the machine instead of filing it as a header-less phantom lane. Operator knowledge, never derived inside the container (its hostname is the container id).
 - `CLAUDISH_RELAY_COMPRESS=1` (only with `-Compress`; WAN uplink gzip).
 - `CLAUDISH_NO_ANTHROPIC=1` (only with `-NoAnthropic`; leak-policy local backstop).
 - `CLAUDISH_CONFIG_DIR` / `CLAUDISH_CAPTURE_HOST_DIR` — the host bind-mount paths.
