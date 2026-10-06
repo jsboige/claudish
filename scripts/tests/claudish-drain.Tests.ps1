@@ -868,20 +868,92 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         (Read-LenientRaw -Path $log) | Should -Match 'OUTCOME '
     }
 
+    It 'the handshake read matches only bytes appended after the offset (unit, fixed pid — re-review round 4)' {
+        # Deterministic on any machine: no child, no pid lottery, no band
+        # coverage question. A stale `START pid 4242` line sits ENTIRELY
+        # before the offset; this is the pin that carries the bloquant-1
+        # guard on every run, whatever pid space the host draws from
+        # (Windows pids exceed 65535 — measured 69440…86348 on ai-01).
+        $watch = Join-Path $script:DetachDir 'watch-unit-offset.log'
+        Remove-Item -LiteralPath $watch -Force -ErrorAction SilentlyContinue
+        '[2026-10-05 00:00:00] START pid 4242 — drained restart begins (reason: old run)' |
+            Set-Content -LiteralPath $watch
+        $offset = (Get-Item -LiteralPath $watch).Length
+        # Nothing appended after the offset: the addition is empty — the
+        # stale line naming the SAME pid is invisible. A whole-file read
+        # (mutation M-C1) reddens HERE, every run, not by pid luck.
+        (Get-WatchLogAddition -WatchLogPath $watch -OffsetBytes $offset) | Should -Be ''
+        # Positive control: a line appended AFTER the offset IS the signal —
+        # even when it names the same pid as the stale one.
+        Add-Content -LiteralPath $watch -Value '[2026-10-06 00:00:00] START pid 4242 — drained restart begins (reason: this run)'
+        $added = Get-WatchLogAddition -WatchLogPath $watch -OffsetBytes $offset
+        $added | Should -Match 'START pid 4242'
+        $added | Should -Not -Match 'reason: old run'
+        # Documented truncation branch: a file SHORTER than the offset
+        # (replaced/truncated watch log) is read from 0 — toward the signal.
+        (Get-WatchLogAddition -WatchLogPath $watch -OffsetBytes ($offset + 4096)) | Should -Match 'reason: old run'
+        # A missing file is '' — a pure read, never a throw.
+        (Get-WatchLogAddition -WatchLogPath (Join-Path $script:DetachDir 'watch-no-such-file.log') -OffsetBytes 0) | Should -Be ''
+        Remove-Item -LiteralPath $watch -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'the offset is taken before the launch and every handshake read is offset-bounded (AST, bloquant 1)' {
+        # Structural pin of Start-DrainDetached: whatever pid the host draws,
+        # the SOURCE guarantees (a) $baseline is assigned BEFORE Start-Process
+        # — the whole fix rests on the offset predating the child's first
+        # possible byte; an offset taken after the launch reintroduces the
+        # stale-line window (mutation M-D2 reddens here); (b) both handshake
+        # reads (loop + post-loop re-check) go through Get-WatchLogAddition
+        # with -OffsetBytes $baseline; (c) the watch log is never read whole.
+        $tokens = $null; $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:DrainScript, [ref]$tokens, [ref]$errors)
+        $fn = @($ast.FindAll({ param($n)
+                    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-DrainDetached'
+                }, $true))
+        $fn.Count | Should -Be 1   # a filter matching nothing would prove nothing
+        $text = $fn[0].Extent.Text
+        # (a) ordering, by Extent position — drift-proof against line moves.
+        $baselinePos = $text.IndexOf('$baseline')
+        $launchPos = $text.IndexOf('Start-Process -FilePath')
+        $baselinePos | Should -BeGreaterOrEqual 0
+        $launchPos | Should -BeGreaterOrEqual 0
+        $baselinePos | Should -BeLessThan $launchPos
+        # (b) both reads are offset-bounded through the helper — no inline
+        # re-implementation can slip in beside them.
+        ([regex]::Matches($text, [regex]::Escape('Get-WatchLogAddition -WatchLogPath $WatchLogPath -OffsetBytes $baseline'))).Count | Should -Be 2
+        # (c) no whole-file read of the WATCH log. Line-level conjunction: a
+        # line reads the watch log AND uses Get-Content/ReadAll* — the
+        # capture tails on $errPath/$outPath legitimately use Get-Content
+        # and stay invisible to this guard.
+        foreach ($line in ($text -split '\r?\n')) {
+            if ($line -match 'Get-Content|ReadAll(Text|Lines|Bytes)') {
+                $line | Should -Not -Match '\$WatchLogPath\b'
+            }
+        }
+        # Positive controls — each primitive must be able to fire.
+        $good = '$baseline = 1' + "`n" + 'Start-Process -FilePath x'
+        $bad = 'Start-Process -FilePath x' + "`n" + '$baseline = 1'
+        ($good.IndexOf('$baseline') -lt $good.IndexOf('Start-Process -FilePath')) | Should -BeTrue
+        ($bad.IndexOf('$baseline') -lt $bad.IndexOf('Start-Process -FilePath')) | Should -BeFalse
+        ([regex]::Matches('one Get-WatchLogAddition -WatchLogPath $WatchLogPath -OffsetBytes $baseline call', [regex]::Escape('Get-WatchLogAddition -WatchLogPath $WatchLogPath -OffsetBytes $baseline'))).Count | Should -Be 1
+        'Get-Content -LiteralPath $WatchLogPath -Raw' | Should -Match 'Get-Content|ReadAll(Text|Lines|Bytes)'
+        'Get-Content -LiteralPath $WatchLogPath -Raw' | Should -Match '\$WatchLogPath\b'
+    }
+
     It 'an OLD START line naming the child pid cannot fake life (re-review, bloquant 1)' {
         # drain.log is never rotated and gains a START line per launch, and
         # Windows reuses pids: with a whole-file scan, an old line naming the
         # CURRENT child's pid reports a binding-death child as alive. The fix
         # reads only bytes appended after the launch. The pin needs the old
         # line to carry exactly the child's pid — unknowable before launch
-        # and NOT derivable after (pid allocation measured random on this
-        # box: frontier probe and next-child pids decorrelated across 10
-        # attempts; band and occupy-then-free shapes both fail to cover). So
-        # pre-fill the ENTIRE pid space with stale lines: whatever pid the
-        # child draws, an old line names it — full coverage, no lottery, and
-        # the ~3.5 MB throwaway file makes the bounded read visible in the
-        # timing too. The child dies at binding; its only trace is the
-        # binding error in stderr.
+        # and not derivable after — so pre-fill a pid BAND with stale lines.
+        # The band covers 4..65535, but Windows pids are NOT bounded by 65535
+        # (measured children at 69440…86348 on ai-01): when the child draws
+        # outside the band this e2e proves nothing about the guard and says
+        # so — Inconclusive, never a false verdict — while the unit pin
+        # (offset read, fixed pid) and the AST pin (offset before launch)
+        # carry the guarantee on every run. The child dies at binding; its
+        # only trace is the binding error in stderr.
         $watch = Join-Path $script:DetachDir 'watch-collide.log'
         $band = for ($n = 4; $n -le 65535; $n++) {
             "[2026-10-05 00:00:00] START pid $n — drained restart begins (reason: old run)"
@@ -890,10 +962,13 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-bindfail.ps1') `
             -ExtraArgs @('-MustBeInt', 'not an int', '-WatchLog', $watch)
         $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
-        # Coverage is assertable, not assumed: outside 4..65535 the pre-fill
-        # would not name the child and the pin would prove nothing.
-        $r.ChildPid | Should -BeGreaterOrEqual 4
-        $r.ChildPid | Should -BeLessOrEqual 65535
+        # Coverage, not a lottery (re-review round 4): outside 4..65535 the
+        # pre-filled band does not name the child and this e2e would prove
+        # nothing — visible Inconclusive, never a false red or green.
+        if ($r.ChildPid -lt 4 -or $r.ChildPid -gt 65535) {
+            Remove-Item -LiteralPath $watch -Force -ErrorAction SilentlyContinue
+            Set-ItResult -Inconclusive -Because ("child pid {0} fell outside the pre-filled 4..65535 band (Windows pids exceed 65535) — the unit and AST pins carry the guard" -f $r.ChildPid)
+        }
         # With the offset-bounded read, the stale space is invisible and the
         # verdict is exited — never a falsified alive.
         $r.Ok | Should -BeFalse
