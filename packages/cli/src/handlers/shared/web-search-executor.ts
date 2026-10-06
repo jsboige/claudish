@@ -17,7 +17,7 @@
  * Every network call is bounded by a strict deadline.
  */
 
-import { log } from "../../logger.js";
+import { log, logStderr } from "../../logger.js";
 import { isMcpSearxngAvailable, mcpWebSearch, mcpUrlRead } from "./mcp-searxng-client.js";
 
 /**
@@ -35,8 +35,8 @@ import { isMcpSearxngAvailable, mcpWebSearch, mcpUrlRead } from "./mcp-searxng-c
  * #26): the old `|| "http://search.myia.io"` fallback could only 401 once
  * that host grew Basic Auth (a working setup MUST carry its creds in the
  * userinfo, i.e. it sets the full URL anyway). Unset now means "direct
- * HTTP search disabled" — a loud log at the call site, never a silent
- * ship-to-an-endpoint-that-refuses. base is "" when unset.
+ * HTTP search disabled" — one logStderr line per process (warnSearxngUrlUnset),
+ * never a silent ship-to-an-endpoint-that-refuses. base is "" when unset.
  */
 export function searxngConfig(): { base: string; authHeaders: Record<string, string> } {
   const raw = process.env.SEARXNG_URL || "";
@@ -53,6 +53,19 @@ export function searxngConfig(): { base: string; authHeaders: Record<string, str
     // Unparseable — use as-is, no auth.
   }
   return { base: raw.replace(/\/+$/, ""), authHeaders: {} };
+}
+
+// Once per process: an unset SEARXNG_URL is a config fact, not a per-search
+// event. logStderr (visible with debug off — a plain log() line is
+// debug-file-only, silent on a production hub) on the FIRST disabled call
+// only, so the signal stays readable instead of one line per search.
+let searxngUrlUnsetWarned = false;
+function warnSearxngUrlUnset(): void {
+  if (searxngUrlUnsetWarned) return;
+  searxngUrlUnsetWarned = true;
+  logStderr(
+    `[WebSearch] SEARXNG_URL not configured — direct HTTP search disabled (no built-in default). Set SEARXNG_URL (basic-auth creds may ride the userinfo) or SEARXNG_MCP_URL for the MCP path.`
+  );
 }
 
 export interface SearchResult {
@@ -149,9 +162,7 @@ async function fetchFromSearXNG(
   // 1fffab8 fix). [] (the "server answered" shape), never a throw — the
   // caller's retry loop must not re-spend the budget on a disabled backend.
   if (!base) {
-    log(
-      `[WebSearch] SEARXNG_URL not configured — direct HTTP search disabled (no built-in default). Set SEARXNG_URL (basic-auth creds may ride the userinfo) or SEARXNG_MCP_URL for the MCP path.`
-    );
+    warnSearxngUrlUnset();
     return [];
   }
   const url = `${base}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
@@ -197,6 +208,17 @@ export async function executeWebSearch(query: string, deadlineMs = 8000): Promis
       return `[Web search results for "${query}"]\n\n${mcp.text}`;
     }
     log(`[WebSearch] MCP route failed (${mcp.error}), falling back to direct HTTP`);
+  }
+
+  // Unset SEARXNG_URL: direct HTTP is DISABLED, not a 0ms "success".
+  // Short-circuit before the retry loop so (a) the latency window records no
+  // sample — a ~0ms one would read absence-of-backend as a fast backend
+  // (#3388 drift detector) — and (b) the agent gets the factual
+  // "not configured" text (openai-sse.ts's own formula for the same state),
+  // not formatSearchResults([])'s misleading "service may be unavailable".
+  if (!searxngConfig().base) {
+    warnSearxngUrlUnset();
+    return `[Web search for "${query}" could not be executed. The search service (SearXNG) is not configured. Set SEARXNG_URL env var to enable.]`;
   }
 
   let lastError = "";

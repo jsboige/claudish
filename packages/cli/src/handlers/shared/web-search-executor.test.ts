@@ -133,7 +133,16 @@ describe("executeWebSearch — Basic auth end-to-end (local mock)", () => {
     try {
       const out = await executeWebSearch("lean", 2000);
       expect(fetchCalls).toBe(0); // disabled ≠ shipped-to-default
-      expect(out).toMatch(/no results|unavailable|disabled/i);
+      // The precise openai-sse.ts "not configured" formula — NOT
+      // formatSearchResults([])'s "service may be unavailable", which tells
+      // the agent the backend may be DOWN when the fact is: not set.
+      expect(out).toBe(
+        `[Web search for "lean" could not be executed. The search service (SearXNG) is not configured. Set SEARXNG_URL env var to enable.]`
+      );
+      // Short-circuit happens BEFORE the retry loop: the #3388 latency window
+      // must record no sample — a ~0ms one would read absence-of-backend as
+      // a fast backend and poison the drift detector.
+      expect(searxngLatencyStats()).toBeNull();
     } finally {
       globalThis.fetch = realFetch;
     }
