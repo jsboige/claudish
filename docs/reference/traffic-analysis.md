@@ -11,6 +11,7 @@
 | **Live surveillance** (cron, quick health check) | `traffic-live.ps1` | `docker logs` stdout | fast |
 | **Rich detail** (workspace, session, CC version, tokens) | `traffic-summary.ps1` / `traffic-sessions.ps1` | `req-*.json` captures | slower |
 | **"Where's the Anthropic traffic from?"** (recurring leak question) | `traffic-anthropic.ps1` | `req-*.json` captures | slower |
+| **Per-session live attribution** ("who pulls what, now") | `live-session-scan.py` | `req-*.json` captures | fast |
 | **History** (past days from compressed archives) | `traffic-history.ps1` | `captures-*.7z` | slow |
 
 ## Scripts
@@ -22,6 +23,7 @@
 | `traffic-sessions.ps1` | Detailed session list with timing, models, data volume | `.\scripts\traffic-sessions.ps1 [-Hours N] [-All]` |
 | `traffic-anthropic.ps1` | **Answers "where does the Anthropic traffic come from?"** — attributes every Anthropic-native (opus/fable) request by **machine + workspace** (workspace = proof, from the system prompt; not stdout). Per-request verdict: `[OK]` ai-01 · `[REVIEW]` po-2025 · `[INFO]` fable during a `-FableOverrideActive` window · `[LEAK-SUBAGENT]` rogue Opus sub-agent (`cc_is_subagent=true`, **exit 1**) · `[REVIEW-INTERACTIVE]` user-driven non-ai-01 session (exit 0). sonnet-4-6 shown separately (remapped to glm → not Anthropic). | `.\scripts\traffic-anthropic.ps1 [-Hours N] [-FableOverrideActive]` |
 | `traffic-history.ps1` | Historical analysis from 7z archives | `.\scripts\traffic-history.ps1 [-Date yyyy-MM-dd] [-Days N]` |
+| `live-session-scan.py` | **Per-session live attribution (#362)** — aggregates in-window `req-*.json` by session (user_id + session_id) with two flag classes: `OPENAI-SHAPED` (`gpt-\|codex\|-sol\|o3-\|o4-`, LEAK-grade — the OpenAI plan is last-chance, non-renewable credit) and `RETIRED-ID` (`claude-sonnet-4-6\|glm-5.2\|qwen3.6-35b-a3b`, INFO-grade — ids removed from the catalogs but still named by drifted client configs). Two-speed read: 6 KiB head + 16 KiB tail by default, `--deep` for the full JSON parse. | `python .\scripts\live-session-scan.py [--hours N] [--top N] [--models regex] [--deep] [--json]` |
 | `compress-captures.ps1` | Nightly 7z compaction + GDrive backup + 30d local purge (scheduled task) | Runs automatically at 04:17 |
 | `claudish-watchdog.ps1` | Proxy health: tool-call stream test + proactive restart (uptime >11h) + auto-recovery on hang. Scheduled every 15min. | Runs automatically |
 | `CaptureUtils.psm1` | Shared module (capture parsing, device mapping, 7z extraction) | Imported by the scripts above |
@@ -47,6 +49,19 @@
 # Historical analysis from compressed archives
 .\scripts\traffic-history.ps1 -Days 7
 ```
+
+## Live session scan
+
+**`live-session-scan.py` answers "who pulls what, right now" per SESSION** — the instrument the 2026-10-06 incident showed missing: a stopped "adjoint" CoursIA-2 session kept pulling `gpt-6-sol` on the OpenAI plan (last-chance, non-renewable gift-card credit) and nothing saw it continuously. It aggregates in-window `req-*.json` captures by `metadata.user_id` + `session_id`, sorts `OPENAI-SHAPED` sessions to the top, and digests both flag classes in one line. Reporting organ only — exit 0 even when flags are present; alarming is the caller's job.
+
+```powershell
+python .\scripts\live-session-scan.py                                     # last hour, top 20
+python .\scripts\live-session-scan.py --hours 6 --models "gpt-|codex|-sol|o3-|o4-" --top 10
+python .\scripts\live-session-scan.py --deep --hours 24                   # slow: full JSON parse
+python .\scripts\live-session-scan.py --json                              # machine output
+```
+
+Measured traps (2026-10-06, 400 newest captures): `body.metadata` is serialized at the **tail**, never the head — its last `"metadata":{` occurrence sits 368-426 bytes before EOF, always after every message/tool block, so the fast pass reads a 6 KiB head (envelope model/machine + workdir hint) plus a 16 KiB tail where **last occurrence wins** (an echo inside message prose precedes the real block). 11.8% of files carry **no metadata block at all** (envelope `machine` empty too — SDK-shaped bodies); they stay countable in a dedicated `(no-metadata)` bucket instead of vanishing. `metadata.user_id` is a JSON-encoded string (`{"device_id","account_uuid","session_id"}`), so machine attribution comes from the envelope `machine` field. Fast and deep produce **identical session/model aggregates** (verified on a frozen 200-file sample); the one divergence is the workdir hint — its marker sits at p50 ~267 KB inside message 0, beyond the fast head, so `--deep` is the mode that recovers it. Fast pass measured on the hub host: 12 882 files over a 6 h window in ~1 min 50 s — and the honest caveat that comes with it: warm-cache `--deep` on the same window ran 1 min 29 s, so the fast pass's edge is **I/O volume** (~284 MB read vs ~9 GB for the full parse), which is what matters on a cold or contended host, not warm wall time.
 
 ## Capture format
 
