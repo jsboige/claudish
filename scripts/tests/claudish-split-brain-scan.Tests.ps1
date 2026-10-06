@@ -45,8 +45,11 @@ BeforeAll {
         [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
     }
 
-    function New-Proc([int]$procId, [int]$parentId, [string]$name, [datetime]$created, [string]$cmd = '') {
-        if (-not $cmd) { $cmd = $name }
+    function New-Proc([int]$procId, [int]$parentId, [string]$name, [datetime]$created, [string]$cmd = '', [switch]$noCmd) {
+        # -NoCmd: a real Win32_Process row with an UNREADABLE command line
+        # (access denied, non-elevated) — CommandLine is $null, not empty text.
+        if ($noCmd) { $cmd = $null }
+        elseif (-not $cmd) { $cmd = $name }
         [pscustomobject]@{ ProcessId = $procId; ParentProcessId = $parentId; Name = $name; CreationDate = $created; CommandLine = $cmd }
     }
 
@@ -150,7 +153,7 @@ Describe 'split-brain-scan' {
     }
 
     Context 'process bursts (double-fire signature)' {
-        It 'flags PROCESS-BURST on TWO identical commands in the window, arguments kept in the flag' {
+        It 'flags PROCESS-BURST on TWO identical commands under ONE parent, arguments kept in the flag' {
             $base = (Get-Date).AddMinutes(-1)
             $global:SBScanState.Procs = @(
                 (New-Proc 900 899 'explorer.exe' $base.AddHours(-6) 'explorer')
@@ -159,7 +162,7 @@ Describe 'split-brain-scan' {
             )
             $r = Invoke-Scan (New-ScanRoot)
 
-            $r.Out | Should -Match 'PROCESS-BURST: 2 x identical claude\.exe command born within 3s'
+            $r.Out | Should -Match 'PROCESS-BURST: 2 x identical claude\.exe command born within 3s under parent 900'
             # ISO 8601 UTC (review #342): machine-local drift must not survive into the flag
             $r.Out | Should -Match 'PROCESS-BURST: .*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z'
             # arguments kept in output, as DIRECT does (review #342): the command
@@ -192,20 +195,63 @@ Describe 'split-brain-scan' {
             $r.Code | Should -Be 0
         }
 
-        It 'flags two identical commands under DIFFERENT roots (double-fire needs no common ancestor)' {
-            # review #342: grouping by root ancestor was the defect — a double-fire
-            # landing under two different roots must flag just the same.
+        It 'does NOT flag identical commands under DISTINCT parents — the VS Code window-restore shape (ai-01 live, review #342)' {
+            # Measured 2026-10-05 20:40:17Z on ai-01 (host reboot 19:56Z + VS Code
+            # update): ELEVEN restored windows each launched a Claude Code panel —
+            # eleven claude.exe with the SAME 450-char command line (VS Code puts
+            # no session id on it) under ELEVEN DISTINCT Code.exe parents. The
+            # (Name, command) key flagged all of them (35 PROCESS-BURST, rc=1 at
+            # both interpreters); (parent, Name, command) flags none. This is the
+            # measured pair 11332/49208, born 7 ms apart.
+            $t = (Get-Date).AddMinutes(-2)
+            $cmd = 'claude.exe --output-format stream-json --verbose --print-logs'
+            $global:SBScanState.Procs = @(
+                (New-Proc 900 899 'explorer.exe' $t.AddHours(-6) 'explorer')
+                (New-Proc 24844 900 'Code.exe' $t.AddHours(-3) 'Code.exe -w')
+                (New-Proc 16308 900 'Code.exe' $t.AddHours(-3) 'Code.exe -w')
+                (New-Proc 11332 24844 'claude.exe' $t $cmd)
+                (New-Proc 49208 16308 'claude.exe' $t.AddMilliseconds(7) $cmd)
+            )
+            $r = Invoke-Scan (New-ScanRoot)
+            $r.Out | Should -Match 'total: 2'   # anti-vacuous: both panels SEEN
+            $r.Out | Should -Not -Match 'PROCESS-BURST'
+            # the raw co-birth count keeps the shape VISIBLE, never flagged
+            $r.Out | Should -Match 'machine-wide max co-births within 3s \(all roots\): 2'
+            $r.Code | Should -Be 0
+        }
+
+        It 'flags two identical node.exe commands under ONE parent (one launcher fired the same server twice)' {
+            # review #342 second pass: the demanded positive under the parent key —
+            # a claude.exe launching ONE MCP server twice is the same-launcher
+            # double-fire the signature exists for.
             $t = (Get-Date).AddMinutes(-2)
             $global:SBScanState.Procs = @(
                 (New-Proc 900 899 'explorer.exe' $t.AddHours(-6) 'explorer')
-                (New-Proc 800 799 'svchost.exe' $t.AddHours(-6) 'svchost -k netsvcs')
-                (New-Proc 1101 900 'claude.exe' $t 'claude.exe -p --resume same-uuid')
-                (New-Proc 1102 800 'claude.exe' $t.AddSeconds(1.5) 'claude.exe -p --resume same-uuid')
+                (New-Proc 901 900 'claude.exe' $t.AddMinutes(-5) 'claude.exe --resume x')
+                (New-Proc 1101 901 'node.exe' $t 'node mcp-searxng\dist\index.js')
+                (New-Proc 1102 901 'node.exe' $t.AddMilliseconds(500) 'node mcp-searxng\dist\index.js')
             )
             $r = Invoke-Scan (New-ScanRoot)
-            $r.Out | Should -Match 'total: 2'   # anti-vacuous
-            $r.Out | Should -Match 'PROCESS-BURST: 2 x identical claude\.exe'
+            $r.Out | Should -Match 'total: 3'   # anti-vacuous
+            $r.Out | Should -Match 'PROCESS-BURST: 2 x identical node\.exe command born within 3s under parent 901'
             $r.Code | Should -Be 1
+        }
+
+        It 'does NOT group processes whose command line is UNREADABLE (two unknowns are not equal)' {
+            # review #342 second pass: the flag once rendered both as
+            # "(command line unavailable)" — a shared IDENTITY out of a shared
+            # IGNORANCE. ai-01 carries 3 such processes (access denied,
+            # non-elevated); nothing says their command lines are equal.
+            $t = (Get-Date).AddMinutes(-2)
+            $global:SBScanState.Procs = @(
+                (New-Proc 900 899 'explorer.exe' $t.AddHours(-6) 'explorer')
+                (New-Proc 1101 900 'node.exe' $t -NoCmd)
+                (New-Proc 1102 900 'node.exe' $t.AddMilliseconds(200) -NoCmd)
+            )
+            $r = Invoke-Scan (New-ScanRoot)
+            $r.Out | Should -Match 'total: 2'   # anti-vacuous: both SEEN, neither grouped
+            $r.Out | Should -Not -Match 'PROCESS-BURST'
+            $r.Code | Should -Be 0
         }
 
         It 'does NOT flag two identical commands OUTSIDE the window' {
@@ -267,9 +313,9 @@ Describe 'split-brain-scan' {
         It 'terminates on a parent cycle instead of looping' {
             $t = (Get-Date).AddMinutes(-5)
             $global:SBScanState.Procs = @(
-                # distinct commands: the pin exercises the CYCLE, not the burst —
-                # the double-fire signature would (correctly) flag two identical
-                # bare command lines
+                # distinct commands (and distinct parents): the pin exercises the
+                # CYCLE, not the burst — two identical bare command lines under
+                # one parent would (correctly) flag
                 (New-Proc 1 2 'node.exe' $t 'node loop-a.js')
                 (New-Proc 2 1 'node.exe' $t 'node loop-b.js')
             )

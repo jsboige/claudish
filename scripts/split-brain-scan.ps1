@@ -19,13 +19,19 @@
        session id in its command line when VS Code spawns it (--output-format
        stream-json stdio), so process->session mapping is impossible by
        design: the session check is (1), the process check is the double-fire
-       signature — THE SAME COMMAND STARTED TWICE in the window — never a
-       same-name burst: one Claude Code session legitimately launches several
-       MCP servers at once (launcher+server node.exe each, DISTINCT command
-       lines), so any name/threshold burst is in permanent alarm on a real
-       host (measured on ai-01, review #342: rc=1, 20 PROCESS-BURST flags on a
-       healthy machine — 21:06:27Z session start, 3 MCPs = 6 node.exe under
-       explorer.exe). The single snapshot also serves root-ancestor
+       signature — THE SAME COMMAND STARTED TWICE BY THE SAME PARENT in the
+       window — never a same-name burst: one Claude Code session legitimately
+       launches several MCP servers at once (launcher+server node.exe each,
+       DISTINCT command lines), so any name/threshold burst is in permanent
+       alarm on a real host (measured on ai-01, review #342: rc=1, 20
+       PROCESS-BURST flags on a healthy machine — 21:06:27Z session start,
+       3 MCPs = 6 node.exe under explorer.exe); and never a
+       same-command-different-parent burst either: after a host reboot + VS
+       Code update, ELEVEN restored windows each launched an identical
+       450-char claude.exe command under ELEVEN DISTINCT Code.exe parents and
+       the (name, command) key flagged them all (rc=1, 35 flags, 2026-10-05
+       20:40:17-20:41:54Z) — the parent pid joined the key after that. The
+       single snapshot also serves root-ancestor
        resolution for the display — a per-process filtered query costs
        ~1.5 s each and a 40-process scan spent a minute on them (review #342).
 
@@ -62,8 +68,12 @@
   mistake blindness for clean.
 
   PROCESS-BURST flags a DOUBLE-FIRE only — the same command line started
-  twice within BurstWindowSec — because a burst of DISTINCT commands is what
-  every healthy session start looks like (review #342).
+  twice BY THE SAME PARENT within BurstWindowSec — because a burst of
+  DISTINCT commands is what every healthy session start looks like, and the
+  same command under distinct parents is what a VS Code window restore looks
+  like (both measured on ai-01, review #342). A process whose command line is
+  unreadable (access denied, non-elevated) is never grouped: two unknowns are
+  not equal.
 
   Flags carry ISO 8601 UTC timestamps (machine-local times drift across hosts
   and against the hub's UTC logs).
@@ -73,9 +83,9 @@
 
 .PARAMETER BurstWindowSec
   Birth window for the PROCESS-BURST double-fire signature: two or more
-  processes launched with an IDENTICAL command line within this many seconds.
-  Default 3. A machine-wide co-birth count is ALSO printed unconditionally —
-  raw visibility, no threshold.
+  processes launched BY ONE PARENT with an IDENTICAL command line within this
+  many seconds. Default 3. A machine-wide co-birth count is ALSO printed
+  unconditionally — raw visibility, no threshold.
 
 .EXAMPLE
   pwsh -File scripts/split-brain-scan.ps1
@@ -167,30 +177,39 @@ function Get-RootAncestor([int]$procId) {
 $rows = @()
 foreach ($p in $procs) {
     $rows += [pscustomobject]@{
-        Pid     = [int]$p.ProcessId
-        Name    = $p.Name
-        Started = $p.CreationDate
-        Cmd     = ("" + $p.CommandLine).Trim()
-        Root    = (Get-RootAncestor ([int]$p.ProcessId))
+        Pid       = [int]$p.ProcessId
+        ParentPid = [int]$p.ParentProcessId
+        Name      = $p.Name
+        Started   = $p.CreationDate
+        Cmd       = ("" + $p.CommandLine).Trim()
+        Root      = (Get-RootAncestor ([int]$p.ProcessId))
     }
 }
 $rows | Sort-Object Started | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
 Write-Output ("  total: {0}" -f $rows.Count)
 
-# PROCESS-BURST = what a double-fire IS: THE SAME COMMAND STARTED TWICE in the
-# window (review #342, ai-01 live). The earlier signature — N same-NAME
-# processes under one ROOT — flagged every Claude Code session start: one
-# session launches several MCP servers, each as launcher+server node.exe with
-# DISTINCT command lines, and Get-RootAncestor clusters the whole VS Code tree
-# under explorer.exe, so "6 node.exe in 3s" is routine, not a split-brain.
-# Signature: group by (Name, normalized command line — the arguments are kept
-# in the FLAG, exactly as DIRECT does; only equality is tested), no ancestry
-# grouping at all: a double-fire under two different roots flags too, and the
-# same MCP server armed by two sessions is a co-launch the operator wants to
-# see (a SAME-session double-spawn of one server is itself the failure).
-# Threshold 2: any second launch of an identical command inside the window is
-# a duplication, never a burst of distinct commands.
-foreach ($g in ($rows | Group-Object Name, Cmd)) {
+# PROCESS-BURST = what a double-fire IS: THE SAME LAUNCHER starting THE SAME
+# COMMAND twice in the window. Key = (parent pid, Name, command) — review
+# #342, second pass. The first rework keyed on (Name, command) alone and the
+# ai-01 live run refuted it: after the 19:56Z host reboot + VS Code update,
+# ELEVEN restored windows each launched a Claude Code panel between
+# 20:40:17 and 20:41:54Z — eleven claude.exe with the SAME 450-char command
+# line (VS Code puts no session id on it) under ELEVEN DISTINCT Code.exe
+# parents: 35 PROCESS-BURST flags, rc=1 at both interpreters, on a healthy
+# machine. Measured on the same snapshot: (Name, command) groups 11 of them,
+# (parent, Name, command) groups 0. A double-fire is the same LAUNCHER doing
+# the same thing twice — an extension host opening two identical panels, a
+# claude.exe launching one MCP server twice, two identical actions under one
+# Schedule service — all still caught; two windows each restoring their panel
+# is not that shape. The arguments are kept in the FLAG, exactly as DIRECT
+# does; only equality is tested. Threshold 2: any second launch of an
+# identical command by the same parent inside the window is a duplication,
+# never a burst of distinct commands.
+# A process whose CommandLine is UNREADABLE (access denied, non-elevated — 3
+# on ai-01) enters NO equality group: "unavailable" is a rendering, not an
+# identity, and two unknowns are not equal.
+$groupable = @($rows | Where-Object { $_.Cmd })
+foreach ($g in ($groupable | Group-Object ParentPid, Name, Cmd)) {
     $sorted = $g.Group | Sort-Object Started
     for ($i = 0; $i -lt $sorted.Count; $i++) {
         $j = $i
@@ -202,9 +221,7 @@ foreach ($g in ($rows | Group-Object Name, Cmd)) {
             # several Add() arguments and -f gets one arg for four
             # placeholders (measured 2026-10-05).
             $ts = ([datetime]$sorted[$i].Started).ToUniversalTime().ToString('o')
-            $cmd = $sorted[$i].Cmd
-            if ([string]::IsNullOrEmpty($cmd)) { $cmd = "(command line unavailable)" }
-            $msg = "PROCESS-BURST: {0} x identical {1} command born within {2}s (first {3}) -> {4}" -f (($j - $i + 1), $sorted[$i].Name, $BurstWindowSec, $ts, $cmd)
+            $msg = "PROCESS-BURST: {0} x identical {1} command born within {2}s under parent {3} (first {4}) -> {5}" -f (($j - $i + 1), $sorted[$i].Name, $BurstWindowSec, $sorted[$i].ParentPid, $ts, $sorted[$i].Cmd)
             $flags.Add($msg)
             $i = $j
         }
@@ -212,9 +229,10 @@ foreach ($g in ($rows | Group-Object Name, Cmd)) {
 }
 
 # Machine-wide co-birth count, printed unconditionally (info, never a flag):
-# the per-root grouping above deliberately answers "is ONE ancestry bursting",
-# which hides a double-fire landing under two different roots in the same
-# second — the raw number keeps that visible without inventing a threshold.
+# the per-parent grouping above answers "did ONE launcher start the same thing
+# twice" and deliberately does NOT see the same command spawned by different
+# parents — the legitimate VS Code window-restore shape (05/10) — so the raw
+# number is what keeps that shape visible without flagging it.
 $allSorted = @($rows | Sort-Object Started)
 $maxCo = 0
 for ($i = 0; $i -lt $allSorted.Count; $i++) {
