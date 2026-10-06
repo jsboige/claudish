@@ -49,13 +49,20 @@ Traps (each inherited from a sibling script or measured here):
      timeout + margin): the hub's reqN resets per restart while pid stays 1,
      so symmetric windows mis-pair a foreign-lane continuation onto a MiniMax
      resp and pollute (b) with thinking the client DID receive elsewhere.
-     And the pairing is ONE-FOR-ONE (each resp consumed once, by the CLOSEST
-     preceding req) with an `ambiguous_pair` counter: a bare any() lets both
-     reqs of a 2-candidate resp enter the denominator -- measured on the
-     04/10 listing: 1 353 resps with exactly 1 candidate, 30 with 2, 0 with
-     0 (the reqN counter reset 5x that day). Also: 1 352/1 383 = 97.8% of
-     MiniMax resps pair to a tool-continuation -- the shape of an agentic
-     role; do NOT read that share against the all-lane continuation rate.
+     And the pairing is TWO-PASS and resp-anchored (#295 review 06/10): EACH
+     RESP goes to the request of MINIMAL dt inside its same-reqN [0, +11 min]
+     window. The first cut walked the reqs in os.listdir order and let each
+     claim its closest FOLLOWING resp -- a FAR req sorting first stole the
+     resp of a NEAR one, and the loser left the denominator as `ambiguous`.
+     One-for-one per resp by construction; deterministic (ties break on the
+     name sort), independent of directory enumeration order. A req that wins
+     >=1 resp enters (b) exactly once; a req that had a candidate window but
+     never won counts `ambiguous_pair`; a req with no candidate at all counts
+     `unpaired`. Measured on the 04/10 listing: 1 353 resps with exactly 1
+     candidate, 30 with 2, 0 with 0 (the reqN counter reset 5x that day).
+     Also: 1 352/1 383 = 97.8% of MiniMax resps pair to a tool-continuation
+     -- the shape of an agentic role; do NOT read that share against the
+     all-lane continuation rate.
   9. Targeted extraction changes what the req-side gate counters MEAN: only
      reqs that COULD pair a selected resp are extracted, so
      `req_out_of_window` / `req_continuation_unpaired` count within the
@@ -71,6 +78,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import json
 import os
 import re
@@ -199,20 +207,22 @@ def scan(dirs, since, until, model_substr):
     total_cont = cont_with_thinking = unpaired_cont = unparsed_req = 0
     cont_sig64 = cont_sig_unsigned = cont_sig_foreign = 0
     ambiguous_pair = 0
-    # ONE-FOR-ONE pairing: each resp is consumed ONCE, by the CLOSEST
-    # preceding req of its reqN. A bare any() let BOTH reqs of a 2-candidate
-    # resp enter (b)'s denominator -- measured on the 04/10 listing: 1 353
-    # resps with exactly 1 candidate, 30 with 2, 0 with 0 (the hub's reqN
-    # counter reset 5x that day; a collision needs two epochs within 11 min).
-    # The consumed set is keyed by the resp's (reqN, ts) -- a resp's own ts
-    # identifies it within its reqN list.
-    consumed_resp = set()
-    # lane map for pairing: reqN -> sorted [resp ts]
     # gate counters: every skip path is COUNTED, never silent -- a 0/0 (b) that
     # is really "the parser never saw a continuation" must be loud (the exact
     # defect this field set catches: the first baseline run printed (b) 0/0 with
     # all skips silent because the envelope was read as the body).
     req_name_mismatch = req_out_of_window = req_no_toolresult = req_shape_skip = 0
+    # TWO-PASS pairing (#295 review 06/10). The first cut walked the reqs in
+    # os.listdir order and let each claim its closest FOLLOWING resp: a FAR req
+    # sorting first stole the resp of a NEAR one (dt-minimal), and the loser
+    # left the denominator as `ambiguous`. The rule is resp-anchored: EACH RESP
+    # goes to the request of MINIMAL dt inside its same-reqN [0, +11 min]
+    # window -- deterministic (ties break on the name sort), independent of
+    # directory enumeration order, one-for-one per resp by construction. A req
+    # that wins >=1 resp enters (b) exactly once; a req that had a candidate
+    # window but never won counts `ambiguous_pair`; a req with no candidate at
+    # all counts `unpaired`.
+    conts = []  # (reqn, ts, name, msgs) -- valid continuations, unpaired yet
     for d in dirs:
         for name in os.listdir(d):
             if name.startswith("req-") and not REQ_RE.match(name):
@@ -257,61 +267,73 @@ def scan(dirs, since, until, model_substr):
             if not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks):
                 req_shape_skip += 1
                 continue
-            # tool-continuation shape confirmed -- lane attribution by pairing.
-            # Directional AND one-for-one: the resp ts is the stream CLOSE, so
-            # it always lands AFTER its request, bounded by the client's 600s
-            # timeout (+margin); and each resp is consumed ONCE, by the closest
-            # preceding req of its reqN (a second candidate of an already-taken
-            # resp counts as ambiguous_pair, never in the denominator -- the
-            # any() form let both in: up to 30/1352 ~= 2.2% on the 04/10 day).
+            # tool-continuation shape confirmed -- pass 2 pairs it.
             reqn = (m.group(2) or "0").lstrip("0") or "0"
-            resp_ts_list = lane_reqn_ts.get(reqn)
-            best = None
-            if resp_ts_list:
-                for rts in resp_ts_list:
-                    dt = (rts - ts).total_seconds()
-                    if 0 <= dt <= PAIR_FORWARD.total_seconds() and (best is None or dt < (best - ts).total_seconds()):
-                        best = rts
-            if best is None:
-                unpaired_cont += 1
+            conts.append((reqn, ts, name, msgs))
+
+    # pass 2 (assignment): group the continuations per reqN, sorted by
+    # (ts, name) -- a resp's candidate window is a contiguous slice of that
+    # sorted list, and its winner is the LAST entry of the slice (latest ts =
+    # minimal dt; the name sort breaks dt ties deterministically).
+    order = sorted(range(len(conts)), key=lambda i: (conts[i][1], conts[i][2]))
+    by_reqn = {}
+    for i in order:
+        by_reqn.setdefault(conts[i][0], []).append(i)
+    won = set()
+    had_candidate = set()
+    for reqn, rlist in lane_reqn_ts.items():
+        idxs = by_reqn.get(reqn)
+        if not idxs:
+            continue
+        tss = [conts[i][1] for i in idxs]
+        for rts in rlist:
+            lo = bisect.bisect_left(tss, rts - PAIR_FORWARD)
+            hi = bisect.bisect_right(tss, rts)
+            if hi <= lo:
                 continue
-            key = (reqn, best)
-            if key in consumed_resp:
-                ambiguous_pair += 1
+            had_candidate.update(idxs[lo:hi])
+            won.add(idxs[hi - 1])
+
+    for i in order:
+        if i not in had_candidate:
+            unpaired_cont += 1
+            continue
+        if i not in won:
+            ambiguous_pair += 1
+            continue
+        total_cont += 1
+        msgs = conts[i][3]
+        # the preceding assistant turn: last assistant message before the
+        # final user turn
+        prev_asst = next((x for x in reversed(msgs[:-1]) if isinstance(x, dict) and x.get("role") == "assistant"), None)
+        if prev_asst is None:
+            continue
+        pc = prev_asst.get("content")
+        pblocks = pc if isinstance(pc, list) else ([{"type": "text", "text": str(pc)}] if isinstance(pc, str) else [])
+        # signature split, THREE-way (the two-way "MiniMax-shaped" split was
+        # measured wrong on the sample): 64-lowercase-hex = decisively
+        # MiniMax (M3's implicit e3b0c442..., M2.5's varying digests);
+        # base64 blob = decisively foreign (Anthropic-shaped); UNSIGNED =
+        # ambiguous -- the OpenAI->Anthropic converter synthesizes unsigned
+        # thinking blocks for GLM/Qwen/DeepSeek too, and a GLM-nominal
+        # sonnet session that fell to MiniMax carries them legitimately.
+        # (b)'s MiniMax-chain signal is the 64-hex count; unsigned is
+        # reported, never claimed.
+        MINIMAX_SIG = re.compile(r"^[0-9a-f]{64}$")
+        for b in pblocks:
+            if not (isinstance(b, dict) and b.get("type") == "thinking"):
                 continue
-            consumed_resp.add(key)
-            total_cont += 1
-            # the preceding assistant turn: last assistant message before the
-            # final user turn
-            prev_asst = next((x for x in reversed(msgs[:-1]) if isinstance(x, dict) and x.get("role") == "assistant"), None)
-            if prev_asst is None:
-                continue
-            pc = prev_asst.get("content")
-            pblocks = pc if isinstance(pc, list) else ([{"type": "text", "text": str(pc)}] if isinstance(pc, str) else [])
-            # signature split, THREE-way (the two-way "MiniMax-shaped" split was
-            # measured wrong on the sample): 64-lowercase-hex = decisively
-            # MiniMax (M3's implicit e3b0c442..., M2.5's varying digests);
-            # base64 blob = decisively foreign (Anthropic-shaped); UNSIGNED =
-            # ambiguous -- the OpenAI->Anthropic converter synthesizes unsigned
-            # thinking blocks for GLM/Qwen/DeepSeek too, and a GLM-nominal
-            # sonnet session that fell to MiniMax carries them legitimately.
-            # (b)'s MiniMax-chain signal is the 64-hex count; unsigned is
-            # reported, never claimed.
-            MINIMAX_SIG = re.compile(r"^[0-9a-f]{64}$")
-            for b in pblocks:
-                if not (isinstance(b, dict) and b.get("type") == "thinking"):
-                    continue
-                sig = b.get("signature")
-                if isinstance(sig, str) and sig:
-                    if MINIMAX_SIG.match(sig):
-                        cont_sig64 += 1
-                    else:
-                        cont_sig_foreign += 1
+            sig = b.get("signature")
+            if isinstance(sig, str) and sig:
+                if MINIMAX_SIG.match(sig):
+                    cont_sig64 += 1
                 else:
-                    cont_sig_unsigned += 1
-                break
-            if any(isinstance(b, dict) and b.get("type") == "thinking" for b in pblocks):
-                cont_with_thinking += 1
+                    cont_sig_foreign += 1
+            else:
+                cont_sig_unsigned += 1
+            break
+        if any(isinstance(b, dict) and b.get("type") == "thinking" for b in pblocks):
+            cont_with_thinking += 1
 
     return {
         "resp_total": total_resp,
@@ -374,7 +396,7 @@ def main():
         res["req_continuation_prev_asst_thinking_sig64_minimax"],
         res["req_continuation_prev_asst_thinking_sig_unsigned_ambiguous"],
         res["req_continuation_prev_asst_thinking_sig_foreign_base64"]))
-    print("    unpaired continuations (no MiniMax resp to attribute the lane): %d ; ambiguous (resp already consumed, 2-candidate): %d ; unparsed req/resp: %d/%d" % (
+    print("    unpaired continuations (no MiniMax resp to attribute the lane): %d ; lost-to-closer (had a candidate resp, a nearer req won it): %d ; unparsed req/resp: %d/%d" % (
         res["req_continuation_unpaired"], res["req_continuation_ambiguous_pair"], res["req_unparsed"], res["resp_unparsed"]))
     print("    req gate skips: name_mismatch=%d out_of_window=%d no_toolresult=%d shape=%d (all paths counted, none silent)" % (
         res["req_name_mismatch"], res["req_out_of_window"], res["req_no_toolresult"], res["req_shape_skip"]))
