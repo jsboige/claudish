@@ -227,6 +227,91 @@ def test_valid_ranges_rejects_impossible_date():
     assert raised, "2026-09-31 must be rejected, not silently measured"
 
 
+# --------------------------------------------------------------------------
+# G8 — lane marker, cost proxies, sweep split
+# --------------------------------------------------------------------------
+
+def test_lane_of_parses_fleet_convention():
+    assert cpl.lane_of("Grain: MED/docs — lane myia-po-2024:CoursIA-2 — prev: x") == \
+        ("myia-po-2024", "CoursIA-2")
+    assert cpl.lane_of("## Grain\nGrain: LIGHT/notebook — lane myia-po-2023:CoursIA") == \
+        ("myia-po-2023", "CoursIA")
+
+
+def test_lane_of_none_without_marker_never_guessed():
+    """A PR without the marker is UNATTRIBUTED — attributing by author would
+    guess the workspace (jsboige-authored PRs came from po-2024's lane)."""
+    assert cpl.lane_of("## Summary\nFix the accents.") is None
+    assert cpl.lane_of(None) is None
+    assert cpl.lane_of("") is None
+
+
+def test_merge_delay_hours_normal_and_garbage():
+    assert cpl.merge_delay_hours("2026-08-14T10:00:00Z", "2026-08-14T22:00:00Z") == 12.0
+    assert cpl.merge_delay_hours(None, "2026-08-14T22:00:00Z") is None
+    assert cpl.merge_delay_hours("garbage", "2026-08-14T22:00:00Z") is None
+
+
+def test_ci_suites_sums_over_commits_and_zero_on_absent():
+    pr = {"commits": {"totalCount": 2, "nodes": [
+        {"commit": {"checkSuites": {"totalCount": 26}}},
+        {"commit": {"checkSuites": {"totalCount": 43}}}]}}
+    assert cpl.ci_suites_of(pr) == 69
+    assert cpl.ci_suites_of({"commits": {"totalCount": 1, "nodes": [{"commit": {}}]}}) == 0
+    assert cpl.ci_suites_of({}) == 0
+
+
+def test_cost_metrics_shapes():
+    def cpr(created, merged, commits, suites):
+        return {"createdAt": created, "mergedAt": merged,
+                "commits": {"totalCount": commits, "nodes": [
+                    {"commit": {"checkSuites": {"totalCount": s}}} for s in suites]}}
+    m = cpl.cost_metrics([cpr("2026-08-14T10:00:00Z", "2026-08-14T22:00:00Z", 1, [26]),
+                          cpr("2026-08-14T08:00:00Z", "2026-08-14T12:00:00Z", 2, [43, 43])])
+    assert m["n"] == 2 and m["delay_median_h"] == 8.0
+    assert m["commits_mean"] == 1.5 and m["commits_median"] == 1.5
+    assert m["ci_mean"] == 56.0 and m["ci_median"] == 56.0  # 26 and 86
+
+
+def test_sweep_split_marks_bulk_minutes():
+    """THE G5 lot filter proxy: 9 closures in one minute = sweep, whatever
+    the stateReason; 3 spread closures = organic."""
+    closed = (["2026-08-14T10:00:%02dZ" % s for s in range(9)] +
+              ["2026-08-14T11:0%d:00Z" % m for m in (1, 2, 3)])
+    items = [{"closedAt": c, "stateReason": "completed"} for c in closed]
+    total, hors, swept = cpl.sweep_split(items)
+    assert total == 12 and swept == 9 and hors == 3, (total, hors, swept)
+
+
+def test_sweep_split_empty():
+    assert cpl.sweep_split([]) == (0, 0, 0)
+
+
+def _daily_page(prs, issue_count=None):
+    return {"search": {"issueCount": issue_count if issue_count is not None else len(prs),
+                       "pageInfo": {"endCursor": None, "hasNextPage": False},
+                       "nodes": [
+                           {"number": p["number"], "createdAt": p["createdAt"], "mergedAt": p["mergedAt"],
+                            "title": p.get("title", ""), "body": p.get("body", ""),
+                            "author": {"login": p.get("author", "x")},
+                            "commits": p.get("commits", {"totalCount": 1, "nodes": []}),
+                            "closingIssuesReferences": {"totalCount": p.get("closing", 0)}}
+                           for p in prs]}}
+
+
+def test_day_prs_extracts_lane_and_cost_fields():
+    def fake_fetch(query, variables):
+        assert "commits(last: 100)" in query  # the daily query, not the weekly one
+        return _daily_page([{"number": 11151, "createdAt": "2026-08-14T09:00:00Z",
+                             "mergedAt": "2026-08-14T21:00:00Z",
+                             "title": "fix(a,#1)",
+                             "body": "Grain: LIGHT/docs — lane myia-po-2024:CoursIA-2 — prev: x"}])
+    prs, cap = cpl.day_prs("r", "2026-08-14", fetch=fake_fetch)
+    assert cap is False and len(prs) == 1
+    assert prs[0]["lane"] == ("myia-po-2024", "CoursIA-2")
+    assert prs[0]["title_nums"] == {"1"}  # extraction still runs
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
