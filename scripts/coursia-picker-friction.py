@@ -86,6 +86,13 @@ PICKER_BASH = [
     ("gh_search", re.compile(r"\bgh\s+search\s+(?:issues|prs|repos)\b")),
     ("branch_inventory", re.compile(r"\bgit\s+(?:worktree\s+list|branch\s+-a)\b")),
 ]
+# A `view <N>` names a concrete target — the selection-shape signal (#328 G3
+# suite). Declared limit: a view right after `gh pr create` may just be the
+# lane checking its OWN fresh PR; the bias is the same instrument both months,
+# so it cancels in the July-vs-September comparison (same argument as the
+# published counter), but a single-month `named` share is a proxy, never a
+# dispatch join — that join is G2's to make.
+RE_NUMBERED_VIEW = re.compile(r"\bgh\s+(?:issue|pr)\s+view\s+\d")
 PICKER_MCP = {"mcp__roo-state-manager__roosync_search",
               "mcp__roo-state-manager__conversation_browser"}
 RE_BACKLOG_PATH = re.compile(r"backlog|ledger|issue-debt|roadmap|open-questions", re.I)
@@ -138,22 +145,23 @@ def scan_file(path, ws):
                 if name == "Bash":
                     cmd = strip_heredocs(inp.get("command", "") or "")
                     if RE_PR_CREATE.search(cmd):
-                        ev.append((dt, "END", "gh pr create", ws, path))
+                        ev.append((dt, "END", "gh pr create", ws, path, False))
                     if RE_BRANCH.search(cmd):
-                        ev.append((dt, "START", "branch", ws, path))
+                        ev.append((dt, "START", "branch", ws, path, False))
                     for cls, rx in PICKER_BASH:
                         if rx.search(cmd):
-                            ev.append((dt, "PICKER", cls, ws, path))
+                            numbered = bool(RE_NUMBERED_VIEW.search(cmd))
+                            ev.append((dt, "PICKER", cls, ws, path, numbered))
                 elif name == DASH and str(inp.get("action")) in WRITE_ACTIONS:
                     c = str(inp.get("content", ""))
                     if "[DONE]" in c:
-                        ev.append((dt, "END", "dashboard [DONE]", ws, path))
+                        ev.append((dt, "END", "dashboard [DONE]", ws, path, False))
                     if "[CLAIMED]" in c:
-                        ev.append((dt, "START", "dashboard [CLAIMED]", ws, path))
+                        ev.append((dt, "START", "dashboard [CLAIMED]", ws, path, False))
                 elif name in PICKER_MCP:
-                    ev.append((dt, "PICKER", name.split("__")[-1], ws, path))
+                    ev.append((dt, "PICKER", name.split("__")[-1], ws, path, False))
                 elif name == "Read" and RE_BACKLOG_PATH.search(str(inp.get("file_path", ""))):
-                    ev.append((dt, "PICKER", "backlog_read", ws, path))
+                    ev.append((dt, "PICKER", "backlog_read", ws, path, False))
     ev.sort(key=lambda e: e[0])
     return ev, n_calls
 
@@ -191,8 +199,11 @@ def windows(bounds, events):
     end — so `END, END, START` is ONE window, not two, and not a dropped one).
     An END with no following START in its file ends at the session boundary and
     is DROPPED, never counted as an infinite window. Returns windows
-    [(end_dt, start_dt, picker Counter, total_picker, first_picker_dt|None, ws)]
-    plus the dropped count."""
+    [(end_dt, start_dt, picker Counter, total_picker, first_picker_dt|None, ws,
+    class)] plus the dropped count. `class` is the selection SHAPE of the
+    window: 'named' (>=1 numbered `view <N>` — a concrete target was on the
+    lane's mind), 'scan' (picker calls but no numbered view — the grain was
+    searched for), 'direct' (no picker call at all)."""
     pickers = defaultdict(list)
     for e in events:
         if e[1] == "PICKER":
@@ -211,8 +222,11 @@ def windows(bounds, events):
                     continue
                 win = [p for p in pickers[f] if pending[0] < p[0] < b[0]]
                 cnt = Counter(p[2] for p in win)
+                total = sum(cnt.values())
+                named = any(len(p) > 5 and p[5] for p in win)
+                wclass = "direct" if total == 0 else ("named" if named else "scan")
                 first = min((p[0] for p in win), default=None)
-                out.append((pending[0], b[0], cnt, sum(cnt.values()), first, b[3]))
+                out.append((pending[0], b[0], cnt, total, first, b[3], wclass))
                 pending = None
         if pending is not None:
             dropped += 1
@@ -273,10 +287,10 @@ def main(argv=None):
         if not mw:
             print("  no windows")
             continue
-        deltas = [(s - e).total_seconds() / 60 for e, s, _, _, _, _ in mw]
-        counts = [c for _, _, _, c, _, _ in mw]
+        deltas = [(s - e).total_seconds() / 60 for e, s, _, _, _, _, _ in mw]
+        counts = [c for _, _, _, c, _, _, _ in mw]
         acts = [((s - fp).total_seconds() / 60 if fp else 0.0)
-                for e, s, _, _, fp, _ in mw]
+                for e, s, _, _, fp, _, _ in mw]
         withp = sum(1 for c in counts if c > 0)
         reopened = sum(1 for d in deltas if d > 360)
         print(f"  delta END->START min : p50={pct(deltas,.5):.0f} p90={pct(deltas,.9):.0f} "
@@ -289,13 +303,24 @@ def main(argv=None):
         print(f"  active span first-picker->START min : p50={pct(acts,.5):.0f} "
               f"p90={pct(acts,.9):.0f}")
         cls = Counter()
-        for _, _, c, _, _, _ in mw:
+        for _, _, c, _, _, _, _ in mw:
             cls.update(c)
         print("  picker class mix      : " + ", ".join(f"{k}:{v}" for k, v in cls.most_common()))
         bws = defaultdict(int)
         for w in mw:
             bws[w[5]] += 1
         print("  windows per workspace : " + ", ".join(f"{k}:{v}" for k, v in sorted(bws.items())))
+        print("  window class (selection shape) — share, picker calls, delta:")
+        for wclass in ("named", "scan", "direct"):
+            sub = [w for w in mw if w[6] == wclass]
+            if not sub:
+                print(f"    {wclass:7}: 0 windows")
+                continue
+            sc = [w[3] for w in sub]
+            sd = [(w[1] - w[0]).total_seconds() / 60 for w in sub]
+            print(f"    {wclass:7}: {len(sub):3} ({100*len(sub)/len(mw):3.0f}%) | "
+                  f"calls/window mean={sum(sc)/len(sc):4.1f} p50={pct(sc,.5):3.0f} "
+                  f"p90={pct(sc,.9):3.0f} | delta p50={pct(sd,.5):3.0f} min")
     print(f"\n  [scope] files under {a.projects_dir}; July is single-machine (see docstring)")
 
 

@@ -289,6 +289,66 @@ def test_main_refuses_malformed_month():
     _check(code == 2, f"malformed month must exit 2, got {code}")
 
 
+# ── window class: named / scan / direct (#328 G3 suite) ─────────────────────
+
+def test_window_class_named_scan_direct():
+    """Three windows in one file: a numbered view names a target (named), an
+    unnumbered inventory search does not (scan), and no picker at all is
+    direct. Each class ACCEPT is pinned on its own window so a classifier
+    collapsing everything to one class cannot pass."""
+    lines = [
+        _dash("2026-07-01T10:00:00.000Z", "append", "[DONE] grain A"),
+        _bash("2026-07-01T10:20:00.000Z", "gh issue view 42"),
+        _dash("2026-07-01T10:30:00.000Z", "append", "[CLAIMED] #42"),
+        _dash("2026-07-01T11:00:00.000Z", "append", "[DONE] grain B"),
+        _bash("2026-07-01T11:10:00.000Z", "gh issue list --state open"),
+        _bash("2026-07-01T11:15:00.000Z", "gh search prs --author me"),
+        _dash("2026-07-01T11:30:00.000Z", "append", "[CLAIMED] #7"),
+        _dash("2026-07-01T12:00:00.000Z", "append", "[DONE] grain C"),
+        _dash("2026-07-01T12:10:00.000Z", "append", "[CLAIMED] #9"),
+    ]
+    ev = _scan(lines)
+    w, _ = cpf.windows(cpf.cluster(ev, 60), ev)
+    _check(len(w) == 3, f"expected 3 windows, got {len(w)}: {w}")
+    by_class = {x[6]: x for x in w}
+    _check(set(by_class) == {"named", "scan", "direct"},
+           f"class set wrong: {sorted(by_class)}")
+    _check(by_class["named"][3] == 1, f"named window picker count wrong: {by_class}")
+    _check(by_class["scan"][3] == 2, f"scan window picker count wrong: {by_class}")
+    _check(by_class["direct"][3] == 0, f"direct window has pickers: {by_class}")
+
+
+def test_numbered_view_refuses_lookalikes():
+    """`--web` and slug views carry NO number: the window must stay scan — a
+    look-alike that would inflate the named share."""
+    lines = [
+        _dash("2026-07-01T10:00:00.000Z", "append", "[DONE] grain A"),
+        _bash("2026-07-01T10:10:00.000Z", "gh pr view --web"),
+        _bash("2026-07-01T10:15:00.000Z", "gh issue view my-team/slug-issue"),
+        _dash("2026-07-01T10:30:00.000Z", "append", "[CLAIMED] #5"),
+    ]
+    ev = _scan(lines)
+    w, _ = cpf.windows(cpf.cluster(ev, 60), ev)
+    _check(len(w) == 1 and w[0][6] == "scan",
+           f"numberless views must keep the window scan: {w}")
+
+
+def test_numbered_view_inside_heredoc_body_is_not_named():
+    """A `gh issue view 42` quoted inside a heredoc body is not a selection
+    (trap 1 applied to the class signal) — the window stays scan."""
+    lines = [
+        _dash("2026-07-01T10:00:00.000Z", "append", "[DONE] grain A"),
+        _bash("2026-07-01T10:10:00.000Z",
+              "cat > x.sh <<'EOF'\ngh issue view 42\nEOF\necho done"),
+        _bash("2026-07-01T10:15:00.000Z", "gh issue list"),
+        _dash("2026-07-01T10:30:00.000Z", "append", "[CLAIMED] #5"),
+    ]
+    ev = _scan(lines)
+    w, _ = cpf.windows(cpf.cluster(ev, 60), ev)
+    _check(len(w) == 1 and w[0][6] == "scan",
+           f"heredoc-quoted numbered view must not name the window: {w}")
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 
 def main():
