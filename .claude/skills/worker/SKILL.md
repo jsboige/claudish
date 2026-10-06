@@ -29,6 +29,13 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      champ `detail` dit si le reload a été différé au restart quotidien ou
      déclenché immédiatement : ancien id retiré amont), `major-ask` → tag
      **ASK** (arbitrage user, la majeure seule n'arme rien),
+     `role-alias-ask` → tag **ASK** (un nom demandable par un client — clé de
+     routage — n'est couvert par aucun motif de `CLAUDISH_FAILOVER_ROLE_MODELS`
+     ni mot-clé de rôle : un client nommant cet id résout **aucun rôle** et
+     perd toute cascade — le champ `from` porte l'alias exact à ajouter,
+     `to` l'id ; geste opérateur = env + recreate drainé, à grouper ; **un seul
+     ask par (id, alias suggéré)**, le journal d'événements déduplique — ne pas
+     re-signaler un identifiant déjà relayé),
      `probe-fail`/`error` → tag WARN, `info` → tag INFO (membre d'une famille sur
      un provider **non surveillé** — `oai@`, ou nu : non sondé, non touché, une
      ligne d'information, pas une action). Après relais, mettre à jour le watermark

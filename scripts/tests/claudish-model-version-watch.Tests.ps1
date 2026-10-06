@@ -322,6 +322,20 @@ Describe 'model-version-watch.ps1 runner wiring (B1/B3)' {
         $text | Should -Match '-ProviderPrefixes \$watchedProviders'
         $text | Should -Match 'REPORT-ONLY'
     }
+    It 'role-alias drift check runs BEFORE the first OAuth early-exit - checked on every run (CR c.6005492851 M1)' {
+        # The check needs only config + env. If its call sat after the OAuth /
+        # probe / pending exits, an expired Codex OAuth or a chatgpt.com outage
+        # would silently disable a check that needs neither network nor token
+        # (CR #344 "checked on every run"). Textual order pin: the call must
+        # precede the first OAuthPath TEST — red under the M1 mutation that
+        # moves the block past the pending exit.
+        $text = Get-Content -LiteralPath $script:RunnerPath -Raw
+        $callIdx = $text.IndexOf('Compare-RoleModelsToRouting -Routing')
+        $oauthTestIdx = $text.IndexOf('Test-Path -LiteralPath $OAuthPath')
+        ($callIdx -ge 0) | Should -Be $true
+        ($oauthTestIdx -ge 0) | Should -Be $true
+        ($oauthTestIdx -gt $callIdx) | Should -Be $true
+    }
 }
 
 Describe 'Write-VersionEvent / Test-ClaudishOptIn' {
@@ -350,5 +364,186 @@ Describe 'Write-VersionEvent / Test-ClaudishOptIn' {
         (Test-ClaudishOptIn -ClaudishHome $script:dir -Token 'enabled') | Should -Be $false
         Set-Content (Join-Path $script:dir 'model-version-watch.enabled') 'enabled'
         (Test-ClaudishOptIn -ClaudishHome $script:dir -Token 'enabled') | Should -Be $true
+    }
+}
+
+Describe 'Compare-RoleModelsToRouting (role-alias drift, 2026-10-05, reworked CR c.5993885265)' {
+    # The drift this hunts: routing repinned to a newer MINOR while
+    # CLAUDE_FAILOVER_ROLE_MODELS kept the older spelling. parseRoleAliases
+    # matches a lowercased SUBSTRING, so the old pattern does NOT cover the new
+    # id and a client naming the current id gets no cascade at all.
+    #
+    # CRITICAL (CR #344): the proxy derives the role from the CLIENT-REQUESTED
+    # name (keywords first, then aliases, first match wins, invalid-role
+    # entries skipped at parse). The pre-CR detector iterated routing TARGETS
+    # instead; every C-case below was replayed by the coordinator against the
+    # real module next to a TS port of the resolution, and each is pinned here.
+    BeforeAll {
+        $script:routing = [pscustomobject]@{
+            'gpt-6-sol'   = @('cx@gpt-6.1-sol')   # spelling old, served id NEW
+            'gpt-5.6-sol' = @('cx@gpt-6.1-sol')
+            'gpt-6.1-sol' = @('cx@gpt-6.1-sol')
+            'gpt-6-astra' = @('cx@gpt-6-astra')
+            'glm-5.3'     = @('gc@glm-5.3')
+        }
+        # The live hub value on 2026-10-05, BEFORE the fix.
+        $script:staleRoles = 'glm-5.2:sonnet,glm-5.3:sonnet,minimax-m3:haiku,gpt-6-sol:opus,gpt-5.6-sol:opus,gpt-6-astra:fable'
+        $script:aliasDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mvalias-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:aliasDir -Force | Out-Null
+        # Build the file path HERE, not inside the It: under Pester 6 a
+        # Describe's BeforeAll and its It blocks do not share the same script
+        # scope for a variable first assigned inside an It, so a path made in
+        # the It reached Write-VersionEvent as $null and the assert then read an
+        # empty file (measured; the file header warns about exactly this shape
+        # for fixtures, it applies to paths too).
+        $script:aliasEv = Join-Path $script:aliasDir 'evt-alias.log'
+    }
+    It 'THE INCIDENT: gpt-6-sol does not cover gpt-6.1-sol (substring semantics) - drift reported with a concrete suggestion' {
+        $d = @(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels $script:staleRoles)
+        $ids = @($d | ForEach-Object { $_.Id })
+        ($ids -contains 'gpt-6.1-sol') | Should -Be $true
+        $row = @($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' })[0]
+        $row.Family | Should -Be 'gpt-sol'
+        # Role inherited from the family's existing alias (gpt-6-sol:opus)
+        $row.Suggested | Should -Be 'gpt-6.1-sol:opus'
+    }
+    It 'POSITIVE CONTROL: adding the exact suggested alias silences it' {
+        $fixed = $script:staleRoles + ',gpt-6.1-sol:opus'
+        $d = @(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels $fixed)
+        (@($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' }).Count) | Should -Be 0
+    }
+    It 'C1: an alias with an INVALID role does not exist for the proxy either - the drift is still reported' {
+        # 'gpt-6.1-sol:opsu' is skipped at parse (role not in opus/sonnet/haiku/
+        # fable), exactly like parseRoleAliases logs-and-skips, so the key is
+        # uncovered and the family (gpt-6-sol:opus) suggests the fix.
+        $r = [pscustomobject]@{ 'gpt-6.1-sol' = @('cx@gpt-6.1-sol') }
+        $d = @(Compare-RoleModelsToRouting -Routing $r -RoleModels 'gpt-6-sol:opus,gpt-6.1-sol:opsu')
+        (@($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' }).Count) | Should -Be 1
+        (@($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' })[0].Suggested) | Should -Be 'gpt-6.1-sol:opus'
+    }
+    It 'C2: coverage of the routing TARGET never covers the requested NAME (drift behind a remap)' {
+        # Key gpt-6.1-sol remapped to cx@gpt-6-sol; the alias covers only the
+        # target spelling. A client naming the KEY still resolves to null.
+        $r = [pscustomobject]@{ 'gpt-6.1-sol' = @('cx@gpt-6-sol') }
+        $d = @(Compare-RoleModelsToRouting -Routing $r -RoleModels 'gpt-6-sol:opus')
+        (@($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' }).Count) | Should -Be 1
+    }
+    It 'C3: a keyword-bearing NAME has a role regardless of where it routes - never a drift, never the wrong suggestion' {
+        # claude-haiku-4-5 aimed at gc@glm-4.7: roleFromModelName says haiku by
+        # keyword. The pre-CR detector suggested glm-4.7:sonnet from the target.
+        $r = [pscustomobject]@{ 'claude-haiku-4-5' = @('gc@glm-4.7') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'glm-5.3:sonnet').Count) | Should -Be 0
+    }
+    It 'C4: a provider-only routing entry (value with no model) is judged on its KEY' {
+        $r = [pscustomobject]@{ 'glm-5.1' = @('gc') }
+        $d = @(Compare-RoleModelsToRouting -Routing $r -RoleModels 'glm-5.3:sonnet')
+        (@($d | Where-Object { $_.Id -eq 'glm-5.1' }).Count) | Should -Be 1
+        (@($d | Where-Object { $_.Id -eq 'glm-5.1' })[0].Suggested) | Should -Be 'glm-5.1:sonnet'
+    }
+    It 'C6: the suggested role comes from the FIRST family alias in ROLE_MODELS order - deterministic under both interpreters' {
+        # gpt-6-sol:opus first, gpt-5.6-sol:sonnet second: same family, the
+        # suggestion must be opus whatever the hashtable iteration order does.
+        $r = [pscustomobject]@{ 'gpt-6.1-sol' = @('cx@gpt-6.1-sol') }
+        $d = @(Compare-RoleModelsToRouting -Routing $r -RoleModels 'gpt-6-sol:opus,gpt-5.6-sol:sonnet')
+        $d[0].Suggested | Should -Be 'gpt-6.1-sol:opus'
+    }
+    It 'C7: a provider-prefixed pattern matches only a provider-prefixed name - no drift either way' {
+        # The proxy resolves a client naming cx@gpt-6.1-sol to opus via the
+        # prefixed pattern; a client naming the bare id resolves to null and
+        # gets the family suggestion. Both halves pinned.
+        $r = [pscustomobject]@{
+            'cx@gpt-6.1-sol' = @('cx@gpt-6.1-sol')
+            'gpt-6.1-sol'    = @('cx@gpt-6.1-sol')
+        }
+        $d = @(Compare-RoleModelsToRouting -Routing $r -RoleModels 'cx@gpt-6.1-sol:opus')
+        (@($d | ForEach-Object { $_.Id }) -join ',') | Should -Be 'gpt-6.1-sol'
+        $d[0].Suggested | Should -Be 'gpt-6.1-sol:opus'
+    }
+    It 'duplicate pattern keeps the FIRST entry (roleFromModelName returns on first match)' {
+        # glm-5.2 twice with different roles: the family suggestion for a new
+        # member must come from the first (sonnet), not the last (haiku).
+        $r = [pscustomobject]@{ 'glm-9.9' = @('gc@glm-9.9') }
+        $d = @(Compare-RoleModelsToRouting -Routing $r -RoleModels 'glm-5.2:sonnet,glm-5.2:haiku')
+        $d[0].Suggested | Should -Be 'glm-9.9:sonnet'
+    }
+    It 'says nothing about families the alias table does not track (no invented work)' {
+        # Untracked AND versioned (llama): silent even though it is a real
+        # family shape - the table does not intend to cover it.
+        $r = [pscustomobject]@{ 'llama-4.9' = @('ll@llama-4.9') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels $script:staleRoles).Count) | Should -Be 0
+        # Unversioned alias shape (mistral-*-latest): silent, never a crash.
+        $r2 = [pscustomobject]@{ 'mistral-medium-latest' = @('mm@mistral-medium-latest') }
+        (@(Compare-RoleModelsToRouting -Routing $r2 -RoleModels $script:staleRoles).Count) | Should -Be 0
+    }
+    It 'substring coverage: a pattern covers LONGER names that contain it (glm-5.3 covers glm-5.3-flash)' {
+        # The live routing has glm-5.3-flash as its own key; the proxy covers it
+        # through the glm-5.3 pattern. An exact-equality or reversed-inclusion
+        # rewrite of the match would report a false drift here (CR M2/M3).
+        $r = [pscustomobject]@{ 'glm-5.3-flash' = @('gc@glm-5.3-flash') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'glm-5.3:sonnet').Count) | Should -Be 0
+    }
+    It 'keyword precedence holds even when the keyword-bearing family IS tracked (no false drift)' {
+        # Keywords win BEFORE aliases (roleFromModelName), so a name carrying
+        # 'sonnet' has a role whatever the family alias says — silent. The
+        # family here IS tracked (pattern glm-5.2-sonnet versions to the same
+        # glm-sonnet family as the key), so removing the keyword block turns
+        # this into a FALSE drift row (CR C3) — the pin is not vacuous.
+        $r = [pscustomobject]@{ 'glm-5.3-sonnet' = @('gc@glm-5.3-sonnet') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'glm-5.2-sonnet:haiku').Count) | Should -Be 0
+    }
+    It 'matching is case-insensitive on both sides (MiniMax-M3 key vs minimax-m3 pattern)' {
+        # parseRoleAliases lowercases the pattern and roleFromModelName the
+        # requested name; the live routing key is spelled MiniMax-M3 (CR M5).
+        $r = [pscustomobject]@{ 'MiniMax-M3' = @('mmc@MiniMax-M3') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'minimax-m3:haiku').Count) | Should -Be 0
+    }
+    It 'CR c.6005492851 M2: a pattern that is a substring WITHOUT the family prefix still covers the name (substring, not equality)' {
+        # The two fixtures the re-review refuted as "non-constructible". The
+        # proxy covers gpt-6.1-sol here via requested.toLowerCase().includes
+        # ('6.1-sol'). Under the equality mutant ($low -eq $a.Pattern) neither
+        # 'gpt-6-sol' nor '6.1-sol' EQUALS the key, the family guard does not
+        # save it (gpt-sol is tracked by gpt-6-sol) and a FALSE drift row gets
+        # through — replayed by the coordinator on both interpreters.
+        $r = [pscustomobject]@{ 'gpt-6.1-sol' = @('cx@gpt-6.1-sol') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'gpt-6-sol:opus,6.1-sol:opus').Count) | Should -Be 0
+    }
+    It 'CR c.6005492851 M5: an UPPERCASE routing key is covered by the lowercase alias (the key is lowercased BEFORE matching)' {
+        # Under the no-lowercase mutant ($low = $key) the .Contains comparisons
+        # turn case-sensitive, 'GPT-6.1-SOL' matches neither alias pattern, and
+        # the tracked family lets a FALSE drift ('GPT-6.1-SOL:opus') through.
+        $r = [pscustomobject]@{ 'GPT-6.1-SOL' = @('cx@gpt-6.1-sol') }
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels 'gpt-6-sol:opus,gpt-6.1-sol:opus').Count) | Should -Be 0
+    }
+    It 'reports once per family member, not once per spelling (3 spellings of one id -> 1 row)' {
+        $d = @(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels $script:staleRoles)
+        (@($d | Where-Object { $_.Id -eq 'gpt-6.1-sol' }).Count) | Should -Be 1
+    }
+    It 'unreadable/empty alias string is not a drift signal (fail safe, never a false report)' {
+        (@(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels '').Count) | Should -Be 0
+        (@(Compare-RoleModelsToRouting -Routing $script:routing -RoleModels ',:,:bogus,').Count) | Should -Be 0
+    }
+    It 'a pattern covering an unrelated id does not silence a gap (each id judged on its own substring)' {
+        # 'glm-5.3:sonnet' must not be read as covering anything but glm-5.3.
+        $r = [pscustomobject]@{ 'glm-5.4' = @('gc@glm-5.4') }
+        $roles = 'glm-5.3:sonnet'
+        (@(Compare-RoleModelsToRouting -Routing $r -RoleModels $roles).Count) | Should -Be 1
+    }
+    It 'role-alias-ask is an accepted event kind (consumer parity with major-ask)' {
+        Write-VersionEvent -EventsPath $script:aliasEv -Kind role-alias-ask -Family gpt-sol -From 'gpt-6.1-sol:opus' -To 'gpt-6.1-sol' -Detail 'suggest gpt-6.1-sol:opus'
+        # @() is load-bearing: Get-Content on a ONE-LINE file returns a STRING,
+        # and indexing a string yields its first character ('{'), which
+        # ConvertFrom-Json reports as "Unexpected end when reading JSON" - a
+        # misleading failure that costs a debug cycle. The sibling block gets
+        # away with (Get-Content ...)[0] only because it writes TWO lines.
+        (@(Get-Content $script:aliasEv)[0] | ConvertFrom-Json).kind | Should -Be 'role-alias-ask'
+    }
+    It 'Test-RoleAliasAskEmitted dedupes by (id, suggested) - one ask per hole, not two per 6h run' {
+        (Test-RoleAliasAskEmitted -EventsPath $script:aliasEv -Id 'gpt-6.1-sol' -Suggested 'gpt-6.1-sol:opus') | Should -Be $true
+        # A DIFFERENT suggestion for the same id is a new question.
+        (Test-RoleAliasAskEmitted -EventsPath $script:aliasEv -Id 'gpt-6.1-sol' -Suggested 'gpt-6.1-sol:sonnet') | Should -Be $false
+        # Another id is a different hole.
+        (Test-RoleAliasAskEmitted -EventsPath $script:aliasEv -Id 'glm-5.1' -Suggested 'glm-5.1:sonnet') | Should -Be $false
+        # Absent log: nothing emitted yet.
+        (Test-RoleAliasAskEmitted -EventsPath (Join-Path $script:aliasDir 'nope.log') -Id 'x' -Suggested 'x:opus') | Should -Be $false
     }
 }
