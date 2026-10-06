@@ -157,6 +157,179 @@ Describe 'Get-FailoverNextSince (watermark)' {
         $w.SinceUtc | Should -Be '2026-10-05T19:15:00.000Z'
         $w.Reason | Should -Be 'held-no-window-start'
     }
+
+    It 'a STALE coherence verdict holds the watermark under its OWN distinct reason — and beats the Ok window' {
+        # The verdict outranks a successful invocation AND an otherwise-valid
+        # window start: certifying a window served from the pre-rotation
+        # segment is strictly worse than holding.
+        $w = Get-FailoverNextSince -InvocationOk $true -WindowStartUtc '2026-10-05T19:30:00.000Z' -PreviousSinceUtc '2026-10-05T19:15:00.000Z' -CoherenceVerdict 'stale'
+        $w.SinceUtc | Should -Be '2026-10-05T19:15:00.000Z'
+        $w.Reason | Should -Be 'held-since-served-stale-segment'
+        ($w.Reason -ne 'held-not-measured') | Should -Be $true
+    }
+
+    It 'an untested or coherent verdict changes nothing to the legacy reasons' {
+        foreach ($v in @('untested', 'coherent', 'coherent-silent')) {
+            $w = Get-FailoverNextSince -InvocationOk $true -WindowStartUtc '2026-10-05T19:30:00.000Z' -PreviousSinceUtc '2026-10-05T19:15:00.000Z' -CoherenceVerdict $v
+            $w.SinceUtc | Should -Be '2026-10-05T19:30:00.000Z'
+            $w.Reason | Should -Be 'window-start'
+        }
+    }
+}
+
+Describe 'Test-DockerLogsSinceCoherence (stale-segment probe)' {
+    # The CR of PR #357 (2026-10-06): on the json-file driver after a rotation,
+    # `docker logs --since` can serve the PREVIOUS segment instead of the
+    # current one — no error, no warning (measured on ai-01 and po-2025 on
+    # 06-07/09, three epochs, three times; reproduced on .46 on 04/10; po-203
+    # does not have the defect; traffic-live.ps1 GOTCHA #2 carries a tail-depth
+    # fallback against the same signature). The collector then receives old
+    # lines or nothing, the bounded invocation renders Ok, an open-instant
+    # watermark ADVANCES, and the tick certifies a window nobody read. The
+    # discriminator is the one traffic-live.ps1 measured reliable: a SHORT
+    # tail probe (`--tail 1 --timestamps`). Everything below runs on INJECTED
+    # docker outputs — the verdict is pure logic, testable with no daemon.
+
+    It 'BLOCKING CASE: window older than the tail-1 line => stale, watermark held under its own reason' {
+        # The exact signature: the --since window (a stale segment) holds
+        # lines whose newest is BEFORE --since, while the container's real
+        # newest line (the tail probe) is at-or-after --since.
+        $since = '2026-10-05T19:30:00.000Z'
+        $staleWindow = @(
+            '2026-10-05T19:14:02.000000000Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=10min'
+            '2026-10-05T19:14:59.000000000Z [Failover] DISARMED bucket glm-coding -> probing nominals'
+        )
+        $tailProbe = @{ Exited = $true; Code = 0; Lines = @('2026-10-05T19:31:07.000000000Z [Request] pid=1 reqN=5001 model=glm-5.3 msgs=9 bytes=12345 ttft=900ms'); ErrorText = '' }
+
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines $staleWindow -SinceUtc $since
+        $c.Verdict | Should -Be 'stale'
+
+        $w = Get-FailoverNextSince -InvocationOk $true -WindowStartUtc '2026-10-05T19:31:00.000Z' -PreviousSinceUtc $since -CoherenceVerdict $c.Verdict
+        $w.SinceUtc | Should -Be $since
+        $w.Reason | Should -Be 'held-since-served-stale-segment'
+    }
+
+    It 'stale ALSO fires on an EMPTY window whose tail line is inside the range — the photographed "quiet proxy" lie' {
+        $since = '2026-10-05T19:30:00.000Z'
+        $tailProbe = @{ Exited = $true; Code = 0; Lines = @('2026-10-05T19:32:40.000000000Z [Request] pid=1 reqN=5002 model=glm-5.3 msgs=4 bytes=6789 ttft=400ms'); ErrorText = '' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines @() -SinceUtc $since
+        $c.Verdict | Should -Be 'stale'
+    }
+
+    It 'a tail probe whose single line lands on the container STDERR is adjudicated by the EXIT CODE, not the events-verdict Ok (the permanent-wedge guard)' {
+        # `docker logs` demuxes container stderr to the CLI's stderr — and the
+        # hub's [Failover] markers ARE stderr-class. A verdict-Ok gate would
+        # read this healthy probe as "docker refused" on every tick, hold the
+        # watermark forever, and kill the collector by wedge. Exit 0 + the
+        # merged streams is the transport truth.
+        $since = '2026-10-05T19:30:00.000Z'
+        $tailProbe = @{ Exited = $true; Code = 0; Lines = @(); ErrorText = '2026-10-05T19:31:07.000000000Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=10min' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines @() -SinceUtc $since
+        $c.Verdict | Should -Be 'stale'
+    }
+
+    It 'the tail adjudication takes the NEWEST parseable instant across both probe streams' {
+        # stdout holds an older timestamped line, stderr a newer one; --since
+        # sits between them and the window is empty. Reading the OLDER would
+        # say coherent-silent (missed stale); the newest says stale.
+        $since = '2026-10-05T19:30:00.000Z'
+        $tailProbe = @{
+            Exited    = $true
+            Code      = 0
+            Lines     = @('2026-10-05T19:11:00.000000000Z [Request] pid=1 reqN=4998 model=glm-5.3 msgs=2 bytes=2222 ttft=150ms')
+            ErrorText = '2026-10-05T19:33:12.000000000Z [Failover] DWELL sonnet session 8f2c…9a yielded — nominal recovered 74s ago'
+        }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines @() -SinceUtc $since
+        $c.Verdict | Should -Be 'stale'
+    }
+
+    It 'a genuinely quiet window is coherent-silent, NOT stale (the false-positive guard traffic-live measured)' {
+        # traffic-live 2026-08-30: `--since 1h` returning 0 lines against a
+        # newest line 4.5 h old is the RIGHT answer, not a defect — the
+        # container truly emitted nothing in the window.
+        $since = '2026-10-05T19:30:00.000Z'
+        $tailProbe = @{ Exited = $true; Code = 0; Lines = @('2026-10-05T19:14:59.000000000Z [Failover] DISARMED bucket glm-coding -> probing nominals'); ErrorText = '' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines @() -SinceUtc $since
+        $c.Verdict | Should -Be 'coherent-silent'
+        $w = Get-FailoverNextSince -InvocationOk $true -WindowStartUtc '2026-10-05T19:45:00.000Z' -PreviousSinceUtc $since -CoherenceVerdict $c.Verdict
+        $w.SinceUtc | Should -Be '2026-10-05T19:45:00.000Z'
+    }
+
+    It 'a window that itself holds a line at-or-after --since is coherent — the segment is the current one' {
+        $since = '2026-10-05T19:30:00.000Z'
+        $window = @(
+            '2026-10-05T19:29:10.000000000Z [Request] pid=1 reqN=5000 model=glm-5.3 msgs=3 bytes=1111 ttft=200ms'
+            '2026-10-05T19:30:41.000000000Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=20min'
+        )
+        $tailProbe = @{ Exited = $true; Code = 0; Lines = @('2026-10-05T19:31:07.000000000Z [Request] pid=1 reqN=5001 model=glm-5.3 msgs=9 bytes=12345 ttft=900ms'); ErrorText = '' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines $window -SinceUtc $since
+        $c.Verdict | Should -Be 'coherent'
+    }
+
+    It 'the tolerance absorbs a boundary line slightly BEFORE --since (photograph skew)' {
+        $since = '2026-10-05T19:30:00.000Z'
+        $window = @('2026-10-05T19:29:58.500000000Z [Request] pid=1 reqN=5000 model=glm-5.3 msgs=3 bytes=1111 ttft=200ms')
+        $tailProbe = @{ Exited = $true; Code = 0; Lines = @('2026-10-05T19:31:07.000000000Z [Request] pid=1 reqN=5001 model=glm-5.3 msgs=9 bytes=12345 ttft=900ms'); ErrorText = '' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines $window -SinceUtc $since
+        $c.Verdict | Should -Be 'coherent'
+    }
+
+    It 'a REFUSED tail probe (non-zero exit) is untested, and untested never downgrades a coherent window — but the GLUE holds on it' {
+        $since = '2026-10-05T19:30:00.000Z'
+        $window = @('2026-10-05T19:30:41.000000000Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=20min')
+        $tailProbe = @{ Exited = $true; Code = 1; Lines = @(); ErrorText = 'Error response from daemon: No such container: claudish-proxy' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines $window -SinceUtc $since
+        $c.Verdict | Should -Be 'untested'
+        # pure function: only 'stale' forces a hold
+        $w = Get-FailoverNextSince -InvocationOk $true -WindowStartUtc '2026-10-05T19:45:00.000Z' -PreviousSinceUtc $since -CoherenceVerdict $c.Verdict
+        $w.SinceUtc | Should -Be '2026-10-05T19:45:00.000Z'
+    }
+
+    It 'a timed-out tail probe (killed at the bound, no exit) is untested — the glue holds the watermark on it' {
+        $since = '2026-10-05T19:30:00.000Z'
+        $tailProbe = @{ Exited = $false; Code = -1; Lines = @(); ErrorText = '' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines @() -SinceUtc $since
+        $c.Verdict | Should -Be 'untested'
+    }
+
+    It 'an unparseable tail line is untested, not coherent' {
+        $since = '2026-10-05T19:30:00.000Z'
+        $tailProbe = @{ Exited = $true; Code = 0; Lines = @('no timestamp on this line at all'); ErrorText = '' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines @() -SinceUtc $since
+        $c.Verdict | Should -Be 'untested'
+    }
+
+    It 'an unparseable --since instant is untested, not stale' {
+        $tailProbe = @{ Exited = $true; Code = 0; Lines = @('2026-10-05T19:31:07.000000000Z [Request] pid=1 reqN=5001 model=glm-5.3'); ErrorText = '' }
+        $c = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines @() -SinceUtc 'not-a-date'
+        $c.Verdict | Should -Be 'untested'
+    }
+
+    It 'the glue CONSULTS the probe on every read window and CARRIES the verdict into the watermark decision (red if the probe is unwired)' {
+        # The pure pins above stay green if someone deletes the glue's probe
+        # call — this static pin is what goes red. Same discipline as the
+        # zero-actuator AST guard: parse the file, assert the wiring.
+        $path = Join-Path $script:ScriptsRoot 'failover-events-collect.ps1'
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errs)
+        $errs.Count | Should -Be 0
+
+        $probeCalls = @($ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] -and $x.GetCommandName() -eq 'Test-DockerLogsSinceCoherence' }, $true))
+        $probeCalls.Count | Should -Be 1
+
+        $nextCalls = @($ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] -and $x.GetCommandName() -eq 'Get-FailoverNextSince' }, $true))
+        $nextCalls.Count | Should -Be 1
+        $carriesVerdict = $false
+        foreach ($el in $nextCalls[0].CommandElements) {
+            if ($el -is [System.Management.Automation.Language.CommandParameterAst] -and $el.ParameterName -eq 'CoherenceVerdict') { $carriesVerdict = $true }
+        }
+        $carriesVerdict | Should -Be $true
+
+        # And the tick-exit gate keys on $measured (the probe verdict), not on
+        # the docker verdict alone.
+        $text = [System.IO.File]::ReadAllText($path)
+        ($text -match '\$measured\s*=\s*\$res\.Ok\s*-and') | Should -Be $true
+    }
 }
 
 Describe 'the collector contains no actuator' {

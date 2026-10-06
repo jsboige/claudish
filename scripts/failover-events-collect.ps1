@@ -176,11 +176,37 @@ $res = Invoke-DockerEventsBounded -DockerArgs @('logs', $Container, '--since', $
 # Container stderr lands in ErrorText (the hub's [Failover] markers are
 # logStderr-class): merge it into the line pool ONLY on a successful
 # invocation — on a failure the pool is not trusted and nothing is written.
+# The merged pool feeds the coherence probe too (never the sink: the
+# allowlist still gates every write).
 $pool = @($res.Lines)
 if ($res.Ok -and -not [string]::IsNullOrWhiteSpace($res.ErrorText)) {
     $pool += @($res.ErrorText -split "`r?`n" | Where-Object { $_ })
 }
 $pool = @($pool | Where-Object { $_ })
+
+# STALE-SEGMENT COHERENCE PROBE (review of PR #357, 2026-10-06): the third
+# path into the "collector dead / proxy calm" ambiguity. On the json-file
+# driver after a rotation, `docker logs --since` can serve the PREVIOUS
+# segment instead of the current one — no error, no warning (measured on
+# ai-01 and po-2025 on 06-07/09, three epochs, three times; reproduced on
+# .46 on 04/10; po-203 does not have the defect; traffic-live.ps1 GOTCHA #2
+# carries a tail-depth fallback against the same signature). The collector
+# then receives old lines or nothing, Invoke-DockerEventsBounded renders Ok,
+# an open-instant watermark ADVANCES, and the tick certifies a window nobody
+# read. The discriminator is the one traffic-live.ps1 measured reliable: a
+# SHORT tail probe (`--tail 1 --timestamps`, the only mode that never lies
+# where --since can). The verdict is pure logic
+# (Test-DockerLogsSinceCoherence) and receives the RAW probe result — the
+# transport truth there is the exit code, not the events-verdict Ok, because
+# a healthy one-line tail can land entirely on the container's stderr.
+# 'stale' or an inconclusive probe both hold the watermark and exit 1 — a
+# tick not measured costs one tick, a swallowed window costs the history.
+$coherence = @{ Verdict = 'untested'; Reason = 'not run' }
+if ($res.Ok) {
+    $tailProbe = Invoke-DockerEventsBounded -DockerArgs @('logs', $Container, '--tail', '1', '--timestamps') -TimeoutSec $DockerTimeoutSec
+    $coherence = Test-DockerLogsSinceCoherence -TailProbe $tailProbe -WindowLines $pool -SinceUtc $sinceUtc
+}
+$measured = $res.Ok -and ($coherence.Verdict -eq 'coherent' -or $coherence.Verdict -eq 'coherent-silent')
 
 # SPLIT FIRST, ALLOWLIST SECOND — both are pure functions from the module:
 # the split drops docker's own non-prefixed noise, the allowlist drops
@@ -208,7 +234,7 @@ $instanceChanged = ($null -ne $instanceId -and $prevInstance -ne '' -and $instan
 # collect instant), the line verbatim, the container name, the instanceId the
 # proxy reported when the tick ran.
 $written = 0
-if ($new.Kept.Count -gt 0) {
+if ($measured -and $new.Kept.Count -gt 0) {
     $sb = New-Object System.Text.StringBuilder
     foreach ($e in @($new.Kept)) {
         $rec = @{
@@ -230,12 +256,17 @@ if ($new.Kept.Count -gt 0) {
     }
 }
 
-$watermark = Get-FailoverNextSince -InvocationOk $res.Ok -WindowStartUtc $windowStartUtc -PreviousSinceUtc $sinceUtc
+$watermark = Get-FailoverNextSince -InvocationOk $res.Ok -WindowStartUtc $windowStartUtc -PreviousSinceUtc $sinceUtc -CoherenceVerdict $coherence.Verdict
 
 $record = [PSCustomObject]@{
     AtUtc            = $tickStart.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', $Invariant)
-    Ok               = $res.Ok
+    Ok               = $measured
     Reason           = $res.Reason
+    Coherence        = $coherence.Verdict
+    # The probe's own reason carries the tail-1 instant — the one number that
+    # separates "stale segment served" from "quiet log" when reading this
+    # record days later.
+    CoherenceReason  = $coherence.Reason
     SinceUtc         = $sinceUtc
     SinceSource      = $sinceSource
     LinesSeen        = $pool.Count
@@ -252,7 +283,16 @@ $record = [PSCustomObject]@{
 $newState = Add-DockerEventsTickRecord -State $state -Record $record -HistoryCap $HistoryCap
 $newState | Add-Member NoteProperty SinceUtc $watermark.SinceUtc -Force
 $newState | Add-Member NoteProperty WatermarkReason $watermark.Reason -Force
-$newState | Add-Member NoteProperty Seen @($new.Seen) -Force
+# The ring advances ONLY on a measured tick. Ingesting fingerprints from a
+# window whose lines were never written (probe untested, stale segment, failed
+# invocation) would make the re-read a skip on the next tick — the window
+# swallowed exactly the way the CR of #357 forbids: a tick not measured costs
+# one tick, a swallowed window costs the history.
+if ($measured) {
+    $newState | Add-Member NoteProperty Seen @($new.Seen) -Force
+} else {
+    $newState | Add-Member NoteProperty Seen @($seen | Where-Object { $null -ne $_ }) -Force
+}
 $newState | Add-Member NoteProperty InstanceId "$instanceId" -Force
 Write-CollectorState -State $newState
 
@@ -283,12 +323,15 @@ if (Test-Path -LiteralPath $LogPath) {
     }
 }
 
-if ($res.Ok) {
-    Write-Output ("[failover-events] ok since={0}({1}) lines={2} failover={3} dropped={4} written={5} skipped={6} instance={7} changed={8} -> next={9}" -f `
-        $sinceUtc, $sinceSource, $pool.Count, $failover.Count, $sel.Dropped, $written, @($new.Skipped).Count, ("$instanceId").Substring(0, [Math]::Min(8, ("$instanceId").Length)), $instanceChanged, $watermark.SinceUtc)
+if ($measured) {
+    Write-Output ("[failover-events] ok since={0}({1}) lines={2} failover={3} dropped={4} written={5} skipped={6} instance={7} changed={8} coherence={9} -> next={10}" -f `
+        $sinceUtc, $sinceSource, $pool.Count, $failover.Count, $sel.Dropped, $written, @($new.Skipped).Count, ("$instanceId").Substring(0, [Math]::Min(8, ("$instanceId").Length)), $instanceChanged, $coherence.Verdict, $watermark.SinceUtc)
     exit 0
 }
-# A failed invocation is NOT a measurement: the watermark was held, the window
-# stays unread for the next tick, and the scheduler sees a non-zero exit.
-Write-Output ("[failover-events] NOT MEASURED — watermark held ({0}); docker said: {1}" -f $watermark.Reason, $res.Reason)
+# A failed invocation OR an incoherent window is NOT a measurement: the
+# watermark was held, the window stays unread for the next tick, and the
+# scheduler sees a non-zero exit. The stale-segment verdict is FATAL (never
+# swallowed): a "measured" tick built on the previous rotation's segment is
+# strictly worse than a held one — it certifies a window nobody read.
+Write-Output ("[failover-events] NOT MEASURED — watermark held ({0}); coherence={1}; docker said: {2}; probe said: {3}" -f $watermark.Reason, $coherence.Verdict, $res.Reason, $coherence.Reason)
 exit 1
