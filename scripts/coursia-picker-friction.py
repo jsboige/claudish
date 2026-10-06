@@ -61,7 +61,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
 PROJECTS_DEFAULT = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 # CoursIA transcript dirs, exact-anchored (the G2 lesson): `c--dev-CoursIA`,
@@ -166,7 +166,7 @@ def scan_file(path, ws):
     return ev, n_calls
 
 
-def select_files(projects, months):
+def select_files(projects):
     out = []
     for d in glob.glob(os.path.join(projects, "*")):
         if not os.path.isdir(d):
@@ -245,12 +245,14 @@ def main(argv=None):
     p.add_argument("--cluster-min", type=float, default=CLUSTER_MIN)
     p.add_argument("--projects-dir", default=PROJECTS_DEFAULT)
     p.add_argument("--list", action="store_true", help="print boundary events per file")
+    p.add_argument("--list-cap", type=int, default=400,
+                   help="max boundary lines printed by --list (default 400, 0 = no cap)")
     a = p.parse_args(sys.argv[1:] if argv is None else argv)
     months = a.months or list(MONTHS)
     bad = [m for m in months if not re.fullmatch(r"\d{4}-\d{2}", m)]
     if bad:
         p.error(f"malformed month(s) {bad}")
-    files = select_files(a.projects_dir, months)
+    files = select_files(a.projects_dir)
     if not files:
         print(f"no CoursIA transcripts under {a.projects_dir}", file=sys.stderr)
         raise SystemExit(2)
@@ -276,7 +278,11 @@ def main(argv=None):
           f"(projects-dir={a.projects_dir}, cluster={a.cluster_min:g}min)")
 
     if a.list:
-        for e in bounds[:400]:
+        cap = a.list_cap
+        if cap > 0 and len(bounds) > cap:
+            print(f"--list truncated at {cap}/{len(bounds)} boundaries "
+                  f"(raise with --list-cap, 0 = no cap)", file=sys.stderr)
+        for e in bounds[:cap] if cap > 0 else bounds:
             print(f"  {e[0]} {e[1]:5} {e[2]:18} {os.path.basename(e[4])[:12]}")
         return
 
@@ -293,15 +299,30 @@ def main(argv=None):
                 for e, s, _, _, fp, _, _ in mw]
         withp = sum(1 for c in counts if c > 0)
         reopened = sum(1 for d in deltas if d > 360)
-        print(f"  delta END->START min : p50={pct(deltas,.5):.0f} p90={pct(deltas,.9):.0f} "
-              f"max={max(deltas):.0f} | >6h (session reopened, not friction): {reopened}")
-        print(f"  delta when a picker call exists (n={withp}): "
-              f"p50={pct([d for d,c in zip(deltas,counts) if c>0],.5):.0f}")
+        # p50-of-effort semantics (coordinator's follow-up, 06/10): TWO
+        # declared measures, not one ambiguous p50. (i) p50 over ALL windows,
+        # zero windows counted 0 — the friction of a grain CYCLE; (ii) p50
+        # over windows with >=1 picker call only — the effort of an ACTIVE
+        # selection. The single undifferentiated p50 of the first cut mixed
+        # both and read as "zero-window = zero effort", which is true of a
+        # cycle but false of a selection.
+        counts_with = [c for c in counts if c > 0]
+        deltas_with = [d for d, c in zip(deltas, counts) if c > 0]
+        acts_with = [a2 for a2, c in zip(acts, counts) if c > 0]
         print(f"  picker calls / window : mean={sum(counts)/len(counts):.1f} "
               f"p50={pct(counts,.5):.0f} p90={pct(counts,.9):.0f} "
+              f"(p50 over ALL windows, zero windows count 0) "
               f"| windows with >=1: {withp}/{len(mw)} ({100*withp/len(mw):.0f}%)")
+        if counts_with:
+            print(f"  picker calls / window (active only, n={withp}) : mean={sum(counts_with)/len(counts_with):.1f} "
+                  f"p50={pct(counts_with,.5):.0f} p90={pct(counts_with,.9):.0f}")
         print(f"  active span first-picker->START min : p50={pct(acts,.5):.0f} "
               f"p90={pct(acts,.9):.0f}")
+        if acts_with:
+            print(f"  active span (windows with a picker, n={withp}) : p50={pct(acts_with,.5):.0f} "
+                  f"p90={pct(acts_with,.9):.0f}")
+        print(f"  delta when a picker call exists (n={withp}): "
+              f"p50={pct(deltas_with,.5):.0f}")
         cls = Counter()
         for _, _, c, _, _, _, _ in mw:
             cls.update(c)

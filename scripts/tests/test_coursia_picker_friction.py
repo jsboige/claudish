@@ -349,6 +349,92 @@ def test_numbered_view_inside_heredoc_body_is_not_named():
            f"heredoc-quoted numbered view must not name the window: {w}")
 
 
+def test_list_cap_is_announced_and_configurable():
+    # --list truncated to --list-cap (default 400) WITHOUT saying so made a
+    # truncated dump read as complete (06/10 review). Now: announced on
+    # stderr when the cap bites, 0 = no cap.
+    lines = []
+    # 25 grains: end -> start, 30 min apart => 50 boundaries.
+    for i in range(25):
+        lines.append(_dash(f"2026-07-01T10:{i % 60:02d}:00.000Z" if False else
+                           f"2026-07-01T{i//2:02d}:{(i*2) % 60:02d}:00.000Z",
+                           "append", "[DONE] g"))
+        lines.append(_dash(f"2026-07-01T{i//2:02d}:{(i*2) % 60:02d}:30.000Z",
+                           "append", "[CLAIMED] #n"))
+    d = _write_dir({"c--dev-CoursIA/s.jsonl": lines})
+    try:
+        import io as _io, contextlib as _ctx
+        out, err = _io.StringIO(), _io.StringIO()
+        with _ctx.redirect_stdout(out), _ctx.redirect_stderr(err):
+            code = None
+            try:
+                cpf.main(["2026-07", "--projects-dir", d, "--list", "--list-cap", "3"])
+            except SystemExit as e:
+                code = e.code
+        _check(code is None, f"--list exited nonzero: {code}")
+        listing = out.getvalue()
+        _check(len([l for l in listing.splitlines() if l.startswith("  ")]) == 3,
+               f"--list-cap 3 must print 3 boundaries:\n{listing}")
+        _check("truncated at 3/50" in err.getvalue(),
+               f"truncation must be announced on stderr: {err.getvalue()!r}")
+        # no cap: all boundaries print, no announcement
+        err2 = _io.StringIO()
+        with _ctx.redirect_stdout(out), _ctx.redirect_stderr(err2):
+            cpf.main(["2026-07", "--projects-dir", d, "--list", "--list-cap", "0"])
+        _check("truncated" not in err2.getvalue(),
+               f"no cap must not announce truncation: {err2.getvalue()!r}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_active_only_p50_differs_from_all_windows_p50():
+    """CR pin (M3): the 'active only' p50 must be held by a test where it
+    DIFFERS from the all-windows p50 — a mixed corpus of 3 zero-picker
+    windows and 2 four-call windows. Under the M3 mutation (counts_with =
+    counts) both lines print the same p50 and this goes red; a corpus of
+    only-active windows would stay green and pin nothing."""
+    lines = [
+        # W1 active: 4 picker calls, first at +2 min, START at +15 -> span 13
+        _dash("2026-07-01T10:00:00.000Z", "append", "[DONE] A"),
+        _bash("2026-07-01T10:02:00.000Z", "gh issue list"),
+        _bash("2026-07-01T10:04:00.000Z", "gh issue list"),
+        _bash("2026-07-01T10:06:00.000Z", "gh issue list"),
+        _bash("2026-07-01T10:08:00.000Z", "gh issue list"),
+        _dash("2026-07-01T10:15:00.000Z", "append", "[CLAIMED] #1"),
+        # W2 zero-picker
+        _dash("2026-07-01T10:30:00.000Z", "append", "[DONE] B"),
+        _dash("2026-07-01T10:35:00.000Z", "append", "[CLAIMED] #2"),
+        # W3 active: same shape as W1
+        _dash("2026-07-01T11:00:00.000Z", "append", "[DONE] C"),
+        _bash("2026-07-01T11:02:00.000Z", "gh issue list"),
+        _bash("2026-07-01T11:04:00.000Z", "gh issue list"),
+        _bash("2026-07-01T11:06:00.000Z", "gh issue list"),
+        _bash("2026-07-01T11:08:00.000Z", "gh issue list"),
+        _dash("2026-07-01T11:15:00.000Z", "append", "[CLAIMED] #3"),
+        # W4, W5 zero-picker
+        _dash("2026-07-01T11:30:00.000Z", "append", "[DONE] D"),
+        _dash("2026-07-01T11:35:00.000Z", "append", "[CLAIMED] #4"),
+        _dash("2026-07-01T12:00:00.000Z", "append", "[DONE] E"),
+        _dash("2026-07-01T12:05:00.000Z", "append", "[CLAIMED] #5"),
+    ]
+    d = _write_dir({"c--dev-CoursIA/s.jsonl": lines})
+    try:
+        out, code = _run_main(["2026-07", "--projects-dir", d])
+        _check(code is None, f"clean corpus exited nonzero: {code}")
+        # counts = [4,0,4,0,0]: all-windows p50 = 0, active-only p50 = 4 (n=2)
+        _check("picker calls / window : mean=1.6 p50=0 p90=4" in out,
+               f"all-windows p50 line wrong (expected p50=0 on mixed corpus):\n{out}")
+        _check("picker calls / window (active only, n=2) : mean=4.0 p50=4 p90=4" in out,
+               f"active-only line wrong (expected mean=4.0 p50=4, differs from all):\n{out}")
+        # acts = [13,0,13,0,0]: all p50 = 0, active-only p50 = 13 (n=2)
+        _check("active span first-picker->START min : p50=0 p90=13" in out,
+               f"all-windows active-span line wrong:\n{out}")
+        _check("active span (windows with a picker, n=2) : p50=13 p90=13" in out,
+               f"active-only span line wrong (expected p50=13, differs from all):\n{out}")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 
 def main():
