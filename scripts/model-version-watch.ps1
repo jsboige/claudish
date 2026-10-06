@@ -355,9 +355,17 @@ if (-not $DryRun -and $restartNow) {
         Write-VersionEvent -EventsPath $eventsPath -Kind error -Family reload `
             -Detail "restart-now decided ($($restartWhy -join '; ')) but drain script absent — routing repinned, hub still on old id"
     } else {
-        & $logTs "launching detached drained restart (reload mode: $($restartWhy -join '; '))"
-        Start-Process powershell -WindowStyle Hidden -ArgumentList `
-            '-ExecutionPolicy', 'Bypass', '-File', $DrainScript, '-Reason', 'model-version-watch minor repin (old id retired)'
+        # Through the drain's OWN -Detach path (#352): the previous inline
+        # Start-Process passed -Reason unquoted in -ArgumentList, the child
+        # died at parameter binding, and the log still said "launching" —
+        # the restart never happened. -Detach quotes every forwarded argument
+        # itself and hands back a countable exit code; the OUTCOME is logged
+        # and evented, never just the attempt.
+        $null = Invoke-DrainDetachedRestart -DrainScript $DrainScript `
+            -Reason ("model-version-watch minor repin (old id retired): " + ($restartWhy -join '; ')) `
+            -Log $logTs `
+            -WriteEvent { param($kind, $family, $detail)
+                Write-VersionEvent -EventsPath $eventsPath -Kind $kind -Family $family -Detail $detail }
     }
 }
 exit 0

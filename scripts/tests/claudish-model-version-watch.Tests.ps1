@@ -547,3 +547,111 @@ Describe 'Compare-RoleModelsToRouting (role-alias drift, 2026-10-05, reworked CR
         (Test-RoleAliasAskEmitted -EventsPath (Join-Path $script:aliasDir 'nope.log') -Id 'x' -Suggested 'x:opus') | Should -Be $false
     }
 }
+
+Describe 'Invoke-DrainDetachedRestart (#352) — the drain child is launched through the drain''s own -Detach, and the OUTCOME is logged' {
+    # The defect was BETWEEN Start-Process and the child's parameter binding:
+    # an unquoted -Reason value split at the first space, every further word
+    # bound positionally, `(old` failed to convert for [int]$MaxWaitSec and
+    # the child died at binding with stderr uncaptured — the log said
+    # "launching" while no restart ever ran. A unit test of the argument list
+    # cannot see that; these fixtures run the REAL chain (powershell.exe ->
+    # module function -> powershell.exe fixture drain), each fixture carrying
+    # the REAL drain param() block (bounded subset — copy-only fidelity, so a
+    # pin would go red if the module function name or invocation form moved).
+    BeforeAll {
+        $script:detachFixDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mvw-detach-{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
+        New-Item -ItemType Directory $script:detachFixDir -Force | Out-Null
+        $global:MVWDetach = @{ Log = @(); Events = @() }
+        # The drain's real param(), trimmed to the params the watch can reach,
+        # with EXACTLY those names/types — the binding defect the pins
+        # reproduce lives there (fix fixtures are prefixed SB- to never
+        # collide with the module's imported function names).
+        $script:drainParamSubset = @'
+param(
+    [string]$ContainerName = "claudish-proxy",
+    [int]$MaxWaitSec = 600,
+    [string]$Reason = "manual",
+    [switch]$Detach
+)
+'@
+        Set-Content -LiteralPath (Join-Path $script:detachFixDir 'fixture-drain.ps1') -Encoding UTF8 -Value @"
+$script:drainParamSubset
+# fixture: exits 0 only when -Detach reached us AND the Reason is intact
+# (unquoted, the binding above DIES before any of this runs - that WAS #352)
+if (-not `$Detach) { Write-Error 'FIXTURE: -Detach missing' ; exit 7 }
+if (`$Reason -ne 'model-version-watch minor repin (old id retired)') { Write-Error "FIXTURE: mangled Reason: <`$Reason>" ; exit 8 }
+'[DrainDetach] child PID 4242 alive — START pid 4242 line present in fixture.log'
+exit 0
+"@
+        Set-Content -LiteralPath (Join-Path $script:detachFixDir 'fixture-drain-exit3.ps1') -Encoding UTF8 -Value @"
+$script:drainParamSubset
+# fixture: simulate a launch failure INSIDE -Detach (rc=3, relaunch safe)
+'[DrainDetach] child PID 4243 EXITED rc=1 — launch FAILED — stderr evidence: fixture.err'
+exit 3
+"@
+        Set-Content -LiteralPath (Join-Path $script:detachFixDir 'fixture-drain-exit4.ps1') -Encoding UTF8 -Value @"
+$script:drainParamSubset
+# fixture: simulate the mute-child window (rc=4, do NOT relaunch)
+'[DrainDetach] child PID 4244 still running but wrote no START line within 45s — do NOT relaunch'
+exit 4
+"@
+    }
+    BeforeEach {
+        $global:MVWDetach.Log = @()
+        $global:MVWDetach.Events = @()
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:detachFixDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Variable -Name MVWDetach -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 'the real entry point: -Detach forwarded, Reason with spaces+parens SURVIVES binding, exit 0 -> info event' {
+        $drain = Join-Path $script:detachFixDir 'fixture-drain.ps1'
+        $rc = Invoke-DrainDetachedRestart -DrainScript $drain `
+            -Reason 'model-version-watch minor repin (old id retired)' `
+            -Log { param($m) $global:MVWDetach.Log += $m } `
+            -WriteEvent { param($k, $f, $d) $global:MVWDetach.Events += (@{ kind = $k; family = $f; detail = $d }) }
+        $rc | Should -Be 0
+        ($global:MVWDetach.Events.Count) | Should -Be 1
+        ($global:MVWDetach.Events[0].kind) | Should -Be 'info'
+        ($global:MVWDetach.Events[0].family) | Should -Be 'reload'
+        ($global:MVWDetach.Events[0].detail) | Should -Match 'exit 0'
+        # the outcome was LOGGED, not just attempted (issue #352's demand)
+        (@($global:MVWDetach.Log) -match 'child alive').Count | Should -Be 1
+        # the drain's own output was relayed to the caller's log
+        (@($global:MVWDetach.Log) -match '\[drain-detach\]').Count | Should -BeGreaterOrEqual 1
+    }
+
+    It 'exit 3 (launch failed) -> ERROR event naming the failure and that a relaunch is safe' {
+        $drain = Join-Path $script:detachFixDir 'fixture-drain-exit3.ps1'
+        $rc = Invoke-DrainDetachedRestart -DrainScript $drain `
+            -Reason 'model-version-watch minor repin (old id retired)' `
+            -Log { param($m) $global:MVWDetach.Log += $m } `
+            -WriteEvent { param($k, $f, $d) $global:MVWDetach.Events += (@{ kind = $k; family = $f; detail = $d }) }
+        $rc | Should -Be 3
+        ($global:MVWDetach.Events[0].kind) | Should -Be 'error'
+        ($global:MVWDetach.Events[0].detail) | Should -Match 'FAILED.*exit 3'
+        ($global:MVWDetach.Events[0].detail) | Should -Match 'relaunch safe'
+        (@($global:MVWDetach.Log) -match 'launch FAILED .*exit 3').Count | Should -Be 1
+    }
+
+    It 'exit 4 (mute child) -> ERROR event forbidding a relaunch' {
+        $drain = Join-Path $script:detachFixDir 'fixture-drain-exit4.ps1'
+        $rc = Invoke-DrainDetachedRestart -DrainScript $drain `
+            -Reason 'model-version-watch minor repin (old id retired)' `
+            -Log { param($m) $global:MVWDetach.Log += $m } `
+            -WriteEvent { param($k, $f, $d) $global:MVWDetach.Events += (@{ kind = $k; family = $f; detail = $d }) }
+        $rc | Should -Be 4
+        ($global:MVWDetach.Events[0].kind) | Should -Be 'error'
+        ($global:MVWDetach.Events[0].detail) | Should -Match 'do NOT relaunch'
+        (@($global:MVWDetach.Log) -match 'MUTE').Count | Should -Be 1
+    }
+
+    It 'runner wiring: the inline unquoted Start-Process launch is GONE, -Detach invoked through the module function' {
+        $text = Get-Content -LiteralPath $script:RunnerPath -Raw
+        $text | Should -Not -Match 'Start-Process powershell'
+        $text | Should -Match 'Invoke-DrainDetachedRestart -DrainScript \$DrainScript'
+        # no bare -Reason array element left behind by the old call
+        $text | Should -Not -Match "'-Reason', 'model-version-watch minor repin \(old id retired\)'"
+    }
+}

@@ -1,4 +1,6 @@
-# claudish-model-version.psm1 — model version watch (pure logic, no network, no docker)
+# claudish-model-version.psm1 — model version watch (pure logic, no network, no
+# docker — the ONE exception is Invoke-DrainDetachedRestart, which runs the
+# drain's own -Detach parent synchronously; every path it touches is passed in)
 #
 # Mandate (user, 2026-10-02): an organ that watches the versions each provider
 # actually offers, auto-repins ROUTING on MINOR bumps (same major), escalates
@@ -362,6 +364,70 @@ function Write-VersionEvent {
     [System.IO.File]::AppendAllText($EventsPath, $evt + "`n", (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Invoke-DrainDetachedRestart {
+    <#
+        .SYNOPSIS
+        Launch the drained restart through claudish-drain.ps1's OWN -Detach
+        path (#352) and report the OUTCOME, never just the attempt.
+
+        .DESCRIPTION
+        The previous inline launch was a raw `Start-Process -ArgumentList`
+        with an unquoted -Reason VALUE: Start-Process joins the array with
+        spaces and does not quote (the same class claudish-engine's
+        Invoke-DockerBounded documents), so the child received `-Reason
+        model-version-watch minor repin (old id retired)`, every word after
+        the first bound positionally, `(old` failed to convert for the
+        drain's [int]$MaxWaitSec, and the child died at parameter binding
+        with stderr uncaptured — the log said "launching" while no restart
+        ever ran (#352, same silent-death shape as #312).
+
+        This function runs the drain's OWN -Detach parent SYNCHRONOUSLY: that
+        path quotes every forwarded argument itself, captures the child's
+        stdout+stderr, and returns on the child's proof of life, handing us a
+        countable exit code to branch on:
+          0 = child alive (its START line was seen) — restart in flight;
+          3 = launch failed — no drain is running, relaunching is safe;
+          4 = mute child — do NOT relaunch, a second drain would race the
+              first.
+        The -Detach parent itself exits within its startup window (default
+        45 s); the hidden drain child keeps running independently, so the
+        synchronous wait here is bounded and cheap. $Log receives one line
+        per message (the watch's $logTs contract); $WriteEvent receives
+        (kind, family, detail) and is expected to call Write-VersionEvent.
+        Both callbacks run in the CALLER's scope (scriptblocks bind to where
+        they were defined), so $eventsPath and friends stay visible.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$DrainScript,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [Parameter(Mandatory = $true)][scriptblock]$Log,
+        [Parameter(Mandatory = $true)][scriptblock]$WriteEvent
+    )
+    & $Log ("launching detached drained restart via -Detach: " + $Reason)
+    $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $DrainScript -Detach -Reason $Reason 2>&1)
+    $rc = $LASTEXITCODE
+    foreach ($line in $out) { & $Log ("  [drain-detach] " + $line) }
+    switch ($rc) {
+        0 {
+            & $Log "drain -Detach: child alive (START line seen) — restart in flight"
+            & $WriteEvent 'info' 'reload' ("drain -Detach launched (exit 0) — poll drain.log for the first OUTCOME after this run's START; reason: " + $Reason)
+        }
+        3 {
+            & $Log "drain -Detach: launch FAILED (exit 3 — child died at launch/binding, or start failed) — relaunching is safe"
+            & $WriteEvent 'error' 'reload' ("drain -Detach FAILED (exit 3 — child died at launch or binding) — routing repinned, hub still on the old id; relaunch safe; reason: " + $Reason)
+        }
+        4 {
+            & $Log "drain -Detach: child MUTE within the startup window (exit 4) — do NOT relaunch"
+            & $WriteEvent 'error' 'reload' ("drain -Detach mute (exit 4 — no START line, child may still run) — do NOT relaunch, a second drain would race the first; reason: " + $Reason)
+        }
+        default {
+            & $Log ("drain -Detach: unexpected exit code " + $rc)
+            & $WriteEvent 'error' 'reload' ("drain -Detach unexpected exit code " + $rc + "; reason: " + $Reason)
+        }
+    }
+    return $rc
+}
+
 function Test-ClaudishOptIn {
     # Consent gate, shared semantics with wedge-watch: the file must exist and
     # contain 'enabled'. Anything else — missing, empty, wrong word — means
@@ -427,4 +493,5 @@ Export-ModuleMember -Function `
     ConvertTo-ModelVersion, Get-LatestFamilyVersion, Compare-RoutingToFamilies, `
     Compare-RoleModelsToRouting, Test-RoleAliasAskEmitted, `
     Edit-RoutingForMinor, Write-VersionEvent, Test-ClaudishOptIn, `
-    Test-ProbeAccepted, Test-ModelRetired, Get-ReloadMode
+    Test-ProbeAccepted, Test-ModelRetired, Get-ReloadMode, `
+    Invoke-DrainDetachedRestart
