@@ -152,6 +152,109 @@ def test_main_json_mode_shape():
     assert rows[0]["verdict"] == "live-only" and rows[0]["declared"] is None, rows
 
 
+# --------------------------------------------------------------------------
+# CR #369 — secrets in the URL slots, malformed files, prose fallback
+# --------------------------------------------------------------------------
+
+def _run_main(argv):
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = vsp.main(argv)
+    return rc, buf.getvalue()
+
+
+def test_live_userinfo_masked_in_text_output():
+    """Basic-auth userinfo rides real fleet URLs; the witness output is meant
+    to be pasted into dashboards — the password must never survive."""
+    password = "s3cret-hunter2"
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(tmp, {"env": {"ANTHROPIC_BASE_URL":
+                                 "https://alice:%s@proxy.example:3000" % password}})
+        rc, out = _run_main(["--settings", p])
+    assert rc == 0, rc
+    assert password not in out, "userinfo password leaked in text output"
+    assert "https://***@proxy.example:3000" in out, out
+
+
+def test_live_userinfo_masked_in_json_output():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(tmp, {"env": {"ANTHROPIC_BASE_URL": "https://alice:s3cret@proxy.example:3000"}})
+        rc, out = _run_main(["--settings", p, "--json"])
+    assert rc == 0, rc
+    assert "s3cret" not in out, "userinfo password leaked in --json output"
+    rows = json.loads(out)
+    assert rows[0]["live"] == "https://***@proxy.example:3000", rows
+
+
+def test_token_pasted_in_base_url_is_no_url_never_the_token():
+    """A credential pasted into the wrong slot has no URL shape: report the
+    sentinel, never echo the value."""
+    token = "sk-ant-api03-TOKENBODY-never-print"
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(tmp, {"env": {"ANTHROPIC_BASE_URL": token},
+                         "_intentional_diffs": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3000 = relais"}})
+        rc, out = _run_main(["--settings", p])
+    assert rc == 1, rc                       # no-URL live vs a declared URL = contradiction
+    assert token not in out, "the whole token was echoed"
+    assert "no-url" in out, out
+
+
+def test_no_url_live_without_declaration_is_live_only():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(tmp, {"env": {"ANTHROPIC_BASE_URL": "garbage-not-a-url"}})
+        rc, out = _run_main(["--settings", p])
+    assert rc == 0, rc
+    assert "live-only" in out and "no-url" in out, out
+    assert "garbage-not-a-url" not in out, out
+
+
+def test_declared_prose_userinfo_masked():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(tmp, {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3000"},
+                         "_intentional_diffs": {"ANTHROPIC_BASE_URL":
+                                                "routage — voir http://bob:hunter2@relay.local:3000 (ancien)"}})
+        rc, out = _run_main(["--settings", p])
+    assert rc == 1, rc
+    assert "hunter2" not in out, "declared userinfo leaked"
+    assert "http://***@relay.local:3000" in out, out
+
+
+def test_malformed_root_array_is_exit_2_not_contradiction():
+    """A top-level JSON array is UNREADABLE (exit 2) — a cron caller reading
+    the exit code must not take it for a contradiction (exit 1)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "settings.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("[1, 2, 3]")
+        rc, _ = _run_main(["--settings", p])
+    assert rc == 2, rc
+
+
+def test_env_not_an_object_is_exit_2_not_contradiction():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _write(tmp, {"env": "oops", "_intentional_diffs": {}})
+        rc, _ = _run_main(["--settings", p])
+    assert rc == 2, rc
+
+
+def test_prose_fallback_takes_last_url():
+    """An annotation naming the old path then its replacement declares the
+    replacement — taking the FIRST URL would mask a silent revert (the exact
+    defect #291 tracks)."""
+    assert vsp.declared_url(
+        "ancien chemin http://192.168.0.50:3000 remplace par http://127.0.0.1:3000 (relais)"
+    ) == "http://127.0.0.1:3000"
+
+
+def test_schemeless_live_matches_schemed_declared():
+    """`127.0.0.1:3000` is the curl form of `http://127.0.0.1:3000` — the
+    pair is one path, not a contradiction."""
+    v, live, declared = vsp.classify("127.0.0.1:3000", "http://127.0.0.1:3000 = relais local")
+    assert v == "match", (v, live, declared)
+
+
 if __name__ == "__main__":
     _passed = failures = 0
     for name, fn in sorted(globals().items()):
