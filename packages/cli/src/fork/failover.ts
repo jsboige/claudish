@@ -150,8 +150,8 @@ interface StepFailure {
    * `resolveRoleStep` yields a different concrete the step is probeable again.
    * For model steps the field is inert (their TTL is about the step itself —
    * a model step's target never moves). Absent = binds (a record without a
-   * concrete — the pre-#331 shape, e.g. the #263 revisit re-mark — keeps the
-   * freeze; conservative, and intra-request advancement relies on it). */
+   * concrete — the pre-#331 shape — keeps the freeze; conservative). Every
+   * proxy-side mark carries it since #331, the #263 revisit re-mark included. */
   concrete?: string;
 }
 
@@ -766,9 +766,9 @@ function isStepTtlFailed(f: StepFailure | undefined, step?: FailoverStep): boole
  *    (nothing succeeds in between), so the same concrete stays skipped.
  *  - The #274 two-level bookkeeping is untouched — this only reads it.
  *  - A MODEL step's TTL is about the step itself (its target never moves):
- *    binds whenever TTL-failed. A record without a concrete (the #263 revisit
- *    re-mark, any pre-#331 shape) binds — conservative, and exactly what the
- *    revisit guard needs.
+ *    binds whenever TTL-failed. A record without a concrete (a pre-#331
+ *    shape) binds — conservative. The #263 revisit re-mark carries its
+ *    concrete, so it binds only while the delegation stays there.
  *  - The #261 closure plane (healthy step, future config resetAt) binds a
  *    role-step regardless of the delegation: an operator closure speaks
  *    louder than where the delegation points today.
@@ -1192,8 +1192,11 @@ function resolveSkippingFailed(
  * a concrete target — plus one exclusion of the walk's own: a step whose
  * provider bucket is WALLED (a weekly OpenAI wall on step 0 must not turn
  * every nominal 529 into a round-trip at a step we already know is dead while
- * a healthy step waits behind it — review of #326, point 3). Unlike
- * `resolveSkippingFailed` there is NO last-step fallback: the walk is a
+ * a healthy step waits behind it — review of #326, point 3; #348 makes the
+ * bucket CANONICAL for bare targets via the injected async resolver, and adds
+ * the nominal's own bucket to the skip — a 529 is that bucket's capacity
+ * saying no, so a sibling model on the same bucket re-pays the overload).
+ * Unlike `resolveSkippingFailed` there is NO last-step fallback: the walk is a
  * recovery attempt, not a substitution, so walking into a step we know is
  * unservable is pure cost — null means "surface the original overload".
  *
@@ -1207,9 +1210,30 @@ function resolveSkippingFailed(
  * refreshes a role-step's `target` in place to the model actually serving it
  * — which is also what keeps the walk from ever routing the ROLE NAME as a
  * model id (the pre-refresh `target` can still be `roleRef`). */
-export function resolveTransientStep(
-  role: FailoverRole
-): { step: FailoverStep; stepIndex: number; concrete: string } | null {
+export async function resolveTransientStep(
+  role: FailoverRole,
+  opts?: {
+    /**
+     * #348: canonical bucket for a step target. BARE targets are the reason
+     * this exists: `providerBucketOf("glm-5.3")` says `glm`, but a bare
+     * nominal's wall is armed on its credential-filtered `route()` primary
+     * (`glm-coding`) — the same canonicalization `classifyNominalBucket`
+     * applies to the nominal (failover.ts:645's "the failover module must
+     * not make a proxy-side route() call" stance still holds for the SYNC
+     * armed walk; here the ASYNC call site injects the resolver, so the
+     * module itself stays route-free). Absent (unit callers): bare targets
+     * fall back to `providerBucketOf` — the pre-#348 behavior.
+     */
+    bucketOf?: (target: string) => Promise<string>;
+    /**
+     * #348 part 3: the overloaded NOMINAL's own bucket. A 529 is the bucket's
+     * plan/provider saying "overloaded" — another model drawing on the SAME
+     * bucket shares that capacity, so walking there re-pays the overload. A
+     * different bucket is a different meter and a legitimate landing.
+     */
+    nominalBucket?: string;
+  }
+): Promise<{ step: FailoverStep; stepIndex: number; concrete: string } | null> {
   const rule = rules.get(role);
   if (!rule) return null;
   const fails = stepFailures.get(role);
@@ -1228,14 +1252,14 @@ export function resolveTransientStep(
     // jumped to the NEXT step (or surfaced the 529) while the delegation's
     // current concrete was servable. Same rule as resolveSkippingFailed: a
     // role-step's TTL binds only while the delegation still resolves to the
-    // recorded concrete. NOTE: this file is also #354's — that PR rewrites
-    // this function (async, bucketOf param); the second merge carries the
-    // combination (stepTtlBinds here AND the concrete-target bucketer), and
-    // its route pins must survive the rebase.
+    // recorded concrete. Composes with #348's concrete-step bucketer below
+    // (pins W17-W19 + W20 in proxy-server-overload-walk-route.test.ts).
     if (stepTtlBinds(role, fails?.[i], step)) continue;
     const concrete = step.roleRef ? resolveConcreteTarget(role, step) : step.target;
     if (concrete === null) continue;
-    if (isBucketWalled(providerBucketOf(concrete))) continue;
+    const stepBucket = opts?.bucketOf ? await opts.bucketOf(concrete) : providerBucketOf(concrete);
+    if (isBucketWalled(stepBucket)) continue;
+    if (opts?.nominalBucket !== undefined && stepBucket === opts.nominalBucket) continue;
     return { step, stepIndex: i, concrete };
   }
   return null;

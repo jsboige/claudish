@@ -143,6 +143,9 @@ services:
       # is a read-per-request switch (the fleet flips it mid-flight; no recreate),
       # but a container still needs the NAME here to ever see any value at all.
       - CLAUDISH_FAILOVER_OVERLOAD_WALK=${CLAUDISH_FAILOVER_OVERLOAD_WALK:-}
+      # #348 — overload-walk time budget (ms). Default 300000; 0 = off. Same
+      # read-per-request class as the switch above, same container rule.
+      - CLAUDISH_FAILOVER_WALK_BUDGET_MS=${CLAUDISH_FAILOVER_WALK_BUDGET_MS:-}
       # #310 — runtime knobs the proxy reads that were never in this list
       # (same absence class as the #304 failover knobs above: the env file only
       # interpolates, so a value set for a name this list does not carry never

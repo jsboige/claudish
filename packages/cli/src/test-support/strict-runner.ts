@@ -256,7 +256,7 @@ export function realSuiteRunner(
   return () => {
     const r = spawnSync(
       process.execPath,
-      ["test", opts.testPath ?? "packages/cli/src", "--timeout", String(DEFAULT_TEST_TIMEOUT_MS)],
+      ["test", opts.testPath ?? "packages/cli/src", "--timeout", String(DEFAULT_TEST_TIMEOUT_MS), "--isolate"],
       { encoding: "utf-8", maxBuffer: 64 * 1024 * 1024, cwd, timeout: opts.wallClockMs ?? WALL_CLOCK_MS },
     );
     const raw = (r.stdout ?? "") + (r.stderr ?? "");
