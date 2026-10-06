@@ -74,6 +74,8 @@ const SANDBOX_ENV_KEYS = [
   "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
   "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
   "CLAUDISH_FAILOVER_OVERLOAD_WALK",
+  "CLAUDISH_FAILOVER_SONNET", "CLAUDISH_FAILOVER_OPUS",
+  "CLAUDISH_FAILOVER_AUTO", "CLAUDISH_FAILOVER_ARM_AFTER",
   "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
 ];
@@ -213,6 +215,15 @@ async function postMessage(model: string, extraHeaders: Record<string, string> =
   });
 }
 
+/** W17/W18: the TARGET side of a `role:opus` delegation — two endpoints the
+ *  spin map does not cover (spin maps sonnet only; the opus/haiku roles then
+ *  resolve to NativeHandler). The fetch stub checks these FIRST (prefix, not
+ *  the two-char which-code). */
+async function postMessageMap(model: string, map: Record<string, string>): Promise<Response> {
+  await spin({ ...map, sonnet: SONNET_NOMINAL });
+  return postMessage(model);
+}
+
 beforeEach(() => {
   calls = { nm: 0, s0: 0, s1: 0, native: 0 };
   failoverLog = [];
@@ -234,6 +245,8 @@ beforeEach(() => {
         "nom-ep": ep("nm"),
         "s0-ep": ep("s0"),
         "s1-ep": ep("s1"),
+        "tr-ep": ep("tr"), // target role's nominal (W17/W18 delegation probes)
+        "t2-ep": ep("t2"), // target role's own cascade step (W18)
       },
     }),
     "utf-8"
@@ -249,6 +262,18 @@ beforeEach(() => {
     if (url.startsWith("https://api.anthropic.com/")) {
       calls.native = (calls.native ?? 0) + 1;
       return overload529();
+    }
+    // W17/W18 delegation targets: prefix matches, not the 2-char which-code.
+    for (const key of ["tr", "t2"] as const) {
+      if (url.startsWith(`${UPSTREAM_BASE}/${key}/`)) {
+        calls[key] = (calls[key] ?? 0) + 1;
+        const st = endpointStatus[key] ?? 200;
+        if (st === 0 || st === 200) return healthySSE();
+        if (st === 402) return quotaWall();
+        if (st === 529) return overload529();
+        if (st === 429) return burst429[key] ? burst429Resp() : overload429();
+        return new Response(JSON.stringify({ error: "stub failure" }), { status: st, headers: { "content-type": "application/json" } });
+      }
     }
     if (!url.startsWith(UPSTREAM_BASE)) return realFetch(input, init);
     const which = url.slice(UPSTREAM_BASE.length + 1, UPSTREAM_BASE.length + 3);
@@ -531,6 +556,51 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
     expect(calls.native).toBe(0);
     expect(isFailoverActive("sonnet")).toBe(false);
     expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 0"))).toBe(true);
+  }, 30_000);
+
+  // Review of #331 (06/10) point 1 — the ONE-SHOT walk used bare
+  // isStepTtlFailed at resolveTransientStep, the exact order resolveSkipping-
+  // Failed was just fixed for. Setup: sonnet[0] = role:opus marked against
+  // opus's nominal (tr) while that delegation still pointed there; since then
+  // the wall crossed to opus's own step (t2), so the delegation resolves to t2
+  // — the frozen concrete is LEFT, the step is probeable. Bare isStepTtlFailed
+  // freezes it anyway: the walk then pays step 1 (s1) instead of serving the
+  // delegation. RED under the mutation; green since stepTtlBinds replaced it.
+  test("W17: a role-step frozen on a concrete its delegation LEFT is still servable by the walk", async () => {
+    const realNow = Date.now;
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    try {
+      await spin({ sonnet: SONNET_NOMINAL, opus: "tr-ep@fake-tr" });
+      resetWalk({
+        CLAUDISH_FAILOVER_SONNET: "role:opus>s1-ep@fake-s1",
+        CLAUDISH_FAILOVER_OPUS: "t2-ep@fake-t2",
+      });
+      // The step is marked WHILE the delegation resolves to the target's
+      // nominal (tr) — the concrete the record must name.
+      markStepFailed("sonnet", 0, "test: role-step walled on the target's nominal", undefined, {
+        concrete: "tr-ep@fake-tr",
+      });
+      // The delegation ADVANCES: opus's nominal is walled (ttl 24h > the
+      // clock advance, so the wall is still up), opus resolves its own step.
+      expect(
+        armFailover("opus", "test: the delegation's nominal walled since the mark", providerBucketOf("tr-ep@fake-tr"))
+      ).toBe(true);
+      clock += 1000; // between requests — a delegation CAN move here
+      const r1 = await postMessage("claude-sonnet-5");
+      expect(r1.status).toBe(200);
+      expect(calls.nm).toBe(1);
+      expect(calls.tr).toBeUndefined(); // the frozen concrete is never re-paid
+      expect(calls.t2).toBe(1); // the delegation's CURRENT concrete served the walk
+      expect(calls.s1).toBe(0); // …and the walk did NOT jump past the step
+      expect(
+        failoverLog.some(
+          (l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("t2-ep@fake-t2") && l.includes("step 0")
+        )
+      ).toBe(true);
+    } finally {
+      Date.now = realNow;
+    }
   }, 30_000);
 });
 

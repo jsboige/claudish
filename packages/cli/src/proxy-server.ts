@@ -1146,8 +1146,12 @@ export async function createProxyServer(
       // form re-marked such a step WITHOUT a concrete, re-freezing it for the
       // full backoff — the intra-request half of the 24 h freeze). The same
       // concrete re-selected after a concurrent clear keeps the #263 semantics
-      // exactly: re-mark (conservative, binds) and re-resolve without consuming
-      // an attempt.
+      // — re-mark and re-resolve. #331 (review 06/10, point 2): the re-mark
+      // CARRIES the concrete — it changes nothing intra-request (nothing
+      // succeeded in between, so the delegation cannot move and the record
+      // binds identically), but a record WITHOUT one binds a role-step for its
+      // whole backoff (up to 24 h) however far the delegation advances LATER
+      // — the revisit path re-opening the freeze #331 closed.
       const attemptConcreteNow = delegation?.concrete ?? resolved.step?.target;
       if (
         role &&
@@ -1157,7 +1161,9 @@ export async function createProxyServer(
         revisits < (rule?.steps.length ?? 0)
       ) {
         revisits++;
-        markStepFailed(role, stepIndex, `re-selected after a concurrent clear — already failed in this request`);
+        markStepFailed(role, stepIndex, `re-selected after a concurrent clear — already failed in this request`, undefined, {
+          concrete: attemptConcreteNow,
+        });
         attempt--;
         continue;
       }

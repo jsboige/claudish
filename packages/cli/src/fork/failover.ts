@@ -1221,7 +1221,18 @@ export function resolveTransientStep(
     // stepFailures record) and the walk pays a round-trip at a step the
     // armed resolver would never select. Compiles either way — the param is
     // optional — so no rebase conflict will ever surface this.
-    if (isStepTtlFailed(fails?.[i], step)) continue;
+    //
+    // #331 (review 06/10, point 1): stepTtlBinds, not bare isStepTtlFailed —
+    // the walk is the third reader of a frozen role-step that used to skip it
+    // however far the delegation had moved: on a nominal 529 the walk then
+    // jumped to the NEXT step (or surfaced the 529) while the delegation's
+    // current concrete was servable. Same rule as resolveSkippingFailed: a
+    // role-step's TTL binds only while the delegation still resolves to the
+    // recorded concrete. NOTE: this file is also #354's — that PR rewrites
+    // this function (async, bucketOf param); the second merge carries the
+    // combination (stepTtlBinds here AND the concrete-target bucketer), and
+    // its route pins must survive the rebase.
+    if (stepTtlBinds(role, fails?.[i], step)) continue;
     const concrete = step.roleRef ? resolveConcreteTarget(role, step) : step.target;
     if (concrete === null) continue;
     if (isBucketWalled(providerBucketOf(concrete))) continue;
