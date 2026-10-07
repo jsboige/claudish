@@ -98,7 +98,11 @@ param(
   # Opt-in for the ONE machine that owns the legacy untagged namespace, so its
   # existing archive names — and every reader matching captures-<day>.7z —
   # are unchanged. Any other machine must pass -MachineTag instead.
-  [switch]$AllowUntaggedSharedArchive
+  [switch]$AllowUntaggedSharedArchive,
+  # #389: how many manifest entries the nightly sha re-check verifies per run
+  # (deterministic rotation; 3 by default, 0 disables). Each entry re-hashed is
+  # one DriveFS hydration, so keep this small.
+  [int]$ShaCheckCount = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -233,7 +237,24 @@ foreach ($day in $daysToArchive) {
               Copy-Item -LiteralPath $archivePath -Destination $GDriveDir -Force -ErrorAction Stop
               # Confirm the copy landed with matching size before trusting it.
               if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -eq $archBytes) {
-                Log ("GDRIVE {0}: uploaded ({1:N1} MB)" -f $day, ($archBytes/1MB))
+                # #389: size equality is not content equality. Hash BOTH sides at
+                # deposit and refuse on mismatch (bytes corrupted in flight land
+                # with the right size), then record the DESTINATION hash as the
+                # off-site reference - the rotating re-check below compares the
+                # live Drive file against exactly this, so drift at equal size
+                # stops being invisible.
+                $shaLocal  = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+                $shaDest   = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
+                if ($shaLocal -ne $shaDest) {
+                  $errors++
+                  Log ("WARN  {0}: GDrive copy SHA mismatch after size-equal copy (local {1}.. vs dest {2}..) -> local kept, retry next run" -f $day, $shaLocal.Substring(0,8), $shaDest.Substring(0,8))
+                } else {
+                  $manifestPath = Get-ShaManifestPath -GDriveDir $GDriveDir -MachineTag $MachineTag
+                  $null = Update-ShaManifest -Path $manifestPath -Archive (Split-Path $archivePath -Leaf) `
+                           -Sha256 $shaDest -Bytes $archBytes `
+                           -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                  Log ("GDRIVE {0}: uploaded ({1:N1} MB, sha256 {2}.. recorded)" -f $day, ($archBytes/1MB), $shaDest.Substring(0,8))
+                }
               } else {
                 $errors++
                 Log ("WARN  {0}: GDrive copy size mismatch -> local kept, retry next run" -f $day)
@@ -324,7 +345,20 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
     try {
       Copy-Item -LiteralPath $arch.FullName -Destination $GDriveDir -Force -ErrorAction Stop
       if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -eq $arch.Length) {
-        Log ("GDRIVE {0}: re-uploaded ({1:N1} MB, was missing)" -f $arch.BaseName, ($arch.Length/1MB))
+        # #389: same deposit discipline as the in-loop upload - hash both sides,
+        # refuse on drift, record the destination hash as the off-site reference.
+        $shaLocal = (Get-FileHash -LiteralPath $arch.FullName -Algorithm SHA256).Hash
+        $shaDest  = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
+        if ($shaLocal -ne $shaDest) {
+          $errors++
+          Log ("WARN  {0}: re-upload SHA mismatch after size-equal copy (local {1}.. vs dest {2}..) -> kept local, retried next run" -f $arch.BaseName, $shaLocal.Substring(0,8), $shaDest.Substring(0,8))
+        } else {
+          $manifestPath = Get-ShaManifestPath -GDriveDir $GDriveDir -MachineTag $MachineTag
+          $null = Update-ShaManifest -Path $manifestPath -Archive $arch.Name `
+                   -Sha256 $shaDest -Bytes $arch.Length `
+                   -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+          Log ("GDRIVE {0}: re-uploaded ({1:N1} MB, was missing, sha256 {2}.. recorded)" -f $arch.BaseName, ($arch.Length/1MB), $shaDest.Substring(0,8))
+        }
       } else {
         $errors++
         Log ("WARN  {0}: re-upload size mismatch -> kept local, retried next run" -f $arch.BaseName)
@@ -332,6 +366,45 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
     } catch {
       $errors++
       Log ("WARN  {0}: re-upload failed: {1} -> kept local, retried next run" -f $arch.BaseName, $_.Exception.Message)
+    }
+  }
+}
+
+# --- rotating off-site sha re-check (#389): every night, re-hash a small,
+# deterministically rotating sample of the manifests this machine owns and
+# compare against the hash recorded at deposit. This is the ONLY guard that can
+# see content drift at EQUAL size on the off-site copy - #208 compares sizes,
+# #322 tests readability, and neither knows what the bytes should be. Drift
+# surfaces as a loud ERROR and a non-zero night (the scheduler's escalation
+# path), never as a deletion: the manifest names the expected hash, the log
+# names both hashes, and the operator arbitrates.
+# Cost note: re-hashing reads the file through DriveFS, which hydrates it into
+# the local content cache - bounded to -ShaCheckCount files a night, and DriveFS
+# evicts under pressure. 0 disables the re-check (escape hatch, like every knob).
+if ($GDriveDir -and (Test-Path -LiteralPath $GDriveDir) -and $ShaCheckCount -gt 0) {
+  $manifestPath = Get-ShaManifestPath -GDriveDir $GDriveDir -MachineTag $MachineTag
+  $m = Read-ShaManifest -Path $manifestPath
+  if ($m.BadLines -gt 0) {
+    Log ("WARN  sha manifest has {0} unparseable line(s) ({1}) - skipped, other entries still checked" -f $m.BadLines, $manifestPath)
+  }
+  $names = @($m.Entries.Keys | Sort-Object)
+  if ($names.Count -gt 0) {
+    $sample = Select-ShaRotation -Names $names -Count $ShaCheckCount -SeedDateUtc (Get-Date).ToUniversalTime()
+    foreach ($name in $sample) {
+      $rec = $m.Entries[$name]
+      $live = Join-Path $GDriveDir $name
+      if (-not (Test-Path -LiteralPath $live)) {
+        $errors++
+        Log ("ERROR SHA-CHECK {0}: recorded in manifest but ABSENT off-site (recorded {1}, {2} bytes) - never overwritten here, investigate" -f $name, $rec.recorded, $rec.bytes)
+        continue
+      }
+      $liveSha = (Get-FileHash -LiteralPath $live -Algorithm SHA256).Hash
+      if ($liveSha -ne $rec.sha256) {
+        $errors++
+        Log ("ERROR SHA-CHECK {0}: CONTENT DRIFT at destination (recorded {1}.., live {2}.., {3} bytes recorded vs {4} live) - equal-size drift is invisible to every other guard" -f $name, $rec.sha256.Substring(0,8), $liveSha.Substring(0,8), $rec.bytes, (Get-Item -LiteralPath $live).Length)
+      } else {
+        Log ("SHA-CHECK {0}: OK (matches deposit hash {1}..)" -f $name, $liveSha.Substring(0,8))
+      }
     }
   }
 }
