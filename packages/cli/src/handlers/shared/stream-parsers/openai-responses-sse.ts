@@ -17,6 +17,7 @@ import { wrapAnthropicError } from "../anthropic-error.js";
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import { overflowReportedTokens, overflowReportFloor } from "../overflow-report-floor.js";
 import { createResponseCapture } from "../response-capture.js";
+import { ttftMarkerLine } from "../traffic-markers.js";
 import { isPolicyRefusal, logPolicyRefusal } from "./policy-refusal.js";
 import { toAnthropicUsage } from "./usage-cache-split.js";
 
@@ -433,10 +434,8 @@ export function createResponsesStreamHandler(
             totalBytes += line.length;
             if (!ttftLogged) {
               ttftLogged = true;
-              const firstEventMs = Math.round(performance.now() - tHeaders);
-              const hdr = opts.headerLatencyMs ?? -1;
               process.stdout.write(
-                `  [ttft] responses model=${opts.modelName} reqN=${reqN} headers=${hdr}ms firstEvent=${firstEventMs}ms total=${hdr >= 0 ? hdr + firstEventMs : -1}ms\n`
+                ttftMarkerLine("responses", opts.modelName, reqN, opts.headerLatencyMs, Math.round(performance.now() - tHeaders))
               );
             }
             if (data === "[DONE]") continue;

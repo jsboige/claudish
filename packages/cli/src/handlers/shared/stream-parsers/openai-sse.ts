@@ -21,6 +21,7 @@ import {
 import { isWebSearchToolCall } from "../web-search-detector.js";
 import { executeWebSearch, extractSearchQuery } from "../web-search-executor.js";
 import { createResponseCapture } from "../response-capture.js";
+import { ttftMarkerLine } from "../traffic-markers.js";
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import {
   isPolicyRefusal,
@@ -933,10 +934,8 @@ export function createStreamingResponseHandler(
               const dataStr = line.slice(6);
               if (!ttftLogged) {
                 ttftLogged = true;
-                const firstEventMs = Math.round(performance.now() - tHeaders);
-                const hdr = headerLatencyMs ?? -1;
                 process.stdout.write(
-                  `  [ttft] openai model=${target} reqN=${reqN} headers=${hdr}ms firstEvent=${firstEventMs}ms total=${hdr >= 0 ? hdr + firstEventMs : -1}ms\n`
+                  ttftMarkerLine("openai", target, reqN, headerLatencyMs, Math.round(performance.now() - tHeaders))
                 );
               }
               // Verbatim: this line IS the fixture source (see SSE_LOG_MAX_CHARS, S4-b 333026b).
