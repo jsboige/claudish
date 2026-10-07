@@ -75,7 +75,12 @@ URL_ANY_RE = re.compile(r"([a-z][a-z0-9+.-]*://[^\s]+)", re.I)
 HOSTPORT_RE = re.compile(r"^\s*([A-Za-z0-9.-]+:\d+(?:/[^\s]*)?)$")
 # `//user:pass@` — Basic-auth userinfo rides real fleet URLs (SEARXNG_URL);
 # a BASE_URL carrying it must not leak it into a dashboard or the #291 matrix.
-USERINFO_RE = re.compile(r"//[^/@\s]+@")
+# R0 (#369 review): the class deliberately allows `@` and admits ZERO chars —
+# `//@host` (empty userinfo) and `//@secret@host` (a second `@` inside the
+# userinfo) masked too. The earlier `//[^/@\s]+@` demanded one non-@ char
+# first and let `//@secret@host` through whole; `[^/\s]` stops at the path, so
+# an `@` in the path alone still never triggers a mask.
+USERINFO_RE = re.compile(r"//[^/\s]*@")
 
 NO_URL = "no-url"
 
