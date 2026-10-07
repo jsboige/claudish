@@ -624,6 +624,44 @@ Each valid custom endpoint calls `registerRuntimeProvider()` (injects into the p
 
 ---
 
+## 7.6 Scoped Inbound Keys (#400)
+
+For external consumers (a shared GPU lane, a friend testing the fleet): a key that authenticates exactly like the proxy key but reaches **only** the models its allowlist names. Subscriptions stay fleet-internal; revoking the external is deleting one config entry, never rotating `CLAUDISH_PROXY_KEY` fleet-wide.
+
+```json
+{
+  "apiKeys": {
+    "INBOUND_EXTERNAL_KEY": "ck-xxxxxxxx"
+  },
+  "inboundKeys": {
+    "external-jamin": {
+      "key": "${INBOUND_EXTERNAL_KEY}",
+      "allowModels": ["swift-1.5-27b", "qwen3.6-35b-a3b", "frognano-4b"]
+    }
+  }
+}
+```
+
+| Field         | Type     | Required | Description                                                        |
+|---------------|----------|----------|--------------------------------------------------------------------|
+| `key`         | string   | yes      | Secret; supports `${VAR}` expansion from `apiKeys` first, then env |
+| `allowModels` | string[] | yes      | Model ids this key may serve. Non-empty.                           |
+
+Semantics (resolved in `handlers/shared/inbound-keys.ts`):
+
+- **Bare names** (`swift-1.5-27b`, alias `qwen3.6-35b-a3b`) pass iff the parsed model id is allowlisted — the id that will actually serve.
+- **Explicit provider forms** (`provider@model`) pass only on an **exact raw allowlist hit** — `or@swift-1.5-27b` is refused, an allowlisted id must not ride onto a different transport's wire.
+- Anything else is a labeled `403 permission_error` (`[InboundKey] key '<name>' is not permitted to use model '<model>'…`) + one `[InboundKey] refused key=<name> model=<model>` marker per refusal. Wording deliberately free of quota-class words (#296 doctrine: `isQuotaExhaustion` must never arm on it).
+- The gate runs **before** the Anthropic passthrough exemption — a scoped key never rides the native lane either.
+- Applies to every ingress this auth covers: `/v1/messages`, `/v1/chat/completions`, `/v1/messages/count_tokens`.
+- **Attribution**: requests authed by a scoped key carry `inbound_key: "<name>"` in the capture envelope (`req-*.json`) — key-based, stable where external IPs are dynamic. The stdout `[Request]` line is unchanged (pinned consumer contract).
+
+Validation doctrine (same as `customEndpoints`): an entry failing validation — missing/empty key, unresolvable `${VAR}`, empty `allowModels`, a key value equal to a full-access proxy key or duplicated across entries — is **skipped with one stderr warning, never a crash**. Inert with no `inboundKeys` config: zero behavior change. Not (yet) per-key: concurrency caps (#400 follow-up).
+
+Requires a proxy restart to take effect (config read once per proxy lifetime — same lifecycle as `customEndpoints`).
+
+---
+
 ## 8. Model Mapping Priority
 
 For each role slot (opus, sonnet, haiku, fable, subagent), resolution from highest to lowest priority:

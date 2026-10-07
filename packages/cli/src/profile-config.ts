@@ -156,6 +156,16 @@ export interface ClaudishProfileConfig {
   proxyKey?: string;
   /** Retiring proxy key, still accepted during a rotation window (env: CLAUDISH_PROXY_KEY_PREVIOUS) */
   proxyKeyPrevious?: string;
+  /**
+   * Scoped inbound keys (#400): authenticate like `proxyKey` but reach ONLY the
+   * models their allowModels names (subscriptions stay fleet-internal — external
+   * consumers get their own revocable key). Keyed by entry NAME (what markers
+   * and captures log — never the value); `key` may be a `${VAR}` reference into
+   * `apiKeys` or env. Entries failing validation are skipped with one stderr
+   * warning at load, never a crash. Semantics resolved in
+   * handlers/shared/inbound-keys.ts.
+   */
+  inboundKeys?: Record<string, { key: string; allowModels: string[] }>;
 }
 
 /**
