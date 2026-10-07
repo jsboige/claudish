@@ -167,11 +167,15 @@ try {
         $ids = @($resp.data | ForEach-Object { $_.id } | Sort-Object)
         $baselineFile = Join-Path $ClaudishHome 'session-watch-models.baseline.json'
         if (Test-Path $baselineFile) {
-            $old = @(Get-Content $baselineFile -Raw -ErrorAction Stop | ConvertFrom-Json)
+            # PS 5.1 vs 7 divergence: under 5.1 ConvertFrom-Json emits a JSON array as ONE
+            # pipeline object, so @() alone nests it (count=1, element=the array) and every
+            # -notcontains misfires (measured 07/10: new-model x8 + model-gone x1 on an
+            # UNCHANGED catalog). Piping through ForEach-Object unrolls in BOTH interpreters.
+            $old = @((Get-Content $baselineFile -Raw -ErrorAction Stop | ConvertFrom-Json) | ForEach-Object { "$_" })
             foreach ($id in $ids) { if ($old -notcontains $id) { Write-Journal 'new-model' '' ("minimax-coding now offers: $id") } }
             foreach ($id in $old) { if ($ids -notcontains $id) { Write-Journal 'model-gone' '' ("minimax-coding retired: $id") } }
         }
-        [System.IO.File]::WriteAllText($baselineFile, ($ids | ConvertTo-Json), $Utf8NoBom)
+        [System.IO.File]::WriteAllText($baselineFile, (ConvertTo-Json -InputObject @($ids)), $Utf8NoBom)
     } else {
         Write-Journal 'catalog-error' '' 'MINIMAX_CODING_API_KEY absent from hub config'
     }
