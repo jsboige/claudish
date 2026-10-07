@@ -215,6 +215,29 @@ def test_at_in_path_alone_does_not_mask():
     assert vsp.mask_url(url) == url
 
 
+def test_at_in_query_alone_does_not_mask():
+    """#380 R1: the RFC 3986 authority ends at `?` too. A pathless URL whose `@`
+    lives in the query was over-masked to `http://***@b.c` (garbled, unreadable
+    in the matrix — measured); it must pass through untouched."""
+    url = "http://host:3000?mail=a@b.c"
+    assert vsp.mask_url(url) == url
+
+
+def test_at_in_fragment_alone_does_not_mask():
+    """#380 R1: same discipline for `#` — an `@` in the fragment is not
+    userinfo."""
+    url = "http://host:3000#team@review"
+    assert vsp.mask_url(url) == url
+
+
+def test_real_userinfo_still_masks_query_survives():
+    """#380 R1: tightening the class must not weaken the mask — a real
+    `//user:pass@` is still fully replaced (nothing after the authority,
+    query included, is touched)."""
+    masked = vsp.mask_url("http://user:secret@host:3000?mail=a@b.c")
+    assert masked == "http://***@host:3000?mail=a@b.c", masked
+
+
 def test_token_pasted_in_base_url_is_no_url_never_the_token():
     """A credential pasted into the wrong slot has no URL shape: report the
     sentinel, never echo the value."""

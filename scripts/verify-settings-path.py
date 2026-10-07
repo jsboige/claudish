@@ -78,9 +78,12 @@ HOSTPORT_RE = re.compile(r"^\s*([A-Za-z0-9.-]+:\d+(?:/[^\s]*)?)$")
 # R0 (#369 review): the class deliberately allows `@` and admits ZERO chars —
 # `//@host` (empty userinfo) and `//@secret@host` (a second `@` inside the
 # userinfo) masked too. The earlier `//[^/@\s]+@` demanded one non-@ char
-# first and let `//@secret@host` through whole; `[^/\s]` stops at the path, so
-# an `@` in the path alone still never triggers a mask.
-USERINFO_RE = re.compile(r"//[^/\s]*@")
+# first and let `//@secret@host` through whole.
+# R1 (#380 suivi): the class stops at `/`, `?` AND `#` — the RFC 3986 authority
+# ends at any of the three. Stopping only at `/` over-masked a pathless URL
+# whose `@` lived in the query: `http://host:3000?mail=a@b.c` became
+# `http://***@b.c` (garbled, unreadable in the matrix — measured, #380).
+USERINFO_RE = re.compile(r"//[^/?#\s]*@")
 
 NO_URL = "no-url"
 
