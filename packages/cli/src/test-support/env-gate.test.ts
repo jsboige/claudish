@@ -40,6 +40,31 @@ envDescribe(
     activeRan = true;
     expect(1 + 1).toBe(2);
   });
+  // skipIf inside an ACTIVE class delegates to bun's named-skip: condition
+  // true ⇒ skipped by name, body never runs, but the name still registers.
+  test.skipIf(true)("active class conditional test skips by name", () => {
+    throw new Error("skipIf(true) must skip, not run");
+  });
+});
+
+envDescribe(
+  {
+    id: "ctl-inactive-skipif",
+    active: false,
+    reason: "control: condition false",
+    activation: "control: never",
+  },
+  "control inactive class with conditional test"
+)((test) => {
+  test("plain test of an inactive class must NOT run", () => {
+    throw new Error("gate failed closed: body of an inactive class executed");
+  });
+  // The class gate dominates the test's own condition: an inactive class
+  // never runs a conditional body either, whatever skipIf says — and the
+  // name registers for the manifest (#175 Group 2 test 3 shape).
+  test.skipIf(true)("conditional test registers, never runs", () => {
+    throw new Error("gate failed closed: conditional body executed");
+  });
 });
 
 describe("env-gate controls", () => {
@@ -55,7 +80,8 @@ describe("env-gate controls", () => {
     const reg = (globalThis as { __claudishEnvGate?: Array<{ cls: { id: string }; testNames: string[] }> }).__claudishEnvGate ?? [];
     const ids = reg.map((e) => `${e.cls.id}:${e.testNames.length}`);
     expect(ids).toContain("ctl-inactive:1");
-    expect(ids).toContain("ctl-active:1");
+    expect(ids).toContain("ctl-active:2");
+    expect(ids).toContain("ctl-inactive-skipif:2");
   });
 });
 
