@@ -29,6 +29,11 @@
   proxy-log-monitoring (bytes=NNNN matching error codes, timestamp digits
   matching 429, [msg:N] previews matching keywords).
 
+  DEPRECATED for live-trace questions (2026-10-04, #72): prefer the MCP tool
+  `claudish_traffic` — it detects rotated corpora (UNKNOWN, no verdict),
+  renders the histogram to now, and splits cron/interactive per machine. This
+  script remains only because the 6h surveillance cron reads this path.
+
   For richer detail (workspace, session_id, CC version, token usage) use
   traffic-summary.ps1 / traffic-sessions.ps1 against the capture files.
   For historical analysis use traffic-history.ps1 against the 7z archives.
@@ -50,6 +55,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# --- deprecation banner (#72 grain 3) -----------------------------------------
+# The header comment above is never read by a CALLER — an agent reaching for
+# this script by name sees only its output. Print the redirect once at start;
+# the 6h surveillance cron's report carries one extra line, which is the point.
+Write-Host '[DEPRECATED #72] Live-trace questions: use the MCP tool claudish_traffic (rotated-corpus detection, histogram to now, cron/interactive split). This script stays ONLY for the 6h surveillance cron - do not add new callers (A/B 2026-10-04: this script rendered a verdict on a rotated corpus + 2 false HANG SUSPECTS where the MCP returns UNKNOWN).'
 
 # --- gather logs -------------------------------------------------------------
 # --timestamps prepends ISO8601 to each line → enables temporal analysis
