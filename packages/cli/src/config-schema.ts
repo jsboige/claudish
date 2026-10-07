@@ -43,8 +43,14 @@ export const CustomEndpointSimpleSchema = z.object({
    * GPU vLLM server) where parallel large prefills cause engine wedging.
    * Wires the endpoint through LocalModelQueue — same mechanism as local
    * models' `:N` concurrency suffix. Omit for unbounded (default behavior).
+   *
+   * Cap raised 8 → 32 (fleet need): the FrogNano-4B vLLM endpoint passed its
+   * N=16/32 gates and runs definitive maxConcurrency=16 — the old cap made
+   * the whole entry FAIL validation and be skipped (measured 2026-10-07: the
+   * endpoint silently left the routing table). The cap is a typo guard, not
+   * a capacity statement; 32 keeps headroom over the measured fleet values.
    */
-  maxConcurrency: z.number().int().min(0).max(8).optional(),
+  maxConcurrency: z.number().int().min(0).max(32).optional(),
   /**
    * Drop `reasoning_content` from outbound assistant messages.
    *
@@ -85,9 +91,9 @@ export const CustomEndpointComplexSchema = z.object({
   models: z.array(z.string()).optional(),
   /**
    * Max concurrent in-flight requests to this endpoint (0 = unlimited, 1 =
-   * sequential). See CustomEndpointSimpleSchema.maxConcurrency.
+   * sequential). See CustomEndpointSimpleSchema.maxConcurrency (cap 32 there).
    */
-  maxConcurrency: z.number().int().min(0).max(8).optional(),
+  maxConcurrency: z.number().int().min(0).max(32).optional(),
   /** See CustomEndpointSimpleSchema.omitReasoningContent. */
   omitReasoningContent: z.boolean().optional(),
 });

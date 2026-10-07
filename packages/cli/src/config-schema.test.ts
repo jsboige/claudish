@@ -57,6 +57,33 @@ describe("CustomEndpointSimpleSchema", () => {
       })
     ).toThrow();
   });
+
+  // Cap 8 → 32 (2026-10-07): the fleet's FrogNano-4B endpoint runs
+  // definitive maxConcurrency=16 (gates N=16/32 passed); at the old cap the
+  // entry failed validation and the endpoint was silently skipped. The cap
+  // stays a typo guard — 33 is still rejected.
+  test("maxConcurrency: accepts 16 (fleet value) and 32, rejects 33", () => {
+    const base = {
+      kind: "simple" as const,
+      url: "https://api.example.com",
+      format: "openai" as const,
+      apiKey: "sk",
+    };
+    for (const n of [16, 32]) {
+      expect(CustomEndpointSimpleSchema.parse({ ...base, maxConcurrency: n }).maxConcurrency).toBe(n);
+    }
+    expect(() => CustomEndpointSimpleSchema.parse({ ...base, maxConcurrency: 33 })).toThrow();
+    expect(() =>
+      CustomEndpointComplexSchema.parse({
+        kind: "complex",
+        displayName: "x",
+        transport: "openai",
+        baseUrl: "https://api.example.com",
+        apiKey: "sk",
+        maxConcurrency: 33,
+      })
+    ).toThrow();
+  });
 });
 
 describe("CustomEndpointComplexSchema", () => {
