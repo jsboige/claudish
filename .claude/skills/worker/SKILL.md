@@ -58,7 +58,11 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      seulement) ; `rogue-schtasks` → **WARN** (tâche planifiée dont l'action lance
      une session claude — classe split-brain, escalade po-2027 07/10 ; triage :
      nom journalisé seul, vérifier l'action réelle avant tout geste, propriétaire
-     roo-extensions pour les launchers cachés) ; `error`/`catalog-error` → WARN.
+     roo-extensions pour les launchers cachés) ; `skip-unattributed` → silence
+     (benigne par construction depuis B1/CR 07/10 : une ligne sans session_id ne peut
+     plus rien lier ni tuer — comptage /worker seulement) ; `scan-skip`/
+     `catalog-skip` → silence (chemins hub absents sur une machine non-hub, N2/CR) ;
+     `error`/`catalog-error` → WARN.
      Après relais, mettre à jour le
      watermark. **Ne JAMAIS tronquer le journal.** Consent kill = fichier
      `~/.claudish/session-watch.kill.enabled` — à n'armer qu'après ≥24 h de journal

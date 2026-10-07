@@ -14,11 +14,22 @@ Per tick:
          cron coordinate-adjoint, principal gpt-6-sol declared — NEVER killed, NEVER
          posted; unconditional, dominance-independent — user arbitration 06/10 23:05)
        - local, sonnet-majority -> journal 'sonnet-majority'  (never killed)
+       - session_id empty/short -> journal 'skip-unattributed' BEFORE anything else
+         (B1, CR 07/10: [regex]::Escape('') matches EVERY claude.exe CommandLine, so a
+         sid-less line would bind-and-kill all sessions on the host once consent is
+         armed, and -Filter "$sid8*.jsonl" degenerates to '*.jsonl' which resolves the
+         first project that answers — starving the CoursIA-2 exemption of its verdict)
        - local, sol > 50%       -> kill path, gated by consent file
-         $ClaudishHome\session-watch.kill.enabled (ABSENT = detector only). Process
-         bound by session-id substring in claude.exe CommandLine; no binding + capture
-         < 2 min old -> 'no-binding-recent' (never conclude "already exited"); never
-         kill a process not bound to the sid.
+         $ClaudishHome\session-watch.kill.enabled (ABSENT = detector only); no binding
+         + capture < 2 min old -> 'no-binding-recent' (never conclude "already exited");
+         never kill a process not bound to the sid.
+         BINDING HONESTY (N1, CR 07/10): a real claude.exe command line carries NO
+         session id — the one live kill (06/10) bound via transcript CreationTime <->
+         process CreationTime correlation instead. The CommandLine-substring binding is
+         therefore near-inoperant BY DESIGN: pre-B1 the only "binding" class was the
+         sid-less line (it matched everything); post-B1 the branch almost always
+         journals 'no-binding-*'. Until a correlation-based binder lands, an armed kill
+         is a tripwire of last resort, not an operative control.
        - local, sol-minority    -> journal 'sol-minority'     (WARN-class at relay)
   3. MiniMax coding catalog watch: GET /v1/models (key read from the hub config.json,
      NEVER journaled, never printed); new/retired id vs baseline file -> journal
@@ -44,13 +55,30 @@ param(
     [string]$HubConfig = 'D:\claudish-shadow\config\config.json',
     [string]$RepoScripts = 'D:\dev\claudish\scripts',
     [double]$WindowHours = 0.3,
-    [switch]$DryRun
+    [switch]$DryRun,
+    # Injectable seams (CR B2): tests pass fixtures so a kill-capable organ can be
+    # pinned WITHOUT touching a live process list. Absent = production default,
+    # normalized just below. Hub-first defaults note (N2): $PythonExe/$HubConfig/
+    # $RepoScripts target po-2025 (the hub) — on any other machine pass them
+    # explicitly; an absent scan script or hub config then journals 'scan-skip'/
+    # 'catalog-skip' (benign, distinct from 'error') instead of failing every tick.
+    [scriptblock]$RunScan = $null,
+    [scriptblock]$GetProcesses = $null,
+    [scriptblock]$StopProcess = $null,
+    [scriptblock]$GetSchTasks = $null,
+    [scriptblock]$FetchCatalog = $null
 )
 
 $ErrorActionPreference = 'Continue'
 if (-not $ScanScript) { $ScanScript = Join-Path $ClaudishHome 'live-session-scan.py' }
 $JournalPath = Join-Path $ClaudishHome 'session-watch.log'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+if (-not $RunScan)      { $RunScan      = { param($Python,$Script,$Hours) (& $Python $Script --hours $Hours --top 12 --json 2>&1 | Out-String) } }
+if (-not $GetProcesses) { $GetProcesses = { Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue } }
+if (-not $StopProcess)  { $StopProcess  = { param($ProcessId) Stop-Process -Id $ProcessId -Force -Confirm:$false -ErrorAction Stop } }
+if (-not $GetSchTasks)  { $GetSchTasks  = { & schtasks.exe /Query /FO CSV /V 2>$null } }
+if (-not $FetchCatalog) { $FetchCatalog = { param($Url,$Key) Invoke-RestMethod -Uri $Url -Headers @{ Authorization = "Bearer $Key" } -TimeoutSec 20 -ErrorAction Stop } }
 
 function Write-Journal {
     param([string]$Kind, [string]$Sid = '', [string]$Detail = '')
@@ -66,11 +94,19 @@ function Write-Journal {
 }
 
 # --- 1. Tripwire scan -----------------------------------------------------------
+$data = $null
 try {
-    if (-not (Test-Path $PythonExe)) { throw "python not found: $PythonExe (Store-Python full path required, bare python = silent no-op)" }
-    if (-not (Test-Path $ScanScript)) { throw "scan script not found: $ScanScript" }
-    $raw = & $PythonExe $ScanScript --hours $WindowHours --top 12 --json 2>&1 | Out-String
-    $data = $raw | ConvertFrom-Json
+    $raw = $null
+    if ($RunScan) {
+        # injected seam (test): the caller provides the scan output, path checks moot
+        $raw = & $RunScan $PythonExe $ScanScript $WindowHours
+    } elseif (-not (Test-Path $ScanScript)) {
+        Write-Journal 'scan-skip' '' ("scan script not found: $ScanScript (pass -ScanScript/-PythonExe on a non-hub machine)")
+    } else {
+        if (-not (Test-Path $PythonExe)) { throw "python not found: $PythonExe (Store-Python full path required, bare python = silent no-op)" }
+        $raw = & $PythonExe $ScanScript --hours $WindowHours --top 12 --json 2>&1 | Out-String
+    }
+    if ($raw) { $data = $raw | ConvertFrom-Json }
 } catch {
     Write-Journal 'error' '' ("scan failed: " + $_.Exception.Message)
     $data = $null
@@ -84,7 +120,16 @@ if ($data -and $data.sessions) {
     foreach ($s in @($data.sessions)) {
         if (@($s.flags) -notcontains 'OPENAI-SHAPED') { continue }
         $sid = [string]$s.session_id
-        $sid8 = $sid.Substring(0, [Math]::Min(8, $sid.Length))
+
+        # B1 (CR): refuse a sid-less line before ANYTHING can consume it — binding,
+        # workspace resolution, consent path. The unattributed bucket keeps the
+        # envelope machine, so it passes the local-machine test and would otherwise
+        # reach the kill branch with an empty regex.
+        if ([string]::IsNullOrWhiteSpace($sid) -or $sid.Length -lt 8) {
+            Write-Journal 'skip-unattributed' '' ("machine=" + $s.machine + " total=" + $s.requests + " (session_id empty/short — never reaches binding)")
+            continue
+        }
+        $sid8 = $sid.Substring(0, 8)
 
         if ([string]$s.machine -ne $localMachine) {
             Write-Journal 'remote-openai' $sid8 ("machine=" + $s.machine + " sol=" + $s.models.PSObject.Properties[$solId].Value + " total=" + $s.requests)
@@ -132,13 +177,13 @@ if ($data -and $data.sessions) {
             }
             $bound = @()
             try {
-                $bound = @(Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue |
+                $bound = @(& $GetProcesses |
                     Where-Object { $_.CommandLine -and ($_.CommandLine -match [regex]::Escape($sid8)) })
             } catch { Write-Journal 'error' $sid8 ("process query failed: " + $_.Exception.Message) }
             if ($bound.Count -gt 0) {
                 foreach ($p in $bound) {
                     try {
-                        Stop-Process -Id $p.ProcessId -Force -Confirm:$false -ErrorAction Stop
+                        & $StopProcess $p.ProcessId
                         Write-Journal 'killed' $sid8 ("pid=" + $p.ProcessId + " sol=$sol total=$total project=$projectName")
                     } catch {
                         Write-Journal 'error' $sid8 ("kill failed pid=" + $p.ProcessId + ": " + $_.Exception.Message)
@@ -160,24 +205,28 @@ if ($data -and $data.sessions) {
 
 # --- 3. MiniMax coding catalog watch --------------------------------------------
 try {
-    $cfg = Get-Content $HubConfig -Raw -ErrorAction Stop | ConvertFrom-Json
-    $apiKey = $cfg.apiKeys.MINIMAX_CODING_API_KEY
-    if ($apiKey) {
-        $resp = Invoke-RestMethod -Uri 'https://api.minimax.io/v1/models' -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 20 -ErrorAction Stop
-        $ids = @($resp.data | ForEach-Object { $_.id } | Sort-Object)
-        $baselineFile = Join-Path $ClaudishHome 'session-watch-models.baseline.json'
-        if (Test-Path $baselineFile) {
-            # PS 5.1 vs 7 divergence: under 5.1 ConvertFrom-Json emits a JSON array as ONE
-            # pipeline object, so @() alone nests it (count=1, element=the array) and every
-            # -notcontains misfires (measured 07/10: new-model x8 + model-gone x1 on an
-            # UNCHANGED catalog). Piping through ForEach-Object unrolls in BOTH interpreters.
-            $old = @((Get-Content $baselineFile -Raw -ErrorAction Stop | ConvertFrom-Json) | ForEach-Object { "$_" })
-            foreach ($id in $ids) { if ($old -notcontains $id) { Write-Journal 'new-model' '' ("minimax-coding now offers: $id") } }
-            foreach ($id in $old) { if ($ids -notcontains $id) { Write-Journal 'model-gone' '' ("minimax-coding retired: $id") } }
-        }
-        [System.IO.File]::WriteAllText($baselineFile, (ConvertTo-Json -InputObject @($ids)), $Utf8NoBom)
+    if (-not (Test-Path $HubConfig)) {
+        Write-Journal 'catalog-skip' '' ("hub config not found: $HubConfig (catalog watch is hub-only)")
     } else {
-        Write-Journal 'catalog-error' '' 'MINIMAX_CODING_API_KEY absent from hub config'
+        $cfg = Get-Content $HubConfig -Raw -ErrorAction Stop | ConvertFrom-Json
+        $apiKey = $cfg.apiKeys.MINIMAX_CODING_API_KEY
+        if ($apiKey) {
+            $resp = & $FetchCatalog 'https://api.minimax.io/v1/models' $apiKey
+            $ids = @($resp.data | ForEach-Object { $_.id } | Sort-Object)
+            $baselineFile = Join-Path $ClaudishHome 'session-watch-models.baseline.json'
+            if (Test-Path $baselineFile) {
+                # PS 5.1 vs 7 divergence: under 5.1 ConvertFrom-Json emits a JSON array as ONE
+                # pipeline object, so @() alone nests it (count=1, element=the array) and every
+                # -notcontains misfires (measured 07/10: new-model x8 + model-gone x1 on an
+                # UNCHANGED catalog). Piping through ForEach-Object unrolls in BOTH interpreters.
+                $old = @((Get-Content $baselineFile -Raw -ErrorAction Stop | ConvertFrom-Json) | ForEach-Object { "$_" })
+                foreach ($id in $ids) { if ($old -notcontains $id) { Write-Journal 'new-model' '' ("minimax-coding now offers: $id") } }
+                foreach ($id in $old) { if ($ids -notcontains $id) { Write-Journal 'model-gone' '' ("minimax-coding retired: $id") } }
+            }
+            [System.IO.File]::WriteAllText($baselineFile, (ConvertTo-Json -InputObject @($ids)), $Utf8NoBom)
+        } else {
+            Write-Journal 'catalog-error' '' 'MINIMAX_CODING_API_KEY absent from hub config'
+        }
     }
 } catch {
     Write-Journal 'catalog-error' '' ("catalog watch failed: " + $_.Exception.Message)
@@ -203,8 +252,12 @@ if (Test-Path $splitBrain) {
 # powershell/wscript/python — no claude.exe — so the predicate needs no allowlist.
 # Journal the task NAME only: a /TR line can carry credentials (docker-events #192
 # lesson) and never enters the journal.
+# DETECTOR BOUNDARY (N3, CR): the predicate sees only actions literally carrying
+# claude.exe/--print//continue//coordinate — a cadence carried by a .vbs/.cmd launcher
+# that reaches claude indirectly escapes it. A "clean" verdict from this detector is a
+# WEAK negative (nothing of the SEEN class was found), never proof that no rogue exists.
 try {
-    $csv = & schtasks.exe /Query /FO CSV /V 2>$null
+    $csv = & $GetSchTasks
     foreach ($ln in $csv) {
         if ($ln -notmatch 'claude') { continue }
         if ($ln -match 'claude\.exe|claude"?\s+--print|--print\b.*claude|/continue|/coordinate') {
