@@ -148,6 +148,13 @@ param(
 
 Import-Module (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1') -Force
 
+# #368 — the pre-gesture failover-events tick runs THIS collector against the
+# old container. Script-scope (not a function default expression) so the test
+# suite can neutralize it after dot-sourcing (same pattern as $LogPath): every
+# suite test then skips the tick instead of spawning a real child, and the
+# dedicated #368 tests bind -FailoverTickCollectorPath to a fixture.
+$DrainFailoverTickCollector = Join-Path $PSScriptRoot 'failover-events-collect.ps1'
+
 function Write-DrainLog {
     param([string]$Message)
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
@@ -381,7 +388,14 @@ function Invoke-ClaudishDrainedRestartImpl {
         [string]$FreezeClaudishHome = $ClaudishHome,
         # #233 AC2 — auto-remove leftover Created-state compose twins instead
         # of refusing. Never removes a twin that ever ran.
-        [switch]$RemoveCreatedTwins
+        [switch]$RemoveCreatedTwins,
+        # #368 — collector script for the pre-gesture failover-events tick.
+        # Default reads the script-scope $DrainFailoverTickCollector (the
+        # suite sets it to '' after dot-sourcing, skipping the tick).
+        [string]$FailoverTickCollectorPath = $DrainFailoverTickCollector,
+        # #368 — hard bound on the tick: the drain must never wait on a
+        # wedged collector invocation. Tests shrink it to prove the kill.
+        [int]$FailoverTickTimeoutSec = 120
     )
 
     # --env-file guard (incident 2026-09-07, EISDIR aftermath): docker compose
@@ -619,6 +633,15 @@ function Invoke-ClaudishDrainedRestartImpl {
         }
     }
 
+    # #368 — pre-gesture failover-events tick: the OLD container's log is
+    # about to die (a recreate destroys it) or its failover state to reset
+    # (any restart); persist the final markers first. Runs AFTER the freeze
+    # arming so new admissions are already gated while the tick runs, and its
+    # default 120 s bound fits the proxy's 900 s freeze expiry. Never blocks
+    # the gesture — see Invoke-DrainFailoverEventsTick's own bounds.
+    Invoke-DrainFailoverEventsTick -CollectorPath $FailoverTickCollectorPath -Container $Container `
+        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec
+
     $restartAt = Get-Date
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
     # governs how long Docker waits between SIGTERM and SIGKILL, and without it
@@ -724,7 +747,11 @@ function Invoke-ClaudishDrainedRestart {
         [string]$EnvFile = "",
         [string]$ComposeDir = (Split-Path -Parent $PSScriptRoot),
         [string]$FreezeClaudishHome = $ClaudishHome,
-        [switch]$RemoveCreatedTwins
+        [switch]$RemoveCreatedTwins,
+        # #368 — forwarded to the impl when bound (unbound callers fall to
+        # the impl's own defaults, which read the script-scope collector path).
+        [string]$FailoverTickCollectorPath,
+        [int]$FailoverTickTimeoutSec = 120
     )
     # #306 — armed by the impl right before its gesture; cleared HERE on every
     # exit (success, failure, exception), so a crashed run cannot outlive its
@@ -816,6 +843,59 @@ function Resolve-DrainTargetsFromEnvFile {
         }
     }
     return $out
+}
+
+function Invoke-DrainFailoverEventsTick {
+    <#
+        #368 — one collection tick against the OLD container, right before the
+        gesture, so the final minutes of its [Failover] markers survive the
+        recreate that destroys the container log (the founding loss of #347:
+        the 04/10 window died at the 05/10 07:58:44Z recreate). At the PT15M
+        cadence every recreate loses up to one tick interval — and that
+        interval is exactly the interesting one: drain cutover, recovery
+        probes, first walls of the new instance.
+
+        The drain's critical path gains NO dependency here: the tick is
+        bounded ($TimeoutSec, then the child is killed), every collector exit
+        code is swallowed-and-logged — the collector's own NOT-MEASURED /
+        held-watermark semantics never hold the drain — and the tick writes
+        only the collector's own state, which the drain never reads back.
+    #>
+    param(
+        [string]$CollectorPath,
+        [string]$Container,
+        [string]$ClaudishHome,
+        [int]$TimeoutSec = 120
+    )
+    if (-not $CollectorPath -or -not (Test-Path -LiteralPath $CollectorPath)) {
+        Write-DrainLog "FAILOVER-TICK skipped — no collector at '$CollectorPath'"
+        return
+    }
+    if (-not (Test-Path -LiteralPath $ClaudishHome)) { New-Item -ItemType Directory -Path $ClaudishHome -Force | Out-Null }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $tickOut = Join-Path $ClaudishHome "drain-failover-tick-$stamp.out.log"
+    $tickErr = Join-Path $ClaudishHome "drain-failover-tick-$stamp.err.log"
+    # Quote every argument through the same Windows rule the detach launcher
+    # uses — 5.1's -ArgumentList array join quotes nothing, so a home path
+    # with a space must not split (02/10 lesson).
+    $argString = Join-DrainDetachArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
+        '-Container', $Container, '-ClaudishHome', $ClaudishHome)
+    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argString `
+        -WindowStyle Hidden -RedirectStandardOutput $tickOut -RedirectStandardError $tickErr -PassThru
+    # 5.1: without a held handle, ExitCode reads empty after the child dies
+    # (#338 round-1 lesson).
+    $null = $p.Handle
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+        try { $p.Kill() } catch { }
+        Write-DrainLog "FAILOVER-TICK killed after ${TimeoutSec}s bound (wedged collector invocation) — swallowed, drain proceeds"
+        return
+    }
+    $code = $p.ExitCode
+    if ($code -eq 0) {
+        Write-DrainLog "FAILOVER-TICK ok — the old container's final markers persisted before the gesture"
+    } else {
+        Write-DrainLog "FAILOVER-TICK collector exit $code (its own NOT-MEASURED / held-watermark semantics) — swallowed, drain proceeds"
+    }
 }
 
 function Join-DrainDetachArguments {
