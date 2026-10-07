@@ -561,6 +561,7 @@ For OpenAI- or Anthropic-compatible servers:
 | `apiKey` | string | no | API key; supports `${VAR}` env expansion |
 | `modelPrefix` | string | no | Prepended to model name before sending to API |
 | `models` | string[] | no | Restrict to listed models; omit to allow any |
+| `maxConcurrency` | integer 0–32 | no | Max concurrent in-flight requests (0 = unlimited, 1 = sequential; omit = unbounded). For capacity-limited backends (single-GPU vLLM). An out-of-range value **fails validation and skips the whole entry** — the endpoint leaves the routing table. |
 
 Usage: `claudish --model my-vllm@llama3.1-70b "task"`
 
