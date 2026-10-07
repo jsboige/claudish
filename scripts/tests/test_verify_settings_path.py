@@ -188,6 +188,33 @@ def test_live_userinfo_masked_in_json_output():
     assert rows[0]["live"] == "https://***@proxy.example:3000", rows
 
 
+def test_raw_at_userinfo_masked():
+    """R0 (#369 review): a userinfo that starts right at `//` — empty userinfo
+    (`//@host`) or a second `@` inside it (`//@secret@host`) — masks like any
+    other. The old `//[^/@\s]+@` required one non-@ char first and let
+    `//@secret@host` reach the output whole."""
+    secret = "sk-ant-raw-at-leak"
+    for raw, masked in [
+        ("https://@proxy.example:3000", "https://***@proxy.example:3000"),
+        ("https://@%s@proxy.example:3000" % secret, "https://***@proxy.example:3000"),
+    ]:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = _write(tmp, {"env": {"ANTHROPIC_BASE_URL": raw}})
+            rc, out = _run_main(["--settings", p, "--json"])
+        assert rc == 0, rc
+        assert secret not in out, "raw-@ userinfo leaked for %r" % raw
+        rows = json.loads(out)
+        assert rows[0]["live"] == masked, (raw, rows)
+
+
+def test_at_in_path_alone_does_not_mask():
+    """The mask's class stops at the path: an `@` after the first `/` is part of
+    the path, not userinfo — the URL must pass through untouched (a mask here
+    would garble a clean URL's path in the matrix)."""
+    url = "http://proxy.example:3000/team@review/export"
+    assert vsp.mask_url(url) == url
+
+
 def test_token_pasted_in_base_url_is_no_url_never_the_token():
     """A credential pasted into the wrong slot has no URL shape: report the
     sentinel, never echo the value."""
