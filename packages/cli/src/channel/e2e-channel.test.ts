@@ -368,6 +368,13 @@ describe("Group 2: Real Claude Code — MCP tool discovery", () => {
         { timeout: 90_000 }
       );
 
+      // Diagnostic surface (#175): the helper already returns stderr — print it
+      // when the call fails, or the expect below shows only "Expected 0,
+      // Received 1" and the cause (auth / endpoint / MCP / model) stays hidden.
+      if (exitCode !== 0) {
+        console.error(`[RealCC:1] exitCode=${exitCode} stderr=${stderr.slice(0, 2000)}`);
+      }
+
       // Claude should have called list_models and included model data in output
       expect(exitCode).toBe(0);
       expect(stdout.length).toBeGreaterThan(0);
@@ -384,11 +391,14 @@ describe("Group 2: Real Claude Code — MCP tool discovery", () => {
   test.skipIf(!claudeAvailable)(
     "claude discovers channel tools (create_session, list_sessions)",
     async () => {
-      const { stdout, exitCode } = await runClaudeWithMcp(
+      const { stdout, stderr, exitCode } = await runClaudeWithMcp(
         "Call the list_sessions tool from the claudish MCP server with include_completed=true. Output the raw JSON result.",
         { timeout: 90_000 }
       );
 
+      if (exitCode !== 0) {
+        console.error(`[RealCC:2] exitCode=${exitCode} stderr=${stderr.slice(0, 2000)}`);
+      }
       expect(exitCode).toBe(0);
       expect(stdout.length).toBeGreaterThan(0);
       // Claude should have called list_sessions and shown the result
@@ -407,6 +417,9 @@ describe("Group 2: Real Claude Code — MCP tool discovery", () => {
         { timeout: 120_000 }
       );
 
+      if (exitCode !== 0) {
+        console.error(`[RealCC:3] exitCode=${exitCode} stderr=${stderr.slice(0, 2000)}`);
+      }
       expect(exitCode).toBe(0);
       expect(stdout.length).toBeGreaterThan(0);
       // Claude should have created a session and shown the session_id
