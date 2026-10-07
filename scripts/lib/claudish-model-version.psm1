@@ -396,21 +396,34 @@ function Invoke-DrainDetachedRestart {
         (kind, family, detail) and is expected to call Write-VersionEvent.
         Both callbacks run in the CALLER's scope (scriptblocks bind to where
         they were defined), so $eventsPath and friends stay visible.
+
+        -ClaudishHome and -LogPath are MANDATORY and forwarded verbatim
+        (CR #377): left to its own defaults the drain resolves everything
+        from $env:USERPROFILE\.claudish — under an account other than the
+        watch's that is a DIFFERENT home, and four things silently follow it
+        there: the probe URL (base-url.txt), the drain-freeze consent file,
+        drain.log (whose START line the -Detach handshake reads) and the
+        drain-detach capture files. The outcome would then be written where
+        nobody looks for it — the same "exists but invisible" class as #352
+        itself. ops-scripts.md's rule for -Detach applies here too: pass
+        both, always.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$DrainScript,
         [Parameter(Mandatory = $true)][string]$Reason,
+        [Parameter(Mandatory = $true)][string]$ClaudishHome,
+        [Parameter(Mandatory = $true)][string]$LogPath,
         [Parameter(Mandatory = $true)][scriptblock]$Log,
         [Parameter(Mandatory = $true)][scriptblock]$WriteEvent
     )
     & $Log ("launching detached drained restart via -Detach: " + $Reason)
-    $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $DrainScript -Detach -Reason $Reason 2>&1)
+    $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $DrainScript -Detach -Reason $Reason -ClaudishHome $ClaudishHome -LogPath $LogPath 2>&1)
     $rc = $LASTEXITCODE
     foreach ($line in $out) { & $Log ("  [drain-detach] " + $line) }
     switch ($rc) {
         0 {
             & $Log "drain -Detach: child alive (START line seen) — restart in flight"
-            & $WriteEvent 'info' 'reload' ("drain -Detach launched (exit 0) — poll drain.log for the first OUTCOME after this run's START; reason: " + $Reason)
+            & $WriteEvent 'info' 'reload' ("drain -Detach launched (exit 0) — poll '" + $LogPath + "' for the first OUTCOME after this run's START; reason: " + $Reason)
         }
         3 {
             & $Log "drain -Detach: launch FAILED (exit 3 — child died at launch/binding, or start failed) — relaunching is safe"

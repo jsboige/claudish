@@ -558,10 +558,23 @@ Describe 'Invoke-DrainDetachedRestart (#352) — the drain child is launched thr
     # module function -> powershell.exe fixture drain), each fixture carrying
     # the REAL drain param() block (bounded subset — copy-only fidelity, so a
     # pin would go red if the module function name or invocation form moved).
+    # CR #377 adds the home question to the same chain: the fixture's
+    # -ClaudishHome/-LogPath defaults are EMPTY, so a module that stops
+    # forwarding either is caught by value, not by presence.
     BeforeAll {
         $script:detachFixDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mvw-detach-{0}" -f ([guid]::NewGuid().ToString('N').Substring(0, 8)))
         New-Item -ItemType Directory $script:detachFixDir -Force | Out-Null
         $global:MVWDetach = @{ Log = @(); Events = @() }
+        # The PRODUCTION Reason (runner line: prefix + restartWhy joined by
+        # ';', each family 'name: old id(s) retired: id,id') — colons, commas,
+        # semicolons, TWO families and TWO ids, the shapes that died at
+        # binding pre-#352 and that a bare-prefix pin would never exercise.
+        $script:prodReason = 'model-version-watch minor repin (old id retired): openai: old id(s) retired: gpt-6-sol,gpt-6-astra; glm: old id(s) retired: glm-5.2'
+        # Sentinel home — deliberately NOT any real profile dir: the fixture
+        # compares by VALUE, so a dropped forward fails even though the real
+        # drain would have happily resolved $env:USERPROFILE\.claudish.
+        $script:detachHome = 'C:\MVWWatchHome'
+        $script:detachLog = 'C:\MVWWatchHome\drain.log'
         # The drain's real param(), trimmed to the params the watch can reach,
         # with EXACTLY those names/types — the binding defect the pins
         # reproduce lives there (fix fixtures are prefixed SB- to never
@@ -571,15 +584,20 @@ param(
     [string]$ContainerName = "claudish-proxy",
     [int]$MaxWaitSec = 600,
     [string]$Reason = "manual",
+    [string]$ClaudishHome = "",
+    [string]$LogPath = "",
     [switch]$Detach
 )
 '@
         Set-Content -LiteralPath (Join-Path $script:detachFixDir 'fixture-drain.ps1') -Encoding UTF8 -Value @"
 $script:drainParamSubset
-# fixture: exits 0 only when -Detach reached us AND the Reason is intact
-# (unquoted, the binding above DIES before any of this runs - that WAS #352)
+# fixture: exits 0 only when -Detach reached us, the Reason is the PRODUCTION
+# form, and BOTH home params carry the caller's values (unquoted, the binding
+# above DIES before any of this runs - that WAS #352)
 if (-not `$Detach) { Write-Error 'FIXTURE: -Detach missing' ; exit 7 }
-if (`$Reason -ne 'model-version-watch minor repin (old id retired)') { Write-Error "FIXTURE: mangled Reason: <`$Reason>" ; exit 8 }
+if (`$Reason -ne '$($script:prodReason)') { Write-Error "FIXTURE: mangled Reason: <`$Reason>" ; exit 8 }
+if (`$ClaudishHome -ne '$($script:detachHome)') { Write-Error "FIXTURE: ClaudishHome not forwarded: <`$ClaudishHome>" ; exit 9 }
+if (`$LogPath -ne '$($script:detachLog)') { Write-Error "FIXTURE: LogPath not forwarded: <`$LogPath>" ; exit 9 }
 '[DrainDetach] child PID 4242 alive — START pid 4242 line present in fixture.log'
 exit 0
 "@
@@ -605,10 +623,12 @@ exit 4
         Remove-Variable -Name MVWDetach -Scope Global -ErrorAction SilentlyContinue
     }
 
-    It 'the real entry point: -Detach forwarded, Reason with spaces+parens SURVIVES binding, exit 0 -> info event' {
+    It 'the real entry point: -Detach forwarded, PRODUCTION Reason (two families, two ids, colons/commas/semicolons) SURVIVES binding, exit 0 -> info event' {
         $drain = Join-Path $script:detachFixDir 'fixture-drain.ps1'
         $rc = Invoke-DrainDetachedRestart -DrainScript $drain `
-            -Reason 'model-version-watch minor repin (old id retired)' `
+            -Reason $script:prodReason `
+            -ClaudishHome $script:detachHome `
+            -LogPath $script:detachLog `
             -Log { param($m) $global:MVWDetach.Log += $m } `
             -WriteEvent { param($k, $f, $d) $global:MVWDetach.Events += (@{ kind = $k; family = $f; detail = $d }) }
         $rc | Should -Be 0
@@ -616,16 +636,42 @@ exit 4
         ($global:MVWDetach.Events[0].kind) | Should -Be 'info'
         ($global:MVWDetach.Events[0].family) | Should -Be 'reload'
         ($global:MVWDetach.Events[0].detail) | Should -Match 'exit 0'
+        # the info event NAMES the drain.log the operator must poll (CR #377:
+        # under another account that file is not $env:USERPROFILE's)
+        ($global:MVWDetach.Events[0].detail) | Should -Match ([regex]::Escape($script:detachLog))
         # the outcome was LOGGED, not just attempted (issue #352's demand)
         (@($global:MVWDetach.Log) -match 'child alive').Count | Should -Be 1
         # the drain's own output was relayed to the caller's log
         (@($global:MVWDetach.Log) -match '\[drain-detach\]').Count | Should -BeGreaterOrEqual 1
     }
 
+    It 'the drain runs in the WATCH home, not its own $env:USERPROFILE default (CR #377): both home params forwarded BY VALUE' {
+        # Distinct sentinel values: if the module ever drops -ClaudishHome or
+        # -LogPath from the invocation, the fixture's own EMPTY defaults see
+        # something else and it exits 9 — rc lands in the default branch, the
+        # event is an error, and this pin goes red. (The real drain resolves
+        # `$env:USERPROFILE\.claudish` when not told otherwise — under a
+        # SYSTEM task that is a different directory, and probe URL, freeze
+        # consent, drain.log and detach captures all follow it there.)
+        $drain = Join-Path $script:detachFixDir 'fixture-drain.ps1'
+        $rc = Invoke-DrainDetachedRestart -DrainScript $drain `
+            -Reason $script:prodReason `
+            -ClaudishHome $script:detachHome `
+            -LogPath $script:detachLog `
+            -Log { param($m) $global:MVWDetach.Log += $m } `
+            -WriteEvent { param($k, $f, $d) $global:MVWDetach.Events += (@{ kind = $k; family = $f; detail = $d }) }
+        $rc | Should -Be 0
+        ($global:MVWDetach.Events[0].kind) | Should -Be 'info'
+        (@($global:MVWDetach.Log) -match 'not forwarded').Count | Should -Be 0
+        (@($global:MVWDetach.Log) -match 'unexpected exit code').Count | Should -Be 0
+    }
+
     It 'exit 3 (launch failed) -> ERROR event naming the failure and that a relaunch is safe' {
         $drain = Join-Path $script:detachFixDir 'fixture-drain-exit3.ps1'
         $rc = Invoke-DrainDetachedRestart -DrainScript $drain `
-            -Reason 'model-version-watch minor repin (old id retired)' `
+            -Reason $script:prodReason `
+            -ClaudishHome $script:detachHome `
+            -LogPath $script:detachLog `
             -Log { param($m) $global:MVWDetach.Log += $m } `
             -WriteEvent { param($k, $f, $d) $global:MVWDetach.Events += (@{ kind = $k; family = $f; detail = $d }) }
         $rc | Should -Be 3
@@ -638,7 +684,9 @@ exit 4
     It 'exit 4 (mute child) -> ERROR event forbidding a relaunch' {
         $drain = Join-Path $script:detachFixDir 'fixture-drain-exit4.ps1'
         $rc = Invoke-DrainDetachedRestart -DrainScript $drain `
-            -Reason 'model-version-watch minor repin (old id retired)' `
+            -Reason $script:prodReason `
+            -ClaudishHome $script:detachHome `
+            -LogPath $script:detachLog `
             -Log { param($m) $global:MVWDetach.Log += $m } `
             -WriteEvent { param($k, $f, $d) $global:MVWDetach.Events += (@{ kind = $k; family = $f; detail = $d }) }
         $rc | Should -Be 4
@@ -647,11 +695,15 @@ exit 4
         (@($global:MVWDetach.Log) -match 'MUTE').Count | Should -Be 1
     }
 
-    It 'runner wiring: the inline unquoted Start-Process launch is GONE, -Detach invoked through the module function' {
+    It 'runner wiring: the inline unquoted Start-Process launch is GONE, -Detach invoked through the module function WITH both home params' {
         $text = Get-Content -LiteralPath $script:RunnerPath -Raw
         $text | Should -Not -Match 'Start-Process powershell'
         $text | Should -Match 'Invoke-DrainDetachedRestart -DrainScript \$DrainScript'
         # no bare -Reason array element left behind by the old call
         $text | Should -Not -Match "'-Reason', 'model-version-watch minor repin \(old id retired\)'"
+        # the runner forwards its OWN $ClaudishHome and derives LogPath from
+        # it — never lets the drain fall back to $env:USERPROFILE (CR #377)
+        $text | Should -Match '-ClaudishHome \$ClaudishHome'
+        $text | Should -Match '-LogPath \(Join-Path \$ClaudishHome ''drain\.log''\)'
     }
 }
