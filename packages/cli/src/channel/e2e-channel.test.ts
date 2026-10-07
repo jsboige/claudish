@@ -14,6 +14,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { envDescribe } from "../test-support/env-gate";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { spawn } from "node:child_process";
@@ -359,14 +360,39 @@ try {
   claudeAvailable = code === 0;
 } catch {}
 
-describe("Group 2: Real Claude Code — MCP tool discovery", () => {
-  test.skipIf(!claudeAvailable)(
+// Opt-in budget gate (#175 arbitration 06/10): these tests spawn a REAL
+// `claude -p` — a full model call on the machine's endpoint — on every
+// `bun test` / `test:strict` run that leaves them ungated. Default OFF;
+// CLAUDISH_E2E_REAL_CC=1 opts in. (Cause of the hermetic-protocol red,
+// measured 07/10: `Not logged in · Please run /login` on stdout — auth fails
+// before any model call under a fake HOME; with a real logged-in HOME these
+// tests would spend budget on every run.)
+const realCcOptIn = process.env.CLAUDISH_E2E_REAL_CC === "1";
+
+envDescribe({
+  id: "real-cc-e2e",
+  active: realCcOptIn && claudeAvailable,
+  reason: realCcOptIn
+    ? "binaire `claude` introuvable sur PATH"
+    : "appel modèle réel — opt-in budget : chaque exécution lance un `claude -p` complet sur l'endpoint de la machine sans demande de l'opérateur",
+  activation: realCcOptIn
+    ? "installer le binaire `claude` sur PATH"
+    : "CLAUDISH_E2E_REAL_CC=1 (avec le binaire `claude` sur PATH et un HOME authentifié)",
+}, "Group 2: Real Claude Code — MCP tool discovery")((test) => {
+  test(
     "claude discovers claudish MCP tools and can call list_models",
     async () => {
       const { stdout, stderr, exitCode } = await runClaudeWithMcp(
         "Use the list_models tool from the claudish MCP server and show me the results. Just call the tool and output the result, nothing else.",
         { timeout: 90_000 }
       );
+
+      // Diagnostic surface (#175): the helper already returns stderr — print it
+      // when the call fails, or the expect below shows only "Expected 0,
+      // Received 1" and the cause (auth / endpoint / MCP / model) stays hidden.
+      if (exitCode !== 0) {
+        console.error(`[RealCC:1] exitCode=${exitCode} stdout=${stdout.slice(0, 1200)} stderr=${stderr.slice(0, 2000)}`);
+      }
 
       // Claude should have called list_models and included model data in output
       expect(exitCode).toBe(0);
@@ -381,14 +407,17 @@ describe("Group 2: Real Claude Code — MCP tool discovery", () => {
     120_000
   );
 
-  test.skipIf(!claudeAvailable)(
+  test(
     "claude discovers channel tools (create_session, list_sessions)",
     async () => {
-      const { stdout, exitCode } = await runClaudeWithMcp(
+      const { stdout, stderr, exitCode } = await runClaudeWithMcp(
         "Call the list_sessions tool from the claudish MCP server with include_completed=true. Output the raw JSON result.",
         { timeout: 90_000 }
       );
 
+      if (exitCode !== 0) {
+        console.error(`[RealCC:2] exitCode=${exitCode} stdout=${stdout.slice(0, 1200)} stderr=${stderr.slice(0, 2000)}`);
+      }
       expect(exitCode).toBe(0);
       expect(stdout.length).toBeGreaterThan(0);
       // Claude should have called list_sessions and shown the result
@@ -399,7 +428,7 @@ describe("Group 2: Real Claude Code — MCP tool discovery", () => {
 
   const hasOpenRouterKey = !!process.env.OPENROUTER_API_KEY;
 
-  test.skipIf(!claudeAvailable || !hasOpenRouterKey)(
+  test.skipIf(!hasOpenRouterKey)(
     "claude creates a session via create_session tool",
     async () => {
       const { stdout, stderr, exitCode } = await runClaudeWithMcp(
@@ -407,6 +436,9 @@ describe("Group 2: Real Claude Code — MCP tool discovery", () => {
         { timeout: 120_000 }
       );
 
+      if (exitCode !== 0) {
+        console.error(`[RealCC:3] exitCode=${exitCode} stderr=${stderr.slice(0, 2000)}`);
+      }
       expect(exitCode).toBe(0);
       expect(stdout.length).toBeGreaterThan(0);
       // Claude should have created a session and shown the session_id

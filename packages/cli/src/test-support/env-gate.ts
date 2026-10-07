@@ -73,19 +73,38 @@ export function envDescribe(cls: EnvGateClass, label = "") {
 
   return (fn: (test: typeof bunTest) => void) => {
     host(label ? `[env:${cls.id}] ${label}` : `[env:${cls.id}]`, () => {
-      const scoped = ((name: string, fn?: any, timeout?: number) => {
-        entry.testNames.push(name);
-        if (!cls.active && strict && !allow.includes(cls.id)) {
-          // Loud by failing — the manifest explains the rest.
-          return bunTest(name, () => {
-            expect.unreachable(
-              `[env-gate:${cls.id}] prerequisite absent on this machine — ${cls.reason} (activation: ${cls.activation}). ` +
-                `Allow explicitly via CLAUDISH_TEST_ENV_ALLOW=${cls.id} or run on a machine that meets the condition.`
-            );
-          }, timeout);
-        }
-        return bunTest(name, fn, timeout);
-      }) as typeof bunTest;
+      // Loud by failing — the manifest explains the rest. Shared by scoped()
+      // and scoped.skipIf(): under strict mode EVERY registered test of an
+      // inactive class fails, whatever its own skip condition.
+      const strictFail = () => () => {
+        expect.unreachable(
+          `[env-gate:${cls.id}] prerequisite absent on this machine — ${cls.reason} (activation: ${cls.activation}). ` +
+            `Allow explicitly via CLAUDISH_TEST_ENV_ALLOW=${cls.id} or run on a machine that meets the condition.`
+        );
+      };
+      const scoped = Object.assign(
+        (name: string, fn?: any, timeout?: number) => {
+          entry.testNames.push(name);
+          if (!cls.active && strict && !allow.includes(cls.id)) {
+            return bunTest(name, strictFail(), timeout);
+          }
+          return bunTest(name, fn, timeout);
+        },
+        {
+          // scoped.skipIf(cond) keeps bun's named-skip semantics for a test
+          // that carries its OWN condition (e.g. a missing API key) inside a
+          // gated class — but the name still registers, so a gated class's
+          // manifest counts every test it owns: no test disappears unnamed
+          // (#175 Group 2 test 3, OPENROUTER_API_KEY-guarded).
+          skipIf: (cond: boolean) => (name: string, fn?: any, timeout?: number) => {
+            entry.testNames.push(name);
+            if (!cls.active && strict && !allow.includes(cls.id)) {
+              return bunTest(name, strictFail(), timeout);
+            }
+            return bunTest.skipIf(cond)(name, fn, timeout);
+          },
+        },
+      ) as typeof bunTest;
       fn(scoped);
     });
   };
