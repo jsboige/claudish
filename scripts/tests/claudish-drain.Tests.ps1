@@ -476,42 +476,143 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
     # declared there is gone by the time an It runs (engine.Tests documents the
     # same trap).
     BeforeAll {
+        # #351 — the fixture used to bind a FIXED port (19937) and treat "any
+        # 200 on /health" as readiness. Two consequences: a listener could
+        # outlive its job (measured after a #344 review run — 19937 still
+        # served a healthy body after Stop-Job/Remove-Job), and that stale
+        # server then satisfied the NEXT fixture's readiness probe, so a
+        # NO-CONSENT case read the PREVIOUS run's admissionFreeze body. Three
+        # structural answers, none of which has to trust Stop-Job's timing:
+        #   1. an EPHEMERAL port per fixture — two fixtures cannot collide;
+        #   2. a per-instance NONCE echoed in every /health body, awaited by
+        #      the readiness probe — a foreign 200 can never pass for ours;
+        #   3. a COOPERATIVE stop through the listener ITSELF: the job blocks
+        #      in GetContext — measured, the Begin/End variant NEVER serves in
+        #      PowerShell (the async wait times out under 5.1 AND 7.x while
+        #      the socket never answers) — so the stop is one more request the
+        #      job answers (`/__stop`), after which ITS OWN finally runs
+        #      ($l.Stop()/$l.Close()) and frees the socket; the teardown then
+        #      ASSERTS the port is free before returning.
+        function Get-FreeLoopbackPort {
+            # Bind :0, read the assignment, release — the standard way to get a
+            # port nobody holds at this instant.
+            $probe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+            $probe.Start()
+            $port = ([System.Net.IPEndPoint]$probe.LocalEndpoint).Port
+            $probe.Stop()
+            return $port
+        }
+
+        function Wait-FakeProxyHealth {
+            # Readiness that proves it reached ITS OWN server: a 200 is not
+            # enough, the body must echo this instance's nonce (#351).
+            param([string]$Url, [string]$Nonce, [int]$TimeoutSec = 10)
+            $deadline = (Get-Date).AddSeconds($TimeoutSec)
+            while ((Get-Date) -lt $deadline) {
+                try {
+                    $resp = Invoke-WebRequest -Uri "$Url/health" -TimeoutSec 2 -UseBasicParsing
+                    # The nonce is guid 'N' format (hex only) — no regex escaping.
+                    if ("$($resp.Content)" -match $Nonce) { return $true }
+                } catch { }
+                Start-Sleep -Milliseconds 200
+            }
+            throw "fake proxy /health on $Url did not answer with nonce $Nonce within ${TimeoutSec}s (#351)"
+        }
+
+        function Assert-PortClosed {
+            # The next fixture's whole problem is this port being free; check
+            # that exact condition instead of trusting the teardown sequence.
+            param([int]$Port, [int]$TimeoutSec = 5)
+            $deadline = (Get-Date).AddSeconds($TimeoutSec)
+            while ((Get-Date) -lt $deadline) {
+                $open = $false
+                try {
+                    $t = [System.Net.Sockets.TcpClient]::new()
+                    $t.Connect('127.0.0.1', $Port)
+                    $t.Close()
+                    $open = $true
+                } catch { $open = $false }
+                if (-not $open) { return }
+                Start-Sleep -Milliseconds 200
+            }
+            throw "port $Port still answers ${TimeoutSec}s after fixture teardown — the next fixture would read a stale server (#351)"
+        }
+
         function New-FakeProxyHealth {
             # AdmissionFreeze 'omit' serves the /health of a PRE-#306 image:
             # JSON answers, but no admissionFreeze field at all — the shape the
             # first freeze-capable -Recreate probes on every machine (review D3).
             param([string]$AdmissionFreeze)
-            $job = Start-Job -ScriptBlock {
-                param($state)
-                $l = [System.Net.HttpListener]::new()
-                $l.Prefixes.Add('http://127.0.0.1:19937/')
-                $l.Start()
-                try {
-                    while ($l.IsListening) {
-                        $ctx = $l.GetContext()
-                        $body = if ($state -eq 'omit') { '{"status":"ok","activeStreams":0}' } else { ('{"status":"ok","activeStreams":0,"admissionFreeze":"' + $state + '"}') }
-                        $buf = [System.Text.Encoding]::UTF8.GetBytes($body)
-                        $ctx.Response.ContentType = 'application/json'
-                        $ctx.Response.ContentLength64 = $buf.Length
-                        $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
-                        $ctx.Response.Close()
+            # The discovered port can be taken between release and the job's
+            # bind (a small race, and this machine runs other lanes' monitors):
+            # retry with a fresh port rather than reporting an environment race
+            # as a suite failure. The nonce probe is what makes each retry safe
+            # — a stale or foreign listener can never answer OUR nonce.
+            $attempts = 3
+            for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+                $port = Get-FreeLoopbackPort
+                $nonce = [guid]::NewGuid().ToString('N')
+                $url = "http://127.0.0.1:$port"
+                $job = Start-Job -ScriptBlock {
+                    param($state, $port, $nonce)
+                    $l = [System.Net.HttpListener]::new()
+                    $l.Prefixes.Add("http://127.0.0.1:$port/")
+                    try {
+                        $l.Start()
+                    } catch {
+                        Write-Output ("BIND-ERR: " + $_.Exception.Message)
+                        return
                     }
-                } catch { } finally { try { $l.Stop() } catch { } }
-            } -ArgumentList $AdmissionFreeze
-            # Wait for the listener to bind (job startup races the drain's first poll).
-            $deadline = (Get-Date).AddSeconds(10)
-            while ((Get-Date) -lt $deadline) {
+                    try {
+                        while ($true) {
+                            # Blocking GetContext on purpose: the Begin/End form
+                            # never serves here (measured under 5.1 and 7.x).
+                            $ctx = $l.GetContext()
+                            $isStop = ($ctx.Request.Url.AbsolutePath -eq '/__stop')
+                            $body = if ($isStop) {
+                                '{"stopping":true}'
+                            } elseif ($state -eq 'omit') {
+                                '{"status":"ok","activeStreams":0,"nonce":"' + $nonce + '"}'
+                            } else {
+                                '{"status":"ok","activeStreams":0,"admissionFreeze":"' + $state + '","nonce":"' + $nonce + '"}'
+                            }
+                            $buf = [System.Text.Encoding]::UTF8.GetBytes($body)
+                            $ctx.Response.ContentType = 'application/json'
+                            $ctx.Response.ContentLength64 = $buf.Length
+                            $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
+                            $ctx.Response.Close()
+                            if ($isStop) { break }
+                        }
+                    } catch { } finally { try { $l.Stop(); $l.Close() } catch { } }
+                } -ArgumentList $AdmissionFreeze, $port, $nonce
                 try {
-                    $null = Invoke-WebRequest -Uri 'http://127.0.0.1:19937/health' -TimeoutSec 2 -UseBasicParsing
-                    return $job
-                } catch { Start-Sleep -Milliseconds 200 }
+                    $null = Wait-FakeProxyHealth -Url $url -Nonce $nonce -TimeoutSec 10
+                    return [pscustomobject]@{ Job = $job; Port = $port; Url = $url; Nonce = $nonce }
+                } catch {
+                    # Carry the job's own verdict into the failure: "no nonce"
+                    # alone cannot distinguish a taken port from a dead job.
+                    $jobSaid = @(Receive-Job -Job $job -ErrorAction SilentlyContinue 2>&1) -join ' | '
+                    $state = $job.State
+                    Stop-Job -Job $job -ErrorAction SilentlyContinue
+                    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                    if ($attempt -eq $attempts) {
+                        throw "fake proxy /health on port $port did not answer with its nonce after $attempts attempts (job state=$state; job said: $jobSaid) (#351)"
+                    }
+                }
             }
-            throw 'fake proxy /health did not come up within 10s'
         }
 
-        function Remove-FakeProxyHealth($job) {
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
-            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        function Remove-FakeProxyHealth($fake) {
+            # Cooperative stop FIRST, through the listener itself: the job
+            # answers /__stop, breaks out and runs its own finally. Stop-Job is
+            # only the belt for a job that ignored it — never the primary
+            # mechanism (#344 review measured Stop-Job returning while the
+            # listener still answered).
+            try { $null = Invoke-WebRequest -Uri "$($fake.Url)/__stop" -TimeoutSec 3 -UseBasicParsing } catch { }
+            $null = Wait-Job -Job $fake.Job -Timeout 5
+            Stop-Job -Job $fake.Job -ErrorAction SilentlyContinue
+            Remove-Job -Job $fake.Job -Force -ErrorAction SilentlyContinue
+            Assert-PortClosed -Port $fake.Port
         }
     }
 
@@ -521,15 +622,15 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
         $freezeHome = Join-Path $TestDrive 'freeze-home'
         New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
         [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
-        $job = New-FakeProxyHealth -AdmissionFreeze 'flag'
+        $fake = New-FakeProxyHealth -AdmissionFreeze 'flag'
         try {
-            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-ok' -Url 'http://127.0.0.1:19937' -FreezeClaudishHome $freezeHome
+            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-ok' -Url $fake.Url -FreezeClaudishHome $freezeHome
             $r | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
             $log = Get-DrainLogText
             $log | Should -Match 'FREEZE armed — proxy confirms'
             $log | Should -Match 'FREEZE \(freeze-ok\): admissions frozen .+ — flag cleared'
-        } finally { Remove-FakeProxyHealth $job }
+        } finally { Remove-FakeProxyHealth $fake }
     }
 
     It 'with consent but proxy reports NO-CONSENT (mount mismatch): NOT HONORED, no window line, gesture proceeds' {
@@ -538,9 +639,9 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
         $freezeHome = Join-Path $TestDrive 'mismatch-home'
         New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
         [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
-        $job = New-FakeProxyHealth -AdmissionFreeze 'no-consent'
+        $fake = New-FakeProxyHealth -AdmissionFreeze 'no-consent'
         try {
-            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-mismatch' -Url 'http://127.0.0.1:19937' -FreezeClaudishHome $freezeHome
+            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-mismatch' -Url $fake.Url -FreezeClaudishHome $freezeHome
             $r | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
             $log = Get-DrainLogText
@@ -549,7 +650,7 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
             # the exact false-attestation the review rejected.
             $log | Should -Not -Match 'admissions frozen'
             $log | Should -Match 'OUTCOME success'
-        } finally { Remove-FakeProxyHealth $job }
+        } finally { Remove-FakeProxyHealth $fake }
     }
 
     It 'with consent but NO proxy answering (dead URL): NOT HONORED (no-signal), no window line' {
@@ -573,14 +674,14 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
         $freezeHome = Join-Path $TestDrive 'absent-home'
         New-Item -ItemType Directory -Path $freezeHome -Force | Out-Null
         [System.IO.File]::WriteAllText((Join-Path $freezeHome 'drain-freeze.enabled'), 'enabled', (New-Object System.Text.UTF8Encoding($false)))
-        $job = New-FakeProxyHealth -AdmissionFreeze 'omit'
+        $fake = New-FakeProxyHealth -AdmissionFreeze 'omit'
         try {
             # The shape every machine meets exactly once: the -Recreate that
             # deploys #306 probes the container it is about to replace —
             # pre-#306 by definition, so /health answers WITHOUT the field.
             # Reading that absence as "flag" (mutation D3) would re-arm the
             # false attestation on the very first run an operator reads.
-            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-absent' -Url 'http://127.0.0.1:19937' -FreezeClaudishHome $freezeHome
+            $r = Invoke-ClaudishDrainedRestart -Reason 'freeze-absent' -Url $fake.Url -FreezeClaudishHome $freezeHome
             $r | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $freezeHome 'drain-freeze') | Should -BeFalse
             $log = Get-DrainLogText
@@ -588,7 +689,55 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
             $log | Should -Not -Match 'FREEZE armed'
             $log | Should -Not -Match 'admissions frozen'
             $log | Should -Match 'OUTCOME success'
-        } finally { Remove-FakeProxyHealth $job }
+        } finally { Remove-FakeProxyHealth $fake }
+    }
+
+    It '#351: teardown ASSERTS the port is free — a still-open port makes it throw (mutation target: drop Assert-PortClosed)' {
+        # Poisoned on purpose: a rogue listener holds the port, so the
+        # teardown's contract is violated. Without Assert-PortClosed the
+        # function returns silently and the next fixture would read the rogue
+        # server — the exact #351 mechanism, caught here instead of one suite
+        # run later.
+        $rogue = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $rogue.Start()
+        $port = ([System.Net.IPEndPoint]$rogue.LocalEndpoint).Port
+        $dead = Start-Job -ScriptBlock { }
+        $null = Wait-Job -Job $dead -Timeout 5
+        try {
+            $poisoned = [pscustomobject]@{ Job = $dead; Port = $port; Url = "http://127.0.0.1:$port" }
+            { Remove-FakeProxyHealth $poisoned } | Should -Throw '*still answers*'
+        } finally {
+            $rogue.Stop()
+            Remove-Job -Job $dead -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It '#351: readiness refuses a foreign server answering 200 without OUR nonce (mutation target: drop the nonce check)' {
+        # The foreign server answers 200 on /health with a proxy-shaped body
+        # carrying someone else's nonce. The pre-#351 probe ("any 200 is up")
+        # accepted it — which is how a NO-CONSENT case read the PREVIOUS
+        # fixture's admissionFreeze body.
+        $port = Get-FreeLoopbackPort
+        $rogue = Start-Job -ScriptBlock {
+            param($port)
+            $l = [System.Net.HttpListener]::new()
+            $l.Prefixes.Add("http://127.0.0.1:$port/")
+            $l.Start()
+            try {
+                $ctx = $l.GetContext()
+                $buf = [System.Text.Encoding]::UTF8.GetBytes('{"status":"ok","activeStreams":0,"nonce":"someone-elses"}')
+                $ctx.Response.ContentType = 'application/json'
+                $ctx.Response.ContentLength64 = $buf.Length
+                $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
+                $ctx.Response.Close()
+            } catch { } finally { try { $l.Stop(); $l.Close() } catch { } }
+        } -ArgumentList $port
+        try {
+            { Wait-FakeProxyHealth -Url "http://127.0.0.1:$port" -Nonce 'my-own-nonce' -TimeoutSec 2 } | Should -Throw '*did not answer with nonce*'
+        } finally {
+            Stop-Job -Job $rogue -ErrorAction SilentlyContinue
+            Remove-Job -Job $rogue -Force -ErrorAction SilentlyContinue
+        }
     }
 
     It 'without consent (the default everywhere): no flag, no FREEZE line, restart unaffected' {
