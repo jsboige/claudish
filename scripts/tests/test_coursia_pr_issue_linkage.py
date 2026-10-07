@@ -287,6 +287,21 @@ def test_sweep_split_empty():
     assert cpl.sweep_split([]) == (0, 0, 0)
 
 
+def test_sweep_split_boundary_at_exactly_eight():
+    """CR #366 follow-up: the frontier is >= 8 — 7 closures in one minute is
+    organic, exactly 8 is a sweep. An off-by-one here silently re-labels every
+    'issues closed' line the daily series prints (8+9 were pinned above the
+    line; the line itself was not)."""
+    def minute(n, ts):
+        return [{"closedAt": ts, "stateReason": "completed"} for _ in range(n)]
+    assert cpl.sweep_split(minute(7, "2026-08-14T10:00:00Z")) == (7, 7, 0), \
+        "7 in one minute is organic per-grain closing"
+    assert cpl.sweep_split(minute(8, "2026-08-14T10:00:00Z")) == (8, 0, 8), \
+        "exactly 8 in one minute IS the bulk sweep"
+    assert cpl.sweep_split(minute(8, "2026-08-14T10:00:00Z") +
+                           minute(3, "2026-08-14T11:30:00Z")) == (11, 3, 8)
+
+
 def _daily_page(prs, issue_count=None):
     return {"search": {"issueCount": issue_count if issue_count is not None else len(prs),
                        "pageInfo": {"endCursor": None, "hasNextPage": False},
@@ -386,6 +401,26 @@ def test_daily_series_issues_line_prints_at_zero_prs():
     assert rc == 0, rc
     line = [l for l in out.splitlines() if l.startswith("   2026-08-02  issues closed")]
     assert line and "2" in line[0], out  # 0 PRs that day, the issues row still renders
+
+
+def test_daily_series_issues_line_pins_the_sweep_split():
+    """CR #366 follow-up: the DAILY line must render the split it computed —
+    total, hors-balayage and balayage each named — so a regression in
+    sweep_split (or in the rendering) cannot pass as 'the line printed'.
+    Day 08-02 holds a bulk minute of exactly 8 plus 2 organic closures."""
+    issues = {"2026-08-01": [],
+              "2026-08-02": [{"closedAt": "2026-08-02T10:00:%02dZ" % s, "stateReason": "completed"}
+                             for s in range(8)] +
+                             [{"closedAt": "2026-08-02T11:20:00Z", "stateReason": "completed"},
+                              {"closedAt": "2026-08-02T11:45:00Z", "stateReason": "completed"}]}
+    rc, out = _run_series(_series_fetch(_SERIES_DAYS, issues, _SERIES_TYPES))
+    assert rc == 0, rc
+    line = [l for l in out.splitlines() if l.startswith("   2026-08-02  issues closed")]
+    assert line, out
+    assert line[0].strip() == "2026-08-02  issues closed 10 (hors-balayage 2 · balayage 8)", line[0]
+    organic = [l for l in out.splitlines() if l.startswith("   2026-08-01  issues closed")]
+    assert organic, out
+    assert organic[0].strip() == "2026-08-01  issues closed 0 (hors-balayage 0 · balayage 0)", organic[0]
 
 
 def test_daily_series_exit_1_on_pr_cap():
