@@ -41,7 +41,10 @@ BeforeAll {
 
     # Files that deliberately use pwsh-7-only syntax. Interactive analysis
     # tools only — never a scheduled task. Kept honest by a test below.
-    $script:Pwsh7OnlyScripts = @('CaptureUtils.psm1')
+    # EMPTY since #72 g2 removed CaptureUtils.psm1's `??` sites — the module
+    # now parses under 5.1 and is asserted under BOTH interpreters below. The
+    # list stays as the mechanism for any future pwsh-7-only interactive tool.
+    $script:Pwsh7OnlyScripts = @()
 }
 
 Describe 'Get-ClaudishMachineName (#345: probes must not arrive header-less)' {
@@ -943,12 +946,12 @@ Describe 'Static guardrails over scripts/' {
     }
 
     It 'every other script in scripts/ parses, except the documented pwsh-7-only ones' {
-        # CaptureUtils.psm1 uses `??` deliberately and its consumers are
-        # documented as requiring pwsh ("traffic-anthropic.ps1 exige pwsh").
-        # That is a supported choice for an interactive analysis tool, and a
-        # different thing from an unattended scheduled task. The exclusion is
-        # scoped to 5.1 only, so under pwsh 7 these files are still asserted —
-        # an exclusion that hides a file from every interpreter hides a defect.
+        # The pwsh-7-only list is EMPTY since #72 g2 (CaptureUtils.psm1's `??`
+        # sites removed — the module parses under both interpreters). It stays
+        # as the mechanism for a future interactive tool that genuinely needs
+        # PS7 syntax, which is a supported choice — and a different thing from
+        # an unattended scheduled task. The exclusion remains scoped to 5.1
+        # only, so under pwsh 7 no file can ever hide from the assertion.
         $skip = if ($PSVersionTable.PSVersion.Major -lt 7) { $script:Pwsh7OnlyScripts } else { @() }
         $errors = @()
         Get-ChildItem -Path $script:ScriptsRoot -Filter '*.ps*1' -Recurse -File |
