@@ -435,6 +435,57 @@ def test_active_only_p50_differs_from_all_windows_p50():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ── self-check bias: numbered views of the lane's OWN fresh PR (#328 G3) ────
+
+def test_selfcheck_bias_isolated():
+    """The bias is measured, not assumed to cancel: a numbered view right
+    after the window's `gh pr create` END is a self-check of the lane's own
+    PR and is excluded from the `pure` class; a numbered view LATE in a
+    pr-create window, or after a dashboard END (the built-in control —
+    nothing was created there), stays a named pick."""
+    lines = [
+        # window A: pr-create END, numbered view +2min → SELF-CHECK
+        _bash("2026-07-01T10:00:00.000Z", "gh pr create -f"),
+        _bash("2026-07-01T10:02:00.000Z", "gh pr view 5 --json state"),
+        _dash("2026-07-01T10:30:00.000Z", "append", "[CLAIMED] #5"),
+        # window B: pr-create END, numbered view +25min (near START) → PICK
+        _bash("2026-07-01T11:00:00.000Z", "gh pr create -f"),
+        _bash("2026-07-01T11:25:00.000Z", "gh issue view 7"),
+        _dash("2026-07-01T11:30:00.000Z", "append", "[CLAIMED] #7"),
+        # window C (control): dashboard END, numbered view +10min → PICK
+        _dash("2026-07-01T12:00:00.000Z", "append", "[DONE] grain C"),
+        _bash("2026-07-01T12:10:00.000Z", "gh pr view 9"),
+        _dash("2026-07-01T12:30:00.000Z", "append", "[CLAIMED] #9"),
+    ]
+    ev = _scan(lines)
+    w, _ = cpf.windows(cpf.cluster(ev, 60), ev)
+    _check(len(w) == 3, f"expected 3 windows, got {len(w)}: {w}")
+    a, b, c = w
+    _check(a[6] == "named" and a[8] == "scan",
+           f"A raw named → pure scan (selfcheck excluded): {a[6]}/{a[8]}")
+    _check(a[9] == (1, 1), f"A: 1 numbered view, 1 selfcheck: {a[9]}")
+    _check(b[6] == "named" and b[8] == "named",
+           f"B: late view stays a pick: {b[6]}/{b[8]}")
+    _check(b[9] == (1, 0), f"B: 1 numbered, 0 selfcheck: {b[9]}")
+    _check(c[6] == "named" and c[8] == "named",
+           f"C control: dashboard-END numbered is a pick: {c[6]}/{c[8]}")
+    _check(c[9] == (1, 0), f"C: never selfcheck after a dashboard END: {c[9]}")
+
+
+def test_selfcheck_only_window_is_pure_scan():
+    """A window whose ONLY picker call is a self-check keeps total>0 (the call
+    happened — not `direct`) but no named target: pure class is scan."""
+    lines = [
+        _bash("2026-07-01T10:00:00.000Z", "gh pr create -f"),
+        _bash("2026-07-01T10:01:00.000Z", "gh pr view 12"),
+        _dash("2026-07-01T10:20:00.000Z", "append", "[CLAIMED] #12"),
+    ]
+    ev = _scan(lines)
+    w, _ = cpf.windows(cpf.cluster(ev, 60), ev)
+    _check(len(w) == 1 and w[0][6] == "named" and w[0][8] == "scan",
+           f"selfcheck-only window: raw named, pure scan: {w}")
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 
 def main():
