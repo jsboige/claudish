@@ -39,6 +39,14 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\model-version-watch.ps1
 # Optional: -DryRun (print decisions, write nothing) · -ConfigPath · -ClaudishHome
 #
+# Task account: non-elevated jsboi (InteractiveToken / Limited) — the armed
+# ClaudishModelVersionWatch task. The drained restart it launches targets the
+# HUB by default: the drain resolves container claudish-proxy and probe URL
+# localhost:3000 from -ClaudishHome. This watch is hub-only today (its config
+# and env paths live under D:\claudish-shadow); on a SIDECAR those drain
+# defaults point at the wrong container (#372) — pass the drain explicit
+# -ContainerName/-ProxyUrl before ever copying this there.
+#
 # Targets PowerShell 5.1.
 
 param(
@@ -355,9 +363,23 @@ if (-not $DryRun -and $restartNow) {
         Write-VersionEvent -EventsPath $eventsPath -Kind error -Family reload `
             -Detail "restart-now decided ($($restartWhy -join '; ')) but drain script absent — routing repinned, hub still on old id"
     } else {
-        & $logTs "launching detached drained restart (reload mode: $($restartWhy -join '; '))"
-        Start-Process powershell -WindowStyle Hidden -ArgumentList `
-            '-ExecutionPolicy', 'Bypass', '-File', $DrainScript, '-Reason', 'model-version-watch minor repin (old id retired)'
+        # Through the drain's OWN -Detach path (#352): the previous inline
+        # Start-Process passed -Reason unquoted in -ArgumentList, the child
+        # died at parameter binding, and the log still said "launching" —
+        # the restart never happened. -Detach quotes every forwarded argument
+        # itself and hands back a countable exit code; the OUTCOME is logged
+        # and evented, never just the attempt. -ClaudishHome/-LogPath are
+        # forwarded EXPLICITLY (CR #377): the drain otherwise resolves its
+        # home from $env:USERPROFILE, which under this task's account is a
+        # different directory — the probe URL, the freeze consent, drain.log
+        # and the detach captures would all land where nobody reads them.
+        $null = Invoke-DrainDetachedRestart -DrainScript $DrainScript `
+            -Reason ("model-version-watch minor repin (old id retired): " + ($restartWhy -join '; ')) `
+            -ClaudishHome $ClaudishHome `
+            -LogPath (Join-Path $ClaudishHome 'drain.log') `
+            -Log $logTs `
+            -WriteEvent { param($kind, $family, $detail)
+                Write-VersionEvent -EventsPath $eventsPath -Kind $kind -Family $family -Detail $detail }
     }
 }
 exit 0
