@@ -17,6 +17,8 @@
 import { mkdirSync, appendFileSync } from "fs";
 import { writeFile } from "fs/promises";
 
+import { respMarkerLine } from "./traffic-markers.js";
+
 // The resp-*.sse write is FIRE-AND-FORGET, for the same reason the request-side
 // capture is (commit 180f1cb, incident 2026-08-20): Bun is single-threaded, and
 // over a Docker bind-mount to a Windows dir one slow writeFileSync freezes EVERY
@@ -138,7 +140,7 @@ export function createResponseCapture(
         const stopReason = extra?.stop_reason ?? "?";
         const closed = extra?.closed ?? "?";
         process.stdout.write(
-          `  [resp] ${label} model=${model} reqN=${reqNumber} events~=${events} bytes=${sse.length} closed=${closed} stop=${stopReason} ${Date.now() - startedAt}ms -> ${file}\n`
+          respMarkerLine(label, model, reqNumber, events, sse.length, closed, stopReason, Date.now() - startedAt, file)
         );
         // Fire-and-forget: see the note at the top of this file.
         writeFile(file, header + sse).catch((e) => {

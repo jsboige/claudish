@@ -13,6 +13,7 @@ import type { Context } from "hono";
 import { log } from "../../../logger.js";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
 import { createResponseCapture } from "../response-capture.js";
+import { ttftMarkerLine } from "../traffic-markers.js";
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import { executeWebFetch } from "../web-search-executor.js";
 import {
@@ -687,10 +688,8 @@ export function createAnthropicPassthroughStream(
               // totals were logged, first-token timing never was).
               if (!ttftLogged && line.startsWith("data: ")) {
                 ttftLogged = true;
-                const firstEventMs = Math.round(performance.now() - tHeaders);
-                const hdr = opts.headerLatencyMs ?? -1;
                 process.stdout.write(
-                  `  [ttft] anthropic model=${opts.modelName} reqN=${reqN} headers=${hdr}ms firstEvent=${firstEventMs}ms total=${hdr >= 0 ? hdr + firstEventMs : -1}ms\n`
+                  ttftMarkerLine("anthropic", opts.modelName, reqN, opts.headerLatencyMs, Math.round(performance.now() - tHeaders))
                 );
               }
 
