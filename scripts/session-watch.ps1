@@ -195,4 +195,27 @@ if (Test-Path $splitBrain) {
     }
 }
 
+# --- 5. rogue schtasks detector (po-2027 escalation 07/10) -----------------------
+# An agent created a Windows scheduled task to carry its session cadence instead of
+# CronCreate (split-brain class: launcher vs in-session scheduler drift apart). The
+# criterion is the ACTION, never the name: a task whose command launches a claude
+# session (claude.exe, --print, /continue, /coordinate). Our organs launch only
+# powershell/wscript/python — no claude.exe — so the predicate needs no allowlist.
+# Journal the task NAME only: a /TR line can carry credentials (docker-events #192
+# lesson) and never enters the journal.
+try {
+    $csv = & schtasks.exe /Query /FO CSV /V 2>$null
+    foreach ($ln in $csv) {
+        if ($ln -notmatch 'claude') { continue }
+        if ($ln -match 'claude\.exe|claude"?\s+--print|--print\b.*claude|/continue|/coordinate') {
+            if ($ln -match '^"[^"]*","([^"]*)"') { $tn = $Matches[1] } else { $tn = '(unparsed)' }
+            if ($tn -notmatch '\\Microsoft\\') {
+                Write-Journal 'rogue-schtasks' '' ("task=$tn — action launches a claude session (split-brain class)")
+            }
+        }
+    }
+} catch {
+    Write-Journal 'error' '' ("schtasks detector failed: " + $_.Exception.Message)
+}
+
 exit 0

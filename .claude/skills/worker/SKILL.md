@@ -55,7 +55,11 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      `remote-openai` → INFO (machine propriétaire nommée dans `detail` — pas un geste
      local) ; `sonnet-majority`/`sol-minority`/`no-binding-*` → silence sauf volume
      anormal (agrégat /worker) ; `exempt` → **jamais relayé** (comptage /worker
-     seulement) ; `error`/`catalog-error` → WARN. Après relais, mettre à jour le
+     seulement) ; `rogue-schtasks` → **WARN** (tâche planifiée dont l'action lance
+     une session claude — classe split-brain, escalade po-2027 07/10 ; triage :
+     nom journalisé seul, vérifier l'action réelle avant tout geste, propriétaire
+     roo-extensions pour les launchers cachés) ; `error`/`catalog-error` → WARN.
+     Après relais, mettre à jour le
      watermark. **Ne JAMAIS tronquer le journal.** Consent kill = fichier
      `~/.claudish/session-watch.kill.enabled` — à n'armer qu'après ≥24 h de journal
      sain (classification conforme à la politique réconciliée), geste consigné
