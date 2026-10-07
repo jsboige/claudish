@@ -32,8 +32,18 @@ have shown ~300. The detectable signal is the sustained THROUGHPUT of
 marked requests per (machine, session): the 27/09 swarm ran 40→120 marked
 req/min for 8 h on one session (peak 15h), while interactive and cycle
 traffic stays under ~10/min bursts. Defaults: WARN at >=30 marked req/min
-sustained over >=10 min, or >=5000 marked reqs per session per day — an
-order of magnitude under the measured swarm, comfortably above the noise.
+averaged over a >=10-min sliding window, or >=5000 marked reqs per session
+over the WHOLE SCANNED WINDOW — an order of magnitude under the measured
+swarm, comfortably above the noise.
+
+Two semantics stated plainly (they were fuzzy names first):
+- the rate rule is an AVERAGE over the window, not "sustained every
+  minute": 300 marked reqs inside one 10-min window trip it even if a
+  1-min burst carried them. A good proxy for the 27/09 shape, not a
+  minute-level throttle measurement.
+- the second rule counts the TOTAL over the scanned window (--since ..
+  --until), NOT per calendar day: a session spread across several days of
+  concatenated extractions trips it once on the window total.
 
 --sample-factor scales measured rates when the input directory holds a
 sampled extraction (e.g. 150 for a 1-in-150 retrospective probe); it is
@@ -63,9 +73,9 @@ WORKLOAD_RE = lc.WORKLOAD_RE
 
 MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]*)"')
 
-DEFAULT_RATE = 30.0        # marked req/min, sustained
-DEFAULT_WINDOW_MIN = 10    # sustained for at least this long
-DEFAULT_DAILY = 5000       # marked reqs per session per day
+DEFAULT_RATE = 30.0          # marked req/min, averaged over the sliding window
+DEFAULT_WINDOW_MIN = 10      # sliding window length in minutes
+DEFAULT_WINDOW_TOTAL = 5000  # marked reqs per session over the WHOLE scanned window
 
 
 def parse_iso(s):
@@ -157,7 +167,7 @@ def peak_window_rate(ts_list, window_min):
 
 
 def verdicts(rows, stats, rate=DEFAULT_RATE, window_min=DEFAULT_WINDOW_MIN,
-             daily=DEFAULT_DAILY, sample_factor=1.0):
+             window_total=DEFAULT_WINDOW_TOTAL, sample_factor=1.0):
     """Group by (machine, session), apply the two WARN rules. `unknown`
     subagent state never counts toward a verdict — it is published in the
     digest so a silent header-parser regression stays visible. Marked reqs
@@ -180,13 +190,13 @@ def verdicts(rows, stats, rate=DEFAULT_RATE, window_min=DEFAULT_WINDOW_MIN,
         peak_n, peak_ts = peak_window_rate(ts_list, window_min)
         peak_rate = peak_n * sample_factor / window_min
         hit_rate = peak_rate >= rate
-        hit_daily = total >= daily
-        if not (hit_rate or hit_daily):
+        hit_total = total >= window_total
+        if not (hit_rate or hit_total):
             continue
         span = (ts_list[0], ts_list[-1])
         out.append({
             "machine": machine, "session": session,
-            "warn": "rate" if hit_rate else "daily",
+            "warn": "rate" if hit_rate else "window-total",
             "marked_total": int(total),
             "peak_rate_per_min": round(peak_rate, 1),
             "peak_window_start": peak_ts.isoformat() if peak_ts else None,
@@ -201,8 +211,9 @@ def verdicts(rows, stats, rate=DEFAULT_RATE, window_min=DEFAULT_WINDOW_MIN,
 
 def to_markdown(v_list, stats, args):
     lines = [f"**[WARN] swarm-signal — {len(v_list)} session(s) over threshold**",
-             f"dir: `{args.capture_dir}` · window: {args.window_min} min · "
-             f"rate ≥ {args.rate}/min · daily ≥ {args.daily}"]
+             f"dir: `{args.capture_dir}` · rate ≥ {args.rate}/min "
+             f"(**average over a {args.window_min}-min sliding window**) · "
+             f"window total ≥ {args.window_total} (whole scanned window, NOT per-day)"]
     if args.sample_factor != 1.0:
         lines.append(f"⚠ SAMPLED input — rates scaled ×{args.sample_factor:g} "
                      f"(extraction sample, not exhaustive counts)")
@@ -216,6 +227,9 @@ def to_markdown(v_list, stats, args):
     lines.append(f"\nscanned: {stats['files']} req (marked {stats['marked']}, "
                  f"main {stats['main']}, unknown {stats['unknown']}, "
                  f"unattributed {stats['unattributed']}"
+                 + (f", **unattributed_marked {stats['unattributed_marked']} "
+                    f"(marked traffic with no session key — never verdict-keyed)**"
+                    if stats.get("unattributed_marked") else "")
                  + (f", header-chunk-fallback {stats['billing_fallback']}" if stats['billing_fallback'] else "")
                  + ")")
     return "\n".join(lines)
@@ -228,11 +242,11 @@ def main(argv=None):
     p.add_argument("--since", help="ISO UTC, inclusive lower bound on file ts")
     p.add_argument("--until", help="ISO UTC, inclusive upper bound on file ts")
     p.add_argument("--rate", type=float, default=DEFAULT_RATE,
-                   help="WARN threshold, marked req/min sustained (default %(default)s)")
+                   help="WARN threshold, marked req/min averaged over the sliding window (default %(default)s)")
     p.add_argument("--window-min", type=int, default=DEFAULT_WINDOW_MIN,
-                   help="sustain window in minutes (default %(default)s)")
-    p.add_argument("--daily", type=int, default=DEFAULT_DAILY,
-                   help="WARN threshold, marked reqs per session per day (default %(default)s)")
+                   help="sliding window length in minutes (default %(default)s)")
+    p.add_argument("--window-total", type=int, default=DEFAULT_WINDOW_TOTAL,
+                   help="WARN threshold, marked reqs per session over the WHOLE scanned window, not per-day (default %(default)s)")
     p.add_argument("--sample-factor", type=float, default=1.0,
                    help="scale rates/totals when the dir holds a sampled extraction (e.g. 150)")
     p.add_argument("--json", action="store_true", help="emit JSON instead of markdown")
@@ -242,20 +256,22 @@ def main(argv=None):
                                      since=parse_iso(args.since),
                                      until=parse_iso(args.until))
     v = verdicts(rows, stats, rate=args.rate, window_min=args.window_min,
-                 daily=args.daily, sample_factor=args.sample_factor)
+                 window_total=args.window_total, sample_factor=args.sample_factor)
     if args.json:
         print(json.dumps({"verdicts": v, "stats": stats,
                           "params": {"rate": args.rate,
                                      "window_min": args.window_min,
-                                     "daily": args.daily,
+                                     "window_total": args.window_total,
                                      "sample_factor": args.sample_factor}},
                          indent=2))
     else:
         if v:
             print(to_markdown(v, stats, args))
         else:
+            extra = (f", unattributed_marked {stats['unattributed_marked']}"
+                     if stats.get("unattributed_marked") else "")
             print(f"swarm-signal: no session over threshold "
-                  f"(scanned {stats['files']} req, marked {stats['marked']})")
+                  f"(scanned {stats['files']} req, marked {stats['marked']}{extra})")
     return 0
 
 

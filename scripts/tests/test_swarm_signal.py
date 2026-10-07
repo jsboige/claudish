@@ -41,11 +41,16 @@ FAILS = []
 
 
 def check(name, cond, detail=""):
+    """RAISES on failure (#378 CR): a check that only appends to FAILS makes
+    the suite green under pytest whatever the code does — pytest collects
+    test_* functions and never runs main(), so FAILS is never read there.
+    Same fix as #333/#364."""
     if cond:
         print(f"  ok   {name}")
     else:
         FAILS.append(name)
         print(f"  FAIL {name}  {detail}")
+        raise AssertionError(f"{name}  {detail}")
 
 
 def envelope(session="sess-swarm-0001", machine="myia-ai-01",
@@ -99,7 +104,7 @@ def test_rate_warn():
         for i in range(12):
             write_req(d, i + 1, i * 45, envelope())
         rows, stats = collect(d)
-        v = ss.verdicts(rows, stats, rate=1.0, window_min=10, daily=5000)
+        v = ss.verdicts(rows, stats, rate=1.0, window_min=10, window_total=5000)
         check("marked scanned (positive control)", stats["marked"] == 12,
               f"marked={stats['marked']}")
         check("one verdict", len(v) == 1, str(len(v)))
@@ -118,7 +123,7 @@ def test_below_threshold():
         for i in range(12):
             write_req(d, i + 1, i * 1500, envelope())
         rows, stats = collect(d)
-        v = ss.verdicts(rows, stats, rate=1.0, window_min=10, daily=5000)
+        v = ss.verdicts(rows, stats, rate=1.0, window_min=10, window_total=5000)
         check("marked scanned (positive control)", stats["marked"] == 12,
               f"marked={stats['marked']}")
         check("no verdict", not v, str(v))
@@ -135,12 +140,12 @@ def test_three_states():
         env_unknown["body"]["system"] = [{"type": "text", "text": "plain system"}]
         write_req(d, 3, 20, env_unknown)                                # unknown
         rows, stats = collect(d)
-        v = ss.verdicts(rows, stats, rate=100.0, window_min=10, daily=1)
+        v = ss.verdicts(rows, stats, rate=100.0, window_min=10, window_total=1)
         check("states counted", (stats["marked"], stats["main"],
                                  stats["unknown"]) == (1, 1, 1),
               str(stats))
-        check("daily verdict on the single marked", len(v) == 1 and
-              v[0]["warn"] == "daily" and v[0]["marked_total"] == 1, str(v))
+        check("window-total verdict on the single marked", len(v) == 1 and
+              v[0]["warn"] == "window-total" and v[0]["marked_total"] == 1, str(v))
 
 
 def test_echo_trap():
@@ -164,15 +169,27 @@ def test_echo_trap():
 
 def test_unattributed():
     print("case: no user_id -> unattributed, scanned but never a verdict key")
+    import io
+    import contextlib
     with tempfile.TemporaryDirectory() as d:
         for i in range(5):
             write_req(d, i + 1, i * 60, envelope(with_user_id=False))
         rows, stats = collect(d)
-        v = ss.verdicts(rows, stats, rate=0.01, window_min=10, daily=1)
+        v = ss.verdicts(rows, stats, rate=0.01, window_min=10, window_total=1)
         check("unattributed counted", stats["unattributed"] == 5, str(stats))
         check("marked unattributed visible", stats.get("unattributed_marked") == 5,
               str(stats))
         check("no verdict on unattributed", not v, str(v))
+        # CR pin: the no-verdict line must SAY the marked traffic is
+        # unattributed — an SDK-shaped swarm with no user_id must not read
+        # as "all quiet" next to a large marked count.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ss.main(["--capture-dir", d])
+        out = buf.getvalue()
+        check("no-verdict line names unattributed_marked",
+              "no session over threshold" in out
+              and "unattributed_marked 5" in out, out)
 
 
 def test_sample_factor():
@@ -181,7 +198,7 @@ def test_sample_factor():
         for i in range(12):
             write_req(d, i + 1, i * 45, envelope())
         rows, stats = collect(d)
-        v = ss.verdicts(rows, stats, rate=100.0, window_min=10, daily=5000,
+        v = ss.verdicts(rows, stats, rate=100.0, window_min=10, window_total=5000,
                         sample_factor=150.0)
         check("scaled rate trips 100/min", len(v) == 1 and
               abs(v[0]["peak_rate_per_min"] - 180.0) < 0.5, str(v))
