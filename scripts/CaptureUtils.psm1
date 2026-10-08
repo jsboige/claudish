@@ -178,11 +178,13 @@ function Get-SessionIdFromMetadata {
     $uid = $Metadata.user_id
 
     # Try JSON format first
+    # (`??` is PS7-only — these four sites were the module's whole 5.1 parse
+    # blocker, measured by the win51 runner on the #72 g2 suite)
     try {
         $parsed = $uid | ConvertFrom-Json -ErrorAction Stop
-        $result.SessionId = $parsed.session_id ?? ''
-        $result.DeviceId = $parsed.device_id ?? ''
-        $result.AccountId = $parsed.account_uuid ?? ''
+        if ($null -ne $parsed.session_id)  { $result.SessionId = $parsed.session_id }
+        if ($null -ne $parsed.device_id)   { $result.DeviceId  = $parsed.device_id }
+        if ($null -ne $parsed.account_uuid) { $result.AccountId = $parsed.account_uuid }
         return $result
     } catch {
         # Not JSON, try flat format
@@ -216,7 +218,10 @@ function Get-CCVersionFromSystem {
     $result = @{ Version = ''; Entrypoint = ''; IsSubagent = $false }
     if (-not $System -or $System.Count -eq 0) { return $result }
 
-    $text = $System[0].text ?? $System[0] ?? ''
+    # PS 5.1-safe null-coalescing chain: text -> the block itself -> ''
+    if ($null -ne $System[0].text) { $text = $System[0].text }
+    elseif ($null -ne $System[0]) { $text = $System[0] }
+    else { $text = '' }
 
     if ($text -match 'cc_version=([^;\s]+)') {
         $result.Version = $Matches[1]
@@ -281,11 +286,15 @@ function Get-ResponseForRequest {
 
     # Parse header lines for stop_reason and elapsed_ms
     $header = Get-Content $respFile.FullName -TotalCount 10 -ErrorAction SilentlyContinue
-    $result = @{ StopReason = ''; ElapsedMs = 0; InputTokens = 0; OutputTokens = 0 }
+    # Label/File (#72 g2): the parser label (native/openai/anthropic/…) is what
+    # discriminates a billed native response from a composed one — callers pairing
+    # requests to responses need it, not just the usage numbers.
+    $result = @{ StopReason = ''; ElapsedMs = 0; InputTokens = 0; OutputTokens = 0; Label = ''; File = $respFile.Name }
 
     foreach ($line in $header) {
         if ($line -match 'stop_reason["\s:]+(\w+)') { $result.StopReason = $Matches[1] }
         if ($line -match 'elapsed_ms=(\d+)') { $result.ElapsedMs = [int]$Matches[1] }
+        if ($line -match '^#\s+parser=(\S+)') { $result.Label = $Matches[1] }
     }
 
     # Parse SSE data for token usage (last message_delta with usage)
@@ -298,6 +307,73 @@ function Get-ResponseForRequest {
     }
 
     return $result
+}
+
+function Get-ResponseIndex {
+    <#
+    .SYNOPSIS
+    One-scan index of resp-*.sse files, for pairing MANY requests at once.
+
+    .DESCRIPTION
+    Get-ResponseForRequest globs the directory once PER REQUEST — fine for the
+    single-request lookups it was written for, prohibitive when a script must
+    pair hundreds of requests in one pass (traffic-anthropic.ps1's sonnet
+    split, #72 g2). This builds the same (pid, counter) -> candidates mapping
+    in a single directory scan, parsing FILENAMES only (never file content):
+    the parser label is the segment between the timestamp and the model id,
+    where the model may itself contain dashes (claude-sonnet-5-5) — hence the
+    lazy label match. Selection stays in Find-PairedResponse, which applies
+    the same lag rule as Get-ResponseForRequest; the two paths are cross-pinned
+    by scripts/tests/traffic-anthropic.Tests.ps1 so they cannot drift.
+    #>
+    [CmdletBinding()]
+    param([string]$Dir = $script:DefaultCaptureDir)
+
+    $index = @{}
+    Get-ChildItem (Join-Path $Dir 'resp-*.sse') -File -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            if ($_.Name -notmatch '^resp-(\d+)-r(\d+)-(.+Z)-([a-z][a-z0-9-]*?)-(.+)\.sse$') { return }
+            $p = [int]$Matches[1]; $c = [int]$Matches[2]; $label = $Matches[4]
+            try {
+                $ts = [datetime]::ParseExact($Matches[3], 'yyyy-MM-ddTHH-mm-ss-fffZ',
+                                             $null, 'AssumeUniversal,AdjustToUniversal')
+            } catch { return }
+            $key = "$p/$c"
+            if (-not $index.ContainsKey($key)) { $index[$key] = New-Object System.Collections.Generic.List[object] }
+            $index[$key].Add([PSCustomObject]@{ Ts = $ts; Label = $label; File = $_.Name })
+        }
+    foreach ($key in @($index.Keys)) { $index[$key] = @($index[$key] | Sort-Object Ts) }
+    return $index
+}
+
+function Find-PairedResponse {
+    <#
+    .SYNOPSIS
+    Select the paired response for one request, from a Get-ResponseIndex index.
+
+    .DESCRIPTION
+    Same selection rule as Get-ResponseForRequest: the earliest candidate whose
+    timestamp lags the request by [-2s, +WindowSec]. Returns $null when no
+    candidate is in window — a RESULT (see Get-ResponseForRequest), never a
+    licence to widen the window.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Index,
+        [Parameter(Mandatory)][int]$ProcId,
+        [Parameter(Mandatory)][int]$Counter,
+        [Parameter(Mandatory)][datetime]$RequestTime,
+        [int]$WindowSec = 180
+    )
+
+    $key = "$ProcId/$Counter"
+    if (-not $Index.ContainsKey($key)) { return $null }
+    $reqUtc = $RequestTime.ToUniversalTime()
+    foreach ($cand in $Index[$key]) {
+        $lag = ($cand.Ts - $reqUtc).TotalSeconds
+        if ($lag -ge -2 -and $lag -le $WindowSec) { return $cand }
+    }
+    return $null
 }
 
 function Get-ArchivedDays {
@@ -457,4 +533,5 @@ function Resolve-MachineFromDevice {
 }
 
 Export-ModuleMember -Function Get-CaptureRequests, Get-WorkspaceFromBody, Get-WorkspaceFromSystem, Get-SessionIdFromMetadata,
-    Get-CCVersionFromSystem, Get-ResponseForRequest, Get-ArchivedDays, Get-ArchiveDayLabel, Get-OutageArchives, Expand-ArchiveDay, Resolve-MachineFromDevice
+    Get-CCVersionFromSystem, Get-ResponseForRequest, Get-ResponseIndex, Find-PairedResponse,
+    Get-ArchivedDays, Get-ArchiveDayLabel, Get-OutageArchives, Expand-ArchiveDay, Resolve-MachineFromDevice

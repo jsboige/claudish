@@ -27,9 +27,7 @@ BeforeAll {
     $script:ModulePath  = Join-Path $script:RepoRoot 'scripts\CaptureUtils.psm1'
     $script:HistoryPath = Join-Path $script:RepoRoot 'scripts\traffic-history.ps1'
 
-    if ($PSVersionTable.PSVersion.Major -ge 7) {
-        Import-Module $script:ModulePath -Force -DisableNameChecking
-    }
+    Import-Module $script:ModulePath -Force -DisableNameChecking
 
     function New-ArchiveSandbox {
         param([string[]]$Names)
@@ -42,12 +40,11 @@ BeforeAll {
     }
 }
 
-# CaptureUtils.psm1 uses `??` deliberately and is the documented pwsh-7-only
-# module (pinned by claudish-engine.Tests.ps1). Under 5.1 it cannot even be
-# parsed, so these cases are skipped there — and the skip is itself measured,
-# one Describe below, so it can never quietly become a green line hiding a
-# real defect.
-Describe 'Get-ArchivedDays' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
+# CaptureUtils.psm1 was pwsh-7-only (`??` sites — #72 g2 removed them), so
+# these cases used to be skipped under 5.1 with a measured justification
+# Describe below. The module now parses under BOTH interpreters and the cases
+# run everywhere; the parse assertion stays as the 5.1 regression pin.
+Describe 'Get-ArchivedDays' {
 
     It 'returns BOTH producers of a day when both spellings are present (#203 AC)' {
         $tmp = New-ArchiveSandbox @('captures-2026-09-20.7z', 'captures-2026-09-20-ai-01.7z')
@@ -111,7 +108,7 @@ Describe 'Get-ArchivedDays' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
     }
 }
 
-Describe 'Get-ArchiveDayLabel' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
+Describe 'Get-ArchiveDayLabel' {
 
     It 'keeps the legacy spelling untouched for an untagged archive' {
         # A fleet that never tagged anything must see byte-identical output.
@@ -154,18 +151,16 @@ Describe 'traffic-history wiring (text only: runs under BOTH interpreters)' {
     }
 }
 
-Describe 'the pwsh-7-only skip is measured, not assumed' {
+Describe 'CaptureUtils parses under BOTH interpreters (#72 g2)' {
 
-    It 'CaptureUtils really is unparseable under Windows PowerShell 5.1' -Skip:($PSVersionTable.PSVersion.Major -ge 7) {
-        # The cases above are skipped under 5.1. A skip nobody justifies is worse
-        # than a missing test: it is a green line. This asserts the skip's cause
-        # is the interpreter and nothing else.
-        $e = $null; $t = $null
-        [System.Management.Automation.Language.Parser]::ParseFile($script:ModulePath, [ref]$t, [ref]$e) | Out-Null
-        $e | Should -Not -BeNullOrEmpty -Because 'if it parses under 5.1, the skip above is hiding the tests for no reason'
-    }
-
-    It 'CaptureUtils parses cleanly under pwsh 7, where the cases above DO run' -Skip:($PSVersionTable.PSVersion.Major -lt 7) {
+    It 'parses cleanly under THIS interpreter, whichever it is' {
+        # Was the 5.1-unparseable pwsh-7-only module (`??` sites) — the cases
+        # above were skipped under 5.1 and a Describe here measured that the
+        # skip was real. #72 g2 removed the `??` sites, so the cases run under
+        # both interpreters and this is now the 5.1 regression pin: a future
+        # PS7-only construct reintroduced to the module goes red HERE first,
+        # instead of surfacing as a production CommandNotFound under the
+        # scheduled-task interpreter.
         $e = $null; $t = $null
         [System.Management.Automation.Language.Parser]::ParseFile($script:ModulePath, [ref]$t, [ref]$e) | Out-Null
         $e | Should -BeNullOrEmpty
