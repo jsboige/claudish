@@ -29,6 +29,8 @@
       inspect_out.txt   returned by every `docker inspect` (armed-env guard,
                         rollback State.Running probe — the tests choose values
                         that keep the two uses consistent)
+      inspect_exit.txt  exit code for `docker inspect` (absent = 0 — a miss
+                        makes the #372 guard refuse; output still prints)
       compose_exit.txt  exit code for `docker compose` (absent = 0)
       rm_exit.txt       exit code for `docker rm` (absent = 0)
     Like docker.exe, `start`, `rm` and `restart` echo the container name on
@@ -73,7 +75,9 @@ exit /b 0
 
 :inspect
 if exist "%SHIM_DIR%\inspect_out.txt" (type "%SHIM_DIR%\inspect_out.txt") else (echo true)
-exit /b 0
+if not exist "%SHIM_DIR%\inspect_exit.txt" exit /b 0
+set /p IE=<"%SHIM_DIR%\inspect_exit.txt"
+exit /b %IE%
 
 :image
 if exist "%SHIM_DIR%\image_out.txt" (type "%SHIM_DIR%\image_out.txt") else (echo 2026-09-24T22:47:44.000000000Z)
@@ -138,7 +142,7 @@ exit /b %CE%
 
     function Reset-DrainFixture {
         Remove-Item -LiteralPath $script:CallsLog -Force -ErrorAction SilentlyContinue
-        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'compose_exit.txt', 'compose_stderr.txt', 'image_out.txt', 'start_exit.txt', 'rm_exit.txt') {
+        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'inspect_exit.txt', 'compose_exit.txt', 'compose_stderr.txt', 'image_out.txt', 'start_exit.txt', 'rm_exit.txt') {
             Remove-Item -LiteralPath (Join-Path $script:ShimDir $f) -Force -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $script:TestLog -Force -ErrorAction SilentlyContinue
@@ -413,6 +417,172 @@ Describe 'armed-cascade guard counts CASCADES, not knobs (#141 x #304)' {
         $oldBroad = [regex]::Escape('^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+')
         $drainText | Should -Not -Match $oldBroad
         $installText | Should -Not -Match $oldBroad
+    }
+}
+
+Describe 'drain targets derived from the env file (#372)' {
+    BeforeAll {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        # The ai-01 sidecar shape: the file names the machine's real
+        # container and host port, and still carries an armed cascade.
+        $script:SidecarEnv = Join-Path $script:TestDir 'sidecar-372.env'
+        [System.IO.File]::WriteAllText($script:SidecarEnv, "CLAUDISH_PROXY_KEY=x`nCLAUDISH_CONTAINER_NAME=claudish-sidecar`nCLAUDISH_HOST_PORT=3010`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", $utf8)
+        # The hub shape (positive control): cascade, no container/port lines.
+        $script:HubEnv = Join-Path $script:TestDir 'hub-372.env'
+        [System.IO.File]::WriteAllText($script:HubEnv, "CLAUDISH_PROXY_KEY=x`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", $utf8)
+    }
+
+    It 'derives -ContainerName/-ProxyUrl from the file when neither was passed explicitly' {
+        $r = Resolve-DrainTargetsFromEnvFile -EnvFilePath $script:SidecarEnv `
+            -PassedContainerName 'claudish-proxy' -ContainerNameExplicit:$false `
+            -PassedProxyUrl 'http://localhost:3000' -ProxyUrlExplicit:$false
+        $r.ContainerName | Should -Be 'claudish-sidecar'
+        $r.ProxyUrl | Should -Be 'http://localhost:3010'
+        $r.Refusal | Should -BeNullOrEmpty
+    }
+
+    It 'agrees idempotently when the derived values come back explicitly (the detached child re-runs the check)' {
+        # Get-DrainDetachForwardedArguments ALWAYS forwards -ContainerName and
+        # -ProxyUrl, so the detached child always sees them as explicit — the
+        # derivation must be a fixpoint after one hop or every detached run
+        # would refuse its own parent's decision.
+        $r = Resolve-DrainTargetsFromEnvFile -EnvFilePath $script:SidecarEnv `
+            -PassedContainerName 'claudish-sidecar' -ContainerNameExplicit:$true `
+            -PassedProxyUrl 'http://localhost:3010' -ProxyUrlExplicit:$true
+        $r.ContainerName | Should -BeNullOrEmpty
+        $r.ProxyUrl | Should -BeNullOrEmpty
+        $r.Refusal | Should -BeNullOrEmpty
+    }
+
+    It 'refuses an explicit -ContainerName that disagrees with the file — naming both values' {
+        $r = Resolve-DrainTargetsFromEnvFile -EnvFilePath $script:SidecarEnv `
+            -PassedContainerName 'claudish-proxy' -ContainerNameExplicit:$true `
+            -PassedProxyUrl 'http://localhost:3010' -ProxyUrlExplicit:$true
+        $r.ContainerName | Should -BeNullOrEmpty
+        $r.Refusal | Should -Not -BeNullOrEmpty
+        $r.Refusal | Should -Match ([regex]::Escape("'claudish-proxy'"))
+        $r.Refusal | Should -Match 'CLAUDISH_CONTAINER_NAME=claudish-sidecar'
+        # The agreeing leg must not poison the refusing one.
+        $r.Refusal | Should -Not -Match 'ProxyUrl'
+    }
+
+    It 'refuses an explicit -ProxyUrl whose PORT disagrees; a different host spelling agrees' {
+        # The file names a port, the caller a URL: 'http://127.0.0.1:1' is a
+        # different listener (refuse), 'http://127.0.0.1:3010' is the same
+        # listener under another spelling (agree — a string compare would
+        # false-refuse every 127.0.0.1 operator).
+        $refuse = Resolve-DrainTargetsFromEnvFile -EnvFilePath $script:SidecarEnv `
+            -PassedContainerName 'claudish-sidecar' -ContainerNameExplicit:$true `
+            -PassedProxyUrl 'http://127.0.0.1:1' -ProxyUrlExplicit:$true
+        $refuse.Refusal | Should -Match 'CLAUDISH_HOST_PORT=3010'
+        $refuse.Refusal | Should -Match ([regex]::Escape("'http://127.0.0.1:1'"))
+
+        $agree = Resolve-DrainTargetsFromEnvFile -EnvFilePath $script:SidecarEnv `
+            -PassedContainerName 'claudish-sidecar' -ContainerNameExplicit:$true `
+            -PassedProxyUrl 'http://127.0.0.1:3010' -ProxyUrlExplicit:$true
+        $agree.Refusal | Should -BeNullOrEmpty
+    }
+
+    It 'hub positive control: a file without container/port lines derives nothing' {
+        $r = Resolve-DrainTargetsFromEnvFile -EnvFilePath $script:HubEnv `
+            -PassedContainerName 'claudish-proxy' -ContainerNameExplicit:$false `
+            -PassedProxyUrl 'http://localhost:3000' -ProxyUrlExplicit:$false
+        $r.ContainerName | Should -BeNullOrEmpty
+        $r.ProxyUrl | Should -BeNullOrEmpty
+        $r.Refusal | Should -BeNullOrEmpty
+    }
+
+    It 'empty values (compose placeholders) and a missing file derive nothing' {
+        $empty = Join-Path $script:TestDir 'empty-372.env'
+        [System.IO.File]::WriteAllText($empty, "CLAUDISH_CONTAINER_NAME=`nCLAUDISH_HOST_PORT=`n", $utf8)
+        $r = Resolve-DrainTargetsFromEnvFile -EnvFilePath $empty `
+            -PassedContainerName 'claudish-proxy' -ContainerNameExplicit:$false `
+            -PassedProxyUrl 'http://localhost:3000' -ProxyUrlExplicit:$false
+        $r.ContainerName | Should -BeNullOrEmpty
+        $r.ProxyUrl | Should -BeNullOrEmpty
+        $r.Refusal | Should -BeNullOrEmpty
+
+        $miss = Resolve-DrainTargetsFromEnvFile -EnvFilePath (Join-Path $script:TestDir 'nope-372.env') `
+            -PassedContainerName 'claudish-proxy' -ContainerNameExplicit:$false `
+            -PassedProxyUrl 'http://localhost:3000' -ProxyUrlExplicit:$false
+        $miss.ContainerName | Should -BeNullOrEmpty
+        $miss.Refusal | Should -BeNullOrEmpty
+    }
+
+    It 'source pin: the entry derivation runs before both dispatch branches and outside the zero-actuator slice' {
+        $text = [System.IO.File]::ReadAllText($script:DrainScript)
+        $entryIdx = $text.IndexOf("if (`$MyInvocation.InvocationName -ne '.') {")
+        $deriveIdx = $text.IndexOf('Resolve-DrainTargetsFromEnvFile -EnvFilePath $EnvFile')
+        $sliceIdx = $text.IndexOf('# <drain-detach-entry>')
+        $restartIdx = $text.IndexOf('$ok = Invoke-ClaudishDrainedRestart')
+        ($entryIdx -ge 0 -and $deriveIdx -gt $entryIdx) | Should -BeTrue
+        # OUTSIDE the guard-scanned slice: that slice must launch and read,
+        # nothing else (adding the derivation inside it would fail the
+        # zero-actuator Pester guard's contract).
+        ($sliceIdx -gt $deriveIdx) | Should -BeTrue
+        # Both dispatch branches sit after the mutation, so the derived
+        # $ContainerName/$ProxyUrl reach the detach forwarder AND the
+        # in-process wrapper call.
+        ($restartIdx -gt $deriveIdx) | Should -BeTrue
+    }
+
+    It 'the #141 guard refuses when its inspect misses — an absent container is no signal, never "0 armed"' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-sidecar running', (New-Object System.Text.ASCIIEncoding))
+        # inspect_exit=1: `docker inspect` cannot produce the container —
+        # the pre-#372 fail-open counted contArmed=0 and waved the recreate
+        # through against a container the drain could not even see.
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_exit.txt'), '1', (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'absent' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:SidecarEnv
+        $r | Should -BeFalse
+        $log = Get-DrainLogText
+        $log | Should -Match 'RECREATE REFUSED'
+        $log | Should -Match ([regex]::Escape("container 'claudish-proxy' unreadable by inspect"))
+        $log | Should -Match 'OUTCOME refused'
+        (Get-CallsText) | Should -Not -Match '(?m)^compose'
+    }
+
+    It 'entry e2e: -EnvFile alone retargets the whole run — the guard inspects the FILE container, and a disagreeing explicit target exits 1 before any docker call' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-sidecar running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", (New-Object System.Text.ASCIIEncoding))
+        $host_ = (Get-Process -Id $PID).Path
+        $e2eLog = Join-Path $script:TestDir 'e2e-372.log'
+        $e2eHome = Join-Path $script:TestDir 'e2e-372-home'
+        New-Item -ItemType Directory -Path $e2eHome -Force | Out-Null
+
+        # (a) derivation: no explicit targets, file names claudish-sidecar —
+        # the run must inspect THAT container, complete, and never touch the
+        # hub default. The URL is derived dead (:3010 has no listener here),
+        # so the drain phase takes the existing no-signal fast path.
+        Remove-Item -LiteralPath $e2eLog -Force -ErrorAction SilentlyContinue
+        & $host_ -NoProfile -ExecutionPolicy Bypass -File $script:DrainScript -Reason 'e2e-derive' -Recreate -EnvFile $script:SidecarEnv -LogPath $e2eLog -ClaudishHome $e2eHome | Out-Null
+        $rcDerive = $LASTEXITCODE
+        $rcDerive | Should -Be 0
+        $e2eText = if (Test-Path -LiteralPath $e2eLog) { [System.IO.File]::ReadAllText($e2eLog) } else { '' }
+        $e2eText | Should -Match ([regex]::Escape('-ContainerName derived from -EnvFile'))
+        $e2eText | Should -Match 'http://localhost:3010'
+        $calls = Get-CallsText
+        # Anchor on the #141 guard's exact inspect form ({{range .Config.Env}})
+        # — the run also inspects images and rollback state under other
+        # --format shapes, which are not the guard and must not swing either
+        # side of this assert.
+        $guardInspect = '(?m)^inspect .*\.Config\.Env.* claudish-'
+        $calls | Should -Match ($guardInspect + 'sidecar')
+        $calls | Should -Not -Match ($guardInspect + 'proxy')
+
+        # (b) refusal: explicit container contradicting the file — exit 1
+        # with a terminal OUTCOME, BEFORE any docker call (the derivation
+        # block is the first executable of the entry).
+        Remove-Item -LiteralPath $script:CallsLog -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $e2eLog -Force -ErrorAction SilentlyContinue
+        & $host_ -NoProfile -ExecutionPolicy Bypass -File $script:DrainScript -Reason 'e2e-refuse' -Recreate -EnvFile $script:SidecarEnv -ContainerName claudish-proxy -LogPath $e2eLog -ClaudishHome $e2eHome | Out-Null
+        $LASTEXITCODE | Should -Be 1
+        $refuseText = if (Test-Path -LiteralPath $e2eLog) { [System.IO.File]::ReadAllText($e2eLog) } else { '' }
+        $refuseText | Should -Match 'RESTART REFUSED'
+        $refuseText | Should -Match 'OUTCOME refused'
+        (Get-CallsText) | Should -Be ''
     }
 }
 

@@ -412,9 +412,14 @@ function Invoke-ClaudishDrainedRestartImpl {
         # container: the 16 present mask the 7 that would be lost). If the file
         # carries no armed CLAUDISH_FAILOVER_* cascade while the live container
         # does, the recreate would wipe an armed state that exists nowhere
-        # else. Refuse before spending the drain. Fail OPEN when docker cannot
-        # answer (no container = no armed state to lose; the existence checks
-        # above still hold).
+        # else. Refuse before spending the drain. An inspect MISS is no
+        # signal, never "0 armed" (#372): the pre-#372 fail-open let a
+        # recreate through against a container the drain could not even see —
+        # ai-01, 2026-10-06: file=1, container=0, but that 0 was an ABSENT
+        # container (the hub default probed on a sidecar machine), not an
+        # unarmed one, and the guard could never refuse. The guard's whole
+        # job is to compare against the container compose is about to
+        # replace; when docker cannot produce it, stop.
         # #304 discrimination: only the four cascade-carrying names count as
         # armed. Knobs (ARM_AFTER, SESSION_DWELL_MS, ...) and decorators
         # (_LABEL/_RESET/_ACTIVE/...) are injected since #304 — counting any
@@ -426,14 +431,22 @@ function Invoke-ClaudishDrainedRestartImpl {
         $contArmed = 0
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
+        $inspectMissed = $false
         try {
             $envArmed = @([System.IO.File]::ReadAllLines($EnvFile) |
                 Where-Object { $_ -match $armedPattern }).Count
             $contEnv = docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $Container 2>$null
             if ($LASTEXITCODE -eq 0) {
                 $contArmed = @($contEnv | Where-Object { $_ -match $armedPattern }).Count
+            } else {
+                $inspectMissed = $true
             }
         } finally { $ErrorActionPreference = $prevEap }
+        if ($inspectMissed) {
+            Write-DrainLog "RECREATE REFUSED ($Reason): docker inspect could not read container '$Container' (exit $LASTEXITCODE — absent, or docker itself failed) — cannot verify its armed cascades; nothing stopped (#372)."
+            Write-DrainOutcome "refused" "${Reason}: container '$Container' unreadable by inspect — nothing stopped"
+            return $false
+        }
         if ($contArmed -gt 0 -and $envArmed -eq 0) {
             Write-DrainLog "RECREATE REFUSED ($Reason): -EnvFile '$EnvFile' carries no armed CLAUDISH_FAILOVER_* while container '$Container' has $contArmed — the recreate would wipe an armed state that exists nowhere on disk. Recover it with install-sidecar.ps1 -RebuildEnvFromContainer, then retry (#141)."
             Write-DrainOutcome "refused" "${Reason}: env file carries no armed cascade while container has $contArmed — nothing stopped"
@@ -744,6 +757,67 @@ function Invoke-ClaudishDrainedRestart {
     }
 }
 
+function Resolve-DrainTargetsFromEnvFile {
+    <#
+        #372. A sidecar recreate that passes only -EnvFile drains, guards and
+        attests against the HUB defaults (container claudish-proxy, port 3000)
+        while compose recreates the machine's real container — on ai-01
+        (2026-10-06) the #141 guard's `docker inspect claudish-proxy` failed
+        (no such container), fail-open counted 0 armed, and the guard could
+        never refuse anything. install-sidecar.ps1 writes
+        CLAUDISH_CONTAINER_NAME and CLAUDISH_HOST_PORT into every sidecar env
+        file, so the file already names the truth: derive unset targets from
+        it, and REFUSE explicit values that disagree with it (a disagreement
+        means draining one container while recreating another).
+
+        Pure — reads the file, decides, never touches docker. Callers pass
+        the SCRIPT-level PSBoundParameters flags: at function level an
+        operator's explicit -ContainerName only ever flows in as a dynamic
+        default, which is indistinguishable from "nobody said anything".
+    #>
+    param(
+        [string]$EnvFilePath,
+        [string]$PassedContainerName,
+        [bool]$ContainerNameExplicit,
+        [string]$PassedProxyUrl,
+        [bool]$ProxyUrlExplicit
+    )
+    $out = [pscustomobject]@{ ContainerName = $null; ProxyUrl = $null; Refusal = $null }
+    if (-not $EnvFilePath -or -not (Test-Path -LiteralPath $EnvFilePath)) { return $out }
+
+    # Same empty-means-absent convention as the armed-cascade guard: compose
+    # injects `${VAR:-}` placeholders, so an empty value is not a target.
+    $fileContainer = $null
+    $filePort = $null
+    foreach ($line in [System.IO.File]::ReadAllLines($EnvFilePath)) {
+        if ($line -match '^CLAUDISH_CONTAINER_NAME=(\S.*)$') { $fileContainer = $Matches[1].Trim() }
+        elseif ($line -match '^CLAUDISH_HOST_PORT=(\d+)\s*$') { $filePort = $Matches[1] }
+    }
+
+    if ($fileContainer) {
+        if (-not $ContainerNameExplicit) { $out.ContainerName = $fileContainer }
+        elseif ($PassedContainerName -ne $fileContainer) {
+            $msg = "explicit -ContainerName '$PassedContainerName' disagrees with -EnvFile '$EnvFilePath' (CLAUDISH_CONTAINER_NAME=$fileContainer) — draining one container while recreating another"
+            $out.Refusal = if ($out.Refusal) { "$($out.Refusal); $msg" } else { $msg }
+        }
+    }
+    if ($filePort) {
+        if (-not $ProxyUrlExplicit) {
+            $out.ProxyUrl = "http://localhost:$filePort"
+        } else {
+            # The file names a PORT, the caller passes a URL: compare ports,
+            # not strings — 'http://127.0.0.1:3010' and the derived
+            # 'http://localhost:3010' target the same listener.
+            $passedPort = if ($PassedProxyUrl -match ':(\d+)(/)?$') { $Matches[1] } else { $null }
+            if ($passedPort -ne $filePort) {
+                $msg = "explicit -ProxyUrl '$PassedProxyUrl' disagrees with -EnvFile '$EnvFilePath' (CLAUDISH_HOST_PORT=$filePort) — probing one port while recreating another"
+                $out.Refusal = if ($out.Refusal) { "$($out.Refusal); $msg" } else { $msg }
+            }
+        }
+    }
+    return $out
+}
+
 function Join-DrainDetachArguments {
     <#
         #312 AC1/AC3, #338 review B3. Quote EVERY argument and join with
@@ -941,6 +1015,34 @@ function Get-DrainDetachForwardedArguments {
 
 # Standalone mode: run the restart. Dot-sourced, define the functions only.
 if ($MyInvocation.InvocationName -ne '.') {
+    # #372 — resolve the drain's targets from the env file BEFORE any dispatch
+    # branch, and deliberately OUTSIDE the <drain-detach-entry> slice the
+    # zero-actuator guard scans (that slice must launch and read, nothing
+    # else). A sidecar recreate that passed only -EnvFile used to drain and
+    # guard the HUB defaults while compose recreated the machine's real
+    # container (ai-01, 2026-10-06). Explicitness is read at SCRIPT level:
+    # at function level an operator's explicit -ContainerName only ever
+    # arrives as a dynamic default, indistinguishable from unset. The
+    # detached child re-runs this with the forwarded (derived) values and
+    # agrees idempotently — the derivation is a fixpoint after one hop.
+    if ($EnvFile -and (Test-Path -LiteralPath $EnvFile)) {
+        $targetFix = Resolve-DrainTargetsFromEnvFile -EnvFilePath $EnvFile `
+            -PassedContainerName $ContainerName -ContainerNameExplicit:($PSBoundParameters.ContainsKey('ContainerName')) `
+            -PassedProxyUrl $ProxyUrl -ProxyUrlExplicit:($PSBoundParameters.ContainsKey('ProxyUrl'))
+        if ($targetFix.Refusal) {
+            Write-DrainLog "RESTART REFUSED ($Reason): $($targetFix.Refusal)"
+            Write-DrainOutcome "refused" "${Reason}: explicit target disagrees with -EnvFile — nothing stopped"
+            exit 1
+        }
+        if ($targetFix.ContainerName -and $targetFix.ContainerName -ne $ContainerName) {
+            Write-DrainLog "DRAIN: -ContainerName derived from -EnvFile '$EnvFile' -> $($targetFix.ContainerName)"
+            $ContainerName = $targetFix.ContainerName
+        }
+        if ($targetFix.ProxyUrl -and $targetFix.ProxyUrl -ne $ProxyUrl) {
+            Write-DrainLog "DRAIN: -ProxyUrl derived from -EnvFile '$EnvFile' -> $($targetFix.ProxyUrl)"
+            $ProxyUrl = $targetFix.ProxyUrl
+        }
+    }
     # <drain-detach-entry> — the slice the zero-actuator Pester guard scans
     # (the detach branch must launch and read, nothing else).
     if ($Detach) {
