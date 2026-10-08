@@ -23,6 +23,7 @@ import {
   type StrictBaseline,
   type SuiteRun,
 } from "./strict-runner";
+import { BUDGET_FOOTER_MARKER, manifestFooter } from "./env-gate";
 
 const base: StrictBaseline = {
   sha: "abc1234",
@@ -312,12 +313,94 @@ describe("parseEnvGateManifests", () => {
     ].join("\n");
     const summary = parseEnvGateManifests(raw);
     expect(summary).toEqual([
-      { classId: "posix-path-shim", notExecuted: 12 },
-      { classId: "live-endpoint-catalog", notExecuted: 2 },
+      { classId: "posix-path-shim", notExecuted: 12, budget: false },
+      { classId: "live-endpoint-catalog", notExecuted: 2, budget: false },
     ]);
   });
 
   test("no manifests → empty summary (complete machine)", () => {
     expect(parseEnvGateManifests("no gates here")).toEqual([]);
+  });
+});
+
+describe("strict-runner consolidated footer vs budget classes (#385 follow-up)", () => {
+  // The runner only sees the PRINTED manifest, so the budget kind has to be
+  // read off the text. These fixtures are built with the REAL producer
+  // (`manifestFooter`) rather than a hand-copied string: if either side's
+  // wording drifts, the pin goes red instead of the detector silently
+  // matching nothing — the failure mode a copied literal cannot catch.
+  function manifestBlock(id: string, n: number, footer: string): string {
+    return [
+      `[ENV-GATE] ${n} test(s) NOT executed — class '${id}':`,
+      `[ENV-GATE]   · some test`,
+      `[ENV-GATE]   reason: r`,
+      `[ENV-GATE]   activation: a`,
+      `[ENV-GATE]   ${footer}`,
+    ].join("\n");
+  }
+  // `kind: BUDGET` (not the literal) keeps the static scan pin in
+  // env-gate.test.ts — "only a real budget declaration may carry the
+  // exemption" — matching exactly one production file; this is a fixture.
+  const BUDGET = "budget" as const;
+  const budgetFooter = manifestFooter({ id: "b", active: false, reason: "r", activation: "a", kind: BUDGET });
+  const regularFooter = manifestFooter({ id: "r", active: true, reason: "r", activation: "a" });
+
+  const prevCwd = process.cwd();
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    process.chdir(prevCwd);
+    for (const d of tmpDirs.splice(0)) spawnSync("cmd", ["/c", "rmdir", "/s", "/q", d]);
+  });
+
+  /** Run main() against a stubbed suite output, returning its stdout. */
+  function verdictOutput(envGateBlocks: string[], entries: string[] = ["A > a1"]): string {
+    const d = mkdtempSync(join(tmpdir(), "strict-budget-"));
+    tmpDirs.push(d);
+    writeFileSync(join(d, ".test-strict-baseline.json"), JSON.stringify({ ...base, fails: entries }), "utf-8");
+    process.chdir(d);
+    const raw = [outputFor(entries), ...envGateBlocks].join("\n");
+    const chunks: string[] = [];
+    const orig = process.stdout.write.bind(process.stdout);
+    (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => {
+      chunks.push(String(s));
+      return true;
+    };
+    try {
+      main([], () => ({ raw }));
+    } finally {
+      (process.stdout as unknown as { write: (s: string) => boolean }).write = orig as unknown as (s: string) => boolean;
+    }
+    return chunks.join("");
+  }
+
+  test("the producer's budget footer is what the detector keys on (no copied literal)", () => {
+    expect(budgetFooter).toContain(BUDGET_FOOTER_MARKER);
+    expect(regularFooter).not.toContain(BUDGET_FOOTER_MARKER);
+    const summary = parseEnvGateManifests(manifestBlock("real-cc-e2e", 3, budgetFooter));
+    expect(summary).toEqual([{ classId: "real-cc-e2e", notExecuted: 3, budget: true }]);
+  });
+
+  test("a budget class in the manifest → the footer no longer claims STRICT=1 fails it", () => {
+    const out = verdictOutput([manifestBlock("real-cc-e2e", 3, budgetFooter)]);
+    expect(out).toContain("opt-in budget — STRICT=1 never fails it");
+    expect(out).toContain("never fails them");
+    // The blanket claim is the lie this pin exists to refuse: it must not
+    // appear when EVERY listed class is budget-exempt.
+    expect(out).not.toContain("fails them instead");
+  });
+
+  test("mixed manifest → only the non-budget class carries the strict-fail claim", () => {
+    const out = verdictOutput([
+      manifestBlock("real-cc-e2e", 3, budgetFooter),
+      manifestBlock("posix-path-shim", 6, regularFooter),
+    ]);
+    expect(out).toContain("fails those instead");
+    expect(out).toContain("the 1 opt-in budget class(es) are exempt by design");
+  });
+
+  test("control: a manifest with NO budget class keeps the original wording", () => {
+    const out = verdictOutput([manifestBlock("posix-path-shim", 6, regularFooter)]);
+    expect(out).toContain("(a complete machine runs them all; CLAUDISH_TEST_ENV_STRICT=1 fails them instead)");
+    expect(out).not.toContain("budget");
   });
 });
