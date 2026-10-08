@@ -1818,6 +1818,109 @@ function Get-OffsiteWriteVerdict {
         Reason = ("destination exists with a DIFFERENT size (dest {0} bytes vs this run {1} bytes) - another producer owns this name; overwriting would destroy it" -f $DestBytes, $LocalBytes)
     }
 }
+# --- off-site sha256 manifest (#389) -----------------------------------------
+# Measured 07/10: a content drift at EQUAL size on an off-site archive is
+# invisible to every guard above - #208 compares sizes, #322 tests readability,
+# and neither knows what the bytes SHOULD be. The remedy is a reference: hash
+# the destination at deposit time into a per-machine manifest, then re-verify a
+# rotating sample of it every night. Drift then surfaces as a loud non-zero
+# night instead of a silent corrupted history (the po-2026 finding).
+# The manifest name carries the machine tag for the same reason the archive
+# name does: GDriveDir is a SHARED namespace (#201) and two producers must
+# never edit one manifest file.
+
+function Get-ShaManifestPath {
+    <#
+        The per-machine manifest path inside the shared off-site directory.
+        Tagged machines get captures-sha256-<tag>.jsonl; the one untagged
+        namespace owner gets captures-sha256.jsonl - mirroring
+        Get-CaptureArchiveName exactly, so the two can never disagree about
+        which namespace a run writes to.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$GDriveDir,
+        [string]$MachineTag = ""
+    )
+    $leaf = if ($MachineTag) { "captures-sha256-$MachineTag.jsonl" } else { "captures-sha256.jsonl" }
+    return (Join-Path $GDriveDir $leaf)
+}
+
+function Read-ShaManifest {
+    <#
+        Parses a manifest into a hashtable archive-name -> record. A torn or
+        hand-edited line is skipped and counted in BadLines, never fatal: the
+        manifest is a reference for the re-check, and one unparseable line must
+        not blind the check to the other entries. Absent file -> empty manifest
+        (first run after this change has nothing recorded yet - legitimate).
+    #>
+    param([Parameter(Mandatory)] [string]$Path)
+    $out = @{}
+    $bad = 0
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Entries = $out; BadLines = 0 }
+    }
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        $t = $line.Trim()
+        if (-not $t) { continue }
+        try {
+            $o = $t | ConvertFrom-Json
+            if ($o.archive) { $out[$o.archive] = $o } else { $bad++ }
+        } catch { $bad++ }
+    }
+    return [pscustomobject]@{ Entries = $out; BadLines = $bad }
+}
+
+function Update-ShaManifest {
+    <#
+        Upserts one archive's record: same archive name replaces (a retried
+        night re-uploads and must not leave two hashes for one name), other
+        entries are preserved byte-for-byte in their recorded order. Written
+        UTF-8 WITHOUT BOM - the same discipline as the 7z @listfile: a BOM
+        poisons readers of the first line.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$Archive,
+        [Parameter(Mandatory)] [string]$Sha256,
+        [Parameter(Mandatory)] [long]$Bytes,
+        [Parameter(Mandatory)] [string]$RecordedUtc
+    )
+    $m = Read-ShaManifest -Path $Path
+    $names = @($m.Entries.Keys | Sort-Object)
+    if ($names -notcontains $Archive) { $names = @($names + $Archive | Sort-Object) }
+    $rec = [pscustomobject]@{
+        archive = $Archive; sha256 = $Sha256; bytes = $Bytes; recorded = $RecordedUtc
+    }
+    $lines = foreach ($n in $names) {
+        if ($n -eq $Archive) { ($rec | ConvertTo-Json -Compress) } else { ($m.Entries[$n] | ConvertTo-Json -Compress) }
+    }
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [System.IO.File]::WriteAllLines($Path, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+    return [pscustomobject]@{ Entries = $names.Count; Archive = $Archive }
+}
+
+function Select-ShaRotation {
+    <#
+        The nightly re-check sample: deterministic, so two runs on the same UTC
+        day pick the same entries (a re-run after a transient failure re-checks
+        the same files, not a fresh random three), and advancing one day
+        advances the window by the sample count, so every recorded entry is
+        re-verified in ceil(count/N) nights. Seed = UTC date as an OADate int.
+        Pure: takes the entry list, returns the selected names.
+    #>
+    param(
+        [string[]]$Names = @(),
+        [int]$Count = 3,
+        [Parameter(Mandatory)] [datetime]$SeedDateUtc
+    )
+    if ($Count -le 0 -or $Names.Count -eq 0) { return @() }
+    $seed = [int][Math]::Floor($SeedDateUtc.ToUniversalTime().Date.ToOADate())
+    $picked = for ($i = 0; $i -lt [Math]::Min($Count, $Names.Count); $i++) {
+        $Names[([Math]::Abs($seed * $Count + $i)) % $Names.Count]
+    }
+    return @($picked | Select-Object -Unique)
+}
 # --- 7-Zip resolution (#214) -------------------------------------------------
 # The compaction night of 2026-09-22 died because the launcher hardcoded a path
 # that did not exist, and the script's own fallback hardcoded a DIFFERENT one
@@ -2174,6 +2277,10 @@ Export-ModuleMember -Function @(
     'Get-CaptureArchiveMachineTag'
     'Get-CaptureArchivePolicy'
     'Get-OffsiteWriteVerdict'
+    'Get-ShaManifestPath'
+    'Read-ShaManifest'
+    'Update-ShaManifest'
+    'Select-ShaRotation'
     'Get-SevenZipCandidates'
     'Resolve-SevenZipPath'
     'Invoke-GitBounded'
