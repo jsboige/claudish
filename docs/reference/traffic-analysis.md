@@ -70,6 +70,44 @@ Measured traps (2026-10-06, 400 newest captures): `body.metadata` is serialized 
 - **Archives** — `D:\claudish-captures\archive\captures-YYYY-MM-DD.7z` (LZMA2, ~100-130:1 ratio), mirrored to `G:\Mon Drive\Backups-Cloud\claudish\` via Google Drive Desktop (plain Windows file copy, no API; online-only — never pin that folder for offline access). Local retention 0 days: each local archive is deleted as soon as its GDrive copy is size-confirmed, so GDrive is the single home of history (2026-08-27 disk mandate; a DriveFS outage defers the purge, it never deletes unconfirmed).
 - **Heavy analysis is host-saturating — schedule it.** Decompressing a weeks-old 7z and parsing 100k+ `req-*.json` pegs the hub host and produces the HUB-LENT signature (event-loop stall, gateway latency still clean) for minutes at a time. Measured: same signature as a crisis wave, yet with streams ≈ 1 it costs nobody anything. Rule: heavy capture analysis runs in the **05-07Z trough**, extracts to **D: never C:**, and is *expected + attributed* there — not a crisis.
 
+## Turn autopsy (#328 G12)
+
+**`scripts/turn-autopsy.py` answers a question no counter can: what KIND of turn was this?** The July-vs-now investigation (`jsboige/claudish#328`) is "×3.4 requests for ~half the PRs"; the counts decomposed the *what* (`ctx total ×6.13 = ×3.41 requests × ×1.80 harness floor`, 05/07 vs 30/09) and cannot reach the *why*, because the why is only in the bodies. This tool turns a 400-600 KB request body into a ~1.5 KB reading slice, so a reader classifies 50-100 turns/hour without opening a JSON by hand. It does **not** classify — it extracts, then aggregates the labels the reader wrote.
+
+```powershell
+# work-list for one era (a bounded, seeded sample)
+python .\scripts\turn-autopsy.py sample --archive 'G:\Mon Drive\Backups-Cloud\claudish\captures-2026-07-05.7z' `
+  --era july --n 50 --seed 328 --stratify lane --out worklist-july.jsonl
+python .\scripts\turn-autopsy.py show      --worklist worklist-july.jsonl      # the reading slices
+python .\scripts\turn-autopsy.py label     --worklist worklist-july.jsonl --out labels.jsonl
+python .\scripts\turn-autopsy.py stats     --worklist worklist-both.jsonl      # trigger x era
+python .\scripts\turn-autopsy.py aggregate --worklist worklist-both.jsonl --labels labels.jsonl
+```
+
+**The three axes are separate on purpose** (arbitration ai-01, 2026-10-08): `nature` (production · verification · coordination · navigation · context-repair · duplicate-restart · waiting-poll) × `result` (advanced · no-op · regression) × `confidence` (measured · inferred · uncertain). "Absence of mutation is not proof of ceremony" — a turn that produced no artefact is not therefore a wasted turn, and the grid forces that distinction instead of folding it into one label.
+
+### Instrument traps, all measured
+
+- **The lane comes out of the resp filename** — `resp-1-r0001-<ts>-<handler>-<model>.sse` — so stratification by lane is free, with no body parse. But the timestamp must be matched with a **strict shape** (`\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z`): a loose `(.+?)-([a-z0-9_.-]+)-(.+?)` split eats the timestamp itself (`T` and `Z` are outside the class), manufactures one "lane" per turn, and an allocation that forces a minimum per lane then turns `--n 50` into "extract 14 244 members". The tool prints the lane count **before** extracting: a lane count near the turn count is that bug.
+- **The capture counter is NOT unique per day.** Measured on `captures-2026-07-05`: 10 498 `resp-*` files for **7 114 distinct counters** (`resp-1-r9997-…` appears twice with different timestamps) — the counter restarts across container restarts and `pid` is always 1 in a container. Pairing req↔resp by counter is therefore approximate; the tool reports `(unpaired)` rather than mispairing. In the pilot that is 16/49 July turns and 1/50 for 30/09.
+- **Pre-#98 captures carry `machine` but not `entrypoint` / `workload` / `device_id8`** (measured on the July archive). The tool returns `None` — the fields are never invented, so an era comparison must not read a `null` as "no entrypoint".
+- **A solid archive pays one full block decompression per `7z e` call** (`Blocks = 1` on a daily pack), and the archive lives on DriveFS. Copy it local once (`--copy-local`, default for a non-`D:` path) and batch the members (`--reuse` skips extraction once the work-dir is populated).
+
+### Pilot result (05/07 vs 30/09, n=49 + n=50, seed 328)
+
+| trigger (last message) | july | now |
+|---|---|---|
+| automatic (`todo-nudge`, `bg-notification`, `date-change`, `cron`) | **17 (35 %)** | **3 (6 %)** |
+| `system-reminder` | 0 | 6 |
+| tool-result | 28 (57 %) | 27 (54 %) |
+| human | 1 (2 %) | 4 (8 %) |
+
+**The headline is a negative, and it is the reason to read rather than count**: the automatic-trigger buckets look like a 6× collapse, but the *last message is a `system`-role message* in **17/49 July turns vs 15/50 now** — the same ~⅓ of turns in both eras. Only the injector's spelling changed (the `TodoWrite` nudge → `<system-reminder>`), which is a harness-version artifact, not a behaviour change. The durable finding is structural: **about a third of all turns, in both eras, are driven by a message the harness injected — not by the user and not by a tool result** — and that share is *constant*, so it cannot explain the ×3.4 growth. The ×3.4 is elsewhere.
+
+What did move in the pilot: the **lane count, 3 → 9** (July: `glm-5.2` 21, `MiniMax-M3` 10, `opus-4-8` 2; 30/09: `glm-5.3` 20, `MiniMax-M3` 19, `opus-5-5` 4, plus 6 single-turn lanes), and the machine spread (5 distinct clients → 7). Treat both as **hypotheses a larger sample must confirm**, not as findings — n≈50 per era reads direction, not magnitude.
+
+**Not done, and deliberately**: no mass reading. The grid is arbitrated but not yet validated against a second reader — ai-01's protocol calls for ~20 turns read twice, independently, with agreement/uncertainty published. The pilot's job was to calibrate the grid and to size the next sample; it does that and stops.
+
 ## Machine attribution
 
 Machines are identified by the `X-Claudish-Machine` header (set via `ANTHROPIC_CUSTOM_HEADERS` in Claude Code settings). When missing, `CaptureUtils.psm1` falls back to device_id fingerprinting. Known device IDs are hardcoded in the module's `$DeviceMap` (currently partial — po-2023 + ai-01 only; update when new machines are seen without the header).
