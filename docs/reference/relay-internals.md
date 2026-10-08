@@ -46,34 +46,48 @@ over the window — the failed entries including real client `POST /v1/messages`
 (`9a8295e5…` → `99c2feef…`, `uptimeSec` reset: the process was replaced); the relay returned
 NOMINAL 32 s later.
 
-**Cause, measured on the hub (po-2025, `~/.claudish/docker-events.log`).** The log records at
-08:50:56Z a `container start claudish-proxy` carrying `com.docker.compose.replace=claudish-proxy`,
-`working_dir=D:\dev\claudish`, `environment_file=D:\claudish-shadow\.env` — a **compose
-force-recreate**, not a daemon bounce and not a reboot (the System log 08:40–08:56Z holds no
-41/6008/1074). **Actor not identified**: `drain.log` is silent on the window, the watchdog is out of
-its slot, ModelVersionWatch logs 06:36Z, and no local session matches. This is exactly the case the
-durable collector exists for — `scripts/docker-events-collect.ps1` (#169).
+**Cause, measured on the hub (po-2025, `~/.claudish/docker-events.log` + the container journal).**
+At 08:50:56Z the journal holds a `container start claudish-proxy` — and, between 06:34:11Z and that
+event, **no `stop`, `die`, `kill` or `destroy` at all**. A container cannot be *started* without
+having been stopped, so the process that would have logged the stop was itself gone: this is an
+**engine resurrection**, the shape the watchdog names elsewhere in the same day (`ENGINE-DOWN: docker
+CLI cannot reach the engine`, then `DIAG[engine-down]: port 3000 DEAF (refused)`) — **not** a
+`compose up` that bypassed the drained wrapper, and not a reboot (the System log 08:40–08:56Z holds
+no 41/6008/1074). The ricochet closes it: a *second, unrelated* compose project
+(`myia_vllm-mini-frognano-4b`) returns 2 s later — two distinct projects cannot recreate one another,
+so a single engine event took both down and brought both back. ⚠ **The
+`com.docker.compose.replace=claudish-proxy` label does not identify an actor**: it is stamped at
+creation and persists, so it reads as a recreate on a container that was never recreated (its
+`environment_file=D:\claudish-shadow\.env` is a creation-time fact for the same reason). Day scale:
+**3 engine resurrections on 2026-10-08** (06:34:11Z, 08:50:56Z, 11:20:37Z — the last with **no**
+process replacement at all, `RestartCount=0` and `StartedAt=12:02:02Z`), against only **2 drained
+gestures** that day. Over the whole available journal, **20 resurrections across 82 hub `start`s
+since 22/09**: a recurring class, not one day's incident. `drain.log` is silent on all three, and
+correctly so — **there was nothing to drain**. That silence is precisely why the durable collector
+matters here: `scripts/docker-events-collect.ps1` (#169).
 
 **Day scale (2026-10-08, closed).** **11 AUTONOMOUS episodes, 11 recoveries** (03:26:02 → 11:13:21);
-**10 of the 11 have matching 502 minutes**, and **179 of the day's 183 502s fall inside a flap
-window** (11 370 requests, 1.6 %). The single episode with no 502 anywhere
+**10 of the 11 have matching 502 minutes**, and **179 of the day's 184 502s fall inside a flap
+window** (13 729 requests, 1.3 %). The single episode with no 502 anywhere
 (**05:49:05→05:50:28**, 83 s) is the one consistent with the local transport class: the two
 signatures coexist, neither abolishes the other.
 
 ⚠ **The relay tally is a lagging, insensitive proxy, and two blind spots make it lossy.** The
 heartbeat arms on **2 consecutive** failures, so it never flaps on a single-minute blip (2026-10-08:
-502s at **00:09, 03:12, 03:41, 03:44** — present in the 502 record, absent from the tally), and it
-can miss a hub restart outright (**12:01**: one 502, the hub's process replaced ~12:02 — **no flap
-at all**). Reading the tally alone therefore **under-counts** hub unavailability. The instrument that
+502s at **00:09, 03:12, 03:41, 03:44, 19:52** — present in the 502 record, absent from the tally),
+and it can miss a hub restart outright (**12:01**: one 502, the hub's process replaced ~12:02 — **no
+flap at all**). Reading the tally alone therefore **under-counts** hub unavailability. The instrument that
 does not is the **ingress IIS log** (`W3SVC49/u_ex<yymmdd>.log`): `awk '$12==502'` over the
 **status / substatus / win32** columns, joined to `/health`'s `instanceId` + `uptimeSec` for process
 identity (an `instanceId` change dates the replacement exactly).
 
-**Client impact beyond the 502s.** The same 08:50:56Z replace loaded a config whose `frognano` entry
-failed Zod validation — a custom endpoint failing validation is skipped whole and warned to stderr
-*by design*, so the **frognano/mini lane was down 2.5 h** (#410). A recreate is therefore not only a
-window of 502s: it is also the instant a bad config takes effect. On ai-01 the same window sent
-clients to the walled last step of the local cascade, a 403 (#409).
+**Client impact beyond the 502s.** The 08:50:56Z restart re-read `config.json`, which carried
+`maxConcurrency: 16` — a value the image then in service (07/10) **rejects**, its Zod schema capping
+at 8. A custom endpoint that fails validation is dropped whole, with a stderr warning, by design, so
+the entire `frognano` entry was skipped and **`frognano-4b` and `mini` stayed down until the revert
+at 11:17:25Z** (#410), about 2.5 h. A restart is therefore not only a window of 502s: it is also the
+instant a config never validated against the *running* image takes effect. On ai-01 the same window
+sent clients to the walled last step of the local cascade, a 403 (#409).
 
 **Consequence, standing.** On this fleet **a relay flap is a hub-availability reading, not a local
 Docker artifact**: attribute its cause at the hub end, and never let *"impact client nul"* cover the
