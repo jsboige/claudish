@@ -42,6 +42,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { BUDGET_FOOTER_MARKER } from "./env-gate";
 
 export const BASELINE_PATH = ".test-strict-baseline.json";
 const DEFAULT_TEST_TIMEOUT_MS = 15_000;
@@ -57,6 +58,14 @@ export interface StrictBaseline {
 export interface EnvGateSummaryEntry {
   classId: string;
   notExecuted: number;
+  /**
+   * True when the class is an opt-in BUDGET class (`kind: "budget"`, #385):
+   * inactive by operator choice, so strict mode never fails it. Detected from
+   * the printed manifest (the runner never sees the EnvGateClass) — the
+   * consolidated footer must not claim a failure mode strict mode does not
+   * have.
+   */
+  budget: boolean;
 }
 
 export interface SuiteRun {
@@ -94,16 +103,27 @@ export function normalizeFailLine(line: string): string | null {
 
 /** Aggregate the per-file ENV-GATE manifests into one summary list. */
 export function parseEnvGateManifests(raw: string): EnvGateSummaryEntry[] {
-  const byClass = new Map<string, number>();
   const re = /\[ENV-GATE\] (\d+) test\(s\) NOT executed — class '([^']+)':/g;
+  const hits: Array<{ index: number; classId: string; notExecuted: number }> = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(raw)) !== null) {
-    const n = Number(m[1]);
-    byClass.set(m[2], (byClass.get(m[2]) ?? 0) + n);
+    hits.push({ index: m.index, classId: m[2], notExecuted: Number(m[1]) });
   }
-  return [...byClass.entries()]
-    .map(([classId, notExecuted]) => ({ classId, notExecuted }))
-    .sort((a, b) => b.notExecuted - a.notExecuted);
+  const byClass = new Map<string, EnvGateSummaryEntry>();
+  // The class's block runs to the NEXT header — its reason, activation and
+  // footer lines. The footer is the only place the budget kind is visible in
+  // the printed output, so the slice is what has to carry the detection.
+  hits.forEach((hit, i) => {
+    const end = i + 1 < hits.length ? hits[i + 1].index : raw.length;
+    const block = raw.slice(hit.index, end);
+    const prev = byClass.get(hit.classId);
+    byClass.set(hit.classId, {
+      classId: hit.classId,
+      notExecuted: (prev?.notExecuted ?? 0) + hit.notExecuted,
+      budget: (prev?.budget ?? false) || block.includes(BUDGET_FOOTER_MARKER),
+    });
+  });
+  return [...byClass.values()].sort((a, b) => b.notExecuted - a.notExecuted);
 }
 
 const FILE_HEADER_RE = /^(.+\.test\.[cm]?[jt]sx?):\s*$/;
@@ -276,9 +296,29 @@ function printVerdict(v: StrictVerdict, hadBaseline: boolean): void {
   line("── [STRICT] end-of-run manifest " + "─".repeat(20));
   if (v.envGates.length > 0) {
     const total = v.envGates.reduce((s, e) => s + e.notExecuted, 0);
+    const budget = v.envGates.filter((e) => e.budget);
+    const regular = v.envGates.filter((e) => !e.budget);
     line(`[STRICT] ${total} test(s) NOT executed, per environment class:`);
-    for (const e of v.envGates) line(`[STRICT]   · ${e.classId}: ${e.notExecuted}`);
-    line(`[STRICT]   (a complete machine runs them all; CLAUDISH_TEST_ENV_STRICT=1 fails them instead)`);
+    for (const e of v.envGates) {
+      line(`[STRICT]   · ${e.classId}: ${e.notExecuted}${e.budget ? " (opt-in budget — STRICT=1 never fails it)" : ""}`);
+    }
+    // The claim must match what strict mode ACTUALLY does (#385): a budget class
+    // is exempt, so a blanket "fails them instead" is false the moment one is
+    // listed — and it was, until this footer learned to read the kind off the
+    // manifest. Three cases, so the honest sentence is never approximated.
+    if (regular.length === 0) {
+      line(
+        `[STRICT]   (every class above is an opt-in budget class — each run costs real money, so a complete machine ` +
+          `deliberately does NOT run them; CLAUDISH_TEST_ENV_STRICT=1 never fails them)`,
+      );
+    } else if (budget.length === 0) {
+      line(`[STRICT]   (a complete machine runs them all; CLAUDISH_TEST_ENV_STRICT=1 fails them instead)`);
+    } else {
+      line(
+        `[STRICT]   (a complete machine runs the ${regular.length} non-budget class(es); CLAUDISH_TEST_ENV_STRICT=1 ` +
+          `fails those instead — the ${budget.length} opt-in budget class(es) are exempt by design)`,
+      );
+    }
   } else {
     line("[STRICT] 0 environment-gated tests — every class active on this machine");
   }
