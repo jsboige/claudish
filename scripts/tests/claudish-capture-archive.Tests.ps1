@@ -542,6 +542,251 @@ exit /b 0
     }
 }
 
+Describe 'Get-CapturePartialInfo (#418) — the quarantine naming needs its own selector' {
+    It 'recovers day, canonical name and tag from a tagged quarantine' {
+        $i = Get-CapturePartialInfo -Name 'captures-2026-09-30-myia-po-2024.7z.partial-20261005T004716'
+        $i.Day       | Should -Be '2026-09-30'
+        $i.Canonical | Should -Be 'captures-2026-09-30-myia-po-2024.7z'
+        $i.Tag       | Should -Be 'myia-po-2024'
+    }
+
+    It 'recovers the same facts from an untagged (legacy namespace) quarantine' {
+        $i = Get-CapturePartialInfo -Name 'captures-2026-09-30.7z.partial-20261005T004716'
+        $i.Day       | Should -Be '2026-09-30'
+        $i.Canonical | Should -Be 'captures-2026-09-30.7z'
+        $i.Tag       | Should -Be ''
+    }
+
+    It 'accepts the collision suffix the quarantine appends when a name is already taken' {
+        (Get-CapturePartialInfo -Name 'captures-2026-09-30-myia-po-2024.7z.partial-20261005T004716-2').Canonical |
+            Should -Be 'captures-2026-09-30-myia-po-2024.7z'
+    }
+
+    It 'returns nothing for a canonical archive (a live archive is never a corpse)' {
+        Get-CapturePartialInfo -Name 'captures-2026-09-30-myia-po-2024.7z' | Should -BeNullOrEmpty
+    }
+
+    It 'returns nothing for a name that is not ours (never guess before deleting)' {
+        Get-CapturePartialInfo -Name 'random.partial-20261005T004716'             | Should -BeNullOrEmpty
+        Get-CapturePartialInfo -Name 'captures-2026-09-30.7z.partial-notats'      | Should -BeNullOrEmpty
+        Get-CapturePartialInfo -Name 'captures-2026-09-30.7z.partial-20261005'    | Should -BeNullOrEmpty
+    }
+
+    It 'the canonical name it recovers is one the day parser accepts (the two must not drift)' {
+        $i = Get-CapturePartialInfo -Name 'captures-2026-09-30-myia-po-2024.7z.partial-20261005T004716'
+        Get-CaptureArchiveDay -Name $i.Canonical | Should -Be $i.Day
+    }
+}
+
+Describe 'compress-captures.ps1 quarantined-partial purge (#418)' {
+    # #322's quarantine renamed a failed pack's partial to `<name>.7z.partial-<ts>`,
+    # which structurally hides it from the `captures-*.7z` selector — the SAME
+    # selector the retention purge uses. So nothing ever removed one: the hub held
+    # a 97 MB corpse 7 days after it was written. These pin the second, narrowly
+    # scoped selector, and — just as important — that it removes ONLY provably
+    # dead weight.
+    BeforeAll {
+        $script:FakeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-fake7z-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:FakeRoot -Force | Out-Null
+        $script:Fake7z = Join-Path $script:FakeRoot 'fake7z.bat'
+        [System.IO.File]::WriteAllText($script:Fake7z, @'
+@echo off
+setlocal
+set "MODE=%~1"
+set "TARGET="
+for %%F in (%*) do if /i "%%~xF"==".7z" set "TARGET=%%~fF"
+if /i "%MODE%"=="a" goto add
+if /i "%MODE%"=="t" goto test
+exit /b 1
+:add
+if not defined TARGET exit /b 1
+echo fake> "%TARGET%"
+exit /b 0
+:test
+if not defined TARGET exit /b 2
+if not exist "%TARGET%" exit /b 2
+exit /b 0
+'@, (New-Object System.Text.ASCIIEncoding))
+        function Invoke-CompactionRun {
+            param([string]$CaptureDir, [string]$GDriveDir)
+            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+        }
+        function New-GuardSandbox {
+            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-418-{0}" -f ([guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'gd')  -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap\archive') -Force | Out-Null
+            return $tmp
+        }
+        # With zero loose files the script bails out long before the purge blocks,
+        # so every case needs one: it rides the ordinary pack path and is not the
+        # subject of these tests.
+        function Add-LooseCapture {
+            param([string]$CaptureDir, [int]$DaysBack)
+            $day = (Get-Date).ToUniversalTime().Date.AddDays(-$DaysBack).ToString('yyyy-MM-dd')
+            [System.IO.File]::WriteAllText((Join-Path $CaptureDir "req-1-1-$($day)T00-00-00.json"), 'loose')
+            return $day
+        }
+        function Add-QuarantinedPartial {
+            param([string]$CaptureDir, [string]$Day)
+            $p = Join-Path $CaptureDir "archive\captures-$($Day)-testbox.7z.partial-20261005T004716"
+            [System.IO.File]::WriteAllText($p, 'corpse')
+            return $p
+        }
+        # The off-site evidence that makes a partial removable. The sha256 must be
+        # the REAL hash: the nightly sha re-check re-hashes this file and would
+        # flag content drift (a non-zero night) on a fabricated digest.
+        function Add-OffsiteEvidence {
+            param([string]$GDriveDir, [string]$Day, [int]$Bytes, [switch]$NoManifestRecord, [int]$RecordedBytes = -1)
+            $name = "captures-$($Day)-testbox.7z"
+            $live = Join-Path $GDriveDir $name
+            [System.IO.File]::WriteAllText($live, ('v' * $Bytes))
+            if (-not $NoManifestRecord) {
+                if ($RecordedBytes -lt 0) { $RecordedBytes = $Bytes }
+                $sha  = (Get-FileHash -LiteralPath $live -Algorithm SHA256).Hash
+                $line = (@{ archive = $name; sha256 = $sha; bytes = $RecordedBytes; recorded = '2026-10-05T00:00:00Z' } | ConvertTo-Json -Compress)
+                [System.IO.File]::WriteAllText((Join-Path $GDriveDir 'captures-sha256-testbox.jsonl'), $line, (New-Object System.Text.UTF8Encoding($false)))
+            }
+        }
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:FakeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'deletes a partial whose day is confirmed off-site at the recorded size (the hub corpse, removable today)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $oldDay  = (Get-Date).ToUniversalTime().Date.AddDays(-5).ToString('yyyy-MM-dd')
+            $partial = Add-QuarantinedPartial -CaptureDir $cap -Day $oldDay
+            Add-OffsiteEvidence -GDriveDir $gd -Day $oldDay -Bytes 500
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            Test-Path -LiteralPath $partial | Should -BeFalse
+            $log | Should -Match 'QUARANTINE purge: 1 partial\(s\) deleted'
+            $LASTEXITCODE | Should -Be 0            # clearing a corpse is not a failed night
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'KEEPS a partial whose day is NOT off-site (a failed pack is exactly when the day is least safe)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $oldDay  = (Get-Date).ToUniversalTime().Date.AddDays(-5).ToString('yyyy-MM-dd')
+            $partial = Add-QuarantinedPartial -CaptureDir $cap -Day $oldDay
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd     # no off-site copy, no record
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            Test-Path -LiteralPath $partial | Should -BeTrue
+            $log | Should -Match 'QUARANTINE purge: 0 partial\(s\) deleted, 1 kept \(day not off-site\)'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'KEEPS a partial whose off-site copy has no MATCHING deposit record (size unproven)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $oldDay  = (Get-Date).ToUniversalTime().Date.AddDays(-5).ToString('yyyy-MM-dd')
+            $partial = Add-QuarantinedPartial -CaptureDir $cap -Day $oldDay
+            Add-OffsiteEvidence -GDriveDir $gd -Day $oldDay -Bytes 500 -RecordedBytes 499
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            Test-Path -LiteralPath $partial | Should -BeTrue
+            $log | Should -Match 'QUARANTINE purge: 0 partial\(s\) deleted, 0 kept \(day not off-site\), 1 kept \(no matching deposit record\)'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'never selects a live archive: the selector needs the .partial- suffix, not just the .7z prefix' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $oldDay = (Get-Date).ToUniversalTime().Date.AddDays(-5).ToString('yyyy-MM-dd')
+            Add-OffsiteEvidence -GDriveDir $gd -Day $oldDay -Bytes 500
+            # A live archive whose off-site copy exists — the retention purge's job
+            # (KeepLocalDays 0 deletes it), never this pass's.
+            [System.IO.File]::WriteAllText((Join-Path $cap "archive\captures-$($oldDay)-testbox.7z"), ('v' * 500))
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            (Get-Content (Join-Path $cap 'compaction.log') -Raw) | Should -Not -Match 'QUARANTINE purge:'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'relocates a canonical archive stranded in the capture ROOT (the same unreachable shape)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $oldDay = (Get-Date).ToUniversalTime().Date.AddDays(-5).ToString('yyyy-MM-dd')
+            Add-OffsiteEvidence -GDriveDir $gd -Day $oldDay -Bytes 500
+            $stray = Join-Path $cap "captures-$($oldDay)-testbox.7z"     # the ROOT, not archive\
+            [System.IO.File]::WriteAllText($stray, ('v' * 500))
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $log | Should -Match "RELOCATE stranded archive captures-$($oldDay)-testbox.7z"
+            Test-Path -LiteralPath $stray | Should -BeFalse          # gone from the ROOT
+            # and the ordinary retention purge reclaimed it from the archive dir
+            # (off-site copy confirmed at the same size) — count is not pinned: the
+            # night's own freshly-packed archive is local at purge time too.
+            @(Get-ChildItem (Join-Path $cap 'archive') -Filter "captures-$($oldDay)-testbox.7z" -File).Count | Should -Be 0
+            $log | Should -Match 'PURGE retention=0d: [1-9][0-9]* local archive\(s\) deleted'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'leaves a stranded archive alone when the run does not own its name (never guess)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $oldDay = (Get-Date).ToUniversalTime().Date.AddDays(-5).ToString('yyyy-MM-dd')
+            $stray = Join-Path $cap "captures-$($oldDay)-someothermachine.7z"
+            [System.IO.File]::WriteAllText($stray, 'not ours')
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            Test-Path -LiteralPath $stray | Should -BeTrue
+            (Get-Content (Join-Path $cap 'compaction.log') -Raw) | Should -Not -Match 'RELOCATE'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'refuses to relocate onto a namesake instead of overwriting it (never a silent merge)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $oldDay = (Get-Date).ToUniversalTime().Date.AddDays(-5).ToString('yyyy-MM-dd')
+            $stray = Join-Path $cap "captures-$($oldDay)-testbox.7z"
+            [System.IO.File]::WriteAllText($stray, 'root copy')
+            $namesake = Join-Path $cap "archive\captures-$($oldDay)-testbox.7z"
+            [System.IO.File]::WriteAllText($namesake, 'archive copy')
+            # A different-size off-site copy makes the re-upload pass REFUSE (#208)
+            # and the retention purge skip, so the namesake stays on disk for this
+            # assertion — the point is that the relocation did not clobber it.
+            [System.IO.File]::WriteAllText((Join-Path $gd "captures-$($oldDay)-testbox.7z"), ('z' * 999))
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $log | Should -Match 'WARN  stranded archive .* has a namesake in the archive dir'
+            Test-Path -LiteralPath $stray | Should -BeTrue
+            (Get-Content -LiteralPath $namesake -Raw) | Should -Be 'archive copy'   # untouched, not merged
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'wiring: the quarantine selector is the .partial- suffix, and the proof runs BEFORE the delete' {
+        $text  = Get-Content -LiteralPath $script:ScriptPath -Raw
+        $start = $text.IndexOf('quarantined-partial purge')
+        $sel   = $text.IndexOf("-Filter 'captures-*.7z.partial-*'", $start)
+        $guard = $text.IndexOf('$qRec.bytes -ne $qDestItem.Length', $start)
+        $del   = $text.IndexOf('Remove-Item -LiteralPath $q.FullName -Force', $start)
+        $start | Should -BeGreaterThan 0
+        $sel   | Should -BeGreaterThan 0
+        $guard | Should -BeGreaterThan 0
+        $del   | Should -BeGreaterThan 0
+        $guard | Should -BeLessThan $del
+    }
+}
+
 Describe 'off-site sha256 manifest (#389) — engine functions' {
     It 'names the manifest per machine tag, mirroring the archive-name namespace' {
         Get-ShaManifestPath -GDriveDir 'G:\shared' -MachineTag 'po-2024' |
@@ -753,8 +998,10 @@ exit /b 0
         $purge | Should -BeGreaterThan $chk
     }
 
-    It 'wiring: the sha-deposit consult (Get-ShaManifestPath) exists at BOTH upload sites' {
+    It 'wiring: the sha-deposit consult (Get-ShaManifestPath) exists at every site that needs it' {
         $text = Get-Content -LiteralPath $script:ScriptPath -Raw
-        @([regex]::Matches($text, 'Get-ShaManifestPath')).Count | Should -Be 3   # 2 deposits + 1 re-check
+        # 2 deposits (fresh + re-upload) + 2 readers (the nightly re-check, and the
+        # #418 quarantine purge, which reuses the deposit record as its proof).
+        @([regex]::Matches($text, 'Get-ShaManifestPath')).Count | Should -Be 4
     }
 }
