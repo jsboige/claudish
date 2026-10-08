@@ -372,6 +372,11 @@ const realCcOptIn = process.env.CLAUDISH_E2E_REAL_CC === "1";
 envDescribe({
   id: "real-cc-e2e",
   active: realCcOptIn && claudeAvailable,
+  // kind "budget": inactive by operator choice when CLAUDISH_E2E_REAL_CC is
+  // unset — each run spends real model budget, so strict mode must not
+  // mandate it and the manifest footer must not claim a complete machine
+  // would run these (#385 review follow-up).
+  kind: "budget",
   reason: realCcOptIn
     ? "binaire `claude` introuvable sur PATH"
     : "appel modèle réel — opt-in budget : chaque exécution lance un `claude -p` complet sur l'endpoint de la machine sans demande de l'opérateur",
