@@ -10,13 +10,18 @@
  *     crash the proxy);
  *   - bare names gate on the PARSED model id, explicit provider@model forms
  *     gate on an EXACT raw match — "or@swift-1.5-27b" must NOT ride an
- *     allowlisted id onto a different transport.
+ *     allowlisted id onto a different transport;
+ *   - a malformed maxConcurrency skips the entry (fail closed) — an unreadable
+ *     cap must never read as "unlimited".
  */
 import { describe, expect, it } from "bun:test";
 import type { ClaudishProfileConfig } from "../../profile-config.js";
 import {
+  acquireInboundSlot,
+  inboundInFlight,
   inboundModelAllowed,
   matchesInboundKey,
+  releaseInboundSlot,
   resolveInboundKeys,
   type InboundKeyEntry,
 } from "./inbound-keys.js";
@@ -144,5 +149,98 @@ describe("inboundModelAllowed — allowlist semantics", () => {
   it("an unparsable model name is refused, never thrown", () => {
     expect(() => inboundModelAllowed(e, "///@@@")).not.toThrow();
     expect(inboundModelAllowed(e, "///@@@")).toBe(false);
+  });
+});
+
+// ── Per-key in-flight cap (ASK FROGNANO-ACCESS 08/10) ────────────────────────
+// The cap exists so an external consumer cannot saturate the local GPU models
+// and starve the fleet's own lanes. Two properties are load-bearing:
+//   - an ABSENT cap is uncapped (`undefined`, byte-identical to pre-cap code);
+//   - a MALFORMED cap is refused (the entry is skipped), never degraded to
+//     "unlimited" — fail closed, same doctrine as the unresolvable ${VAR}.
+
+describe("maxConcurrency parsing (#400)", () => {
+  const withCap = (maxConcurrency: unknown) =>
+    resolveInboundKeys(
+      cfg({ external: { key: "scoped-secret", allowModels: VLLM_ALLOW, maxConcurrency } }),
+      ["fleet"]
+    );
+
+  it("an absent cap yields an entry with NO maxConcurrency key at all (uncapped default)", () => {
+    const entries = resolveInboundKeys(
+      cfg({ external: { key: "scoped-secret", allowModels: VLLM_ALLOW } }),
+      ["fleet"]
+    );
+    expect(entries[0]?.maxConcurrency).toBeUndefined();
+    // The field is omitted, not set to undefined — callers spread the object.
+    expect("maxConcurrency" in entries[0]!).toBe(false);
+  });
+
+  it("accepts a positive integer, and a numeric string (config files are JSON-read generously)", () => {
+    expect(withCap(2)[0]?.maxConcurrency).toBe(2);
+    expect(withCap("3")[0]?.maxConcurrency).toBe(3);
+    expect(withCap(1)[0]?.maxConcurrency).toBe(1);
+  });
+
+  it("REFUSES a malformed cap by skipping the entry — never silently unlimited", () => {
+    for (const bad of [0, -1, 1.5, "abc", "", null, {}, []]) {
+      const entries = withCap(bad);
+      expect(entries).toHaveLength(0);
+    }
+  });
+});
+
+describe("acquire/release in-flight slots (#400)", () => {
+  // Names are unique per test: the counters are module-level process state, so
+  // a shared name would let one test's leak read as another test's defect.
+  it("an uncapped entry always acquires and is never counted", () => {
+    const e = entry({ name: "uncapped", maxConcurrency: undefined });
+    for (let i = 0; i < 10; i++) expect(acquireInboundSlot(e)).toBe(true);
+    expect(inboundInFlight("uncapped")).toBe(0);
+  });
+
+  it("a capped entry admits exactly `cap` slots, then refuses", () => {
+    const e = entry({ name: "cap-2", maxConcurrency: 2 });
+    expect(acquireInboundSlot(e)).toBe(true);
+    expect(acquireInboundSlot(e)).toBe(true);
+    expect(inboundInFlight("cap-2")).toBe(2);
+    expect(acquireInboundSlot(e)).toBe(false); // at cap — the 429 path
+    expect(inboundInFlight("cap-2")).toBe(2);  // a refused acquire never counts
+  });
+
+  it("a release frees the slot for the next request", () => {
+    const e = entry({ name: "cap-1", maxConcurrency: 1 });
+    expect(acquireInboundSlot(e)).toBe(true);
+    expect(acquireInboundSlot(e)).toBe(false);
+    releaseInboundSlot("cap-1");
+    expect(inboundInFlight("cap-1")).toBe(0);
+    expect(acquireInboundSlot(e)).toBe(true);
+    releaseInboundSlot("cap-1");
+  });
+
+  it("release is a no-op on an unknown name or an empty count — a double release never mints a free slot", () => {
+    releaseInboundSlot("never-acquired"); // must not throw
+    expect(inboundInFlight("never-acquired")).toBe(0);
+
+    const e = entry({ name: "cap-1-dup", maxConcurrency: 1 });
+    expect(acquireInboundSlot(e)).toBe(true);
+    releaseInboundSlot("cap-1-dup");
+    releaseInboundSlot("cap-1-dup"); // extra release: no negative count
+    expect(inboundInFlight("cap-1-dup")).toBe(0);
+
+    // The proof it did not go negative: cap 1 still admits exactly ONE.
+    expect(acquireInboundSlot(e)).toBe(true);
+    expect(acquireInboundSlot(e)).toBe(false);
+    releaseInboundSlot("cap-1-dup");
+  });
+
+  it("two keys never share a cap", () => {
+    const a = entry({ name: "iso-a", maxConcurrency: 1 });
+    const b = entry({ name: "iso-b", maxConcurrency: 1 });
+    expect(acquireInboundSlot(a)).toBe(true);
+    expect(acquireInboundSlot(b)).toBe(true); // b is unaffected by a being at cap
+    expect(acquireInboundSlot(a)).toBe(false);
+    releaseInboundSlot("iso-a");
+    releaseInboundSlot("iso-b");
   });
 });

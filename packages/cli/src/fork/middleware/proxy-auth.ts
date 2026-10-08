@@ -16,9 +16,12 @@ import type { MiddlewareHandler } from "hono";
 import { wrapAnthropicError } from "../../handlers/shared/anthropic-error.js";
 import { matchesProxyKey } from "../../handlers/shared/proxy-keys.js";
 import {
+  acquireInboundSlot,
+  inboundInFlight,
   inboundModelAllowed,
   matchesInboundKey,
   markInboundKey,
+  releaseInboundSlot,
   type InboundKeyEntry,
 } from "../../handlers/shared/inbound-keys.js";
 import { logStderr } from "../../logger.js";
@@ -75,7 +78,39 @@ export function createProxyAuthMiddleware(
             403
           );
         }
-        return await next();
+        // Per-key in-flight cap (ASK FROGNANO-ACCESS): acquired BEFORE the
+        // handler does any work. Wording deliberately avoids every word
+        // `isQuotaExhaustion` arms on (quota/credit/balance/weekly/exhaust/
+        // usage limit/plan limit/"exceed your account") — a per-key cap must
+        // never divert the fleet's failover. Pinned by test.
+        if (!acquireInboundSlot(scoped)) {
+          logStderr(
+            `[InboundKey] concurrency cap reached key=${scoped.name} cap=${scoped.maxConcurrency} inFlight=${inboundInFlight(scoped.name)}`
+          );
+          return c.json(
+            wrapAnthropicError(
+              429,
+              `[InboundKey] key '${scoped.name}' already has ${scoped.maxConcurrency} request(s) in flight — retry shortly`,
+              "rate_limit_error"
+            ),
+            429
+          );
+        }
+        // Release on completion. SSE bodies outlive this middleware, so they are
+        // released by the stream tracker's end/cancel hooks instead; everything
+        // else (JSON responses, errors, throws) is done by the time next()
+        // returns — including the 403 above, which returns before acquiring.
+        try {
+          await next();
+        } catch (err) {
+          releaseInboundSlot(scoped.name);
+          throw err;
+        }
+        const contentType = c.res?.headers.get("content-type") ?? "";
+        if (!contentType.includes("text/event-stream")) {
+          releaseInboundSlot(scoped.name);
+        }
+        return;
       }
     }
 
