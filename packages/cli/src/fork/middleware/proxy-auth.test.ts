@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { createProxyAuthMiddleware } from "./proxy-auth.js";
+import { createProxyAuthMiddleware, collectRoutedBareNames } from "./proxy-auth.js";
 import { matchesProxyKey, resolveProxyKeys } from "../../handlers/shared/proxy-keys.js";
 import {
   inboundInFlight,
@@ -10,9 +10,13 @@ import {
 import { createStreamTracker } from "../server/stream-registry.js";
 import { isQuotaExhaustion } from "../failover.js";
 
-function buildApp(keys: string[], inboundKeys: InboundKeyEntry[] = []): Hono {
+function buildApp(
+  keys: string[],
+  inboundKeys: InboundKeyEntry[] = [],
+  routedBareNames: ReadonlySet<string> = new Set()
+): Hono {
   const app = new Hono();
-  app.use("/v1/*", createProxyAuthMiddleware(keys, inboundKeys));
+  app.use("/v1/*", createProxyAuthMiddleware(keys, inboundKeys, routedBareNames));
   app.post("/v1/messages", (c) => c.json({ ok: true }));
   app.get("/v1/models", (c) => c.json({ ok: true }));
   return app;
@@ -332,5 +336,76 @@ describe("proxy-auth middleware — per-key concurrency cap (#400)", () => {
 
     openStreams[0]!();
     await draining;
+  });
+});
+
+// ── #410 — the native exemption must not serve routed bare names ────────────
+// Measured on the live hub: a POST with NO auth header and a bare name that
+// resolves via routing/customEndpoints (frognano-4b, mini, local-fast…) was
+// served with the cluster's stored credentials, because parseModelSpec
+// defaults family-unknown bare names to "native-anthropic" and the pass-through
+// exemption skipped the key check. The exemption stays for claude-* and other
+// non-routed names; routed bare names fall through to the proxy-key check.
+describe("proxy-auth middleware — routed bare names off the native exemption (#410)", () => {
+  const fleetKeys = ["fleet-key"];
+  const routed = new Set(["frognano-4b", "mini", "local-fast", "swift-1.5-27b"]);
+  const build = (inboundKeys: InboundKeyEntry[] = []) =>
+    buildApp(fleetKeys, inboundKeys, routed);
+
+  it("a routed bare name with NO credential is a plain 401 — the measured hole, closed", async () => {
+    const app = build();
+    for (const model of ["frognano-4b", "mini", "local-fast"]) {
+      const res = await post(app, {}, model);
+      expect(res.status).toBe(401);
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toContain("invalid proxy authentication");
+    }
+  });
+
+  it("a routed bare name still serves with the fleet key", async () => {
+    const app = build();
+    expect((await post(app, { "x-proxy-key": "fleet-key" }, "frognano-4b")).status).toBe(200);
+  });
+
+  it("a scoped key naming its allowlisted routed model passes (#402 becomes reachable once #410 loads it)", async () => {
+    const scoped: InboundKeyEntry[] = [
+      { name: "external", key: "scoped-secret", allowModels: ["frognano-4b", "mini"] },
+    ];
+    const app = build(scoped);
+    expect((await post(app, { "x-api-key": "scoped-secret" }, "frognano-4b")).status).toBe(200);
+    // Non-allowlisted stays the labeled 403 even though glm-5.3 is family-known.
+    expect((await post(app, { "x-api-key": "scoped-secret" }, "glm-5.3")).status).toBe(403);
+  });
+
+  it("the native passthrough itself is untouched: claude-* and unknown bare names stay exempt", async () => {
+    const app = build();
+    // claude-* is what the exemption exists for (OAuth / proxy-key swap).
+    expect((await post(app, {}, "claude-opus-5-5")).status).toBe(200);
+    // An unknown bare name is NOT routed anywhere — it stays exempt and the
+    // native lane refuses it downstream ("not served on this proxy").
+    expect((await post(app, {}, "zzz-nope")).status).toBe(200);
+    // Explicit native form, belt and braces.
+    expect((await post(app, {}, "anthropic/claude-opus-5")).status).toBe(200);
+  });
+});
+
+describe("collectRoutedBareNames (#410)", () => {
+  it("unions routing-map keys and custom-endpoint model ids, dropping non-strings", () => {
+    const names = collectRoutedBareNames({
+      routing: { mini: ["frognano@mini"], "glm-5.3": ["gc@glm-5.3"] },
+      customEndpoints: {
+        frognano: { models: ["frognano-4b", "mini"] },
+        vllm: { models: ["qwen3.6-35b-a3b", 7, null] },
+        keyless: { url: "http://x" },
+      },
+    });
+    expect([...names].sort()).toEqual(
+      ["frognano-4b", "glm-5.3", "mini", "qwen3.6-35b-a3b"].sort()
+    );
+  });
+
+  it("empty/absent config yields an empty set", () => {
+    expect(collectRoutedBareNames({}).size).toBe(0);
+    expect(collectRoutedBareNames({ routing: {}, customEndpoints: {} }).size).toBe(0);
   });
 });

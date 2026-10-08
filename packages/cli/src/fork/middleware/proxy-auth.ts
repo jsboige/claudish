@@ -26,10 +26,34 @@ import {
 } from "../../handlers/shared/inbound-keys.js";
 import { logStderr } from "../../logger.js";
 import { parseModelSpec } from "../../providers/model-parser.js";
+import type { ClaudishProfileConfig } from "../../profile-config.js";
+
+/**
+ * #410 — the bare model names that leave the native lane: routing-map keys
+ * plus custom-endpoint model ids. Custom-endpoint ids are family-unknown by
+ * construction, so parseModelSpec defaults them to "native-anthropic"; without
+ * this set the pass-through exemption would serve them with the cluster's
+ * stored credentials (measured: no-auth model=frognano-4b → 200).
+ */
+export function collectRoutedBareNames(
+  config: Pick<ClaudishProfileConfig, "routing" | "customEndpoints">
+): Set<string> {
+  return new Set<string>([
+    ...Object.keys(config.routing ?? {}),
+    ...Object.values(config.customEndpoints ?? {}).flatMap((ep) =>
+      ep && typeof ep === "object" && Array.isArray((ep as { models?: unknown }).models)
+        ? (ep as { models: unknown[] }).models.filter(
+            (m): m is string => typeof m === "string" && m.length > 0
+          )
+        : []
+    ),
+  ]);
+}
 
 export function createProxyAuthMiddleware(
   proxyKeys: string[],
-  inboundKeys: InboundKeyEntry[] = []
+  inboundKeys: InboundKeyEntry[] = [],
+  routedBareNames: ReadonlySet<string> = new Set()
 ): MiddlewareHandler {
   return async (c, next) => {
     if (c.req.method === "GET") {
@@ -117,9 +141,18 @@ export function createProxyAuthMiddleware(
     // Anthropic pass-through: skip proxy key validation entirely.
     // NativeHandler will either swap proxyKey → stored Anthropic key,
     // or pass the client's OAuth token through unchanged.
+    //
+    // #410 — the exemption is for the Anthropic lane ONLY. parseModelSpec
+    // defaults every family-unknown bare name to "native-anthropic", but the
+    // handler then resolves such a name through routing/customEndpoints to a
+    // remote handler running with the CLUSTER's stored credentials — so
+    // without this guard, every routed bare name (frognano-4b, mini,
+    // local-fast, …) was served with no credential at all (measured: no-auth
+    // POST /v1/messages model=frognano-4b → 200). Explicit provider@model
+    // forms never parsed as native and are unaffected.
     if (model) {
       const spec = parseModelSpec(model);
-      if (spec.provider === "native-anthropic") {
+      if (spec.provider === "native-anthropic" && !routedBareNames.has(model)) {
         return await next();
       }
     }
