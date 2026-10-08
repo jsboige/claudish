@@ -7,6 +7,7 @@ Planned-but-unimplemented work — the SEP-1686 channel migration, optional `not
 | Topic | Full reference |
 |---|---|
 | Routing syntax, provider shortcuts, `defaultProvider`, custom endpoints, vendor prefixes, local models | `docs/settings-reference.md` (§5–§7.5, §9, §12) |
+| Scoped inbound keys (`inboundKeys` — external consumers, allowlist-only access, per-key capture attribution) | `docs/settings-reference.md` §7.6 |
 | Three-layer adapter architecture (class-name Rosetta stone, per-layer detail) | `docs/three-layer-architecture.md` |
 | `stream:false`, inline system messages, body capture, debug logging, translation-debugging workflow | `docs/reference/proxy-pipeline-notes.md` |
 | Web search interception paths, SearXNG/MCP fallback chains, components | `docs/reference/web-search-interception.md` |

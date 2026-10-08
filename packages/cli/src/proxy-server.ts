@@ -52,7 +52,7 @@ import { loadCustomEndpoints } from "./providers/custom-endpoints-loader.js";
 import { getRuntimeProviders } from "./providers/runtime-providers.js";
 import { loadConfig } from "./profile-config.js";
 import { createStreamTracker, stallThresholdMs } from "./fork/server/stream-registry";
-import { registerForkExtensions, stripBillingHeaderFromBody, logRequest, createHostnameConfig } from "./fork/index.js";
+import { registerForkExtensions, resolveInboundKeys, stripBillingHeaderFromBody, logRequest, createHostnameConfig } from "./fork/index.js";
 import { forwardToUpstream, readRequestBody, relayHealthFields, requestLoopedBack, HOPS_HEADER, type RelayState } from "./fork/server/relay.js";
 import { getInstanceId } from "./instance-id.js";
 import {
@@ -476,6 +476,13 @@ export async function createProxyServer(
     process.env.CLAUDISH_PROXY_KEY || loadedConfig.proxyKey,
     process.env.CLAUDISH_PROXY_KEY_PREVIOUS || loadedConfig.proxyKeyPrevious
   );
+
+  // #400 — scoped inbound keys (external consumers): same ingress as the proxy
+  // key but gated to an allowlist of models, so subscriptions stay
+  // fleet-internal. Same lifecycle as customEndpoints: config read once per
+  // proxy lifetime (bind-mounted config.json, picked up at restart/recreate).
+  // Invalid entries were already warned+skipped inside the resolver.
+  const inboundKeys = resolveInboundKeys(loadedConfig, proxyKeys);
 
   // Budget failover config (fork extension). Inert with no CLAUDISH_FAILOVER_*
   // env; when set, diverts a whole role to another pool and announces it at the
@@ -1587,7 +1594,7 @@ export async function createProxyServer(
   });
 
   // Fork extensions: proxy auth + model discovery
-  registerForkExtensions(app, { proxyKeys });
+  registerForkExtensions(app, { proxyKeys, inboundKeys });
 
   app.get("/", (c) =>
     c.json({

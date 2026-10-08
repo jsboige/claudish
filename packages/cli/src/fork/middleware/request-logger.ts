@@ -9,6 +9,7 @@
 
 import { mkdirSync } from "fs";
 import { writeFile } from "fs/promises";
+import { inboundKeyFor } from "../../handlers/shared/inbound-keys.js";
 
 // Capture writes are FIRE-AND-FORGET on purpose. The old writeFileSync stalled the
 // ENTIRE event loop on every request (Bun is single-threaded) — over a Docker
@@ -151,6 +152,11 @@ export function logRequest(
   // the capture side is what the traffic-*.ps1 analysis scripts attribute by.
   const machine = req.headers.get("x-claudish-machine") || "";
 
+  // #400 — scoped inbound keys attribute by KEY NAME, not IP (an external's IP
+  // is dynamic; the name is stable and revocation-scoped). Marked by the auth
+  // middleware off the same raw Request object.
+  const inboundKey = inboundKeyFor(req);
+
   // Assign the request number at INGESTION, unconditionally: the parsers and
   // response-capture resolve it through requestNumberFor/reqNumberMap, and the
   // [ttft]/[resp] markers must label the request that spawned them even when
@@ -166,7 +172,7 @@ export function logRequest(
     const safeSrc = src.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40);
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const file = `${captureDir}/req-${process.pid}-${String(n).padStart(4, "0")}-${ts}-${safeSrc}.json`;
-    const payload = JSON.stringify({ ts, src, machine, model, pid: process.pid, ...extractAttributionFields(body), body });
+    const payload = JSON.stringify({ ts, src, machine, ...(inboundKey ? { inbound_key: inboundKey } : {}), model, pid: process.pid, ...extractAttributionFields(body), body });
     // Never block the request path: fire-and-forget with a silent catch.
     writeFile(file, payload).catch((e) => {
       process.stdout.write(`  [capture] error: ${String(e)}\n`);
@@ -179,6 +185,10 @@ export function logRequest(
   const maxTokens = body.max_tokens ?? "-";
   const machineTag = machine ? ` machine=${machine}` : "";
   process.stdout.write(
+    // NOTE: this line is a PINNED consumer contract (claudish_traffic REQUEST_RE +
+    // __fixtures__/traffic-format) — the scoped-key attribution (#400) deliberately
+    // does NOT add a tag here; it lives in the capture envelope (inbound_key),
+    // which is what the traffic-*.ps1 scripts attribute by.
     `[claudish] [Request] model=${model} handler=${handlerName} src=${src} ${stream} msgs=${msgs} max_tokens=${maxTokens}${machineTag} ua=${ua.slice(0, 80)}\n`
   );
 
