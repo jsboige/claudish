@@ -87,12 +87,15 @@ PICKER_BASH = [
     ("branch_inventory", re.compile(r"\bgit\s+(?:worktree\s+list|branch\s+-a)\b")),
 ]
 # A `view <N>` names a concrete target — the selection-shape signal (#328 G3
-# suite). Declared limit: a view right after `gh pr create` may just be the
-# lane checking its OWN fresh PR; the bias is the same instrument both months,
-# so it cancels in the July-vs-September comparison (same argument as the
-# published counter), but a single-month `named` share is a proxy, never a
-# dispatch join — that join is G2's to make.
+# suite). Measured bias (not assumed): a view right after `gh pr create` is
+# often the lane checking its OWN fresh PR. Those are isolated as `selfcheck`
+# (numbered view within SELFCHECK_MIN of a pr-create END) and every window
+# also carries a `pure` class recomputed without them — the report prints both
+# shares so the July-vs-September trend can be read with and without the bias.
+# A single-month `named` share is a proxy, never a dispatch join — that join
+# is G2's to make.
 RE_NUMBERED_VIEW = re.compile(r"\bgh\s+(?:issue|pr)\s+view\s+\d")
+SELFCHECK_MIN = 10
 PICKER_MCP = {"mcp__roo-state-manager__roosync_search",
               "mcp__roo-state-manager__conversation_browser"}
 RE_BACKLOG_PATH = re.compile(r"backlog|ledger|issue-debt|roadmap|open-questions", re.I)
@@ -200,10 +203,14 @@ def windows(bounds, events):
     An END with no following START in its file ends at the session boundary and
     is DROPPED, never counted as an infinite window. Returns windows
     [(end_dt, start_dt, picker Counter, total_picker, first_picker_dt|None, ws,
-    class)] plus the dropped count. `class` is the selection SHAPE of the
-    window: 'named' (>=1 numbered `view <N>` — a concrete target was on the
-    lane's mind), 'scan' (picker calls but no numbered view — the grain was
-    searched for), 'direct' (no picker call at all)."""
+    class, end_detail, pure_class, (n_numbered, n_selfcheck))] plus the dropped
+    count. `class` is the selection SHAPE of the window: 'named' (>=1 numbered
+    `view <N>` — a concrete target was on the lane's mind), 'scan' (picker
+    calls but no numbered view — the grain was searched for), 'direct' (no
+    picker call at all). `pure_class` recomputes the shape EXCLUDING
+    self-checks (numbered views ≤ SELFCHECK_MIN after a `gh pr create` END —
+    the lane verifying its own fresh PR), so the report can show the trend
+    with and without that bias."""
     pickers = defaultdict(list)
     for e in events:
         if e[1] == "PICKER":
@@ -223,10 +230,25 @@ def windows(bounds, events):
                 win = [p for p in pickers[f] if pending[0] < p[0] < b[0]]
                 cnt = Counter(p[2] for p in win)
                 total = sum(cnt.values())
-                named = any(len(p) > 5 and p[5] for p in win)
+                numbered = [p for p in win if len(p) > 5 and p[5]]
+                named = bool(numbered)
+                # Self-check isolation (#328 G3 suite): a numbered view in a
+                # window whose END was `gh pr create`, within SELFCHECK_MIN of
+                # that END, is the lane checking its OWN fresh PR — not naming
+                # its next target. Dashboard-END windows are the built-in
+                # control: nothing was created there, so their numbered views
+                # are picks by construction.
+                selfcheck = [
+                    p for p in numbered
+                    if pending[2] == "gh pr create"
+                    and (p[0] - pending[0]).total_seconds() <= SELFCHECK_MIN * 60
+                ]
+                pure_named = len(numbered) > len(selfcheck)
                 wclass = "direct" if total == 0 else ("named" if named else "scan")
+                pure = "direct" if total == 0 else ("named" if pure_named else "scan")
                 first = min((p[0] for p in win), default=None)
-                out.append((pending[0], b[0], cnt, total, first, b[3], wclass))
+                out.append((pending[0], b[0], cnt, total, first, b[3], wclass,
+                            pending[2], pure, (len(numbered), len(selfcheck))))
                 pending = None
         if pending is not None:
             dropped += 1
@@ -293,10 +315,10 @@ def main(argv=None):
         if not mw:
             print("  no windows")
             continue
-        deltas = [(s - e).total_seconds() / 60 for e, s, _, _, _, _, _ in mw]
-        counts = [c for _, _, _, c, _, _, _ in mw]
+        deltas = [(s - e).total_seconds() / 60 for e, s, *_ in mw]
+        counts = [c for _, _, _, c, *_ in mw]
         acts = [((s - fp).total_seconds() / 60 if fp else 0.0)
-                for e, s, _, _, fp, _, _ in mw]
+                for e, s, _, _, fp, *_ in mw]
         withp = sum(1 for c in counts if c > 0)
         reopened = sum(1 for d in deltas if d > 360)
         # p50-of-effort semantics (coordinator's follow-up, 06/10): TWO
@@ -324,7 +346,7 @@ def main(argv=None):
         print(f"  delta when a picker call exists (n={withp}): "
               f"p50={pct(deltas_with,.5):.0f}")
         cls = Counter()
-        for _, _, c, _, _, _, _ in mw:
+        for _, _, c, *_ in mw:
             cls.update(c)
         print("  picker class mix      : " + ", ".join(f"{k}:{v}" for k, v in cls.most_common()))
         bws = defaultdict(int)
@@ -342,6 +364,19 @@ def main(argv=None):
             print(f"    {wclass:7}: {len(sub):3} ({100*len(sub)/len(mw):3.0f}%) | "
                   f"calls/window mean={sum(sc)/len(sc):4.1f} p50={pct(sc,.5):3.0f} "
                   f"p90={pct(sc,.9):3.0f} | delta p50={pct(sd,.5):3.0f} min")
+        # Self-check bias (#328 G3): numbered views that are plausibly the lane
+        # verifying its own fresh PR. Printed with the purified named share so
+        # the between-months trend can be read with AND without the bias — the
+        # bias is measured, never assumed to cancel.
+        nv = sum(w[9][0] for w in mw)
+        sc_n = sum(w[9][1] for w in mw)
+        n_named = sum(1 for w in mw if w[6] == "named")
+        n_pure = sum(1 for w in mw if w[8] == "named")
+        print(f"  self-check bias        : numbered views {nv}, of which "
+              f"≤{SELFCHECK_MIN:g}min-after-gh-pr-create {sc_n} "
+              f"({(100*sc_n/nv if nv else 0):.0f}% of views)")
+        print(f"    named windows       : {n_named} ({100*n_named/len(mw):.0f}%) "
+              f"→ excluding self-checks {n_pure} ({100*n_pure/len(mw):.0f}%)")
     print(f"\n  [scope] files under {a.projects_dir}; July is single-machine (see docstring)")
 
 
