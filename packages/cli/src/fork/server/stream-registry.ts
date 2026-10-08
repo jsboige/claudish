@@ -95,6 +95,7 @@
  */
 
 import type { Context, MiddlewareHandler } from "hono";
+import { inboundKeyFor, releaseInboundSlot } from "../../handlers/shared/inbound-keys.js";
 
 export interface StreamTracker {
   /** Hono middleware — mount with `app.use("*", tracker.middleware)`. */
@@ -168,12 +169,21 @@ export function createStreamTracker(): StreamTracker {
     if (!body) return;
     if (!(res.headers.get("content-type") || "").includes(SSE_CONTENT_TYPE)) return;
 
+    // A scoped inbound key that holds one of its in-flight slots (acquired in
+    // the auth middleware) keeps it until THIS stream ends — close, cancel, or
+    // upstream death. Non-SSE responses are released by the middleware itself,
+    // so this branch and that one are disjoint by content-type. The mark is
+    // read here, after next(): the auth middleware set it during the chain.
+    const inboundKeyName = inboundKeyFor(c.req.raw);
     activeStreams++;
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
       activeStreams--;
+      // Free the key's slot on every terminal path — a stream that ends by any
+      // means must not leak a slot, or the cap would ratchet shut over time.
+      if (inboundKeyName) releaseInboundSlot(inboundKeyName);
       // A stream ending IS progress: without this, the last stream to finish
       // would leave a stale stamp behind for the next one to be judged on.
       lastProgressAt = Date.now();

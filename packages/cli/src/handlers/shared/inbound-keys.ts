@@ -34,6 +34,14 @@ export interface InboundKeyEntry {
   key: string;
   /** Model ids this key may serve (raw allowlist, compared per the semantics above). */
   allowModels: string[];
+  /**
+   * Optional per-key in-flight cap (ASK FROGNANO-ACCESS 08/10: an external
+   * consumer must not saturate the local GPUs and starve the fleet's own
+   * lanes). `undefined` = uncapped; any configured value is a POSITIVE
+   * INTEGER and is enforced fail-closed — a malformed value skips the entry
+   * rather than silently granting unlimited concurrency.
+   */
+  maxConcurrency?: number;
 }
 
 /**
@@ -76,7 +84,9 @@ export function resolveInboundKeys(
   const seenKeyValues = new Set<string>(proxyKeys); // full-access values are pre-taken
 
   for (const [name, value] of Object.entries(raw)) {
-    const v = value as { key?: unknown; allowModels?: unknown } | undefined;
+    const v = value as
+      | { key?: unknown; allowModels?: unknown; maxConcurrency?: unknown }
+      | undefined;
     const skip = (why: string): void => {
       // logStderr, not console.error: must reach the durable log file (218c3586).
       logStderr(`[claudish] inboundKeys['${name}'] skipped: ${why}`);
@@ -96,12 +106,24 @@ export function resolveInboundKeys(
       skip("allowModels missing/empty — a scoped key with no reachable model is a config error");
       continue;
     }
+    let maxConcurrency: number | undefined;
+    if (v?.maxConcurrency !== undefined) {
+      const n =
+        typeof v.maxConcurrency === "number" ? v.maxConcurrency : Number(v.maxConcurrency);
+      // Fail closed: an unreadable cap must never degrade to "unlimited" — a
+      // malformed cap is a config error and the entry is refused loudly.
+      if (!Number.isInteger(n) || n < 1) {
+        skip(`maxConcurrency must be a positive integer (got ${JSON.stringify(v.maxConcurrency)})`);
+        continue;
+      }
+      maxConcurrency = n;
+    }
     if (seenKeyValues.has(key)) {
       skip("key value already used by a full-access proxy key or another inbound key");
       continue;
     }
     seenKeyValues.add(key);
-    entries.push({ name, key, allowModels });
+    entries.push({ name, key, allowModels, ...(maxConcurrency !== undefined ? { maxConcurrency } : {}) });
   }
   return entries;
 }
@@ -125,6 +147,50 @@ export function inboundModelAllowed(entry: InboundKeyEntry, model: string): bool
   } catch {
     return false;
   }
+}
+
+// ─── Per-key in-flight accounting (ASK FROGNANO-ACCESS 08/10) ───
+// The cap exists so an external consumer cannot saturate the two local GPU
+// models and starve the fleet's own lanes. Acquire happens in the auth
+// middleware (pre-handler, where the key is known); release happens on the
+// response lifecycle — immediately for a non-SSE response, on stream
+// close/cancel for SSE (the tracker's `finish()`).
+//
+// Deliberately module-level process state, like the stream registry's counters:
+// one proxy process owns one fleet's worth of inbound keys, and the counters
+// must be shared across requests. Keyed by the config-declared NAME (unique by
+// construction — duplicate values are refused at resolve time).
+
+const inFlightByKey = new Map<string, number>();
+
+/**
+ * Take one in-flight slot. Uncapped entries always succeed. Returns false when
+ * the cap is already reached — the caller answers 429 and MUST NOT release.
+ */
+export function acquireInboundSlot(entry: InboundKeyEntry): boolean {
+  const cap = entry.maxConcurrency;
+  if (cap === undefined) return true;
+  const current = inFlightByKey.get(entry.name) ?? 0;
+  if (current >= cap) return false;
+  inFlightByKey.set(entry.name, current + 1);
+  return true;
+}
+
+/**
+ * Release one slot. Idempotent-ish by design: an unknown name or a zero count
+ * is a no-op, so a double release can never drive a live count negative and
+ * hand out free slots.
+ */
+export function releaseInboundSlot(name: string): void {
+  const current = inFlightByKey.get(name);
+  if (current === undefined) return;
+  if (current <= 1) inFlightByKey.delete(name);
+  else inFlightByKey.set(name, current - 1);
+}
+
+/** Observable in-flight count for one key — used in markers and tests. */
+export function inboundInFlight(name: string): number {
+  return inFlightByKey.get(name) ?? 0;
 }
 
 // ─── Per-request attribution (#400 goal 2: the capture names the KEY, not the IP) ───
