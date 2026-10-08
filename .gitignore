@@ -83,6 +83,12 @@ test-results/
 packages/cli/results/*.json
 .worktrees
 
+# Pester NUnit output written by a manual/CI `Invoke-Pester -OutputFile testResults.xml`
+# at the repo root. Same rationale as __pycache__ below: an untracked artifact made
+# check_clean_cycle_exit report a dirty tree every cycle, which trains an operator to
+# ignore dirt.
+testResults.xml
+
 # Model validation
 validation/
 
