@@ -190,6 +190,22 @@ def test_unattributed():
         check("no-verdict line names unattributed_marked",
               "no session over threshold" in out
               and "unattributed_marked 5" in out, out)
+        # #378 F1 pin: the DIGEST line must render unattributed_marked too —
+        # measured 07/10, removing the digest clause left the suite green (the
+        # no-verdict pin above covers a different line, so the mutation passed).
+        # An SDK-shaped swarm surfacing as a digest must not read "all quiet".
+        import argparse
+        args = argparse.Namespace(capture_dir=d, rate=0.01, since=None, until=None,
+                                  window_min=10, window_total=1, sample_factor=1.0)
+        md = ss.to_markdown([], stats, args)
+        check("digest line names unattributed_marked",
+              "scanned: 5 req" in md
+              and "unattributed_marked 5" in md
+              and "marked traffic with no session key" in md, md)
+        stats0 = dict(stats, unattributed_marked=0)
+        md0 = ss.to_markdown([], stats0, args)
+        check("digest omits the clause when the count is zero (control)",
+              "unattributed_marked" not in md0, md0)
 
 
 def test_sample_factor():

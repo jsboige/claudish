@@ -9,7 +9,7 @@
  * probe" applies to real gated classes, not to the gate's own controls.
  */
 import { describe, test, expect } from "bun:test";
-import { envDescribe } from "./env-gate";
+import { envDescribe, strictFailsClass, manifestFooter, type EnvGateClass } from "./env-gate";
 
 let activeRan = false;
 
@@ -108,5 +108,64 @@ describe("env-gate doctrine: real reds are never gatable", () => {
     );
     expect(host2b).not.toContain("envDescribe");
     expect(host2b).not.toContain("env-gate");
+  });
+});
+
+describe("env-gate budget classes (#385 review follow-up)", () => {
+  // `kind: "budget"` marks a class inactive BY OPERATOR CHOICE (each run
+  // spends real money). The review asked two things: a truthful manifest
+  // footer, and exemption from CLAUDISH_TEST_ENV_STRICT=1 — strict mode
+  // exists to catch machines quietly skipping to zero, not to mandate spend.
+  // `kind: BUDGET` (not the literal) in the fixtures below keeps the static
+  // scan in the last test blind to this file.
+  const BUDGET = "budget" as const;
+  const regular: EnvGateClass = { id: "ctl-regular", active: false, reason: "r", activation: "a" };
+  const budget: EnvGateClass = { id: "ctl-budget", active: false, reason: "r", activation: "a", kind: BUDGET };
+
+  test("strict fails an inactive regular class not allowlisted", () => {
+    expect(strictFailsClass(regular, true, [])).toBe(true);
+  });
+
+  test("strict never fails a budget class — spend is an operator choice", () => {
+    expect(strictFailsClass(budget, true, [])).toBe(false);
+    expect(strictFailsClass(budget, true, ["other"])).toBe(false);
+  });
+
+  test("allowlist exempts, active never fails, non-strict never fails (controls)", () => {
+    expect(strictFailsClass(regular, true, ["ctl-regular"])).toBe(false);
+    expect(strictFailsClass({ ...regular, active: true }, true, [])).toBe(false);
+    expect(strictFailsClass(regular, false, [])).toBe(false);
+  });
+
+  test("budget footer states opt-in spend — not 'a complete machine runs them all'", () => {
+    const f = manifestFooter(budget);
+    expect(f).toContain("opt-in budget class");
+    expect(f).toContain("never fails a budget class");
+    expect(f).not.toContain("a complete machine runs them all");
+  });
+
+  test("regular footer unchanged (control)", () => {
+    const f = manifestFooter(regular);
+    expect(f).toContain("a complete machine runs them all");
+    expect(f).not.toContain("budget");
+  });
+
+  test("only e2e-channel.test.ts declares a budget class — no red can hide behind the exemption", async () => {
+    const { readFileSync, readdirSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    // Detector control: the pattern matches a synthetic declaration, so this
+    // test can never pass by matching nothing.
+    const re = /kind:\s*"budget"/;
+    expect(re.test('envDescribe({ id: "x", kind: "budget" })')).toBe(true);
+    const srcRoot = dirname(import.meta.dir); // .../packages/cli/src
+    const files = readdirSync(srcRoot, { recursive: true })
+      .filter((f): f is string => typeof f === "string" && f.endsWith(".test.ts"))
+      .map((f) => join(srcRoot, f))
+      // Self-excluded: this file legitimately writes the literal (doc comment
+      // + detector-control string above) — the gate's own controls are not a
+      // production gated class. Same allowlist shape as the doctrine pin.
+      .filter((f) => f !== import.meta.path);
+    const offenders = files.filter((f) => re.test(readFileSync(f, "utf-8")));
+    expect(offenders).toEqual([join(srcRoot, "channel", "e2e-channel.test.ts")]);
   });
 });

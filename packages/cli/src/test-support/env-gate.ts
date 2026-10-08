@@ -36,6 +36,16 @@ export interface EnvGateClass {
   reason: string;
   /** what would make it run */
   activation: string;
+  /**
+   * "budget": the class is inactive BY OPERATOR CHOICE, not because the
+   * machine is missing a prerequisite — each run costs real money, so a
+   * complete machine deliberately does NOT run it by default (#385 review).
+   * Consequences: the manifest footer states that (not "a complete machine
+   * runs them all", which would be false), and strict mode never fails it —
+   * CLAUDISH_TEST_ENV_STRICT=1 exists to catch machines that quietly skip
+   * their way to zero, not to mandate spend.
+   */
+  kind?: "budget";
 }
 
 interface GateEntry {
@@ -47,6 +57,40 @@ interface GateEntry {
 // imported from several files must share one registry for the exit manifest.
 const G = globalThis as typeof globalThis & { __claudishEnvGate?: GateEntry[] };
 const registry: GateEntry[] = (G.__claudishEnvGate ??= []);
+
+/**
+ * Pure strict-mode decision, shared by the host selection and both scoped
+ * variants (it was three copies of the same condition before #385's review
+ * follow-up — a budget exemption added to two of them would have drifted).
+ * `strict` is a parameter, not read from env, so the exemption is testable
+ * without spawning a process.
+ */
+export function strictFailsClass(cls: EnvGateClass, strict: boolean, allow: string[]): boolean {
+  return strict && !cls.active && !allow.includes(cls.id) && cls.kind !== "budget";
+}
+
+/**
+ * Opening of the budget footer, exported as the ONE source both sides read.
+ *
+ * The strict-runner's consolidated block only ever sees the PRINTED manifest —
+ * never the EnvGateClass — so recognising a budget class from the text is the
+ * only way it can stop claiming a failure mode strict mode does not have. #385
+ * corrected the per-class footer here; the runner's consolidated footer kept
+ * asserting "CLAUDISH_TEST_ENV_STRICT=1 fails them instead" for every class,
+ * budget included. Sharing the marker keeps the producer's wording and the
+ * consumer's detector from drifting apart (the failure mode this file's own
+ * comment warns about for the three copies of the strict condition).
+ */
+export const BUDGET_FOOTER_MARKER = "(opt-in budget class";
+
+/** The manifest footer line, switched on the class kind (see EnvGateClass.kind). */
+export function manifestFooter(cls: EnvGateClass): string {
+  if (cls.kind === "budget") {
+    return `${BUDGET_FOOTER_MARKER}: each run costs real money, so a complete machine does NOT run these by default; ` +
+      "CLAUDISH_TEST_ENV_STRICT=1 never fails a budget class — activation is an operator choice, not a machine property)";
+  }
+  return "(expected on machines missing prerequisites; a complete machine runs them all; CLAUDISH_TEST_ENV_STRICT=1 fails them instead)";
+}
 
 export function envDescribe(cls: EnvGateClass, label = "") {
   const strict = process.env.CLAUDISH_TEST_ENV_STRICT === "1";
@@ -65,7 +109,7 @@ export function envDescribe(cls: EnvGateClass, label = "") {
     if (!cls.active) printEntry(entry);
   });
 
-  const host = strict && !cls.active && !allow.includes(cls.id)
+  const host = strictFailsClass(cls, strict, allow)
     ? describe   // strict: inactive classes REGISTER (and their tests FAIL below)
     : cls.active
       ? describe
@@ -85,7 +129,7 @@ export function envDescribe(cls: EnvGateClass, label = "") {
       const scoped = Object.assign(
         (name: string, fn?: any, timeout?: number) => {
           entry.testNames.push(name);
-          if (!cls.active && strict && !allow.includes(cls.id)) {
+          if (strictFailsClass(cls, strict, allow)) {
             return bunTest(name, strictFail(), timeout);
           }
           return bunTest(name, fn, timeout);
@@ -98,7 +142,7 @@ export function envDescribe(cls: EnvGateClass, label = "") {
           // (#175 Group 2 test 3, OPENROUTER_API_KEY-guarded).
           skipIf: (cond: boolean) => (name: string, fn?: any, timeout?: number) => {
             entry.testNames.push(name);
-            if (!cls.active && strict && !allow.includes(cls.id)) {
+            if (strictFailsClass(cls, strict, allow)) {
               return bunTest(name, strictFail(), timeout);
             }
             return bunTest.skipIf(cond)(name, fn, timeout);
@@ -125,5 +169,5 @@ function printEntry(entry: GateEntry): void {
   for (const name of entry.testNames) out(`[ENV-GATE]   · ${name}`);
   out(`[ENV-GATE]   reason: ${entry.cls.reason}`);
   out(`[ENV-GATE]   activation: ${entry.cls.activation}`);
-  out(`[ENV-GATE]   (expected on machines missing prerequisites; a complete machine runs them all; CLAUDISH_TEST_ENV_STRICT=1 fails them instead)`);
+  out(`[ENV-GATE]   ${manifestFooter(entry.cls)}`);
 }

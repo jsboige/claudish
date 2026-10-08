@@ -13,6 +13,7 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs"
 import { tmpdir } from "os";
 import { join } from "path";
 import { logRequest } from "./request-logger";
+import { markInboundKey } from "../../handlers/shared/inbound-keys.js";
 
 function mkRequest(headers: Record<string, string> = {}): Request {
   return new Request("http://localhost:3000/v1/messages", {
@@ -130,6 +131,50 @@ describe("request-logger capture (fork)", () => {
     expect(json.workload).toBe("cron");
     // Top level, next to machine/model — not nested.
     expect(Object.keys(json)).toContain("device_id8");
+  });
+
+  it("persists inbound_key when the request was authed by a scoped key, omits it otherwise (#400)", async () => {
+    mkdirSync(capDir, { recursive: true });
+    process.env.CLAUDISH_CAPTURE_DIR = capDir;
+
+    // Marked off the same raw Request the auth middleware sees — the WeakMap
+    // handoff is the whole attribution mechanism (dynamic external IPs are
+    // useless; the key name is stable and revocation-scoped).
+    const marked = mkRequest({ "x-claudish-machine": "external-dynamic-ip" });
+    markInboundKey(marked, "external-jamin");
+    logRequest(
+      { model: "swift-1.5-27b", messages: [{ role: "user", content: "x" }] },
+      "ComposedHandler",
+      marked,
+      new WeakMap()
+    );
+
+    let file = await waitForCapture(capDir);
+    expect(file).not.toBeNull();
+    let json = JSON.parse(readFileSync(file!, "utf8"));
+    expect(json.inbound_key).toBe("external-jamin");
+    expect(json.model).toBe("swift-1.5-27b");
+
+    // Unmarked (fleet-internal) request: field simply omitted — the envelope
+    // of every existing consumer stays byte-compatible.
+    const plain = mkRequest({ "x-claudish-machine": "myia-po-2023" });
+    logRequest(
+      { model: "glm-5.3", messages: [{ role: "user", content: "x" }] },
+      "ComposedHandler",
+      plain,
+      new WeakMap()
+    );
+    const deadline = Date.now() + 2000;
+    let files: string[] = [];
+    while (Date.now() < deadline) {
+      files = readdirSync(capDir).filter((f) => f.startsWith("req-"));
+      if (files.length >= 2) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(files.length).toBeGreaterThanOrEqual(2);
+    const plainFile = join(capDir, files.sort()[1]);
+    json = JSON.parse(readFileSync(plainFile, "utf8"));
+    expect(json.inbound_key).toBeUndefined();
   });
 
   it("omits absent attribution fields instead of writing empties (#98)", async () => {

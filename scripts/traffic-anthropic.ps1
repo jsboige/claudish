@@ -30,10 +30,17 @@ What counts as "Anthropic" in THIS deployment:
     proof of Anthropic spend. The billed proof is a `resp-*-native-*.sse`
     capture in the window; this script counts it separately ($NativeRespProof)
     and labels the rows "REQUESTED". Leak tags stay machine-level regardless.
-  - claude-sonnet-4-6 is REMAPPED to gc@glm-5.2 (ComposedHandler) → NOT Anthropic.
+  - sonnet is NOT categorically remapped. The hub's modelMap pins the sonnet
+    role to a budget target, but a client naming claude-sonnet-* with an
+    sk-ant- credential rides NativeHandler → api.anthropic.com and IS billed
+    (ai-01 OAuth passthrough; WAN seats measured 30/09–01/10: 40 native calls
+    from a non-authorized machine). Every sonnet request is paired with its
+    resp-* capture and split: paired native → full verdict pipeline below;
+    composed/no-capture → informational section.
   - haiku is REMAPPED to mmc@MiniMax-M3 → NOT Anthropic.
-So the Anthropic filter defaults to the model pattern 'opus|fable'. Sonnet is shown
-separately (informational) so you can see it was requested-but-remapped, not billed.
+So the Anthropic filter defaults to the model pattern 'opus|fable', augmented by
+every sonnet request PROVEN native-served by its paired capture. Remaining
+sonnet is shown separately (informational, with its served-by label).
 
 VERDICT per row:
   [OK]     machine is in -AnthropicMachines (authorized; default: myia-ai-01)
@@ -117,15 +124,35 @@ function Get-Verdict {
     return               @{ Tag = '[REVIEW-INTERACTIVE]'; Color = 'Yellow' }
 }
 
-# ── Anthropic-native rows (opus/fable), tagged per request, then grouped ────
-$anthropic = @($requests | Where-Object { $_.Model -match $AnthropicModelPattern })
+# ── Sonnet pairing (#72 g2): a sonnet request is NOT proof of remap ─────────
+# The hub's modelMap pins the sonnet role to a budget target, but a client
+# naming claude-sonnet-* with an sk-ant- credential rides NativeHandler to
+# api.anthropic.com — measured 30/09–01/10, 40 native sonnet requests from a
+# WAN seat on a NON-authorized machine. The discriminator is the PAIRED
+# response capture's parser label, never the model name: paired native →
+# billed → verdict pipeline below; anything else → informational section.
+# The categorical "sonnet = remapped → not a leak" this replaces exonerated
+# those requests while the script's own billed-proof counter counted them.
+$sonnetAll = @($requests | Where-Object { $_.Model -match 'sonnet' })
+$respIndex = $null
+if ($sonnetAll) { $respIndex = Get-ResponseIndex -Dir $Dir }
+foreach ($r in $sonnetAll) {
+    $r | Add-Member -NotePropertyName ServedBy -NotePropertyValue $null -Force
+    if ($r.ProcId -le 0 -or $r.Counter -le 0 -or -not $r.ReqTime) { continue }
+    $pair = Find-PairedResponse -Index $respIndex -ProcId $r.ProcId -Counter $r.Counter -RequestTime $r.ReqTime
+    if ($pair) { $r.ServedBy = $pair.Label }
+}
+$nativeSonnet = @($sonnetAll | Where-Object { $_.ServedBy -eq 'native' })
+
+# ── Anthropic-native rows: opus/fable by name + sonnet proven native ────────
+$anthropic = @($requests | Where-Object { $_.Model -match $AnthropicModelPattern -and $_.Model -notmatch 'sonnet' }) + $nativeSonnet
 foreach ($r in $anthropic) {
     $v = Get-Verdict -Machine $r.Machine -Model $r.Model -IsSubagent ([bool]$r.IsSubagent)
     $r | Add-Member -NotePropertyName VerdictTag   -NotePropertyValue $v.Tag   -Force
     $r | Add-Member -NotePropertyName VerdictColor -NotePropertyValue $v.Color -Force
 }
 
-Write-Host "--- ANTHROPIC-native REQUESTED (opus/fable — billed only if served native) ---" -ForegroundColor Yellow
+Write-Host "--- ANTHROPIC-native (opus/fable requested + sonnet PROVEN native-served) ---" -ForegroundColor Yellow
 Write-Host ("  billed-proof in window: {0} resp-*-native-* capture(s)" -f $nativeResp.Count) -ForegroundColor DarkGray
 if (-not $anthropic) {
     Write-Host "  (none — 0 requests naming opus/fable in this window)" -ForegroundColor Green
@@ -162,23 +189,29 @@ if ($anthropic) {
     Write-Host ""
 }
 
-# ── sonnet-4-6 (requested but REMAPPED → glm, NOT Anthropic) ─────────────────
-$sonnet = $requests | Where-Object { $_.Model -match 'sonnet' }
-if ($sonnet) {
-    Write-Host "--- sonnet-4-6 (requested, REMAPPED to glm → NOT Anthropic) ---" -ForegroundColor DarkGray
-    $sg = $sonnet | Group-Object Machine, Workspace | Sort-Object Count -Descending
+# ── Sonnet, informational: paired to a composed lane (or no capture) ────────
+# These were served by a composed handler (label openai/anthropic/…) or left
+# no response capture at all — NOT billed natively. Informational by design:
+# the leak organ for native sonnet is the table above, where every
+# native-served sonnet request carries its machine's verdict.
+$sonnetOther = @($sonnetAll | Where-Object { $_.ServedBy -ne 'native' })
+if ($sonnetOther) {
+    Write-Host "--- sonnet (requested, served COMPOSED/no-capture → not billed) ---" -ForegroundColor DarkGray
+    $sg = $sonnetOther | Group-Object Machine, Workspace, ServedBy | Sort-Object Count -Descending
     foreach ($g in $sg) {
-        Write-Host ("  {0,5}  {1,-14} {2}" -f $g.Count, $g.Group[0].Machine, $g.Group[0].Workspace) -ForegroundColor DarkGray
+        $s = $g.Group[0]
+        $label = if ($s.ServedBy) { $s.ServedBy } else { 'no-resp' }
+        Write-Host ("  {0,5}  {1,-14} {2,-40} served-by: {3}" -f $g.Count, $s.Machine, $s.Workspace, $label) -ForegroundColor DarkGray
     }
-    Write-Host "  (unknown/no-workspace sonnet = Hermes wire-forcing pattern → glm; not a leak)" -ForegroundColor DarkGray
+    Write-Host "  (no-resp = served by a path that writes no capture, or unanswered — informational only, carry no verdict)" -ForegroundColor DarkGray
     Write-Host ""
 }
 
 # ── Final verdict ───────────────────────────────────────────────────────────
-$totalAnthropic = @($anthropic).Count
+$opusFableReq = @($requests | Where-Object { $_.Model -match $AnthropicModelPattern }).Count
 Write-Host "=== Verdict ===" -ForegroundColor Cyan
-Write-Host ("  Opus/Fable REQUESTED: {0} req · billed-proof (resp-*-native-*): {1}" -f $totalAnthropic, $nativeResp.Count)
-if ($totalAnthropic -gt 0 -and $nativeResp.Count -eq 0) {
+Write-Host ("  Opus/Fable REQUESTED: {0} req · native-served sonnet: {1} req · billed-proof (resp-*-native-*): {2}" -f $opusFableReq, $nativeSonnet.Count, $nativeResp.Count)
+if ($opusFableReq -gt 0 -and $nativeResp.Count -eq 0) {
     Write-Host "  [NOT-BILLED] all opus/fable requests were served by the cascade (wall-active) — real Anthropic spend 0 in this window" -ForegroundColor DarkGray
 }
 if ($leakCount -gt 0) {

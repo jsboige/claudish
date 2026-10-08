@@ -156,6 +156,16 @@ export interface ClaudishProfileConfig {
   proxyKey?: string;
   /** Retiring proxy key, still accepted during a rotation window (env: CLAUDISH_PROXY_KEY_PREVIOUS) */
   proxyKeyPrevious?: string;
+  /**
+   * Scoped inbound keys (#400): authenticate like `proxyKey` but reach ONLY the
+   * models their allowModels names (subscriptions stay fleet-internal — external
+   * consumers get their own revocable key). Keyed by entry NAME (what markers
+   * and captures log — never the value); `key` may be a `${VAR}` reference into
+   * `apiKeys` or env. Entries failing validation are skipped with one stderr
+   * warning at load, never a crash. Semantics resolved in
+   * handlers/shared/inbound-keys.ts.
+   */
+  inboundKeys?: Record<string, { key: string; allowModels: string[] }>;
 }
 
 /**
@@ -187,6 +197,67 @@ function ensureConfigDir(): void {
 }
 
 /**
+ * Merge a parsed config.json onto the defaults, preserving every field the
+ * proxy reads. Extracted from loadConfig (#410) so the copy list is testable
+ * without the filesystem seam — a field present in the interface but missing
+ * here is silently dropped from every running proxy (that is exactly how
+ * `inboundKeys` shipped dead: #402 wired the resolver, the loader dropped it,
+ * and the unit tests built configs directly, bypassing this function).
+ */
+export function mergeLoadedConfig(
+  config: Partial<ClaudishProfileConfig>
+): ClaudishProfileConfig {
+  // Validate and merge with defaults
+  const merged: ClaudishProfileConfig = {
+    version: config.version || DEFAULT_CONFIG.version,
+    defaultProfile: config.defaultProfile || DEFAULT_CONFIG.defaultProfile,
+    profiles: config.profiles || DEFAULT_CONFIG.profiles,
+  };
+  // Preserve telemetry consent state if present
+  if (config.telemetry !== undefined) {
+    merged.telemetry = config.telemetry;
+  }
+  // Preserve stats consent state if present
+  if (config.stats !== undefined) {
+    merged.stats = config.stats;
+  }
+  // Preserve custom routing rules if present
+  if (config.routing !== undefined) {
+    merged.routing = config.routing;
+  }
+  if (config.apiKeys !== undefined) {
+    merged.apiKeys = config.apiKeys;
+  }
+  if (config.endpoints !== undefined) {
+    merged.endpoints = config.endpoints;
+  }
+  if (config.autoApproveConfirmedAt !== undefined) {
+    merged.autoApproveConfirmedAt = config.autoApproveConfirmedAt;
+  }
+  if (config.defaultProvider !== undefined) {
+    merged.defaultProvider = config.defaultProvider;
+  }
+  if (config.customEndpoints !== undefined) {
+    merged.customEndpoints = config.customEndpoints;
+  }
+  if (config.providerConcurrency !== undefined) {
+    merged.providerConcurrency = config.providerConcurrency;
+  }
+  if (config.proxyKey !== undefined) {
+    merged.proxyKey = config.proxyKey;
+  }
+  if (config.proxyKeyPrevious !== undefined) {
+    merged.proxyKeyPrevious = config.proxyKeyPrevious;
+  }
+  // #410 — scoped inbound keys (#400) live in config.json; forgetting them
+  // here made every deployed proxy resolve zero inbound keys, silently.
+  if (config.inboundKeys !== undefined) {
+    merged.inboundKeys = config.inboundKeys;
+  }
+  return merged;
+}
+
+/**
  * Load global configuration from ~/.claudish/config.json
  * Returns default config if file doesn't exist
  */
@@ -200,50 +271,7 @@ export function loadConfig(): ClaudishProfileConfig {
   try {
     const content = readFileSync(CONFIG_FILE, "utf-8");
     const config = JSON.parse(content) as ClaudishProfileConfig;
-
-    // Validate and merge with defaults
-    const merged: ClaudishProfileConfig = {
-      version: config.version || DEFAULT_CONFIG.version,
-      defaultProfile: config.defaultProfile || DEFAULT_CONFIG.defaultProfile,
-      profiles: config.profiles || DEFAULT_CONFIG.profiles,
-    };
-    // Preserve telemetry consent state if present
-    if (config.telemetry !== undefined) {
-      merged.telemetry = config.telemetry;
-    }
-    // Preserve stats consent state if present
-    if (config.stats !== undefined) {
-      merged.stats = config.stats;
-    }
-    // Preserve custom routing rules if present
-    if (config.routing !== undefined) {
-      merged.routing = config.routing;
-    }
-    if (config.apiKeys !== undefined) {
-      merged.apiKeys = config.apiKeys;
-    }
-    if (config.endpoints !== undefined) {
-      merged.endpoints = config.endpoints;
-    }
-    if (config.autoApproveConfirmedAt !== undefined) {
-      merged.autoApproveConfirmedAt = config.autoApproveConfirmedAt;
-    }
-    if (config.defaultProvider !== undefined) {
-      merged.defaultProvider = config.defaultProvider;
-    }
-    if (config.customEndpoints !== undefined) {
-      merged.customEndpoints = config.customEndpoints;
-    }
-    if (config.providerConcurrency !== undefined) {
-      merged.providerConcurrency = config.providerConcurrency;
-    }
-    if (config.proxyKey !== undefined) {
-      merged.proxyKey = config.proxyKey;
-    }
-    if (config.proxyKeyPrevious !== undefined) {
-      merged.proxyKeyPrevious = config.proxyKeyPrevious;
-    }
-    return merged;
+    return mergeLoadedConfig(config);
   } catch (error) {
     console.error(`Warning: Failed to load config, using defaults: ${error}`);
     return { ...DEFAULT_CONFIG };

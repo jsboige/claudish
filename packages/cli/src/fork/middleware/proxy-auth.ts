@@ -4,14 +4,57 @@
  * Anthropic pass-through is exempt (OAuth or proxy-key swap handled by NativeHandler).
  * Non-Anthropic providers require the proxy key in x-api-key / authorization / x-proxy-key.
  * GET requests and health endpoints are exempt for Docker healthcheck and model discovery.
+ *
+ * #400 — scoped inbound keys authenticate like a proxy key but are gated to
+ * their allowModels BEFORE anything else (including the native exemption: a
+ * scoped key never rides the Anthropic passthrough). Everything outside the
+ * allowlist is a labeled 403 — wording deliberately free of quota-class words
+ * (same doctrine as #296: isQuotaExhaustion must never arm on this refusal).
  */
 
 import type { MiddlewareHandler } from "hono";
 import { wrapAnthropicError } from "../../handlers/shared/anthropic-error.js";
 import { matchesProxyKey } from "../../handlers/shared/proxy-keys.js";
+import {
+  acquireInboundSlot,
+  inboundInFlight,
+  inboundModelAllowed,
+  matchesInboundKey,
+  markInboundKey,
+  releaseInboundSlot,
+  type InboundKeyEntry,
+} from "../../handlers/shared/inbound-keys.js";
+import { logStderr } from "../../logger.js";
 import { parseModelSpec } from "../../providers/model-parser.js";
+import type { ClaudishProfileConfig } from "../../profile-config.js";
 
-export function createProxyAuthMiddleware(proxyKeys: string[]): MiddlewareHandler {
+/**
+ * #410 — the bare model names that leave the native lane: routing-map keys
+ * plus custom-endpoint model ids. Custom-endpoint ids are family-unknown by
+ * construction, so parseModelSpec defaults them to "native-anthropic"; without
+ * this set the pass-through exemption would serve them with the cluster's
+ * stored credentials (measured: no-auth model=frognano-4b → 200).
+ */
+export function collectRoutedBareNames(
+  config: Pick<ClaudishProfileConfig, "routing" | "customEndpoints">
+): Set<string> {
+  return new Set<string>([
+    ...Object.keys(config.routing ?? {}),
+    ...Object.values(config.customEndpoints ?? {}).flatMap((ep) =>
+      ep && typeof ep === "object" && Array.isArray((ep as { models?: unknown }).models)
+        ? (ep as { models: unknown[] }).models.filter(
+            (m): m is string => typeof m === "string" && m.length > 0
+          )
+        : []
+    ),
+  ]);
+}
+
+export function createProxyAuthMiddleware(
+  proxyKeys: string[],
+  inboundKeys: InboundKeyEntry[] = [],
+  routedBareNames: ReadonlySet<string> = new Set()
+): MiddlewareHandler {
   return async (c, next) => {
     if (c.req.method === "GET") {
       return await next();
@@ -27,17 +70,6 @@ export function createProxyAuthMiddleware(proxyKeys: string[]): MiddlewareHandle
       return await next(); // Malformed body — let handler return 400
     }
 
-    // Anthropic pass-through: skip proxy key validation entirely.
-    // NativeHandler will either swap proxyKey → stored Anthropic key,
-    // or pass the client's OAuth token through unchanged.
-    if (model) {
-      const spec = parseModelSpec(model);
-      if (spec.provider === "native-anthropic") {
-        return await next();
-      }
-    }
-
-    // Non-Anthropic: enforce proxy key
     const authHeader = c.req.header("authorization");
     const apiKeyHeader = c.req.header("x-api-key");
     const proxyKeyHeader = c.req.header("x-proxy-key");
@@ -47,6 +79,85 @@ export function createProxyAuthMiddleware(proxyKeys: string[]): MiddlewareHandle
       : authHeader;
 
     const provided = proxyKeyHeader || apiKeyHeader || bearerToken;
+
+    // #400 — scoped inbound keys: gate BEFORE the native exemption. A scoped
+    // key sees only its allowlist, on every ingress route this middleware
+    // covers (/v1/messages, /v1/chat/completions, count_tokens included).
+    if (inboundKeys.length > 0 && typeof model === "string" && model.length > 0) {
+      const scoped = matchesInboundKey(provided, inboundKeys);
+      if (scoped) {
+        markInboundKey(c.req.raw, scoped.name);
+        if (!inboundModelAllowed(scoped, model)) {
+          // Countable marker via logStderr — the hub runs with debug off, where
+          // log() alone is file-only and invisible to docker logs (#212 lesson).
+          logStderr(
+            `[InboundKey] refused key=${scoped.name} model=${model} (allowlist: ${scoped.allowModels.join(", ")})`
+          );
+          return c.json(
+            wrapAnthropicError(
+              403,
+              `[InboundKey] key '${scoped.name}' is not permitted to use model '${model}' — allowed models: ${scoped.allowModels.join(", ")}`,
+              "permission_error"
+            ),
+            403
+          );
+        }
+        // Per-key in-flight cap (ASK FROGNANO-ACCESS): acquired BEFORE the
+        // handler does any work. Wording deliberately avoids every word
+        // `isQuotaExhaustion` arms on (quota/credit/balance/weekly/exhaust/
+        // usage limit/plan limit/"exceed your account") — a per-key cap must
+        // never divert the fleet's failover. Pinned by test.
+        if (!acquireInboundSlot(scoped)) {
+          logStderr(
+            `[InboundKey] concurrency cap reached key=${scoped.name} cap=${scoped.maxConcurrency} inFlight=${inboundInFlight(scoped.name)}`
+          );
+          return c.json(
+            wrapAnthropicError(
+              429,
+              `[InboundKey] key '${scoped.name}' already has ${scoped.maxConcurrency} request(s) in flight — retry shortly`,
+              "rate_limit_error"
+            ),
+            429
+          );
+        }
+        // Release on completion. SSE bodies outlive this middleware, so they are
+        // released by the stream tracker's end/cancel hooks instead; everything
+        // else (JSON responses, errors, throws) is done by the time next()
+        // returns — including the 403 above, which returns before acquiring.
+        try {
+          await next();
+        } catch (err) {
+          releaseInboundSlot(scoped.name);
+          throw err;
+        }
+        const contentType = c.res?.headers.get("content-type") ?? "";
+        if (!contentType.includes("text/event-stream")) {
+          releaseInboundSlot(scoped.name);
+        }
+        return;
+      }
+    }
+
+    // Anthropic pass-through: skip proxy key validation entirely.
+    // NativeHandler will either swap proxyKey → stored Anthropic key,
+    // or pass the client's OAuth token through unchanged.
+    //
+    // #410 — the exemption is for the Anthropic lane ONLY. parseModelSpec
+    // defaults every family-unknown bare name to "native-anthropic", but the
+    // handler then resolves such a name through routing/customEndpoints to a
+    // remote handler running with the CLUSTER's stored credentials — so
+    // without this guard, every routed bare name (frognano-4b, mini,
+    // local-fast, …) was served with no credential at all (measured: no-auth
+    // POST /v1/messages model=frognano-4b → 200). Explicit provider@model
+    // forms never parsed as native and are unaffected.
+    if (model) {
+      const spec = parseModelSpec(model);
+      if (spec.provider === "native-anthropic" && !routedBareNames.has(model)) {
+        return await next();
+      }
+    }
+
+    // Non-Anthropic: enforce proxy key
     if (!matchesProxyKey(provided, proxyKeys)) {
       return c.json(wrapAnthropicError(401, "invalid proxy authentication"), 401);
     }

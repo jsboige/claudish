@@ -50,7 +50,12 @@ import {
   describeProbeState,
   type ProbeResult,
 } from "./providers/probe-live.js";
-import { startProbeTui } from "./probe/probe-tui-runtime.js";
+// `startProbeTui` is imported lazily at its call site (interactive TUI path):
+// `probe-tui-runtime` pulls `@opentui/core`, whose module scope reads a
+// dynamic-import namespace before it is initialized — under `bun test
+// --isolate` that throws during evaluation and kills the importing file
+// (#386). Keeping the edge out of this module's static graph means every test
+// that only needs `parseArgs` never evaluates it.
 import type {
   ProbeAppState,
   ProbeLinkState,
@@ -1424,6 +1429,7 @@ async function probeModelRouting(
     steps: [],
     links: [],
   };
+  const { startProbeTui } = await import("./probe/probe-tui-runtime.js");
   const tui = await startProbeTui(initialState);
 
   const addStep = (name: string, status: ProbeStepState["status"]): void => {

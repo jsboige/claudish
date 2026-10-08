@@ -541,3 +541,220 @@ exit /b 0
         $gate | Should -BeLessThan $copy
     }
 }
+
+Describe 'off-site sha256 manifest (#389) — engine functions' {
+    It 'names the manifest per machine tag, mirroring the archive-name namespace' {
+        Get-ShaManifestPath -GDriveDir 'G:\shared' -MachineTag 'po-2024' |
+            Should -Be 'G:\shared\captures-sha256-po-2024.jsonl'
+        Get-ShaManifestPath -GDriveDir 'G:\shared' |
+            Should -Be 'G:\shared\captures-sha256.jsonl'
+        # two machines never share one manifest file (same reason as #201)
+        (Get-ShaManifestPath -GDriveDir 'G:\s' -MachineTag 'a') -ne (Get-ShaManifestPath -GDriveDir 'G:\s' -MachineTag 'b') |
+            Should -BeTrue
+    }
+
+    It 'reads an absent manifest as empty (first run after the change has nothing recorded)' {
+        $m = Read-ShaManifest -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("no-such-{0}.jsonl" -f ([guid]::NewGuid().ToString('N'))))
+        $m.Entries.Count | Should -Be 0
+        $m.BadLines     | Should -Be 0
+    }
+
+    It 'upserts, replaces on re-upload, preserves siblings, and round-trips' {
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            $null = Update-ShaManifest -Path $p -Archive 'captures-2026-10-05-po-2024.7z' -Sha256 ('a' * 64) -Bytes 6 -RecordedUtc '2026-10-06T02:47:11Z'
+            $null = Update-ShaManifest -Path $p -Archive 'captures-2026-10-06-po-2024.7z' -Sha256 ('b' * 64) -Bytes 7 -RecordedUtc '2026-10-07T02:47:09Z'
+            $m = Read-ShaManifest -Path $p
+            $m.Entries.Count | Should -Be 2
+            $m.Entries['captures-2026-10-05-po-2024.7z'].sha256 | Should -Be ('a' * 64)
+            # a retried night re-uploads the SAME name: one hash per name, not two
+            $null = Update-ShaManifest -Path $p -Archive 'captures-2026-10-05-po-2024.7z' -Sha256 ('c' * 64) -Bytes 6 -RecordedUtc '2026-10-07T03:12:00Z'
+            $m2 = Read-ShaManifest -Path $p
+            $m2.Entries.Count | Should -Be 2
+            $m2.Entries['captures-2026-10-05-po-2024.7z'].sha256 | Should -Be ('c' * 64)
+            $m2.Entries['captures-2026-10-06-po-2024.7z'].sha256 | Should -Be ('b' * 64)
+            # no BOM: a BOM poisons the first line for every non-PowerShell reader.
+            # The first line is the record's JSON, so byte 0 must be '{' (0x7B),
+            # never the EF BB BF preamble.
+            [System.IO.File]::ReadAllBytes($p)[0] | Should -Be 0x7B
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'skips a torn manifest line and counts it, without blinding the rest' {
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            [System.IO.File]::WriteAllLines($p, [string[]]@(
+                '{"archive":"a.7z","sha256":"aaaa","bytes":1,"recorded":"t1"}',
+                '>>> torn mid-write garbage <<<',
+                '{"archive":"b.7z","sha256":"bbbb","bytes":2,"recorded":"t2"}'
+            ), (New-Object System.Text.UTF8Encoding($false)))
+            $m = Read-ShaManifest -Path $p
+            $m.BadLines      | Should -Be 1
+            $m.Entries.Count | Should -Be 2
+            $m.Entries['b.7z'].sha256 | Should -Be 'bbbb'
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'Select-ShaRotation: same seed picks the same entries (a re-run re-checks the same files)' {
+        $names = @('a.7z','b.7z','c.7z','d.7z','e.7z','f.7z','g.7z')
+        $seed  = [datetime]'2026-10-07T00:00:00Z'
+        $x = Select-ShaRotation -Names $names -Count 3 -SeedDateUtc $seed
+        $y = Select-ShaRotation -Names $names -Count 3 -SeedDateUtc $seed
+        ($x -join ';') | Should -Be ($y -join ';')
+        $x.Count | Should -Be 3
+    }
+
+    It 'Select-ShaRotation: every entry is re-checked within ceil(count/N) consecutive days' {
+        $names = @('a.7z','b.7z','c.7z','d.7z','e.7z','f.7z','g.7z','h.7z')
+        $seen  = @{}
+        for ($d = 0; $d -lt 3; $d++) {
+            $seed = ([datetime]'2026-10-01T00:00:00Z').AddDays($d)
+            foreach ($n in (Select-ShaRotation -Names $names -Count 3 -SeedDateUtc $seed)) { $seen[$n] = $true }
+        }
+        $seen.Count | Should -Be $names.Count
+    }
+
+    It 'Select-ShaRotation: Count 0 disables (the escape hatch), empty names yields nothing' {
+        (Select-ShaRotation -Names @('a.7z') -Count 0 -SeedDateUtc ([datetime]'2026-10-07T00:00:00Z')).Count | Should -Be 0
+        (Select-ShaRotation -Names @()        -Count 3 -SeedDateUtc ([datetime]'2026-10-07T00:00:00Z')).Count | Should -Be 0
+    }
+}
+
+Describe 'compress-captures.ps1 off-site sha manifest wiring (#389) — end to end' {
+    BeforeAll {
+        # Same fake-7z contract as the #208/#322 suites: `a` writes a deterministic
+        # 6-byte archive ("fake" + CRLF), `t` answers from existence. The deposit
+        # hash of that archive is therefore known and stable inside a sandbox.
+        $script:FakeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-fake7z-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:FakeRoot -Force | Out-Null
+        $script:Fake7z = Join-Path $script:FakeRoot 'fake7z.bat'
+        [System.IO.File]::WriteAllText($script:Fake7z, @'
+@echo off
+setlocal
+set "MODE=%~1"
+set "TARGET="
+for %%F in (%*) do if /i "%%~xF"==".7z" set "TARGET=%%~fF"
+if /i "%MODE%"=="a" goto add
+if /i "%MODE%"=="t" goto test
+exit /b 1
+:add
+if not defined TARGET exit /b 1
+echo fake> "%TARGET%"
+exit /b 0
+:test
+if not defined TARGET exit /b 2
+if not exist "%TARGET%" exit /b 2
+exit /b 0
+'@, (New-Object System.Text.ASCIIEncoding))
+        function Invoke-CompactionRun {
+            param([string]$CaptureDir, [string]$GDriveDir)
+            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+        }
+        function New-GuardSandbox {
+            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-389-{0}" -f ([guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'gd')  -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap\archive') -Force | Out-Null
+            return $tmp
+        }
+        function Add-LooseCapture {
+            param([string]$CaptureDir, [int]$DaysBack)
+            $day = (Get-Date).ToUniversalTime().Date.AddDays(-$DaysBack).ToString('yyyy-MM-dd')
+            [System.IO.File]::WriteAllText((Join-Path $CaptureDir "req-1-1-$($day)T00-00-00.json"), 'loose')
+            return $day
+        }
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:FakeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'a successful upload records the DESTINATION hash in the per-machine manifest' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $LASTEXITCODE | Should -Be 0
+            $manifest = Join-Path $gd 'captures-sha256-testbox.jsonl'
+            Test-Path $manifest | Should -BeTrue
+            $m = Read-ShaManifest -Path $manifest
+            $m.Entries.Count | Should -Be 1
+            $rec = $m.Entries["captures-$($day)-testbox.7z"]
+            $rec | Should -Not -BeNullOrEmpty
+            $rec.bytes | Should -Be 6
+            # the reference is the hash of what the DESTINATION holds, not a wish
+            $rec.sha256 | Should -Be ((Get-FileHash -LiteralPath (Join-Path $gd "captures-$($day)-testbox.7z") -Algorithm SHA256).Hash)
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'THE #389 pin: content drift at EQUAL SIZE on the off-site copy is DETECTED by the next night' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day1 = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd     # night 1: upload + record
+            $LASTEXITCODE | Should -Be 0
+            # --- the drift: same 6 bytes' worth of file, different bytes. Invisible
+            # to #208 (sizes equal) and to 7z t is NOT even run off-site - only the
+            # recorded hash can see it.
+            [System.IO.File]::WriteAllText((Join-Path $gd "captures-$($day1)-testbox.7z"), 'DRIFT!')   # 6 bytes, different content
+            (Get-Item -LiteralPath (Join-Path $gd "captures-$($day1)-testbox.7z")).Length | Should -Be 6
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd     # night 2: re-check runs
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0                  # loud, non-zero night
+            $log | Should -Match 'SHA-CHECK captures-.*-testbox\.7z: CONTENT DRIFT'
+            $log | Should -Match 'ERROR'                             # countable marker class
+            # the drifted file is NEVER touched by the check - read-only verdict
+            [System.IO.File]::ReadAllText((Join-Path $gd "captures-$($day1)-testbox.7z")) | Should -Be 'DRIFT!'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'control: an untampered history re-checks OK and the night stays zero' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -Be 0
+            $log | Should -Match 'SHA-CHECK captures-.*-testbox\.7z: OK'
+            $log | Should -Not -Match 'CONTENT DRIFT'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'a manifest entry whose file went ABSENT off-site is an error, never silently dropped' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day1 = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            Remove-Item -LiteralPath (Join-Path $gd "captures-$($day1)-testbox.7z") -Force
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0
+            $log | Should -Match 'recorded in manifest but ABSENT off-site'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'wiring: the re-check block sits between the re-upload pass and the retention purge' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        $reup   = $text.IndexOf('re-upload pass')
+        $chk    = $text.IndexOf('rotating off-site sha re-check')
+        $purge  = $text.IndexOf('local retention purge')
+        $reup  | Should -BeGreaterThan 0
+        $chk   | Should -BeGreaterThan $reup
+        $purge | Should -BeGreaterThan $chk
+    }
+
+    It 'wiring: the sha-deposit consult (Get-ShaManifestPath) exists at BOTH upload sites' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        @([regex]::Matches($text, 'Get-ShaManifestPath')).Count | Should -Be 3   # 2 deposits + 1 re-check
+    }
+}
