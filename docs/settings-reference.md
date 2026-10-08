@@ -649,14 +649,14 @@ For external consumers (a shared GPU lane, a friend testing the fleet): a key th
 
 Semantics (resolved in `handlers/shared/inbound-keys.ts`):
 
-- **Bare names** (`swift-1.5-27b`, alias `qwen3.6-35b-a3b`) pass iff the parsed model id is allowlisted — the id that will actually serve.
+- **Bare names** pass iff the **client-sent model string** is allowlisted. For a bare name that string *is* the parsed id (`parseModelSpec` returns it unchanged) — the `routing` / `customEndpoints` resolution that picks the serving target runs **later**, inside the route handler, so it never feeds this gate. A name that exists only as a routing **alias** is therefore refused unless the alias is listed **as the client spells it**. Measured 2026-10-08 on the hub: `swift-1.5-27b` → `403`, which listed only `qwen3.6-35b-a3b`; both spellings name the same routing target (`vllm-myia@qwen3.6-35b-a3b`), so the two are independent allowlist entries, not one name in two forms.
 - **Explicit provider forms** (`provider@model`) pass only on an **exact raw allowlist hit** — `or@swift-1.5-27b` is refused, an allowlisted id must not ride onto a different transport's wire.
 - Anything else is a labeled `403 permission_error` (`[InboundKey] key '<name>' is not permitted to use model '<model>'…`) + one `[InboundKey] refused key=<name> model=<model>` marker per refusal. Wording deliberately free of quota-class words (#296 doctrine: `isQuotaExhaustion` must never arm on it).
 - The gate runs **before** the Anthropic passthrough exemption — a scoped key never rides the native lane either.
 - Applies to every ingress this auth covers: `/v1/messages`, `/v1/chat/completions`, `/v1/messages/count_tokens`.
 - **Attribution**: requests authed by a scoped key carry `inbound_key: "<name>"` in the capture envelope (`req-*.json`) — key-based, stable where external IPs are dynamic. The stdout `[Request]` line is unchanged (pinned consumer contract).
 
-Validation doctrine (same as `customEndpoints`): an entry failing validation — missing/empty key, unresolvable `${VAR}`, empty `allowModels`, a key value equal to a full-access proxy key or duplicated across entries — is **skipped with one stderr warning, never a crash**. Inert with no `inboundKeys` config: zero behavior change. Not (yet) per-key: concurrency caps (#400 follow-up).
+Validation doctrine (same as `customEndpoints`): an entry failing validation — missing/empty key, unresolvable `${VAR}`, empty `allowModels`, a key value equal to a full-access proxy key or duplicated across entries — is **skipped with one stderr warning, never a crash**. Inert with no `inboundKeys` config: zero behavior change. An entry may also carry a `maxConcurrency` (#406) capping that key's concurrent in-flight requests: acquired at authentication, released on the response lifecycle (immediately for a non-SSE response, on stream close/cancel for SSE); at the cap the refusal is a labeled `429` whose wording deliberately never arms `isQuotaExhaustion`. An unreadable cap (`0`, negative, non-integer, `null`) **skips the entry** — never "unlimited".
 
 Requires a proxy restart to take effect (config read once per proxy lifetime — same lifecycle as `customEndpoints`).
 
