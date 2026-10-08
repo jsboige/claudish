@@ -38,6 +38,7 @@ import {
 import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
 import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
+import { isKeylessExempt, keylessRefusalMessage } from "./handlers/shared/keyless-exempt.js";
 import { resolveProxyKeys, matchesProxyKey } from "./handlers/shared/proxy-keys.js";
 import { admissionFreezeState } from "./handlers/shared/admission-freeze.js";
 import {
@@ -1231,6 +1232,33 @@ export async function createProxyServer(
         }
         paid.add(attemptConcreteNow);
       }
+      // #412 — the keyless exemption admits, this decides. A request admitted
+      // without a credential of its own may only be served by the native
+      // passthrough (which spends the CLIENT's Anthropic-shaped credential).
+      // Every other resolution spends one the caller does not hold: a modelMap
+      // reroute, a routing entry, a custom endpoint, a cascade step, the
+      // one-shot overload walk, the vision fallback. Placed HERE — after the
+      // revisit guard's `continue`s and before the pin mutates the body — so it
+      // runs only on an attempt that would actually be served.
+      //
+      // Refuse BEFORE any upstream fetch. Two shapes, deliberately different:
+      //   - nothing answered yet ⇒ labeled 401. The request never had a right
+      //     to this lane;
+      //   - a prior native attempt already answered (attempt 0 was NativeHandler
+      //     and came back non-ok) ⇒ surface THAT. On a walled native bucket the
+      //     honest answer to the client is their own 429 — their meter is the
+      //     exhausted one — not a 401 blaming the key they never needed.
+      if (isKeylessExempt(c.req.raw) && !(handler instanceof NativeHandler)) {
+        const lane = resolved.step?.target ?? handler.constructor.name;
+        if (response) return response;
+        logStderr(
+          `[ProxyAuth] keyless request for ${requestedModel} resolves to a server-held credential (${lane}) — refused, zero upstream fetch`
+        );
+        return c.json(
+          wrapAnthropicError(401, keylessRefusalMessage(requestedModel, lane), "authentication_error"),
+          401
+        );
+      }
       // Native-lane version pin. Applied HERE rather than at the route, because the
       // cascade re-resolves the handler every attempt: only the attempt that actually
       // lands on NativeHandler may carry a bare Anthropic id, and a later attempt is a
@@ -1679,6 +1707,21 @@ export async function createProxyServer(
         );
       }
       const handler = await getHandlerForRequest(body.model, 0, extractSessionKey(body));
+
+      // #412 — same invariant on the counting path as on the serving one, and
+      // for the same reason: a keyless request resolves here to a handler that
+      // would spend the FLEET's credential. No cascade on this route, so there
+      // is no prior attempt to surface — it is always the labeled 401.
+      if (isKeylessExempt(c.req.raw) && !(handler instanceof NativeHandler)) {
+        const lane = handler.constructor.name;
+        logStderr(
+          `[ProxyAuth] keyless request for ${body.model} resolves to a server-held credential (${lane}) — refused, zero upstream fetch (count_tokens)`
+        );
+        return c.json(
+          wrapAnthropicError(401, keylessRefusalMessage(body.model, lane), "authentication_error"),
+          401
+        );
+      }
 
       // If native, forward transparently (all client headers passthrough).
       if (handler instanceof NativeHandler) {
