@@ -69,6 +69,8 @@ import {
   resolveDelegationOwner,
   setRoleNominalResolver,
   markStepFailed,
+  earliestWalledReprobeAt,
+  ARM_TTL_MAX_MS,
   NATIVE_BUCKET,
   parseResetAtFromBody,
   resetStepSuccess,
@@ -1531,7 +1533,76 @@ export async function createProxyServer(
             });
           }
         }
-        if (rule && stepIndex === rule.steps.length - 1) return response; // last step also walled
+        if (rule && stepIndex === rule.steps.length - 1) {
+          // #409: a walled LAST step used to surface the provider's own status
+          // verbatim. Claude Code renders a 403 as an auth failure and offers an
+          // Anthropic login prompt (measured ai-01 2026-10-08: Kimi's weekly 403
+          // blocked a session on that prompt until the user intervened), and a
+          // DeepSeek 402 "Insufficient Balance" reads as a wiring error to fix by
+          // hand. Both ARE budget walls — isQuotaExhaustion just classified them,
+          // the steps above were walled the same way — so say so in the
+          // vocabulary the client already retries: 429 rate_limit_error, which is
+          // what Anthropic's own weekly cap returns, with a retry-after bounded
+          // by the proxy's next re-probe (capped at the wall-TTL max — below).
+          // The message names role, concrete and original status,
+          // so the wall is never silent. Native lane excluded: its meter is the
+          // client's own Anthropic credential, which already speaks 429 (the
+          // walk above uses the same bucket guard). 401/404 never reach here —
+          // they don't classify as walls and surface unchanged.
+          if (!(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`)) {
+            const lastConcrete = delegation?.concrete ?? resolved.step?.target ?? requestedModel;
+            let upstreamMsg = errBody.slice(0, 200);
+            try {
+              const parsed = JSON.parse(errBody);
+              const m = parsed?.error?.message ?? parsed?.message;
+              if (typeof m === "string" && m.length > 0) upstreamMsg = m.slice(0, 200);
+            } catch {
+              // not JSON — the raw slice above already is the message
+            }
+            const headers = new Headers({ "Content-Type": "application/json" });
+            // CR1a — the horizon is the proxy's next re-probe of ANY walled
+            // element (bucket-wall TTL expiry, step backoff expiry, or a known
+            // step reset when one is named), never a far-future announced
+            // reset alone: a retry-after beyond that moment tells the client
+            // to sleep through the return of service. CR1b — defensive ceiling
+            // at the bucket-wall TTL cap (ARM_TTL_MAX_MS, 40 min): the horizon
+            // can exceed it only via a distant step reset (Kimi announces a
+            // week while GLM reopens every 5 h), and Claude Code honors a
+            // multi-day retry-after by sleeping or abandoning the turn.
+            const horizon = earliestWalledReprobeAt(role, bucket);
+            let capped = false;
+            if (horizon) {
+              const seconds = Math.max(1, Math.ceil((horizon.getTime() - Date.now()) / 1000));
+              capped = seconds > ARM_TTL_MAX_MS / 1000;
+              headers.set("retry-after", String(Math.min(Math.ceil(ARM_TTL_MAX_MS / 1000), seconds)));
+            }
+            log(
+              `[Failover] WALL-SURFACE ${role} — HTTP ${response.status} from ${lastConcrete} rewritten to 429 rate_limit_error` +
+                (horizon
+                  ? ` (retry-after ${headers.get("retry-after")}s${capped ? ", capped at wall-TTL max" : ""})`
+                  : " (no re-probe horizon — retry-after omitted)"),
+              true
+            );
+            // The upstream body was only ever read from a clone; the original is
+            // a connection held open for nothing once we replace the response.
+            try {
+              await response.body?.cancel();
+            } catch {
+              // already gone — nothing to drain
+            }
+            return new Response(
+              JSON.stringify({
+                type: "error",
+                error: {
+                  type: "rate_limit_error",
+                  message: `[Failover] ${role}: every step walled — last: ${lastConcrete} ${response.status}: ${upstreamMsg}`,
+                },
+              }),
+              { status: 429, headers }
+            );
+          }
+          return response; // last step also walled (native lane: surface as-is)
+        }
       }
     }
     return response as Response;
