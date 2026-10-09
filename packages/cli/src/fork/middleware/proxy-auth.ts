@@ -24,6 +24,7 @@ import {
   releaseInboundSlot,
   type InboundKeyEntry,
 } from "../../handlers/shared/inbound-keys.js";
+import { markKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 import { logStderr } from "../../logger.js";
 import { parseModelSpec } from "../../providers/model-parser.js";
 import type { ClaudishProfileConfig } from "../../profile-config.js";
@@ -153,6 +154,19 @@ export function createProxyAuthMiddleware(
     if (model) {
       const spec = parseModelSpec(model);
       if (spec.provider === "native-anthropic" && !routedBareNames.has(model)) {
+        // #412 — the exemption ADMITS, it no longer decides alone. Record
+        // whether this request holds a credential of its own; the resolution
+        // site refuses it later if it lands anywhere but the native
+        // passthrough (see keyless-exempt.ts). Without the record, a keyless
+        // `claude-*` whose modelMap/wall resolution reaches a subscription or
+        // PAYG step is served on the FLEET's credential while the caller's own
+        // meter — the one actually exhausted — is never surfaced.
+        //
+        // A scoped inbound key never reaches this line (handled and returned
+        // above), so `provided` here is a cluster key or nothing/foreign.
+        if (!matchesProxyKey(provided, proxyKeys)) {
+          markKeylessExempt(c.req.raw);
+        }
         return await next();
       }
     }
