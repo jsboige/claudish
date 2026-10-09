@@ -882,6 +882,17 @@ function Invoke-DrainFailoverEventsTick {
     # cleanup alike: every step here is the passenger's, never the drain's.
     try {
         if (-not (Test-Path -LiteralPath $ClaudishHome)) { New-Item -ItemType Directory -Path $ClaudishHome -Force | Out-Null }
+        # Retention (R2, file 09/10): the tick's per-run capture pair accumulates
+        # without bound otherwise — two files per drain run, and the home is never
+        # rotated. This is the SAME 7-day best-effort rule the detach launcher
+        # already applies to its own pair under this home (Start-DrainDetached,
+        # #338 review), applied to the tick's pair; the tick pair sits under the
+        # same directory but carries a different prefix, so neither filter can
+        # take the other's files. Best-effort by construction (-ErrorAction
+        # SilentlyContinue) — a locked or vanished file is not a launch blocker.
+        Get-ChildItem -Path $ClaudishHome -Filter 'drain-failover-tick-*.log' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $tickOut = Join-Path $ClaudishHome "drain-failover-tick-$stamp.out.log"
         $tickErr = Join-Path $ClaudishHome "drain-failover-tick-$stamp.err.log"

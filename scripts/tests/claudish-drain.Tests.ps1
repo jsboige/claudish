@@ -704,6 +704,36 @@ Start-Sleep -Seconds 45
         $log | Should -Match 'OUTCOME success'
         $log | Should -Not -Match 'OUTCOME exception'
     }
+
+    It 'a stale tick capture is pruned at launch, an in-window one survives (R2 retention)' {
+        # R2 (file 09/10): the tick writes a capture pair per run and nothing
+        # pruned them — two files per drain run, unbounded. The fix mirrors the
+        # detach launcher's 7-day rule; this pin holds both halves so a mutation
+        # that drops the cleanup (or one that over-prunes) is caught.
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        $staleOut = Join-Path $script:TickHome 'drain-failover-tick-20200101-000000.out.log'
+        $staleErr = Join-Path $script:TickHome 'drain-failover-tick-20200101-000000.err.log'
+        $freshOut = Join-Path $script:TickHome 'drain-failover-tick-20261009-000000.out.log'
+        foreach ($f in @($staleOut, $staleErr, $freshOut)) {
+            [System.IO.File]::WriteAllText($f, 'capture', (New-Object System.Text.ASCIIEncoding))
+        }
+        (Get-Item -LiteralPath $staleOut).LastWriteTime = (Get-Date).AddDays(-30)
+        (Get-Item -LiteralPath $staleErr).LastWriteTime = (Get-Date).AddDays(-30)
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-retention' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-ok.ps1') -FailoverTickTimeoutSec 30
+        $r | Should -BeTrue
+        # BOTH members of the stale pair are gone; the in-window file is untouched.
+        Test-Path -LiteralPath $staleOut | Should -BeFalse
+        Test-Path -LiteralPath $staleErr | Should -BeFalse
+        Test-Path -LiteralPath $freshOut | Should -BeTrue
+        # The pruning must not disturb the tick itself.
+        $log = Get-DrainLogText
+        $log | Should -Match 'FAILOVER-TICK ok'
+        $log | Should -Match 'OUTCOME success'
+    }
 }
 
 Describe 'Invoke-ClaudishDrainedRestart — compose stderr and deployed-image attestation (#257)' {
