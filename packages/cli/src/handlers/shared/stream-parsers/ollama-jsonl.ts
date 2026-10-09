@@ -11,6 +11,8 @@
 
 import type { Context } from "hono";
 import { log } from "../../../logger.js";
+import { createResponseCapture } from "../response-capture.js";
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 
 export function createOllamaJsonlStream(
   c: Context,
@@ -20,6 +22,12 @@ export function createOllamaJsonlStream(
     onTokenUpdate?: (input: number, output: number) => void;
   }
 ): Response {
+  // Diagnostic capture (no-op unless CLAUDISH_CAPTURE_DIR is set) — this lane
+  // emitted with no capture at all, the same asymmetry the responses lane
+  // carried before bb170b97: an uninstrumented lane is indistinguishable from
+  // a silent one. Mandate: capture every lane, no exception.
+  const reqN = requestNumberFor(c.req);
+  const cap = createResponseCapture("ollama", opts.modelName, true, reqN);
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let isClosed = false;
@@ -27,6 +35,14 @@ export function createOllamaJsonlStream(
 
   const stream = new ReadableStream({
     async start(controller) {
+      // Tap the CLIENT-bound SSE (the translated stream), same seam as the
+      // openai/anthropic lanes — the capture is then replayable as a fixture.
+      const _origEnqueue = controller.enqueue.bind(controller);
+      controller.enqueue = ((chunk: any) => {
+        cap.tap(chunk);
+        return _origEnqueue(chunk);
+      }) as any;
+
       const send = (event: string, data: any) => {
         if (!isClosed) {
           controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
@@ -39,6 +55,10 @@ export function createOllamaJsonlStream(
       let promptTokens = 0;
       let completionTokens = 0;
       let lastActivity = Date.now();
+      // The stop_reason of the terminal message_delta the client actually
+      // received; undefined means the [resp] marker reads `stop=?` ("ended
+      // without one"), never a bug. Same contract as the openai lane (#220).
+      let sentStopReason: string | undefined;
 
       // Send initial message_start
       send("message_start", {
@@ -81,6 +101,7 @@ export function createOllamaJsonlStream(
           if (reason === "error") {
             send("error", { type: "error", error: { type: "api_error", message: err } });
           } else {
+            sentStopReason = "end_turn";
             send("message_delta", {
               type: "message_delta",
               delta: { stop_reason: "end_turn", stop_sequence: null },
@@ -98,6 +119,7 @@ export function createOllamaJsonlStream(
           // Last-ditch terminal pair so the client never hangs waiting for the end.
           log(`[OllamaJSONL] finalize() body threw: ${finalizeErr}`);
           try {
+            sentStopReason = "end_turn";
             send("message_delta", {
               type: "message_delta",
               delta: { stop_reason: "end_turn", stop_sequence: null },
@@ -106,6 +128,15 @@ export function createOllamaJsonlStream(
             send("message_stop", { type: "message_stop" });
           } catch {}
         } finally {
+          // Anthropic-lane convention: `closed: true` on every path that reached
+          // finalize, with the terminal stop reason the client received. done()
+          // is idempotent and swallows its own errors — never breaks the stream.
+          cap.done({
+            closed: true,
+            stop_reason: reason === "error" ? "exception" : sentStopReason,
+            reason,
+            path: "finalize",
+          });
           if (!isClosed) {
             isClosed = true;
             if (pingInterval) {
@@ -178,6 +209,9 @@ export function createOllamaJsonlStream(
       }
     },
     cancel() {
+      // A client abort never reaches finalize; closed=false marks it (#220).
+      cap.note("client-cancel");
+      cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
       isClosed = true;
       if (pingInterval) {
         clearInterval(pingInterval);
