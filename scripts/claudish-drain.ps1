@@ -857,9 +857,12 @@ function Invoke-DrainFailoverEventsTick {
 
         The drain's critical path gains NO dependency here: the tick is
         bounded ($TimeoutSec, then the child is killed), every collector exit
-        code is swallowed-and-logged — the collector's own NOT-MEASURED /
-        held-watermark semantics never hold the drain — and the tick writes
-        only the collector's own state, which the drain never reads back.
+        code is swallowed-and-logged — and so is a FAILED LAUNCH: preparation,
+        Start-Process, handle, wait and cleanup all sit under one catch, so
+        the collector's own NOT-MEASURED / held-watermark semantics never hold
+        the drain and neither does a powershell.exe that cannot even start —
+        and the tick writes only the collector's own state, which the drain
+        never reads back.
     #>
     param(
         [string]$CollectorPath,
@@ -871,30 +874,45 @@ function Invoke-DrainFailoverEventsTick {
         Write-DrainLog "FAILOVER-TICK skipped — no collector at '$CollectorPath'"
         return
     }
-    if (-not (Test-Path -LiteralPath $ClaudishHome)) { New-Item -ItemType Directory -Path $ClaudishHome -Force | Out-Null }
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $tickOut = Join-Path $ClaudishHome "drain-failover-tick-$stamp.out.log"
-    $tickErr = Join-Path $ClaudishHome "drain-failover-tick-$stamp.err.log"
-    # Quote every argument through the same Windows rule the detach launcher
-    # uses — 5.1's -ArgumentList array join quotes nothing, so a home path
-    # with a space must not split (02/10 lesson).
-    $argString = Join-DrainDetachArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
-        '-Container', $Container, '-ClaudishHome', $ClaudishHome)
-    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argString `
-        -WindowStyle Hidden -RedirectStandardOutput $tickOut -RedirectStandardError $tickErr -PassThru
-    # 5.1: without a held handle, ExitCode reads empty after the child dies
-    # (#338 round-1 lesson).
-    $null = $p.Handle
-    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-        try { $p.Kill() } catch { }
-        Write-DrainLog "FAILOVER-TICK killed after ${TimeoutSec}s bound (wedged collector invocation) — swallowed, drain proceeds"
-        return
-    }
-    $code = $p.ExitCode
-    if ($code -eq 0) {
-        Write-DrainLog "FAILOVER-TICK ok — the old container's final markers persisted before the gesture"
-    } else {
-        Write-DrainLog "FAILOVER-TICK collector exit $code (its own NOT-MEASURED / held-watermark semantics) — swallowed, drain proceeds"
+    # Review 09/10 (c6070969008): the three swallowed shapes below (absent
+    # collector, exit != 0, timeout) only cover a launch that SUCCEEDED — a
+    # throwing Start-Process escaped to the wrapper as OUTCOME exception, so a
+    # collector failure BLOCKED the drain, the exact coupling this function
+    # exists to prevent. One catch wraps preparation, launch, handle, wait and
+    # cleanup alike: every step here is the passenger's, never the drain's.
+    try {
+        if (-not (Test-Path -LiteralPath $ClaudishHome)) { New-Item -ItemType Directory -Path $ClaudishHome -Force | Out-Null }
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $tickOut = Join-Path $ClaudishHome "drain-failover-tick-$stamp.out.log"
+        $tickErr = Join-Path $ClaudishHome "drain-failover-tick-$stamp.err.log"
+        # Quote every argument through the same Windows rule the detach launcher
+        # uses — 5.1's -ArgumentList array join quotes nothing, so a home path
+        # with a space must not split (02/10 lesson).
+        $argString = Join-DrainDetachArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
+            '-Container', $Container, '-ClaudishHome', $ClaudishHome)
+        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argString `
+            -WindowStyle Hidden -RedirectStandardOutput $tickOut -RedirectStandardError $tickErr -PassThru
+        # 5.1: without a held handle, ExitCode reads empty after the child dies
+        # (#338 round-1 lesson).
+        $null = $p.Handle
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch { }
+            Write-DrainLog "FAILOVER-TICK killed after ${TimeoutSec}s bound (wedged collector invocation) — swallowed, drain proceeds"
+            return
+        }
+        $code = $p.ExitCode
+        if ($code -eq 0) {
+            Write-DrainLog "FAILOVER-TICK ok — the old container's final markers persisted before the gesture"
+        } else {
+            Write-DrainLog "FAILOVER-TICK collector exit $code (its own NOT-MEASURED / held-watermark semantics) — swallowed, drain proceeds"
+        }
+    } catch {
+        # Log safely: the drain log is line-shaped, so keep the first line of
+        # the exception message and cap its length — a multi-line or very long
+        # message must not break the log the wrapper's OUTCOME depends on.
+        $first = ($_.Exception.Message -split "`r?`n")[0]
+        if ($first.Length -gt 160) { $first = $first.Substring(0, 160) }
+        Write-DrainLog "FAILOVER-TICK failed ($($_.Exception.GetType().Name): $first) — swallowed, drain proceeds"
     }
 }
 

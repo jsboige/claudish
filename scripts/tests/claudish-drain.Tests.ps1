@@ -680,6 +680,30 @@ Start-Sleep -Seconds 45
         # away this assert trips AND the kill line vanishes.)
         $sw.Elapsed.TotalSeconds | Should -BeLessThan 30
     }
+
+    It 'a THROWING launch (Start-Process fails) is swallowed — drain success, OUTCOME success, labeled tick failure' {
+        # Review 09/10 (c6070969008): a Start-Process that throws escaped the
+        # tick entirely and reached the wrapper as OUTCOME exception — a
+        # collector failure BLOCKED the drain, the exact coupling #368 exists
+        # to prevent. The three swallowed shapes (absent collector, exit != 0,
+        # timeout) only cover a launch that SUCCEEDED. The mock is scoped to
+        # the tick's own launch: this e2e path calls Start-Process exactly
+        # once (the detach launcher at :1016 is a different entry branch).
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        Mock Start-Process { throw [System.ComponentModel.Win32Exception]::new(2, 'mocked launch failure') } `
+            -ParameterFilter { "$FilePath" -eq 'powershell.exe' }
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-throw' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-ok.ps1') -FailoverTickTimeoutSec 30
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match ([regex]::Escape('FAILOVER-TICK failed (Win32Exception'))
+        $log | Should -Match 'swallowed, drain proceeds'
+        $log | Should -Match 'OUTCOME success'
+        $log | Should -Not -Match 'OUTCOME exception'
+    }
 }
 
 Describe 'Invoke-ClaudishDrainedRestart — compose stderr and deployed-image attestation (#257)' {
