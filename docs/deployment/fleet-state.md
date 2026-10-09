@@ -47,6 +47,10 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 | `ClaudishDailyRestart` 04:00 | DISABLED (05/09, user UAC) | VERIFIED 09/10 (po-2023: `State=Disabled`, `LastRunTime 05/09 04:00:01`, `LastTaskResult 0`) |
 | Cascade | auto; haiku→DeepSeek v4 Flash PAYG observed armed + recovered 07/09 | VERIFIED (po-203 cycles) |
 | Sidecar native `:8787` | restarted (fix #3388) | DECLARED 06/09 |
+| **Client path** (live `~/.claude/settings.json`) | `env.ANTHROPIC_BASE_URL = http://192.168.0.50:3000` — hub **direct**, bypasses this relay. `_intentional_diffs.ANTHROPIC_BASE_URL` still declares `http://127.0.0.1:3000` (this relay) → **contradiction open with the user** (Q-20261006-1; #291 c.6018454098) | VERIFIED 09/10 07:20Z (po-203 cycle) |
+| **WAN edge** `models.myia.io` (IIS site 49, hosted on po-2023) | reverse-proxy target `http://192.168.0.50:3000` — hub **direct**, relay bypassed. web.config mtime **2026-10-04 21:24 local**, sha256 `7ADE6AD6` — **unchanged since the 08/10 measurement** (no silent revert; the 30/09 state `localhost:3000` no longer holds) | VERIFIED 09/10 07:20Z (live web.config + `applicationHost.config`) |
+| **Edge client population** (09/10 00:00→07:19Z, 4961 req) | 2 off-site `claude-cli` **cron** clients (2141 + 71 real `/v1/messages`; 7× 429 = 0.3%) · 2634 `/health` from the **hairpin** (LAN-internal `Bun/1.3.14` prober, exact 10 s cadence — source not attributable from po-203) · ~15 internet scanner hits (Palo Alto Xpanse, `/.env`) | VERIFIED 09/10 (W3SVC49 log) |
+| **Population served by this relay** | **probes only** — its own watchdog heartbeat + deep probe. No client transits it on either path: local clients go `.50` direct, and so does the WAN edge | VERIFIED 09/10 07:20Z (`/health` `relay-nominal` + edge/relay logs) |
 
 ## ai-01 — COORDINATOR + sidecar
 
@@ -82,6 +86,7 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 
 | Date (Z) | Machine | Change | Proof |
 | --- | --- | --- | --- |
+| 2026-10-09 07:20 | po-2023 | **path witness re-read, read-only — no gesture applied** (#291 grain 3): edge backend `192.168.0.50:3000` unchanged (mtime 04/10 21:24, sha `7ADE6AD6`), client `env` still hub-direct vs the relay-declaring `_intentional_diffs`, relay serves probes only, edge today = 2 off-site cron clients + a 10 s hairpin `/health` prober | live web.config + `applicationHost.config` + `settings.json` + W3SVC49 log + `/health` probes on both relay and hub |
 | 2026-10-08 10:09:58 local | po-2025 | `ClaudishDailyRestart` (04:00) **deleted** — user UAC batch v2, gesture G1; the user arbitrated "no daily restart". Last run 08/10 07:31 local → `OUTCOME success` | DECLARED by po-2025; absence re-confirmed 10:19:35 local. With po-2023's disabled since 05/09, **no daily restart remains on the fleet** |
 | 2026-09-23 04:16 | ai-01 | drained recreate under po-2025's `[ACK]` (single-ACK rule), plan posted 04:12Z: image rebuilt from `61c3d2d`, opus map → `claude-opus-5-5`, sonnet cascade armed (3 steps) + `ROLE_MODELS=glm-5.2:sonnet`. Drain: 0 in flight | precondition 3/3 on a throwaway container; `/health` :3002 + :13000; real tool-call turn to `message_stop` with local capture count unchanged (NOMINAL); in-container pin; armed by value = 3 |
 | 2026-09-23 | po-2026 | state audited on-boarding (no change applied): sidecar still on pre-migration upstream `.46` (file + container), 0 cascades armed, client bypasses it direct to `.50`; runbook's 13/09 repoint claim corrected — it never landed; compose dir is a second clone (`C:\dev\claudish`) | section above (all items VERIFIED 23/09) |
