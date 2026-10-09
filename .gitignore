@@ -115,3 +115,15 @@ __pycache__/
 
 # #175 strict-runner per-machine baseline (systematic fail population is machine-local)
 .test-strict-baseline.json
+
+# Agent scratchpad accidents (global proposal 09/10, CoursIA-3 amendment): a
+# script that resolves a temp path to the CWD leaves `scratchpad_*` behind, and
+# a mangled absolute path (separators stripped) lands as a file NAMED like the
+# path — measured 29.3 MB of those at a repo root, invisible to every guard
+# because no destructive command ever ran. Two lines catch both families.
+scratchpad_*
+C:Users*
+
+# Session-local scratch dir per the same proposal (never commit, never in the
+# Claude dirs)
+.tmp/
