@@ -1205,7 +1205,19 @@ export async function createProxyServer(
     // writes NO fleet state (no arm, no step mark, no dwell pin): a request
     // that may not spend fleet budget must not shape the fleet's failover.
     const keylessNative = keylessNativeRequest(c, requestedModel);
-    const maxAttempts = keylessNative ? 1 : rule ? rule.steps.length + 1 : 1; // nominal + each step
+    // #416 review (ai-01, non-blocking): there used to be a second belt here —
+    // `keylessNative ? 1 : …` — capping the loop at one attempt. It was
+    // UNREACHABLE, and measured as such: widening it back changes no test
+    // outcome (15/15 either way), because the loop's own step guard already
+    // forces `stepIndex === -1` for a keyless request (the resolution above is
+    // `role && !keylessNative ? … : { step: null, stepIndex: -1 }`), and both
+    // outcomes of attempt 0 return: a served response ends the loop, a refused
+    // one hits the `if (keylessNative)` early return below. An unreachable
+    // guard is worse than no guard — it reads as protection nobody has. The
+    // early return is the guard, it is observable (it emits the countable
+    // marker) and it is pinned (T3/T4); this line is subtraction, not a new
+    // promise.
+    const maxAttempts = rule ? rule.steps.length + 1 : 1; // nominal + each step
     const armGraceMs = getArmGraceMs();
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
     let graceRetried = false; // #91: one wait-and-retry on the nominal per request

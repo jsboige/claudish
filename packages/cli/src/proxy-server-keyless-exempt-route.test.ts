@@ -25,7 +25,10 @@
  *   T4  bucket ALREADY armed on the NEXT request (point 1b) — still native,
  *       never a 401 about a key the client never needed
  *   T5  keyed / relay-injected / scoped-inbound shapes — the guard must not
- *       fire on any of them
+ *       fire on any of them. This file covers the HUB's reading of a
+ *       relay-shaped request; the RELAY's side (it must not manufacture that
+ *       shape for a client holding no key) lives in
+ *       fork/server/relay-keyless-forward.test.ts (#416 review point 2/3)
  *   T6  count_tokens — same invariant on the counting path
  *   T7  an image-bearing body (vision) is refused at RESOLUTION, before any
  *       fetch — the vision description call is unreachable keylessly
@@ -396,14 +399,20 @@ describe("#416 T5 — authorized shapes are untouched", () => {
     expect(calls.bud).toBe(1);
   });
 
-  test("relay-injected cluster key ⇒ treated as authenticated, never as keyless", async () => {
+  test("HUB reading of a relay-shaped forward (cluster key in x-proxy-key) ⇒ authenticated, never keyless", async () => {
     await spin();
     // A sidecar forwards with the cluster key injected as `x-proxy-key`: that
     // authenticates the RELAY, and the hub cannot see the client's own
-    // credential behind it. Scope of this pin, stated rather than assumed: it
-    // verifies the HUB's reading of a relay-shaped request, observed on a
-    // direct connection. The sidecar's own ingress ACLs are NOT exercised
-    // here and live with their owner.
+    // credential behind it.
+    //
+    // Scope, stated rather than promised by the title (review ai-01 09/10,
+    // point 3): this verifies the HUB's READING of an already-relayed request,
+    // observed on a direct connection. It does NOT prove the relay refrains
+    // from manufacturing that shape for a client that holds no key — that is
+    // the relay's job, pinned on a real sidecar against a stub hub in
+    // fork/server/relay-keyless-forward.test.ts (F1/F2). The sidecar's ingress
+    // ACLs beyond the forward are not exercised here either and live with
+    // their owner.
     const res = await post("/v1/messages", SONNET, { "x-proxy-key": PROXY_KEY });
     expect(res.status).toBe(200);
     expect(calls.bud).toBe(1);

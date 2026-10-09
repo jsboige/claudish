@@ -26,12 +26,13 @@
 
 import type { Context } from "hono";
 import { gzipSync, gunzipSync } from "node:zlib";
-import { log } from "../../logger.js";
+import { log, logStderr } from "../../logger.js";
 import { getInstanceId } from "../../instance-id.js";
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
 import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
 import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
 import { isQuotaExhaustion } from "../failover.js";
+import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 
 /** Headers we must not blindly forward to the upstream. */
 const HOP_BY_HOP = new Set([
@@ -406,7 +407,18 @@ export async function forwardToUpstream(
   // re-visited node will check). Overwrites the copy the loop above made of
   // the inbound value, if any.
   headers[HOPS_HEADER] = appendHop(c.req.raw.headers.get(HOPS_HEADER), getInstanceId());
-  if (state.proxyKey) {
+  // #416 — the relay's cluster key authenticates the RELAY, never its client.
+  //
+  // The auth middleware (registerForkExtensions, mounted before every route)
+  // marks a request whose Anthropic-shaped target it admitted WITHOUT the
+  // caller holding a key of its own (keyless-exempt.ts, #412). Injecting the
+  // cluster key here on such a request would hand that client the fleet's
+  // credential at the hub — the elevation #412 exists to close, reopened by the
+  // very hop that carries it. Measured shape: a keyless native client through a
+  // sidecar arrives at the hub authenticated, and `[InboundKey]`/keyless
+  // accounting never sees it.
+  const keyless = isKeylessExempt(c.req.raw);
+  if (state.proxyKey && !keyless) {
     // Inject the cluster proxy key as x-proxy-key (NOT x-api-key). The hub's
     // auth gate accepts x-proxy-key, but NativeHandler's proxyKey→Anthropic swap
     // only triggers on x-api-key/authorization == proxyKey. Using x-proxy-key
@@ -419,6 +431,32 @@ export async function forwardToUpstream(
     delete headers["x-api-key"]; // a stale client x-api-key==proxyKey would re-arm the hub swap
     headers["x-proxy-key"] = state.proxyKey;
     // KEEP authorization — preserves the client OAuth for native passthrough.
+  } else if (keyless) {
+    // Explicit decision on the two neighbouring headers, on the keyless path:
+    //
+    // - `x-api-key` is KEPT, unlike the keyed branch above. On that branch the
+    //   delete exists to stop a stale copy of OUR cluster key re-arming the
+    //   hub's proxyKey→Anthropic swap; here the value cannot be our cluster key
+    //   at all — the middleware only marks keyless after `matchesProxyKey`
+    //   failed on exactly this header value at THIS process's key list. What it
+    //   can be is the client's own `sk-ant-…` API key, and deleting it would
+    //   strip the only credential of a native client authenticating that way:
+    //   the hub would then see no credential, take the #296 shape-A path, and
+    //   answer 403 where the pre-#412 relay worked. The exemption means "spends
+    //   its OWN credential" — so its own credential travels.
+    // - `x-proxy-key` is DROPPED anyway. It is the relay's own header: a hub
+    //   with a different key value would read a non-matching forwarded copy as
+    //   an authentication attempt, and nothing legitimate ever puts a client
+    //   value there (a matching one would have authenticated this request one
+    //   line earlier, so this branch cannot see one). Not forwarding it keeps
+    //   the "no key" reading at the hub unambiguous.
+    delete headers["x-proxy-key"];
+    // logStderr, not log(): a sidecar runs with debug off, where log() is
+    // file-only and the marker would be invisible to `docker logs` — the same
+    // reason the sibling `[InboundKey]` / `[Relay] forward connect failed`
+    // markers exist (#212 lesson). One line per keyless forward is the
+    // countable evidence for the post-deploy consumer check (#416 DoD).
+    logStderr("[Relay] keyless-exempt forward — cluster key not injected (#416)");
   }
 
   // Serialize (body already consumed by the route's readRequestBody). Optionally
