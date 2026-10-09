@@ -867,6 +867,34 @@ export async function createProxyServer(
     return providerBucketOf(stepTarget);
   };
 
+  /**
+   * #412 (review ai-01 08/10, point 1) — is this request's NOMINAL target the
+   * native passthrough? The auth middleware marked the request keyless
+   * precisely because its ASKED name parsed native and is not a routed bare
+   * name, but `modelMap` can still send it elsewhere (`modelMap.sonnet =
+   * glm-5.3`): that shape must keep requiring a key, so the failover-swap
+   * suppression is keyed on the nominal TARGET, never on the request merely
+   * being keyless.
+   */
+  const nominalIsNative = (requestedModel: string): boolean => {
+    const { target } = resolveNominalTarget(requestedModel);
+    const spec = parseModelSpec(target);
+    return spec.provider === "native-anthropic" && !routedBareNames.has(target);
+  };
+
+  /**
+   * #412 — ONE definition of "this request is keyless and its nominal is
+   * native", read by every resolution of the same request: the route's
+   * log/billing-strip resolution, `handleWithCascade`'s, and count_tokens'.
+   * They MUST agree — the route's resolution is not a dry run: it mutates the
+   * #91 per-session dwell pin, and its handler identity decides whether the
+   * billing header is stripped. Two resolutions disagreeing would label the
+   * request `ComposedHandler` while the cascade served it natively, and would
+   * let a keyless request write fleet failover state through the back door.
+   */
+  const keylessNativeRequest = (c: Context, requestedModel: string): boolean =>
+    isKeylessExempt(c.req.raw) && nominalIsNative(requestedModel);
+
   const getHandlerForRequest = async (
     requestedModel: string,
     depth = 0,
@@ -879,7 +907,18 @@ export async function createProxyServer(
      * by resolution — a state read would either re-select the nominal (no arm)
      * or write the dwell pin the walk must not write.
      */
-    forceTarget?: string
+    forceTarget?: string,
+    /**
+     * #412 (review ai-01 08/10, point 1): suppress the 2a failover swap for
+     * THIS request. Set only for a keyless request whose NOMINAL target is
+     * native — substituting a budget step there answers the client's own
+     * exhausted meter with a 401 about a key they never needed, which
+     * conflates a native quota limit with a login failure. It suppresses the
+     * SWAP, never the resolution: modelMap and the routing chain still decide
+     * the target, so a keyless request whose modelMap entry is a budget model
+     * still resolves there and is then refused by the keyless guard below.
+     */
+    suppressFailover = false
   ): Promise<ModelHandler> => {
     // 1. Monitor Mode Override
     if (monitorMode) return nativeHandler;
@@ -914,7 +953,7 @@ export async function createProxyServer(
     // available. Inert unless CLAUDISH_FAILOVER_* is configured. See fork/failover.ts.
     // Skipped entirely for a forced walk target: that attempt must not read
     // failover state (the walk changes none).
-    if (!forceTarget && role && getFailoverRule(role)) {
+    if (!forceTarget && !suppressFailover && role && getFailoverRule(role)) {
       // #275: the diversion test is bucket-scoped — compute this request's
       // nominal bucket (unless the caller — the cascade loop — already did).
       const bucket = nominalBucket ?? (await nominalBucketOfModel(requestedModel));
@@ -1155,7 +1194,18 @@ export async function createProxyServer(
     // must all key on the same bucket or the diversion test lies.
     const bucket =
       nominalBucket ?? (rule ? await nominalBucketOfModel(requestedModel) : undefined);
-    const maxAttempts = rule ? rule.steps.length + 1 : 1; // nominal + each step
+    // #412 — a keyless request whose NOMINAL is native must not be substituted
+    // away by the budget failover (review ai-01 08/10, point 1). Two measured
+    // shapes, one answer: (a) in-request, the native 429 arms the role and the
+    // retry re-resolves to a budget step; (b) a bucket already armed by a
+    // PREVIOUS request resolves straight to that step on attempt 0, with no
+    // prior response to surface. Both would hand a client its own native wall
+    // as a 401 about a key it never needed. Suppressing the swap keeps the
+    // native trajectory bounded — the client's own response surfaces — and
+    // writes NO fleet state (no arm, no step mark, no dwell pin): a request
+    // that may not spend fleet budget must not shape the fleet's failover.
+    const keylessNative = keylessNativeRequest(c, requestedModel);
+    const maxAttempts = keylessNative ? 1 : rule ? rule.steps.length + 1 : 1; // nominal + each step
     const armGraceMs = getArmGraceMs();
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
     let graceRetried = false; // #91: one wait-and-retry on the nominal per request
@@ -1178,8 +1228,15 @@ export async function createProxyServer(
     // does afterwards.
     let overloadWalked = false;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const handler = await getHandlerForRequest(requestedModel, 0, sessionKey, bucket);
-      const resolved = role
+      const handler = await getHandlerForRequest(
+        requestedModel,
+        0,
+        sessionKey,
+        bucket,
+        undefined,
+        keylessNative
+      );
+      const resolved = role && !keylessNative
         ? resolveFailoverTargetForSession(role, sessionKey, bucket)
         : { step: null, stepIndex: -1 };
       const { stepIndex } = resolved;
@@ -1249,7 +1306,12 @@ export async function createProxyServer(
       //     honest answer to the client is their own 429 — their meter is the
       //     exhausted one — not a 401 blaming the key they never needed.
       if (isKeylessExempt(c.req.raw) && !(handler instanceof NativeHandler)) {
-        const lane = resolved.step?.target ?? handler.constructor.name;
+        // #412 (review ai-01 08/10, point 4): name a CONCRETE, non-secret lane,
+        // never the handler class alone — `ComposedHandler` as the lane says
+        // nothing about which credential the request resolved to, and an
+        // operator reading the marker needs the target (`glm-5.3`,
+        // `frognano-4b`) to know what would have been spent.
+        const lane = resolved.step?.target ?? resolveNominalTarget(requestedModel).target;
         if (response) return response;
         logStderr(
           `[ProxyAuth] keyless request for ${requestedModel} resolves to a server-held credential (${lane}) — refused, zero upstream fetch`
@@ -1354,6 +1416,14 @@ export async function createProxyServer(
           rule != null &&
           rule.steps.length > 0 &&
           !(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`) &&
+          // #412 (review ai-01 08/10, point 3): the native lane is excluded
+          // ABOVE by its bucket prefix — but that predicate is a property of
+          // `nominalBucketOfModel`, and a future bucketing change would reopen
+          // the path silently. A keyless request never walks: the walk serves
+          // the turn from a step the FLEET pays for, which is exactly what the
+          // keyless invariant forbids, and its "no failure state" promise
+          // would not make that spend legitimate.
+          !keylessNative &&
           isOverloadWalkClass(response.status, errBody)
         ) {
           overloadWalked = true;
@@ -1503,6 +1573,18 @@ export async function createProxyServer(
       }
       const reason = `HTTP ${response.status} from ${requestedModel}`;
       if (stepIndex === -1) {
+        // #412 (review ai-01 08/10, point 1): a keyless NATIVE request surfaces
+        // the client's own wall — it is their meter that is exhausted — and
+        // arms nothing. Arming here would exile the role for a TTL off a
+        // credential the fleet does not hold, and the retry it triggers would
+        // then hand the client a 401 about a key they never needed. One
+        // countable marker, then the native response.
+        if (keylessNative) {
+          logStderr(
+            `[ProxyAuth] keyless native ${requestedModel} [${bucket ?? "-"}] → HTTP ${response.status} surfaced, no arm (client's own credential)`
+          );
+          return response;
+        }
         // Nominal walled (#91 gate: burst discrimination + grace before arming —
         // see onNominalRefusal). "armed" also covers the concurrent-request race
         // where another request armed the role between this one's handler
@@ -1706,14 +1788,24 @@ export async function createProxyServer(
           400
         );
       }
-      const handler = await getHandlerForRequest(body.model, 0, extractSessionKey(body));
+      // #412 — same suppression as the serving routes: this resolution writes
+      // the dwell pin too, and the keyless guard just below must see the
+      // handler the request would ACTUALLY get, not a swapped one.
+      const handler = await getHandlerForRequest(
+        body.model,
+        0,
+        extractSessionKey(body),
+        undefined,
+        undefined,
+        keylessNativeRequest(c, body.model)
+      );
 
       // #412 — same invariant on the counting path as on the serving one, and
       // for the same reason: a keyless request resolves here to a handler that
       // would spend the FLEET's credential. No cascade on this route, so there
       // is no prior attempt to surface — it is always the labeled 401.
       if (isKeylessExempt(c.req.raw) && !(handler instanceof NativeHandler)) {
-        const lane = handler.constructor.name;
+        const lane = resolveNominalTarget(body.model).target;
         logStderr(
           `[ProxyAuth] keyless request for ${body.model} resolves to a server-held credential (${lane}) — refused, zero upstream fetch (count_tokens)`
         );
@@ -1922,7 +2014,18 @@ export async function createProxyServer(
       const requestRole = roleFromModelName(body.model);
       const requestBucket =
         requestRole && getFailoverRule(requestRole) ? await nominalBucketOfModel(body.model) : undefined;
-      const handler = await getHandlerForRequest(body.model, 0, sessionKey, requestBucket);
+      // #412 — the SAME suppression as the cascade below: this resolution is
+      // not a dry run (it writes the per-session dwell pin and decides the
+      // billing-header strip), so letting it swap behind a keyless native
+      // request would both mislabel the log and write fleet state.
+      const handler = await getHandlerForRequest(
+        body.model,
+        0,
+        sessionKey,
+        requestBucket,
+        undefined,
+        keylessNativeRequest(c, body.model)
+      );
       logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
       stripBillingHeaderFromBody(body, handler instanceof NativeHandler);
 
@@ -2008,11 +2111,16 @@ export async function createProxyServer(
         requestRole && getFailoverRule(requestRole)
           ? await nominalBucketOfModel(anthropicBody.model)
           : undefined;
+      // #412 — the OpenAI-compatible ingress resolves the handler for the same
+      // two reasons as /v1/messages (log label + billing strip, plus the dwell
+      // pin it writes as a side effect), so it carries the same suppression.
       const handler = await getHandlerForRequest(
         anthropicBody.model,
         0,
         extractSessionKey(anthropicBody),
-        requestBucket
+        requestBucket,
+        undefined,
+        keylessNativeRequest(c, anthropicBody.model)
       );
       logRequest(anthropicBody, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
       stripBillingHeaderFromBody(anthropicBody, handler instanceof NativeHandler);
