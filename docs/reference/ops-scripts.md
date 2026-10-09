@@ -65,3 +65,23 @@ nightly 7z compaction + GDrive backup (02:47 — moved off 04:17 on 2026-08-20: 
 **Zero actuator** (#172/#185/#192 convention): no process, service, task or file is modified — a detector that acts on what it finds is the #173 teardown-without-rebuild shape. Enforced by an AST guard with a positive control (`Restart-*`/`Stop-*`/`Start-*`/`Remove-*`/`Register-*`/`Unregister-*`/`Set-*`/`Suspend-*`/`Disable-*` cmdlets, `docker stop|restart|kill|rm`, `taskkill`, `schtasks /change|create|delete|end|run`, `-Verb RunAs`), plus the INCOMPLETE pins per source and one pin per flag and per benign shape.
 
 **Tests**: `scripts/tests/claudish-split-brain-scan.Tests.ps1` (both `powershell.exe` 5.1 and `pwsh` 7), fixtures injected by mocking the three OS sources (`Get-CimInstance` — which also throws on any `-Filter`, pinning the single-snapshot rule — / `Get-ScheduledTask` / `Get-ScheduledTaskInfo`).
+
+## Content-level split-brain discriminator (`split-brain-content.py`, #41)
+
+**Read-only, capture-side complement to `split-brain-scan.ps1`.** The host scan answers "is a session id duplicated on this machine?"; this one answers the question a host scan cannot, from the hub's own captures: *inside one `session_id`, are two message sequences cohabiting?* (user directive 2026-10-09 — when metadata cannot separate two sequences under one lane, descend to the content). A Claude Code conversation is append-only, so each request's user-message history extends the previous one; the instrument reconstructs those histories and flags sequences that are disjoint **and concurrently alive**.
+
+```
+python scripts/split-brain-content.py --date 2026-10-09 [--session <prefix>]...
+```
+
+Method, in order: (1) **harness removal by document frequency** — a user-segment hash present in ≥10% of a broad sample is harness (CLAUDE.md/memory/system-reminders re-injected into every request) and is dropped *wherever it sits*, order preserved; (2) **partition each session's requests by `cc_is_subagent`** (T5 below); (3) **chain by prefix containment** within each partition — B extends A iff A's residual core is a prefix of B's; a compaction replaces the history and legitimately starts a *new, sequential* chain; (4) a **fork** is two chains *inside the same partition whose time ranges overlap*. Chains shorter than 8 residual segments are not counted (T3).
+
+Five measured traps, each of which produced a wrong answer before its fix — the script header documents them in full:
+
+- **T1 — chaining on all segments**: every request opens with the same harness head, so the containment test compares harness to harness and *no request ever extends another* (every chain depth 1, measured on 4021 requests).
+- **T2 — stripping a contiguous head is not enough**: the harness injects a *variable* number of blocks whose position shifts between requests; harness blocks survive in the residual core and one thread splits into "concurrent" chains. The tell: every such "fork" was same-machine, same-client IP. Hence document-frequency removal.
+- **T3 — short recurring task prompts** (a cron lane re-sends the same opening prompt each epoch) bucket unrelated epochs into one chain spanning hours.
+- **T4 — `cc_is_subagent` as a bare grep is always true**: the fleet's own CLAUDE.md documents the 2026-08-10 leak using that literal string, so it is quoted inside nearly every request body. The real flag lives on the `cc_version=…` metadata line — read that line.
+- **T5 — a Task sub-agent carries the PARENT's `session_id`** (measured: disjoint requests under one id map exactly onto `cc_version` build `…79e` main vs `…4be` + `cc_is_subagent=true`). One session therefore legitimately holds the main conversation plus one disjoint conversation per concurrent sub-agent — raw content diffing calls that a fork, and a coordinator lane with parallel sub-agents shows dozens of concurrent sub-chains. Partitioning is what separates them; concurrent **SUB** chains are reported for information and are **not** split-brain.
+
+**First full run (2026-10-09, hub po-2025, CoursIA corpus: 26 298 requests, 35 sessions incl. the 18 stage-2 fork candidates): 0 concurrent MAIN chains.** The apparent "two disjoint cohabiting sequences" were main-agent + sub-agent streams; within the main partition every session is one compacting thread (a sawtooth message-count trajectory, zero shared content across each compaction boundary because the summary replaces the history). Corroborates CoursIA's independent GitHub-side finding (no duplicated branches over 386 PRs). Limit of the instrument: it cannot separate *two processes on one machine* from *one compacting thread* on content alone — that residual ambiguity stays with the host scan (`split-brain-scan.ps1`), which sees the processes.
