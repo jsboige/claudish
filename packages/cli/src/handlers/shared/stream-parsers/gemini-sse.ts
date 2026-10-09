@@ -10,6 +10,8 @@ import type { Context } from "hono";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
 import type { MiddlewareManager } from "../../../middleware/manager.js";
 import { log } from "../../../logger.js";
+import { createResponseCapture } from "../response-capture.js";
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 
 export interface GeminiSseOptions {
   modelName: string;
@@ -27,6 +29,13 @@ export function createGeminiSseStream(
   response: Response,
   opts: GeminiSseOptions
 ): Response {
+  // Diagnostic capture (no-op unless CLAUDISH_CAPTURE_DIR is set). This lane
+  // streamed with NO capture at all — the same blind spot the responses lane
+  // had before bb170b97: a lane that emits and captures nothing is invisible to
+  // every capture analysis, and its absence reads as "no traffic on this lane"
+  // rather than "this lane is not instrumented". Mandate: capture every lane.
+  const reqN = requestNumberFor(c.req);
+  const cap = createResponseCapture("gemini", opts.modelName, true, reqN);
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let isClosed = false;
@@ -34,6 +43,15 @@ export function createGeminiSseStream(
 
   const stream = new ReadableStream({
     async start(controller) {
+      // Tap the CLIENT-bound SSE, mirroring the openai/anthropic lanes: wired at
+      // enqueue rather than on the upstream bytes, so a capture is the exact
+      // translated stream the client received and is replayable as a fixture.
+      const _origEnqueue = controller.enqueue.bind(controller);
+      controller.enqueue = ((chunk: any) => {
+        cap.tap(chunk);
+        return _origEnqueue(chunk);
+      }) as any;
+
       const send = (event: string, data: any) => {
         if (!isClosed) {
           controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
@@ -51,6 +69,11 @@ export function createGeminiSseStream(
       const toolCalls = new Map<number, any>();
       let accumulatedText = "";
       let lastActivity = Date.now();
+      // The stop_reason of the terminal message_delta the client actually
+      // received — same contract as the openai lane (#220): stays undefined when
+      // no message_delta went out, and the [resp] marker then reads `stop=?`,
+      // which is a meaning ("the stream ended without one"), never a bug.
+      let sentStopReason: string | undefined;
 
       send("message_start", {
         type: "message_start",
@@ -123,6 +146,7 @@ export function createGeminiSseStream(
             send("error", { type: "error", error: { type: "api_error", message: err } });
           } else {
             const hasToolCalls = toolCalls.size > 0;
+            sentStopReason = hasToolCalls ? "tool_use" : "end_turn";
             send("message_delta", {
               type: "message_delta",
               delta: { stop_reason: hasToolCalls ? "tool_use" : "end_turn", stop_sequence: null },
@@ -134,6 +158,7 @@ export function createGeminiSseStream(
           // Last-ditch terminal pair so the client never hangs waiting for the end.
           log(`[GeminiSSE] finalize() body threw: ${finalizeErr}`);
           try {
+            sentStopReason = "end_turn";
             send("message_delta", {
               type: "message_delta",
               delta: { stop_reason: "end_turn", stop_sequence: null },
@@ -142,6 +167,16 @@ export function createGeminiSseStream(
             send("message_stop", { type: "message_stop" });
           } catch {}
         } finally {
+          // Mirrors the anthropic lane's convention: `closed: true` on every path
+          // that reached finalize (the controller always closes there), with the
+          // stop reason of the terminal event the client got. done() is
+          // idempotent and swallows its own errors — it can never break the stream.
+          cap.done({
+            closed: true,
+            stop_reason: reason === "error" ? "exception" : sentStopReason,
+            reason,
+            path: "finalize",
+          });
           if (!isClosed) {
             isClosed = true;
             if (pingInterval) {
@@ -314,6 +349,10 @@ export function createGeminiSseStream(
       }
     },
     cancel() {
+      // A client abort never reaches finalize, so it closes the capture here —
+      // closed=false is what distinguishes it from a clean close (#220).
+      cap.note("client-cancel");
+      cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
       isClosed = true;
       if (pingInterval) {
         clearInterval(pingInterval);
