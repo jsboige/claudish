@@ -69,6 +69,7 @@ import {
   resolveDelegationOwner,
   setRoleNominalResolver,
   markStepFailed,
+  earliestWalledResetAt,
   NATIVE_BUCKET,
   parseResetAtFromBody,
   resetStepSuccess,
@@ -1531,7 +1532,61 @@ export async function createProxyServer(
             });
           }
         }
-        if (rule && stepIndex === rule.steps.length - 1) return response; // last step also walled
+        if (rule && stepIndex === rule.steps.length - 1) {
+          // #409: a walled LAST step used to surface the provider's own status
+          // verbatim. Claude Code renders a 403 as an auth failure and offers an
+          // Anthropic login prompt (measured ai-01 2026-10-08: Kimi's weekly 403
+          // blocked a session on that prompt until the user intervened), and a
+          // DeepSeek 402 "Insufficient Balance" reads as a wiring error to fix by
+          // hand. Both ARE budget walls — isQuotaExhaustion just classified them,
+          // the steps above were walled the same way — so say so in the
+          // vocabulary the client already retries: 429 rate_limit_error, which is
+          // what Anthropic's own weekly cap returns, with a retry-after when a
+          // reset is known. The message names role, concrete and original status,
+          // so the wall is never silent. Native lane excluded: its meter is the
+          // client's own Anthropic credential, which already speaks 429 (the
+          // walk above uses the same bucket guard). 401/404 never reach here —
+          // they don't classify as walls and surface unchanged.
+          if (!(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`)) {
+            const lastConcrete = delegation?.concrete ?? resolved.step?.target ?? requestedModel;
+            let upstreamMsg = errBody.slice(0, 200);
+            try {
+              const parsed = JSON.parse(errBody);
+              const m = parsed?.error?.message ?? parsed?.message;
+              if (typeof m === "string" && m.length > 0) upstreamMsg = m.slice(0, 200);
+            } catch {
+              // not JSON — the raw slice above already is the message
+            }
+            const headers = new Headers({ "Content-Type": "application/json" });
+            const reset = earliestWalledResetAt(role);
+            if (reset) {
+              headers.set("retry-after", String(Math.max(1, Math.ceil((reset.getTime() - Date.now()) / 1000))));
+            }
+            log(
+              `[Failover] WALL-SURFACE ${role} — HTTP ${response.status} from ${lastConcrete} rewritten to 429 rate_limit_error` +
+                (reset ? ` (retry-after ${headers.get("retry-after")}s)` : " (no known reset — retry-after omitted)"),
+              true
+            );
+            // The upstream body was only ever read from a clone; the original is
+            // a connection held open for nothing once we replace the response.
+            try {
+              await response.body?.cancel();
+            } catch {
+              // already gone — nothing to drain
+            }
+            return new Response(
+              JSON.stringify({
+                type: "error",
+                error: {
+                  type: "rate_limit_error",
+                  message: `[Failover] ${role}: every step walled — last: ${lastConcrete} ${response.status}: ${upstreamMsg}`,
+                },
+              }),
+              { status: 429, headers }
+            );
+          }
+          return response; // last step also walled (native lane: surface as-is)
+        }
       }
     }
     return response as Response;

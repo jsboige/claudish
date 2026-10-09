@@ -846,6 +846,26 @@ export function resetAllStepFailures(role: FailoverRole): void {
   stepFailures.delete(role);
 }
 
+/**
+ * #409: the earliest KNOWN reset among a role's walled steps — a failure
+ * record's resetAt first (body-parsed at mark time, else the operator's
+ * `_RESET`), then any future config step.resetAt (#261). Feeds the
+ * `retry-after` of the rewritten last-step wall so the client's backoff
+ * ladder aims at a real horizon instead of a blind guess. Undefined when
+ * nothing names a reset: the header is then omitted, never invented.
+ */
+export function earliestWalledResetAt(role: FailoverRole): Date | undefined {
+  const now = Date.now();
+  let earliest: Date | undefined;
+  const consider = (d: Date | undefined) => {
+    if (d && d.getTime() > now && (!earliest || d.getTime() < earliest.getTime())) earliest = d;
+  };
+  for (const f of stepFailuresFor(role)) consider(f?.resetAt);
+  const rule = rules.get(role);
+  if (rule) for (const s of rule.steps) consider(s.resetAt);
+  return earliest;
+}
+
 // ─── #274 bookkeeping seam (proxy-side) ────────────────────────────────────────
 // When a role-step serves, the concrete model must ALSO record against the
 // OWNING cascade — a delegated wall of sonnet's nominal arms sonnet's nominal
