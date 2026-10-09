@@ -299,6 +299,34 @@ foreach ($day in $daysToArchive) {
   }
 }
 
+# --- stranded archive in the capture ROOT (#418, the same shape as the partial)
+# Every pass above walks $ArchiveDir, and the compress loop enumerates only
+# req-*/resp-* loose files — so a canonical captures-<day>.7z that ends up in
+# $CaptureDir ITSELF is invisible to all three: never re-uploaded, never
+# re-packed, never purged. Measured on the hub 2026-10-08: a 500 MB
+# captures-2026-09-30.7z sitting in the root, byte-identical to its off-site copy.
+# Relocate it into $ArchiveDir — a REVERSIBLE move, never a delete — so the
+# re-upload, sha re-check and retention passes below own it from this line on and
+# apply their own proof gates. Placed here, after the compress loop: moving an
+# archive for a day that still has loose files could make `7z a` APPEND to it.
+# A name this run does not own, or a collision with a file already in the
+# archive dir, is left exactly where it is and said out loud — never guessed at.
+if (Test-Path -LiteralPath $ArchiveDir) {
+  foreach ($stray in (Get-ChildItem -LiteralPath $CaptureDir -Filter 'captures-*.7z' -File)) {
+    if (-not (Get-CaptureArchiveDay -Name $stray.Name)) { continue }
+    if ((Get-CaptureArchiveMachineTag -Name $stray.Name) -ne $MachineTag) { continue }
+    $strayTarget = Join-Path $ArchiveDir $stray.Name
+    if (Test-Path -LiteralPath $strayTarget) {
+      Log ("WARN  stranded archive {0} in the capture root has a namesake in the archive dir - LEFT in place, resolve by hand" -f $stray.Name)
+      continue
+    }
+    if ($PSCmdlet.ShouldProcess($stray.FullName, ("relocate stranded archive into the archive dir: {0}" -f $stray.Name))) {
+      Move-Item -LiteralPath $stray.FullName -Destination $strayTarget
+      Log ("RELOCATE stranded archive {0} from the capture root into the archive dir (the retention/re-upload passes own it from here)" -f $stray.Name)
+    }
+  }
+}
+
 # --- re-upload pass: retry any local archive whose GDrive copy is MISSING. A
 # destination that exists at a DIFFERENT size is not retried — it is refused
 # (#208): that file belongs to another producer on this name, and re-uploading
@@ -438,6 +466,47 @@ if ($KeepLocalDays -ge 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDi
   }
   if ($purged -gt 0 -or $purgeSkipped -gt 0) {
     Log ("PURGE retention={0}d: {1} local archive(s) deleted, {2} kept (not yet on GDrive)" -f $KeepLocalDays, $purged, $purgeSkipped)
+  }
+}
+
+# --- quarantined-partial purge (#418): the missing other half of #322 --------
+# #322 renames a failed pack's partial to captures-<day>[-<tag>].7z.partial-<ts>
+# precisely so the `captures-*.7z` selector skips it. But the retention purge
+# above uses that SAME selector, so a quarantined corpse is unreachable by both
+# scans — never re-uploaded (correct) and never removed (not intended by
+# anyone). Measured on the hub 2026-10-08: a 97 MB corpse written 10-05 was
+# still there 7 days later, unreadable (`7z l` answers "Cannot open the file as
+# archive"). This pass is the explicit, narrowly-scoped selector the quarantine
+# naming needs: `-Filter 'captures-*.7z.partial-*'`.
+#
+# What it deletes — and only that: a partial whose DAY is already preserved
+# off-site under its canonical tagged name AND whose off-site copy matches the
+# size recorded at deposit. The manifest is written only after a verified
+# upload, so a matching record proves the day survived the pack that failed.
+# A partial whose day is not provably off-site is KEPT: that is the whole point
+# of quarantining instead of deleting, and a failed pack is exactly when the day
+# is least likely to be safe yet. It is independent of $KeepLocalDays — a corpse
+# is dead weight the moment its day is safe, whatever the retention window.
+if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -LiteralPath $GDriveDir)) {
+  $qPurged = 0; $qNotOffsite = 0; $qUnproven = 0
+  $qManifest = Read-ShaManifest -Path (Get-ShaManifestPath -GDriveDir $GDriveDir -MachineTag $MachineTag)
+  foreach ($q in (Get-ChildItem -LiteralPath $ArchiveDir -Filter 'captures-*.7z.partial-*' -File)) {
+    $qInfo = Get-CapturePartialInfo -Name $q.Name
+    if (-not $qInfo) { continue }                    # not a quarantine of ours: skip, never guess
+    if ($qInfo.Tag -ne $MachineTag) { continue }     # another producer's partial on a shared mount
+    $qDestItem = Get-Item -LiteralPath (Join-Path $GDriveDir $qInfo.Canonical) -ErrorAction SilentlyContinue
+    if (-not $qDestItem) { $qNotOffsite++; continue }
+    $qRec = $qManifest.Entries[$qInfo.Canonical]
+    if (-not $qRec -or $qRec.bytes -ne $qDestItem.Length) { $qUnproven++; continue }
+    # Parenthesised: in a METHOD argument list the comma separates arguments, so
+    # a bare `-f $a, $b` here would bind only $a and strand the {1} placeholder.
+    if ($PSCmdlet.ShouldProcess($q.FullName, ("purge quarantined partial (day {0} confirmed off-site at {1} bytes)" -f $qInfo.Day, $qDestItem.Length))) {
+      Remove-Item -LiteralPath $q.FullName -Force
+      $qPurged++
+    }
+  }
+  if ($qPurged -gt 0 -or $qNotOffsite -gt 0 -or $qUnproven -gt 0) {
+    Log ("QUARANTINE purge: {0} partial(s) deleted, {1} kept (day not off-site), {2} kept (no matching deposit record)" -f $qPurged, $qNotOffsite, $qUnproven)
   }
 }
 
