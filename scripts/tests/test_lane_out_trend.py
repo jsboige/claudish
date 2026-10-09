@@ -31,6 +31,7 @@ Or under pytest: pytest scripts/tests/test_lane_out_trend.py
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -42,6 +43,16 @@ _SPEC.loader.exec_module(lt)
 lt.LANE_GROUPS, lt.group_of = lt.load_groups()
 
 FAILS = []
+
+# The mutant, kept live next to the pin that kills it (review #414, mutation 3):
+# the exact regex the pre-fix reader used. It cannot match an object containing
+# a nested one, which is EVERY native Anthropic usage object — so on the case-6
+# fixture it returns 0 while the file plainly carries two usage objects.
+MUTANT_RX = re.compile(r'"usage":\s*\{[^{}]*\}')
+
+
+def raw_usage_blocks_with_flat_regex(text):
+    return len(MUTANT_RX.findall(text))
 
 
 def check(name, cond, detail=""):
@@ -64,12 +75,22 @@ def write_fixture(events):
     return d
 
 
+def write_raw_fixture(lines):
+    """A resp-*.sse fixture written VERBATIM — the fixture must reproduce the
+    wire, not the shape a regex author had in mind (review #414 point 2)."""
+    d = tempfile.mkdtemp(prefix="lane-out-pins-")
+    name = "resp-1-r20179-2026-10-09T11-42-00-000Z-native-claude-opus-5-5.sse"
+    with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return d
+
+
 def run_stats(d):
     """Collapse across lane groups — the pins are about aggregation, not
     lanes; the row totals are what the table prints."""
     per = lt.stats(d)
     keys = ("n", "out", "in", "ctx", "cr", "cc", "ctx_ck", "n_ck",
-            "no_input", "no_usage")
+            "no_input", "no_usage", "parse_fail", "line_fail")
     return {k: sum(row[k] for row in per.values()) for k in keys}
 
 
@@ -155,6 +176,98 @@ def main():
     check("OUT = last cumulative (42), not first (5)",
           t["out"] == 42, t)
     check("chosen input = terminal non-empty block", t["in"] == 100, t)
+
+    print("case 6 — VERBATIM native wire (hub resp-1-r20179-…-native-claude-"
+          "opus-5-5.sse, 09/10 11:42Z): usage objects carry NESTED siblings "
+          "(cache_creation / output_tokens_details / iterations[]) — the "
+          "`[^{}]*` mutant read 0 of 123 native captures")
+    raw = write_raw_fixture([
+        # message_start — the real shape: usage lives at .message.usage, and
+        # cache_creation is a nested object.
+        'event: message_start',
+        'data: ' + json.dumps({
+            "type": "message_start",
+            "message": {
+                "id": "msg_01r20179", "type": "message", "role": "assistant",
+                "model": "claude-opus-5-5", "content": [], "stop_reason": None,
+                "usage": {
+                    "input_tokens": 2,
+                    "cache_creation_input_tokens": 1909,
+                    "cache_read_input_tokens": 133633,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                                       "ephemeral_1h_input_tokens": 1909},
+                    "output_tokens": 24,
+                    "service_tier": "standard",
+                },
+            },
+        }),
+        '',
+        # terminal message_delta — nested output_tokens_details AND an
+        # iterations[] entry carrying its OWN input_tokens (4400). That
+        # number belongs to the iteration, never to the request's triple.
+        'event: message_delta',
+        'data: ' + json.dumps({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {
+                "input_tokens": 4500,
+                "cache_creation_input_tokens": 1909,
+                "cache_read_input_tokens": 133633,
+                "output_tokens": 377,
+                "output_tokens_details": {"thinking_tokens": 0},
+                "iterations": [
+                    {"type": "message", "input_tokens": 4400,
+                     "output_tokens": 100}
+                ],
+            },
+        }),
+        '',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+    ])
+    t = run_stats(raw)
+    check("native capture is MEASURED, not sansUsage (the mutant read it as "
+          "no usage at all)", t["no_usage"] == 0 and t["n"] == 1, t)
+    check("no parse failure on a well-formed native capture",
+          t["parse_fail"] == 0 and t["line_fail"] == 0, t)
+    check("terminal triple kept WHOLE from the top-level usage object",
+          t["ctx"] == 4500 + 133633 + 1909, t)
+    check("IN is the top-level statement, NOT the iteration's (4400 is a "
+          "different object)", t["in"] == 4500, t)
+    check("cache split measured (delta sits after the start)",
+          t["cr"] == 133633 and t["cc"] == 1909 and t["n_ck"] == 1, t)
+    check("OUT is the terminal cumulative value", t["out"] == 377, t)
+    check("the mutant could not have produced these blocks: a brace-delimited "
+          "regex stops at the first nested `{`",
+          raw_usage_blocks_with_flat_regex(raw) == 0)
+
+    print("case 7 — a capture that TALKS about usage but does not decode is a "
+          "parse FAILURE, not an absence (review #414 point 3)")
+    d = write_raw_fixture([
+        'event: message_delta',
+        # truncated mid-number: not valid JSON, but unmistakably a usage line
+        'data: {"type":"message_delta","usage":{"output_tokens":',
+        '',
+    ])
+    t = run_stats(d)
+    check("counted as parse_fail, never folded into sansUsage",
+          t["parse_fail"] == 1 and t["no_usage"] == 0, t)
+    check("the undecodable line is counted too", t["line_fail"] == 1, t)
+    check("still a response (it was read, it was not understood)",
+          t["n"] == 1, t)
+    check("verdict refuses: exit code non-zero when a lane is unmeasured",
+          lt.verdict_exit_code(True) != 0 and lt.verdict_exit_code(False) == 0)
+
+    print("case 8 — a capture WITHOUT any usage statement stays sansUsage (the "
+          "parseFail counter must not swallow the honest absence)")
+    d = write_raw_fixture([
+        'event: message_start',
+        'data: {"type":"message_start","message":{"id":"m","content":[]}}',
+        '',
+    ])
+    t = run_stats(d)
+    check("no usage at all -> sansUsage, not parseFail",
+          t["no_usage"] == 1 and t["parse_fail"] == 0, t)
 
     print()
     if FAILS:
