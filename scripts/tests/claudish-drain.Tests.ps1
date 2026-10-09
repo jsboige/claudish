@@ -1266,27 +1266,35 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         # reads only bytes appended after the launch. The pin needs the old
         # line to carry exactly the child's pid — unknowable before launch
         # and not derivable after — so pre-fill a pid BAND with stale lines.
-        # The band covers 4..65535, but Windows pids are NOT bounded by 65535
-        # (measured children at 69440…86348 on ai-01): when the child draws
-        # outside the band this e2e proves nothing about the guard and says
-        # so — Inconclusive, never a false verdict — while the unit pin
-        # (offset read, fixed pid) and the AST pin (offset before launch)
-        # carry the guarantee on every run. The child dies at binding; its
-        # only trace is the binding error in stderr.
+        # The band's ceiling is DERIVED FROM THE HOST, not fixed: a constant
+        # 4..65535 left ai-01 permanently Inconclusive because Windows draws
+        # children from free slots in the live range AND new high slots
+        # (measured children at 69440…86348 on ai-01, 31716 on po-2026 —
+        # both at or below their host's max-in-use). Covering the host's
+        # highest pid in use plus headroom for the slots the launch will
+        # allocate names the child on any machine. The Inconclusive stays as
+        # an honest fallback for the residual case, never a false verdict —
+        # while the unit pin (offset read, fixed pid) and the AST pin (offset
+        # before launch) carry the guarantee on every run regardless. The
+        # child dies at binding; its only trace is the binding error in stderr.
         $watch = Join-Path $script:DetachDir 'watch-collide.log'
-        $band = for ($n = 4; $n -le 65535; $n++) {
+        $hostCeiling = [int]((Get-Process -ErrorAction SilentlyContinue |
+                Measure-Object -Property Id -Maximum).Maximum) + 65536
+        # Cost bound: never build an absurd band if a host reports a huge pid.
+        if ($hostCeiling -gt 1048576) { $hostCeiling = 1048576 }
+        $band = for ($n = 4; $n -le $hostCeiling; $n++) {
             "[2026-10-05 00:00:00] START pid $n — drained restart begins (reason: old run)"
         }
         Set-Content -LiteralPath $watch -Value $band
         $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-bindfail.ps1') `
             -ExtraArgs @('-MustBeInt', 'not an int', '-WatchLog', $watch)
         $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
-        # Coverage, not a lottery (re-review round 4): outside 4..65535 the
-        # pre-filled band does not name the child and this e2e would prove
-        # nothing — visible Inconclusive, never a false red or green.
-        if ($r.ChildPid -lt 4 -or $r.ChildPid -gt 65535) {
+        # Coverage, not a lottery: a child outside the derived band would make
+        # this e2e prove nothing — visible Inconclusive, never a false red or
+        # green. With the host-derived ceiling this is the rare residual case.
+        if ($r.ChildPid -lt 4 -or $r.ChildPid -gt $hostCeiling) {
             Remove-Item -LiteralPath $watch -Force -ErrorAction SilentlyContinue
-            Set-ItResult -Inconclusive -Because ("child pid {0} fell outside the pre-filled 4..65535 band (Windows pids exceed 65535) — the unit and AST pins carry the guard" -f $r.ChildPid)
+            Set-ItResult -Inconclusive -Because ("child pid {0} fell outside the host-derived 4..{1} band — the unit and AST pins carry the guard" -f $r.ChildPid, $hostCeiling)
         }
         # With the offset-bounded read, the stale space is invisible and the
         # verdict is exited — never a falsified alive.
