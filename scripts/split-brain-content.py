@@ -23,7 +23,7 @@ METHOD
      replaced); that is a SEQUENTIAL break, not a fork.
   5. A fork = two chains inside the SAME partition whose time ranges OVERLAP.
 
-FOUR MEASURED TRAPS (each produced a wrong answer before being fixed)
+SIX MEASURED TRAPS (each produced a wrong answer before being fixed)
   T1  Chaining on ALL user segments: every request opens with the SAME harness
       head, so the containment test compares harness to harness and NO request
       ever extends another — every chain has depth 1.
@@ -48,6 +48,13 @@ FOUR MEASURED TRAPS (each produced a wrong answer before being fixed)
       concurrent sub-chains. Partitioning by cc_is_subagent (step 3) is what
       separates them; without it the method cries split-brain on every
       coordinator lane.
+  T6  The session id itself must be read by PARSING `body.metadata.user_id`
+      (a nested JSON string), never by a raw regex over the file: an analysis
+      session that CITES other sessions' ids in its message bodies (traffic
+      work does, constantly) gets its own requests attributed to the cited
+      id by a first-match regex — and a monotone chain from a second machine
+      then reads as a cross-machine fork. Measured 2026-10-09: the instrument's
+      only "SPLIT-BRAIN?" flag on a 43k-capture day was exactly this artifact.
 
 Read-only. Exits 0 always (this is an observation instrument, not a gate).
 """
@@ -176,19 +183,30 @@ def main():
     print("corpus: %d captures | harness: %d hashes over %d sampled requests (df>=%.0f%%)"
           % (len(paths), len(harness), nseen, args.harness_df * 100))
 
-    # One pass to group by session (session_id is the escaped JSON string field).
-    sess_re = re.compile(r'session_id\\?"\s*:\s*\\?"([0-9a-f-]{36})')
+    # One pass to group by session. T6: the session id is read by PARSING
+    # body.metadata.user_id (a nested JSON *string*), never by a raw regex
+    # over the file — a first-match regex grabs a session id QUOTED inside a
+    # message body (an analysis session that cites other sessions' ids gets
+    # its own requests attributed to them, and a same-id chain from a second
+    # machine then reads as a cross-machine fork — measured 2026-10-09: the
+    # one flagged session was exactly this artifact, from this instrument's
+    # own predecessor).
     by = collections.defaultdict(list)
     for p in paths:
         try:
-            with open(p, encoding="utf-8", errors="replace") as fh:
-                head = fh.read()
-        except OSError:
+            with open(p, encoding="utf-8", errors="strict") as fh:
+                d = json.load(fh)
+        except Exception:
             continue
-        m = sess_re.search(head)
-        if not m:
+        uid = ((d.get("body") or {}).get("metadata") or {}).get("user_id")
+        if not isinstance(uid, str):
             continue
-        by[m.group(1)].append(p)
+        try:
+            sid = json.loads(uid).get("session_id")
+        except Exception:
+            continue
+        if isinstance(sid, str) and len(sid) == 36:
+            by[sid].append(p)
 
     targets = []
     if args.session:
