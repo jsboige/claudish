@@ -30,6 +30,7 @@ Rules:
 | ⚠ Trap | plain `up -d` loads `D:\dev\claudish\.env` (1 line) → **cascades EMPTY** | VERIFIED by incident 07/09 |
 | Cascades | configured=3, auto=1 — SONNET mistral→qwen→PAYG · OPUS qwen→gc→PAYG · HAIKU qwen→PAYG · `ROLE_MODELS` set · `QWEN_THINKING=budget:4096` | DECLARED 07/09 14:01Z (startup line quoted) |
 | Codex OAuth | file bind, 2165 B, expiry ~12-13/09 | DECLARED 07/09 |
+| `ClaudishDailyRestart` 04:00 | **DELETED 08/10 10:09:58 local** (user UAC batch v2, gesture G1); last `daily-0400` → `OUTCOME success` 08/10 07:31 local | DECLARED 08/10 (po-2025; absence re-confirmed 10:19:35 local) |
 | Restart epochs 07/09 | ~08:06Z · 13:59Z (incident repair) | VERIFIED (uptime probes) |
 
 Incident 07/09: bind source `codex-oauth.json` recreated as an empty **directory** by
@@ -43,7 +44,7 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 | --- | --- | --- |
 | Role | Relay → po-2025 via host TCP forwarder `:18182` | VERIFIED (settings + relay logs) |
 | Endpoint | `192.168.0.46:3000` (LAN) | VERIFIED 07/09 (ai-01 `/health`) |
-| `ClaudishDailyRestart` 04:00 | DISABLED (05/09, user UAC) | DECLARED |
+| `ClaudishDailyRestart` 04:00 | DISABLED (05/09, user UAC) | VERIFIED 09/10 (po-2023: `State=Disabled`, `LastRunTime 05/09 04:00:01`, `LastTaskResult 0`) |
 | Cascade | auto; haiku→DeepSeek v4 Flash PAYG observed armed + recovered 07/09 | VERIFIED (po-203 cycles) |
 | Sidecar native `:8787` | restarted (fix #3388) | DECLARED 06/09 |
 
@@ -81,6 +82,7 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 
 | Date (Z) | Machine | Change | Proof |
 | --- | --- | --- | --- |
+| 2026-10-08 10:09:58 local | po-2025 | `ClaudishDailyRestart` (04:00) **deleted** — user UAC batch v2, gesture G1; the user arbitrated "no daily restart". Last run 08/10 07:31 local → `OUTCOME success` | DECLARED by po-2025; absence re-confirmed 10:19:35 local. With po-2023's disabled since 05/09, **no daily restart remains on the fleet** |
 | 2026-09-23 04:16 | ai-01 | drained recreate under po-2025's `[ACK]` (single-ACK rule), plan posted 04:12Z: image rebuilt from `61c3d2d`, opus map → `claude-opus-5-5`, sonnet cascade armed (3 steps) + `ROLE_MODELS=glm-5.2:sonnet`. Drain: 0 in flight | precondition 3/3 on a throwaway container; `/health` :3002 + :13000; real tool-call turn to `message_stop` with local capture count unchanged (NOMINAL); in-container pin; armed by value = 3 |
 | 2026-09-23 | po-2026 | state audited on-boarding (no change applied): sidecar still on pre-migration upstream `.46` (file + container), 0 cascades armed, client bypasses it direct to `.50`; runbook's 13/09 repoint claim corrected — it never landed; compose dir is a second clone (`C:\dev\claudish`) | section above (all items VERIFIED 23/09) |
 | 2026-09-07 23:12 | ai-01 | sidecar recreated: `CLAUDISH_RELAY_UPSTREAM` `.46` → `.50`. Double-hop removed. Under the user's fleet-wide rollout GO (07/09 ~22:10Z) | startup `[Relay] sidecar mode: upstream=http://192.168.0.50:3000` + `docker inspect` env + `/health` + egress `curl` **from inside the container** to `.50` |

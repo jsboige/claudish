@@ -1722,6 +1722,37 @@ function Get-CaptureArchiveMachineTag {
     return ''
 }
 
+function Get-CapturePartialInfo {
+    <#
+        A quarantined partial (#322) is named `<canonical>.7z.partial-<ts>`,
+        where <canonical> is a full `captures-<day>[-<tag>].7z` name. The suffix
+        is placed AFTER the `.7z` on purpose: it is what keeps the corpse out of
+        the `captures-*.7z` selector that drives the re-upload scan. The cost is
+        that it is ALSO out of the retention purge, which uses the same filter —
+        so nothing ever removed one (#418, measured: a 97 MB corpse still on the
+        hub 7 days after it was written).
+
+        Recovers the two facts a quarantine purge needs — the day it belongs to,
+        and the canonical name whose off-site copy is the proof it is dead
+        weight — or $null when the name is not a quarantine of ours. A name this
+        cannot parse must be SKIPPED, never guessed at: the caller deletes on
+        what comes back.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    if ($Name -notmatch '^(captures-\d{4}-\d{2}-\d{2}(?:-[A-Za-z0-9._-]+)?\.7z)\.partial-\d{8}T\d{6}(?:-\d+)?$') {
+        return $null
+    }
+    # Capture the group BEFORE calling out — the nested -match below resets $matches.
+    $canonical = $matches[1]
+    $day = Get-CaptureArchiveDay -Name $canonical
+    if (-not $day) { return $null }
+    return [pscustomobject]@{
+        Day       = $day
+        Canonical = $canonical
+        Tag       = Get-CaptureArchiveMachineTag -Name $canonical
+    }
+}
+
 function Get-CaptureArchivePolicy {
     <#
         Decides whether a run may write into the off-site namespace, BEFORE it
@@ -2275,6 +2306,7 @@ Export-ModuleMember -Function @(
     'Get-CaptureArchiveName'
     'Get-CaptureArchiveDay'
     'Get-CaptureArchiveMachineTag'
+    'Get-CapturePartialInfo'
     'Get-CaptureArchivePolicy'
     'Get-OffsiteWriteVerdict'
     'Get-ShaManifestPath'

@@ -139,6 +139,12 @@ exit /b %CE%
     # ~/.claudish (same clobber the watchdog saves/restores around).
     . $script:DrainScript
     $LogPath = $script:TestLog
+    # #368 — neutralize the pre-gesture failover-events tick for every suite
+    # test (same pattern as $LogPath above): the default points at the REAL
+    # collector, which would spawn a powershell.exe child per test against the
+    # shim. The dedicated #368 Describe binds -FailoverTickCollectorPath to
+    # fixtures instead.
+    $DrainFailoverTickCollector = ''
 
     function Reset-DrainFixture {
         Remove-Item -LiteralPath $script:CallsLog -Force -ErrorAction SilentlyContinue
@@ -583,6 +589,150 @@ Describe 'drain targets derived from the env file (#372)' {
         $refuseText | Should -Match 'RESTART REFUSED'
         $refuseText | Should -Match 'OUTCOME refused'
         (Get-CallsText) | Should -Be ''
+    }
+}
+
+Describe 'pre-gesture failover-events tick (#368)' {
+    BeforeAll {
+        # Fixtures stand in for the collector; each accepts the two arguments
+        # the drain passes (-Container, -ClaudishHome) — a fixture without
+        # those params would die at BINDING and prove nothing about the exit
+        # paths under test.
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $tickDir = Join-Path $TestDrive 'tick'
+        New-Item -ItemType Directory -Path $tickDir -Force | Out-Null
+
+        $okBody = @'
+param([string]$Container, [string]$ClaudishHome)
+Set-Content -LiteralPath (Join-Path $ClaudishHome 'tick-ok.marker') -Value "ran:$Container"
+exit 0
+'@
+        [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-ok.ps1'), $okBody, $utf8)
+
+        $exit1Body = @'
+param([string]$Container, [string]$ClaudishHome)
+Write-Error 'not-measured (fixture)'
+exit 1
+'@
+        [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-exit1.ps1'), $exit1Body, $utf8)
+
+        $hangBody = @'
+param([string]$Container, [string]$ClaudishHome)
+Start-Sleep -Seconds 45
+'@
+        [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-hang.ps1'), $hangBody, $utf8)
+
+        $script:TickEnv = Join-Path $TestDrive 'tick.env'
+        [System.IO.File]::WriteAllText($script:TickEnv, "CLAUDISH_FAILOVER_SONNET=example@model`n", $utf8)
+        $script:TickHome = Join-Path $TestDrive 'tick-home'
+        New-Item -ItemType Directory -Path $script:TickHome -Force | Out-Null
+    }
+
+    It 'a normal tick persists the markers and the drain completes with a normal OUTCOME' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-ok' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-ok.ps1') -FailoverTickTimeoutSec 30
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match 'FAILOVER-TICK ok'
+        $log | Should -Match 'OUTCOME success'
+        Test-Path -LiteralPath (Join-Path $script:TickHome 'tick-ok.marker') | Should -BeTrue
+        # The tick ran BEFORE the gesture. The interpolating RECREATE line is
+        # logged in the early guard section (pre-drain), so the anchor is the
+        # LAST RECREATE line — on a successful recreate that is always a
+        # post-gesture line (compose output at :648 or the deployed-image
+        # attestation), never the pre-drain guard one.
+        $log.IndexOf('FAILOVER-TICK ok') | Should -BeLessThan $log.LastIndexOf('RECREATE (')
+    }
+
+    It 'a collector exit 1 (NOT MEASURED / held watermark) is swallowed — drain proceeds, normal OUTCOME' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-exit1' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-exit1.ps1') -FailoverTickTimeoutSec 30
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match 'FAILOVER-TICK collector exit 1'
+        $log | Should -Match 'swallowed, drain proceeds'
+        $log | Should -Match 'OUTCOME success'
+    }
+
+    It 'a WEDGED collector is killed at the bound — drain completes within it, normal OUTCOME' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-hang' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-hang.ps1') -FailoverTickTimeoutSec 3
+        $sw.Stop()
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match ([regex]::Escape('FAILOVER-TICK killed after 3s bound'))
+        $log | Should -Match 'OUTCOME success'
+        # The whole run must fit far inside the fixture's 45 s sleep: the
+        # bound, not the fixture, ended the wait. (With the bound mutated
+        # away this assert trips AND the kill line vanishes.)
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 30
+    }
+
+    It 'a THROWING launch (Start-Process fails) is swallowed — drain success, OUTCOME success, labeled tick failure' {
+        # Review 09/10 (c6070969008): a Start-Process that throws escaped the
+        # tick entirely and reached the wrapper as OUTCOME exception — a
+        # collector failure BLOCKED the drain, the exact coupling #368 exists
+        # to prevent. The three swallowed shapes (absent collector, exit != 0,
+        # timeout) only cover a launch that SUCCEEDED. The mock is scoped to
+        # the tick's own launch: this e2e path calls Start-Process exactly
+        # once (the detach launcher at :1016 is a different entry branch).
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        Mock Start-Process { throw [System.ComponentModel.Win32Exception]::new(2, 'mocked launch failure') } `
+            -ParameterFilter { "$FilePath" -eq 'powershell.exe' }
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-throw' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-ok.ps1') -FailoverTickTimeoutSec 30
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match ([regex]::Escape('FAILOVER-TICK failed (Win32Exception'))
+        $log | Should -Match 'swallowed, drain proceeds'
+        $log | Should -Match 'OUTCOME success'
+        $log | Should -Not -Match 'OUTCOME exception'
+    }
+
+    It 'a stale tick capture is pruned at launch, an in-window one survives (R2 retention)' {
+        # R2 (file 09/10): the tick writes a capture pair per run and nothing
+        # pruned them — two files per drain run, unbounded. The fix mirrors the
+        # detach launcher's 7-day rule; this pin holds both halves so a mutation
+        # that drops the cleanup (or one that over-prunes) is caught.
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        $staleOut = Join-Path $script:TickHome 'drain-failover-tick-20200101-000000.out.log'
+        $staleErr = Join-Path $script:TickHome 'drain-failover-tick-20200101-000000.err.log'
+        $freshOut = Join-Path $script:TickHome 'drain-failover-tick-20261009-000000.out.log'
+        foreach ($f in @($staleOut, $staleErr, $freshOut)) {
+            [System.IO.File]::WriteAllText($f, 'capture', (New-Object System.Text.ASCIIEncoding))
+        }
+        (Get-Item -LiteralPath $staleOut).LastWriteTime = (Get-Date).AddDays(-30)
+        (Get-Item -LiteralPath $staleErr).LastWriteTime = (Get-Date).AddDays(-30)
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-retention' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-ok.ps1') -FailoverTickTimeoutSec 30
+        $r | Should -BeTrue
+        # BOTH members of the stale pair are gone; the in-window file is untouched.
+        Test-Path -LiteralPath $staleOut | Should -BeFalse
+        Test-Path -LiteralPath $staleErr | Should -BeFalse
+        Test-Path -LiteralPath $freshOut | Should -BeTrue
+        # The pruning must not disturb the tick itself.
+        $log = Get-DrainLogText
+        $log | Should -Match 'FAILOVER-TICK ok'
+        $log | Should -Match 'OUTCOME success'
     }
 }
 
@@ -1266,27 +1416,35 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         # reads only bytes appended after the launch. The pin needs the old
         # line to carry exactly the child's pid — unknowable before launch
         # and not derivable after — so pre-fill a pid BAND with stale lines.
-        # The band covers 4..65535, but Windows pids are NOT bounded by 65535
-        # (measured children at 69440…86348 on ai-01): when the child draws
-        # outside the band this e2e proves nothing about the guard and says
-        # so — Inconclusive, never a false verdict — while the unit pin
-        # (offset read, fixed pid) and the AST pin (offset before launch)
-        # carry the guarantee on every run. The child dies at binding; its
-        # only trace is the binding error in stderr.
+        # The band's ceiling is DERIVED FROM THE HOST, not fixed: a constant
+        # 4..65535 left ai-01 permanently Inconclusive because Windows draws
+        # children from free slots in the live range AND new high slots
+        # (measured children at 69440…86348 on ai-01, 31716 on po-2026 —
+        # both at or below their host's max-in-use). Covering the host's
+        # highest pid in use plus headroom for the slots the launch will
+        # allocate names the child on any machine. The Inconclusive stays as
+        # an honest fallback for the residual case, never a false verdict —
+        # while the unit pin (offset read, fixed pid) and the AST pin (offset
+        # before launch) carry the guarantee on every run regardless. The
+        # child dies at binding; its only trace is the binding error in stderr.
         $watch = Join-Path $script:DetachDir 'watch-collide.log'
-        $band = for ($n = 4; $n -le 65535; $n++) {
+        $hostCeiling = [int]((Get-Process -ErrorAction SilentlyContinue |
+                Measure-Object -Property Id -Maximum).Maximum) + 65536
+        # Cost bound: never build an absurd band if a host reports a huge pid.
+        if ($hostCeiling -gt 1048576) { $hostCeiling = 1048576 }
+        $band = for ($n = 4; $n -le $hostCeiling; $n++) {
             "[2026-10-05 00:00:00] START pid $n — drained restart begins (reason: old run)"
         }
         Set-Content -LiteralPath $watch -Value $band
         $argStr = New-DetachArgumentString -Fixture (Join-Path $script:DetachDir 'child-bindfail.ps1') `
             -ExtraArgs @('-MustBeInt', 'not an int', '-WatchLog', $watch)
         $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
-        # Coverage, not a lottery (re-review round 4): outside 4..65535 the
-        # pre-filled band does not name the child and this e2e would prove
-        # nothing — visible Inconclusive, never a false red or green.
-        if ($r.ChildPid -lt 4 -or $r.ChildPid -gt 65535) {
+        # Coverage, not a lottery: a child outside the derived band would make
+        # this e2e prove nothing — visible Inconclusive, never a false red or
+        # green. With the host-derived ceiling this is the rare residual case.
+        if ($r.ChildPid -lt 4 -or $r.ChildPid -gt $hostCeiling) {
             Remove-Item -LiteralPath $watch -Force -ErrorAction SilentlyContinue
-            Set-ItResult -Inconclusive -Because ("child pid {0} fell outside the pre-filled 4..65535 band (Windows pids exceed 65535) — the unit and AST pins carry the guard" -f $r.ChildPid)
+            Set-ItResult -Inconclusive -Because ("child pid {0} fell outside the host-derived 4..{1} band — the unit and AST pins carry the guard" -f $r.ChildPid, $hostCeiling)
         }
         # With the offset-bounded read, the stale space is invisible and the
         # verdict is exited — never a falsified alive.

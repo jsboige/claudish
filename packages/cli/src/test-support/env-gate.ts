@@ -69,10 +69,24 @@ export function strictFailsClass(cls: EnvGateClass, strict: boolean, allow: stri
   return strict && !cls.active && !allow.includes(cls.id) && cls.kind !== "budget";
 }
 
+/**
+ * Opening of the budget footer, exported as the ONE source both sides read.
+ *
+ * The strict-runner's consolidated block only ever sees the PRINTED manifest —
+ * never the EnvGateClass — so recognising a budget class from the text is the
+ * only way it can stop claiming a failure mode strict mode does not have. #385
+ * corrected the per-class footer here; the runner's consolidated footer kept
+ * asserting "CLAUDISH_TEST_ENV_STRICT=1 fails them instead" for every class,
+ * budget included. Sharing the marker keeps the producer's wording and the
+ * consumer's detector from drifting apart (the failure mode this file's own
+ * comment warns about for the three copies of the strict condition).
+ */
+export const BUDGET_FOOTER_MARKER = "(opt-in budget class";
+
 /** The manifest footer line, switched on the class kind (see EnvGateClass.kind). */
 export function manifestFooter(cls: EnvGateClass): string {
   if (cls.kind === "budget") {
-    return "(opt-in budget class: each run costs real money, so a complete machine does NOT run these by default; " +
+    return `${BUDGET_FOOTER_MARKER}: each run costs real money, so a complete machine does NOT run these by default; ` +
       "CLAUDISH_TEST_ENV_STRICT=1 never fails a budget class — activation is an operator choice, not a machine property)";
   }
   return "(expected on machines missing prerequisites; a complete machine runs them all; CLAUDISH_TEST_ENV_STRICT=1 fails them instead)";
