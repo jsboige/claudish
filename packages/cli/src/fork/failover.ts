@@ -280,7 +280,10 @@ const AUTO_ARM_TTL_MS = 10 * 60 * 1000;
  * a wall (measured on the hub: 107 arms ≈ 214 model transitions per 24 h), cold
  * prompt-cache on BOTH ends each time. Steps: 10 m → 20 m → 40 m, capped. */
 const ARM_TTL_STEPS_MS = [AUTO_ARM_TTL_MS, 20 * 60_000, 40 * 60_000];
-const ARM_TTL_MAX_MS = ARM_TTL_STEPS_MS[ARM_TTL_STEPS_MS.length - 1];
+/** Cap of the bucket-wall TTL ladder (40 min). Exported as the documented
+ * defensive ceiling for the #409 retry-after horizon: the longest the proxy
+ * can ever sit on a walled bucket without re-probing it. */
+export const ARM_TTL_MAX_MS = ARM_TTL_STEPS_MS[ARM_TTL_STEPS_MS.length - 1];
 const RECOVERY_CONDENSATIONS = 3;
 /** Safety TTL: clear recovery even if no compactions fire to decrement it. */
 const RECOVERY_MAX_MS = 60 * 60 * 1000;
@@ -847,22 +850,39 @@ export function resetAllStepFailures(role: FailoverRole): void {
 }
 
 /**
- * #409: the earliest KNOWN reset among a role's walled steps — a failure
- * record's resetAt first (body-parsed at mark time, else the operator's
- * `_RESET`), then any future config step.resetAt (#261). Feeds the
- * `retry-after` of the rewritten last-step wall so the client's backoff
- * ladder aims at a real horizon instead of a blind guess. Undefined when
- * nothing names a reset: the header is then omitted, never invented.
+ * #409 (review CR1): the earliest instant the proxy will re-probe ANY walled
+ * element of the role — the earliest moment service can come back on its own.
+ * Sources, all future-dated (a past reset means "already open" and bounds
+ * nothing): the request's bucket wall at TTL expiry (the wall disarms and
+ * probes the nominal again), the legacy role-wide `*` wall if armed, each
+ * step's known reset when it names one (body-parsed at mark time, else the
+ * operator's `_RESET`), else that step's backoff expiry
+ * (`lastFailure + stepTtlMs(count)` — the cascade re-probes skipped steps when
+ * it resolves), then any future config step.resetAt (#261 closures, which DO
+ * re-arm when the date passes). Feeds the `retry-after` of the rewritten
+ * last-step wall: a horizon beyond the next re-probe tells the client to sleep
+ * through the moment service returns — the R1 defect was exactly that, Kimi's
+ * announced week on one step producing ≈83 days while GLM's 5-hour window on
+ * another step reopened on its own — and Claude Code honors a multi-day
+ * retry-after by sleeping or abandoning the turn.
  */
-export function earliestWalledResetAt(role: FailoverRole): Date | undefined {
+export function earliestWalledReprobeAt(role: FailoverRole, bucket?: string): Date | undefined {
   const now = Date.now();
   let earliest: Date | undefined;
-  const consider = (d: Date | undefined) => {
-    if (d && d.getTime() > now && (!earliest || d.getTime() < earliest.getTime())) earliest = d;
+  const consider = (t: number) => {
+    if (t > now && (earliest === undefined || t < earliest.getTime())) earliest = new Date(t);
   };
-  for (const f of stepFailuresFor(role)) consider(f?.resetAt);
+  const wall = walled.get(bucket ?? "");
+  if (wall) consider(wall.since.getTime() + wall.ttlMs);
+  const legacy = walled.get(LEGACY_ROLE_WIDE_BUCKET);
+  if (legacy) consider(legacy.since.getTime() + legacy.ttlMs);
+  for (const f of stepFailuresFor(role)) {
+    if (!f) continue;
+    if (f.resetAt) consider(f.resetAt.getTime());
+    else consider(f.lastFailure.getTime() + stepTtlMs(f.count));
+  }
   const rule = rules.get(role);
-  if (rule) for (const s of rule.steps) consider(s.resetAt);
+  if (rule) for (const s of rule.steps) if (s.resetAt) consider(s.resetAt.getTime());
   return earliest;
 }
 
