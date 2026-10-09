@@ -68,31 +68,6 @@ const realConsoleLog = console.log.bind(console);
 /** What the LAST step (s1) answers this test; nm and s0 always wall (quota). */
 let lastStepResponse: () => Response = () => kimiWeekly403();
 
-function healthySSE(): Response {
-  const chunk = (delta: any, finish_reason: string | null = null) =>
-    `data: ${JSON.stringify({
-      id: "chatcmpl-fake",
-      object: "chat.completion.chunk",
-      created: 1,
-      model: "fake-c",
-      choices: [{ index: 0, delta, finish_reason }],
-    })}\n\n`;
-  const sse =
-    chunk({ role: "assistant", content: "" }) +
-    chunk({ content: "Hello from the cascade." }) +
-    chunk({}, "stop") +
-    "data: [DONE]\n\n";
-  return new Response(
-    new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode(sse));
-        controller.close();
-      },
-    }),
-    { status: 200, headers: { "content-type": "text/event-stream" } }
-  );
-}
-
 function quotaWall(): Response {
   // Mistral's silent subscription 402 — walls on status alone, names no reset.
   return new Response(
@@ -283,7 +258,7 @@ describe("#409 — a walled last cascade step surfaces as 429 rate_limit_error",
     const r1 = await postMessage();
     // THE PIN: not the raw 403 Claude Code renders as an auth failure.
     expect(r1.status).toBe(429);
-    const body = await r1.json();
+    const body: any = await r1.json();
     expect(body?.error?.type).toBe("rate_limit_error");
     // Labeled: role, concrete, ORIGINAL status — the wall is never silent.
     expect(body?.error?.message).toContain("[Failover] sonnet: every step walled");
@@ -310,7 +285,7 @@ describe("#409 — a walled last cascade step surfaces as 429 rate_limit_error",
 
     const r1 = await postMessage();
     expect(r1.status).toBe(429);
-    const body = await r1.json();
+    const body: any = await r1.json();
     expect(body?.error?.type).toBe("rate_limit_error");
     expect(body?.error?.message).toContain("s1-ep@fake-s1 402:");
     expect(body?.error?.message).toContain("Insufficient Balance");
