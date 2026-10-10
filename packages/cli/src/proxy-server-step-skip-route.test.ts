@@ -24,6 +24,17 @@
  *    (r2 waits for the holder and answers from s0, not s1).
  *  - m5: remove the kill-switch gate ⇒ K11 red (skip fires with
  *    CLAUDISH_FAILOVER_STEP_SKIP=0 where today's behavior is required).
+ *  - m6 (CR B1): null the loop's recordServedStepForNotices call ⇒ K1/K2's
+ *    "served by **s1**" name asserts red — the notices fall back to the
+ *    general resolver, which announces the SKIPPED step's name.
+ *  - m7 (CR S2/S3): restore the bound on the last step (drop the else-re-mark)
+ *    ⇒ K12 red (bounded 529 at ~100 ms instead of the unbounded wait).
+ *  - m8 (CR S5a): drop the stepIndex >= 0 term from the skip predicate ⇒ K13
+ *    red (a nominal overflow diverts to step 0's answer).
+ *  - m9 (CR S1): let the busy bound ride the 429-retry ladder ⇒ the gate
+ *    asserts in K8 stay green (its holder never 429s) — pinned instead by the
+ *    transport-level suite; the route-level contract is documented, not
+ *    re-derived here.
  *
  * Same harness contract as proxy-server-wall-surface-route.test.ts.
  */
@@ -180,6 +191,26 @@ async function responseText(r: Response): Promise<string> {
     .join("");
 }
 
+/** Concatenated text_delta payloads out of a streaming SSE response — the
+ * stream-notice channel (block 0) lands in the same text, so name asserts
+ * work identically on both channels. */
+async function responseSseText(r: Response): Promise<string> {
+  const raw = await r.text();
+  let out = "";
+  for (const line of raw.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const jsonStr = line.slice(5).trim();
+    if (!jsonStr || jsonStr === "[DONE]") continue;
+    try {
+      const ev = JSON.parse(jsonStr);
+      if (ev?.type === "content_block_delta" && ev?.delta?.type === "text_delta") out += ev.delta.text ?? "";
+    } catch {
+      /* not json */
+    }
+  }
+  return out;
+}
+
 beforeEach(() => {
   calls = {};
   upstreamBodies = {};
@@ -331,7 +362,14 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     const big = "x".repeat(400_000); // est ≈ 100k+ tokens — over any 262k cap when doubled? est = len/4 ≈ 100k; the refusal is the upstream's word, not ours.
     const r1 = await postMessage({ session: "sess-one", content: `read: ${big}` });
     expect(r1.status).toBe(200);
-    expect(await responseText(r1)).toContain("ok-from-s1"); // (the armed failover notice rides block 0)
+    // CR B1: the condensation notice names the step that SERVED the turn. The
+    // "served by **…**" anchor is load-bearing — the correct notice still
+    // names s0 in its "ahead of it" enumeration, so a bare label assert would
+    // pass on the defect too (the general resolver announced s0's name here).
+    const t1 = await responseText(r1);
+    expect(t1).toContain("ok-from-s1"); // (the armed failover notice rides block 0)
+    expect(t1).toContain("served by **s1-ep@fake-s1**");
+    expect(t1).not.toContain("served by **s0-ep@fake-s0**");
     // Exactly ONE overflow round-trip to s0 (the vllm ask: no local retry, no
     // re-attempt of the skipped step for the same request).
     expect(calls.s0).toBe(2); // healthy turn + the refused one
@@ -350,6 +388,17 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     expect(
       markerLog.some((l) => l.includes("DWELL sonnet") && l.includes("skipped for this request"))
     ).toBe(true);
+
+    // 2b. CR B1, STREAM channel: a follow-up streaming request of the same
+    // session is served by s1 (dwell pin) — the block-0 notice names s1. The
+    // "as " anchor matters: the correct notice enumerates s0 in its "ahead of
+    // you" tail, exactly like the condensation one.
+    const r1s = await postMessage({ session: "sess-one", stream: true, content: "streaming follow-up" });
+    const sse1 = await responseSseText(r1s);
+    expect(sse1).toContain("ok-from-s1");
+    expect(sse1).toContain("as s1-ep@fake-s1");
+    expect(sse1).not.toContain("as s0-ep@fake-s0");
+    expect(calls.s1).toBe(2);
 
     // 3. No failure mark: a FRESH session's next request resolves step 0
     //    again (a markStepFailed would TTL-freeze it for 10 min). The learned
@@ -375,6 +424,9 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     expect(r1.status).toBe(200);
     const text = await responseText(r1);
     expect(text).toContain("ok-from-s1");
+    // CR B1: the appended notice names the SERVED step (same anchor rule as K1).
+    expect(text).toContain("served by **s1-ep@fake-s1**");
+    expect(text).not.toContain("served by **s0-ep@fake-s0**");
     // The recovery notice must not ride as the summary — the successor's own
     // words are the answer, and the marker proves the skip fired.
     expect(text).not.toContain("exceeded the serving model's maximum prompt size");
@@ -583,5 +635,60 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     expect(await responseText(r2)).toContain("ok-late-b0"); // waited for the slot — no skip
     expect(markerLog.some((l) => l.includes("reason=busy"))).toBe(false);
     await rh;
+  }, 30_000);
+
+  test("K12 (CR S2/S3): busy on the LAST step waits unbounded — no 529 skip, the turn itself is the answer", async () => {
+    await spin();
+    resetCascade(cascadeEnv("b0-ep@fake-b0")); // single-step: b0 IS the last step
+    process.env.CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS = "100";
+    upstreamAnswer.nm = () => quotaWall402();
+    let holderResolve: ((r: Response) => void) | undefined;
+    let b0Call = 0;
+    upstreamAnswer.b0 = () =>
+      b0Call++ === 0
+        ? new Promise<Response>((resolve) => { holderResolve = resolve; })
+        : Promise.resolve(okSse("ok-from-b0", "fake-b0"));
+
+    const r1p = postMessage({ session: "sess-last-hold", content: "hold the slot" });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(calls.b0).toBe(1);
+
+    // Pre-CR marking armed the bound on the last step too: this 529'd at
+    // ~100 ms with no successor to advance to — the skip predicate refusing
+    // to advance is what kept it from looping, so the client just lost the
+    // wait AND the turn. The last step keeps the unbounded FIFO (the re-mark
+    // clears any bound an earlier attempt of the SAME request set).
+    let r2done = false;
+    const r2p = postMessage({ session: "sess-last-wait", content: "waiter" }).then((r) => {
+      r2done = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(r2done).toBe(false); // still queued — no bounded 529
+    expect(markerLog.some((l) => l.includes("[StepBusy]"))).toBe(false);
+    expect(markerLog.some((l) => l.includes("[Failover] SKIP"))).toBe(false);
+    holderResolve?.(okSse("ok-from-b0", "fake-b0"));
+    const r2 = await r2p;
+    expect(r2.status).toBe(200);
+    expect(await responseText(r2)).toContain("ok-from-b0");
+    await r1p;
+  }, 30_000);
+
+  test("K13 (CR S5a): overflow on the NOMINAL with a cascade configured — the recovery turn is the answer, the skip never fires", async () => {
+    await spin();
+    resetCascade(); // TWO_STEP configured — the request resolves the NOMINAL first
+    upstreamAnswer.nm = () => vllmContextOverflow400();
+
+    // The skip predicate requires stepIndex >= 0: a nominal (stepIndex -1)
+    // overflow never advances, even with two healthy steps configured beneath
+    // it. Without that guard the loop would divert a nominal context overflow
+    // to step 0 — the client asked for the nominal and got a substitute with
+    // no refusal to justify it.
+    const r1 = await postMessage({ session: "sess-nom-ovf", content: "n".repeat(400_000) });
+    expect(r1.status).toBe(200);
+    expect(await responseText(r1)).toContain("exceeded the serving model's maximum prompt size");
+    expect(calls.s0 ?? 0).toBe(0);
+    expect(calls.s1 ?? 0).toBe(0);
+    expect(markerLog.some((l) => l.includes("[Failover] SKIP"))).toBe(false);
   }, 30_000);
 });

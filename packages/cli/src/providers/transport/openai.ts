@@ -107,8 +107,20 @@ export class OpenAIProviderTransport implements ProviderTransport {
     // opts.busyWaitMs (#431): bounded queue wait for a cascade step attempt —
     // StepBusyError propagates to ComposedHandler's skip response; undefined =
     // today's unbounded FIFO.
-    const gate = (fn: () => Promise<Response>): Promise<Response> =>
-      this.limiter ? this.limiter.run(fn, opts?.busyWaitMs) : fn();
+    //
+    // CR S1: the bound applies to the FIRST admission only. `gate` runs at
+    // every iteration of the 429-retry ladder below, and a StepBusyError on a
+    // retry surfaced as a skip for a request the backend had ALREADY served a
+    // 429 on — worse, the second `limiter.run` re-queued behind fresh traffic,
+    // so a bounded step could spend its whole budget twice. First-admission
+    // gating matches the knob's meaning ("waited for a slot before the FIRST
+    // attempt"); retries admit unbounded, like every pre-#431 caller.
+    let firstAdmission = true;
+    const gate = (fn: () => Promise<Response>): Promise<Response> => {
+      const budget = firstAdmission ? opts?.busyWaitMs : undefined;
+      firstAdmission = false;
+      return this.limiter ? this.limiter.run(fn, budget) : fn();
+    };
 
     const runWith429Retry = async (): Promise<Response> => {
       const maxRetries = 5;

@@ -1837,6 +1837,42 @@ function ordinal(n: number): string {
   return (["1st", "2nd", "3rd"][n] as string | undefined) ?? `${n + 1}th`;
 }
 
+/** The step that actually produced the ok response a request is being handed back (#431 CR B1). */
+export interface ServedStepRecord {
+  role: FailoverRole;
+  step: FailoverStep;
+  stepIndex: number;
+}
+
+/**
+ * #431 CR B1: keyed on the Hono Context of the request (WeakMap — the entry dies
+ * with the request, never needs a reset between tests). The loop records the step
+ * whose response it returns; the notice builders prefer that record over their
+ * general resolution, because `resolveFailoverTarget` cannot see request-local
+ * skips or the session pin — with skip {0} armed, it kept announcing step 0's
+ * name on turns step 1 had just served.
+ */
+const servedStepRecords = new WeakMap<object, ServedStepRecord>();
+
+/** Loop-side record: the step whose response goes back to the client. No-op without one. */
+export function recordServedStepForNotices(
+  c: object,
+  role: FailoverRole,
+  step: FailoverStep | null | undefined,
+  stepIndex: number
+): void {
+  if (!step || stepIndex < 0) return;
+  servedStepRecords.set(c, { role, step, stepIndex });
+}
+
+/** Notice-side read: this request's served step, when it reports `role` (else undefined). */
+export function servedStepForNotices(c: object, role?: FailoverRole | null): ServedStepRecord | undefined {
+  const rec = servedStepRecords.get(c);
+  if (!rec) return undefined;
+  if (role && rec.role !== role) return undefined;
+  return rec;
+}
+
 /**
  * The block appended to a condensation result. Returns null when nothing is armed and
  * nothing is recovering, so the common case adds zero bytes. Emits one line per armed
@@ -1850,13 +1886,23 @@ function ordinal(n: number): string {
  * serving you". An armed sibling role is someone else's failover — announcing it
  * here tells the agent its own requests are substituted when they are not.
  */
-export function buildFailoverNotice(role?: FailoverRole | null, bucket?: string): string | null {
+export function buildFailoverNotice(
+  role?: FailoverRole | null,
+  bucket?: string,
+  served?: ServedStepRecord
+): string | null {
   const active: (ResolvedFailover & { bucket: string })[] = [];
   if (role) {
     // One session, one (role, bucket): only ITS OWN bucket's diversion is "the
     // model actually serving you" — a sibling bucket's wall is someone else's
     // failover and must not be announced here (#275).
-    const { step, stepIndex } = resolveFailoverTarget(role, bucket);
+    //
+    // #431 CR B1: `served` is the step the loop actually returned a response
+    // from for THIS request. When present it wins over the general resolver,
+    // which cannot see request-local skips: a turn served by the SUCCESSOR
+    // after a skipped step otherwise announced the skipped step's name.
+    const servedRec = served && served.role === role ? served : undefined;
+    const { step, stepIndex } = servedRec ?? resolveFailoverTarget(role, bucket);
     if (step) active.push({ role, step, stepIndex, bucket: bucket ?? LEGACY_ROLE_WIDE_BUCKET });
   } else {
     active.push(...getActiveFailovers());
@@ -1922,9 +1968,14 @@ export function buildFailoverNotice(role?: FailoverRole | null, bucket?: string)
  * `content[0]`), otherwise pushes one. Never throws — a malformed message must not
  * turn a working condensation into a failed one.
  */
-export function appendFailoverNoticeToMessage(message: any, role?: FailoverRole | null, bucket?: string): void {
+export function appendFailoverNoticeToMessage(
+  message: any,
+  role?: FailoverRole | null,
+  bucket?: string,
+  served?: ServedStepRecord
+): void {
   try {
-    const notice = buildFailoverNotice(role, bucket);
+    const notice = buildFailoverNotice(role, bucket, served);
     if (!notice) return;
     if (!message || !Array.isArray(message.content)) return;
 
@@ -2007,7 +2058,8 @@ function buildStreamRecoveryText(role: FailoverRole, st: RecoveryState): string 
 export function consumeStreamNotice(
   role: FailoverRole,
   sessionKey: string | null,
-  bucket?: string
+  bucket?: string,
+  served?: ServedStepRecord
 ): string | null {
   if (!sessionKey) return null;
 
@@ -2019,7 +2071,11 @@ export function consumeStreamNotice(
   }
 
   if (!isFailoverActive(role, bucket)) return null;
-  const { step, stepIndex } = resolveFailoverTarget(role, bucket);
+  // #431 CR B1: prefer what actually served this request — same rationale as
+  // buildFailoverNotice. The announced-depth dedup below then keys on the
+  // SERVED depth, so a skip-induced depth change still announces once.
+  const servedRec = served && served.role === role ? served : undefined;
+  const { step, stepIndex } = servedRec ?? resolveFailoverTarget(role, bucket);
   if (!step) return null;
   const key = roleBucketKey(role, bucket);
   let perPair = notifiedSessions.get(key);

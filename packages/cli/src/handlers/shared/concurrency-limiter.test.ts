@@ -174,4 +174,44 @@ describe("ConcurrencyLimiter", () => {
     await waiter;
     expect(ran).toBe(true);
   });
+
+  test("#431 CR: a grant racing the timeout is RUN, not abandoned (no stranded waiters)", async () => {
+    const limiter = new ConcurrencyLimiter(1, "race");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5));
+
+    // The race window — the timeout settling the race WHILE the release
+    // already shifted our resolver out of the FIFO — lives INSIDE one
+    // microtask drain: a separate release timer can never reach it (each
+    // timer's microtasks drain fully before the next macrotask). So the
+    // release rides the SAME drain as the limiter's timeout callback: wrap
+    // setTimeout for exactly the limiter's timer, and queueMicrotask the
+    // release right after its callback. Production hits the same shape when
+    // the holder's task completes in the same event-loop turn as the budget
+    // timer. Pre-fix, the continuation then found indexOf === -1 and STILL
+    // threw StepBusyError — a GRANTED slot abandoned, nobody re-transmits
+    // it, every later waiter strands while `active` undercounts by one.
+    let ran = false;
+    const realSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = ((fn: any, ms?: number, ...rest: any[]) =>
+      realSetTimeout((...args: any[]) => {
+        fn(...args);
+        queueMicrotask(() => releaseHolder());
+      }, ms, ...rest)) as any;
+    let waiter: Promise<void>;
+    try {
+      waiter = limiter.run(async () => { ran = true; }, 20);
+    } finally {
+      (globalThis as any).setTimeout = realSetTimeout;
+    }
+
+    await waiter; // never rejects under the fix — the granted slot runs the task
+    expect(ran).toBe(true);
+    await holder;
+    expect(limiter.activeCount).toBe(0);
+    expect(limiter.queuedCount).toBe(0);
+  });
 });

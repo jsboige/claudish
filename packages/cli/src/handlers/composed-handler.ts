@@ -549,6 +549,15 @@ export class ComposedHandler implements ModelHandler {
         `[${this.provider.displayName}] max_tokens ${claudeRequest.max_tokens} → ${this.options.maxOutputTokens} (endpoint maxOutputTokens cap, #431)`
       );
       claudeRequest.max_tokens = this.options.maxOutputTokens;
+      // CR minor: a thinking budget ABOVE the clamped max is invalid on the
+      // Anthropic wire (budget_tokens must stay < max_tokens — CC sends
+      // 31999 against 32000), and a pass-through converter copies both fields
+      // verbatim. Pull the budget down to cap-1 so the clamp does not
+      // manufacture a 400 the endpoint would otherwise never see.
+      const budget = claudeRequest.thinking?.budget_tokens;
+      if (typeof budget === "number" && budget >= this.options.maxOutputTokens) {
+        claudeRequest.thinking!.budget_tokens = this.options.maxOutputTokens - 1;
+      }
     }
     let requestPayload = adapter.buildPayload(claudeRequest, messages, tools);
 

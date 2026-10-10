@@ -80,6 +80,8 @@ import {
   onNominalRefusal,
   getArmGraceMs,
   extractSessionKey,
+  recordServedStepForNotices,
+  servedStepForNotices,
 } from "./fork/failover.js";
 import {
   readStepSkip,
@@ -1378,8 +1380,20 @@ export async function createProxyServer(
       // guards that `continue`/return, so only an attempt that will actually
       // be served pays for the marking. The kill switch gates it: off = no
       // bound anywhere, today's behavior.
-      if (role && stepIndex >= 0 && !stepSkipDisabled()) {
-        markCascadeStepAttempt(c, readStepBusyWaitMs());
+      //
+      // CR S2/S3: the bound applies to a NON-LAST step only — on the last step
+      // (and on the nominal) the 529-skip has no successor to advance to, so a
+      // bound there converts a long-but-finite queue wait into an empty-skip
+      // surface. The unbounded re-mark (0) matters for the SAME request: the
+      // marking is per-ATTEMPT state on the Context, and an earlier attempt of
+      // this request may have already set a bound that must not survive into
+      // the final attempt.
+      if (role && !stepSkipDisabled()) {
+        if (rule != null && stepIndex >= 0 && stepIndex < rule.steps.length - 1) {
+          markCascadeStepAttempt(c, readStepBusyWaitMs());
+        } else {
+          markCascadeStepAttempt(c, 0);
+        }
       }
       response = await handler.handle(c, body);
       if (pinnedModel && !response.ok) body.model = modelBeforePin;
@@ -1404,6 +1418,15 @@ export async function createProxyServer(
           stepIndex >= 0 &&
           rule != null &&
           stepIndex < rule.steps.length - 1 &&
+          // CR S4: a skip on the LAST iteration has no attempt left to advance
+          // to — without this guard the `continue` would exit the loop and fall
+          // through to the empty-return path, handing the client a bare 200
+          // with no message_stop. The recovery turn / 529 of the last attempt
+          // must be the answer (the predicate above normally prevents this —
+          // the last STEP cannot skip — but `maxAttempts` can be exhausted one
+          // iteration before the last step is reached, e.g. a delegated
+          // resolution that advanced mid-request).
+          attempt + 1 < maxAttempts &&
           !stepSkipDisabled()
         ) {
           log(
@@ -1423,6 +1446,13 @@ export async function createProxyServer(
       }
       if (response.ok) {
         if (role) {
+          // #431 CR B1: record the step that actually produced this response —
+          // the notice builders (applyFailoverNotices) resolve "who is serving"
+          // generically and cannot see request-local skips, so without this a
+          // successor-served turn announced the SKIPPED step's name. No-op on
+          // the nominal (stepIndex -1 / undefined step), and cleared-by-design
+          // per request (WeakMap on the Context).
+          recordServedStepForNotices(c, role, resolved.step, stepIndex);
           if (stepIndex === -1) onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
           else resetStepSuccess(role, stepIndex);
           // #274: the concrete model succeeded — clear the OWNING side too,
@@ -2191,7 +2221,8 @@ export async function createProxyServer(
         sessionKey,
         body.stream === true,
         noticePolicyForIngress(c.req.path),
-        requestBucket
+        requestBucket,
+        servedStepForNotices(c, requestRole) // #431 CR B1: name the step that actually served
       );
       // The `await` is load-bearing (218c3586): `return promise` hands it back
       // BEFORE it settles, so a rejection escapes this try/catch entirely and
@@ -2291,7 +2322,8 @@ export async function createProxyServer(
         extractSessionKey(anthropicBody),
         wantsStream,
         noticePolicyForIngress(c.req.path),
-        requestBucket
+        requestBucket,
+        servedStepForNotices(c, requestRole) // #431 CR B1: name the step that actually served
       );
 
       // Translate the final Anthropic response to OpenAI shape.

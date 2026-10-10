@@ -73,8 +73,17 @@ export class ConcurrencyLimiter {
         });
         if (raced === "timeout") {
           const i = this.waiting.indexOf(slot);
-          if (i >= 0) this.waiting.splice(i, 1);
-          throw new StepBusyError(this.label, waitBudgetMs);
+          if (i >= 0) {
+            this.waiting.splice(i, 1);
+            throw new StepBusyError(this.label, waitBudgetMs);
+          }
+          // CR minor (race): a release fired between the race settling on
+          // "timeout" and this lookup — `indexOf === -1` means OUR resolver
+          // was already shifted out and called, and that release also
+          // decremented `active` for the waiter it woke. Throwing here would
+          // abandon a GRANTED slot: nobody re-transmits it, every later waiter
+          // stays stranded and `active` undercounts by one. Fall through and
+          // run the task on the slot we hold.
         }
       } else {
         await queued;

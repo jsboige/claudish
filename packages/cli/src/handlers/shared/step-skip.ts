@@ -79,8 +79,14 @@ export const STEP_BUSY_WAIT_DEFAULT_MS = 2_000;
  * nominal path never reads it.
  */
 export function readStepBusyWaitMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = Number.parseInt((env.CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS || "").trim(), 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : STEP_BUSY_WAIT_DEFAULT_MS;
+  // CR minor: STRICT integer parse. `Number.parseInt("2s")` is 2 — two
+  // MILLISECONDS, not two seconds — so a unit-suffixed value silently armed a
+  // bound tighter than any real queue wait, and every marked attempt skipped.
+  // Reject anything that is not all digits, then clamp: an operator typing
+  // 300000 (minutes-as-milliseconds) should not get a five-minute client stall.
+  const raw = (env.CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS || "").trim();
+  if (!/^\d+$/.test(raw)) return STEP_BUSY_WAIT_DEFAULT_MS;
+  return Math.min(Number.parseInt(raw, 10), 60_000);
 }
 
 // ── Per-attempt busy budget, request-scoped ────────────────────────────────────

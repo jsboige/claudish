@@ -126,8 +126,15 @@ export class AnthropicProviderTransport implements ProviderTransport {
     // cluster-wide key and therefore throttle in synchronized bursts.
     // opts.busyWaitMs (#431): bounded queue wait — StepBusyError propagates to
     // ComposedHandler's skip response; undefined = today's unbounded FIFO.
-    const gate = (fn: () => Promise<Response>): Promise<Response> =>
-      this.limiter ? this.limiter.run(fn, opts?.busyWaitMs) : fn();
+    // CR S1: first admission only — the gate runs at every 429-retry
+    // iteration, and a bound riding a retry surfaces as a skip for a request
+    // the backend already 429'd (see OpenAIProviderTransport for the full text).
+    let firstAdmission = true;
+    const gate = (fn: () => Promise<Response>): Promise<Response> => {
+      const budget = firstAdmission ? opts?.busyWaitMs : undefined;
+      firstAdmission = false;
+      return this.limiter ? this.limiter.run(fn, budget) : fn();
+    };
 
     const runWith429Retry = async (): Promise<Response> => {
       const maxRetries = 5;
