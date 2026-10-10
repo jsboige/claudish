@@ -639,8 +639,16 @@ function Invoke-ClaudishDrainedRestartImpl {
     # arming so new admissions are already gated while the tick runs, and its
     # default 120 s bound fits the proxy's 900 s freeze expiry. Never blocks
     # the gesture — see Invoke-DrainFailoverEventsTick's own bounds.
+    # #422 CR — normalize localhost -> 127.0.0.1 so a :3000 seat stays on the
+    # collector's OWN default host. $Url is derived as "http://localhost:$port"
+    # (Get-ClaudishProbeUrl), while the collector defaults to 127.0.0.1 — under
+    # PS 5.1 localhost may resolve ::1 first (the wslrelay shape: ::1 listens
+    # but is wedged while 127.0.0.1 serves), which is the very failure #422
+    # fixes, reintroduced on the port that was exempt. An explicit non-localhost
+    # -Url (LAN host) passes through unchanged.
+    $tickHealthUrl = "$Url/health" -replace '^http://localhost:', 'http://127.0.0.1:'
     Invoke-DrainFailoverEventsTick -CollectorPath $FailoverTickCollectorPath -Container $Container `
-        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec
+        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec -HealthUrl $tickHealthUrl
 
     $restartAt = Get-Date
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
@@ -868,6 +876,14 @@ function Invoke-DrainFailoverEventsTick {
         [string]$CollectorPath,
         [string]$Container,
         [string]$ClaudishHome,
+        # #422 — the address the collector should probe for the per-process
+        # instanceId. Empty leaves the collector's own default, which is what
+        # the tick used to get unconditionally on the one call path that
+        # already knows the derived port. The call site passes the
+        # #372-derived "$Url/health" with the host normalized to 127.0.0.1
+        # (the collector's own default host — a derived localhost:3000 is NOT
+        # byte-identical to it, see the call site's #422 CR note).
+        [string]$HealthUrl,
         [int]$TimeoutSec = 120
     )
     if (-not $CollectorPath -or -not (Test-Path -LiteralPath $CollectorPath)) {
@@ -899,8 +915,23 @@ function Invoke-DrainFailoverEventsTick {
         # Quote every argument through the same Windows rule the detach launcher
         # uses — 5.1's -ArgumentList array join quotes nothing, so a home path
         # with a space must not split (02/10 lesson).
-        $argString = Join-DrainDetachArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
+        $tickArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
             '-Container', $Container, '-ClaudishHome', $ClaudishHome)
+        # #422 — forward the DERIVED probe address, so the collector never falls
+        # back to its hardcoded :3000 default on a call path that already knows
+        # the real port. On a machine whose host port is not 3000 that fallback
+        # makes the probe fail, Get-InstanceId returns $null, and the collector
+        # overwrites the state's instanceId with '' — which disarms
+        # InstanceChanged for the very tick that spans the gesture (the
+        # pre-gesture tick writes '' immediately before it). A :3000 seat is a
+        # strict no-op only because the CALL SITE normalizes localhost to
+        # 127.0.0.1 first — the derived "http://localhost:3000/health" is NOT
+        # byte-identical to the collector's default (see the call site's #422
+        # CR note).
+        if (-not [string]::IsNullOrWhiteSpace($HealthUrl)) {
+            $tickArgs += @('-HealthUrl', "$HealthUrl")
+        }
+        $argString = Join-DrainDetachArguments $tickArgs
         $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argString `
             -WindowStyle Hidden -RedirectStandardOutput $tickOut -RedirectStandardError $tickErr -PassThru
         # 5.1: without a held handle, ExitCode reads empty after the child dies
