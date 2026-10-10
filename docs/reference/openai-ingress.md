@@ -22,7 +22,48 @@ changing `base_url` alone.
 | `tool` role | `tool_result` |
 | function tools | `input_schema` |
 | `tool_choice` | mapped |
+| `enable_thinking` / `chat_template_kwargs.enable_thinking` / `reasoning_effort` | `thinking` object — see #435 below |
 | *(absent)* `max_tokens` | defaulted — Anthropic requires it, OpenAI does not |
+
+## Request-side thinking controls (#435)
+
+vLLM-style `enable_thinking` (top level, or under `chat_template_kwargs`) and OpenAI's
+`reasoning_effort` were **silently dropped** by the converter until #435: the reasoning decision
+fell to the served dialect's policy (`CLAUDISH_GLM_THINKING` passthrough by default = GLM thinks;
+`CLAUDISH_QWEN_THINKING` disabled) and the client's ask never reached `prepareRequest`. They now
+map onto the house `thinking` object — the seam every dialect already consults
+(`originalRequest.thinking`):
+
+| Client field | Mapped shape |
+|---|---|
+| `enable_thinking: false` | `{type: "disabled"}` |
+| `enable_thinking: true` | `{type: "enabled", budget_tokens: 2048}` |
+| `reasoning_effort: minimal/low/medium/high` | `{type: "enabled", budget_tokens: 2000/8000/24000/32000}` |
+
+- Top-level `enable_thinking` wins over the `chat_template_kwargs` spelling; an unknown
+  `reasoning_effort` value is ignored (no partial mapping); no controls → no `thinking` field
+  (pre-#435 behavior).
+- The effort ladder is the exact inverse of `openai-api-format.ts`'s budget→effort map, so an
+  o1/o3 round trip (`reasoning_effort` in, budget back out) is stable.
+- **Budget legality**: an enabled block always carries `budget_tokens ≥ 1024` (native Anthropic
+  floor) and `< max_tokens` (Qwen requirement). Against a **client-sent** `max_tokens` the budget
+  clamps into it; against **our 4096 placeholder** it instead *raises* the placeholder to
+  `budget + 1` — clamping "high" (32000) to 4095 would invert the ask to "minimal" downstream.
+  No room for a legal block (tiny `max_tokens`) → the mapping is skipped; dialect policy decides.
+
+**Downstream fates** (dialect `prepareRequest`): GLM openai wire forwards `{type:"disabled"}`
+verbatim and reduces an enabled block to its binary `{type:"enabled"}`; Qwen maps to
+`enable_thinking` + `thinking_budget` (openai wire) or keeps the native object (anthropic wire);
+o1/o3 remaps budget → `reasoning_effort`. `#435` also fixed the Qwen openai-wire passthrough,
+which mapped *any* `originalRequest.thinking` to `enable_thinking: true` — inverting an explicit
+disabled ask.
+
+**Measured on the real lane (2026-10-11)**, probe proxy → hub `/v1/messages` → sonnet nominal
+`gc@glm-5.3`, prompt `"Reponds exactement: ok"`, `max_tokens: 200`: no controls → **36 completion
+tokens, 131 chars of `reasoning_content`**; `enable_thinking: false` → **3 completion tokens,
+reasoning absent** — the 37→3 shape of the 2026-08-20 probe of record, end to end through the
+ingress. Pins: `openai-request-to-anthropic.test.ts` (mapping matrix),
+`qwen-model-dialect.test.ts` + `glm-model-dialect.test.ts` (dialect ends).
 
 ## Response translators
 
