@@ -154,6 +154,14 @@ services:
       # #348 — overload-walk time budget (ms). Default 300000; 0 = off. Same
       # read-per-request class as the switch above, same container rule.
       - CLAUDISH_FAILOVER_WALK_BUDGET_MS=${CLAUDISH_FAILOVER_WALK_BUDGET_MS:-}
+      # #431 — step-skip kill switch: "0" restores the pre-#431 behavior (an
+      # overflowed/busy cascade step surfaces its recovery turn / waits
+      # unbounded instead of skipping forward). Read-per-request.
+      - CLAUDISH_FAILOVER_STEP_SKIP=${CLAUDISH_FAILOVER_STEP_SKIP:-}
+      # #431 — how long a CASCADE STEP attempt waits for an endpoint
+      # concurrency slot before skipping forward (ms). Default 2000; 0 = off
+      # (unbounded FIFO). The nominal path never reads it. Read-per-request.
+      - CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS=${CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS:-}
       # #310 — runtime knobs the proxy reads that were never in this list
       # (same absence class as the #304 failover knobs above: the env file only
       # interpolates, so a value set for a name this list does not carry never

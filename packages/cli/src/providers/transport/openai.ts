@@ -103,9 +103,12 @@ export class OpenAIProviderTransport implements ProviderTransport {
    * request the backend just throttled should not cut ahead of traffic it has
    * not. Patience is unchanged — same maxRetries, same delays, same responses.
    */
-  async enqueueRequest(fetchFn: () => Promise<Response>): Promise<Response> {
+  async enqueueRequest(fetchFn: () => Promise<Response>, opts?: { busyWaitMs?: number }): Promise<Response> {
+    // opts.busyWaitMs (#431): bounded queue wait for a cascade step attempt —
+    // StepBusyError propagates to ComposedHandler's skip response; undefined =
+    // today's unbounded FIFO.
     const gate = (fn: () => Promise<Response>): Promise<Response> =>
-      this.limiter ? this.limiter.run(fn) : fn();
+      this.limiter ? this.limiter.run(fn, opts?.busyWaitMs) : fn();
 
     const runWith429Retry = async (): Promise<Response> => {
       const maxRetries = 5;

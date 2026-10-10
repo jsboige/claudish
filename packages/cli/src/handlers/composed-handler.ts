@@ -55,6 +55,12 @@ import {
   buildOverflowRecoveryStream,
   buildOverflowRecoveryMessage,
 } from "./shared/context-overflow.js";
+import {
+  STEP_SKIP_HEADER,
+  encodeStepSkipHeader,
+  cascadeStepBusyWaitMs,
+} from "./shared/step-skip.js";
+import { StepBusyError } from "./shared/concurrency-limiter.js";
 import { isQuotaExhaustion } from "../fork/failover.js";
 import type { StreamFormat } from "../providers/transport/types.js";
 import { log, logStderr, logStructured, getLogLevel, truncateContent } from "../logger.js";
@@ -260,6 +266,16 @@ export interface ComposedHandlerOptions {
    * fields — see CustomEndpointSimpleSchema.omitReasoningContent.
    */
   omitReasoningContent?: boolean;
+  /**
+   * #431 AC2 — per-endpoint output cap. Clamps `max_tokens` DOWN (never up)
+   * on the Claude-level request before any format conversion, so every wire
+   * (openai `max_tokens`/`max_completion_tokens`, anthropic `max_tokens`)
+   * inherits it from one seam. vLLM counts `prompt + max_tokens` against
+   * `--max-model-len` and REFUSES rather than trims (measured on Swift,
+   * v0.31): a 240k prompt with `max_tokens: 32000` against a 262k window is
+   * a refusal, and the same prompt with the cap at 8192 is served.
+   */
+  maxOutputTokens?: number;
 }
 
 export class ComposedHandler implements ModelHandler {
@@ -518,6 +534,22 @@ export class ComposedHandler implements ModelHandler {
     }
 
     // 4. Build request payload
+    // #431 AC2 — clamp BEFORE the conversion: every wire derives its output
+    // field from `claudeRequest.max_tokens` (openai-api-format.ts L101/103,
+    // anthropic passthrough), so one Claude-level seam covers all formats.
+    // `claudeRequest` is this handler's transform copy — the route's `body`
+    // and the client's retry semantics are untouched.
+    if (
+      this.options.maxOutputTokens !== undefined &&
+      this.options.maxOutputTokens > 0 &&
+      typeof claudeRequest.max_tokens === "number" &&
+      claudeRequest.max_tokens > this.options.maxOutputTokens
+    ) {
+      log(
+        `[${this.provider.displayName}] max_tokens ${claudeRequest.max_tokens} → ${this.options.maxOutputTokens} (endpoint maxOutputTokens cap, #431)`
+      );
+      claudeRequest.max_tokens = this.options.maxOutputTokens;
+    }
     let requestPayload = adapter.buildPayload(claudeRequest, messages, tools);
 
     // 4a. Fallback de-escalation system message (cost control).
@@ -717,7 +749,7 @@ export class ComposedHandler implements ModelHandler {
           `[ContextGuard] short-circuit provider=${this.provider.displayName} model=${this.targetModel} est=${est} cap=${overflowCap} (learned) — no upstream call`,
           true
         );
-        return this.buildOverflowRecoveryResponse(c, payload, est, undefined);
+        return this.buildOverflowRecoveryResponse(c, payload, est, undefined, overflowCap);
       }
     }
 
@@ -740,9 +772,30 @@ export class ComposedHandler implements ModelHandler {
     let response: Response;
     try {
       response = this.provider.enqueueRequest
-        ? await this.provider.enqueueRequest(doFetch)
+        ? await this.provider.enqueueRequest(doFetch, {
+            // #431 AC3: only a loop-marked CASCADE STEP attempt carries a
+            // budget — nominal / walk / non-cascade callers read undefined and
+            // keep today's unbounded FIFO.
+            busyWaitMs: cascadeStepBusyWaitMs(c),
+          })
         : await doFetch();
     } catch (error: any) {
+      // #431 AC3: the bounded busy wait expired. Never confuse this with a
+      // connection error (the retry below would re-queue behind the same
+      // saturated limiter and pay the whole ladder again) — answer the labeled
+      // 529 with the skip header; the cascade advances past a non-last step
+      // without a failure mark, and every other caller surfaces it as an
+      // ordinary retryable overload.
+      if (error instanceof StepBusyError) {
+        // `log`, not `logStderr`: the forceConsole second argument exists only
+        // on log() — several legacy logStderr(x, true) calls are standing type
+        // errors in the baseline, and this change adds none.
+        log(
+          `[StepBusy] provider=${this.provider.displayName} model=${this.targetModel} waited=${error.waitedMs}ms — no concurrency slot (#431)`,
+          true // forceConsole — operational event
+        );
+        return this.buildBusySkipResponse(c, error);
+      }
       // A failure to even REACH the provider (DNS can't resolve, connection
       // refused, host unreachable) is a LOCAL network problem, not an upstream
       // server error. Surface it as a 400 connection_error with an honest,
@@ -1125,7 +1178,7 @@ export class ComposedHandler implements ModelHandler {
             `[ContextGuard] overflow provider=${this.provider.displayName} model=${this.targetModel} used=${overflow.used ?? "?"} est=${est} floor=${floor} reported=${reported} synthetic=${reported > (overflow.used ?? 0)}`,
             true // forceConsole — operational event
           );
-          return this.buildOverflowRecoveryResponse(c, payload, est, overflow.used);
+          return this.buildOverflowRecoveryResponse(c, payload, est, overflow.used, overflow.limit);
         }
 
         return c.json(ensureAnthropicErrorFormat(response.status, errorBody), response.status as any);
@@ -1345,16 +1398,56 @@ export class ComposedHandler implements ModelHandler {
     c: Context,
     payload: any,
     est: number,
-    used: number | undefined
+    used: number | undefined,
+    /** Provider-stated token limit, when the refusal named one (#431 marker). */
+    limit?: number
   ): Response {
     const inputTokens = overflowReportedTokens(used, est, overflowReportFloor());
     const text = overflowRecoveryText(this.provider.displayName, this.targetModel, est);
+    let response: Response;
     if (payload?.stream === true) {
-      return buildOverflowRecoveryStream(text, inputTokens, this.bareModelName);
+      response = buildOverflowRecoveryStream(text, inputTokens, this.bareModelName);
+    } else {
+      response = c.json(buildOverflowRecoveryMessage(text, inputTokens, this.bareModelName), {
+        headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+      });
     }
-    return c.json(buildOverflowRecoveryMessage(text, inputTokens, this.bareModelName), {
-      headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
-    });
+    // #431 AC1/AC4: mark this 200 as "cannot take THIS request", not a success.
+    // Only handleWithCascade acts on it, and only for a non-last cascade step —
+    // everywhere else the recovery turn surfaces unchanged, header and all
+    // (same doctrine as x-claudish-failover-notice, #229). The cap in the
+    // detail prefers the provider-stated limit (vLLM names 262144) and falls
+    // back to the learned one; est is the payload estimate either way.
+    const cap = limit ?? getOverflowCap(this.provider.displayName, this.targetModel);
+    response.headers.set(
+      STEP_SKIP_HEADER,
+      encodeStepSkipHeader("context", `est=${est}${cap !== undefined ? ` cap=${cap}` : ""}`)
+    );
+    return response;
+  }
+
+  /**
+   * #431 AC3 — bounded-busy answer for a cascade step attempt whose concurrency
+   * wait expired. A 529 (not 429: the meter is not walled, the lane is full —
+   * same vocabulary as the patient-backoff path) carrying the skip header so
+   * the cascade advances past a non-last step with no failure mark. Last step
+   * and non-cascade callers surface it as an ordinary retryable overload.
+   */
+  private buildBusySkipResponse(c: Context, err: StepBusyError): Response {
+    const response = c.json(
+      wrapAnthropicError(
+        529,
+        `${this.provider.displayName} busy — no concurrency slot within the bounded wait (${err.waitedMs}ms)`,
+        "overloaded_error"
+      ),
+      529 as any
+    );
+    response.headers.set("Retry-After", "2");
+    response.headers.set(
+      STEP_SKIP_HEADER,
+      encodeStepSkipHeader("busy", `wait=${err.waitedMs}ms label=${err.label}`)
+    );
+    return response;
   }
 
   /**

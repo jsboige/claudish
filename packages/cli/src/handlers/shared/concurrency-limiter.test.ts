@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { ConcurrencyLimiter } from "./concurrency-limiter.js";
+import { ConcurrencyLimiter, StepBusyError } from "./concurrency-limiter.js";
 
 /**
  * ConcurrencyLimiter — per-instance async semaphore for remote transports.
@@ -98,5 +98,80 @@ describe("ConcurrencyLimiter", () => {
     });
     expect(secondRan).toBe(true);
     expect(limiter.activeCount).toBe(0);
+  });
+
+  // ── #431: bounded queue wait (busy skip) ──────────────────────────────────
+
+  test("#431: a bounded wait that expires rejects with StepBusyError", async () => {
+    const limiter = new ConcurrencyLimiter(1, "busy");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5)); // holder has the slot
+
+    const t0 = Date.now();
+    await expect(limiter.run(async () => "never", 50)).rejects.toBeInstanceOf(StepBusyError);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(45); // it really waited
+    releaseHolder();
+    await holder;
+  });
+
+  test("#431: a busy timeout does NOT leak the slot — the next task still runs", async () => {
+    const limiter = new ConcurrencyLimiter(1, "busy-leak");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5));
+
+    // The abandoned waiter's resolver must be GONE from the queue: a freed
+    // slot that wakes it would decrement `active` for a waiter that never
+    // increments — the slot disappears for every later task.
+    await expect(limiter.run(async () => "x", 20)).rejects.toBeInstanceOf(StepBusyError);
+    releaseHolder();
+    await holder;
+
+    let ran = false;
+    await limiter.run(async () => { ran = true; }, 20);
+    expect(ran).toBe(true);
+    expect(limiter.activeCount).toBe(0);
+    expect(limiter.queuedCount).toBe(0);
+  });
+
+  test("#431: without a budget the FIFO wait stays unbounded (pre-#431 behavior)", async () => {
+    const limiter = new ConcurrencyLimiter(1, "unbounded");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5));
+
+    let ran = false;
+    const waiter = limiter.run(async () => { ran = true; }); // no budget arg
+    await new Promise((r) => setTimeout(r, 40));
+    expect(ran).toBe(false); // still waiting — no silent timeout
+    releaseHolder();
+    await holder;
+    await waiter;
+    expect(ran).toBe(true);
+  });
+
+  test("#431: budget 0 means no bound, not an instant timeout", async () => {
+    const limiter = new ConcurrencyLimiter(1, "zero-off");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5));
+
+    let ran = false;
+    const waiter = limiter.run(async () => { ran = true; }, 0);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(ran).toBe(false);
+    releaseHolder();
+    await holder;
+    await waiter;
+    expect(ran).toBe(true);
   });
 });
