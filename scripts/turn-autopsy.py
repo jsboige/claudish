@@ -16,7 +16,9 @@ the labels the reader wrote.
 Subcommands
 -----------
   sample     Work-list: bounded, seeded sample of turns, with reading slices.
+  show       Render a work-list as reading slices -- the reader's input.
   label      Scaffold a labels file from a work-list (one blank record per turn).
+  stats      Per-era distributions: trigger, last role, machine, lane, pairing.
   aggregate  nature x era table from a work-list plus its labels file.
 
 Corpus
@@ -60,6 +62,7 @@ import shutil
 import subprocess
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 SEVENZIP = os.environ.get(
     "SEVENZIP", r"D:\PortableApps\PortableApps\7-ZipPortable\App\7-Zip\7z.exe"
@@ -99,16 +102,20 @@ AUTOMATIC_TRIGGERS = {"todo-nudge", "bg-notification", "date-change", "cron"}
 
 
 def classify_trigger(msgs: list) -> str:
+    """Tool-result FIRST (#424 CR): a message carrying a `tool_result` block is
+    a tool-result turn, full stop -- its tool_result content may QUOTE harness
+    phrases ("Command running in background with ID:" is the agent's own Bash
+    result echoing the notification shape) and must not masquerade as a nudge.
+    Trigger regexes only ever read text blocks."""
     if not msgs:
         return "empty"
     last = msgs[-1] or {}
-    text = _text_of(last)
+    if "tool_result" in _blocks_of(last):
+        return "tool-result"
+    text = _textblocks_of(last)
     for name, rx in TRIGGERS:
         if rx.search(text):
             return name
-    blocks = _blocks_of(last)
-    if "tool_result" in blocks:
-        return "tool-result"
     if last.get("role") == "system":
         return "system"
     if last.get("role") == "user":
@@ -168,50 +175,119 @@ def list_dir_members(path: str) -> list[tuple[str, int]]:
 
 
 def index_members(members: list[tuple[str, int]]) -> tuple[dict, dict]:
-    """req counter -> name ; resp counter -> (name, lane)."""
-    reqs, resps = {}, {}
+    """req counter -> [(ts, name)] ; resp counter -> [(ts, name, lane)].
+
+    LISTS, not single values (#424 CR): the capture counter restarts with the
+    container (measured on captures-2026-07-05: 10 498 resp files for 7 114
+    distinct counters), so a dict assignment silently overwrites homonyms and
+    mispairs requests of one uptime window with responses of another."""
+    reqs: dict[int, list[tuple[str, str]]] = defaultdict(list)
+    resps: dict[int, list[tuple[str, str, str]]] = defaultdict(list)
     for name, _size in members:
         base = os.path.basename(name)
         m = REQ_RE.match(base)
         if m:
-            reqs[int(m.group(1))] = base
+            reqs[int(m.group(1))].append((m.group(2), base))
             continue
         m = RESP_RE.match(base)
         if m:
             handler, _, model = m.group(3).partition("-")
-            resps[int(m.group(1))] = (base, f"{handler}/{model or '?'}")
+            resps[int(m.group(1))].append((m.group(2), base, f"{handler}/{model or '?'}"))
     return reqs, resps
 
 
-def pick_sample(reqs: dict, resps: dict, n: int, seed: int,
-                stratify_by_lane: bool) -> list[int]:
-    """Seeded sample of req counters. Optional proportional stratification by
-    the lane read off the resp filename (the volume axis #328 is about).
+# A resp belongs to the LATEST req of its counter whose ts it follows, within
+# this bound. 20 min: generous vs a slow first token, narrow vs the hours that
+# separate two uptime windows reusing the same counter.
+PAIR_WINDOW_MS = 20 * 60 * 1000
+
+
+def _ts_ms(ts: str) -> int:
+    """Filename timestamp -> epoch ms. Real calendar arithmetic, never digit
+    concatenation: `02-59-59-999 -> 03-00-00-000` is 1 ms, not 4e7 units."""
+    return int(datetime.strptime(ts, "%Y-%m-%dT%H-%M-%S-%fZ")
+               .replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def pair_all(reqs: dict, resps: dict) -> dict:
+    """Pair every req with the resp of its counter whose timestamp is >= its
+    own and within PAIR_WINDOW_MS. Returns {(counter, req_ts, req_name):
+    (status, resp_entry|None)} with status in paired / unpaired / ambiguous.
+
+    Ownership is decided resp-side (each resp goes to the LATEST req it
+    follows within the window), so two windows reusing one counter each keep
+    their own response. A req with no in-window resp after it is `unpaired`;
+    a req claimed by several resps is `ambiguous` -- both are reported as
+    their own status, never silently folded into a wrong pairing."""
+    out: dict[tuple[int, str, str], tuple[str, object]] = {}
+    for c, rlist in reqs.items():
+        rlist = sorted(rlist)
+        slist = sorted(resps.get(c) or [])
+        claims: dict[int, list[tuple[str, str, str]]] = defaultdict(list)
+        for sp in slist:
+            t1 = _ts_ms(sp[0])
+            owner = -1
+            for r_i, rq in enumerate(rlist):
+                t0 = _ts_ms(rq[0])
+                if t0 > t1:
+                    break              # rlist is ts-sorted: past here, no owner
+                if t1 - t0 <= PAIR_WINDOW_MS:
+                    owner = r_i        # keep the LATEST in-window predecessor
+            if owner >= 0:
+                claims[owner].append(sp)
+        for r_i, rq in enumerate(rlist):
+            got = claims.get(r_i) or []
+            if len(got) == 1:
+                out[(c, *rq)] = ("paired", got[0])
+            elif got:
+                out[(c, *rq)] = ("ambiguous", got)
+            else:
+                out[(c, *rq)] = ("unpaired", None)
+    return out
+
+
+def build_candidates(reqs: dict, resps: dict) -> list[dict]:
+    """One candidate per REQUEST (not per counter): counter, timestamps,
+    pairing status and the paired resp entry when there is one."""
+    pairs = pair_all(reqs, resps)
+    out = []
+    for (c, rq_ts, rq_name), (status, entry) in pairs.items():
+        out.append({"counter": c, "req_ts": rq_ts, "req_name": rq_name,
+                    "pair": status, "resp": entry})
+    out.sort(key=lambda r: (r["req_ts"], r["req_name"]))
+    return out
+
+
+def pick_sample(cands: list[dict], n: int, seed: int,
+                stratify_by_lane: bool) -> list[dict]:
+    """Seeded sample of turn candidates. Optional proportional stratification
+    by the lane read off the paired resp filename (the volume axis #328 is
+    about); unpaired and ambiguous candidates pool under their own labels.
 
     Allocation is bounded by `n`: a lane is never forced to a minimum when more
     lanes exist than slots (that is what turned `--n 50` into 14 244 members)."""
-    counters = sorted(reqs)
     rng = random.Random(seed)
     if not stratify_by_lane:
-        return sorted(rng.sample(counters, min(n, len(counters))))
+        return sorted(rng.sample(cands, min(n, len(cands))),
+                      key=lambda r: (r["req_ts"], r["req_name"]))
 
-    by_lane: dict[str, list[int]] = defaultdict(list)
-    for c in counters:
-        lane = resps.get(c, (None, "unknown/unpaired"))[1]
-        by_lane[lane].append(c)
-    total = len(counters)
+    by_lane: dict[str, list[dict]] = defaultdict(list)
+    for r in cands:
+        lane = r["resp"][2] if r["resp"] else f"unknown/{r['pair']}"
+        by_lane[lane].append(r)
+    total = len(cands)
     lanes = sorted(by_lane.items(), key=lambda kv: -len(kv[1]))
 
     if len(lanes) >= n:                       # more lanes than slots: one each
-        return sorted(rng.choice(group) for _lane, group in lanes[:n])
-
-    chosen: list[int] = []
-    for lane, group in lanes:
-        share = max(1, round(n * len(group) / total))
-        chosen += rng.sample(group, min(share, len(group)))
-    if len(chosen) > n:                       # the min-1 rule can overshoot
-        chosen = rng.sample(chosen, n)
-    return sorted(set(chosen))
+        picked = [rng.choice(group) for _lane, group in lanes[:n]]
+    else:
+        picked = []
+        for lane, group in lanes:
+            share = max(1, round(n * len(group) / total))
+            picked += rng.sample(group, min(share, len(group)))
+        if len(picked) > n:                   # the min-1 rule can overshoot
+            picked = rng.sample(picked, n)
+    return sorted(picked, key=lambda r: (r["req_ts"], r["req_name"]))
 
 
 def local_copy(archive: str) -> str:
@@ -259,6 +335,20 @@ def _blocks_of(msg: dict) -> list[str]:
     if isinstance(content, list):
         return [b.get("type", "?") for b in content if isinstance(b, dict)]
     return []
+
+
+def _textblocks_of(msg: dict) -> str:
+    """Text blocks ONLY -- what the harness or the user WROTE, never what a
+    tool returned. The trigger scan runs on this (#424 CR): a tool_result
+    quoting "Command running in background with ID:" is the agent's own
+    output, not a background notification."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return ""
 
 
 def _text_of(msg: dict) -> str:
@@ -372,45 +462,51 @@ def cmd_sample(args) -> int:
     reqs, resps = index_members(members)
     if not reqs:
         die("no req-* members found")
-    counters = pick_sample(reqs, resps, args.n, args.seed, args.stratify == "lane")
+    cands = build_candidates(reqs, resps)
+    picked = pick_sample(cands, args.n, args.seed, args.stratify == "lane")
 
-    lanes_seen = len({lane for _n, lane in resps.values()})
-    print(f"[turn-autopsy] corpus: {len(reqs)} req / {len(resps)} resp, "
-          f"{lanes_seen} lane(s)", file=sys.stderr)
-    if args.stratify == "lane" and lanes_seen > len(counters):
-        print(f"[turn-autopsy] WARNING: {lanes_seen} lanes > {len(counters)} slots "
+    lanes_seen = len({e[2] for lst in resps.values() for e in lst})
+    pair_counts = Counter(r["pair"] for r in cands)
+    print(f"[turn-autopsy] corpus: {sum(len(v) for v in reqs.values())} req / "
+          f"{sum(len(v) for v in resps.values())} resp, {lanes_seen} lane(s); "
+          f"pairing: {dict(pair_counts)}", file=sys.stderr)
+    if args.stratify == "lane" and lanes_seen > len(picked):
+        print(f"[turn-autopsy] WARNING: {lanes_seen} lanes > {len(picked)} slots "
               f"-- allocation degraded, check the lane grammar", file=sys.stderr)
 
     wanted = []
-    for c in counters:
-        wanted.append(reqs[c])
-        if c in resps:
-            wanted.append(resps[c][0])
+    for cand in picked:
+        wanted.append(cand["req_name"])
+        if cand["resp"]:
+            wanted.append(cand["resp"][1])
     dest = args.workdir or os.path.join(SCRATCH_ROOT, f"{args.era}-{args.seed}")
     have = all(os.path.exists(os.path.join(dest, n)) for n in wanted)
     if have and args.reuse:
         print(f"[turn-autopsy] reuse: {len(wanted)} members already in {dest}",
               file=sys.stderr)
     else:
-        print(f"[turn-autopsy] {len(counters)} turns -> extracting "
+        print(f"[turn-autopsy] {len(picked)} turns -> extracting "
               f"{len(wanted)} members to {dest}", file=sys.stderr)
-        extract(args.archive, src, wanted, dest)
+        # `archive`, not args.archive: with the local copy in play the
+        # extraction must read the D: copy, not re-cross the cloud mount
+        extract(archive, src, wanted, dest)
 
     out_path = args.out
     rows = []
-    for c in counters:
-        name = reqs[c]
-        rec = {"turn_id": name.split("-2026")[0], "req_file": name,
-               "era": args.era, "counter": c}
+    for cand in picked:
+        name = cand["req_name"]
+        rec = {"turn_id": os.path.splitext(name)[0],  # full name, no extension
+               "req_file": name, "era": args.era, "counter": cand["counter"],
+               "pair_status": cand["pair"]}
         m = REQ_RE.match(name)
         if m:
             rec["ip_chain"] = "direct" if m.group(6) else \
                 f"{m.group(3)}, {m.group(4)}:{m.group(5)}"
-        r = resps.get(c)
-        rec["lane"] = r[1] if r else None
+        entry = cand["resp"]
+        rec["lane"] = entry[2] if entry else None
         rec["req"] = slice_req(os.path.join(dest, name))
-        if r:
-            rec["resp"] = slice_resp(os.path.join(dest, r[0]))
+        if entry:
+            rec["resp"] = slice_resp(os.path.join(dest, entry[1]))
         rows.append(rec)
 
     with open(out_path, "w", encoding="utf-8") as fh:
@@ -420,7 +516,7 @@ def cmd_sample(args) -> int:
 
     # realized stratification -- report it, never assume it
     print("machines :", dict(Counter((r["req"].get("machine") or "(none)") for r in rows).most_common()))
-    print("lanes    :", dict(Counter((r.get("lane") or "(unpaired)") for r in rows).most_common(10)))
+    print("lanes    :", dict(Counter((r.get("lane") or f"({r.get('pair_status')})") for r in rows).most_common(10)))
     print("roles    :", dict(Counter((r["req"].get("last_role") or "?") for r in rows).most_common()))
     return 0
 
@@ -452,16 +548,18 @@ def cmd_stats(args) -> int:
     for e in eras:
         n = sum(trig[e].values())
         autos = sum(trig[e].get(t, 0) for t in AUTOMATIC_TRIGGERS)
-        print(f"\n[{e}] n={n}  automatic-trigger = {autos} "
-              f"({100.0 * autos / n:.0f}% if n else 0)")
+        pct = f"{100.0 * autos / n:.0f}%" if n else "0%"
+        print(f"\n[{e}] n={n}  automatic-trigger = {autos} ({pct})")
 
     lr = dist(lambda r: (r.get("req") or {}).get("last_role") or "?")
     block("last role", lr, ["user", "system", "assistant", "?"])
 
     mach = dist(lambda r: (r.get("req") or {}).get("machine") or "(none)")
     block("machine", mach, sorted({k for e in eras for k in mach[e]}))
-    lan = dist(lambda r: r.get("lane") or "(unpaired)")
+    lan = dist(lambda r: r.get("lane") or f"({r.get('pair_status') or 'unpaired'})")
     block("lane", lan, sorted({k for e in eras for k in lan[e]}))
+    pr = dist(lambda r: r.get("pair_status") or "(legacy)")
+    block("pairing", pr, ["paired", "unpaired", "ambiguous", "(legacy)"])
     return 0
 
 
@@ -474,8 +572,10 @@ def cmd_show(args) -> int:
     for i, r in enumerate(rows):
         req = r.get("req") or {}
         resp = r.get("resp") or {}
+        pair = r.get("pair_status") or "unpaired"
+        lane_disp = r.get("lane") or f"({pair})"
         print(f"--- [{i+1}/{len(rows)}] {r['turn_id']}  era={r['era']} "
-              f"lane={r.get('lane') or '(unpaired)'}")
+              f"lane={lane_disp}")
         print(f"    machine={req.get('machine') or '(none)'} "
               f"src={req.get('ip_chain')} msgs={req.get('n_messages')} "
               f"sys={req.get('system_chars')} tools_decl={req.get('declared_tools')}")
@@ -484,7 +584,7 @@ def cmd_show(args) -> int:
                   f"cache_read={resp.get('cache_read')} "
                   f"tools={resp.get('tools')}")
         else:
-            print("    resp: (unpaired)")
+            print(f"    resp: ({pair})")
         fi = req.get("first_intent") or {}
         if fi.get("head"):
             print(f"    intent: {fi['head'][:220]}")
