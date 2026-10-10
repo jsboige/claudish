@@ -73,7 +73,7 @@ Measured traps (2026-10-06, 400 newest captures): `body.metadata` is serialized 
 
 ## Turn autopsy (#328 G12)
 
-**`scripts/turn-autopsy.py` answers a question no counter can: what KIND of turn was this?** The July-vs-now investigation (`jsboige/claudish#328`) is "×3.4 requests for ~half the PRs"; the counts decomposed the *what* (`ctx total ×6.13 = ×3.41 requests × ×1.80 harness floor`, 05/07 vs 30/09) and cannot reach the *why*, because the why is only in the bodies. This tool turns a 400-600 KB request body into a ~1.5 KB reading slice, so a reader classifies 50-100 turns/hour without opening a JSON by hand. It does **not** classify — it extracts, then aggregates the labels the reader wrote.
+**`scripts/turn-autopsy.py` answers a question no counter can: what KIND of turn was this?** The July-vs-now investigation (`jsboige/claudish#328`) is "×3.4 requests for ~half the PRs"; the counts decomposed the *what* (`ctx total ×3.68 ≈ ×3.41 requests × ×1.08 harness floor`, 05/07 vs 30/09 — corrected per #414; the earlier ×6.13/×1.80 was a per-field max() artifact mixing usage snapshots, withdrawn) and cannot reach the *why*, because the why is only in the bodies. This tool turns a 400-600 KB request body into a ~1.5 KB reading slice, so a reader classifies 50-100 turns/hour without opening a JSON by hand. It does **not** classify — it extracts, then aggregates the labels the reader wrote.
 
 ```powershell
 # work-list for one era (a bounded, seeded sample)
