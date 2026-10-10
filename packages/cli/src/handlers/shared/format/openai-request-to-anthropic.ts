@@ -215,6 +215,7 @@ export function convertOpenAIRequestToAnthropic(openai: any): any {
   out.messages = transformed;
 
   // Sampling / stop params.
+  let maxTokensDefaulted = false;
   if (typeof src.max_tokens === "number") {
     out.max_tokens = src.max_tokens;
   } else if (typeof src.max_completion_tokens === "number") {
@@ -222,6 +223,7 @@ export function convertOpenAIRequestToAnthropic(openai: any): any {
     out.max_tokens = src.max_completion_tokens;
   } else {
     out.max_tokens = 4096; // Anthropic requires max_tokens; OpenAI doesn't send it.
+    maxTokensDefaulted = true;
   }
   if (typeof src.temperature === "number") out.temperature = src.temperature;
   if (typeof src.top_p === "number") out.top_p = src.top_p;
@@ -229,6 +231,67 @@ export function convertOpenAIRequestToAnthropic(openai: any): any {
     out.stop_sequences = Array.isArray(src.stop) ? src.stop : [src.stop];
   }
   if (src.user) out.metadata = { ...(out.metadata ?? {}), user_id: src.user };
+
+  // #435 — request-side thinking controls. vLLM-style `enable_thinking` (top
+  // level or under `chat_template_kwargs`) and OpenAI's `reasoning_effort` were
+  // silently DROPPED here, so the reasoning decision fell to the served
+  // dialect's policy (CLAUDISH_GLM_THINKING passthrough by default = GLM thinks;
+  // CLAUDISH_QWEN_THINKING disabled) — the client's ask never reached
+  // `prepareRequest`. Mapping them onto the house `thinking` object is the seam
+  // every dialect already consults (`originalRequest.thinking`).
+  //
+  // Shapes and their downstream fate (measured/probed conventions):
+  //  - {type:"disabled"} — GLM openai wire forwards it verbatim (the 37→3 token
+  //    probe shape, 2026-08-20); Qwen anthropic wire accepts it natively.
+  //  - {type:"enabled", budget_tokens} — GLM reduces to its binary
+  //    {type:"enabled"}; Qwen maps to enable_thinking + thinking_budget under
+  //    `passthrough`; o1/o3 converts back to reasoning_effort (the effort ladder
+  //    below is the exact inverse of openai-api-format's budget→effort map, so
+  //    the round trip is stable).
+  //  - The enabled block always carries a budget ≥ 1024 and < max_tokens: the
+  //    native Anthropic lane requires budget_tokens ≥ 1024, Qwen requires
+  //    budget < max_tokens, and the ingress defaults max_tokens to 4096. When
+  //    there is no room for a legal block (tiny max_tokens), the mapping is
+  //    skipped entirely — a logged-none no-op beats an invalid body or silently
+  //    inverting the client's ask.
+  const enableThinking =
+    typeof src.enable_thinking === "boolean"
+      ? src.enable_thinking
+      : typeof src.chat_template_kwargs?.enable_thinking === "boolean"
+        ? src.chat_template_kwargs.enable_thinking
+        : undefined;
+  const effortBudget: Record<string, number> = {
+    minimal: 2_000,
+    low: 8_000,
+    medium: 24_000,
+    high: 32_000,
+  };
+  const fromEffort =
+    typeof src.reasoning_effort === "string"
+      ? effortBudget[src.reasoning_effort.toLowerCase()]
+      : undefined;
+  if (enableThinking !== undefined || fromEffort !== undefined) {
+    if (enableThinking === false) {
+      out.thinking = { type: "disabled" };
+    } else {
+      let budget = fromEffort ?? 2_048;
+      if (maxTokensDefaulted) {
+        // The 4096 ceiling is OUR placeholder, not the client's — clamping an
+        // explicit "high" (32000) to 4095 would invert the ask downstream
+        // (o1/o3 remap 4095 back to "minimal"). Raise the placeholder to fit.
+        if (budget >= out.max_tokens) out.max_tokens = budget + 1;
+      } else {
+        // A CLIENT-sent max_tokens is their ceiling: clamp into it (Qwen
+        // requires budget < max_tokens), or drop the mapping when no legal
+        // block fits — never fail the body, never silently invert.
+        budget = Math.min(budget, out.max_tokens - 1);
+        if (budget < 1_024) budget = 0;
+      }
+      if (budget >= 1_024) {
+        out.thinking = { type: "enabled", budget_tokens: budget };
+      }
+    }
+  }
 
   // Tools + tool_choice.
   const tools = mapTools(src.tools);

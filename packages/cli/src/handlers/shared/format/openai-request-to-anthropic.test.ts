@@ -251,3 +251,72 @@ describe("convertOpenAIRequestToAnthropic", () => {
     expect(out.max_tokens).toBe(4096);
   });
 });
+
+describe("#435 — request-side thinking controls reach the Anthropic `thinking` object", () => {
+  const base = { model: "glm-5.3", messages: [{ role: "user", content: "hi" }] };
+
+  test("enable_thinking:false → {type:'disabled'} — the shape GLM forwards verbatim (37→3 probe)", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base, enable_thinking: false });
+    expect(out.thinking).toEqual({ type: "disabled" });
+  });
+
+  test("chat_template_kwargs.enable_thinking:false → same disabled block (vLLM spelling)", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base, chat_template_kwargs: { enable_thinking: false } });
+    expect(out.thinking).toEqual({ type: "disabled" });
+  });
+
+  test("top-level enable_thinking wins over chat_template_kwargs when both present", () => {
+    const out = convertOpenAIRequestToAnthropic({
+      ...base,
+      enable_thinking: false,
+      chat_template_kwargs: { enable_thinking: true },
+    });
+    expect(out.thinking).toEqual({ type: "disabled" });
+  });
+
+  test("enable_thinking:true → enabled block with a legal default budget (native lane needs ≥1024)", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base, enable_thinking: true });
+    expect(out.thinking).toEqual({ type: "enabled", budget_tokens: 2048 });
+  });
+
+  test("reasoning_effort maps onto budget_tokens — the exact inverse of openai-api-format's ladder", () => {
+    for (const [effort, budget] of [["minimal", 2000], ["low", 8000], ["medium", 24000], ["high", 32000]] as const) {
+      const out = convertOpenAIRequestToAnthropic({ ...base, reasoning_effort: effort });
+      expect(out.thinking).toEqual({ type: "enabled", budget_tokens: budget });
+    }
+  });
+
+  test("a defaulted max_tokens rises to fit the effort budget — our 4096 placeholder must not invert 'high' into 'minimal'", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base, reasoning_effort: "high" });
+    expect(out.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
+    expect(out.max_tokens).toBe(32001); // budget < max_tokens holds on every wire
+    // A small effort still inside the placeholder leaves it untouched.
+    const small = convertOpenAIRequestToAnthropic({ ...base, reasoning_effort: "minimal" });
+    expect(small.max_tokens).toBe(4096);
+  });
+
+  test("enable_thinking:true + reasoning_effort — the effort sizes the budget", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base, enable_thinking: true, reasoning_effort: "low" });
+    expect(out.thinking).toEqual({ type: "enabled", budget_tokens: 8000 });
+  });
+
+  test("budget clamps to max_tokens - 1 (Qwen requires budget < max_tokens)", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base, reasoning_effort: "high", max_tokens: 2000 });
+    expect(out.thinking).toEqual({ type: "enabled", budget_tokens: 1999 });
+  });
+
+  test("no room for a legal enabled block (max_tokens ≤ 1024) → thinking left unset, dialect policy decides", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base, enable_thinking: true, max_tokens: 500 });
+    expect(out.thinking).toBeUndefined();
+  });
+
+  test("unknown reasoning_effort value is ignored — no partial mapping", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base, reasoning_effort: "ultra" });
+    expect(out.thinking).toBeUndefined();
+  });
+
+  test("no thinking controls → no thinking field (pre-#435 behavior unchanged)", () => {
+    const out = convertOpenAIRequestToAnthropic({ ...base });
+    expect(out.thinking).toBeUndefined();
+  });
+});

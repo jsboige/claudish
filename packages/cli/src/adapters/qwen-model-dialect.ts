@@ -171,6 +171,17 @@ export class QwenModelDialect extends BaseAPIFormat {
     }
 
     if (originalRequest.thinking) {
+      // #435: the OpenAI ingress can now carry an explicit DISABLED block (a
+      // client's `enable_thinking:false`). The historical mapping assumed
+      // thinking-present = enabled-ask and would have sent `enable_thinking:
+      // true` for it — the exact inversion of the client's ask.
+      if ((originalRequest.thinking as { type?: string }).type === "disabled") {
+        request.enable_thinking = false;
+        delete request.thinking_budget;
+        delete request.thinking;
+        log("[QwenModelDialect] openai wire: enable_thinking=false (client asked)");
+        return request;
+      }
       const { budget_tokens } = originalRequest.thinking;
 
       // Qwen specific parameters

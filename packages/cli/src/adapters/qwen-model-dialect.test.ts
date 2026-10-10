@@ -115,6 +115,41 @@ describe("QwenModelDialect — OpenAI-compatible wire", () => {
   });
 });
 
+describe("QwenModelDialect — #435 ingress-mapped thinking", () => {
+  it("passthrough + ingress enabled block → enable_thinking + thinking_budget on the OpenAI wire", () => {
+    process.env.CLAUDISH_QWEN_THINKING = "passthrough";
+    const payload: any = {};
+    dialect().prepareRequest(payload, { thinking: { type: "enabled", budget_tokens: 8000 } }, OPENAI);
+    expect(payload.enable_thinking).toBe(true);
+    expect(payload.thinking_budget).toBe(8000);
+    expect(payload.thinking).toBeUndefined();
+  });
+
+  it("passthrough + ingress disabled block stays disabled on the anthropic wire", () => {
+    process.env.CLAUDISH_QWEN_THINKING = "passthrough";
+    const payload: any = {};
+    dialect().prepareRequest(payload, { thinking: { type: "disabled" } }, ANTHROPIC);
+    expect(payload.thinking).toEqual({ type: "disabled" });
+  });
+
+  it("#435 passthrough + ingress DISABLED block → enable_thinking:false (never the inverted true)", () => {
+    process.env.CLAUDISH_QWEN_THINKING = "passthrough";
+    const payload: any = {};
+    dialect().prepareRequest(payload, { thinking: { type: "disabled" } }, OPENAI);
+    expect(payload.enable_thinking).toBe(false);
+    expect(payload.thinking_budget).toBeUndefined();
+    expect(payload.thinking).toBeUndefined();
+  });
+
+  it("the default disabled policy overrides an ingress enabled ask (budget-lane contract, unchanged by #435)", () => {
+    delete process.env.CLAUDISH_QWEN_THINKING;
+    const payload: any = {};
+    dialect().prepareRequest(payload, { thinking: { type: "enabled", budget_tokens: 8000 } }, OPENAI);
+    expect(payload.enable_thinking).toBe(false);
+    expect(payload.thinking_budget).toBeUndefined();
+  });
+});
+
 describe("QwenModelDialect — policy parsing", () => {
   it("falls back to 'disabled' on an unrecognized value", () => {
     process.env.CLAUDISH_QWEN_THINKING = "yes-please";
