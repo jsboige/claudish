@@ -9,7 +9,10 @@ The review's two blockers, pinned:
      mispaired a request of one uptime window with a response of another.
      Fixed as: counter -> LIST of (ts, name); a resp belongs to the LATEST req
      of its counter whose ts it follows within PAIR_WINDOW_MS (20 min);
-     `unpaired` and `ambiguous` are reported as their own statuses.
+     several in-window resps on one req are a CASCADE ATTEMPT CHAIN (measured
+     2026-07-05: 2 598 counters, resps seconds apart on different lanes) --
+     the LAST attempt serves the client, earlier ones are counted as attempts,
+     and `unpaired` is reported as its own status.
   2. TRIGGER ORDER -- `classify_trigger` ran the harness-phrase regexes over
      `_text_of(last)`, which concatenates tool_result content, so the agent's
      own Bash result quoting "Command running in background with ID:" was
@@ -141,7 +144,7 @@ def pin_pair_hour_boundary():
     _check(st[0] == "paired", "1-ms-across-the-hour resp must pair, got %r" % (st,))
 
 
-def pin_pair_resp_before_req_and_ambiguous():
+def pin_pair_resp_before_req_and_attempt_chain():
     # resp BEFORE its counter's req: never a pairing (ts must be >= the req's)
     reqs, resps = taut.index_members(_members(
         "req-1-0013-2026-07-05T04-00-05-000Z-direct.json",
@@ -150,8 +153,10 @@ def pin_pair_resp_before_req_and_ambiguous():
     out = taut.pair_all(reqs, resps)
     st = out[(13, "2026-07-05T04-00-05-000Z", "req-1-0013-2026-07-05T04-00-05-000Z-direct.json")]
     _check(st[0] == "unpaired", "resp before req must be unpaired, got %r" % (st,))
-    # TWO resps within the window of the same req, no interleaving req:
-    # which one is THE response is not decidable -> ambiguous, never a guess
+    # TWO resps within the window of the same req = a CASCADE ATTEMPT CHAIN
+    # (measured 2026-07-05: 2 598 such counters, resps seconds apart on
+    # different lanes). The LAST attempt serves the client -> that is the
+    # pair; the earlier one is counted, not guessed at.
     reqs, resps = taut.index_members(_members(
         "req-1-0017-2026-07-05T05-00-00-000Z-direct.json",
         "resp-1-r17-2026-07-05T05-00-01-000Z-openai-glm-5.2.sse",
@@ -159,7 +164,8 @@ def pin_pair_resp_before_req_and_ambiguous():
     ))
     out = taut.pair_all(reqs, resps)
     st = out[(17, "2026-07-05T05-00-00-000Z", "req-1-0017-2026-07-05T05-00-00-000Z-direct.json")]
-    _check(st[0] == "ambiguous", "two in-window resps must be ambiguous, got %r" % (st,))
+    _check(st[0] == "paired" and "MiniMax" in st[1][2] and st[2] == 1,
+           "attempt chain: pair the LAST attempt, count the earlier one, got %r" % (st,))
 
 
 # --- trigger classification --------------------------------------------------
@@ -271,7 +277,7 @@ def main():
     pin_pair_two_windows_same_counter()
     pin_pair_window_bound()
     pin_pair_hour_boundary()
-    pin_pair_resp_before_req_and_ambiguous()
+    pin_pair_resp_before_req_and_attempt_chain()
     pin_trigger_tool_result_first()
     pin_trigger_text_blocks_still_fire()
     pin_pick_sample_bounded()

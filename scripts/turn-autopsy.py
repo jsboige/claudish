@@ -212,14 +212,18 @@ def _ts_ms(ts: str) -> int:
 def pair_all(reqs: dict, resps: dict) -> dict:
     """Pair every req with the resp of its counter whose timestamp is >= its
     own and within PAIR_WINDOW_MS. Returns {(counter, req_ts, req_name):
-    (status, resp_entry|None)} with status in paired / unpaired / ambiguous.
+    (status, resp_entry|None, attempts)} with status in paired / unpaired.
 
     Ownership is decided resp-side (each resp goes to the LATEST req it
     follows within the window), so two windows reusing one counter each keep
-    their own response. A req with no in-window resp after it is `unpaired`;
-    a req claimed by several resps is `ambiguous` -- both are reported as
-    their own status, never silently folded into a wrong pairing."""
-    out: dict[tuple[int, str, str], tuple[str, object]] = {}
+    their own response. A req claimed by SEVERAL in-window resps is NOT
+    ambiguous -- measured on captures-2026-07-05 (probe, CR #424): 2 598 such
+    counters, all with resp pairs seconds apart on different lanes (glm-5.2
+    then MiniMax-M3, or twice glm) -- that is the CASCADE writing one capture
+    per upstream attempt, and the attempt that serves the client is the LAST
+    (the cascade stops when one succeeds). The pair is therefore the latest
+    claim and the earlier ones are counted as `attempts`."""
+    out: dict[tuple[int, str, str], tuple[str, object, int]] = {}
     for c, rlist in reqs.items():
         rlist = sorted(rlist)
         slist = sorted(resps.get(c) or [])
@@ -236,24 +240,23 @@ def pair_all(reqs: dict, resps: dict) -> dict:
             if owner >= 0:
                 claims[owner].append(sp)
         for r_i, rq in enumerate(rlist):
-            got = claims.get(r_i) or []
-            if len(got) == 1:
-                out[(c, *rq)] = ("paired", got[0])
-            elif got:
-                out[(c, *rq)] = ("ambiguous", got)
+            got = sorted(claims.get(r_i) or [])
+            if got:
+                out[(c, *rq)] = ("paired", got[-1], len(got) - 1)
             else:
-                out[(c, *rq)] = ("unpaired", None)
+                out[(c, *rq)] = ("unpaired", None, 0)
     return out
 
 
 def build_candidates(reqs: dict, resps: dict) -> list[dict]:
     """One candidate per REQUEST (not per counter): counter, timestamps,
-    pairing status and the paired resp entry when there is one."""
+    pairing status, the paired resp entry when there is one, and how many
+    EARLIER upstream attempts the cascade burned on that turn."""
     pairs = pair_all(reqs, resps)
     out = []
-    for (c, rq_ts, rq_name), (status, entry) in pairs.items():
+    for (c, rq_ts, rq_name), (status, entry, attempts) in pairs.items():
         out.append({"counter": c, "req_ts": rq_ts, "req_name": rq_name,
-                    "pair": status, "resp": entry})
+                    "pair": status, "resp": entry, "attempts": attempts})
     out.sort(key=lambda r: (r["req_ts"], r["req_name"]))
     return out
 
@@ -504,6 +507,8 @@ def cmd_sample(args) -> int:
                 f"{m.group(3)}, {m.group(4)}:{m.group(5)}"
         entry = cand["resp"]
         rec["lane"] = entry[2] if entry else None
+        if cand.get("attempts"):
+            rec["attempts"] = cand["attempts"]
         rec["req"] = slice_req(os.path.join(dest, name))
         if entry:
             rec["resp"] = slice_resp(os.path.join(dest, entry[1]))
@@ -559,7 +564,13 @@ def cmd_stats(args) -> int:
     lan = dist(lambda r: r.get("lane") or f"({r.get('pair_status') or 'unpaired'})")
     block("lane", lan, sorted({k for e in eras for k in lan[e]}))
     pr = dist(lambda r: r.get("pair_status") or "(legacy)")
-    block("pairing", pr, ["paired", "unpaired", "ambiguous", "(legacy)"])
+    block("pairing", pr, ["paired", "unpaired", "(legacy)"])
+    att = dist(lambda r: r.get("attempts") or 0)
+    print("\nattempt-chained turns (cascade burned earlier upstream attempts):")
+    for e in eras:
+        multi = sum(v for k, v in att[e].items() if k and k > 0)
+        n = sum(trig[e].values())
+        print(f"  {e}: {multi}/{n}")
     return 0
 
 
