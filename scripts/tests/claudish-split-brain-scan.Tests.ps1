@@ -1,5 +1,5 @@
 <#
-    Pester 5/6 suite for the split-brain / ghost-session scanner (jsboige/claudish#41, review #342).
+    Pester 5/6 suite for the split-brain / ghost-session scanner (jsboige/claudish#341, review #342).
 
     Run:  bun run test:scripts        (pwsh 7)
           bun run test:scripts:win51  (Windows PowerShell 5.1 — what the task runs)
@@ -40,9 +40,26 @@ BeforeAll {
         return (Join-Path $dir 'projects')
     }
 
-    function Invoke-Scan([string]$ProjectsRoot, [int]$ActiveMinutes = 30) {
-        $out = & $script:ScanPath -ProjectsRoot $ProjectsRoot -ActiveMinutes $ActiveMinutes 2>&1 | Out-String
+    function Invoke-Scan([string]$ProjectsRoot, [int]$ActiveMinutes = 30, [int]$StaleDays = 14, [string[]]$AliveRoles = @()) {
+        $out = & $script:ScanPath -ProjectsRoot $ProjectsRoot -ActiveMinutes $ActiveMinutes -StaleDays $StaleDays -AliveRoles $AliveRoles 2>&1 | Out-String
         [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
+    }
+
+    # One transcript line carrying exactly what the roster reads: a CronCreate
+    # cron/prompt pair (compact JSON, adjacent keys — the measured transcript
+    # shape, verified on the real ~/.claude/projects 2026-10-06) plus the
+    # line-level timestamp that dates the arming.
+    function New-CronLine([string]$tsIso, [string]$cron, [string]$prompt) {
+        '{"parentUuid":null,"isSidechain":false,"toolUseInput":{"cron":"' + $cron + '","prompt":"' + $prompt + '"},"timestamp":"' + $tsIso + '"}'
+    }
+
+    # Fixture transcript: old mtime on purpose — the roster must read armings
+    # NO transcript mtime window covers (a stale arming is by definition old),
+    # and the live-session section must stay quiet so the roster drives the
+    # exit code alone.
+    function New-CronTranscript([string]$path, [string[]]$lines) {
+        Set-Content -LiteralPath $path -Value ($lines -join "`n")
+        (Get-Item -LiteralPath $path).LastWriteTime = (Get-Date).AddDays(-5)
     }
 
     function New-Proc([int]$procId, [int]$parentId, [string]$name, [datetime]$created, [string]$cmd = '', [switch]$noCmd) {
@@ -394,13 +411,15 @@ Describe 'split-brain-scan' {
             # only the never-ran assertion below fails — quoted in the PR thread.
             $global:SBScanState.Tasks = @(
                 (New-Task 'never-ran' '\Claudish\' 'Ready' 1 @((New-Action 'wscript.exe' '"D:\ops\claude-hidden-launchers.vbs"')) 267011),
+                (New-Task 'ready-tick' '\Claudish\' 'Ready' 1 @((New-Action 'wscript.exe' '"D:\ops\compress-captures.vbs"')) 267008),
                 (New-Task 'disabled-tick' '\Claudish\' 'Disabled' 1 @((New-Action 'wscript.exe' '"D:\ops\compress-captures.vbs"')) 267010),
                 (New-Task 'queued-tick' '\Claudish\' 'Ready' 1 @((New-Action 'wscript.exe' '"D:\ops\compress-captures.vbs"')) 267045),
                 (New-Task 'terminated-tick' '\Claudish\' 'Ready' 1 @((New-Action 'wscript.exe' '"D:\ops\claude-hidden-launchers.vbs"')) 267014)
             )
             $r = Invoke-Scan (New-ScanRoot)
-            $r.Out | Should -Match 'launcher-shaped actions visible: 4'   # anti-vacuous
+            $r.Out | Should -Match 'launcher-shaped actions visible: 5'   # anti-vacuous
             $r.Out | Should -Not -Match ('TASK-NONZERO-RESULT: ' + [regex]::Escape('\Claudish\never-ran'))
+            $r.Out | Should -Not -Match ('TASK-NONZERO-RESULT: ' + [regex]::Escape('\Claudish\ready-tick'))
             $r.Out | Should -Not -Match ('TASK-NONZERO-RESULT: ' + [regex]::Escape('\Claudish\disabled-tick'))
             $r.Out | Should -Not -Match ('TASK-NONZERO-RESULT: ' + [regex]::Escape('\Claudish\queued-tick'))
             # 0x41306 TERMINATED deliberately stays a flag — a killed task is a signal
@@ -452,6 +471,135 @@ Describe 'split-brain-scan' {
             $r.Out | Should -Match 'TASK-NONZERO-RESULT'
             $r.Out | Should -Match 'INCOMPLETE SOURCE'
             $r.Code | Should -Be 2
+        }
+    }
+
+    Context 'session roster (cron armings, #362)' {
+        It 'flags DOUBLON: one prompt-root armed from two workspace dirs within 48h (exit 1)' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-main'), (Join-Path $root 'ws-worktree-11703') -Force | Out-Null
+            # two dirs, TWO DIFFERENT cadences for the same root — the measured
+            # 2026-10-01 shape (each worktree armed its own /coordinate-adjoint)
+            New-CronTranscript (Join-Path $root 'ws-main\sess-a.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-48).ToString('o')) '17 * * * *' '/coordinate-adjoint cycle horaire du main'),
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-2).ToString('o')) '17 * * * *' '/coordinate-adjoint cycle horaire du main')
+            )
+            New-CronTranscript (Join-Path $root 'ws-worktree-11703\sess-b.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-3).ToString('o')) '33 * * * *' '/coordinate-adjoint adjoint du worktree')
+            )
+            $r = Invoke-Scan $root
+            $r.Out | Should -Match 'WARN SESSION-ROSTER DOUBLON: prompt-root /coordinate-adjoint armed from 2 workspace dirs within 48h'
+            $r.Out | Should -Match 'ws-main \(last '
+            $r.Out | Should -Match 'ws-worktree-11703 \(last '
+            # the flag is registered, not just printed — the verdict recaps it
+            $r.Out | Should -Match 'FLAG\s+SESSION-ROSTER DOUBLON'
+            $r.Code | Should -Be 1
+        }
+
+        It 'DOUBLON never echoes the prompt body — root and schedule only' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-a'), (Join-Path $root 'ws-b') -Force | Out-Null
+            $t = (Get-Date).ToUniversalTime().AddHours(-1).ToString('o')
+            New-CronTranscript (Join-Path $root 'ws-a\s.jsonl') @((New-CronLine $t '17 * * * *' '/secret-role burn-baby-burn with live tokens'))
+            New-CronTranscript (Join-Path $root 'ws-b\s.jsonl') @((New-CronLine $t '18 * * * *' '/secret-role other body'))
+            $r = Invoke-Scan $root
+            $r.Out | Should -Match 'WARN SESSION-ROSTER DOUBLON: prompt-root /secret-role'
+            $r.Out | Should -Not -Match 'burn-baby-burn'
+            $r.Out | Should -Not -Match 'other body'
+        }
+
+        It 'no DOUBLON when one dir re-arms the same root (session restarts are not a split brain)' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-only') -Force | Out-Null
+            New-CronTranscript (Join-Path $root 'ws-only\s.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddDays(-3).ToString('o')) '41 */4 * * *' '/executor first arming'),
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-1).ToString('o')) '41 */4 * * *' '/executor re-armed after restart')
+            )
+            $r = Invoke-Scan $root
+            $r.Out | Should -Not -Match 'SESSION-ROSTER DOUBLON'
+            $r.Code | Should -Be 0
+        }
+
+        It 'no DOUBLON when the sibling dir last armed outside the 48h window (history, not a live double)' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-alive'), (Join-Path $root 'ws-dead-long-ago') -Force | Out-Null
+            New-CronTranscript (Join-Path $root 'ws-alive\s.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-1).ToString('o')) '17 * * * *' '/continue')
+            )
+            New-CronTranscript (Join-Path $root 'ws-dead-long-ago\s.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddDays(-21).ToString('o')) '17 * * * *' '/continue')
+            )
+            $r = Invoke-Scan $root
+            $r.Out | Should -Not -Match 'SESSION-ROSTER DOUBLON'
+            $r.Code | Should -Be 0
+        }
+
+        It 'prints INFO STALE for a declared-alive root whose last arming exceeds the threshold (and never fails the scan)' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-old') -Force | Out-Null
+            New-CronTranscript (Join-Path $root 'ws-old\s.jsonl') @(
+                # the measured secretary shape: /executor */30, last armed long ago
+                (New-CronLine ((Get-Date).ToUniversalTime().AddDays(-30).ToString('o')) '*/30 * * * *' '/executor secrétaire CoursIA')
+            )
+            $r = Invoke-Scan $root -AliveRoles @('/executor') -StaleDays 14
+            $r.Out | Should -Match 'INFO SESSION-ROSTER STALE: prompt-root /executor declared alive \(-AliveRoles\) but last arming'
+            $r.Out | Should -Match '30 days ago, threshold 14 days'
+            # INFO severity is pinned: a belief-vs-roster discrepancy advises,
+            # it does not fail the host
+            $r.Out | Should -Not -Match 'FLAG\s+SESSION-ROSTER STALE'
+            $r.Code | Should -Be 0
+        }
+
+        It 'prints INFO STALE for a declared-alive root with NO arming found at all' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-x') -Force | Out-Null
+            New-CronTranscript (Join-Path $root 'ws-x\s.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-1).ToString('o')) '17 * * * *' '/continue')
+            )
+            $r = Invoke-Scan $root -AliveRoles @('/executor')
+            $r.Out | Should -Match 'INFO SESSION-ROSTER STALE: prompt-root /executor declared alive \(-AliveRoles\) but no CronCreate arming found'
+            $r.Code | Should -Be 0
+        }
+
+        It 'no STALE at all without -AliveRoles (the class is opt-in)' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-x') -Force | Out-Null
+            New-CronTranscript (Join-Path $root 'ws-x\s.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddDays(-30).ToString('o')) '*/30 * * * *' '/executor secrétaire')
+            )
+            $r = Invoke-Scan $root
+            $r.Out | Should -Not -Match 'SESSION-ROSTER STALE'
+            $r.Code | Should -Be 0
+        }
+
+        It 'no STALE when the declared-alive root is armed fresh (inside the threshold)' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-x') -Force | Out-Null
+            New-CronTranscript (Join-Path $root 'ws-x\s.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-2).ToString('o')) '*/30 * * * *' '/executor secrétaire')
+            )
+            $r = Invoke-Scan $root -AliveRoles @('/executor')
+            $r.Out | Should -Match 'roster: 1 distinct armings'   # anti-vacuous: the fixture was seen
+            $r.Out | Should -Not -Match 'SESSION-ROSTER STALE'
+            $r.Code | Should -Be 0
+        }
+
+        It 'prints the roster summary and a per-root table (anti-vacuous)' {
+            $root = New-ScanRoot
+            New-Item -ItemType Directory (Join-Path $root 'ws-a'), (Join-Path $root 'ws-b') -Force | Out-Null
+            New-CronTranscript (Join-Path $root 'ws-a\s1.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-1).ToString('o')) '7 * * * *' '/continue')
+            )
+            New-CronTranscript (Join-Path $root 'ws-b\s2.jsonl') @(
+                (New-CronLine ((Get-Date).ToUniversalTime().AddHours(-2).ToString('o')) '17 * * * *' '/coordinate-adjoint adjoint')
+            )
+            $r = Invoke-Scan $root
+            $r.Out | Should -Match 'roster: 2 distinct armings \| 2 workspace dirs \| 2 prompt roots \(stale threshold 14 days, alive roles declared: 0\)'
+            $r.Out | Should -Match '/continue'
+            $r.Out | Should -Match '/coordinate-adjoint'
+            # no third root invented, no DOUBLON across DIFFERENT roots
+            $r.Out | Should -Not -Match 'SESSION-ROSTER DOUBLON'
+            $r.Code | Should -Be 0
         }
     }
 }
