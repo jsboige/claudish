@@ -163,6 +163,29 @@ exit /b %CE%
         if (Test-Path -LiteralPath $script:CallsLog) { return (Get-Content -LiteralPath $script:CallsLog) -join "`n" }
         return ''
     }
+
+    function Wait-WatchLogMatch {
+        # #428 — the -Detach fixtures write their handshake line FIRST
+        # (`START pid <pid>`) and their parameter dump as a LATER append, while
+        # Start-DrainDetached returns as soon as it observes the handshake. A
+        # single read straight after the call can therefore observe a file that
+        # does not yet hold the dump — measured on po-2026: the same test
+        # reddened 1 full run in N (526 ms) and passed in isolation (896 ms).
+        # Poll to a bounded budget instead of racing the child: the assertion
+        # is unchanged, only its timing is. Returns the last text read, so a
+        # GENUINE quoting defect still fails the caller's -Match (the timeout
+        # path returns the short text and the assert fires, never a false
+        # green). 15 s sits far inside the 25 s the detached entry is given.
+        param([string]$Path, [string]$Pattern, [int]$TimeoutSec = 15)
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        $raw = ''
+        do {
+            if (Test-Path -LiteralPath $Path) { $raw = Get-Content -LiteralPath $Path -Raw }
+            if ($raw -and $raw -match $Pattern) { return $raw }
+            Start-Sleep -Milliseconds 50
+        } while ((Get-Date) -lt $deadline)
+        return $raw
+    }
 }
 
 AfterAll {
@@ -594,30 +617,31 @@ Describe 'drain targets derived from the env file (#372)' {
 
 Describe 'pre-gesture failover-events tick (#368)' {
     BeforeAll {
-        # Fixtures stand in for the collector; each accepts the two arguments
-        # the drain passes (-Container, -ClaudishHome) — a fixture without
-        # those params would die at BINDING and prove nothing about the exit
-        # paths under test.
+        # Fixtures stand in for the collector; each accepts the arguments the
+        # drain passes (-Container, -ClaudishHome, -HealthUrl, #422) — a
+        # fixture without those params would die at BINDING and prove nothing
+        # about the exit paths under test. The real collector takes all three.
         $utf8 = New-Object System.Text.UTF8Encoding($false)
         $tickDir = Join-Path $TestDrive 'tick'
         New-Item -ItemType Directory -Path $tickDir -Force | Out-Null
 
         $okBody = @'
-param([string]$Container, [string]$ClaudishHome)
+param([string]$Container, [string]$ClaudishHome, [string]$HealthUrl)
 Set-Content -LiteralPath (Join-Path $ClaudishHome 'tick-ok.marker') -Value "ran:$Container"
+Set-Content -LiteralPath (Join-Path $ClaudishHome 'tick-ok.healthurl') -Value "$HealthUrl"
 exit 0
 '@
         [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-ok.ps1'), $okBody, $utf8)
 
         $exit1Body = @'
-param([string]$Container, [string]$ClaudishHome)
+param([string]$Container, [string]$ClaudishHome, [string]$HealthUrl)
 Write-Error 'not-measured (fixture)'
 exit 1
 '@
         [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-exit1.ps1'), $exit1Body, $utf8)
 
         $hangBody = @'
-param([string]$Container, [string]$ClaudishHome)
+param([string]$Container, [string]$ClaudishHome, [string]$HealthUrl)
 Start-Sleep -Seconds 45
 '@
         [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-hang.ps1'), $hangBody, $utf8)
@@ -733,6 +757,26 @@ Start-Sleep -Seconds 45
         $log = Get-DrainLogText
         $log | Should -Match 'FAILOVER-TICK ok'
         $log | Should -Match 'OUTCOME success'
+    }
+
+    It 'the DERIVED probe address reaches the collector — #422, never the hardcoded :3000' {
+        # #422: the tick used to launch the collector with no -HealthUrl, so it
+        # fell back to its own :3000 default on the one call path that already
+        # knows the derived port. On a machine whose host port is not 3000 that
+        # probe fails, the collector overwrites instanceId with '', and
+        # InstanceChanged is disarmed for the very tick spanning the gesture.
+        # The fixture records the bound -HealthUrl, so dropping the forwarding
+        # (or reverting to the default) turns this red.
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-healthurl' -Url 'http://127.0.0.1:19191' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-ok.ps1') -FailoverTickTimeoutSec 30
+        $r | Should -BeTrue
+        Get-DrainLogText | Should -Match 'FAILOVER-TICK ok'
+        $recorded = Get-Content -LiteralPath (Join-Path $script:TickHome 'tick-ok.healthurl') -Raw
+        $recorded.Trim() | Should -Be 'http://127.0.0.1:19191/health'
     }
 }
 
@@ -1188,10 +1232,13 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         # inside the value — the suite then matches the literal text
         # "[regex]::Escape" (first run of this test, measured).
         $expectedSpaced = [regex]::Escape('a value with  spaces')
-        (Get-Content -LiteralPath $watch -Raw) | Should -Match $expectedSpaced
+        # #428 — wait for the dump line (the child's SECOND append); a single
+        # read here is the read-before-write race.
+        $raw = Wait-WatchLogMatch -Path $watch -Pattern 'bound:\['
+        $raw | Should -Match $expectedSpaced
         # B2: alive is proven by the pid handshake, and the pid in the file
         # IS the pid the parent reports — not just any growth.
-        (Get-Content -LiteralPath $watch -Raw) | Should -Match ('START pid {0}\b' -f $r.ChildPid)
+        $raw | Should -Match ('START pid {0}\b' -f $r.ChildPid)
         # Evidence files exist under the Claudish home, per-run named (AC1).
         (Get-ChildItem -LiteralPath $script:DetachDir -Filter 'drain-detach-*.out.log' | Measure-Object).Count | Should -BeGreaterOrEqual 1
     }
@@ -1250,7 +1297,8 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
             -ExtraArgs @('-Reason', 'b3a', '-EnvFile', 'D:\claudish shadow\.env', '-HomeDir', $homeVal, '-WatchLog', $watch)
         $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
         $r.Ok | Should -BeTrue
-        $raw = Get-Content -LiteralPath $watch -Raw
+        # #428 — the dump is the child's second append; poll, never race it.
+        $raw = Wait-WatchLogMatch -Path $watch -Pattern 'reason='
         # All four bound: the backslash case kills the parameters AFTER it.
         $raw | Should -Match ('home=\[{0}\]' -f [regex]::Escape($homeVal))
         $raw | Should -Match ([regex]::Escape('env=[D:\claudish shadow\.env]'))
@@ -1265,7 +1313,8 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
             -ExtraArgs @('-Reason', 'deploy "v2" now', '-EnvFile', 'D:\claudish shadow\.env', '-Recreate', '-WatchLog', $watch)
         $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
         $r.Ok | Should -BeTrue
-        $raw = Get-Content -LiteralPath $watch -Raw
+        # #428 — poll the dump append instead of racing it.
+        $raw = Wait-WatchLogMatch -Path $watch -Pattern 'reason='
         $raw | Should -Match ([regex]::Escape('reason=[deploy "v2" now]'))
         $raw | Should -Match ([regex]::Escape('env=[D:\claudish shadow\.env]'))
         $raw | Should -Match 'recreate=\[True\]'
@@ -1464,7 +1513,10 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
             -ExtraArgs @('-Reason', $reasonVal, '-EnvFile', 'D:\claudish shadow\.env', '-WatchLog', $watch)
         $r = Start-DrainDetached -ArgumentString $argStr -ClaudishHomeDir $script:DetachDir -WatchLogPath $watch -TimeoutSec 25
         $r.Ok | Should -BeTrue
-        $raw = Get-Content -LiteralPath $watch -Raw
+        # #428 — this is the pin that reddened 1 full run in N: it read the
+        # watch log straight after Start-DrainDetached returned, so a fast run
+        # observed only the handshake line. Poll for the dump append instead.
+        $raw = Wait-WatchLogMatch -Path $watch -Pattern 'reason='
         $raw | Should -Match ('reason=\[{0}\]' -f [regex]::Escape($reasonVal))
         $raw | Should -Match ([regex]::Escape('env=[D:\claudish shadow\.env]'))
     }

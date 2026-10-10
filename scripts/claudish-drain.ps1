@@ -640,7 +640,7 @@ function Invoke-ClaudishDrainedRestartImpl {
     # default 120 s bound fits the proxy's 900 s freeze expiry. Never blocks
     # the gesture — see Invoke-DrainFailoverEventsTick's own bounds.
     Invoke-DrainFailoverEventsTick -CollectorPath $FailoverTickCollectorPath -Container $Container `
-        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec
+        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec -HealthUrl "$Url/health"
 
     $restartAt = Get-Date
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
@@ -868,6 +868,12 @@ function Invoke-DrainFailoverEventsTick {
         [string]$CollectorPath,
         [string]$Container,
         [string]$ClaudishHome,
+        # #422 — the address the collector should probe for the per-process
+        # instanceId. Empty leaves the collector's own default (:3000), which
+        # is what the tick used to get unconditionally on the one call path
+        # that already knows the derived port. The call site passes the
+        # #372-derived "$Url/health".
+        [string]$HealthUrl,
         [int]$TimeoutSec = 120
     )
     if (-not $CollectorPath -or -not (Test-Path -LiteralPath $CollectorPath)) {
@@ -899,8 +905,21 @@ function Invoke-DrainFailoverEventsTick {
         # Quote every argument through the same Windows rule the detach launcher
         # uses — 5.1's -ArgumentList array join quotes nothing, so a home path
         # with a space must not split (02/10 lesson).
-        $argString = Join-DrainDetachArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
+        $tickArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
             '-Container', $Container, '-ClaudishHome', $ClaudishHome)
+        # #422 — forward the DERIVED probe address, so the collector never falls
+        # back to its hardcoded :3000 default on a call path that already knows
+        # the real port. On a machine whose host port is not 3000 that fallback
+        # makes the probe fail, Get-InstanceId returns $null, and the collector
+        # overwrites the state's instanceId with '' — which disarms
+        # InstanceChanged for the very tick that spans the gesture (the
+        # pre-gesture tick writes '' immediately before it). Strict no-op at
+        # :3000: $Url is then http://localhost:3000, so "$Url/health" is
+        # byte-identical to the collector's own default.
+        if (-not [string]::IsNullOrWhiteSpace($HealthUrl)) {
+            $tickArgs += @('-HealthUrl', "$HealthUrl")
+        }
+        $argString = Join-DrainDetachArguments $tickArgs
         $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argString `
             -WindowStyle Hidden -RedirectStandardOutput $tickOut -RedirectStandardError $tickErr -PassThru
         # 5.1: without a held handle, ExitCode reads empty after the child dies
