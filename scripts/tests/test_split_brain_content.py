@@ -165,6 +165,18 @@ def test_user_segments_order():
               len(segs) == 3, "segs=%d" % len(segs))
 
 
+def test_cache_control_not_hashed():
+    # point 4, re-review #432: cache_control moves at every request, so the
+    # same block must hash identically with and without it.
+    base = {"type": "tool_result", "tool_use_id": "t1",
+            "content": [{"type": "text", "text": "same block"}]}
+    with_cc = dict(base, cache_control={"type": "ephemeral"})
+    d1 = {"body": {"messages": [{"role": "user", "content": [base]}]}}
+    d2 = {"body": {"messages": [{"role": "user", "content": [with_cc]}]}}
+    check("hash: cache_control does NOT change a block's hash",
+          sbc.segments_of(d1) == sbc.segments_of(d2) and len(sbc.segments_of(d1)) == 1)
+
+
 # ------------------------------------------------- end-to-end positive control
 
 def test_end_to_end_fork_fires_and_sequential_stays_clean():
@@ -193,13 +205,41 @@ def test_end_to_end_fork_fires_and_sequential_stays_clean():
               bool(clean_line) and clean_line[0].rstrip().endswith("clean"),
               clean_line[0] if clean_line else "line absent")
         check("e2e: exactly ONE flagged session", "verdict: 1 session(s)" in out)
+        # point 2, re-review #432: the per-session line carries its sampling
+        # step and the resulting detection floor (~2x step, in requests).
+        check("e2e: per-session line shows step and floor",
+              " step floor " in out or (" step " in out and " floor " in out),
+              next((l for l in out.splitlines() if l.startswith("session ")), "header absent"))
+
+
+def test_end_to_end_max_samples_zero_reads_all():
+    # point 2, re-review #432: --max-samples 0 means "every request" (step 1)
+    # — it used to raise ZeroDivisionError at `len(files) // 0`.
+    with tempfile.TemporaryDirectory() as tmp:
+        build_corpus(tmp)
+        r = subprocess.run(
+            [sys.executable, _SCRIPT, "--date", DATE, "--captures", tmp,
+             "--harness-df", "1.0", "--max-samples", "0",
+             "--session", SID_FORK[:8]],
+            capture_output=True, text=True, timeout=300)
+        out = r.stdout
+        check("e2e --max-samples 0: exit 0 (no ZeroDivisionError)",
+              r.returncode == 0, "rc=%d stderr=%s" % (r.returncode, r.stderr[:200]))
+        fork_line = [l for l in out.splitlines() if l.startswith(SID_FORK[:13])]
+        cols = fork_line[0].split() if fork_line else []
+        check("e2e --max-samples 0: step=1 on the session line, fork still fires",
+              bool(fork_line) and fork_line[0].rstrip().endswith("SPLIT-BRAIN?")
+              and len(cols) >= 3 and cols[-3] == "1" and cols[-2] == "2",
+              fork_line[0] if fork_line else "line absent")
 
 
 if __name__ == "__main__":
     for fn in [test_chain_append_only, test_chain_disjoint_opens_second,
                test_chain_min_core_floor, test_concurrent_overlap_vs_sequential,
                test_is_subagent_line_scoped, test_user_segments_order,
-               test_end_to_end_fork_fires_and_sequential_stays_clean]:
+               test_cache_control_not_hashed,
+               test_end_to_end_fork_fires_and_sequential_stays_clean,
+               test_end_to_end_max_samples_zero_reads_all]:
         print("## %s" % fn.__name__)
         fn()
     print()

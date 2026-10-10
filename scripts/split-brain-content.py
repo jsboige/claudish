@@ -75,10 +75,19 @@ DEFAULT_HARNESS_DF = 0.10   # a hash in >=10% of sampled requests is harness
 DEFAULT_MIN_CORE = 8        # a real conversation has deep residual history
 
 
-def user_segments(path):
-    """Ordered hashes of the request's user-message segments."""
-    with open(path, encoding="utf-8", errors="strict") as fh:
-        d = json.load(fh)
+def _block_hash(b):
+    # cache_control (point 4, re-review #432): Claude Code re-anchors the cache
+    # breakpoint at every request, so the SAME block carries a different
+    # cache_control from one request to the next — hashed as-is it fragments
+    # chains. Strip the key before hashing (measured 67/73 -> 72/73 consecutive
+    # extensions on a 4.5k-request session; no effect on chain semantics).
+    if isinstance(b, dict):
+        b = {k: v for k, v in b.items() if k != "cache_control"}
+    return hashlib.sha1(str(b)[:300].encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def segments_of(d):
+    """Ordered hashes of a PARSED request's user-message segments."""
     msgs = (d.get("body") or {}).get("messages") or []
     out = []
     for m in msgs:
@@ -90,8 +99,16 @@ def user_segments(path):
         elif isinstance(c, list):
             for b in c:
                 if isinstance(b, dict):
-                    out.append(hashlib.sha1(str(b)[:300].encode("utf-8", "replace")).hexdigest()[:10])
+                    out.append(_block_hash(b))
     return out
+
+
+def user_segments(path):
+    """Parse-and-extract wrapper (harness sampling reads files on its own;
+    callers there hold it under try — the main loop uses segments_of on the
+    dict it already parsed so a bad capture can never drop the run)."""
+    with open(path, encoding="utf-8", errors="strict") as fh:
+        return segments_of(json.load(fh))
 
 
 def is_subagent(raw):
@@ -111,8 +128,11 @@ def secs(ts):
 def build_harness(paths, limit, df_threshold):
     df = collections.Counter()
     seen = 0
-    step = max(1, len(paths) // limit)
-    for p in paths[::step][:limit]:
+    # limit <= 0 = sample every path (same escape hatch as --max-samples 0;
+    # a naive `len // limit` would ZeroDivisionError there).
+    step = max(1, len(paths) // limit) if limit > 0 else 1
+    sample = paths[::step][:limit] if limit > 0 else paths[::step]
+    for p in sample:
         if not os.path.exists(p):
             continue
         try:
@@ -168,10 +188,12 @@ def main():
     ap.add_argument("--captures", default=DEFAULT_CAPTURES)
     ap.add_argument("--session", action="append", default=[],
                     help="session_id prefix to analyse (repeatable). Default: all sessions found.")
-    ap.add_argument("--harness-sample", type=int, default=1200)
+    ap.add_argument("--harness-sample", type=int, default=1200,
+                    help="captures sampled for the harness set (0 = every capture)")
     ap.add_argument("--harness-df", type=float, default=DEFAULT_HARNESS_DF)
     ap.add_argument("--min-core", type=int, default=DEFAULT_MIN_CORE)
-    ap.add_argument("--max-samples", type=int, default=150, help="samples per session")
+    ap.add_argument("--max-samples", type=int, default=150,
+                    help="samples per session (0 = read every request)")
     args = ap.parse_args()
 
     paths = sorted(glob.glob(os.path.join(args.captures, "req-*-%s*.json" % args.date)))
@@ -221,12 +243,17 @@ def main():
 
     fork_count = 0
     print()
-    print("%-14s %6s %6s %6s %9s %6s %9s  %s"
-          % ("session", "req", "main", "mchain", "mconcur", "sub", "sconcur", "verdict"))
+    print("%-14s %6s %6s %6s %9s %6s %9s %5s %6s  %s"
+          % ("session", "req", "main", "mchain", "mconcur", "sub", "sconcur",
+             "step", "floor", "verdict"))
     for sess in targets:
         files = sorted(by[sess])
-        step = max(1, len(files) // args.max_samples)
-        sample = files[::step][:args.max_samples]
+        # 0 = read every request (point 2, re-review #432: the sampling floor
+        # documented in ops-scripts.md needs its escape hatch to exist).
+        full = args.max_samples <= 0
+        step = 1 if full else max(1, len(files) // args.max_samples)
+        sample = files[::step] if full else files[::step][:args.max_samples]
+        floor = 2 * step  # a chain needs >=2 sampled points with deep cores
         recs = []
         for p in sample:
             try:
@@ -235,8 +262,10 @@ def main():
                 d = json.loads(raw)
             except Exception:
                 continue
-            ts = (d.get("ts") or os.path.basename(p)[8:32])
-            core = [h for h in user_segments(p) if h not in harness]
+            ts = d.get("ts")
+            if not ts:
+                continue  # every fleet capture carries ts; no filename fallback
+            core = [h for h in segments_of(d) if h not in harness]
             recs.append((ts, core, is_subagent(raw)))
         if not recs:
             continue
@@ -251,9 +280,9 @@ def main():
         verdict = "SPLIT-BRAIN?" if main_conc else ("clean" if main_pts else "no-main")
         if main_conc:
             fork_count += 1
-        print("%-14s %6d %6d %6d %9d %6d %9d  %s"
+        print("%-14s %6d %6d %6d %9d %6d %9d %5d %6d  %s"
               % (sess[:13], len(files), main_pts, main_chains, len(main_conc),
-                 sub_pts, len(sub_conc), verdict))
+                 sub_pts, len(sub_conc), step, floor, verdict))
         for a, b, ov in main_conc[:5]:
             print("      MAIN overlap %ds : %s-%s vs %s-%s"
                   % (ov, a[0][0][11:19], a[-1][0][11:19], b[0][0][11:19], b[-1][0][11:19]))
