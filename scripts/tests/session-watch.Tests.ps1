@@ -76,15 +76,19 @@ BeforeAll {
         @{ sessions = @($Sessions) } | ConvertTo-Json -Depth 6 -Compress
     }
 
-    function Invoke-Watch([string]$Sandbox, [string]$HubConfig = '') {
+    function Invoke-Watch([string]$Sandbox, [string]$HubConfig = '', [string]$ProjectsRoot = '', [switch]$NoScanSeam) {
         # Child = production shape (task runs powershell.exe -File); seams + sandbox
         # ride -Command / the inherited environment. -RepoScripts points at an empty
         # dir (split-brain hook off), -HubConfig at a non-existent path (catalog skip,
         # except the catalog pin which provides its own fixture home).
+        # -ProjectsRoot plants workspace identity in the sandbox (B3); -NoScanSeam
+        # omits the -RunScan injection so the real scan-skip path is exercised (N2).
         if (-not $HubConfig) { $HubConfig = "$Sandbox\no-hub-config.json" }
         $inner = "& '$($script:WatchPath)' -ClaudishHome '$Sandbox'" +
-            " -ScanScript '$Sandbox\scan.py' -HubConfig '$HubConfig'" +
-            " -RepoScripts '$Sandbox' -RunScan $script:SeamScan -GetProcesses $script:SeamProcs" +
+            " -ScanScript '$Sandbox\scan.py' -HubConfig '$HubConfig'"
+        if (-not $NoScanSeam) { $inner += " -RunScan $script:SeamScan" }
+        if ($ProjectsRoot) { $inner += " -ProjectsRoot '$ProjectsRoot'" }
+        $inner += " -RepoScripts '$Sandbox' -GetProcesses $script:SeamProcs" +
             " -StopProcess $script:SeamStop -GetSchTasks $script:SeamSchTasks -FetchCatalog $script:SeamCatalog"
         $prev = $env:WATCH_SB
         $env:WATCH_SB = $Sandbox
@@ -94,6 +98,31 @@ BeforeAll {
             if ($null -ne $prev) { $env:WATCH_SB = $prev } else { Remove-Item Env:WATCH_SB -ErrorAction SilentlyContinue }
         }
         [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
+    }
+
+    # B3 (CR 08/10): plant one transcript <sid8>-session.jsonl under a project dir
+    # inside a sandbox projects root, so workspace identity is establishable without
+    # touching the real ~/.claude\projects.
+    function New-ProjectTranscript([string]$ProjectsRoot, [string]$ProjectDir, [string]$Sid8) {
+        $dir = Join-Path $ProjectsRoot $ProjectDir
+        New-Item -ItemType Directory $dir -Force | Out-Null
+        New-Item -ItemType File (Join-Path $dir ($Sid8 + '-session.jsonl')) -Force | Out-Null
+    }
+
+    # B3 (CR 08/10): the most kill-permissive state the organ can be in — sol-dominant
+    # session, consent file present, dry-run off, one positively-bound process —
+    # parameterized by whether/where a transcript plants the workspace identity.
+    # (Defined HERE, not in the Describe: Pester 6 runs each It in a new scope.)
+    function New-ArmedSandbox([string]$Sid, [string]$ProjectDir) {
+        $sb = New-WatchSandbox; $script:Sandboxes += $sb
+        Initialize-BenignFixtures $sb
+        Write-SandboxFile $sb 'scan-output.json' (ScanJson @(New-ScanSession $Sid 90 10 100))
+        Write-SandboxFile $sb 'procs.json' (@(@{ ProcessId = 4242; CommandLine = 'claude.exe --session ' + $Sid.Substring(0, 8) }) | ConvertTo-Json -Compress)
+        New-Item -ItemType File (Join-Path $sb 'session-watch.kill.enabled') -Force | Out-Null
+        $pr = Join-Path $sb 'projects'
+        New-Item -ItemType Directory $pr -Force | Out-Null
+        if ($ProjectDir) { New-ProjectTranscript $pr $ProjectDir $Sid.Substring(0, 8) }
+        return @{ Sb = $sb; Pr = $pr }
     }
 
     function Get-Journal([string]$Sandbox) {
@@ -133,8 +162,12 @@ Describe 'session-watch consent guard (CR B2-a)' {
         # one live-looking claude.exe the kill path WOULD have bound
         Write-SandboxFile $sb 'procs.json' (@(@{ ProcessId = 4242; CommandLine = 'claude.exe --session a1b2c3d4' }) | ConvertTo-Json -Compress)
         # consent file deliberately ABSENT
+        # B3: identity must be ESTABLISHABLE to reach the consent branch at all —
+        # an unknown-identity session short-circuits to no-workspace-identity before it.
+        $pr = Join-Path $sb 'projects'
+        New-ProjectTranscript $pr 'd--dev-rogue-lane' 'a1b2c3d4'
 
-        $r = Invoke-Watch $sb
+        $r = Invoke-Watch $sb -ProjectsRoot $pr
         $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
         $kinds = @(Get-Journal $sb | ForEach-Object { $_.kind })
         $kinds | Should -Contain 'kill-blocked-no-consent'
@@ -236,6 +269,72 @@ Describe 'session-watch catalog unroll (CR B2-d, PS 5.1 vs 7)' {
         $new = @(Get-Journal $sb | Where-Object { $_.kind -eq 'new-model' })
         $new.Count | Should -Be 1
         $new[0].detail | Should -BeLike '*MiniMax-M3.1-Flash*'
+    }
+}
+
+Describe 'session-watch workspace frontier (CR B3)' {
+    # The reviewer's pin list verbatim: main CoursIA-2, worktree CoursIA-2, and
+    # unknown identity — each with consent PRESENT and a process positively
+    # bound — must yield ZERO StopProcess; a session outside the protected
+    # scope under the same conditions is the positive control (it MUST die).
+    # (New-ArmedSandbox lives in the BeforeAll — Pester 6 scope isolation.)
+
+    It 'MAIN CoursIA-2 checkout: consent present, process positively bound -> exempt, ZERO StopProcess' {
+        $f = New-ArmedSandbox 'aaaac2d4-0000-0000-0000-000000000001' 'd--dev-CoursIA-2'
+        $r = Invoke-Watch $f.Sb -ProjectsRoot $f.Pr
+        $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
+        $kinds = @(Get-Journal $f.Sb | ForEach-Object { $_.kind })
+        $kinds | Should -Contain 'exempt'
+        $kinds | Should -Not -Contain 'killed'
+        $kinds | Should -Not -Contain 'dryrun-kill'
+        $kinds | Should -Not -Contain 'no-workspace-identity'
+        Get-StopCount $f.Sb | Should -Be 0
+    }
+
+    It 'CoursIA-2 WORKTREE (capital-D project dir, the reviewer-named shape): same exemption, ZERO StopProcess' {
+        $f = New-ArmedSandbox 'bbbac2d4-0000-0000-0000-000000000002' 'D--dev-CoursIA-2--claude-worktrees-smartgrid-risk-17083'
+        $r = Invoke-Watch $f.Sb -ProjectsRoot $f.Pr
+        $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
+        $kinds = @(Get-Journal $f.Sb | ForEach-Object { $_.kind })
+        $kinds | Should -Contain 'exempt'
+        Get-StopCount $f.Sb | Should -Be 0
+        (Get-Journal $f.Sb | Where-Object kind -eq 'exempt')[0].detail | Should -BeLike '*smartgrid-risk-17083*'
+    }
+
+    It 'near-miss repo d--dev-CoursIA-20 (shares the prefix, is NOT CoursIA-2): positive control — consent + binding DO kill' {
+        $f = New-ArmedSandbox 'cccc42d4-0000-0000-0000-000000000003' 'd--dev-CoursIA-20'
+        $r = Invoke-Watch $f.Sb -ProjectsRoot $f.Pr
+        $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
+        $kinds = @(Get-Journal $f.Sb | ForEach-Object { $_.kind })
+        $kinds | Should -Not -Contain 'exempt'      # a permissive contains would have exempted it
+        $kinds | Should -Contain 'killed'
+        Get-StopCount $f.Sb | Should -Be 1
+    }
+
+    It 'workspace identity UNESTABLISHED (transcript under no project dir): consent present, process positively bound -> no-workspace-identity, ZERO StopProcess' {
+        $f = New-ArmedSandbox 'dddd72d4-0000-0000-0000-000000000004' ''   # no transcript planted
+        $r = Invoke-Watch $f.Sb -ProjectsRoot $f.Pr
+        $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
+        $kinds = @(Get-Journal $f.Sb | ForEach-Object { $_.kind })
+        $kinds | Should -Contain 'no-workspace-identity'
+        $kinds | Should -Not -Contain 'killed'
+        $kinds | Should -Not -Contain 'dryrun-kill'
+        $kinds | Should -Not -Contain 'kill-blocked-no-consent'   # consent was present — refusal came from identity, not the file
+        Get-StopCount $f.Sb | Should -Be 0
+    }
+}
+
+Describe 'session-watch scan-skip reachable (CR N2)' {
+    It 'NO -RunScan injection + absent scan script -> scan-skip journaled (not error): the dead wiring is live' {
+        $sb = New-WatchSandbox; $script:Sandboxes += $sb
+        Initialize-BenignFixtures $sb
+        # scan.py is deliberately NOT written — only scan-output.json is, and the
+        # seam that reads it is omitted, so the child must take the real path.
+        $r = Invoke-Watch $sb -NoScanSeam
+        $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
+        $kinds = @(Get-Journal $sb | ForEach-Object { $_.kind })
+        $kinds | Should -Contain 'scan-skip'
+        $kinds | Should -Not -Contain 'error'      # the pre-N2 shape: default installer made scan-skip unreachable
     }
 }
 

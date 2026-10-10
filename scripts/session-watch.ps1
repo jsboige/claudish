@@ -10,10 +10,17 @@ Per tick:
   1. live-session-scan.py --hours 0.3 --json  (short-window tripwire, #362)
   2. OPENAI-SHAPED sessions:
        - remote machine         -> journal 'remote-openai'    (owning lane relays/acts)
-       - CoursIA-2 workspace    -> journal 'exempt'           (user-authorized adjoint,
-         cron coordinate-adjoint, principal gpt-6-sol declared — NEVER killed, NEVER
-         posted; unconditional, dominance-independent — user arbitration 06/10 23:05)
+       - CoursIA-2 workspace AND its worktrees -> journal 'exempt' (user-authorized
+         adjoint, cron coordinate-adjoint, principal gpt-6-sol declared — NEVER
+         killed, NEVER posted; unconditional, dominance-independent — user
+         arbitration 06/10 23:05. B3, CR 08/10: the frontier is the boundary match
+         ^d--dev-CoursIA-2(--|$) — worktree project dirs carry a
+         '--claude-worktrees-*' suffix and the exact -eq left them killable)
        - local, sonnet-majority -> journal 'sonnet-majority'  (never killed)
+       - workspace identity unestablished (transcript under no project dir)
+                            -> journal 'no-workspace-identity' and STOP (B3, CR
+         08/10: an empty $projectName must never traverse into the kill branch —
+         consent + binding would reach StopProcess on a session we cannot place)
        - session_id empty/short -> journal 'skip-unattributed' BEFORE anything else
          (B1, CR 07/10: [regex]::Escape('') matches EVERY claude.exe CommandLine, so a
          sid-less line would bind-and-kill all sessions on the host once consent is
@@ -63,6 +70,10 @@ param(
     # explicitly; an absent scan script or hub config then journals 'scan-skip'/
     # 'catalog-skip' (benign, distinct from 'error') instead of failing every tick.
     [scriptblock]$RunScan = $null,
+    # Workspace identity source (B3, CR 08/10): the transcripts root the identity
+    # resolution walks. Injectable so the suite can plant project dirs in a
+    # sandbox — a pin must never depend on (or touch) the real ~/.claude\projects.
+    [string]$ProjectsRoot = (Join-Path $env:USERPROFILE '.claude\projects'),
     [scriptblock]$GetProcesses = $null,
     [scriptblock]$StopProcess = $null,
     [scriptblock]$GetSchTasks = $null,
@@ -74,7 +85,11 @@ if (-not $ScanScript) { $ScanScript = Join-Path $ClaudishHome 'live-session-scan
 $JournalPath = Join-Path $ClaudishHome 'session-watch.log'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-if (-not $RunScan)      { $RunScan      = { param($Python,$Script,$Hours) (& $Python $Script --hours $Hours --top 12 --json 2>&1 | Out-String) } }
+# N2 (CR): NO default installer for $RunScan — installing one here made the
+# `if ($RunScan)` branch below always true in production, so the scan-skip
+# elseif was dead code and the docstring's promise ('absent scan script
+# journals scan-skip') never fired. The seam stays injection-only; a
+# non-injected run reaches the real path/existence checks.
 if (-not $GetProcesses) { $GetProcesses = { Get-CimInstance Win32_Process -Filter "Name='claude.exe'" -ErrorAction SilentlyContinue } }
 if (-not $StopProcess)  { $StopProcess  = { param($ProcessId) Stop-Process -Id $ProcessId -Force -Confirm:$false -ErrorAction Stop } }
 if (-not $GetSchTasks)  { $GetSchTasks  = { & schtasks.exe /Query /FO CSV /V 2>$null } }
@@ -114,7 +129,6 @@ try {
 
 $solId = 'gpt-6-sol'
 $localMachine = $env:COMPUTERNAME.ToLower()
-$projectsRoot = Join-Path $env:USERPROFILE '.claude\projects'
 
 if ($data -and $data.sessions) {
     foreach ($s in @($data.sessions)) {
@@ -147,8 +161,26 @@ if ($data -and $data.sessions) {
             }
         }
 
-        if ($projectName -eq 'd--dev-CoursIA-2') {
-            Write-Journal 'exempt' $sid8 'coursia-2 adjoint (user-authorized, principal gpt-6-sol declared)'
+        # B3 (CR): the user-authorized exemption covers the main checkout AND its
+        # worktrees. A worktree project dir is the main dir plus a
+        # '--claude-worktrees-*' suffix (path separators flatten to '--'), so the
+        # frontier is the boundary match ^<main>(--|$): the main checkout exactly,
+        # every '--'-derived worktree of it, and NOT a different repo sharing the
+        # prefix (d--dev-CoursIA-20) — a permissive contains draws no frontier.
+        # -match is case-insensitive: project dirs arrive as D--dev-… or d--dev-…
+        if ($projectName -and $projectName -match '^d--dev-CoursIA-2(--|$)') {
+            Write-Journal 'exempt' $sid8 ("coursia-2 adjoint or worktree (user-authorized, principal gpt-6-sol declared): $projectName")
+            continue
+        }
+
+        # B3 (CR): workspace identity unestablished => NO kill and no verdict that
+        # could arm one. An empty $projectName must not traverse into the
+        # sol-majority branch where consent + a positively-bound process would
+        # reach StopProcess on a session we cannot place. Journal and stop.
+        if (-not $projectName) {
+            $solUnk = 0
+            if ($s.models.PSObject.Properties[$solId]) { $solUnk = [int]$s.models.PSObject.Properties[$solId].Value }
+            Write-Journal 'no-workspace-identity' $sid8 ("sol=$solUnk total=" + $s.requests + " (transcript not found under any project dir — identity unproven, no kill)")
             continue
         }
 
