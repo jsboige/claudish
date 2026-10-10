@@ -40,8 +40,8 @@ import json
 import os
 import re
 import sys
-from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 
 MSG_HEADER_RE = re.compile(
     r"^### \[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\] "
@@ -50,8 +50,10 @@ MSG_HEADER_RE = re.compile(
 )
 FRONTMATTER_COUNT_RE = re.compile(r"^messageCount: (\d+)", re.MULTILINE)
 # First bracketed token near the start of a message ("[DONE]", "[REPLY]",
-# "[INFO/WARN]", "[WARN][WATCHDOG]", "[CLUSTER-HEALTH] T#163"…).
-FIRST_TAG_RE = re.compile(r"^\s*(?:#+\s*)?\*\*\[|\[")
+# "[INFO/WARN]", "[WARN][WATCHDOG]", "[CLUSTER-HEALTH] T#163"…). System
+# condensation messages (**CONDENSATION-SUMMARY** …) carry NO bracketed token,
+# so their tag is "" — exclusion is by author (machine == "system"), never by
+# tag (review #426, bloquant 1).
 TAG_TOKEN_RE = re.compile(r"\[([A-Z][A-Z0-9 ./#-]{1,30}?)\]")
 ARCHIVE_NAME_RE = re.compile(r"^(.*)-(\d{4})-(\d{2})-(\d{2})T")
 
@@ -241,8 +243,10 @@ def summarize(args):
     a_start, a_end = args.era_a.split(":")
     b_start, b_end = args.era_b.split(":")
     rows = []
-    dedup = set()
-    dup_count = 0
+    seen_full = set()  # (key, ts, machine, ws, len) — re-emission WITHIN one dashboard
+    seen_unique = set()  # (ts, machine, ws, len) — the same message cross-posted elsewhere
+    dm_seen = set()
+    dup_by_day = Counter()  # near-duplicate re-emissions, bucketed for per-era counts
     dm_dup = 0
     with open(args.series, encoding="utf-8") as f:
         for line in f:
@@ -253,17 +257,32 @@ def summarize(args):
             if not r.get("ts_ok"):
                 continue
             if r["kind"] == "dash":
-                k = (r["ts"], r["machine"], r["ws"], r["len"])
+                # Bloquant 2 (review #426): per-dashboard attribution must not
+                # depend on file order. Dedup re-emissions WITHIN a dashboard
+                # (same key), but KEEP one record per dashboard a message was
+                # actually posted to (cross-post, the escalation norm since
+                # 06/09) — flagged so unique counts stay unique and the
+                # cross-post volume is reportable per era.
+                k_unique = (r["ts"], r["machine"], r["ws"], r["len"])
+                k_full = (r["key"],) + k_unique
+                if k_full in seen_full:
+                    dup_by_day[r["ts"][:10]] += 1
+                    continue
+                seen_full.add(k_full)
+                if k_unique in seen_unique:
+                    r = dict(r, cross=1)
+                else:
+                    seen_unique.add(k_unique)
+                rows.append(r)
             else:
                 # One DM per mailbox copy (sent + inbox + archive + " (1)"
                 # clones) — see the docstring trap. Only unique messages count.
                 k = (r["ts"], r["from"], r["to"], r["subject_len"], r["body_len"])
-            if k in dedup:
-                dup_count += r["kind"] == "dash"
-                dm_dup += r["kind"] == "dm"
-                continue
-            dedup.add(k)
-            rows.append(r)
+                if k in dm_seen:
+                    dm_dup += 1
+                    continue
+                dm_seen.add(k)
+                rows.append(r)
 
     def in_era(ts, s, e):
         return s <= ts[:10] <= e
@@ -273,18 +292,40 @@ def summarize(args):
             datetime.fromisoformat(e) - datetime.fromisoformat(s)
         ).days + 1
 
+    panel = None
+    if args.panel:
+        with open(args.panel, encoding="utf-8") as f:
+            panel = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+
+    stats = {}
     for name, s, e in (("A", a_start, a_end), ("B", b_start, b_end)):
+        # Bloquant 1 (review #426): system/condensation messages are excluded
+        # by AUTHOR (machine == "system"). Their **CONDENSATION** header
+        # carries no bracketed token, so the old tag-based filter matched
+        # nothing — and October (92% auto-condensation, 2 system msgs per
+        # event) was inflated asymmetrically vs July.
         era = [
             r
             for r in rows
             if in_era(r["ts"], s, e)
-            and not (r["kind"] == "dash" and r["machine"] == "system" and r["tag"].startswith("CONDENSATION"))
+            and not (r["kind"] == "dash" and r["machine"] == "system")
         ]
         dash = [r for r in era if r["kind"] == "dash"]
         dm = [r for r in era if r["kind"] == "dm"]
+        cross_era = sum(1 for r in dash if r.get("cross"))
+        dup_era = sum(v for d, v in dup_by_day.items() if s <= d <= e)
         n = days(s, e)
+        stats[name] = {
+            "dash": dash,
+            "dm": dm,
+            "cross": cross_era,
+            "per_key": Counter(r["key"] for r in dash),
+            "n": n,
+            "s": s,
+            "e": e,
+        }
         tags = Counter(t for t in (r["tag"] for r in dash) if t)
-        per_key = Counter(r["key"] for r in dash)
+        per_key = stats[name]["per_key"]
         per_day_dash = Counter(r["ts"][:10] for r in dash)
         per_day_dm = Counter(r["ts"][:10] for r in dm)
         authors = Counter(f'{r["machine"]}|{r["ws"]}' for r in dash)
@@ -293,20 +334,19 @@ def summarize(args):
         print(f"\n===== ERA {name}: {s} → {e} ({n} days) =====")
         print(
             f"dashboard messages: {len(dash)} ({len(dash)/n:.1f}/day) | "
-            f"DMs: {len(dm)} ({len(dm)/n:.1f}/day) | deduped near-duplicates: {dup_count if name == 'B' else dup_count}"
+            f"unique (cross-posts collapsed): {len(dash)-cross_era} | cross-posts: {cross_era} | "
+            f"DMs: {len(dm)} ({len(dm)/n:.1f}/day) | near-duplicate re-emissions in era: {dup_era}"
         )
+        if panel:
+            pn = sum(c for k, c in per_key.items() if k in panel)
+            print(f"panel ({len(panel)} keys): {pn} msgs ({pn/n:.1f}/day)")
         print(f"dashboard msg length: median {med} ch, p90 {lens[int(len(lens)*0.9)] if lens else 0} ch, total {sum(lens)} ch")
         print("days with zero dashboard msgs (inside era): ", end="")
         all_days = []
         d0 = datetime.fromisoformat(s)
         for i in range(n):
-            all_days.append((d0.strftime("%Y-%m-%d")))
-            try:
-                from datetime import timedelta
-
-                d0 += timedelta(days=1)
-            except Exception:
-                break
+            all_days.append(d0.strftime("%Y-%m-%d"))
+            d0 += timedelta(days=1)
         zero = [d for d in all_days if per_day_dash.get(d, 0) == 0]
         print(f"{len(zero)} {zero[:8]}")
         print("top tags:", tags.most_common(12))
@@ -324,7 +364,17 @@ def summarize(args):
             and r["machine"] == "system"
         )
         print(f"(system/condensation msgs in era, excluded from counts: {cond})")
-    print(f"\nnear-duplicates deduped overall: {dup_count} dashboard, {dm_dup} DM mailbox copies")
+    print(f"\nnear-duplicates deduped overall: {sum(dup_by_day.values())} dashboard, {dm_dup} DM mailbox copies")
+    if args.panel_auto:
+        common = sorted(
+            set(stats["A"]["per_key"]) & set(stats["B"]["per_key"])
+        )
+        a_msgs = sum(stats["A"]["per_key"][k] for k in common)
+        b_msgs = sum(stats["B"]["per_key"][k] for k in common)
+        print(f"\n--panel-auto: {len(common)} keys present in BOTH eras "
+              f"(A {a_msgs} msgs, B {b_msgs}) — freeze this list into a --panel file:")
+        for k in common:
+            print(f"  {k}")
 
 
 def main():
@@ -342,6 +392,10 @@ def main():
     s.add_argument("--series", required=True)
     s.add_argument("--era-a", required=True, help="YYYY-MM-DD:YYYY-MM-DD")
     s.add_argument("--era-b", required=True, help="YYYY-MM-DD:YYYY-MM-DD")
+    s.add_argument("--panel", help="file with one dashboard key per line — a FIXED "
+                                   "same-key panel, so per-era ratios are reproducible")
+    s.add_argument("--panel-auto", action="store_true",
+                   help="print the keys present in BOTH eras (paste into a --panel file)")
     s.set_defaults(func=summarize)
     args = p.parse_args()
     args.func(args)
