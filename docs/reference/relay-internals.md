@@ -34,7 +34,7 @@ A relay flap has **two** signatures, and they do not mean the same thing. Only t
 
 | Signature | What it is | Who absorbs it |
 |---|---|---|
-| **Connect failure** — refused / reset, fails in milliseconds | the container → `host.docker.internal` tunnel (Docker Desktop transport) | the single +250 ms retry (#80 part 2); an absorbed retry does **not** `markFail` |
+| **Connect failure** — refused / reset, fails in milliseconds | *client-side transport* **only under #80's precondition — the hub independently reachable at the same moment** (there: the Docker Desktop tunnel); a refusal with the hub down is the hub, not the transport | the single +250 ms retry (#80 part 2); an absorbed retry does **not** `markFail` |
 | **Invalid response** — TCP accepted, nothing valid returned | **hub-end availability**: the port is open, the process answers nothing readable | nobody — it reaches the client |
 
 Measured on po-203, **2026-10-08 `08:48:52→08:50:55Z`**, the same signature on **three independent
@@ -42,29 +42,43 @@ paths to the same hub**: the host's own `curl http://192.168.0.50:3000/health` (
 path at all**), the `:18182` TCP relay (`relay.js`, a raw `net` pipe), and **IIS ARR on the ingress**,
 which logged **34 × 502** (substatus 3/6, **win32 12152 = `ERROR_WINHTTP_INVALID_SERVER_RESPONSE`**)
 over the window — the failed entries including real client `POST /v1/messages` from
-`claude-cli/2.1.292|2.1.293`. The hub's `/health` `instanceId` **changed at 08:50:56Z**
-(`9a8295e5…` → `99c2feef…`, `uptimeSec` reset: the process was replaced); the relay returned
-NOMINAL 32 s later.
+`claude-cli/2.1.292|2.1.293`. Between the probes bracketing the window, the hub's `/health`
+`instanceId` changed (`9a8295e5…` → `99c2feef…`) and `uptimeSec` reset — read from po-203's side as
+a process replacement **bounded to that interval** (an id change dates nothing by itself); the relay
+returned NOMINAL 32 s later. **That replacement is contested, not established — see below.**
 
-**Cause, measured on the hub (po-2025, `~/.claudish/docker-events.log` + the container journal).**
-At 08:50:56Z the journal holds a `container start claudish-proxy` — and, between 06:34:11Z and that
-event, **no `stop`, `die`, `kill` or `destroy` at all**. A container cannot be *started* without
-having been stopped, so the process that would have logged the stop was itself gone: this is an
-**engine resurrection**, the shape the watchdog names elsewhere in the same day (`ENGINE-DOWN: docker
-CLI cannot reach the engine`, then `DIAG[engine-down]: port 3000 DEAF (refused)`) — **not** a
-`compose up` that bypassed the drained wrapper, and not a reboot (the System log 08:40–08:56Z holds
-no 41/6008/1074). The ricochet closes it: a *second, unrelated* compose project
-(`myia_vllm-mini-frognano-4b`) returns 2 s later — two distinct projects cannot recreate one another,
-so a single engine event took both down and brought both back. ⚠ **The
-`com.docker.compose.replace=claudish-proxy` label does not identify an actor**: it is stamped at
-creation and persists, so it reads as a recreate on a container that was never recreated (its
-`environment_file=D:\claudish-shadow\.env` is a creation-time fact for the same reason). Day scale:
-**3 engine resurrections on 2026-10-08** (06:34:11Z, 08:50:56Z, 11:20:37Z — the last with **no**
-process replacement at all, `RestartCount=0` and `StartedAt=12:02:02Z`), against only **2 drained
-gestures** that day. Over the whole available journal, **20 resurrections across 82 hub `start`s
-since 22/09**: a recurring class, not one day's incident. `drain.log` is silent on all three, and
-correctly so — **there was nothing to drain**. That silence is precisely why the durable collector
-matters here: `scripts/docker-events-collect.ps1` (#169).
+**What the hub-side journal holds (po-2025, `~/.claudish/docker-events.log` + the container journal)
+— observation, not a cause.** At 08:50:56Z a `container start claudish-proxy`, and between
+06:34:11Z and that event **no logged `stop`, `die`, `kill` or `destroy` at all**. Two readings fit
+that observation, and the instruments available do not separate them:
+
+1. **Engine death and resurrection** — a container cannot be *started* without having been stopped,
+   so the daemon that would have logged the stop was itself gone. Shapes consistent with it, same
+   day, watchdog: `ENGINE-DOWN: docker CLI cannot reach the engine`, then `DIAG[engine-down]: port
+   3000 DEAF (refused)`; and a *second, unrelated* compose project (`myia_vllm-mini-frognano-4b`)
+   returning 2 s later — two distinct projects cannot recreate one another, which one engine event
+   explains. Not a reboot: the System log 08:40–08:56Z holds no 41/6008/1074.
+2. **An incomplete journal** — the durable collector loses ticks (measured, #417/#419), so the
+   missing `stop` may simply never have been collected.
+
+⚠ **`com.docker.compose.replace=claudish-proxy` identifies no actor and no recreate**: it is
+stamped at creation and persists, so it reads as a recreate on a container that was never
+recreated (its `environment_file=D:\claudish-shadow\.env` is a creation-time fact for the same
+reason).
+
+**The 08:50:56Z process replacement is contested, and no cause is asserted until it is reconciled.**
+Issue #419 (po-2025) reports a *continuous* process uptime through the same instant — watchdog
+`0.2 h` at 08:47Z, `0.5 h` at 09:02Z — while this PR's relay observed the `/health` `instanceId`
+change and `uptimeSec` reset at 08:50:56Z. Both cannot describe the same process. The
+reconciliation inputs live on po-2025: which probe the watchdog samples, which process/container it
+resolves to, and
+which clock stamps each log. Until that lands, the counts below count the **journal's shape** (a
+`start` with no logged `stop`), not engine events: **3 such `start`s on 2026-10-08** (06:34:11Z,
+08:50:56Z, 11:20:37Z — the last with no observed process replacement, `RestartCount=0`,
+`StartedAt=12:02:02Z`), against **2 drained gestures** that day; over the whole available journal,
+**20 such `start`s across 82 hub `start`s since 22/09**. `drain.log` is silent on all three —
+consistent with reading 1 (nothing to drain), uninformative under reading 2. Either way that
+silence is why the durable collector matters here: `scripts/docker-events-collect.ps1` (#169).
 
 **Day scale (2026-10-08, closed).** **11 AUTONOMOUS episodes, 11 recoveries** (03:26:02 → 11:13:21);
 **10 of the 11 have matching 502 minutes**, and **179 of the day's 184 502s fall inside a flap
@@ -76,23 +90,32 @@ signatures coexist, neither abolishes the other.
 heartbeat arms on **2 consecutive** failures, so it never flaps on a single-minute blip (2026-10-08:
 502s at **00:09, 03:12, 03:41, 03:44, 19:52** — present in the 502 record, absent from the tally),
 and it can miss a hub restart outright (**12:01**: one 502, the hub's process replaced ~12:02 — **no
-flap at all**). Reading the tally alone therefore **under-counts** hub unavailability. The instrument that
-does not is the **ingress IIS log** (`W3SVC49/u_ex<yymmdd>.log`): `awk '$12==502'` over the
-**status / substatus / win32** columns, joined to `/health`'s `instanceId` + `uptimeSec` for process
-identity (an `instanceId` change dates the replacement exactly).
+flap at all**). Reading the tally alone therefore **under-counts** hub unavailability *on the WAN
+ingress*. The instrument that does not is the **ingress IIS log** (`W3SVC49/u_ex<yymmdd>.log`):
+`awk '$12==502'` over the **status / substatus / win32** columns — with its own scope: it sees
+**only the requests that traverse it**; LAN-direct clients and sidecar traffic on the `:18182`
+tunnel never appear. Joined to `/health`'s `instanceId` + `uptimeSec` for process identity, an
+`instanceId` change *bounds* a replacement between two observations; it does not date it, absent a
+corroborating timestamped event.
 
-**Client impact beyond the 502s.** The 08:50:56Z restart re-read `config.json`, which carried
-`maxConcurrency: 16` — a value the image then in service (07/10) **rejects**, its Zod schema capping
-at 8. A custom endpoint that fails validation is dropped whole, with a stderr warning, by design, so
-the entire `frognano` entry was skipped and **`frognano-4b` and `mini` stayed down until the revert
-at 11:17:25Z** (#410), about 2.5 h. A restart is therefore not only a window of 502s: it is also the
+**Client impact beyond the 502s — #410 owns the defect; the *timing tie* is contingent on the
+contested replacement.** The Zod rejection is real and measured: `config.json` carried
+`maxConcurrency: 16`, the image then in service (07/10) caps at 8, and an endpoint failing
+validation is dropped whole (by design, with a stderr warning), so the entire `frognano` entry was
+skipped and **`frognano-4b` and `mini` stayed down until the revert at 11:17:25Z** — about 2.5 h.
+But *"the 08:50:56Z restart re-read `config.json`"* holds only if the process replacement at that
+instant is confirmed, exactly the contested point above: if the reconciliation goes the other way,
+the re-read happened at some other unobserved moment, and the 2.5 h window keeps its bounds while
+losing its start attribution. The general point is independent of the tie: a process restart is the
 instant a config never validated against the *running* image takes effect. On ai-01 the same window
 sent clients to the walled last step of the local cascade, a 403 (#409).
 
-**Consequence, standing.** On this fleet **a relay flap is a hub-availability reading, not a local
-Docker artifact**: attribute its cause at the hub end, and never let *"impact client nul"* cover the
-**WAN entry**. Only the relay-**bypassed** *local* clients are shielded from a hub outage — which is
-the measured argument for pointing the WAN entry at a relay rather than straight at the hub
+**Consequence, standing.** On this fleet **a relay flap is a reading of hub *reachability from the
+relay* — not a local Docker artifact, and not a cause localisation**: the three concordant paths
+qualify *this* window (the failures sat at the hub end of the path on 08/10); they do not
+pre-locate the cause of future flaps. Never let *"impact client nul"* cover the **WAN entry**. Only
+the relay-**bypassed** *local* clients are shielded from a hub outage — which is the measured
+argument for pointing the WAN entry at a relay rather than straight at the hub
 (`models.myia.io`, IIS site id=49).
 
 ## Tests
