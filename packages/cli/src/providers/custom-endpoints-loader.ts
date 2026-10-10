@@ -169,6 +169,7 @@ function buildSimpleHandler(
       adapter,
       tokenStrategy: "delta-aware",
       omitReasoningContent: ep.omitReasoningContent,
+      maxOutputTokens: ep.maxOutputTokens,
       ...ctx.sharedOpts,
     });
   }
@@ -187,6 +188,7 @@ function buildSimpleHandler(
   const adapter = new AnthropicAPIFormat(finalModel, ctx.provider.name);
   return new ComposedHandler(transport, ctx.targetModel, finalModel, ctx.port, {
     adapter,
+    maxOutputTokens: ep.maxOutputTokens,
     ...ctx.sharedOpts,
   });
 }
@@ -206,6 +208,7 @@ function buildComplexHandler(
       const adapter = new LiteLLMAPIFormat(finalModel, baseUrl);
       return new ComposedHandler(transport, ctx.targetModel, finalModel, ctx.port, {
         adapter,
+        maxOutputTokens: ep.maxOutputTokens,
         ...ctx.sharedOpts,
       });
     }
@@ -226,6 +229,7 @@ function buildComplexHandler(
         adapter,
         tokenStrategy: "delta-aware",
         omitReasoningContent: ep.omitReasoningContent,
+        maxOutputTokens: ep.maxOutputTokens,
         ...ctx.sharedOpts,
       });
     }
@@ -244,6 +248,7 @@ function buildComplexHandler(
       const adapter = new AnthropicAPIFormat(finalModel, ctx.provider.name);
       return new ComposedHandler(transport, ctx.targetModel, finalModel, ctx.port, {
         adapter,
+        maxOutputTokens: ep.maxOutputTokens,
         ...ctx.sharedOpts,
       });
     }

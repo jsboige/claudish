@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { ConcurrencyLimiter } from "./concurrency-limiter.js";
+import { ConcurrencyLimiter, StepBusyError } from "./concurrency-limiter.js";
 
 /**
  * ConcurrencyLimiter — per-instance async semaphore for remote transports.
@@ -98,5 +98,120 @@ describe("ConcurrencyLimiter", () => {
     });
     expect(secondRan).toBe(true);
     expect(limiter.activeCount).toBe(0);
+  });
+
+  // ── #431: bounded queue wait (busy skip) ──────────────────────────────────
+
+  test("#431: a bounded wait that expires rejects with StepBusyError", async () => {
+    const limiter = new ConcurrencyLimiter(1, "busy");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5)); // holder has the slot
+
+    const t0 = Date.now();
+    await expect(limiter.run(async () => "never", 50)).rejects.toBeInstanceOf(StepBusyError);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(45); // it really waited
+    releaseHolder();
+    await holder;
+  });
+
+  test("#431: a busy timeout does NOT leak the slot — the next task still runs", async () => {
+    const limiter = new ConcurrencyLimiter(1, "busy-leak");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5));
+
+    // The abandoned waiter's resolver must be GONE from the queue: a freed
+    // slot that wakes it would decrement `active` for a waiter that never
+    // increments — the slot disappears for every later task.
+    await expect(limiter.run(async () => "x", 20)).rejects.toBeInstanceOf(StepBusyError);
+    releaseHolder();
+    await holder;
+
+    let ran = false;
+    await limiter.run(async () => { ran = true; }, 20);
+    expect(ran).toBe(true);
+    expect(limiter.activeCount).toBe(0);
+    expect(limiter.queuedCount).toBe(0);
+  });
+
+  test("#431: without a budget the FIFO wait stays unbounded (pre-#431 behavior)", async () => {
+    const limiter = new ConcurrencyLimiter(1, "unbounded");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5));
+
+    let ran = false;
+    const waiter = limiter.run(async () => { ran = true; }); // no budget arg
+    await new Promise((r) => setTimeout(r, 40));
+    expect(ran).toBe(false); // still waiting — no silent timeout
+    releaseHolder();
+    await holder;
+    await waiter;
+    expect(ran).toBe(true);
+  });
+
+  test("#431: budget 0 means no bound, not an instant timeout", async () => {
+    const limiter = new ConcurrencyLimiter(1, "zero-off");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5));
+
+    let ran = false;
+    const waiter = limiter.run(async () => { ran = true; }, 0);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(ran).toBe(false);
+    releaseHolder();
+    await holder;
+    await waiter;
+    expect(ran).toBe(true);
+  });
+
+  test("#431 CR: a grant racing the timeout is RUN, not abandoned (no stranded waiters)", async () => {
+    const limiter = new ConcurrencyLimiter(1, "race");
+    let releaseHolder!: () => void;
+    const holder = limiter.run(
+      () => new Promise<void>((r) => { releaseHolder = r; })
+    );
+    await new Promise((r) => setTimeout(r, 5));
+
+    // The race window — the timeout settling the race WHILE the release
+    // already shifted our resolver out of the FIFO — lives INSIDE one
+    // microtask drain: a separate release timer can never reach it (each
+    // timer's microtasks drain fully before the next macrotask). So the
+    // release rides the SAME drain as the limiter's timeout callback: wrap
+    // setTimeout for exactly the limiter's timer, and queueMicrotask the
+    // release right after its callback. Production hits the same shape when
+    // the holder's task completes in the same event-loop turn as the budget
+    // timer. Pre-fix, the continuation then found indexOf === -1 and STILL
+    // threw StepBusyError — a GRANTED slot abandoned, nobody re-transmits
+    // it, every later waiter strands while `active` undercounts by one.
+    let ran = false;
+    const realSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = ((fn: any, ms?: number, ...rest: any[]) =>
+      realSetTimeout((...args: any[]) => {
+        fn(...args);
+        queueMicrotask(() => releaseHolder());
+      }, ms, ...rest)) as any;
+    let waiter: Promise<void>;
+    try {
+      waiter = limiter.run(async () => { ran = true; }, 20);
+    } finally {
+      (globalThis as any).setTimeout = realSetTimeout;
+    }
+
+    await waiter; // never rejects under the fix — the granted slot runs the task
+    expect(ran).toBe(true);
+    await holder;
+    expect(limiter.activeCount).toBe(0);
+    expect(limiter.queuedCount).toBe(0);
   });
 });

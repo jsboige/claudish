@@ -562,6 +562,7 @@ For OpenAI- or Anthropic-compatible servers:
 | `modelPrefix` | string | no | Prepended to model name before sending to API |
 | `models` | string[] | no | Restrict to listed models; omit to allow any |
 | `maxConcurrency` | integer 0–32 | no | Max concurrent in-flight requests (0 = unlimited, 1 = sequential; omit = unbounded). For capacity-limited backends (single-GPU vLLM). An out-of-range value **fails validation and skips the whole entry** — the endpoint leaves the routing table. |
+| `maxOutputTokens` | integer ≥ 1 | no | #431 — clamps `max_tokens` DOWN to this before the request leaves (never up; unset = verbatim). vLLM counts `prompt + max_tokens` against `--max-model-len` and refuses rather than trims: a ~240k prompt with the fleet-standard `max_tokens: 32000` against a 262144 window is a refusal; with the cap at 8192 the same prompt is served. Same field on simple and complex kinds. |
 
 Usage: `claudish --model my-vllm@llama3.1-70b "task"`
 
@@ -602,6 +603,9 @@ Full control over transport, auth, headers, and stream format:
 | `streamFormat` | string | no | Stream parser override (e.g., `"openai-sse"`, `"anthropic-sse"`) |
 | `modelPrefix` | string | no | Prepended to model name |
 | `models` | string[] | no | Restrict to listed models |
+| `maxConcurrency` | integer 0–32 | no | Same as the simple kind |
+| `maxOutputTokens` | integer ≥ 1 | no | #431 — same as the simple kind: clamps `max_tokens` down before the request leaves |
+| `omitReasoningContent` | boolean | no | Drops `reasoning_content` from outbound assistant messages (strict-schema backends) |
 
 ### Environment variable expansion
 

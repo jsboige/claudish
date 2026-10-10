@@ -43,6 +43,31 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      il est la seule trace durable des éditions automatiques de l'infra
      partagée (post-mortem après incident), et une troncature détruirait les
      événements arrivés pendant le relai.
+   - **Relais session-watch** (organe bg 07/10, tâche planifiée `ClaudishSessionWatch`
+     15 min, non élevée — remplace le cron tripwire interactif, mandat user) : lire
+     `~/.claudish/session-watch.log` (NDJSON : `ts`, `kind`, `sid`, `detail`), relayer
+     les événements plus récents que le watermark `~/.claudish/session-watch-relay.ts`
+     (une ligne ISO-UTC ; absent ⇒ tout relayer). Mapping : `killed` → **WARN**
+     (crossPost global) ; `kill-blocked-no-consent` → WARN locale (une cible qualifiée
+     attend le consent kill) ; `new-model`/`model-gone` → INFO, ou **ASK** si l'id
+     touche une cascade (ex. retrait de `MiniMax-M3` = ASK immédiat — lane la plus
+     chargée du hub ; arrivée d'un `M3.1`/Flash = ASK banc comparatif) ;
+     `remote-openai` → INFO (machine propriétaire nommée dans `detail` — pas un geste
+     local) ; `sonnet-majority`/`sol-minority`/`no-binding-*` → silence sauf volume
+     anormal (agrégat /worker) ; `exempt` → **jamais relayé** (comptage /worker
+     seulement) ; `rogue-schtasks` → **WARN** (tâche planifiée dont l'action lance
+     une session claude — classe split-brain, escalade po-2027 07/10 ; triage :
+     nom journalisé seul, vérifier l'action réelle avant tout geste, propriétaire
+     roo-extensions pour les launchers cachés) ; `skip-unattributed` → silence
+     (benigne par construction depuis B1/CR 07/10 : une ligne sans session_id ne peut
+     plus rien lier ni tuer — comptage /worker seulement) ; `scan-skip`/
+     `catalog-skip` → silence (chemins hub absents sur une machine non-hub, N2/CR) ;
+     `error`/`catalog-error` → WARN.
+     Après relais, mettre à jour le
+     watermark. **Ne JAMAIS tronquer le journal.** Consent kill = fichier
+     `~/.claudish/session-watch.kill.enabled` — à n'armer qu'après ≥24 h de journal
+     sain (classification conforme à la politique réconciliée), geste consigné
+     dashboard.
 4. **Commit + PR AVANT le rapport** — ne jamais annoncer un travail non commité.
    `cd d:/Dev/claudish && git pull origin main` d'abord ; conventional commits.
 5. **Rapport [DONE] sur le dashboard workspace** — faits, métriques, décisions prises
