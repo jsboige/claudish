@@ -89,22 +89,26 @@ python .\scripts\turn-autopsy.py aggregate --worklist worklist-both.jsonl --labe
 ### Instrument traps, all measured
 
 - **The lane comes out of the resp filename** — `resp-1-r0001-<ts>-<handler>-<model>.sse` — so stratification by lane is free, with no body parse. But the timestamp must be matched with a **strict shape** (`\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z`): a loose `(.+?)-([a-z0-9_.-]+)-(.+?)` split eats the timestamp itself (`T` and `Z` are outside the class), manufactures one "lane" per turn, and an allocation that forces a minimum per lane then turns `--n 50` into "extract 14 244 members". The tool prints the lane count **before** extracting: a lane count near the turn count is that bug.
-- **The capture counter is NOT unique per day.** Measured on `captures-2026-07-05`: 10 498 `resp-*` files for **7 114 distinct counters** (`resp-1-r9997-…` appears twice with different timestamps) — the counter restarts across container restarts and `pid` is always 1 in a container. Pairing req↔resp by counter is therefore approximate; the tool reports `(unpaired)` rather than mispairing. In the pilot that is 16/49 July turns and 1/50 for 30/09.
+- **The capture counter is NOT unique per day.** Measured on `captures-2026-07-05`: 10 498 `resp-*` files for **7 114 distinct counters** (`resp-1-r9997-…` appears twice with different timestamps) — the counter restarts across container restarts and `pid` is always 1 in a container. Since CR #424 the tool pairs by counter **and timestamp**: a resp pairs the LATEST req of its counter whose ts it follows, within a 20-min bound (real calendar arithmetic — digit concatenation reads a 1-ms hour rollover as ~4e7 units); homonyms outside the bound stay `unpaired`, never mispaired.
+- **A counter with SEVERAL resps is an attempt chain, not ambiguity** (probe, CR #424): on 2026-07-05, 2 598 counters carry ≥2 resps, closest pairs p50 5 s apart on **different lanes** (`openai/glm-5.2` then `anthropic/MiniMax-M3`, or twice glm) — the cascade writes one capture per upstream attempt, and the attempt that serves the client is the LAST. The tool pairs the latest and counts the earlier ones as `attempts` (work-list field + stats block).
 - **Pre-#98 captures carry `machine` but not `entrypoint` / `workload` / `device_id8`** (measured on the July archive). The tool returns `None` — the fields are never invented, so an era comparison must not read a `null` as "no entrypoint".
 - **A solid archive pays one full block decompression per `7z e` call** (`Blocks = 1` on a daily pack), and the archive lives on DriveFS. Copy it local once (`--copy-local`, default for a non-`D:` path) and batch the members (`--reuse` skips extraction once the work-dir is populated).
 
-### Pilot result (05/07 vs 30/09, n=49 + n=50, seed 328)
+### Pilot result (05/07 vs 30/09, n=49 + n=50, seed 328 — re-run on the CR-#424-corrected instrument)
 
 | trigger (last message) | july | now |
 |---|---|---|
-| automatic (`todo-nudge`, `bg-notification`, `date-change`, `cron`) | **17 (35 %)** | **3 (6 %)** |
-| `system-reminder` | 0 | 6 |
-| tool-result | 28 (57 %) | 27 (54 %) |
-| human | 1 (2 %) | 4 (8 %) |
+| automatic (`todo-nudge`, `bg-notification`, `date-change`, `cron`) | **5 (10 %)** | **1 (2 %)** |
+| `system-reminder` | 0 | 1 |
+| tool-result | **37 (76 %)** | 22 (44 %) |
+| human | 6 (12 %) | 6 (12 %) |
+| `system` role | 1 | 20 (40 %) |
 
-**The headline is a negative, and it is the reason to read rather than count**: the automatic-trigger buckets look like a 6× collapse, but the *last message is a `system`-role message* in **17/49 July turns vs 15/50 now** — the same ~⅓ of turns in both eras. Only the injector's spelling changed (the `TodoWrite` nudge → `<system-reminder>`), which is a harness-version artifact, not a behaviour change. The durable finding is structural: **about a third of all turns, in both eras, are driven by a message the harness injected — not by the user and not by a tool result** — and that share is *constant*, so it cannot explain the ×3.4 growth. The ×3.4 is elsewhere.
+pairing: july 33 paired / 16 unpaired · now 50/0 — attempt-chained turns (**cascade burned ≥1 earlier upstream attempt**): **july 8/49, now 0/50**.
 
-What did move in the pilot: the **lane count, 3 → 9** (July: `glm-5.2` 21, `MiniMax-M3` 10, `opus-4-8` 2; 30/09: `glm-5.3` 20, `MiniMax-M3` 19, `opus-5-5` 4, plus 6 single-turn lanes), and the machine spread (5 distinct clients → 7). Treat both as **hypotheses a larger sample must confirm**, not as findings — n≈50 per era reads direction, not magnitude.
+**The first pilot's headline is WITHDRAWN.** Its "17 (35 %) automatic July triggers" was an artifact of the pre-CR classification: ~12 of those were tool-result turns whose Bash output quoted `"Command running in background with ID:"` — the agent's own tool result, not a harness notification (CR #424 bloquant 2, the exact case the review named). On the corrected instrument the automatic share is 5/49 vs 1/50, and the old claim of a *constant* ~⅓ harness-driven share in both eras does not reproduce at this sample size: the last message is `system`-role in 6/49 July vs 21/50 now. Both eras' numbers moved more than any conclusion should — n≈50 reads direction, not magnitude, and the direction itself changed with the instrument. The ×3.4 question stays open; the pilot's calibrated job (instrument + sample size for the mass reading) is done.
+
+What stands: the **lane count, 3 → 14** (July: `glm-5.2` 21, `MiniMax-M3` 10, `opus-4-8` 2; 30/09: `glm-5.3` 19, `MiniMax-M3` 15, `opus-5-5` 5, plus 9 single-turn lanes), and the **attempt-chain contrast** (8/49 vs 0/50) — July's cascade churned upstream attempts on a sixth of its turns, the now-era none. Treat both as hypotheses a larger sample must confirm, not as findings.
 
 **Not done, and deliberately**: no mass reading. The grid is arbitrated but not yet validated against a second reader — ai-01's protocol calls for ~20 turns read twice, independently, with agreement/uncertainty published. The pilot's job was to calibrate the grid and to size the next sample; it does that and stops.
 
