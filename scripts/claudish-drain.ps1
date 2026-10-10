@@ -923,9 +923,11 @@ function Invoke-DrainFailoverEventsTick {
         # makes the probe fail, Get-InstanceId returns $null, and the collector
         # overwrites the state's instanceId with '' — which disarms
         # InstanceChanged for the very tick that spans the gesture (the
-        # pre-gesture tick writes '' immediately before it). Strict no-op at
-        # :3000: $Url is then http://localhost:3000, so "$Url/health" is
-        # byte-identical to the collector's own default.
+        # pre-gesture tick writes '' immediately before it). A :3000 seat is a
+        # strict no-op only because the CALL SITE normalizes localhost to
+        # 127.0.0.1 first — the derived "http://localhost:3000/health" is NOT
+        # byte-identical to the collector's default (see the call site's #422
+        # CR note).
         if (-not [string]::IsNullOrWhiteSpace($HealthUrl)) {
             $tickArgs += @('-HealthUrl', "$HealthUrl")
         }
