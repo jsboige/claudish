@@ -778,6 +778,30 @@ Start-Sleep -Seconds 45
         $recorded = Get-Content -LiteralPath (Join-Path $script:TickHome 'tick-ok.healthurl') -Raw
         $recorded.Trim() | Should -Be 'http://127.0.0.1:19191/health'
     }
+
+    It 'a DERIVED localhost URL is normalized to 127.0.0.1 — #422 CR: the REAL :3000 no-op' {
+        # #422 CR (ai-01): the collector's own default is
+        # http://127.0.0.1:3000/health — NOT http://localhost:3000/health.
+        # $Url derives as "http://localhost:$port" (Get-ClaudishProbeUrl), so
+        # forwarding it verbatim CHANGES the probe host on every :3000 seat,
+        # and under PS 5.1 localhost may resolve ::1 first (the wslrelay
+        # wedge shape: [::1] listens but is wedged while 127.0.0.1 serves) —
+        # the very failure #422 fixes, reintroduced on the exempt port. This
+        # test takes the DERIVED shape itself (localhost:3000) and asserts the
+        # collector sees the 127.0.0.1 host; removing the -replace at the call
+        # site turns it red. The It above pins the other half: an explicit
+        # non-localhost -Url must pass through unchanged.
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`n", (New-Object System.Text.ASCIIEncoding))
+        $r = Invoke-ClaudishDrainedRestart -Reason 'tick-healthurl-loopback' -Url 'http://localhost:3000' -Recreate -EnvFile $script:TickEnv `
+            -FreezeClaudishHome $script:TickHome `
+            -FailoverTickCollectorPath (Join-Path $tickDir 'tick-ok.ps1') -FailoverTickTimeoutSec 30
+        $r | Should -BeTrue
+        Get-DrainLogText | Should -Match 'FAILOVER-TICK ok'
+        $recorded = Get-Content -LiteralPath (Join-Path $script:TickHome 'tick-ok.healthurl') -Raw
+        $recorded.Trim() | Should -Be 'http://127.0.0.1:3000/health'
+    }
 }
 
 Describe 'Invoke-ClaudishDrainedRestart — compose stderr and deployed-image attestation (#257)' {

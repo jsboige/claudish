@@ -639,8 +639,16 @@ function Invoke-ClaudishDrainedRestartImpl {
     # arming so new admissions are already gated while the tick runs, and its
     # default 120 s bound fits the proxy's 900 s freeze expiry. Never blocks
     # the gesture — see Invoke-DrainFailoverEventsTick's own bounds.
+    # #422 CR — normalize localhost -> 127.0.0.1 so a :3000 seat stays on the
+    # collector's OWN default host. $Url is derived as "http://localhost:$port"
+    # (Get-ClaudishProbeUrl), while the collector defaults to 127.0.0.1 — under
+    # PS 5.1 localhost may resolve ::1 first (the wslrelay shape: ::1 listens
+    # but is wedged while 127.0.0.1 serves), which is the very failure #422
+    # fixes, reintroduced on the port that was exempt. An explicit non-localhost
+    # -Url (LAN host) passes through unchanged.
+    $tickHealthUrl = "$Url/health" -replace '^http://localhost:', 'http://127.0.0.1:'
     Invoke-DrainFailoverEventsTick -CollectorPath $FailoverTickCollectorPath -Container $Container `
-        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec -HealthUrl "$Url/health"
+        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec -HealthUrl $tickHealthUrl
 
     $restartAt = Get-Date
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
@@ -869,10 +877,12 @@ function Invoke-DrainFailoverEventsTick {
         [string]$Container,
         [string]$ClaudishHome,
         # #422 — the address the collector should probe for the per-process
-        # instanceId. Empty leaves the collector's own default (:3000), which
-        # is what the tick used to get unconditionally on the one call path
-        # that already knows the derived port. The call site passes the
-        # #372-derived "$Url/health".
+        # instanceId. Empty leaves the collector's own default, which is what
+        # the tick used to get unconditionally on the one call path that
+        # already knows the derived port. The call site passes the
+        # #372-derived "$Url/health" with the host normalized to 127.0.0.1
+        # (the collector's own default host — a derived localhost:3000 is NOT
+        # byte-identical to it, see the call site's #422 CR note).
         [string]$HealthUrl,
         [int]$TimeoutSec = 120
     )
