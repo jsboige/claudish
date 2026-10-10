@@ -158,6 +158,44 @@ describe("OpenAIProviderTransport 429 backoff releases the concurrency slot", ()
   }, 15000);
 });
 
+describe("OpenAIProviderTransport busy bound applies to the first admission only (#431 CR S1)", () => {
+  test("a 429-retry admission is unbounded — the bound never rides the ladder", async () => {
+    const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key", 1);
+
+    let bCalls = 0;
+    const b = transport
+      .enqueueRequest(() => {
+        bCalls++;
+        if (bCalls === 1) {
+          // While B backs off (Retry-After: 0), A takes the only slot and
+          // holds it ~400 ms — B's RETRY admission finds the limiter full.
+          void transport
+            .enqueueRequest(
+              () =>
+                new Promise<Response>((resolve) => {
+                  setTimeout(() => resolve(new Response('{"ok":true}', { status: 200 })), 400);
+                })
+            )
+            .then(() => {});
+          return Promise.resolve(
+            new Response('{"error":"rate limited"}', {
+              status: 429,
+              headers: { "Retry-After": "0" },
+            })
+          );
+        }
+        return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+      }, { busyWaitMs: 100 })
+      .then((r) => r.status);
+
+    // Pre-fix, the retry's gate call re-applied the 100 ms bound and rejected
+    // with StepBusyError — a skip-shaped failure for a request the backend had
+    // already 429'd. Post-fix the retry admits unbounded and waits out A's
+    // lease (the pre-#431 behavior of every unbounded caller).
+    await expect(b).resolves.toBe(200);
+  }, 15000);
+});
+
 describe("OpenAIProviderTransport 429 quota-wall short-circuit", () => {
   const WALL = '{"error":{"message":"You have exceeded your plan limit for this period"}}';
   const BURST = '{"error":{"message":"rate limited, slow down"}}';

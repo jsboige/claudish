@@ -25,6 +25,7 @@ import {
   buildFailoverNotice,
   consumeStreamNotice,
   type FailoverRole,
+  type ServedStepRecord,
 } from "../../fork/failover.js";
 
 export function prependNoticeToAnthropicStream(
@@ -249,11 +250,16 @@ export async function applyFailoverNotices(
   policy: NoticeIngressPolicy = { inContent: true },
   /** #275: provider bucket of THIS request's nominal — the notice fires only for
    * the diversion the session actually took, never for a sibling bucket's wall. */
-  nominalBucket?: string
+  nominalBucket?: string,
+  /** #431 CR B1: the step that actually served THIS request (loop-side record).
+   * When it matches `role` the notices name IT — the general resolver cannot see
+   * request-local skips, so without this a successor-served turn announced the
+   * skipped step's name. */
+  served?: ServedStepRecord
 ): Promise<Response> {
   if (!role) return response;
   if (wantsStreaming) {
-    const text = consumeStreamNotice(role, sessionKey, nominalBucket);
+    const text = consumeStreamNotice(role, sessionKey, nominalBucket, served);
     if (!text) return response;
     if (!policy.inContent) {
       return responseWithNoticeHeader(response, text);
@@ -276,13 +282,13 @@ export async function applyFailoverNotices(
   if (!policy.inContent) {
     // Same notice text and side effects (recovery-budget decrement) as the
     // content path — only the channel differs.
-    const text = buildFailoverNotice(role, nominalBucket);
+    const text = buildFailoverNotice(role, nominalBucket, served);
     if (text) return responseWithNoticeHeader(response, text);
     return response;
   }
   try {
     const message = await response.clone().json();
-    appendFailoverNoticeToMessage(message, role, nominalBucket);
+    appendFailoverNoticeToMessage(message, role, nominalBucket, served);
     const headers = new Headers(response.headers);
     headers.set("Content-Type", "application/json");
     return new Response(JSON.stringify(message), { status: response.status, headers });

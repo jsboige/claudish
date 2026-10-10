@@ -52,6 +52,17 @@ export const CustomEndpointSimpleSchema = z.object({
    */
   maxConcurrency: z.number().int().min(0).max(32).optional(),
   /**
+   * #431 — clamp `max_tokens` DOWN to this before the request leaves.
+   *
+   * vLLM counts `prompt + max_tokens` against `--max-model-len` and REFUSES
+   * rather than trims (measured on the Swift lane, v0.31): a ~240k prompt
+   * with the fleet-standard `max_tokens: 32000` against a 262144 window is a
+   * hard refusal, and the same prompt with the cap at 8192 is served. Set it
+   * to the window minus your real prompt headroom; unset = verbatim
+   * passthrough (today's behavior).
+   */
+  maxOutputTokens: z.number().int().min(1).optional(),
+  /**
    * Drop `reasoning_content` from outbound assistant messages.
    *
    * The OpenAI-format converter emits that field whenever a thinking block is
@@ -94,6 +105,8 @@ export const CustomEndpointComplexSchema = z.object({
    * sequential). See CustomEndpointSimpleSchema.maxConcurrency (cap 32 there).
    */
   maxConcurrency: z.number().int().min(0).max(32).optional(),
+  /** See CustomEndpointSimpleSchema.maxOutputTokens (#431 output cap). */
+  maxOutputTokens: z.number().int().min(1).optional(),
   /** See CustomEndpointSimpleSchema.omitReasoningContent. */
   omitReasoningContent: z.boolean().optional(),
 });

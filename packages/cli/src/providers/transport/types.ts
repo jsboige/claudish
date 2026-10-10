@@ -54,8 +54,13 @@ export interface ProviderTransport {
   /**
    * Optional request queue for rate limiting / concurrency control.
    * If provided, the ComposedHandler will call this instead of raw fetch.
+   *
+   * `opts.busyWaitMs` (#431): bound on the concurrency-slot wait for a CASCADE
+   * STEP attempt — on expiry the call rejects with StepBusyError so the
+   * cascade can skip forward. Undefined (nominal, walk, non-cascade callers)
+   * keeps the unbounded FIFO of today.
    */
-  enqueueRequest?(fetchFn: () => Promise<Response>): Promise<Response>;
+  enqueueRequest?(fetchFn: () => Promise<Response>, opts?: { busyWaitMs?: number }): Promise<Response>;
 
   /**
    * Optional auth refresh (e.g., OAuth token rotation).

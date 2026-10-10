@@ -80,7 +80,15 @@ import {
   onNominalRefusal,
   getArmGraceMs,
   extractSessionKey,
+  recordServedStepForNotices,
+  servedStepForNotices,
 } from "./fork/failover.js";
+import {
+  readStepSkip,
+  stepSkipDisabled,
+  readStepBusyWaitMs,
+  markCascadeStepAttempt,
+} from "./handlers/shared/step-skip.js";
 import {
   appendCapabilityQueryToMessage,
   isCapabilityVocabEnabled,
@@ -920,7 +928,15 @@ export async function createProxyServer(
      * the target, so a keyless request whose modelMap entry is a budget model
      * still resolves there and is then refused by the keyless guard below.
      */
-    suppressFailover = false
+    suppressFailover = false,
+    /**
+     * #431: step indexes this request has already skipped (context overflow /
+     * busy). Threaded into the 2a resolution so the handler swap and the
+     * loop's own bookkeeping resolution agree — they run twice per attempt
+     * and a divergence would build the handler for one step while the loop
+     * advances past another. Undefined for every non-loop caller.
+     */
+    skipSteps?: ReadonlySet<number>
   ): Promise<ModelHandler> => {
     // 1. Monitor Mode Override
     if (monitorMode) return nativeHandler;
@@ -959,7 +975,7 @@ export async function createProxyServer(
       // #275: the diversion test is bucket-scoped — compute this request's
       // nominal bucket (unless the caller — the cascade loop — already did).
       const bucket = nominalBucket ?? (await nominalBucketOfModel(requestedModel));
-      const resolved = resolveFailoverTargetForSession(role, sessionKey, bucket);
+      const resolved = resolveFailoverTargetForSession(role, sessionKey, bucket, skipSteps);
       if (resolved.step && resolved.step.target !== target) {
         log(
           `[Proxy] Failover: role '${role}' [${bucket}] ${target} → ${resolved.step.target} step[${resolved.stepIndex}] (${resolved.step.label})`
@@ -1241,6 +1257,13 @@ export async function createProxyServer(
     // first servable cascade step at most ONCE per request, whatever the loop
     // does afterwards.
     let overloadWalked = false;
+    // #431: cascade steps THIS request has skipped (context overflow / busy) —
+    // request-scoped memory for both resolutions (handler swap + loop read),
+    // so the walk advances past a step that cannot take the request instead of
+    // re-paying it. Never contains the last index: a skip fires only when a
+    // successor exists. Writes NO fleet state — no markStepFailed, no bucket
+    // wall, no arm — the step is healthy, the request just does not fit.
+    const skippedSteps = new Set<number>();
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const handler = await getHandlerForRequest(
         requestedModel,
@@ -1248,10 +1271,11 @@ export async function createProxyServer(
         sessionKey,
         bucket,
         undefined,
-        keylessNative
+        keylessNative,
+        skippedSteps
       );
       const resolved = role && !keylessNative
-        ? resolveFailoverTargetForSession(role, sessionKey, bucket)
+        ? resolveFailoverTargetForSession(role, sessionKey, bucket, skippedSteps)
         : { step: null, stepIndex: -1 };
       const { stepIndex } = resolved;
       // #274 (review 29/09): when this attempt serves a role-step's DELEGATION,
@@ -1349,10 +1373,86 @@ export async function createProxyServer(
         log(`[Proxy] native pin: '${modelBeforePin}' → '${pinnedModel}' (modelMap role target)`, true);
         body.model = pinnedModel;
       }
+      // #431 AC3: arm the bounded busy wait for THIS attempt only — a cascade
+      // step (stepIndex >= 0) skips forward when the endpoint limiter stays
+      // full past the knob; the nominal keeps its unbounded FIFO (AC3: "the
+      // nominal path keeps its current behavior"). Marked here, after the
+      // guards that `continue`/return, so only an attempt that will actually
+      // be served pays for the marking. The kill switch gates it: off = no
+      // bound anywhere, today's behavior.
+      //
+      // CR S2/S3: the bound applies to a NON-LAST step only — on the last step
+      // (and on the nominal) the 529-skip has no successor to advance to, so a
+      // bound there converts a long-but-finite queue wait into an empty-skip
+      // surface. The unbounded re-mark (0) matters for the SAME request: the
+      // marking is per-ATTEMPT state on the Context, and an earlier attempt of
+      // this request may have already set a bound that must not survive into
+      // the final attempt.
+      if (role && !stepSkipDisabled()) {
+        if (rule != null && stepIndex >= 0 && stepIndex < rule.steps.length - 1) {
+          markCascadeStepAttempt(c, readStepBusyWaitMs());
+        } else {
+          markCascadeStepAttempt(c, 0);
+        }
+      }
       response = await handler.handle(c, body);
       if (pinnedModel && !response.ok) body.model = modelBeforePin;
+      // #431 AC1/AC3 — a step that cannot take THIS request skips forward.
+      // Two shapes, one header: `context` rides the overflow recovery turn
+      // (HTTP 200 — classified from upstream or short-circuited by the learned
+      // cap; without this block that ok would run the SUCCESS bookkeeping and
+      // pin the session onto a step that just refused the prompt), `busy`
+      // rides the bounded 529. Advance requires: a cascade step, a successor
+      // (never the last step — its recovery turn / 529 IS the client's answer
+      // today and stays so), and the kill switch off. No markStepFailed, no
+      // bucket wall, no arm: the step is healthy, the request does not fit.
+      // The dwell pin is handled at the resolution (a pin on the skipped
+      // index yields for this request; the re-pin lands on the successor,
+      // which is now what serves this session). Body drained: a discarded
+      // recovery stream is a connection held open for nothing.
+      {
+        const stepSkip = readStepSkip(response);
+        if (
+          stepSkip &&
+          role &&
+          stepIndex >= 0 &&
+          rule != null &&
+          stepIndex < rule.steps.length - 1 &&
+          // CR S4: a skip on the LAST iteration has no attempt left to advance
+          // to — without this guard the `continue` would exit the loop and fall
+          // through to the empty-return path, handing the client a bare 200
+          // with no message_stop. The recovery turn / 529 of the last attempt
+          // must be the answer (the predicate above normally prevents this —
+          // the last STEP cannot skip — but `maxAttempts` can be exhausted one
+          // iteration before the last step is reached, e.g. a delegated
+          // resolution that advanced mid-request).
+          attempt + 1 < maxAttempts &&
+          !stepSkipDisabled()
+        ) {
+          log(
+            `[Failover] SKIP ${role}[${stepIndex}] reason=${stepSkip.reason}` +
+              (stepSkip.detail ? ` ${stepSkip.detail}` : "") +
+              ` (${attemptConcreteNow ?? resolved.step?.target ?? "?"}) — advancing to next step, no failure mark`,
+            true // forceConsole — operational event (#431 AC4)
+          );
+          skippedSteps.add(stepIndex);
+          try {
+            await response.body?.cancel();
+          } catch {
+            // already gone — nothing to drain
+          }
+          continue;
+        }
+      }
       if (response.ok) {
         if (role) {
+          // #431 CR B1: record the step that actually produced this response —
+          // the notice builders (applyFailoverNotices) resolve "who is serving"
+          // generically and cannot see request-local skips, so without this a
+          // successor-served turn announced the SKIPPED step's name. No-op on
+          // the nominal (stepIndex -1 / undefined step), and cleared-by-design
+          // per request (WeakMap on the Context).
+          recordServedStepForNotices(c, role, resolved.step, stepIndex);
           if (stepIndex === -1) onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
           else resetStepSuccess(role, stepIndex);
           // #274: the concrete model succeeded — clear the OWNING side too,
@@ -2121,7 +2221,8 @@ export async function createProxyServer(
         sessionKey,
         body.stream === true,
         noticePolicyForIngress(c.req.path),
-        requestBucket
+        requestBucket,
+        servedStepForNotices(c, requestRole) // #431 CR B1: name the step that actually served
       );
       // The `await` is load-bearing (218c3586): `return promise` hands it back
       // BEFORE it settles, so a rejection escapes this try/catch entirely and
@@ -2221,7 +2322,8 @@ export async function createProxyServer(
         extractSessionKey(anthropicBody),
         wantsStream,
         noticePolicyForIngress(c.req.path),
-        requestBucket
+        requestBucket,
+        servedStepForNotices(c, requestRole) // #431 CR B1: name the step that actually served
       );
 
       // Translate the final Anthropic response to OpenAI shape.

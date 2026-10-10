@@ -119,13 +119,22 @@ export class AnthropicProviderTransport implements ProviderTransport {
    * backoff-retry + cross-provider fallback), since it isn't visible from the
    * Response status alone.
    */
-  async enqueueRequest(fetchFn: () => Promise<Response>): Promise<Response> {
+  async enqueueRequest(fetchFn: () => Promise<Response>, opts?: { busyWaitMs?: number }): Promise<Response> {
     // Gates the fetch, not the backoff sleep — see OpenAIProviderTransport for
     // the full rationale. A slot held across a backoff blocks the lane while the
     // backend is idle; here that matters most, because these providers share one
     // cluster-wide key and therefore throttle in synchronized bursts.
-    const gate = (fn: () => Promise<Response>): Promise<Response> =>
-      this.limiter ? this.limiter.run(fn) : fn();
+    // opts.busyWaitMs (#431): bounded queue wait — StepBusyError propagates to
+    // ComposedHandler's skip response; undefined = today's unbounded FIFO.
+    // CR S1: first admission only — the gate runs at every 429-retry
+    // iteration, and a bound riding a retry surfaces as a skip for a request
+    // the backend already 429'd (see OpenAIProviderTransport for the full text).
+    let firstAdmission = true;
+    const gate = (fn: () => Promise<Response>): Promise<Response> => {
+      const budget = firstAdmission ? opts?.busyWaitMs : undefined;
+      firstAdmission = false;
+      return this.limiter ? this.limiter.run(fn, budget) : fn();
+    };
 
     const runWith429Retry = async (): Promise<Response> => {
       const maxRetries = 5;
