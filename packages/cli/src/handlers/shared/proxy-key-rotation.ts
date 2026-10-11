@@ -38,6 +38,15 @@ let previousKey: string | null = null;
 let buckets: Map<string, BucketHit> | null = null;
 
 /**
+ * Requests already counted, keyed by the raw Request object (same identity
+ * from the fork middleware to the handler — Hono threads one Context, one
+ * `c.req.raw`, through `next()`). One authentication, one count: the
+ * middleware marks what it counted and both native swap sites skip a marked
+ * request instead of counting the same authentication twice.
+ */
+const countedRequests = new WeakSet<object>();
+
+/**
  * Activate (or deactivate) tracking. Called once at proxy startup, right
  * where `resolveProxyKeys()` runs. An empty/unset previous key leaves the
  * tracker inert — /health then omits the fields entirely, which is itself
@@ -73,15 +82,25 @@ export function proxyKeyAuthBucket(headers: Record<string, string | undefined>):
  * that counts everything measures nothing).
  *
  * Called at every site that ACCEPTS a proxy key: the fork auth middleware
- * (non-Anthropic ingress) and the two native proxyKey→Anthropic swaps
- * (/v1/messages in NativeHandler, count_tokens in proxy-server). Each
- * request crosses exactly one of them, so a request counts at most once.
+ * (BOTH branches — the native exemption branch decides the keyless mark
+ * through `matchesProxyKey` on this very key, and a bare `claude-*` remapped
+ * by modelMap to a remote lane never reaches any swap site, so the
+ * middleware is the ONLY site that can count it) and the two native
+ * proxyKey→Anthropic swaps (/v1/messages in NativeHandler, count_tokens in
+ * proxy-server). A request can now cross several of those sites, so callers
+ * that hold the raw request pass it: a request already counted (marked) is
+ * skipped — one authentication, one count.
  */
 export function noteProxyKeyAuthentication(
   provided: string | undefined,
-  headers: Record<string, string | undefined>
+  headers: Record<string, string | undefined>,
+  raw?: object
 ): void {
   if (!previousKey || !buckets || provided === undefined || provided !== previousKey) return;
+  if (raw !== undefined) {
+    if (countedRequests.has(raw)) return;
+    countedRequests.add(raw);
+  }
   const bucket = proxyKeyAuthBucket(headers);
   const now = Date.now();
   const hit = buckets.get(bucket) ?? { count: 0, lastAt: now, lastMarkerAt: 0 };

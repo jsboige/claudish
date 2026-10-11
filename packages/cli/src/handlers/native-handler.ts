@@ -234,7 +234,10 @@ export class NativeHandler implements ModelHandler {
       if (matchesProxyKey(clientAuthToken, this.proxyKeys)) {
         // #439 — this swap is one of the sites that ACCEPT a proxy key:
         // count it when it is the retiring one (no-op outside a window).
-        noteProxyKeyAuthentication(clientAuthToken, originalHeaders);
+        // The raw request carries the middleware's mark when the fork
+        // middleware already counted this authentication (exemption
+        // branch) — then this site skips, keeping one request = one count.
+        noteProxyKeyAuthentication(clientAuthToken, originalHeaders, c.req.raw);
         // Strip proxy key from forwarded headers
         delete headers["x-api-key"];
         delete headers["authorization"];

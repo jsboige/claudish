@@ -2039,7 +2039,9 @@ export async function createProxyServer(
           if (matchesProxyKey(clientAuthToken, proxyKeys)) {
             // #439 — this swap is one of the sites that ACCEPT a proxy key:
             // count it when it is the retiring one (no-op outside a window).
-            noteProxyKeyAuthentication(clientAuthToken, c.req.header());
+            // The middleware's mark on c.req.raw (exemption branch, which
+            // count_tokens crosses — /v1/*) keeps one request = one count.
+            noteProxyKeyAuthentication(clientAuthToken, c.req.header(), c.req.raw);
             delete reqHeaders["x-api-key"];
             delete reqHeaders["authorization"];
             if (anthropicApiKey) {

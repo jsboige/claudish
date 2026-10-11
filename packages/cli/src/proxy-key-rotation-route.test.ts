@@ -16,18 +16,27 @@
  *   R2  no machine header ⇒ counted under the UA product-token bucket
  *   R3  _PREVIOUS unset ⇒ the retiring key is refused (401) and /health
  *       omits the fields entirely
- *   R4  native swap (/v1/messages) with the previous key ⇒ counted there
- *       (the middleware exemption path must not double-count)
- *   R5  native count_tokens swap ⇒ counted
+ *   R4  native passthrough (/v1/messages) with the previous key ⇒ counted
+ *       EXACTLY once — the middleware exemption branch and the NativeHandler
+ *       swap both see the key; the raw-request mark keeps one request = one
+ *       count (review of 91311241, pin b)
+ *   R5  native count_tokens swap ⇒ counted (exactly once, same mechanism)
  *   R6  the forceConsole marker fires once per bucket per hour — a second
  *       hit inside the window is counted but stays silent
+ *   R7  bare `claude-sonnet-5-5` remapped by modelMap onto the budget lane
+ *       + previous key ⇒ 200 served by the budget, counted ONCE — the
+ *       dominant fleet shape: the exemption branch is the only site a
+ *       remapped bare claude-* ever crosses (review of 91311241, pin a)
  *
  * Mutation proof (executed against this file, recorded in the PR):
  *   - remove the `noteProxyKeyAuthentication` call in the fork auth
- *     middleware ⇒ R1, R2 red (no bucket ever appears on /health).
- *   - remove the call in NativeHandler's swap ⇒ R4 red alone (R1/R2 green:
- *     the middleware site is intact) — proving the two sites are separately
- *     pinned.
+ *     middleware's ENFORCE branch ⇒ R1, R2 red (no bucket ever appears).
+ *   - remove the call in the middleware's EXEMPTION branch ⇒ R7 red alone
+ *     (R4 stays green: the swap site still counts a passthrough) — the
+ *     remapped class is pinned separately from the swap class (pin c).
+ *   - remove the WeakSet skip (`countedRequests.has(raw)`) ⇒ R4 red at 2 —
+ *     a passthrough crosses exemption branch AND swap; the mark is what
+ *     keeps one authentication = one count.
  *   - drop the `lastMarkerAt` rate-limit check ⇒ R6 red (two markers).
  */
 
@@ -76,6 +85,14 @@ const STORED_ANTHROPIC_KEY = "sk-ant-api03-fake-439";
 const OPUS = "claude-opus-5-5";
 /** Non-native target: the fake custom endpoint (server-held credential). */
 const BUDGET_TARGET = "bud-ep@fake-bud";
+/**
+ * R7 — the review repro verbatim: a bare `claude-*` whose ROLE resolves
+ * through modelMap onto a remote lane. The middleware exemption branch
+ * still admits it (claude-* parses native-anthropic), then the route
+ * handler remaps it — no native swap site is ever crossed. modelMap is the
+ * 6th positional parameter of createProxyServer, not a config.json field.
+ */
+const MODEL_MAP = { sonnet: BUDGET_TARGET };
 
 let activeProxy: ProxyServer | null = null;
 const realFetch = globalThis.fetch;
@@ -83,17 +100,35 @@ const realFetch = globalThis.fetch;
 let markers: string[] = [];
 const realStderrWrite = process.stderr.write.bind(process.stderr);
 
+/**
+ * OpenAI-shaped SSE upstream (same contract as healthySSE in the other
+ * in-process route tests — a plain JSON body parses as zero data: lines and
+ * the lane reports EMPTY RESPONSE). Distinctive text: R7 asserts the
+ * REMAPPED bare claude-* was served by this lane, not by the native
+ * passthrough ("ok" from anthropicMessage).
+ */
 function budgetMessage(): Response {
-  return new Response(
-    JSON.stringify({
+  const chunk = (delta: any, finish_reason: string | null = null) =>
+    `data: ${JSON.stringify({
       id: "chatcmpl-fake",
-      object: "chat.completion",
+      object: "chat.completion.chunk",
       created: 1,
       model: "fake-bud",
-      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
-      usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+      choices: [{ index: 0, delta, finish_reason }],
+    })}\n\n`;
+  const sse =
+    chunk({ role: "assistant", content: "" }) +
+    chunk({ content: "ok-budget" }) +
+    chunk({}, "stop") +
+    "data: [DONE]\n\n";
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sse));
+        controller.close();
+      },
     }),
-    { status: 200, headers: { "content-type": "application/json" } }
+    { status: 200, headers: { "content-type": "text/event-stream" } }
   );
 }
 
@@ -193,7 +228,7 @@ async function spinWindowOpen(): Promise<void> {
     undefined,
     false,
     STORED_ANTHROPIC_KEY,
-    undefined,
+    MODEL_MAP,
     { quiet: true }
   );
 }
@@ -208,7 +243,7 @@ async function spinWindowClosed(): Promise<void> {
     undefined,
     false,
     STORED_ANTHROPIC_KEY,
-    undefined,
+    MODEL_MAP,
     { quiet: true }
   );
 }
@@ -323,28 +358,61 @@ describe("#439 R3 — no _PREVIOUS ⇒ /health omits the fields, old key refused
   });
 });
 
-// ---- R4/R5: the native swap sites -------------------------------------------------
+// ---- R4/R5: native passthrough — exactly once despite two crossings ----------------
 
-describe("#439 R4/R5 — native swap counts, exactly once per site", () => {
-  test("/v1/messages native swap and count_tokens swap both count the machine bucket", async () => {
+describe("#439 R4/R5 — native passthrough counted exactly once (mark prevents double)", () => {
+  test("/v1/messages and count_tokens each count 1, never 2", async () => {
     await spinWindowOpen();
     const auth = { "x-api-key": PREVIOUS_KEY, "X-Claudish-Machine": "myia-ai-01" };
 
-    // R4 — the native lane is EXEMPT from the middleware; the swap inside
-    // NativeHandler is the only site that sees the key.
+    // R4 (pin b) — a native passthrough crosses BOTH counting sites: the
+    // middleware exemption branch (native-anthropic model) counts and marks
+    // c.req.raw, then NativeHandler's swap sees the same key and must SKIP.
+    // Exactly 1 — 2 would mean the mark is not threaded.
     const r4 = await post("/v1/messages", OPUS, auth);
     expect(r4.status).toBe(200);
+    let h = await health();
+    expect(h.proxyKeyPreviousHits).toEqual({ "myia-ai-01": 1 });
 
-    // R5 — the count_tokens native path has its own swap (proxy-server.ts).
+    // R5 — count_tokens crosses the middleware (/v1/*) the same way, then
+    // proxy-server's own swap: same mark, same exactly-once.
     const r5 = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages/count_tokens`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", ...auth },
       body: JSON.stringify({ model: OPUS, messages: [{ role: "user", content: "hi" }] }),
     });
     expect(r5.status).toBe(200);
-
-    const h = await health();
+    h = await health();
     expect(h.proxyKeyPreviousHits).toEqual({ "myia-ai-01": 2 });
     expect(markers.filter((m) => m.includes("myia-ai-01"))).toHaveLength(1);
+  });
+});
+
+// ---- R7: the dominant fleet shape — remapped bare claude-* (pin a) -----------------
+
+describe("#439 R7 — remapped bare claude-* counted in the exemption branch", () => {
+  test("claude-sonnet-5-5 + modelMap→budget + previous key ⇒ 200 budget, counted once", async () => {
+    await spinWindowOpen();
+    // The review repro verbatim (91311241 review, measured 200 + hits {}):
+    // bare claude-sonnet-5-5, x-proxy-key = PREVIOUS. The middleware takes
+    // the exemption branch and returns next() — before the fix, the request
+    // was served by the budget lane with the retiring key and NO site ever
+    // counted it: the P4 criterion would have read green while the holder
+    // was heading for a 401 at the cut.
+    const res = await post("/v1/messages", "claude-sonnet-5-5", {
+      "x-proxy-key": PREVIOUS_KEY,
+      "X-Claudish-Machine": "myia-po-2023",
+    });
+    expect(res.status).toBe(200);
+
+    // Served by the BUDGET lane (remapped), not the native passthrough.
+    const body = await res.json();
+    const text = (body.content ?? []).map((b: any) => b.text ?? "").join("");
+    expect(text).toContain("ok-budget");
+
+    // Counted exactly once, under the machine bucket.
+    const h = await health();
+    expect(h.proxyKeyPreviousHits).toEqual({ "myia-po-2023": 1 });
+    expect(markers.filter((m) => m.includes("myia-po-2023"))).toHaveLength(1);
   });
 });
