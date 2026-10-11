@@ -247,6 +247,9 @@ beforeEach(() => {
         // so their limiters are built with maxConcurrency from the first use.
         "b0-ep": ep("b0", { maxConcurrency: 1 }),
         "b1-ep": ep("b1"),
+        // K12 (#441): the dynamic contextLimit endpoints.
+        "ctx-ep": ep("ctx", { contextLimit: 262144 }),
+        "ctx-both-ep": ep("ctxb", { contextLimit: 262144, maxOutputTokens: 8000 }),
       },
     }),
     "utf-8"
@@ -520,6 +523,48 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     // And an endpoint WITHOUT the field keeps the verbatim passthrough.
     await postMessage({ model: "s0-ep@fake-s0", maxTokens: 32000 }); // body inspected, answer unused
     expect(upstreamBodies.s0[0].max_tokens).toBe(32000);
+  }, 30_000);
+
+  test("K12 (#441): contextLimit clamps max_tokens to the window remainder — dynamic, composed, inert when absent", async () => {
+    await spin();
+    resetFailoverForTests({}); // direct endpoints, no cascade
+    setRoleNominalResolver(() => undefined);
+
+    // The RX95 compaction shape: ~249 850 prompt tokens (999 400 chars / 4,
+    // the house estimator's convention) against a 262 144 Swift window —
+    // vLLM refuses any prompt + max_tokens over the window without trimming
+    // (vllm#110). Fleet-standard compact ask: max_tokens 16384.
+    const rx95Prompt = "y".repeat(999_400);
+
+    // 1. THE DoD PIN: the shipped max_tokens fits the remainder.
+    //    262144 − ~249850 − 2048 (margin) ≈ 10 246; the wire must not exceed
+    //    12294 − 2048, and must stay ABOVE the static-cap class (> 9000) —
+    //    proving the clamp is the dynamic remainder, not a disguised constant.
+    await postMessage({ model: "ctx-ep@fake-ctx", maxTokens: 16384, content: rx95Prompt });
+    expect(upstreamBodies.ctx?.length).toBe(1);
+    const shipped = upstreamBodies.ctx[0].max_tokens;
+    expect(shipped).toBeLessThanOrEqual(12_294 - 2_048);
+    expect(shipped).toBeGreaterThan(9_000);
+    expect(shipped).toBeLessThan(16_384); // actually clamped
+
+    // 2. Byte-identical when the field is absent: same oversized prompt on a
+    //    plain endpoint ships max_tokens verbatim (pre-#441 behavior).
+    await postMessage({ model: "s0-ep@fake-s0", maxTokens: 16384, content: rx95Prompt });
+    expect(upstreamBodies.s0[0].max_tokens).toBe(16_384);
+
+    // 3. Composition with the #431 static cap: smallest wins (8000 < ~10246).
+    await postMessage({ model: "ctx-both-ep@fake-ctxb", maxTokens: 16384, content: rx95Prompt });
+    expect(upstreamBodies.ctxb[0].max_tokens).toBe(8_000);
+
+    // 4. Never clamps down a small ask: 100 < remainder → verbatim.
+    await postMessage({ model: "ctx-ep@fake-ctx", maxTokens: 100, content: "say hi" });
+    expect(upstreamBodies.ctx[1].max_tokens).toBe(100);
+
+    // 5. Stand-down when the prompt ALONE overflows: estimate past the window
+    //    leaves no output budget — the clamp must not fire (max_tokens
+    //    verbatim); the upstream refusal + context-overflow recovery own it.
+    await postMessage({ model: "ctx-ep@fake-ctx", maxTokens: 16384, content: "z".repeat(1_200_000) });
+    expect(upstreamBodies.ctx[2].max_tokens).toBe(16_384);
   }, 30_000);
 
   test("K8 (AC3): saturated limiter on a non-last step → bounded wait, skip to the successor, no failure mark", async () => {

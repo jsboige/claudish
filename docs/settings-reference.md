@@ -563,6 +563,7 @@ For OpenAI- or Anthropic-compatible servers:
 | `models` | string[] | no | Restrict to listed models; omit to allow any |
 | `maxConcurrency` | integer 0–32 | no | Max concurrent in-flight requests (0 = unlimited, 1 = sequential; omit = unbounded). For capacity-limited backends (single-GPU vLLM). An out-of-range value **fails validation and skips the whole entry** — the endpoint leaves the routing table. |
 | `maxOutputTokens` | integer ≥ 1 | no | #431 — clamps `max_tokens` DOWN to this before the request leaves (never up; unset = verbatim). vLLM counts `prompt + max_tokens` against `--max-model-len` and refuses rather than trims: a ~240k prompt with the fleet-standard `max_tokens: 32000` against a 262144 window is a refusal; with the cap at 8192 the same prompt is served. Same field on simple and complex kinds. |
+| `contextLimit` | integer ≥ 1 | no | #441 — the endpoint's TOTAL window (`--max-model-len` on vLLM: prompt + output counted together, refusal never trim). When set, `max_tokens` is clamped per request to `contextLimit − promptEstimate − 2048` (estimate = the house /4 convention, `estimatePayloadTokens`). This is the dynamic complement of `maxOutputTokens`: a compaction turn at the RX95 window (~250k prompt) with the fleet-standard `max_tokens: 32000` ships ~10k against a 262144 window instead of 400ing. Smallest cap wins when both fields are set. If the estimate alone overflows the window, the clamp stands down (max_tokens verbatim) — that turn belongs to the context-overflow recovery path (#431 K1–K5). Unset = verbatim passthrough. Zero-code alternative (#441 option A): a plain `maxOutputTokens: 12000` also fits the RX95 window, but caps EVERY request — `contextLimit` only caps the ones near the window. Same field on simple and complex kinds. |
 
 Usage: `claudish --model my-vllm@llama3.1-70b "task"`
 
@@ -605,6 +606,7 @@ Full control over transport, auth, headers, and stream format:
 | `models` | string[] | no | Restrict to listed models |
 | `maxConcurrency` | integer 0–32 | no | Same as the simple kind |
 | `maxOutputTokens` | integer ≥ 1 | no | #431 — same as the simple kind: clamps `max_tokens` down before the request leaves |
+| `contextLimit` | integer ≥ 1 | no | #441 — same as the simple kind: dynamic `contextLimit − promptEstimate − 2048` clamp |
 | `omitReasoningContent` | boolean | no | Drops `reasoning_content` from outbound assistant messages (strict-schema backends) |
 
 ### Environment variable expansion

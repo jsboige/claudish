@@ -63,6 +63,17 @@ export const CustomEndpointSimpleSchema = z.object({
    */
   maxOutputTokens: z.number().int().min(1).optional(),
   /**
+   * #441 — dynamic output clamp: the provider's TOTAL window (`--max-model-len`
+   * on vLLM, `prompt + max_tokens` counted together, refusal never trim —
+   * vllm#110). When set, `max_tokens` is clamped to
+   * `contextLimit − promptEstimate − 2048` per request (estimate = the house
+   * /4 convention, see `estimatePayloadTokens`), so a compaction turn at the
+   * RX95 window (250k) still fits a 262 144 Swift window instead of 400ing.
+   * Composes with `maxOutputTokens` (the smaller cap wins). Unset = verbatim
+   * passthrough (today's behavior).
+   */
+  contextLimit: z.number().int().min(1).optional(),
+  /**
    * Drop `reasoning_content` from outbound assistant messages.
    *
    * The OpenAI-format converter emits that field whenever a thinking block is
@@ -107,6 +118,8 @@ export const CustomEndpointComplexSchema = z.object({
   maxConcurrency: z.number().int().min(0).max(32).optional(),
   /** See CustomEndpointSimpleSchema.maxOutputTokens (#431 output cap). */
   maxOutputTokens: z.number().int().min(1).optional(),
+  /** See CustomEndpointSimpleSchema.contextLimit (#441 dynamic clamp). */
+  contextLimit: z.number().int().min(1).optional(),
   /** See CustomEndpointSimpleSchema.omitReasoningContent. */
   omitReasoningContent: z.boolean().optional(),
 });

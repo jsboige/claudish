@@ -92,6 +92,18 @@ export function estimatePayloadTokens(payload: unknown): number {
   }
 }
 
+/**
+ * #441 — safety margin subtracted from `contextLimit − promptEstimate` before
+ * the dynamic max_tokens clamp. Covers the two drifts the /4 estimator cannot
+ * see: a tokenizer reading structured JSON yields MORE tokens than chars/4
+ * (every `{`/`"`/`:` is a token), and the wire prompt is the CONVERTED payload
+ * (openai or anthropic), not the Claude-shaped request we estimate — a few
+ * percent of shape delta at 250k. Over-estimating the prompt is safe (it only
+ * shrinks max_tokens further); UNDER-estimating re-arms the vLLM 400 this
+ * clamp exists to prevent. 2048 ≈ 0.8% of the Swift window (262 144).
+ */
+export const CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS = 2048;
+
 // ── Learned provider cap ──────────────────────────────────────────────────────
 // providerKey → last rejected estimate. In-memory only (cleared on restart): the
 // first oversized request after a restart pays one round-trip to relearn, which is
