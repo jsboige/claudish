@@ -15,6 +15,7 @@
 import type { MiddlewareHandler } from "hono";
 import { wrapAnthropicError } from "../../handlers/shared/anthropic-error.js";
 import { matchesProxyKey } from "../../handlers/shared/proxy-keys.js";
+import { noteProxyKeyAuthentication } from "../../handlers/shared/proxy-key-rotation.js";
 import {
   acquireInboundSlot,
   inboundInFlight,
@@ -175,6 +176,13 @@ export function createProxyAuthMiddleware(
     if (!matchesProxyKey(provided, proxyKeys)) {
       return c.json(wrapAnthropicError(401, "invalid proxy authentication"), 401);
     }
+    // #439 — the request is authenticated and this middleware is the site
+    // that accepted the key: count it when it is the retiring one. Native
+    // lanes never reach this line (exempted above); their swap counts there.
+    noteProxyKeyAuthentication(provided, {
+      "x-claudish-machine": c.req.header("x-claudish-machine"),
+      "user-agent": c.req.header("user-agent"),
+    });
     await next();
   };
 }
