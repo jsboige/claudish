@@ -93,16 +93,26 @@ export function estimatePayloadTokens(payload: unknown): number {
 }
 
 /**
- * #441 — safety margin subtracted from `contextLimit − promptEstimate` before
- * the dynamic max_tokens clamp. Covers the two drifts the /4 estimator cannot
- * see: a tokenizer reading structured JSON yields MORE tokens than chars/4
- * (every `{`/`"`/`:` is a token), and the wire prompt is the CONVERTED payload
- * (openai or anthropic), not the Claude-shaped request we estimate — a few
- * percent of shape delta at 250k. Over-estimating the prompt is safe (it only
- * shrinks max_tokens further); UNDER-estimating re-arms the vLLM 400 this
- * clamp exists to prevent. 2048 ≈ 0.8% of the Swift window (262 144).
+ * #441 — FLOOR of the safety margin subtracted from `contextLimit − promptEstimate`
+ * before the dynamic max_tokens clamp. The margin actually applied is
+ * proportional — `max(this floor, est/64)` — because the /4 estimator drifts
+ * toward /3.5 on code-dense prompts: a fixed margin covers none of that at
+ * 250k, a proportional one tracks it (~1.6% of the prompt, ~3.9k at the RX95
+ * window; pre-review #442, ai-01 2026-10-11). Covers the two drifts the /4
+ * estimator cannot see: a tokenizer reading structured JSON yields MORE tokens
+ * than chars/4 (every `{`/`"`/`:` is a token), and the wire prompt is the
+ * CONVERTED payload (openai or anthropic), not the Claude-shaped request we
+ * estimate — a few percent of shape delta at 250k. Over-estimating the prompt
+ * is safe (it only shrinks max_tokens further); UNDER-estimating re-arms the
+ * vLLM 400 this clamp exists to prevent. 2048 ≈ 0.8% of the Swift window
+ * (262 144).
  */
 export const CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS = 2048;
+
+/** #441 — the margin actually applied for a given prompt estimate. */
+export function contextLimitMarginTokens(est: number): number {
+  return Math.max(CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS, Math.ceil(est / 64));
+}
 
 // ── Learned provider cap ──────────────────────────────────────────────────────
 // providerKey → last rejected estimate. In-memory only (cleared on restart): the

@@ -48,6 +48,7 @@ import {
   classifyContextOverflow,
   estimatePayloadTokens,
   CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS,
+  contextLimitMarginTokens,
   rememberOverflowCap,
   getOverflowCap,
   overflowReportFloor,
@@ -280,7 +281,7 @@ export interface ComposedHandlerOptions {
   /**
    * #441 — per-endpoint TOTAL window (prompt + output counted together, as
    * vLLM's `--max-model-len` does). When set, `max_tokens` is clamped to
-   * `contextLimit − estimatePayloadTokens(request) − CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS`
+   * `contextLimit − estimatePayloadTokens(request) − max(2048, est/64)`
    * per request — the dynamic complement of the #431 static cap, so a
    * compaction turn at the RX95 window (~250k prompt) fits a 262 144 Swift
    * window instead of hitting vLLM's refusal-without-trim (vllm#110). If the
@@ -565,11 +566,14 @@ export class ComposedHandler implements ModelHandler {
     }
     if (this.options.contextLimit !== undefined && this.options.contextLimit > 0) {
       const est = estimatePayloadTokens(claudeRequest);
-      const dynamicCap =
-        this.options.contextLimit - est - CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS;
+      // Proportional margin (pre-review #442, ai-01 2026-10-11): the /4
+      // estimate drifts toward /3.5 on code-dense prompts — a fixed margin
+      // covers none of that at 250k.
+      const margin = contextLimitMarginTokens(est);
+      const dynamicCap = this.options.contextLimit - est - margin;
       if (dynamicCap >= 1 && (outputCap === undefined || dynamicCap < outputCap)) {
         outputCap = dynamicCap;
-        capSource = `contextLimit ${this.options.contextLimit} − est ${est} − ${CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS}, #441`;
+        capSource = `contextLimit ${this.options.contextLimit} − est ${est} − ${margin}, #441`;
       }
       // dynamicCap < 1: the prompt alone overflows the window — no output
       // budget can save the turn. Stand down and let the request leave; the

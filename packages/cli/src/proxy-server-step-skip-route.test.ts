@@ -537,14 +537,15 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     const rx95Prompt = "y".repeat(999_400);
 
     // 1. THE DoD PIN: the shipped max_tokens fits the remainder.
-    //    262144 − ~249850 − 2048 (margin) ≈ 10 246; the wire must not exceed
-    //    12294 − 2048, and must stay ABOVE the static-cap class (> 9000) —
-    //    proving the clamp is the dynamic remainder, not a disguised constant.
+    //    262144 − est(~249 880) − max(2048, est/64 ≈ 3 905) ≈ 8 360 — the
+    //    margin is PROPORTIONAL (pre-review #442): a fixed 2048 would ship
+    //    ~10 246 and turn this assert red. Bounds [7 500, 8 400] absorb the
+    //    envelope-JSON drift of the /4 estimate without touching either class.
     await postMessage({ model: "ctx-ep@fake-ctx", maxTokens: 16384, content: rx95Prompt });
     expect(upstreamBodies.ctx?.length).toBe(1);
     const shipped = upstreamBodies.ctx[0].max_tokens;
-    expect(shipped).toBeLessThanOrEqual(12_294 - 2_048);
-    expect(shipped).toBeGreaterThan(9_000);
+    expect(shipped).toBeLessThanOrEqual(8_400);
+    expect(shipped).toBeGreaterThan(7_500);
     expect(shipped).toBeLessThan(16_384); // actually clamped
 
     // 2. Byte-identical when the field is absent: same oversized prompt on a
