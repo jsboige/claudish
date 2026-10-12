@@ -24,12 +24,12 @@ skill **`worker-issues`**.
      (NDJSON) — relayer sur le dashboard les événements **plus récents que le
      watermark** (`~/.claudish/*-relay.ts`, une ligne ISO-UTC ; absent ⇒ tout relayer).
      **Mappings complets : `reference.md` §« Cycle »** —
-     résumé : `major-ask`, `role-alias-ask`, `new-model` touchant une cascade →
-     **ASK** (un seul ask par (id, alias), le journal déduplique) ; `killed`,
-     `kill-blocked-no-consent`, `rogue-schtasks`, `probe-fail`, `error`,
-     `catalog-error` → WARN ; `exempt`, `skip-*`, agrégats
-     `*-majority`/`*-minority`/`no-binding-*` (sauf volume anormal) → silence ; le
-     reste → INFO. Dures : watermark mis à jour après relais ; **JAMAIS tronquer les
+     résumé : `major-ask`, `role-alias-ask`, `new-model`/`model-gone` touchant une
+     cascade → **ASK** (un seul ask par (id, alias), le journal déduplique) ;
+     `killed` (crossPost global), `kill-blocked-no-consent`, `rogue-schtasks`,
+     `probe-fail`, `error`, `catalog-error` → WARN ; `exempt`, `skip-*`, `*-skip`,
+     agrégats `*-majority`/`*-minority`/`no-binding-*` (sauf volume anormal) →
+     silence ; le reste → INFO. Dures : watermark mis à jour après relais ; **JAMAIS tronquer les
      journaux** (trace durable des éditions d'infra) ; consent kill
      (`session-watch.kill.enabled`) : ≥24 h de journal sain avant armement, consigné.
 4. **Commit + PR AVANT le rapport** — ne jamais annoncer un travail non commité.

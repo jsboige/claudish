@@ -1,3 +1,14 @@
+<!--
+  reference.md — copie VERBATIM du runbook worker complet, tel que SKILL.md le portait
+  au commit 71491e7a (12/10/2026), avant le découpage #445 (A4).
+  NON chargé par défaut : le cœur opératoire est SKILL.md, qui pointe ici par section.
+  Tout ce qui suit la ligne de séparation ci-dessous est octet pour octet le SKILL.md de 71491e7a
+  (preuve : tail -n +12 reference.md | cmp - <(git show 71491e7a:.claude/skills/worker/SKILL.md)).
+  Instantané daté : les valeurs vivantes (cadence, topologie, pièges) font foi dans SKILL.md.
+  Pour justifier ou étendre une règle du cœur, lire la section homonyme ici.
+-->
+
+<!-- ===== verbatim SKILL.md @ 71491e7a ===== -->
 ---
 name: worker
 description: Running règle le rôle de worker du cluster claudish — boucle de cycle (dashboard → inbox → exécution → commit+PR → rapport DONE), ré-armement cadence, et pièges du périmètre hub observé par un worker. Équivalent côté exécutant du skill de coordination d'ai-01.
