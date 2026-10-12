@@ -576,12 +576,18 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     setRoleNominalResolver(() => undefined);
 
     // The review's measured shape (c.6114982206): "describe this screenshot"
-    // + a 1.03 MB base64 PNG asked max_tokens 16384 and was clamped to 558 —
-    // the /4 estimate charged ~257k for a block whose real cost is ~1.5k
-    // (vision lane) or ~0 (described/stripped by the vision fallback). With
-    // the fixed 1600-allocation the estimate stays ~2k → the ask ships
-    // VERBATIM (no clamp), the turn is not truncated.
-    const oneMbPng = "A".repeat(1_030_000);
+    // + a ~1 MB base64 PNG — the /4 estimate charges ~250k for a block whose
+    // real cost is ~1.5k (vision lane) or ~0 (described/stripped by the
+    // vision fallback). With the fixed 1600-allocation the estimate stays
+    // ~2k → the ask ships VERBATIM (no clamp), the turn is not truncated.
+    //
+    // Calibration note: the image is 1.00 MB (not the review's 1.03) so the
+    // MUTATION stays visible — with the useful-floor guard in force, a
+    // base64/4 estimate of ~258k yields dynamicCap ~113 < 4096 and the
+    // stand-down would mask the bug (verbatim in BOTH worlds). At 1.00 MB
+    // the mutated dynamicCap lands at ~8 200 ≥ 4 096: fix = verbatim 16384,
+    // mutation = clamped ~8 200. The pin bites.
+    const oneMbPng = "A".repeat(1_000_000);
     await postMessage({
       model: "ctx-ep@fake-ctx",
       maxTokens: 16384,
