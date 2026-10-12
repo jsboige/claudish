@@ -114,6 +114,21 @@ def parse_iso(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+def extract_complete(d):
+    """True only for a dir whose targeted extraction FINISHED. Same guard as
+    compaction-trend.extract_complete (marked dir, or both member patterns for
+    pre-marker dirs) -- `isdir and listdir` accepted a partial extraction left
+    by a killed run as complete (incident detail in compaction-trend.py)."""
+    if os.path.isfile(os.path.join(d, ".extract-complete")):
+        return True
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return False
+    return (any(n.startswith("req-") and n.endswith(".json") for n in names)
+            and any(n.startswith("resp-") and n.endswith(".sse") for n in names))
+
+
 def extract_archives(archives, scratch_root, since, until, model_substr):
     """Targeted extraction: LIST first, compute the targets from the NAMES
     (the model rides the resp filename; reqN + ts ride both), then one
@@ -130,7 +145,7 @@ def extract_archives(archives, scratch_root, since, until, model_substr):
     dirs = []
     for a in archives:
         dest = os.path.join(scratch_root, os.path.splitext(os.path.basename(a))[0])
-        if os.path.isdir(dest) and os.listdir(dest):
+        if extract_complete(dest):
             dirs.append(dest)
             continue
         os.makedirs(dest, exist_ok=True)
@@ -169,6 +184,7 @@ def extract_archives(archives, scratch_root, since, until, model_substr):
                         break
             print("extracting %d target files of %d ..." % (len(targets), len(names)))
             z.extract(path=dest, targets=sorted(targets))
+        open(os.path.join(dest, ".extract-complete"), "w").close()
         dirs.append(dest)
     return dirs
 

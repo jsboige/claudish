@@ -104,9 +104,29 @@ def fname_dt(date_h, minutes):
     return datetime.strptime(date_h + minutes, "%Y-%m-%dT%H%M")
 
 
+def extract_complete(d):
+    """True only for a dir whose extraction FINISHED.
+
+    `os.path.isdir(d) and os.listdir(d)` accepts a PARTIAL extraction: a 7z
+    run killed by a vanishing archive device (measured 2026-07-05, G: DriveFS
+    unmount) left every req and zero resp, and the census printed an empty
+    table for a day holding 10,498 responses while the archive was intact.
+    The marker is written after a clean extraction; dirs predating the marker
+    fall back to requiring both member patterns -- still strictly stronger
+    than a non-emptiness test."""
+    if os.path.isfile(os.path.join(d, ".extract-complete")):
+        return True
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return False
+    return (any(n.startswith("req-") and n.endswith(".json") for n in names)
+            and any(n.startswith("resp-") and n.endswith(".sse") for n in names))
+
+
 def day_dir(day, a, root):
     d = os.path.join(root, "comp-" + day)
-    if os.path.isdir(d) and os.listdir(d):
+    if extract_complete(d):
         return d
     archive = os.path.join(a.archives_dir, "captures-%s.7z" % day)
     if not os.path.isfile(archive):
@@ -116,6 +136,7 @@ def day_dir(day, a, root):
     subprocess.run([a.seven_z, "x", archive, "-o" + d,
                     "req-*.json", "resp-*.sse", "-y"],
                    check=True, stdout=subprocess.DEVNULL)
+    open(os.path.join(d, ".extract-complete"), "w").close()
     return d
 
 
