@@ -93,6 +93,52 @@ export function estimatePayloadTokens(payload: unknown): number {
 }
 
 /**
+ * #441/#442 — fixed token allocation charged for ONE image/document block
+ * when estimating for the dynamic clamp. A 1 MB screenshot is ~1.5k tokens
+ * on a vision lane and ~0 once described/stripped by the vision fallback —
+ * never the ~750k its base64 characters score under the /4 convention.
+ */
+export const MEDIA_BLOCK_TOKENS = 1600;
+
+/**
+ * Prompt estimate for the #441 dynamic clamp — DISTINCT from
+ * `estimatePayloadTokens` (the overflow-recovery estimate, where
+ * over-counting base64 is safe: an inflated count only compacts earlier).
+ * Here an inflated estimate TRUNCATES the answer: measured (review
+ * c.6114982206), a 1.03 MB screenshot plus "describe this screenshot"
+ * clamped max_tokens 16384 → 558 on a 262 144 window. Each image/document
+ * `source.data` is therefore replaced by a fixed MEDIA_BLOCK_TOKENS
+ * allocation instead of its base64 length / 4.
+ */
+export function estimateClampTokens(payload: unknown): number {
+  if (payload === undefined || payload === null) return 0;
+  let mediaBlocks = 0;
+  const strip = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(strip);
+    if (node === null || typeof node !== "object") return node;
+    const obj = { ...(node as Record<string, unknown>) };
+    const src = obj.source as Record<string, unknown> | undefined;
+    const hasMediaData =
+      src !== null && typeof src === "object" && typeof src.data === "string" && src.data.length > 0;
+    if (hasMediaData) {
+      mediaBlocks++;
+      obj.source = { ...src, data: "" };
+    }
+    for (const k of Object.keys(obj)) {
+      if (k === "source" && hasMediaData) continue; // replaced above — do not re-walk
+      obj[k] = strip(obj[k]);
+    }
+    return obj;
+  };
+  try {
+    const stripped = strip(payload);
+    return Math.ceil(JSON.stringify(stripped).length / 4) + mediaBlocks * MEDIA_BLOCK_TOKENS;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * #441 — FLOOR of the safety margin subtracted from `contextLimit − promptEstimate`
  * before the dynamic max_tokens clamp. The margin actually applied is
  * proportional — `max(this floor, est/64)` — because the /4 estimator drifts

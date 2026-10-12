@@ -47,6 +47,7 @@ import { appendUpstreamError } from "./shared/response-capture.js";
 import {
   classifyContextOverflow,
   estimatePayloadTokens,
+  estimateClampTokens,
   CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS,
   contextLimitMarginTokens,
   rememberOverflowCap,
@@ -281,14 +282,18 @@ export interface ComposedHandlerOptions {
   /**
    * #441 — per-endpoint TOTAL window (prompt + output counted together, as
    * vLLM's `--max-model-len` does). When set, `max_tokens` is clamped to
-   * `contextLimit − estimatePayloadTokens(request) − max(2048, est/64)`
-   * per request — the dynamic complement of the #431 static cap, so a
-   * compaction turn at the RX95 window (~250k prompt) fits a 262 144 Swift
-   * window instead of hitting vLLM's refusal-without-trim (vllm#110). If the
-   * estimate already leaves no room, the clamp stands down (max_tokens
-   * unchanged): the request is over-window whatever the output budget, and the
-   * context-overflow recovery path (#431 K1–K5) owns that case. Composes with
-   * `maxOutputTokens` — the smaller cap wins. Unset = verbatim passthrough.
+   * `contextLimit − clampEstimate(request) − max(2048, est/64)` per request —
+   * the dynamic complement of the #431 static cap, so a compaction turn at
+   * the RX95 window (~250k prompt) fits a 262 144 Swift window instead of
+   * hitting vLLM's refusal-without-trim (vllm#110). The clamp estimate
+   * replaces each image/document base64 block with a fixed 1600-token
+   * allocation (`estimateClampTokens`) — a 1 MB screenshot scores ~1.6k
+   * tokens, not ~750k (#442 review). If the remainder falls below a useful
+   * floor of `min(max_tokens asked, 4096)`, the clamp stands down (max_tokens
+   * unchanged): no useful output budget remains, and the upstream refusal +
+   * context-overflow recovery path (#431 K1–K5, SKIP stays reachable) own
+   * that case. Composes with `maxOutputTokens` — the smaller cap wins. Unset
+   * = verbatim passthrough.
    */
   contextLimit?: number;
 }
@@ -565,19 +570,26 @@ export class ComposedHandler implements ModelHandler {
       capSource = "endpoint maxOutputTokens cap, #431";
     }
     if (this.options.contextLimit !== undefined && this.options.contextLimit > 0) {
-      const est = estimatePayloadTokens(claudeRequest);
+      const est = estimateClampTokens(claudeRequest);
       // Proportional margin (pre-review #442, ai-01 2026-10-11): the /4
       // estimate drifts toward /3.5 on code-dense prompts — a fixed margin
       // covers none of that at 250k.
       const margin = contextLimitMarginTokens(est);
       const dynamicCap = this.options.contextLimit - est - margin;
-      if (dynamicCap >= 1 && (outputCap === undefined || dynamicCap < outputCap)) {
+      // Useful-floor guard (#442 review c.6114982206): below min(asked, 4096)
+      // the clamp would turn a recoverable upstream refusal into a truncated
+      // 200 — the exact shape #431 closed (SKIP reason=context must stay
+      // reachable on a non-last step; on /compact a truncated "summary").
+      const asked =
+        typeof claudeRequest.max_tokens === "number" ? claudeRequest.max_tokens : 4096;
+      const floor = Math.min(asked, 4096);
+      if (dynamicCap >= floor && (outputCap === undefined || dynamicCap < outputCap)) {
         outputCap = dynamicCap;
         capSource = `contextLimit ${this.options.contextLimit} − est ${est} − ${margin}, #441`;
       }
-      // dynamicCap < 1: the prompt alone overflows the window — no output
-      // budget can save the turn. Stand down and let the request leave; the
-      // upstream refusal + context-overflow recovery (#431 K1–K5) own it.
+      // dynamicCap < floor: no useful output budget remains in the window —
+      // stand down and let the request leave unclamped; the upstream refusal
+      // + context-overflow recovery (#431 K1–K5) own the turn.
     }
     if (
       outputCap !== undefined &&

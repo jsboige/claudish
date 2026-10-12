@@ -165,6 +165,8 @@ async function postMessage(
     model?: string;
     session?: string;
     content?: string;
+    /** K13 (#442 CR): raw Anthropic content blocks (e.g. a base64 image). */
+    contentBlocks?: unknown[];
     stream?: boolean;
     maxTokens?: number;
   } = {}
@@ -177,7 +179,7 @@ async function postMessage(
       max_tokens: opts.maxTokens ?? 64,
       stream: opts.stream ?? false,
       ...(opts.session ? { metadata: { user_id: opts.session } } : {}),
-      messages: [{ role: "user", content: opts.content ?? "say hi" }],
+      messages: [{ role: "user", content: opts.contentBlocks ?? opts.content ?? "say hi" }],
     }),
   });
 }
@@ -566,6 +568,48 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     //    verbatim); the upstream refusal + context-overflow recovery own it.
     await postMessage({ model: "ctx-ep@fake-ctx", maxTokens: 16384, content: "z".repeat(1_200_000) });
     expect(upstreamBodies.ctx[2].max_tokens).toBe(16_384);
+  }, 30_000);
+
+  test("K13 (#442 CR): a base64 image does not eat the window — the clamp estimate allocates 1600/block, not base64/4", async () => {
+    await spin();
+    resetFailoverForTests({}); // direct endpoints, no cascade
+    setRoleNominalResolver(() => undefined);
+
+    // The review's measured shape (c.6114982206): "describe this screenshot"
+    // + a 1.03 MB base64 PNG asked max_tokens 16384 and was clamped to 558 —
+    // the /4 estimate charged ~257k for a block whose real cost is ~1.5k
+    // (vision lane) or ~0 (described/stripped by the vision fallback). With
+    // the fixed 1600-allocation the estimate stays ~2k → the ask ships
+    // VERBATIM (no clamp), the turn is not truncated.
+    const oneMbPng = "A".repeat(1_030_000);
+    await postMessage({
+      model: "ctx-ep@fake-ctx",
+      maxTokens: 16384,
+      contentBlocks: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: oneMbPng } },
+        { type: "text", text: "describe this screenshot" },
+      ],
+    });
+    expect(upstreamBodies.ctx?.length).toBe(1);
+    // THE PIN: not clamped — an image block is worth MEDIA_BLOCK_TOKENS, not
+    // its base64 length / 4.
+    expect(upstreamBodies.ctx[0].max_tokens).toBe(16_384);
+  }, 30_000);
+
+  test("K14 (#442 CR): below a useful floor the clamp stands down — the refusal stays skippable", async () => {
+    await spin();
+    resetFailoverForTests({});
+    setRoleNominalResolver(() => undefined);
+
+    // est = 1_024_000/4 = 256_000 → margin = max(2048, 4000) = 4_000 →
+    // dynamicCap = 262_144 − 256_000 − 4_000 = 2_144 ∈ [1, 4_096). The old
+    // guard (dynamicCap ≥ 1) clamped 16384 → 2144: a truncated 200 standing
+    // in for a recoverable refusal — the exact shape #431 closed (SKIP
+    // reason=context must stay reachable on a non-last step; on /compact a
+    // truncated "summary"). The floor min(asked, 4096) stands the clamp down.
+    await postMessage({ model: "ctx-ep@fake-ctx", maxTokens: 16384, content: "w".repeat(1_024_000) });
+    expect(upstreamBodies.ctx?.length).toBe(1);
+    expect(upstreamBodies.ctx[0].max_tokens).toBe(16_384); // verbatim — floor stands down
   }, 30_000);
 
   test("K8 (AC3): saturated limiter on a non-last step → bounded wait, skip to the successor, no failure mark", async () => {
