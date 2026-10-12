@@ -51,7 +51,11 @@ describe("harness byte budgets (#445)", () => {
 
   for (const b of BUDGETS) {
     test(`${b.path} ≤ ${b.maxBytes} bytes`, () => {
-      const size = statSync(join(REPO_ROOT, b.path)).size;
+      // Measured as committed (LF), not as checked out: under core.autocrlf=true a
+      // Windows working copy carries one extra byte per line, which would make the
+      // verdict depend on the machine running the suite.
+      const raw = readFileSync(join(REPO_ROOT, b.path), "utf-8");
+      const size = Buffer.byteLength(raw.replace(/\r\n/g, "\n"), "utf-8");
       expect(
         size,
         `${b.path} is ${size} B, over its ${b.maxBytes} B budget (+${size - b.maxBytes}). ` +
