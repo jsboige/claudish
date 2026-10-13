@@ -384,3 +384,38 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
     expect(JSON.stringify(message)).not.toContain("connection_error");
   });
 });
+
+describe("ComposedHandler.handle — non-ok body: the provider's own words travel separately (196e6f8f port)", () => {
+  test("a non-JSON SSE-frame body surfaces provider_message with the unwrapped sentence", async () => {
+    // The non-JSON fallback wraps the WHOLE raw body as error.message — an SSE
+    // frame. The unwrapped provider sentence must travel beside it.
+    const frame =
+      'event:error\ndata:{"code":"AccessDenied","message":"Model access denied.","request_id":"x"}';
+    globalThis.fetch = (async () =>
+      new Response(frame, { status: 403 })) as unknown as typeof fetch;
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    expect(captured.status).toBe(403);
+    const err = captured.body?.error as { message?: string; provider_message?: string };
+    // message keeps the raw frame (the fallback wrap — unchanged behavior)…
+    expect(err.message).toContain("event:error");
+    // …and the sentence rides in provider_message — unwrapped all the way to
+    // the provider's words (string arm re-enters: frame → payload → message).
+    expect(err.provider_message).toBe("Model access denied.");
+  });
+
+  test("a JSON error body does NOT duplicate itself into provider_message", async () => {
+    const body = JSON.stringify({
+      error: { type: "permission_error", message: "Model access denied." },
+    });
+    globalThis.fetch = (async () =>
+      new Response(body, { status: 403 })) as unknown as typeof fetch;
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    const err = captured.body?.error as { message?: string; provider_message?: string };
+    expect(err.message).toBe("Model access denied.");
+    expect(Object.hasOwn(err, "provider_message")).toBe(false);
+  });
+});
