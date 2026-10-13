@@ -1844,6 +1844,40 @@ export function isOverloadWalkClass(status: number, errorText: string): boolean 
 }
 
 /**
+ * Phrases that name the MODEL as the problem rather than the credential or the
+ * payload. Shared by the 401/403 and 400 branches of getRecoveryHint so the two
+ * cannot disagree about which status "the MODEL is the problem" arrives under
+ * (upstream fa09cb7e): Alibaba's silos answer an id their plan does not serve
+ * with a bare `400 Model not exist`, which matched none of our phrases — the
+ * only hint was "Request format may be incompatible with provider", sending the
+ * reader to audit a payload that is fine.
+ *
+ * Deliberately narrow: a false positive here tells a user with genuinely broken
+ * credentials to go check their model name instead. Every phrase names a model
+ * or says "not supported" — never bare "invalid", "denied" or "unauthorized",
+ * the vocabulary of real auth failures.
+ *
+ * Hint wording only: `FallbackHandler.isRetryableError` keeps its own 400
+ * phrase list and deliberately does NOT carry "model not exist", so the chain
+ * still stops on it rather than advancing — a model fault is terminal, not a
+ * transport blip another host could absorb.
+ */
+const MODEL_UNSUPPORTED_PHRASES = [
+  "not supported",
+  "unsupported model",
+  "unsupported_model",
+  "model not found",
+  "model_not_found",
+  "unknown model",
+  "model not exist",
+  "no such model",
+] as const;
+
+function hasModelUnsupportedWording(lower: string): boolean {
+  return MODEL_UNSUPPORTED_PHRASES.some((phrase) => lower.includes(phrase));
+}
+
+/**
  * Return a human-readable recovery hint based on HTTP status and error body.
  *
  * Exported for tests: this hint is the line an operator reads first, and a wrong
@@ -1869,11 +1903,7 @@ export function getRecoveryHint(status: number, errorText: string, providerName:
       return "Plan/quota window exhausted — a wall, not an auth fault. The cascade advances to the next step.";
     }
     // Some providers (e.g. OpenCode Zen) return 401 for unsupported models, not auth failures
-    if (
-      lower.includes("not supported") ||
-      lower.includes("unsupported model") ||
-      lower.includes("model not found")
-    ) {
+    if (hasModelUnsupportedWording(lower)) {
       return "Model not supported by this provider. Verify model name.";
     }
     return "Check API key / OAuth credentials.";
@@ -1884,6 +1914,14 @@ export function getRecoveryHint(status: number, errorText: string, providerName:
   if (status === 400) {
     if (lower.includes("unsupported content type") || lower.includes("unsupported_content_type")) {
       return "Model doesn't support this content format. Try a different model.";
+    }
+    // A model the provider does not carry also arrives as a 400 (fa09cb7e): same
+    // predicate as the 401/403 branch above, so the hint cannot say something
+    // different depending on which status the provider chose. Checked BEFORE
+    // the size test, which is a bare includes("token") and would otherwise
+    // claim any model-unsupported body that happens to spell "tokens".
+    if (hasModelUnsupportedWording(lower)) {
+      return "Model not supported by this provider. Verify model name.";
     }
     if (lower.includes("context") || lower.includes("too long") || lower.includes("token")) {
       return "Input too large. Reduce message history or use a larger-context model.";
