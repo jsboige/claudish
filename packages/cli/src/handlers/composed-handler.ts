@@ -1077,17 +1077,30 @@ export class ComposedHandler implements ModelHandler {
               // Stats must never crash claudish
             }
             // (port 196e6f8f) `errorText` IS the raw upstream body here — often a
-            // whole SSE frame or nested JSON, not a sentence. The unwrapped
-            // provider sentence travels beside it in provider_message.
-            return c.json(
-              wrapAnthropicError(
-                retryResp.status,
-                errorText,
-                undefined,
-                extractProviderMessage(errorText)
-              ),
-              retryResp.status as any
+            // whole SSE frame or nested JSON, not a sentence. Parse it first
+            // (upstream passes `parsedErrorBody ?? errorText`) so a JSON body
+            // yields its nested sentence instead of the whole document
+            // re-stringified into provider_message; the `!==` guard then keeps
+            // the field for the non-JSON case, exactly like the main non-ok
+            // return below.
+            let parsedRetryBody: unknown = errorText;
+            try {
+              parsedRetryBody = JSON.parse(errorText);
+            } catch {
+              // not JSON — the raw text is what we have (SSE frames unwrap inside)
+            }
+            const retryEnvelope = ensureAnthropicErrorFormat(
+              retryResp.status,
+              parsedRetryBody
             );
+            const retryProviderSentence = extractProviderMessage(parsedRetryBody);
+            if (
+              retryProviderSentence &&
+              retryProviderSentence !== retryEnvelope.error.message
+            ) {
+              retryEnvelope.error.provider_message = retryProviderSentence;
+            }
+            return c.json(retryEnvelope, retryResp.status as any);
           }
         } catch (err: any) {
           log(`[${this.provider.displayName}] Auth refresh failed: ${err.message}`);
