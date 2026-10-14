@@ -68,6 +68,17 @@ EXTERNAL_ALLOWLIST = {
     ".mcp.json",            # user-home MCP config, never committed
     "GAP",                  # claudish_traffic MCP vocabulary (roo-state-manager repo)
     "scheduled_tasks.lock", # deliberately machine-local (gitignored harness state)
+    ".test-strict-baseline.json",  # per-machine gitignored snapshot (#175): the
+                                   # failing population is seat-dependent BY
+                                   # DESIGN and must never be committed
+    "compaction.log",       # runtime artifact of the nightly capture compaction
+    "memory/open-questions-ledger.md",  # per-workspace memory file under
+                                        # ~/.claude/projects/<hash>/ -- cited by
+                                        # the global harness rules, not this repo
+    "MEMORY.md",               # index of the same per-workspace memory dir
+    "baseRefName",             # GitHub GraphQL schema field (gh pr view)
+    "mergeStateStatus",        # GitHub GraphQL schema field (gh pr view)
+    "CronList",               # Claude Code built-in tool (session scheduler)
 }
 
 
@@ -120,6 +131,7 @@ SKIP_REASON_PATTERNS = [
     (re.compile(r"^v\d"), "version"),
     (re.compile(r"^.{0,2}$"), "too-short"),  # `g@`, `or`, `x`
     (re.compile(r"[<>|]"), "placeholder"),   # `<model>`, `path → maxBytes`
+    (re.compile(r"NN"), "placeholder"),      # `fix/NN-slug` branch-name templates
     (re.compile(r"@"), "route-or-handle"),   # `google@gemini-2.0-flash`, emails
 ]
 
