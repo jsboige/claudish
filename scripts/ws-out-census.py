@@ -4,8 +4,9 @@
 Answers "who spends the output tokens, per lane and workspace" (#445 B1): one
 row per (lane, workspace, machine) with non-compaction turns and their OUT,
 plus compaction turns/OUT counted separately (COMPACT_SIG on the last user
-text). Reuses compaction-trend.py plumbing verbatim (regexes, workspace_of,
-req_identity, (pid, reqN) + 35-min pairing). On the containerized hub pid is
+text). Copied from compaction-trend.py @ 77a96b10 (regexes, workspace_of,
+req_identity, (pid, reqN) + 35-min pairing) -- copied, NOT imported, so
+re-diff against the source when either side drifts. On the containerized hub pid is
 always 1 and reqN resets per restart, so counting is per FILE, never per
 (pid, reqN) aggregate.
 
@@ -141,6 +142,7 @@ def census_day(dirpath, day):
     agg = collections.defaultdict(lambda: {
         "turns": 0, "out": 0, "c_turns": 0, "c_out": 0, "parse_fail": 0})
     unp = 0
+    no_usage = 0
     with os.scandir(dirpath) as it:
         for e in it:
             n = e.name
@@ -170,7 +172,8 @@ def census_day(dirpath, day):
                 agg[(lane, "?", "?")]["parse_fail"] += 1
                 continue
             if u is None:
-                continue  # no usage statement (lane-out-trend sansUsage class)
+                no_usage += 1  # no usage statement (lane-out-trend sansUsage class)
+                continue
             rp = req[1]
             if rp not in ident_cache:
                 try:
@@ -195,7 +198,7 @@ def census_day(dirpath, day):
             else:
                 cell["turns"] += 1
                 cell["out"] += out
-    return n_req, unp, n_req_bad, agg
+    return n_req, unp, n_req_bad, no_usage, agg
 
 
 def main():
@@ -205,9 +208,9 @@ def main():
     a = ap.parse_args()
     for d in a.dirs:
         day = os.path.basename(d).replace("comp-", "")
-        n_req, unp, bad, agg = census_day(d, day)
-        print("== %s  reqs=%d unpaired_resp=%d ident_fail=%d" %
-              (day, n_req, unp, bad))
+        n_req, unp, bad, nousage, agg = census_day(d, day)
+        print("== %s  reqs=%d unpaired_resp=%d ident_fail=%d no_usage=%d" %
+              (day, n_req, unp, bad, nousage))
         print("  %-14s %-14s %-10s %7s %12s %9s %7s %10s" % (
             "lane", "workspace", "machine", "turns", "OUT", "OUT/t", "c_turns", "c_OUT"))
         for (lane, ws, mach), v in sorted(
