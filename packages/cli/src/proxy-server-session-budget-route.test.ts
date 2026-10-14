@@ -18,8 +18,14 @@
  *    ⇒ B2a red at `expect(consumed).toBe(350)` (the armed cascade's second
  *    attempt — the one that SERVED — is never counted);
  *  - remove `openSessionBudgetAttempt` before the WALK's `walkHandler.handle`
- *    ⇒ B2b red at the same shape (the walk's serving attempt is never
- *    counted);
+ *    ⇒ B2b stays GREEN, by construction (measured): a nominal that walks
+ *    (529/503/400-connection_error) carries NO usage chunk, so the stale
+ *    nominal token still counts the walk's report — nothing is lost. The
+ *    site's real protection is slot DISTINCTNESS when both attempts pay,
+ *    which the wire cannot produce on the walk path; that is pinned at
+ *    module level (session-budget.test.ts "pin 2b": same raw, re-attached
+ *    between two paid attempts ⇒ sum, not max — red under the token-reuse
+ *    mutation);
  *  - neutralize the ComposedHandler sink (`recordSessionBudgetOutput` call in
  *    `onTokenUpdate`) ⇒ B1/B2a/B2b/B3 red (consumed stays 0, nothing ever
  *    refuses);

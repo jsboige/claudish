@@ -124,6 +124,23 @@ describe("session budget ceiling (#317 option B)", () => {
     expect(admitSessionBudget(MACHINE, SID_SWARM, ENV_CEILING)!.refused).toBe(true);
   });
 
+  it("pin 2b: two paid attempts of ONE request (same raw, re-attached between) land in DISTINCT slots", () => {
+    // The re-attach site (#299-B walk / armed loop, proxy-server): the second
+    // openSessionBudgetAttempt on the SAME raw must replace the token, or the
+    // max-per-attempt ledger takes max(400, 350) = 400 and under-counts a
+    // request that paid 750. Route-level B2b cannot kill this mutation: a
+    // nominal that walks (529) carries no usage, so the stale token still
+    // counts the walk's — the slot-distinctness is only observable when BOTH
+    // attempts pay, which is HERE.
+    const raw = fakeRaw();
+    openSessionBudgetAttempt(raw, MACHINE, SID_SWARM, ENV_CEILING);
+    recordSessionBudgetOutput(raw, 400);
+    openSessionBudgetAttempt(raw, MACHINE, SID_SWARM, ENV_CEILING); // the re-attach
+    recordSessionBudgetOutput(raw, 350);
+    clockMs += ATTEMPT_SETTLE_MS + 1;
+    expect(sessionBudgetConsumed(MACHINE, SID_SWARM)).toBe(750); // sum, not max
+  });
+
   it("pin 3: two sessions have independent counters; the TTL slides on activity", () => {
     paidAttempt(MACHINE, SID_SWARM, 900, ENV_CEILING);
     paidAttempt(MACHINE, SID_OTHER, 100, ENV_CEILING);
