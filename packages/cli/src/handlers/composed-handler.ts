@@ -1845,25 +1845,34 @@ export function isOverloadWalkClass(status: number, errorText: string): boolean 
 
 /**
  * Phrases that name the MODEL as the problem rather than the credential or the
- * payload. Shared by the 401/403 and 400 branches of getRecoveryHint so the two
- * cannot disagree about which status "the MODEL is the problem" arrives under
- * (upstream fa09cb7e): Alibaba's silos answer an id their plan does not serve
- * with a bare `400 Model not exist`, which matched none of our phrases — the
- * only hint was "Request format may be incompatible with provider", sending the
- * reader to audit a payload that is fine.
+ * payload. The phrases that NAME the model are shared by the 401/403 and 400
+ * branches of getRecoveryHint so the two cannot disagree about which status
+ * "the MODEL is the problem" arrives under (upstream fa09cb7e): Alibaba's
+ * silos answer an id their plan does not serve with a bare `400 Model not
+ * exist`, which matched none of our phrases — the only hint was "Request
+ * format may be incompatible with provider", sending the reader to audit a
+ * payload that is fine.
  *
  * Deliberately narrow: a false positive here tells a user with genuinely broken
  * credentials to go check their model name instead. Every phrase names a model
- * or says "not supported" — never bare "invalid", "denied" or "unauthorized",
- * the vocabulary of real auth failures.
+ * — never bare "invalid", "denied" or "unauthorized", the vocabulary of real
+ * auth failures.
+ *
+ * Two predicates, one canonical list (review of #455, B1): the bare
+ * "not supported" is deliberately 401/403-ONLY. On an auth-status answer that
+ * wording almost always names the model (OpenCode Zen), but on a 400 it most
+ * often names a PARAMETER or a content type — "stream_options is not
+ * supported" and "Image input is not supported for this model" must keep the
+ * format hint, not send the operator to audit a model id that is fine.
+ * Upstream keys one shared list on both branches and carries that defect; this
+ * split is a deliberate divergence.
  *
  * Hint wording only: `FallbackHandler.isRetryableError` keeps its own 400
  * phrase list and deliberately does NOT carry "model not exist", so the chain
  * still stops on it rather than advancing — a model fault is terminal, not a
  * transport blip another host could absorb.
  */
-const MODEL_UNSUPPORTED_PHRASES = [
-  "not supported",
+const MODEL_NAMING_PHRASES = [
   "unsupported model",
   "unsupported_model",
   "model not found",
@@ -1873,8 +1882,13 @@ const MODEL_UNSUPPORTED_PHRASES = [
   "no such model",
 ] as const;
 
+function hasModelNamingWording(lower: string): boolean {
+  return MODEL_NAMING_PHRASES.some((phrase) => lower.includes(phrase));
+}
+
+/** 401/403 only: the naming phrases plus the bare "not supported" (see above). */
 function hasModelUnsupportedWording(lower: string): boolean {
-  return MODEL_UNSUPPORTED_PHRASES.some((phrase) => lower.includes(phrase));
+  return lower.includes("not supported") || hasModelNamingWording(lower);
 }
 
 /**
@@ -1915,12 +1929,15 @@ export function getRecoveryHint(status: number, errorText: string, providerName:
     if (lower.includes("unsupported content type") || lower.includes("unsupported_content_type")) {
       return "Model doesn't support this content format. Try a different model.";
     }
-    // A model the provider does not carry also arrives as a 400 (fa09cb7e): same
-    // predicate as the 401/403 branch above, so the hint cannot say something
-    // different depending on which status the provider chose. Checked BEFORE
-    // the size test, which is a bare includes("token") and would otherwise
-    // claim any model-unsupported body that happens to spell "tokens".
-    if (hasModelUnsupportedWording(lower)) {
+    // A model the provider does not carry also arrives as a 400 (fa09cb7e) —
+    // but only the phrases that NAME the model key the hint here (that subset
+    // is shared with the 401/403 branch, so the two cannot disagree on it). A
+    // bare "not supported" on a 400 most often faults a PARAMETER or a content
+    // type ("stream_options is not supported") and must fall through (review
+    // of #455, B1). Checked BEFORE the size test, which is a bare
+    // includes("token") and would otherwise claim any model-named body that
+    // happens to spell "tokens".
+    if (hasModelNamingWording(lower)) {
       return "Model not supported by this provider. Verify model name.";
     }
     if (lower.includes("context") || lower.includes("too long") || lower.includes("token")) {

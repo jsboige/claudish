@@ -365,8 +365,11 @@ describe("getRecoveryHint — a quota 403 is not an auth fault", () => {
 // an id their silo does not serve with a bare `400 Model not exist` — matched
 // none of the phrases, so the only hint was "Request format may be incompatible
 // with provider", sending the reader to audit a payload that is fine. The same
-// wording can also surface under 401/403 (the OpenCode Zen shape), so both
-// branches share one predicate and cannot disagree.
+// wording can also surface under 401/403 (the OpenCode Zen shape), so the
+// phrases that NAME a model are shared by both branches. The bare
+// "not supported" is 401/403-only (review of #455, B1): on a 400 it most often
+// faults a parameter or a content type, and keying the model hint on it
+// regressed measured bodies that main classified correctly.
 // ---------------------------------------------------------------------------
 describe("getRecoveryHint — fa09cb7e port: an unsupported model is a model problem", () => {
   test("bare 400 `Model not exist` gets the model hint, not the format hint", () => {
@@ -392,13 +395,53 @@ describe("getRecoveryHint — fa09cb7e port: an unsupported model is a model pro
   test("the model check runs BEFORE the size test — a body spelling 'tokens' is not input-too-large", () => {
     // The size test is a bare includes("token"); without the ordering a
     // model-unsupported body that happens to spell "tokens" is claimed as
-    // "Input too large" and buries the real cause.
+    // "Input too large" and buries the real cause. The body must NAME the
+    // model (review of #455, B1): a bare "not supported for token streaming"
+    // no longer keys the hint on 400.
     const hint = getRecoveryHint(
       400,
-      "Model deepseek-v4-pro is not supported for token streaming",
+      "Model not found: glm-9.5 does not take part in token streaming",
       "Qwen Token Plan"
     );
     expect(hint).toBe("Model not supported by this provider. Verify model name.");
+  });
+
+  test("B1: a 400 'not supported' faulting a parameter or content keeps the format hint", () => {
+    // Measured regressions of the shared list (review of #455): on a 400 the
+    // bare phrase most often names a parameter or a content type, and keying
+    // the model hint on it sent the operator to audit a model id that was
+    // fine. Bodies verbatim.
+    expect(getRecoveryHint(400, "Image input is not supported for this model", "OpenAI")).toBe(
+      "Request format may be incompatible with provider."
+    );
+    expect(getRecoveryHint(400, "stream_options is not supported", "OpenAI")).toBe(
+      "Request format may be incompatible with provider."
+    );
+  });
+
+  test("B1: OpenAI's max_tokens body never says 'Verify model name'", () => {
+    // Verbatim OpenAI 400. It falls through to "Input too large" (as on main,
+    // already imperfect); a future parameter-specific hint may replace that —
+    // out of scope here. The pin only requires it never points at the model id.
+    const hint = getRecoveryHint(
+      400,
+      "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
+      "OpenAI"
+    );
+    expect(hint).not.toMatch(/verify model name/i);
+  });
+
+  test("B1 branch split: bare 'not supported' arms the model hint on 401, not on 400", () => {
+    // On an auth-status answer the bare wording almost always names the model
+    // (OpenCode Zen); on a 400 it must fall through. Same body, two statuses,
+    // two hints — the split IS the fix.
+    const body = "This model is not supported";
+    expect(getRecoveryHint(401, body, "Zen")).toBe(
+      "Model not supported by this provider. Verify model name."
+    );
+    expect(getRecoveryHint(400, body, "Zen")).toBe(
+      "Request format may be incompatible with provider."
+    );
   });
 
   test("the model hint never arms the quota classifier — a model fault must not exile a role", () => {
