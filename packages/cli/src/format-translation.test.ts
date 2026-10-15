@@ -2209,6 +2209,59 @@ describe("Regression: web search remap to client WebSearch tool_use", () => {
     expect(extractStopReason(events)).toBe("end_turn");
   });
 
+  // The Hermes IndexError shape (measured 15/10, hub capture
+  // msg_1792076842247: thinking + text carrying a <searchWeb> tag + a
+  // structured web_search tool call, ending with finish_reason "stop").
+  // Pre-fix: the suppressed call reserved index 2 and never spent it, the
+  // tag injection took index 3 — the client saw blocks 0,1,3, and the
+  // Anthropic Python SDK died on the gap with IndexError: list index out
+  // of range. The search itself was also silently dropped on this ending.
+  test("web_search call + <searchWeb> tag + finish=stop → contiguous indices, no hole (Hermes IndexError 15/10)", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"checking"},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Let me verify <searchWeb><query>shapley 1967 balanced sets</query></searchWeb>"},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_2","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"bondareva 1963\\"}"}}]},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":7}}`,
+      ``,
+      `data: [DONE]`,
+      ``,
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [READ_SCHEMA] // no WebSearch in the request
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // No tool_use leaks through
+    expect(extractToolNames(events)).toHaveLength(0);
+
+    // Both searches deliver their injection (or graceful degradation notice)
+    const text = extractText(events);
+    expect(text).toContain("[Web search");
+
+    // Contiguous block indices from 0 — the hole IS the crash
+    const starts = events
+      .filter((e) => e.data?.type === "content_block_start")
+      .map((e) => e.data.index);
+    starts.forEach((idx, i) => expect(idx).toBe(i));
+
+    expect(extractStopReason(events)).toBe("end_turn");
+  });
+
   test("GLM <searchWeb> tag + WebSearch declared → remapped tool_use, stop_reason=tool_use", async () => {
     const createStreamingResponseHandler = await getParser();
     const adapter = await getDefaultAdapter();
