@@ -45,7 +45,8 @@ the predicate must not drift between the copies):
 Mutation proofs (run before pushing): restore `isdir and listdir` in either
 carrier -> pins 1/2 red; restore the unconditional both-patterns fallback ->
 pin 3 red; restore native-trend's old acceptance (`any .sse`) as its trust
-fallback -> the native pins of 8 red.
+fallback -> the no-resp-native pin of 8 red (a dir with zero native members
+passes -- the exact hole).
 
 Run standalone (no pytest needed):
   python scripts/tests/test_extract_complete.py
