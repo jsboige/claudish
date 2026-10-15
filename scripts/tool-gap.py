@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""tool-gap.py -- approval-wait detector: the gap between a tool_use and its tool_result.
+
+Why this exists
+---------------
+Mandate 2026-10-15 (ai-01:CoursIA, dashboard workspace-roo-extensions): an agent
+instance spent ~1 h waiting for a permission prompt DESPITE bypass mode. The
+roo-extensions volet reads client transcripts; THIS volet reads hub proxy
+traffic, the only place where a wait is attributable to a machine, an entrypoint
+and the command itself.
+
+The measurement
+---------------
+Claude Code resends the WHOLE conversation on every request, so capture B holds
+both the assistant `tool_use` (issued in turn A) and the user `tool_result`
+answering it -- one file yields the command. Only the timeline needs two:
+
+    ts(A) --[ generation ]--> resp_end(A) --[ approval + execution ]--> ts(B)
+
+`resp-1-r<N>` is written at response CLOSE: its filename timestamp equals the
+file mtime within ~50 ms (measured 2026-10-15 on 6 consecutive responses, spread
+4-15 s), so it marks the end of generation. Hence, per session:
+
+    delta = ts(B) - ts(A)            generation + wait + execution
+    wait  = ts(B) - resp_end(A)      wait + execution        <-- the number that matters
+
+A multi-minute `wait` around a command that is fast by nature cannot be
+execution. `wait` is the mandate's "ecart long entre tool_use et tool_result"
+with the model's own latency subtracted.
+
+Reading rules
+-------------
+* A session that sits at an approval prompt emits NO capture until the user
+  answers: the wait is only visible retrospectively, from the NEXT request.
+* `resp_end(A)` is absent when the response was a relay passthrough or was
+  never captured: those turns are reported with `wait = None`, never guessed.
+* Denial markers are searched in a window around each `tool_result` marker --
+  never over the message tail, which also carries the system prompt where the
+  words "refus"/"rejected" occur for unrelated reasons (false positive measured
+  on the first run: 6/6 flagged).
+* `machine`, `entrypoint`, `session_id` are absent on pre-#98 captures: empty
+  strings, never invented (trap measured on captures-2026-07-05).
+
+Usage
+-----
+  python scripts/tool-gap.py --hours 24 --min-wait 120
+  python scripts/tool-gap.py --hours 24 --min-wait 300 --json D:/tmp/gaps.json
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import glob
+import json
+import os
+import re
+import sys
+
+TAIL_BYTES = 320 * 1024
+HEAD_BYTES = 4 * 1024
+
+STAMP = r"(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z"
+# Strict grammar: a loose pattern splits the timestamp itself and manufactures
+# one "lane" per turn (trap measured 2026-10-09).
+REQ_RE = re.compile(r"^req-1-(\d+)-" + STAMP + r"-")
+RESP_RE = re.compile(r"^resp-1-r(\d+)-" + STAMP + r"-")
+
+# Key order is NOT stable across clients: Claude Code writes
+# {"type":"tool_result","tool_use_id":…}, others write
+# {"tool_use_id":…,"type":"tool_result"}. Anchor on the marker, then read the
+# id from a small window -- a fixed two-key sequence matched 2/1500 captures.
+RESULT_MARK = re.compile(r'"type":"tool_result"')
+USE_ID_ANY = re.compile(r'"tool_use_id":"([A-Za-z0-9_-]{6,64})"')
+NAME_NEAR = re.compile(r'"name":"([^"]+)"')
+# `session_id` rides inside `metadata.user_id`, itself a JSON *string*, so the
+# quotes arrive escaped: match both spellings.
+SESSION_ID = re.compile(r'session_id\\?":\\?"([0-9a-fA-F-]{8,64})')
+
+# The friction shapes the mandate names -- composite commands, recursive delete,
+# elevation, a shell launched outside the sandbox. A HYPOTHESIS column: these
+# are what a human approves by hand, it is not a verdict.
+RISK_PATTERNS = [
+    ("rm-rf", re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f|\bRemove-Item\b[^\n]*-Recurse", re.I)),
+    ("elevation", re.compile(r"-Verb\s+RunAs|\bsudo\b", re.I)),
+    ("wsl-shell", re.compile(r"\bwsl(\.exe)?\b", re.I)),
+    ("composite-cd", re.compile(r"\bcd\s+[^\n]*(&&|;)")),
+    ("dotdot-path", re.compile(r"\.\./|\.\.\\\\")),
+]
+
+DENIAL = re.compile(
+    r"doesn't want to proceed|user rejected|tool use was rejected|"
+    r"Request interrupted by user|permission denied by user|"
+    r"user doesn't want to take this action",
+    re.I,
+)
+
+# Commands that are fast by nature: a multi-minute wait around one of these
+# cannot be execution time.
+FAST_HEADS = {
+    "cd", "echo", "ls", "dir", "pwd", "cat", "head", "tail", "type", "which",
+    "where", "set", "export", "true", "date", "whoami",
+}
+
+
+def stamp_to_dt(groups: tuple) -> dt.datetime:
+    y, mo, d, hh, mm, ss, ms = (int(x) for x in groups)
+    return dt.datetime(y, mo, d, hh, mm, ss, ms * 1000, tzinfo=dt.timezone.utc)
+
+
+def read_slice(path: str) -> tuple[str, str]:
+    """(head, tail) as text; decoding is lenient on both edges."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        head = fh.read(HEAD_BYTES).decode("utf-8", "replace")
+        if size > TAIL_BYTES:
+            fh.seek(size - TAIL_BYTES)
+            tail = fh.read().decode("utf-8", "replace")
+        else:
+            tail = head
+    return head, tail
+
+
+def brace_scan(text: str, start: int, limit: int = 4096) -> str:
+    """The balanced {...} at `start` (string/escape aware, bounded)."""
+    if start < 0 or start >= len(text) or text[start] != "{":
+        return ""
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, min(len(text), start + limit)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return ""
+
+
+def envelope(head: str) -> dict:
+    out = {}
+    for key in ("src", "machine", "model", "entrypoint", "device_id8"):
+        m = re.search(r'"%s":"([^"]*)"' % key, head)
+        out[key] = m.group(1) if m else ""
+    m = re.search(r'"pid":(\d+)', head)
+    out["pid"] = int(m.group(1)) if m else 0
+    return out
+
+
+def trailing_calls(tail: str) -> tuple[list[dict], bool]:
+    """Tool calls completed by the LAST user message, with their raw input."""
+    last_user = tail.rfind('"role":"user"')
+    if last_user < 0:
+        return [], False
+    scope = tail[last_user:]
+    ids, denied = [], False
+    for m in RESULT_MARK.finditer(scope):
+        w = USE_ID_ANY.search(scope, max(0, m.start() - 200),
+                              min(len(scope), m.start() + 200))
+        if not w:
+            continue
+        ids.append(w.group(1))
+        if DENIAL.search(scope[m.start():m.start() + 3000]):
+            denied = True
+    if not ids:
+        return [], False
+    calls = []
+    for tid in ids:
+        idx = tail.rfind('"id":"%s"' % tid)
+        if idx < 0:
+            calls.append({"id": tid, "name": "?", "input": ""})
+            continue
+        nm = None
+        for m in NAME_NEAR.finditer(tail, max(0, idx - 400), idx + 400):
+            nm = m.group(1)
+        inp = tail.find('"input":', idx)
+        raw = ""
+        if 0 <= inp < idx + 400:
+            brace = tail.find("{", inp)
+            raw = brace_scan(tail, brace) if brace >= 0 else ""
+        calls.append({"id": tid, "name": nm or "?", "input": raw})
+    return calls, denied
+
+
+def cmd_of(call: dict) -> str:
+    raw = call.get("input") or ""
+    if not raw:
+        return ""
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return raw[:400]
+    if isinstance(obj, dict):
+        for key in ("command", "file_path", "path", "pattern", "query", "url"):
+            if key in obj:
+                return str(obj[key])[:400]
+        return json.dumps(obj, ensure_ascii=False)[:400]
+    return str(obj)[:400]
+
+
+def classify(call: dict, cmd: str) -> str:
+    if call.get("name") != "Bash":
+        return "tool:" + str(call.get("name") or "?")
+    hits = [n for n, rx in RISK_PATTERNS if rx.search(cmd)]
+    if hits:
+        return "risk:" + "+".join(hits)
+    head = (cmd.strip().split() or [""])[0].lower()
+    if head in FAST_HEADS and len(cmd) < 120:
+        return "fast"
+    return "plain"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=r"D:\claudish-captures")
+    ap.add_argument("--hours", type=float, default=24.0)
+    ap.add_argument("--min-wait", type=float, default=120.0, help="seconds")
+    ap.add_argument("--limit", type=int, default=0, help="cap files (0 = all)")
+    ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--session", default="", help="session_id prefix (follow one instance)")
+    ap.add_argument("--machine", default="", help="exact machine name, e.g. myia-ai-01")
+    ap.add_argument("--json", default="")
+    args = ap.parse_args()
+
+    now = dt.datetime.now(dt.timezone.utc)
+    floor = now - dt.timedelta(hours=args.hours)
+
+    # resp_end: request number -> end of that request's response (last one wins).
+    resp_end: dict[int, dt.datetime] = {}
+    for p in glob.glob(os.path.join(args.root, "resp-1-r*.sse")):
+        m = RESP_RE.match(os.path.basename(p))
+        if m:
+            try:
+                resp_end[int(m.group(1))] = stamp_to_dt(m.groups()[1:])
+            except ValueError:
+                pass
+
+    work = []
+    for p in glob.glob(os.path.join(args.root, "req-*.json")):
+        m = REQ_RE.match(os.path.basename(p))
+        if not m:
+            continue
+        try:
+            when = stamp_to_dt(m.groups()[1:])
+        except ValueError:
+            continue
+        if when >= floor:
+            work.append((when, int(m.group(1)), os.path.basename(p)))
+    work.sort()
+    if args.limit:
+        work = work[-args.limit:]
+
+    print(f"corpus: {len(work)} captures in the last {args.hours}h "
+          f"(resp_end index: {len(resp_end)} responses)", file=sys.stderr)
+
+    per_session: dict[str, list] = collections.defaultdict(list)
+    records: dict[str, dict] = {}
+    no_session = 0
+    for when, num, name in work:
+        try:
+            head, tail = read_slice(os.path.join(args.root, name))
+        except OSError:
+            continue
+        env = envelope(head)
+        if args.machine and env.get("machine") != args.machine:
+            continue
+        # LAST match, never the first: a session_id can be CITED inside a
+        # message body (a traffic-analysis session quotes ids constantly), and
+        # the head of the tail slice is mid-conversation. `metadata` sits at the
+        # very end of the body, so the last match is the real one -- the trap
+        # that mis-attributed 14 captures on 2026-10-09 (see memory T6-bis).
+        hits = list(SESSION_ID.finditer(tail))
+        sid = hits[-1].group(1) if hits else ""
+        if not sid:
+            no_session += 1
+            sid = "device:" + (env.get("device_id8") or "?")
+        if args.session and not sid.startswith(args.session):
+            continue
+        per_session[sid].append((when, num, name))
+        calls, denied = trailing_calls(tail)
+        if calls:
+            records[name] = {"env": env, "calls": calls, "denied": denied}
+
+    gaps = []
+    no_resp = 0
+    for sid, items in per_session.items():
+        items.sort()
+        for i in range(1, len(items)):
+            prev, cur = items[i - 1], items[i]
+            rec = records.get(cur[2])
+            if not rec:
+                continue
+            end = resp_end.get(prev[1])
+            wait = (cur[0] - end).total_seconds() if end else None
+            if wait is None:
+                no_resp += 1
+                continue
+            if wait < args.min_wait:
+                continue
+            for call in rec["calls"]:
+                cmd = cmd_of(call)
+                gaps.append({
+                    "ts": cur[0].isoformat(),
+                    "wait_s": round(wait, 1),
+                    "delta_s": round((cur[0] - prev[0]).total_seconds(), 1),
+                    "machine": rec["env"]["machine"],
+                    "entrypoint": rec["env"]["entrypoint"],
+                    "session": sid[:8],
+                    "tool": call["name"],
+                    "class": classify(call, cmd),
+                    "cmd": cmd,
+                    "denied": rec["denied"],
+                })
+
+    gaps.sort(key=lambda g: -g["wait_s"])
+    print(f"captures with a trailing tool_result: {len(records)}")
+    print(f"captures without session_id (device_id8 fallback): {no_session}")
+    print(f"boundaries skipped for want of a resp_end: {no_resp}")
+    print(f"\n=== waits >= {args.min_wait:.0f}s : {len(gaps)} ===")
+    print("by class:", dict(collections.Counter(g["class"].split(":")[0] for g in gaps)))
+    print("by machine:", dict(collections.Counter(g["machine"] or "(empty)" for g in gaps)))
+    print(f"explicit denials among them: {sum(1 for g in gaps if g['denied'])}")
+
+    print(f"\n=== top {args.top} ===")
+    for g in gaps[:args.top]:
+        flag = " DENIED" if g["denied"] else ""
+        print(f"[{g['ts'][11:19]}] wait {g['wait_s']:>7.0f}s (delta {g['delta_s']:>7.0f}s)  "
+              f"{g['machine']:<14} {g['entrypoint']:<14} {g['session']}  "
+              f"{g['tool']:<8} {g['class']:<22}{flag}")
+        if g["cmd"]:
+            print(f"            {g['cmd'][:180]}")
+
+    if args.json:
+        out_dir = os.path.dirname(args.json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump({"generated": now.isoformat(), "min_wait_s": args.min_wait,
+                       "hours": args.hours, "count": len(gaps), "gaps": gaps},
+                      fh, ensure_ascii=False, indent=1)
+        print(f"\njson -> {args.json}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
