@@ -25,8 +25,9 @@ human before a fix.
 Positive control
 ----------------
 `--selftest` runs the verifier on an embedded fixture doc that pairs two real
-references with two deliberately false ones (`resolveEverythingMagically`,
-`CLAUDISH_IMAGINARY_FLAG_XYZ`). The selftest FAILS (exit 2) unless exactly the
+references with three deliberately false ones (`resolveEverythingMagically`,
+`CLAUDISH_IMAGINARY_FLAG_XYZ`, `CLAUDISH_CHANNEL_IMAGINARY_XYZ` -- the last one
+guards the placeholder skip against swallowing real names). The selftest FAILS (exit 2) unless exactly the
 false pair goes red and the real pair passes -- a verifier that cannot go red
 certifies nothing (invariant: positive control on every counter).
 
@@ -131,7 +132,9 @@ SKIP_REASON_PATTERNS = [
     (re.compile(r"^v\d"), "version"),
     (re.compile(r"^.{0,2}$"), "too-short"),  # `g@`, `or`, `x`
     (re.compile(r"[<>|]"), "placeholder"),   # `<model>`, `path → maxBytes`
-    (re.compile(r"NN"), "placeholder"),      # `fix/NN-slug` branch-name templates
+    # `fix/NN-slug`, `#NN` templates. Anchored: a bare r"NN" also matched
+    # CHANNEL / CONNECT / RUNNER, silently skipping real env names.
+    (re.compile(r"(?<![A-Z])NN(?![A-Z])"), "placeholder"),
     (re.compile(r"@"), "route-or-handle"),   # `google@gemini-2.0-flash`, emails
 ]
 
@@ -261,6 +264,7 @@ FIXTURE = """## Fixture section
 
 - Real flag `CLAUDISH_FIRST_EVENT_TIMEOUT_MS` and real symbol `withFirstUsefulEventWatchdog`.
 - False symbol `resolveEverythingMagically` and false flag `CLAUDISH_IMAGINARY_FLAG_XYZ`.
+- False flag `CLAUDISH_CHANNEL_IMAGINARY_XYZ` (contains NN: must be checked, not skipped).
 """
 
 
@@ -277,7 +281,8 @@ def selftest() -> int:
             for _line, token, _cls, verdict in verify_doc(fixture, code, "", set())
         }
     must_pass = ["CLAUDISH_FIRST_EVENT_TIMEOUT_MS", "withFirstUsefulEventWatchdog"]
-    must_fail = ["resolveEverythingMagically", "CLAUDISH_IMAGINARY_FLAG_XYZ"]
+    must_fail = ["resolveEverythingMagically", "CLAUDISH_IMAGINARY_FLAG_XYZ",
+                 "CLAUDISH_CHANNEL_IMAGINARY_XYZ"]
     ok = True
     for token in must_pass:
         if results.get(token) != "ok":
