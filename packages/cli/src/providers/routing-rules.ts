@@ -49,7 +49,13 @@ export interface RoutingRuleSources {
  * interleaving).
  *
  * Always returns a non-null `RoutingRules` because defaults are baked in.
- * To get strict no-fallback mode, set `routing["*"] = []` in user config.
+ * Strict no-fallback mode takes TWO settings: `routing["*"] = []` in user
+ * config AND an empty default provider (`CLAUDISH_DEFAULT_PROVIDER=""` or
+ * `defaultProvider: ""`). Since the proxy passes `effectiveDefaultProvider()`
+ * to route(), routeBare() appends the default hop to every bare-name chain,
+ * an empty one included — and with nothing set that hop resolves to
+ * `openrouter`. Compose-deployed containers already pass an empty
+ * `CLAUDISH_DEFAULT_PROVIDER` (docker-compose.yml), so they stay opt-out.
  */
 export function loadRoutingRules(sources?: RoutingRuleSources): RoutingRules {
   return mergeRoutingRules(DEFAULT_ROUTING_RULES, loadUserRoutingRules(sources));
