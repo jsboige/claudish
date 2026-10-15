@@ -55,6 +55,7 @@ import glob
 import json
 import os
 import re
+import statistics
 import sys
 
 TAIL_BYTES = 320 * 1024
@@ -227,6 +228,8 @@ def main() -> int:
     ap.add_argument("--root", default=r"D:\claudish-captures")
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--min-wait", type=float, default=120.0, help="seconds")
+    ap.add_argument("--max-gen", type=float, default=7200.0,
+                    help="plausible ceiling on generation time, seconds")
     ap.add_argument("--limit", type=int, default=0, help="cap files (0 = all)")
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--session", default="", help="session_id prefix (follow one instance)")
@@ -237,15 +240,24 @@ def main() -> int:
     now = dt.datetime.now(dt.timezone.utc)
     floor = now - dt.timedelta(hours=args.hours)
 
-    # resp_end: request number -> end of that request's response (last one wins).
-    resp_end: dict[int, dt.datetime] = {}
+    # resp_end: request number -> EVERY response end carrying that number, sorted.
+    #
+    # The request number is NOT unique across the corpus: it is a per-process
+    # counter, so a hub recreate restarts it (measured 2026-10-15: req 36324 at
+    # 01:02Z, req 7213 at 08:57Z). Keying by number alone therefore pairs a
+    # request with the response of an OLDER epoch -- which manufactured a block
+    # of impossible "wait ~12 000 s with delta 8 s" rows on this tool's first
+    # full run. The response must be the first one at or after its own request.
+    resp_end: dict[int, list[dt.datetime]] = collections.defaultdict(list)
     for p in glob.glob(os.path.join(args.root, "resp-1-r*.sse")):
         m = RESP_RE.match(os.path.basename(p))
         if m:
             try:
-                resp_end[int(m.group(1))] = stamp_to_dt(m.groups()[1:])
+                resp_end[int(m.group(1))].append(stamp_to_dt(m.groups()[1:]))
             except ValueError:
                 pass
+    for v in resp_end.values():
+        v.sort()
 
     work = []
     for p in glob.glob(os.path.join(args.root, "req-*.json")):
@@ -297,12 +309,23 @@ def main() -> int:
     no_resp = 0
     for sid, items in per_session.items():
         items.sort()
+        # A session's own rhythm separates the two populations that a raw wait
+        # cannot: a session that was WORKING and stalled (approval) versus a
+        # session that was IDLE for hours and merely resumed (a cron wake-up,
+        # a user coming back). Measured on the first full run: the 15 401 s and
+        # 13 785 s rows were both resumptions -- the sessions' surrounding
+        # deltas were of the same order.
+        deltas = [(items[i][0] - items[i - 1][0]).total_seconds()
+                  for i in range(1, len(items))]
+        rhythm = statistics.median(deltas) if deltas else 0.0
         for i in range(1, len(items)):
             prev, cur = items[i - 1], items[i]
             rec = records.get(cur[2])
             if not rec:
                 continue
-            end = resp_end.get(prev[1])
+            end = next((t for t in resp_end.get(prev[1], ()) if t >= prev[0]), None)
+            if end is not None and (end - prev[0]).total_seconds() > args.max_gen:
+                end = None  # implausible generation: not this request's response
             wait = (cur[0] - end).total_seconds() if end else None
             if wait is None:
                 no_resp += 1
@@ -314,7 +337,9 @@ def main() -> int:
                 gaps.append({
                     "ts": cur[0].isoformat(),
                     "wait_s": round(wait, 1),
-                    "delta_s": round((cur[0] - prev[0]).total_seconds(), 1),
+                    "delta_s": round(deltas[i - 1], 1),
+                    "rhythm_s": round(rhythm, 1),
+                    "ratio": round(wait / rhythm, 1) if rhythm else None,
                     "machine": rec["env"]["machine"],
                     "entrypoint": rec["env"]["entrypoint"],
                     "session": sid[:8],
@@ -332,11 +357,18 @@ def main() -> int:
     print("by class:", dict(collections.Counter(g["class"].split(":")[0] for g in gaps)))
     print("by machine:", dict(collections.Counter(g["machine"] or "(empty)" for g in gaps)))
     print(f"explicit denials among them: {sum(1 for g in gaps if g['denied'])}")
+    # The population the mandate is after: a session that was ALREADY in rhythm
+    # and then stalled. A resumption after hours of idleness is not a wait.
+    stalled = [g for g in gaps if g["ratio"] and g["ratio"] >= 5]
+    print(f"waits on a session in rhythm (wait / own median >= 5): {len(stalled)}")
+    print("  by class:", dict(collections.Counter(g["class"].split(":")[0] for g in stalled)))
+    print("  by machine:", dict(collections.Counter(g["machine"] or "(empty)" for g in stalled)))
 
     print(f"\n=== top {args.top} ===")
     for g in gaps[:args.top]:
         flag = " DENIED" if g["denied"] else ""
-        print(f"[{g['ts'][11:19]}] wait {g['wait_s']:>7.0f}s (delta {g['delta_s']:>7.0f}s)  "
+        print(f"[{g['ts'][11:19]}] wait {g['wait_s']:>7.0f}s (delta {g['delta_s']:>7.0f}s, "
+              f"rythme {g['rhythm_s']:>6.0f}s, x{g['ratio'] if g['ratio'] else 0:>5.1f})  "
               f"{g['machine']:<14} {g['entrypoint']:<14} {g['session']}  "
               f"{g['tool']:<8} {g['class']:<22}{flag}")
         if g["cmd"]:
