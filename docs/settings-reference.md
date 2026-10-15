@@ -439,6 +439,10 @@ The fallback chain is **configurable** via the `defaultProvider` setting. Set it
 
 Valid values: any built-in provider name (`"openrouter"`, `"litellm"`, `"openai"`, `"anthropic"`, `"google"`) or a custom endpoint name from `customEndpoints`.
 
+**Where it applies (proxy side, #468):** the proxy server resolves the effective default once at startup and passes it to `route()`, so **every bare-name chain served through the proxy** gets the default appended as a final fallback hop (deduped — `or` ≡ `openrouter`; explicit `provider@model` targets are never affected). Before #468 the proxy routed bare names with **no** fallback hop at all, whatever `defaultProvider` said — the setting only governed the CLI-side chain.
+
+**Strict no-fallback mode takes TWO settings**: `routing["*"] = []` in user config AND an *explicitly empty* default (`defaultProvider: ""` or `CLAUDISH_DEFAULT_PROVIDER=""`). An absent default is not an empty one — with nothing set, the fallback hop resolves to the hardcoded `openrouter` (precedence step 5) and lands on every bare-name chain, an empty one included. Compose-deployed containers pass `CLAUDISH_DEFAULT_PROVIDER` empty by default (`docker-compose.yml`), which keeps them opt-out; a non-empty value there would add an OpenRouter (PAYG) hop to every bare-name chain.
+
 ### 6.2 Default chain (no `defaultProvider` set)
 
 When `defaultProvider` is absent and only `OPENROUTER_API_KEY` is present:
