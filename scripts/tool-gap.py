@@ -195,6 +195,49 @@ def trailing_calls(tail: str) -> tuple[list[dict], bool]:
     return calls, denied
 
 
+# --- Redaction ---------------------------------------------------------------
+#
+# The command text is meant to be pasted on dashboards (the PR's own comment
+# does it): a key passed on a fleet session's command line would end up
+# published. Review #474 CHANGES_REQUESTED demonstrated exactly that with a
+# synthetic `curl -H "x-api-key: sk-…"`. Every path out of this tool -- the
+# top table AND --json -- goes through cmd_of(), so redacting there covers
+# both. Over-masking is accepted by design (a 40-hex commit SHA is
+# indistinguishable from a key and gets masked too); under-masking is not.
+REDACTED = "<redacted>"
+
+REDACT_RULES = [
+    # URL userinfo: scheme://user:password@ -> scheme://<redacted>@
+    (re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s:]{1,64}):([^/@\s]{1,128})@", re.I),
+     r"\1" + REDACTED + r"@"),
+    # Bearer/Basic <token> -- MUST run before the header rule: the header rule
+    # masks a single token after the colon, which would eat the word "Bearer"
+    # alone and leave the token exposed (caught by the selftest's JWT vector).
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"),
+     r"\1 " + REDACTED),
+    # named headers / flags carrying a value
+    (re.compile(r"(?i)\b(x-api-key|x-proxy-key|api-key|proxy-key|authorization)"
+                r"(\s*[:=]\s*)\"?([^\s\"',;)]+)"),
+     r"\1\2" + REDACTED),
+    # KEY=/TOKEN=/SECRET=/... assignments (env style, quoted or bare)
+    (re.compile(r"(?i)\b([A-Z][A-Z0-9_]{0,30}(?:KEY|TOKEN|SECRET|PASSWD|PASSWORD"
+                r"|CREDENTIAL)[A-Z0-9_]{0,10})(=)(\"?)[^\s\"&;)]+"),
+     r"\1\2\3" + REDACTED),
+    # provider key shapes
+    (re.compile(r"\b(sk|rk)-[A-Za-z0-9_-]{8,}\b"), REDACTED),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"), REDACTED),
+    # opaque runs: any hex >= 32 (digests, most API keys), any run >= 40
+    (re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32,}(?![0-9a-fA-F])"), REDACTED),
+    (re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])"), REDACTED),
+]
+
+
+def redact(text: str) -> str:
+    for rx, repl in REDACT_RULES:
+        text = rx.sub(repl, text)
+    return text
+
+
 def cmd_of(call: dict) -> str:
     raw = call.get("input") or ""
     if not raw:
@@ -202,13 +245,13 @@ def cmd_of(call: dict) -> str:
     try:
         obj = json.loads(raw)
     except Exception:
-        return raw[:400]
+        return redact(raw)[:400]
     if isinstance(obj, dict):
         for key in ("command", "file_path", "path", "pattern", "query", "url"):
             if key in obj:
-                return str(obj[key])[:400]
-        return json.dumps(obj, ensure_ascii=False)[:400]
-    return str(obj)[:400]
+                return redact(str(obj[key]))[:400]
+        return redact(json.dumps(obj, ensure_ascii=False))[:400]
+    return redact(str(obj))[:400]
 
 
 def classify(call: dict, cmd: str) -> str:
@@ -223,6 +266,54 @@ def classify(call: dict, cmd: str) -> str:
     return "plain"
 
 
+# Synthetic vectors: (text, secret substring that MUST NOT survive redaction).
+# The second element doubles as the mutation guard -- the review asked for a
+# "red mutation": if someone strips the redact() call, these tests must fail,
+# and they only can if the unredacted text actually contains the secret.
+SELFTEST_VECTORS = [
+    ('curl -s https://api.example.com/v1 -H "x-api-key: sk-ant-api03-FAKE0123456789abcdef"',
+     "sk-ant-api03-FAKE0123456789abcdef"),
+    ('curl -H "Authorization: Bearer eyJhbGciOiJ9.fakepayload.sig55" https://host/x',
+     "eyJhbGciOiJ9.fakepayload.sig55"),
+    ('DEEPSEEK_API_KEY="sb-abcdef0123456789abcdef0123456789" python client.py',
+     "sb-abcdef0123456789abcdef0123456789"),
+    ('export GH_TOKEN=$(gh auth token -u lane) && gh api /user',
+     "GH_TOKEN=$(gh"),
+    ('curl https://user:hunter2secretpw@example.com/feed?q=1',
+     "user:hunter2secretpw@example.com"),
+    ('echo ghp_16CharsOfTokenExample0000 | docker login -p-stdin',
+     "ghp_16CharsOfTokenExample0000"),
+]
+
+
+def selftest() -> int:
+    failures = []
+    for text, secret in SELFTEST_VECTORS:
+        # teeth: the raw vector DOES carry the secret (else it pins nothing)
+        if secret not in text:
+            failures.append(f"vector broken, secret absent from raw text: {secret[:12]}…")
+            continue
+        masked = redact(text)
+        if secret in masked:
+            failures.append(f"LEAK: {secret[:12]}… survived redaction")
+        if len(masked) < len(text) // 4:
+            failures.append(f"over-masked to noise: {masked[:60]}")
+    # pipeline: cmd_of is the single choke point for stdout AND --json
+    call = {"id": "call_x", "name": "Bash",
+            "input": '{"command":"curl -H \'x-api-key: sk-ant-api03-FAKE0123456789abcdef\' https://x"}'}
+    out = cmd_of(call)
+    if "sk-ant-api03-FAKE0123456789abcdef" in out:
+        failures.append("LEAK: cmd_of pipeline emitted the key")
+    if "curl" not in out:
+        failures.append(f"pipeline lost the command shape: {out[:60]}")
+    if failures:
+        for f in failures:
+            print(f"selftest FAIL: {f}")
+        return 1
+    print(f"selftest OK: {len(SELFTEST_VECTORS)} vectors redacted, pipeline clean")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=r"D:\claudish-captures")
@@ -232,10 +323,15 @@ def main() -> int:
                     help="plausible ceiling on generation time, seconds")
     ap.add_argument("--limit", type=int, default=0, help="cap files (0 = all)")
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--selftest", action="store_true",
+                    help="pin the redaction on synthetic inputs, then exit")
     ap.add_argument("--session", default="", help="session_id prefix (follow one instance)")
     ap.add_argument("--machine", default="", help="exact machine name, e.g. myia-ai-01")
     ap.add_argument("--json", default="")
     args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
 
     now = dt.datetime.now(dt.timezone.utc)
     floor = now - dt.timedelta(hours=args.hours)
