@@ -215,9 +215,18 @@ REDACT_RULES = [
     # alone and leave the token exposed (caught by the selftest's JWT vector).
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"),
      r"\1 " + REDACTED),
-    # named headers / flags carrying a value
-    (re.compile(r"(?i)\b(x-api-key|x-proxy-key|api-key|proxy-key|authorization)"
+    # named headers / flags carrying a value. Bare token/secret/client-secret/
+    # access-key included (cross-review: the KEY= rule demands a prefix char
+    # before the keyword, so bare `token=` / `secret:` slipped through).
+    (re.compile(r"(?i)\b(x-api-key|x-proxy-key|api-key|proxy-key|authorization"
+                r"|token|secret|client-secret|access-key)"
                 r"(\s*[:=]\s*)\"?([^\s\"',;)]+)"),
+     r"\1\2" + REDACTED),
+    # dashed flags carrying a keyword in their name: --xxx-secret[= :]value
+    # (the = form overlaps the rule above only when the name is bare; space-
+    # separated values need this one -- opaque-run rules miss values <40 chars)
+    (re.compile(r"(?i)(--?[a-z0-9-]*(?:key|token|secret|passwd|password"
+                r"|credential)[a-z0-9-]*)(\s*[=:]?\s*)\"?([^\s\"',;)]+)"),
      r"\1\2" + REDACTED),
     # KEY=/TOKEN=/SECRET=/... assignments (env style, quoted or bare)
     (re.compile(r"(?i)\b([A-Z][A-Z0-9_]{0,30}(?:KEY|TOKEN|SECRET|PASSWD|PASSWORD"
@@ -283,6 +292,13 @@ SELFTEST_VECTORS = [
      "user:hunter2secretpw@example.com"),
     ('echo ghp_16CharsOfTokenExample0000 | docker login -p-stdin',
      "ghp_16CharsOfTokenExample0000"),
+    # cross-review vectors: bare/lowercase names (value under every threshold,
+    # so ONLY the named rule can catch it) and dashed flag with space-separated
+    # value (non-hex, 39 chars -- under the opaque-run threshold on purpose)
+    ('python cfg.py --config \'{"note":"token=AbCdEf123456789012345678"}\'',
+     "AbCdEf123456789012345678"),
+    ('app --client-secret Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9i start',
+     "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9i"),
 ]
 
 
