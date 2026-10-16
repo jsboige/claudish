@@ -113,12 +113,16 @@ def tool_matches(tool_v, cited_v):
 
 
 def path_mobilizes(tool_path, cited):
+    # norm() alone covers every TOOL-input spelling (~ strip, /c/ drive,
+    # case, backslash); variants() on the CITED side adds the Git-Bash and
+    # home-relative spellings a tool input or Bash text can carry.
+    tv = norm(tool_path)
+    if not tv:
+        return None
     for c in cited:
-        cvs = variants(c)
-        for tv in variants(tool_path):
-            for cv in cvs:
-                if tool_matches(tv, cv):
-                    return c
+        for cv in variants(c):
+            if tool_matches(tv, cv):
+                return c
     return None
 
 
