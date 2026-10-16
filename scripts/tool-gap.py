@@ -58,6 +58,7 @@ import re
 import statistics
 import sys
 import tempfile
+import time
 
 TAIL_BYTES = 320 * 1024
 HEAD_BYTES = 4 * 1024
@@ -217,7 +218,10 @@ REDACTED = "<redacted>"
 
 REDACT_RULES = [
     # URL userinfo: scheme://user:password@ -> scheme://<redacted>@
-    (re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s:]{1,64}):([^/@\s]{1,128})@", re.I),
+    # The scheme is BOUNDED ({0,31}): an unbounded `[a-z0-9+.-]*://` backtrack
+    # made this rule quadratic -- redact("a"*50000) measured 12.7 s (3rd CR
+    # #474), 55 s through cmd_of on 100 KB. Real schemes are <= 32 chars.
+    (re.compile(r"([a-z][a-z0-9+.-]{0,31}://)([^/@\s:]{1,64}):([^/@\s]{1,128})@", re.I),
      r"\1" + REDACTED + r"@"),
     # Bearer/Basic <token> -- MUST run before the header rule: the header rule
     # masks a single token after the colon, which would eat the word "Bearer"
@@ -226,18 +230,22 @@ REDACT_RULES = [
      r"\1 " + REDACTED),
     # named keys/headers carrying a value, in every quoting dialect a command
     # line or an embedded JSON blob produces: bare (token=v, token: v),
-    # shell-quoted (token='v', token="v") and JSON ("token": "v", quoted name
-    # included). Bare token/secret/api_key included (cross-review: the KEY=
-    # rule demands a prefix char, so bare `token=` / `secret:` slipped through;
-    # re-review: quotes around the value used to BLOCK the match instead of
-    # delimiting it, letting `export token='…'` and `{"api_key": "…"}` through
-    # -- values here are <40 chars on purpose, under the opaque-run rules).
-    # `[_-]` accepts both spellings; access/refresh/id token join the family.
-    (re.compile(r"(?i)(['\"]?)\b(x-api-key|x-proxy-key|api[_-]key|proxy[_-]key"
-                r"|api[_-]token|access[_-]token|refresh[_-]token|id[_-]token"
-                r"|authorization|token|secret|client[_-]secret|access[_-]key)\1"
-                r"(\s*[:=]\s*)(['\"]?)[^\s'\",;)}\]]+"),
-     r"\1\2\1\3\4" + REDACTED),
+    # shell-quoted (token='v', token="v"), JSON ("token": "v", quoted name
+    # included) and JSON embedded-then-escaped (\"token\": \"v\" -- the \" is
+    # a literal two-char sequence inside an outer shell string, seen in --json
+    # dumps). The quote groups each take an optional backslash before the
+    # quote. camelCase twins (apiKey, accessToken...) join the snake/kebab
+    # spellings; password/passwd/key/credential are part of the named family
+    # (3rd CR #474: bare `password=` / `PASSWORD=` / `export PASSWORD=` leaked
+    # -- the ENV rule needs >=1 prefix char before the keyword, and the named
+    # rule did not carry these words).
+    (re.compile(r"(?i)(\\?['\"]?)\b(x-api-key|x-proxy-key|api[_-]key|apiKey"
+                r"|proxy[_-]key|api[_-]token|apiToken|access[_-]token|accessToken"
+                r"|refresh[_-]token|refreshToken|id[_-]token|idToken"
+                r"|authorization|token|secret|client[_-]secret|clientSecret"
+                r"|access[_-]key|accessKey|password|passwd|key|credential)"
+                r"\\?(['\"]?)(\s*[:=]\s*)(\\?['\"]?)[^\s'\",;)}\]]+"),
+     r"\1\2\3\4\5" + REDACTED),
     # dashed flags carrying a keyword in their name: --xxx-secret[= :]value
     # (the = form overlaps the rule above only when the name is bare; space-
     # separated values need this one -- opaque-run rules miss values <40 chars)
@@ -325,6 +333,17 @@ SELFTEST_VECTORS = [
      "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
     ('cfg = {"api_key": "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9", "n": 1}',
      "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
+    # 3rd-review vectors: bare password spellings (the ENV rule needs a prefix
+    # char before the keyword, so `password=` alone is the named rule's job),
+    # camelCase names, and the escaped-JSON form a --json dump carries.
+    ("PASSWORD=Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9 ./deploy.sh",
+     "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
+    ("password=Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9 curl https://x/y",
+     "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
+    ('cfg = {"apiKey": "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9", "n": 1}',
+     "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
+    ('run --config \'{\\"apiKey\\": \\"Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9\\"}\'',
+     "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
 ]
 
 
@@ -357,6 +376,15 @@ def selftest() -> int:
         failures.append("LEAK: dict-fallback dump emitted the api_key")
     if "api_key" not in out2:
         failures.append(f"fallback lost the shape: {out2[:60]}")
+    # perf pin: the URL-userinfo rule used to backtrack quadratically on a
+    # long scheme-shaped run -- redact("a"*50000) measured 12.7 s, 55 s
+    # through cmd_of on 100 KB (3rd review #474). The scheme bound must keep
+    # a 50 KiB pass under 1 s even on a busy machine.
+    t0 = time.perf_counter()
+    redact("a" * 50000)
+    elapsed = time.perf_counter() - t0
+    if elapsed >= 1.0:
+        failures.append(f"redact 50 KiB took {elapsed:.2f}s (quadratic rule? bound the scheme)")
     # read_slice pin: an intermediate capture (4 KiB < size <= 320 KiB) with
     # its tool_result + metadata past the first 4 KiB must still yield its
     # call and session. Mutation guard: reverting the else-branch to
