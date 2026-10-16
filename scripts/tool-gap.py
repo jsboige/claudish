@@ -57,6 +57,7 @@ import os
 import re
 import statistics
 import sys
+import tempfile
 
 TAIL_BYTES = 320 * 1024
 HEAD_BYTES = 4 * 1024
@@ -110,15 +111,23 @@ def stamp_to_dt(groups: tuple) -> dt.datetime:
 
 
 def read_slice(path: str) -> tuple[str, str]:
-    """(head, tail) as text; decoding is lenient on both edges."""
+    """(head, tail) as text; decoding is lenient on both edges.
+
+    Under TAIL_BYTES the whole file IS the tail: a `tail = head` shortcut here
+    used to keep only the first HEAD_BYTES of every capture between 4 KiB and
+    320 KiB, hiding the last tool_result and the metadata (re-review #474
+    witness: a 435 B capture yielded its one line, the same capture padded to
+    6 434 B yielded none and fell back to device: attribution).
+    """
     size = os.path.getsize(path)
     with open(path, "rb") as fh:
-        head = fh.read(HEAD_BYTES).decode("utf-8", "replace")
         if size > TAIL_BYTES:
+            head = fh.read(HEAD_BYTES).decode("utf-8", "replace")
             fh.seek(size - TAIL_BYTES)
             tail = fh.read().decode("utf-8", "replace")
         else:
-            tail = head
+            data = fh.read().decode("utf-8", "replace")
+            head, tail = data, data
     return head, tail
 
 
@@ -215,23 +224,30 @@ REDACT_RULES = [
     # alone and leave the token exposed (caught by the selftest's JWT vector).
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"),
      r"\1 " + REDACTED),
-    # named headers / flags carrying a value. Bare token/secret/client-secret/
-    # access-key included (cross-review: the KEY= rule demands a prefix char
-    # before the keyword, so bare `token=` / `secret:` slipped through).
-    (re.compile(r"(?i)\b(x-api-key|x-proxy-key|api-key|proxy-key|authorization"
-                r"|token|secret|client-secret|access-key)"
-                r"(\s*[:=]\s*)\"?([^\s\"',;)]+)"),
-     r"\1\2" + REDACTED),
+    # named keys/headers carrying a value, in every quoting dialect a command
+    # line or an embedded JSON blob produces: bare (token=v, token: v),
+    # shell-quoted (token='v', token="v") and JSON ("token": "v", quoted name
+    # included). Bare token/secret/api_key included (cross-review: the KEY=
+    # rule demands a prefix char, so bare `token=` / `secret:` slipped through;
+    # re-review: quotes around the value used to BLOCK the match instead of
+    # delimiting it, letting `export token='…'` and `{"api_key": "…"}` through
+    # -- values here are <40 chars on purpose, under the opaque-run rules).
+    # `[_-]` accepts both spellings; access/refresh/id token join the family.
+    (re.compile(r"(?i)(['\"]?)\b(x-api-key|x-proxy-key|api[_-]key|proxy[_-]key"
+                r"|api[_-]token|access[_-]token|refresh[_-]token|id[_-]token"
+                r"|authorization|token|secret|client[_-]secret|access[_-]key)\1"
+                r"(\s*[:=]\s*)(['\"]?)[^\s'\",;)}\]]+"),
+     r"\1\2\1\3\4" + REDACTED),
     # dashed flags carrying a keyword in their name: --xxx-secret[= :]value
     # (the = form overlaps the rule above only when the name is bare; space-
     # separated values need this one -- opaque-run rules miss values <40 chars)
     (re.compile(r"(?i)(--?[a-z0-9-]*(?:key|token|secret|passwd|password"
-                r"|credential)[a-z0-9-]*)(\s*[=:]?\s*)\"?([^\s\"',;)]+)"),
+                r"|credential)[a-z0-9-]*)(\s*[=:]?\s*)(?:['\"]?)([^\s\"',;)]+)"),
      r"\1\2" + REDACTED),
     # KEY=/TOKEN=/SECRET=/... assignments (env style, quoted or bare)
     (re.compile(r"(?i)\b([A-Z][A-Z0-9_]{0,30}(?:KEY|TOKEN|SECRET|PASSWD|PASSWORD"
-                r"|CREDENTIAL)[A-Z0-9_]{0,10})(=)(\"?)[^\s\"&;)]+"),
-     r"\1\2\3" + REDACTED),
+                r"|CREDENTIAL)[A-Z0-9_]{0,10})(=)(?:['\"]?)[^\s\"'&;)]+"),
+     r"\1\2" + REDACTED),
     # provider key shapes
     (re.compile(r"\b(sk|rk)-[A-Za-z0-9_-]{8,}\b"), REDACTED),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"), REDACTED),
@@ -299,6 +315,16 @@ SELFTEST_VECTORS = [
      "AbCdEf123456789012345678"),
     ('app --client-secret Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9i start',
      "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9i"),
+    # re-review vectors: quoted values and JSON separators (the named rule
+    # used to EXCLUDE quote chars from the value, so a quote blocked the match
+    # instead of delimiting it) -- 37-char non-hex values, under every
+    # opaque-run threshold on purpose, only the named family can catch them.
+    ("export token='Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9' && ./run.sh",
+     "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
+    ('cfg = {"token": "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9", "n": 1}',
+     "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
+    ('cfg = {"api_key": "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9", "n": 1}',
+     "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9"),
 ]
 
 
@@ -322,11 +348,48 @@ def selftest() -> int:
         failures.append("LEAK: cmd_of pipeline emitted the key")
     if "curl" not in out:
         failures.append(f"pipeline lost the command shape: {out[:60]}")
+    # E2E re-review vector: a JSON input with NO command/path key takes the
+    # dict-fallback dump -- the --json path the re-review reached.
+    call2 = {"id": "call_y", "name": "Bash",
+             "input": '{"api_key": "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9", "note": "x"}'}
+    out2 = cmd_of(call2)
+    if "Zq7vKx2mNp4rTb8wYs3hJd5fGc6aLu1eRo9" in out2:
+        failures.append("LEAK: dict-fallback dump emitted the api_key")
+    if "api_key" not in out2:
+        failures.append(f"fallback lost the shape: {out2[:60]}")
+    # read_slice pin: an intermediate capture (4 KiB < size <= 320 KiB) with
+    # its tool_result + metadata past the first 4 KiB must still yield its
+    # call and session. Mutation guard: reverting the else-branch to
+    # `tail = head` fails this (re-review witness: 6 434 B -> zero lines).
+    with tempfile.TemporaryDirectory() as tmp:
+        pad = '{"pad":"' + "x" * 4400 + '"},'
+        body = ('{"machine":"myia-po-2025","model":"glm-5.3","entrypoint":"proxy",'
+                '"device_id8":"abcd1234","pid":42,"messages":[' + pad
+                + '{"role":"assistant","content":[{"id":"toolu_01PINNED","name":"Bash",'
+                  '"input":{"command":"echo pinned"}}]},'
+                + '{"role":"user","content":[{"type":"tool_result",'
+                  '"tool_use_id":"toolu_01PINNED","content":"ok"}]}],'
+                + '"metadata":{"user_id":"...\\"session_id\\":\\"a1b2c3d4e5f6a7b8\\""}}')
+        path = os.path.join(tmp, "req-1-999-2026-10-16T00-00-00-000Z-openai-glm-5.3.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        head, tail = read_slice(path)
+        if len(body) <= HEAD_BYTES or not tail.endswith('a7b8\\""}}'):
+            failures.append(f"slice pin broken: body shape/size changed ({len(body)} B)")
+        else:
+            calls, _denied = trailing_calls(tail)
+            if not calls or calls[0]["id"] != "toolu_01PINNED" \
+                    or calls[0]["name"] != "Bash" or "echo pinned" not in calls[0]["input"]:
+                failures.append("read_slice lost markers past 4 KiB (tail = head regression?)")
+            hits = list(SESSION_ID.finditer(tail))
+            if not hits or hits[-1].group(1) != "a1b2c3d4e5f6a7b8":
+                failures.append("read_slice lost the metadata session_id past 4 KiB")
     if failures:
         for f in failures:
             print(f"selftest FAIL: {f}")
         return 1
-    print(f"selftest OK: {len(SELFTEST_VECTORS)} vectors redacted, pipeline clean")
+    print(f"selftest OK: {len(SELFTEST_VECTORS)} vectors redacted, pipeline clean, "
+          f"slice pin held")
     return 0
 
 
