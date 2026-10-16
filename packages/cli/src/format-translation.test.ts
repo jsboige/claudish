@@ -2249,17 +2249,79 @@ describe("Regression: web search remap to client WebSearch tool_use", () => {
     // No tool_use leaks through
     expect(extractToolNames(events)).toHaveLength(0);
 
-    // Both searches deliver their injection (or graceful degradation notice)
+    // Both searches deliver their injection (or graceful degradation notice).
+    // The query substring is what discriminates the STRUCTURED call's
+    // injection from the <searchWeb> tag path: on the pre-fix tree only the
+    // tag path injected, so this query never reached the client.
     const text = extractText(events);
     expect(text).toContain("[Web search");
+    expect(text).toContain("bondareva 1963");
 
-    // Contiguous block indices from 0 — the hole IS the crash
+    // Exact block coverage, not just contiguity — on the pre-fix tree this
+    // shape yields [0,1] (the structured search silently dropped), and the
+    // hole shape yields [0,1,3]. Both must fail this assertion.
     const starts = events
       .filter((e) => e.data?.type === "content_block_start")
       .map((e) => e.data.index);
-    starts.forEach((idx, i) => expect(idx).toBe(i));
+    expect(starts).toEqual([0, 1, 2]);
 
     expect(extractStopReason(events)).toBe("end_turn");
+  });
+
+  // The coordinator's discriminating probe (review #485, table row 1):
+  // a suppressed web_search call arrives FIRST, then text, then a buffered
+  // real tool, and the turn ends finish_reason "stop". On origin/main the
+  // suppressed call reserves index 0 and never spends it (text lands at 1,
+  // tool at 2) — the reported IndexError class, measured with this exact
+  // wire. With the fix the suppressed call reserves nothing and the real
+  // tool must ship, and the suppressed call's query must reach the client
+  // as injected text.
+  test("suppressed web_search first + buffered real tool + finish=stop → [0,1,2] exact, structured query injected (review #485 probe)", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_first","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"shapley 1967 balanced sets\\"}"}}]},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Checking sources."},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_rd","type":"function","function":{"name":"Read","arguments":"{\\"file_path\\":\\"notes.txt\\"}"}}]},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":9}}`,
+      ``,
+      `data: [DONE]`,
+      ``,
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [READ_SCHEMA] // no WebSearch in the request
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // The real buffered tool ships (buffered-flush on a "stop" ending)
+    expect(extractToolNames(events)).toContain("Read");
+
+    // The suppressed call's query reaches the client as injected text
+    const text = extractText(events);
+    expect(text).toContain("shapley 1967");
+
+    // Exact coverage — the hole IS the crash. Measured on origin/main with
+    // this exact wire: the suppressed call's reservation puts the text at
+    // index 1 and the tool at 2, i.e. starts [1,2] with a HOLE at index 0 —
+    // the Anthropic SDK dies on the gap. The fix reserves nothing for a
+    // suppressed call: starts [0,1], no hole.
+    const starts = events
+      .filter((e) => e.data?.type === "content_block_start")
+      .map((e) => e.data.index);
+    expect(starts).toEqual([0, 1]);
   });
 
   test("GLM <searchWeb> tag + WebSearch declared → remapped tool_use, stop_reason=tool_use", async () => {

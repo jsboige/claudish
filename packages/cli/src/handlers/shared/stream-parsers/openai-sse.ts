@@ -380,7 +380,12 @@ export function createStreamingResponseHandler(
         // the client's own WebSearch tool so the agentic loop continues
         // (stop_reason "tool_use") instead of ending the turn on raw results.
         const emitWebSearchToolUse = (query: string, t?: ToolState) => {
-          const blockIndex = t?.blockIndex ?? writer.reserve();
+          // -1 = suppressed at creation, holds no client index (review #485):
+          // it is not nullish, so without this guard a -1 reaching the remap
+          // path would emit content_block_start index:-1. Unreachable today
+          // (a suppressed call never reaches the remap), but the sentinel
+          // gets its guard at its one consumer.
+          const blockIndex = t && t.blockIndex >= 0 ? t.blockIndex : writer.reserve();
           const id = t?.id ?? `tool_websearch_${Date.now()}_${blockIndex}`;
           const ref = writer.openTool({ id, name: "WebSearch", index: blockIndex });
           writer.append(ref, JSON.stringify({ query }));
