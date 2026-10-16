@@ -120,11 +120,14 @@ describe("SSE optional data space regression (upstream 3dbd3167)", () => {
     expect(original.some((e) => e.delta?.type === "text_delta")).toBe(true);
     expect(original.at(-1)?.type).toBe("message_stop");
     // Real content, not the empty-response injection (identity adapter — review #469).
+    // The fixture-specific substring is what discriminates: with adapter=null
+    // both replays die on the TypeError and converge to the parser's injected
+    // 223-char empty-response message, which does NOT contain this text.
     const text = original
       .filter((e) => e.delta?.type === "text_delta")
       .map((e) => e.delta?.text ?? "")
       .join("");
-    expect(text.length).toBeGreaterThan(0);
+    expect(text).toContain("a test model.");
     expect(await replay(bare)).toEqual(original);
   });
 
