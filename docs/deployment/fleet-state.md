@@ -83,7 +83,7 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 | Machine | State | Status |
 | --- | --- | --- |
 | po-2024 | nominal, traffic on new hub | DECLARED |
-| po-2027 | **hub-direct via the WAN edge — no local claudish container** (`docker ps -a --filter name=claudish` empty). Client `ANTHROPIC_BASE_URL=https://models.myia.io` with `X-Claudish-Machine: myia-po-2027` + `x-proxy-key` fp `6302afdc` (64 chars = the current RX96 cluster key, **not** the pre-rotation `780f0142`); `CLAUDE_CODE_SUBAGENT_MODEL=haiku`, `ENABLE_TOOL_SEARCH=true`, `ANTHROPIC_CUSTOM_MODEL_OPTION=qwen3.8-max`. Personal laptop of the user; four lanes share it (`claudish`, `CoursIA`, `CoursIA-2`, `roo-extensions`) | VERIFIED 16/10 (live `~/.claude/settings.json`; edge `/health` **200 in 81 ms**; authenticated `/v1/messages` probes `frognano-4b` **200 in 0.85 s**, `swift-1.5-27b` **200 in 0.65 s**; unauthenticated probe **401**) |
+| po-2027 | **hub-direct via the WAN edge — no local claudish container** (`docker ps -a --filter name=claudish` empty). Client `ANTHROPIC_BASE_URL=https://models.myia.io` with `X-Claudish-Machine: myia-po-2027` + `x-proxy-key` fp `6302afdc` = the current RX96 cluster key, **not** the pre-rotation `780f0142`; `CLAUDE_CODE_SUBAGENT_MODEL=haiku`, `ENABLE_TOOL_SEARCH=true`, `ANTHROPIC_CUSTOM_MODEL_OPTION=qwen3.8-max`. Four lanes share it (`claudish`, `CoursIA`, `CoursIA-2`, `roo-extensions`) | VERIFIED 16/10 (live `~/.claude/settings.json`; edge `/health` **200 in 81 ms**; authenticated `/v1/messages` probes `frognano-4b` **200 in 0.85 s**, `swift-1.5-27b` **200 in 0.65 s**; unauthenticated probe **401**) |
 
 ## Change log
 
