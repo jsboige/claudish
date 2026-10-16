@@ -9,9 +9,9 @@
   sidecar: clones/pulls the fork, writes the per-machine .env, builds+starts the
   container, and probes it end-to-end.
 
-  Run this ON the target sidecar machine (all cluster machines except po-2023 the
-  hub, and except web1 which stays on models.myia.io directly). It does NOT touch
-  any other machine.
+  Run this ON the target sidecar machine (all cluster machines except the hub
+  machine — po-2025 since the 2026-09 migration, po-2023 before it — and except
+  web1 which stays on models.myia.io directly). It does NOT touch any other machine.
 
   After it succeeds, repoint THIS machine's Claude Code to its local sidecar:
     ANTHROPIC_BASE_URL = http://localhost:3000
@@ -21,14 +21,16 @@
   Machine name for attribution (e.g. myia-po-2024). Required.
 
 .PARAMETER Upstream
-  Hub URL. LAN machines: http://192.168.0.46:3000. WAN externals: https://models.myia.io.
+  Hub URL. LAN machines: http://192.168.0.50:3000 (po-2025 since the 2026-09
+  migration; po-2023 .46 is a relay now — never an upstream). WAN externals:
+  https://models.myia.io.
 
 .PARAMETER ProxyKey
   The cluster proxy gate key (shared across the cluster). NOT hardcoded; pass it
   explicitly or export CLAUDISH_PROXY_KEY in the environment.
 
 .PARAMETER Compress
-  Set CLAUDISH_RELAY_COMPRESS=1 (WAN externals only: po-2025).
+  Set CLAUDISH_RELAY_COMPRESS=1 (WAN upstream only).
 
 .PARAMETER NoAnthropic
   Set CLAUDISH_NO_ANTHROPIC=1 (every machine except ai-01 — leak-policy backstop).
@@ -80,11 +82,13 @@
   Host dir mounted as /captures. Default D:\claudish-captures.
 
 .EXAMPLE
-  # ai-01 (LAN, Anthropic authority — NO NoAnthropic)
-  .\install-sidecar.ps1 -Machine myia-ai-01 -Upstream http://192.168.0.46:3000 -ProxyKey '<CLUSTER_KEY>'
+  # ai-01 (Anthropic authority — NO NoAnthropic; LAN, measured from inside the container 2026-10-15)
+  .\install-sidecar.ps1 -Machine myia-ai-01 -Upstream http://192.168.0.50:3000 -ProxyKey '<CLUSTER_KEY>' -HostPort 3002 -ContainerName claudish-sidecar
 
-  # po-2025 (WAN external — Compress + NoAnthropic)
-  .\install-sidecar.ps1 -Machine myia-po-2025 -Upstream https://models.myia.io -ProxyKey '<CLUSTER_KEY>' -Compress -NoAnthropic
+  # a LAN machine (e.g. po-2026)
+  .\install-sidecar.ps1 -Machine myia-po-2026 -Upstream http://192.168.0.50:3000 -ProxyKey '<CLUSTER_KEY>' -NoAnthropic
+
+  # Never run on the hub machine (po-2025): it runs no sidecar.
 #>
 
 [CmdletBinding()]

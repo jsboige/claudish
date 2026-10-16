@@ -57,10 +57,10 @@ After the sidecar is installed, repoint `ANTHROPIC_BASE_URL` to the **local** si
 
 | Machine | `-Upstream` | `-Compress` | `-NoAnthropic` | Note |
 |---|---|---|---|---|
-| myia-ai-01 | `https://models.myia.io` | — | **no** | The one Anthropic authority; Opus traverses the relay via the header fix (OAuth preserved). **Not the LAN IP** — this machine's Docker has no route to it (see "Docker cannot reach the LAN hub"). Also needs `-HostPort 3002 -ContainerName claudish-sidecar` (3000 taken by a third-party service). |
-| myia-po-2024 | `http://192.168.0.50:3000` | — | yes | LAN — ⚠ **measured stale 2026-09-14**: the installed sidecar still carries `192.168.0.46` (see "A hub migration does not propagate") |
-| myia-po-2025 | `https://models.myia.io` | yes | yes | WAN external — **this machine is the hub** |
-| myia-po-2026 | `http://192.168.0.50:3000` | — | yes | LAN — ⚠ **measured stale 2026-09-23**: compose `.env` (mtime 26/07) AND live container still carry `192.168.0.46` (see "A hub migration does not propagate"); client bypasses the sidecar direct to `.50`, so the drift is latent |
+| myia-ai-01 | `http://192.168.0.50:3000` | — | **no** | The one Anthropic authority; Opus traverses the relay via the header fix (OAuth preserved). **LAN since the 2026-09-07 recreate** — measured 2026-10-15 at the live path: container env `CLAUDISH_RELAY_UPSTREAM=http://192.168.0.50:3000`, in-container `wget …/health` → 200, `/health` `relay-nominal`. The 2026-08-10 "no route" finding was against the old hub `.46` (see "Docker cannot reach the LAN hub") — diagnose from inside the container, never inherit this row. Also needs `-HostPort 3002 -ContainerName claudish-sidecar` (3000 taken by a third-party service). |
+| myia-po-2024 | `http://192.168.0.50:3000` | — | yes | LAN — **repointed** (measured 2026-10-15: bun-process launcher AND live `/health` upstream both carry `.50`; the 2026-09-14 `.46` drift is cleared — see the dated correction under "A hub migration does not propagate") |
+| myia-po-2025 | **none** | — | — | **The hub — no sidecar, never `CLAUDISH_RELAY_UPSTREAM`.** On 2026-09-19 a sidecar-model `.env` here (`https://models.myia.io`) made the hub relay to itself through the edge for 4 h 40, `200` all along and invisible from outside; `CLAUDISH_NO_ANTHROPIC=1` is not the hub's policy either. |
+| myia-po-2026 | `http://192.168.0.50:3000` | — | yes | LAN — **HS matériel, hors service** (user declaration, 10/10 per Maintenance#91); the `.46` drift below is a dead record, no longer to correct |
 
 - **web1**: no sidecar — stays on `https://models.myia.io` directly.
 - **po-2023**: no longer the hub; it runs a relay sidecar like the others.
@@ -69,7 +69,7 @@ After the sidecar is installed, repoint `ANTHROPIC_BASE_URL` to the **local** si
 
 `CLAUDISH_RELAY_UPSTREAM` is a **literal baked into the sidecar's `.env` at install time**. Nothing re-resolves it: move the hub and every sidecar keeps forwarding to the old address until someone edits that file by hand.
 
-The 2026-09 migration (hub po-2023 `192.168.0.46` → po-2025 `192.168.0.50`) exposed this on **po-2024**, where a standalone sidecar (`:3914`, auto-started from HKCU `Run` via `.start-claudish-sidecar.ps1`) still carries the hardcoded `http://192.168.0.46:3000`. It relays po-2024 → po-203 → hub, re-introducing po-203 into a path the sidecar design exists to remove. This document previously stated that **po-2026's `.env` was repointed to `.50` by hand on 2026-09-13 — that never landed**: measured 2026-09-23, the compose `.env` (`C:\dev\claudish\.env`, mtime 2026-07-26) and the live container env **both** still carry `.46`. Both machines are in the same drift state; po-2026's is latent only because its client points at the hub directly and the sidecar serves zero streams. The repoint is planned for the next drained recreate, via `[PROPOSAL]` + single ACK (coordinator arbitration 2026-09-22). Nothing flagged the drift on either machine until the live paths were cross-read — a settings file alone proves nothing about the container.
+The 2026-09 migration (hub po-2023 `192.168.0.46` → po-2025 `192.168.0.50`) exposed this on **po-2024**, where a standalone sidecar (`:3914`, auto-started from HKCU `Run` via `.start-claudish-sidecar.ps1`) still carries the hardcoded `http://192.168.0.46:3000`. It relays po-2024 → po-203 → hub, re-introducing po-203 into a path the sidecar design exists to remove. This document previously stated that **po-2026's `.env` was repointed to `.50` by hand on 2026-09-13 — that never landed**: measured 2026-09-23, the compose `.env` (`C:\dev\claudish\.env`, mtime 2026-07-26) and the live container env **both** still carry `.46`. Both machines are in the same drift state; po-2026's is latent only because its client points at the hub directly and the sidecar serves zero streams. The repoint was planned for the next drained recreate, via `[PROPOSAL]` + single ACK (coordinator arbitration 2026-09-22) — **mooted: po-2026 went hard-down (HS matériel) on 10/10** per the user's declaration (Maintenance#91, on-site ~00:30), so the drift is a dead record, no longer scheduled for a repoint. Nothing flagged the drift on either machine until the live paths were cross-read — a settings file alone proves nothing about the container. **Update 2026-10-15 (po-2024)**: that machine's drift is cleared — the bun-process launcher file and the live `/health` (`upstream: http://192.168.0.50:3000`, role `relay-nominal`) both carry `.50` (measured while answering po-2027:claudish's onboarding). Only **po-2026** carried the drift state above, and it is out of service.
 
 ### The compose dir may be a different clone than the one you develop in
 
@@ -104,13 +104,17 @@ Any hub move must walk this list on every machine. A machine whose only evidence
 # From a clone of the fork (or the installer clones it for you at C:\Dev\claudish)
 cd D:\Dev\claudish   # if already cloned here; else the script clones to C:\Dev\claudish
 
-# ai-01 (Anthropic authority — NO -NoAnthropic)
+# ai-01 (Anthropic authority — NO -NoAnthropic; port 3000 taken)
 .\scripts\install-sidecar.ps1 -Machine myia-ai-01 `
-    -Upstream https://models.myia.io -ProxyKey '<CLUSTER_KEY>'
+    -Upstream http://192.168.0.50:3000 -ProxyKey '<CLUSTER_KEY>' -HostPort 3002 -ContainerName claudish-sidecar
 
-# po-2025 (WAN external — Compress + NoAnthropic)
-.\scripts\install-sidecar.ps1 -Machine myia-po-2025 `
-    -Upstream https://models.myia.io -ProxyKey '<CLUSTER_KEY>' -Compress -NoAnthropic
+# a LAN machine (e.g. po-2026)
+.\scripts\install-sidecar.ps1 -Machine myia-po-2026 `
+    -Upstream http://192.168.0.50:3000 -ProxyKey '<CLUSTER_KEY>' -NoAnthropic
+
+# a machine whose CONTAINER cannot reach .50 (diagnosed from inside, see Troubleshooting)
+#   -Upstream https://models.myia.io -Compress
+# Never on the hub machine (po-2025): it runs no sidecar.
 ```
 
 The installer is **idempotent**: it pulls latest `main`, (re)writes the `.env`, and recreates the container. It will not clobber an existing `config.json` — and since #141 it will not clobber runtime-policy lines either: any `CLAUDISH_FAILOVER_*`, `CLAUDISH_QWEN_THINKING`, `CLAUDISH_GLM_THINKING`, `SEARXNG_URL` or set-but-empty `CLAUDISH_CAPTURE_DIR` lines already present in the `.env` are carried over verbatim on rewrite (before #141 the wholesale rewrite silently dropped them, so an armed cascade lived only in the container's Docker env record — and the installer's own `compose up` wiped it).
@@ -201,12 +205,12 @@ Three traps found while making that change, all worth keeping:
 
 **Symptom**: the installer's probe returns 200 with `message_stop`, but the sidecar logs `[Relay] upstream … DOWN → AUTONOMOUS`, and every request shows a local `[claudish] [Request]` line plus a fresh capture file. The sidecar looks healthy while silently bypassing the hub.
 
-**Cause**: Docker's egress is not the host's egress. On ai-01 (2026-08-10) `curl http://192.168.0.46:3000/health` returned `{"status":"ok"}` **from the host** while the same request **from inside the container** timed out and `ping` lost 100% of packets — internet egress worked fine. Docker Desktop on Windows routinely has no route to a physical LAN address.
+**Cause**: Docker's egress is not the host's egress. On ai-01 (2026-08-10) `curl http://192.168.0.46:3000/health` returned `{"status":"ok"}` **from the host** while the same request **from inside the container** timed out and `ping` lost 100% of packets — internet egress worked fine. Docker Desktop on Windows routinely has no route to a physical LAN address. **It is not a constant (measured 2026-10-15)**: the same ai-01 container reaches the hub `.50` from inside (`wget` → 200) and has relayed on LAN since the 2026-09-07 recreate — the route depends on the target and on Docker Desktop's state, so the diagnosis below is run at each install, never inherited from a table row.
 
 **Diagnose from inside the container** (host-side tests prove nothing here):
 
 ```powershell
-docker exec <ContainerName> wget -qO- --timeout=5 http://192.168.0.46:3000/health   # LAN
+docker exec <ContainerName> wget -qO- --timeout=5 http://192.168.0.50:3000/health   # LAN
 docker exec <ContainerName> wget -qO- --timeout=8 https://models.myia.io/health     # WAN
 ```
 

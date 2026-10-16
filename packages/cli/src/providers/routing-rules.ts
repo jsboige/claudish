@@ -1,6 +1,7 @@
 import { hasOAuthCredentials } from "../auth/oauth-registry.js";
 import { loadConfig, loadLocalConfig } from "../profile-config.js";
 import type { RoutingEntry, RoutingRules } from "../profile-config.js";
+import { resolveDefaultProvider } from "../default-provider.js";
 import { DISPLAY_NAMES, PROVIDER_TO_PREFIX } from "./auto-route.js";
 import { DEFAULT_ROUTING_RULES } from "./default-routing-rules.js";
 import { resolveModelNameSync } from "./model-catalog-resolver.js";
@@ -27,6 +28,17 @@ export function mergeRoutingRules(
 }
 
 /**
+ * The user's two rule files, before merging. `sources` keeps rule composition
+ * and problem detection testable without reading machine config.
+ */
+export interface RoutingRuleSources {
+  /** Rules from ~/.claudish/config.json (global). */
+  globalRules: RoutingRules;
+  /** Rules from ./.claudish.json (project). */
+  localRules: RoutingRules;
+}
+
+/**
  * Load effective routing rules. Layers:
  *   1. DEFAULT_ROUTING_RULES (built-in, see default-routing-rules.ts)
  *   2. Global config (~/.claudish/config.json)
@@ -37,24 +49,41 @@ export function mergeRoutingRules(
  * interleaving).
  *
  * Always returns a non-null `RoutingRules` because defaults are baked in.
- * To get strict no-fallback mode, set `routing["*"] = []` in user config.
+ * Strict no-fallback mode takes TWO settings: `routing["*"] = []` in user
+ * config AND an empty default provider — in the ENV form only
+ * (`CLAUDISH_DEFAULT_PROVIDER=""`, present but empty; the config form
+ * `defaultProvider: ""` is dropped by the truthiness guard in
+ * resolveDefaultProvider and falls through to `openrouter`). Since the proxy
+ * passes `effectiveDefaultProvider()` to route(), routeBare() appends the
+ * default hop to every bare-name chain, an empty one included — and with
+ * nothing set that hop resolves to `openrouter`. Compose-deployed containers
+ * already pass an empty `CLAUDISH_DEFAULT_PROVIDER` (docker-compose.yml), so
+ * they stay opt-out.
  */
-export function loadRoutingRules(): RoutingRules {
-  return mergeRoutingRules(DEFAULT_ROUTING_RULES, loadUserRoutingRules());
+export function loadRoutingRules(sources?: RoutingRuleSources): RoutingRules {
+  return mergeRoutingRules(DEFAULT_ROUTING_RULES, loadUserRoutingRules(sources));
+}
+
+/** Read the user's two rule files off disk, before merging. */
+export function loadRoutingRuleSources(): RoutingRuleSources {
+  return {
+    localRules: loadLocalConfig()?.routing ?? {},
+    globalRules: loadConfig().routing ?? {},
+  };
 }
 
 /**
  * User-authored routing layers only (global config ← local config), without
  * the baked-in defaults. This is the "the user explicitly spoke about this
  * model" set — see matchUserRoutingOverride for its one load-bearing use.
+ *
+ * Prints nothing (upstream 5af1bf3f): it runs inside TUIs and on every
+ * `route()` call, where a stray stderr line lands in the middle of a frame.
+ * Problems in the rules are {@link routingRuleProblems}'s to report: the proxy
+ * prints them once at startup.
  */
-export function loadUserRoutingRules(): RoutingRules {
-  const local = loadLocalConfig()?.routing ?? {};
-  const global_ = loadConfig().routing ?? {};
-
-  validateRoutingRules(local);
-  validateRoutingRules(global_);
-
+export function loadUserRoutingRules(sources?: RoutingRuleSources): RoutingRules {
+  const { localRules: local, globalRules: global_ } = sources ?? loadRoutingRuleSources();
   return { ...global_, ...local };
 }
 
@@ -85,17 +114,88 @@ export function matchUserRoutingOverride(
   return globKeys.some((pattern) => globMatch(pattern, model));
 }
 
-/** Warn about config issues that would silently misbehave. */
-function validateRoutingRules(rules: RoutingRules): void {
+/** A problem in the user's routing rules that would make them silently misbehave. */
+export interface RoutingRuleProblem {
+  /** The config file the rule is in. */
+  scope: "global" | "project";
+  /** The rule key as stored. */
+  pattern: string;
+  problem: "multiple-wildcards" | "unknown-provider";
+  /** `unknown-provider` only: the rule entry, as written, that names no known provider. */
+  entry?: string;
+}
+
+/**
+ * Every problem in the user's two rule files. Pure: it reads nothing and prints
+ * nothing, so a TUI can show the result and the proxy can print it once
+ * (upstream 5af1bf3f).
+ *
+ * `unknown-provider` (upstream 8a23cf3e) asks the provider registry, so the
+ * CALLER registers the custom endpoints first (`loadCustomEndpoints` in the
+ * proxy, before it reads the rules); without that every custom endpoint a rule
+ * names reads as a typo.
+ *
+ * Each file is checked on its own, as the rules have always been: a key that
+ * collides only with a key in the OTHER file is not reported.
+ *
+ * An empty chain is not a problem: `[]` is the user's explicit no-route.
+ */
+export function routingRuleProblems(sources: RoutingRuleSources): RoutingRuleProblem[] {
+  return [
+    ...ruleTableProblems(sources.globalRules, "global"),
+    ...ruleTableProblems(sources.localRules, "project"),
+  ];
+}
+
+function ruleTableProblems(rules: RoutingRules, scope: "global" | "project"): RoutingRuleProblem[] {
+  const problems: RoutingRuleProblem[] = [];
   for (const key of Object.keys(rules)) {
     // Multi-wildcard patterns only use the first *, rest become literals
     if (key !== "*" && (key.match(/\*/g) || []).length > 1) {
-      console.error(
-        `[claudish] Warning: routing pattern "${key}" has multiple wildcards — only single * is supported. This pattern may not match as expected.`
-      );
+      problems.push({ scope, pattern: key, problem: "multiple-wildcards" });
     }
     // Empty chain is valid — explicit no-fallback mode (route() returns
-    // no-route). No warning needed; user opted in.
+    // no-route). Not a problem; user opted in.
+    for (const entry of rules[key] ?? []) {
+      if (!isKnownProvider(ruleEntryProvider(entry))) {
+        problems.push({ scope, pattern: key, problem: "unknown-provider", entry });
+      }
+    }
+  }
+  return problems;
+}
+
+/**
+ * The claudish provider a rule entry names: the part before an optional
+ * `@<model>`, with a shortcut (`or`) resolved, exactly as `buildRoutingChain`
+ * resolves it.
+ */
+function ruleEntryProvider(entry: RoutingEntry): string {
+  const atIdx = entry.indexOf("@");
+  const providerRaw = atIdx === -1 ? entry : entry.slice(0, atIdx);
+  return PROVIDER_SHORTCUTS[providerRaw.toLowerCase()] ?? providerRaw.toLowerCase();
+}
+
+/** A built-in provider or a runtime-registered custom endpoint. */
+function isKnownProvider(provider: string): boolean {
+  return getProviderByName(provider) !== undefined || getRuntimeProviders().has(provider);
+}
+
+/** One line for a rule problem, without a "[claudish]" prefix (logStderr adds it). */
+export function describeRoutingRuleProblem(problem: RoutingRuleProblem): string {
+  switch (problem.problem) {
+    case "multiple-wildcards":
+      return (
+        `routing pattern "${problem.pattern}" (${problem.scope}) has more than one * — ` +
+        "only a single * is supported, so it may not match as expected."
+      );
+    case "unknown-provider": {
+      const entry = problem.entry ?? "";
+      return (
+        `routing rule "${problem.pattern}" (${problem.scope}) names "${entry}", but no ` +
+        `provider "${ruleEntryProvider(entry)}" exists, so that entry never routes.`
+      );
+    }
   }
 }
 
@@ -412,4 +512,23 @@ export function route(
         ? undefined
         : loadConfig().defaultProvider;
   return routeBare(model, parsed.provider, rules, defaultProvider);
+}
+
+/**
+ * The fallback hop the PROXY passes to route() beside its rules snapshot
+ * (port of upstream 9f8364f5). Resolved through the full precedence
+ * (flag → env → config → OPENROUTER_API_KEY → hardcoded) so the proxy's
+ * chains name the same default the documented precedence promises.
+ *
+ * Why this exists: `route(model, rules)` — rules override, no default
+ * override — reads NO default provider (the guard above keeps the host
+ * machine's config out of unit tests), so before the proxy passed the
+ * resolved value explicitly, its bare-name routing appended NO fallback hop
+ * at all, whatever `defaultProvider` (or `CLAUDISH_DEFAULT_PROVIDER`) said.
+ *
+ * Read once beside loadRoutingRules() at createProxyServer. An empty string
+ * is a real value — it disables the fallback hop.
+ */
+export function effectiveDefaultProvider(): string {
+  return resolveDefaultProvider({ config: loadConfig(), env: process.env }).provider;
 }

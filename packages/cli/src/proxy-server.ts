@@ -47,10 +47,14 @@ import {
 } from "./handlers/shared/proxy-key-rotation.js";
 import { admissionFreezeState } from "./handlers/shared/admission-freeze.js";
 import {
+  describeRoutingRuleProblem,
+  effectiveDefaultProvider,
+  loadRoutingRuleSources,
   loadRoutingRules,
   loadUserRoutingRules,
   matchUserRoutingOverride,
   route,
+  routingRuleProblems,
 } from "./providers/routing-rules.js";
 import { createHandlerForProvider } from "./providers/provider-profiles.js";
 import { applyNativePinOverride } from "./providers/native-pin-auto.js";
@@ -770,8 +774,25 @@ export async function createProxyServer(
   // routing engine consults these via route() for every bare-name request.
   // `userRoutingRules` keeps the user-authored subset apart: it is what lets a
   // user routing override beat the native-anthropic heuristic below (2c).
-  const effectiveRoutingRules = loadRoutingRules();
-  const userRoutingRules = loadUserRoutingRules();
+  const routingRuleSources = loadRoutingRuleSources();
+  const effectiveRoutingRules = loadRoutingRules(routingRuleSources);
+  // The fallback hop, resolved once beside the rules and passed to route()
+  // with them (upstream 9f8364f5). Passing rules alone makes route() read NO
+  // default provider (its guard keeps this machine's setting out of tests),
+  // so before this every bare name the proxy routed appended NO fallback hop,
+  // whatever `defaultProvider` — or `CLAUDISH_DEFAULT_PROVIDER` — said.
+  const effectiveFallbackProvider = effectiveDefaultProvider();
+  const userRoutingRules = loadUserRoutingRules(routingRuleSources);
+  // Problems in those rules, reported ONCE, here (upstream 5af1bf3f): before
+  // Claude Code owns the terminal, and through logStderr, which the quiet flag
+  // and a diagnostics pane both govern. `loadRoutingRules` prints nothing,
+  // because it also runs inside TUIs and on every `route()` call — the old
+  // per-load console.error tore TUI frames mid-draw. The custom endpoints were
+  // registered above (loadCustomEndpoints), so a rule naming one is not
+  // reported as an unknown provider (upstream 8a23cf3e).
+  for (const problem of routingRuleProblems(routingRuleSources)) {
+    logStderr(`Warning: ${describeRoutingRuleProblem(problem)}`);
+  }
 
   // Cache fallback handlers by target model string.
   // No TTL/invalidation: claudish is ephemeral per session, so env changes
@@ -856,7 +877,7 @@ export async function createProxyServer(
     );
     if ("bucket" in decision) return decision.bucket;
     await ensureCatalogReady("openrouter", 5000);
-    const plan = route(decision.routeModel, effectiveRoutingRules);
+    const plan = route(decision.routeModel, effectiveRoutingRules, effectiveFallbackProvider);
     // plan.primary is the credential-filtered primary — if the natural primary
     // lacks its key the serving candidate is the first fallback (accepted v1
     // approximation: a mis-credentialed primary is a config error, and the
@@ -887,7 +908,7 @@ export async function createProxyServer(
     );
     if ("bucket" in decision) return decision.bucket;
     await ensureCatalogReady("openrouter", 5000);
-    const plan = route(decision.routeModel, effectiveRoutingRules);
+    const plan = route(decision.routeModel, effectiveRoutingRules, effectiveFallbackProvider);
     if (plan.kind === "ok" && plan.primary) return plan.primary.provider;
     return providerBucketOf(stepTarget);
   };
@@ -1059,7 +1080,7 @@ export async function createProxyServer(
         // Ensure catalog is warm before route() builds OpenRouter modelSpecs.
         await ensureCatalogReady("openrouter", 5000);
 
-        const plan = route(parsedForFallback.model, effectiveRoutingRules);
+        const plan = route(parsedForFallback.model, effectiveRoutingRules, effectiveFallbackProvider);
         if (plan.kind === "ok") {
           const chain = [plan.primary, ...plan.fallbacks];
           const candidates: FallbackCandidate[] = [];
@@ -1081,10 +1102,15 @@ export async function createProxyServer(
 
             fallbackHandlerCache.set(cacheKey, resultHandler);
 
+            const routeLine = `[Route] ${candidates.length} ${candidates.length === 1 ? "provider" : "providers"} for ${parsedForFallback.model}: ${candidates.map((c) => c.name).join(" → ")}`;
             if (!options.quiet && candidates.length > 1) {
-              logStderr(
-                `[Route] ${candidates.length} providers for ${parsedForFallback.model}: ${candidates.map((c) => c.name).join(" → ")}`
-              );
+              logStderr(routeLine);
+            } else {
+              // The debug log gets the chain even when stderr does not: a
+              // single hop, or a quiet `-p` run. Without it a request that
+              // went to the fallback hop alone left no line naming the
+              // provider it used (upstream 9f8364f5).
+              log(routeLine);
             }
             return resultHandler;
           }
