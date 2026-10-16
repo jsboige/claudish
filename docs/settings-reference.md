@@ -331,6 +331,7 @@ Provider part is **case-insensitive**. Shortcuts are resolved to canonical provi
 |-------------|-------------------|-------|
 | `g`, `gemini` | `google` | Direct Google Gemini API (`GEMINI_API_KEY`) |
 | `oai` | `openai` | Direct OpenAI API (`OPENAI_API_KEY`) |
+| `cx`, `codex` | `openai-codex` | OpenAI Codex — Responses API (`OPENAI_CODEX_API_KEY`, alias `OPENAI_API_KEY`; ChatGPT Plus/Pro key or OAuth; `OPENAI_CODEX_BASE_URL` overrides) |
 | `or`, `openrouter` | `openrouter` | OpenRouter (`OPENROUTER_API_KEY`) |
 | `mm`, `mmax` | `minimax` | MiniMax direct API (`MINIMAX_API_KEY`) |
 | `mmc` | `minimax-coding` | MiniMax Coding Plan (`MINIMAX_CODING_API_KEY`) |
