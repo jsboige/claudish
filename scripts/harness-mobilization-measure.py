@@ -32,6 +32,12 @@ Usage:
     python -I scripts/harness-mobilization-measure.py \
         --share //192.168.0.50/d$/claudish-captures \
         --day 2026-10-15 --machine myia-po-2024
+    # when the day's raw captures are already compacted into the archive:
+    python -I scripts/harness-mobilization-measure.py \
+        --archive //192.168.0.50/d$/claudish-captures/archive/captures-2026-10-15.7z \
+        --machine myia-po-2024 --sevenz "C:/path/to/7zr.exe"
+    (--archive streams `7zr e -so` and splits the concatenated JSON stream
+    with raw_decode — no disk extraction, one sequential archive read.)
 
 Traps baked into the design (all hit during the first run, 16/10):
   - UNC paths from python: FORWARD SLASHES ONLY ("//host/d$/dir"). Backslash
@@ -59,6 +65,7 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -235,6 +242,54 @@ def selftest():
     print("selftest: all forms green")
 
 
+def iter_archive_docs(sevenz, archive):
+    """Yield parsed JSON docs from `7zr e -so <archive>`, never touching the
+    disk: the archive is a day's concatenated req-*.json captures, and JSON is
+    self-delimiting — json.JSONDecoder.raw_decode splits the stream. The
+    stream order is the ARCHIVE order (never trust `7z l` listing order —
+    the listing is name-sorted, memory 7z-listing-sort-order-trap)."""
+    import codecs
+    proc = subprocess.Popen(
+        [sevenz, "e", "-so", archive],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    dec = json.JSONDecoder()
+    inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    tail = ""
+    try:
+        while True:
+            chunk = proc.stdout.read(1 << 20)
+            if not chunk:
+                break
+            text = tail + inc.decode(chunk)
+            idx = 0
+            n = len(text)
+            while idx < n:
+                # find the next document start
+                while idx < n and text[idx] not in "{[":
+                    idx += 1
+                if idx >= n:
+                    break
+                try:
+                    obj, end = dec.raw_decode(text, idx)
+                except json.JSONDecodeError:
+                    # Truncated doc (more bytes coming) or corrupt one. With
+                    # >1 MB already buffered past the failure it is corrupt:
+                    # skip one char and resync (forward progress guaranteed;
+                    # the next "{" of a corrupt doc yields an object without
+                    # a machine field, which the filter drops). Else wait.
+                    if n - idx > (1 << 20):
+                        idx += 1
+                        continue
+                    break
+                yield obj
+                idx = end
+            tail = text[idx:]
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+
 def lane_of(cited):
     """Lane label from the cited-path set: the project CLAUDE.md parent dir,
     else the component before '.claude', else the memory-project hash."""
@@ -255,9 +310,68 @@ def lane_of(cited):
     return "(machine-level only)"
 
 
+def aggregate(agg, cited, mobil, model_id):
+    """Fold one request's extraction into the lane aggregate."""
+    lane = lane_of(sorted(cited)) if cited else "(no citation)"
+    a = agg[lane]
+    a["req"] += 1
+    a["models"][model_id] += 1
+    for c in cited:
+        a["cfiles"][c.split("\\")[-1]] += 1
+    if mobil:
+        a["mob"] += 1
+        for form, tool, c in mobil:
+            a["mfiles"][c.split("\\")[-1] + " <- " + tool + "/" + form] += 1
+
+
+def report(agg, started):
+    total = sum(a["req"] for a in agg.values())
+    print(f"\n=== mobilization by lane ({total} requests) ===")
+    for lane, a in sorted(agg.items(), key=lambda kv: -kv[1]["req"]):
+        rate = 100 * a["mob"] / a["req"] if a["req"] else 0
+        print(f"{lane}: {a['req']} req, mobilized {a['mob']} ({rate:.1f}%), models={dict(a['models'].most_common(3))}")
+        top = dict(a["mfiles"].most_common(4))
+        print(f"   mobilized files: {top if top else 'NONE'}")
+        never = [f for f in a["cfiles"] if not any(f + " <-" in k for k in a["mfiles"])]
+        if never:
+            print(f"   NEVER mobilized ({len(never)} cited files): {', '.join(sorted(never)[:12])}{' ...' if len(never) > 12 else ''}")
+    ended = datetime.datetime.now(datetime.timezone.utc)
+    print(f"run end (UTC): {ended.isoformat()} (elapsed {(ended - started).total_seconds():.0f}s)", flush=True)
+
+
+def run_archive(args):
+    """Stream mode: one sequential archive read over SMB, docs parsed from
+    the concatenated stream, machine filter applied on the parsed envelope.
+    Bounded by construction — the hub host serves a single file read."""
+    started = datetime.datetime.now(datetime.timezone.utc)
+    print(f"run start (UTC): {started.isoformat()}", flush=True)
+    print(f"archive: {args.archive} (streamed, no disk extraction)", flush=True)
+    agg = collections.defaultdict(lambda: {"req": 0, "mob": 0, "models": collections.Counter(),
+                                           "mfiles": collections.Counter(), "cfiles": collections.Counter()})
+    seen = kept = 0
+    for doc in iter_archive_docs(args.sevenz, args.archive):
+        seen += 1
+        if doc.get("machine") != args.machine:
+            continue
+        kept += 1
+        model_id = doc.get("model") or "?"
+        cited, mobil = extract(doc)
+        aggregate(agg, cited, mobil, model_id)
+        if (kept) % 1000 == 0:
+            print(f"  stream {kept} kept / {seen} docs", flush=True)
+        if args.pace_every and kept % args.pace_every == 0:
+            time.sleep(args.pace_sleep)
+        if args.limit and kept >= args.limit:
+            break
+    print(f"stream: {kept} {args.machine} docs kept of {seen} parsed", flush=True)
+    report(agg, started)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--share", help="capture dir, forward slashes: //host/d$/claudish-captures")
+    ap.add_argument("--archive", help="day archive to STREAM (7zr e -so), e.g. //host/d$/claudish-captures/archive/captures-2026-10-15.7z — no disk extraction")
+    ap.add_argument("--sevenz", default="7zr", help="path to 7zr executable")
     ap.add_argument("--day", help="capture day as it appears in filenames: 2026-10-15")
     ap.add_argument("--machine", help="x-claudish-machine value to keep")
     ap.add_argument("--limit", type=int, default=0, help="stop after N kept machine requests (0 = all)")
@@ -269,8 +383,13 @@ def main():
     if args.selftest:
         selftest()
         return
+    if args.archive:
+        if not args.machine:
+            sys.exit("--archive requires --machine")
+        run_archive(args)
+        return
     if not (args.share and args.day and args.machine):
-        sys.exit("--share, --day and --machine are required (or --selftest)")
+        sys.exit("--share, --day and --machine are required (or --selftest / --archive)")
 
     started = datetime.datetime.now(datetime.timezone.utc)
     print(f"run start (UTC): {started.isoformat()}", flush=True)
@@ -323,32 +442,12 @@ def main():
             print(f"  jsonerr {n}: {e}", file=sys.stderr)
             continue
         cited, mobil = extract(doc)
-        lane = lane_of(sorted(cited)) if cited else "(no citation)"
-        a = agg[lane]
-        a["req"] += 1
-        a["models"][mo.group(1) if mo else "?"] += 1
-        for c in cited:
-            a["cfiles"][c.split("\\")[-1]] += 1
-        if mobil:
-            a["mob"] += 1
-            for form, tool, c in mobil:
-                a["mfiles"][c.split("\\")[-1] + " <- " + tool + "/" + form] += 1
+        aggregate(agg, cited, mobil, mo.group(1) if mo else "?")
         if (i + 1) % 1000 == 0:
             print(f"  pass2 {i + 1}/{len(kept)}", flush=True)
         pace(i)
 
-    total = sum(a["req"] for a in agg.values())
-    print(f"\n=== mobilization by lane ({total} requests) ===")
-    for lane, a in sorted(agg.items(), key=lambda kv: -kv[1]["req"]):
-        rate = 100 * a["mob"] / a["req"] if a["req"] else 0
-        print(f"{lane}: {a['req']} req, mobilized {a['mob']} ({rate:.1f}%), models={dict(a['models'].most_common(3))}")
-        top = dict(a["mfiles"].most_common(4))
-        print(f"   mobilized files: {top if top else 'NONE'}")
-        never = [f for f in a["cfiles"] if not any(f + " <-" in k for k in a["mfiles"])]
-        if never:
-            print(f"   NEVER mobilized ({len(never)} cited files): {', '.join(sorted(never)[:12])}{' ...' if len(never) > 12 else ''}")
-    ended = datetime.datetime.now(datetime.timezone.utc)
-    print(f"run end (UTC): {ended.isoformat()} (elapsed {(ended - started).total_seconds():.0f}s)", flush=True)
+    report(agg, started)
 
 
 if __name__ == "__main__":
