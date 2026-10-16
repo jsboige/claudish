@@ -256,35 +256,38 @@ def iter_archive_docs(sevenz, archive):
     dec = json.JSONDecoder()
     inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
     tail = ""
+    SIG = '{"ts":'  # every capture envelope starts with this — doc boundary anchor
     try:
         while True:
             chunk = proc.stdout.read(1 << 20)
             if not chunk:
                 break
             text = tail + inc.decode(chunk)
-            idx = 0
+            idx = text.find(SIG)
             n = len(text)
-            while idx < n:
-                # find the next document start
-                while idx < n and text[idx] not in "{[":
-                    idx += 1
-                if idx >= n:
-                    break
+            while idx != -1:
                 try:
                     obj, end = dec.raw_decode(text, idx)
                 except json.JSONDecodeError:
                     # Truncated doc (more bytes coming) or corrupt one. With
-                    # >1 MB already buffered past the failure it is corrupt:
-                    # skip one char and resync (forward progress guaranteed;
-                    # the next "{" of a corrupt doc yields an object without
-                    # a machine field, which the filter drops). Else wait.
+                    # >1 MB buffered past the failure it is corrupt: resync
+                    # on the NEXT document signature (a plain char-skip would
+                    # land inside the corrupt doc and yield nested fragments
+                    # — measured: doc #2025 was a "messages":[ array). If no
+                    # signature follows in this buffer, break WITH idx at the
+                    # corrupt doc so the tail never rewinds over docs already
+                    # yielded (a whole-buffer tail would double-count them).
                     if n - idx > (1 << 20):
-                        idx += 1
+                        nxt = text.find(SIG, idx + 1)
+                        if nxt == -1:
+                            break
+                        idx = nxt
                         continue
                     break
-                yield obj
-                idx = end
-            tail = text[idx:]
+                if isinstance(obj, dict):
+                    yield obj
+                idx = text.find(SIG, end)
+            tail = text[idx:] if idx != -1 else text
     finally:
         proc.stdout.close()
         proc.wait()
