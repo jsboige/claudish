@@ -1262,11 +1262,14 @@ export function createStreamingResponseHandler(
                             name: restoredName,
                             // Reserved, not opened: a buffered tool keeps its place
                             // in the index order and emits at finish_reason time.
-                            // A suppressed web-search call never emits a block, so
-                            // it reserves nothing (-1): its index would otherwise
-                            // leak a hole to the client when the turn ends without
-                            // the finish_reason="tool_calls" spend path.
-                            blockIndex: isWebSearch && !remapToWebSearch ? -1 : writer.reserve(),
+                            // Only a SUPPRESSED web-search call never emits a
+                            // block, so it reserves nothing (-1): its index would
+                            // otherwise leak a hole to the client when the turn
+                            // ends without the finish_reason="tool_calls" spend
+                            // path. The sentinel follows the disposition, not the
+                            // name: lane 1 (exact-name declared) forwards and
+                            // MUST own a real index (#498 CR, #484 class).
+                            blockIndex: suppressWebSearch ? -1 : writer.reserve(),
                             started: false,
                             closed: false,
                             suppressed: suppressWebSearch,

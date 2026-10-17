@@ -2664,6 +2664,14 @@ describe("Regression: empty-response cause classification", () => {
     // No interception: nothing injected, and the loop continues
     expect(extractText(events)).not.toContain("[Web search");
     expect(extractStopReason(events)).toBe("tool_use");
+
+    // #498 CR: the forwarded call must own a real, contiguous index. The
+    // naive merge onto #485's main gave lane 1 the suppressed sentinel (-1)
+    // and the wire carried content_block_start at index -1 — the #484 class.
+    const startIndices = events
+      .filter((e) => e.data?.type === "content_block_start")
+      .map((e) => e.data?.index);
+    expect(startIndices).toEqual([0]);
   });
 
   test("three-way lane 2 twin: only WebSearch declared → remapped, not forwarded verbatim", async () => {
