@@ -2,7 +2,7 @@
 
 The relay/sidecar design (v7.2+, see `CLAUDE.md` → "Relay / Sidecar Mode") removes po-2023 as a single point of failure: each machine runs its own claudish container that **relays** to the hub in nominal mode and **takes over locally** (AUTONOMOUS) when the hub dies. The relay code lives in [`packages/cli/src/fork/server/relay.ts`](../../packages/cli/src/fork/server/relay.ts); the per-machine installer is [`scripts/install-sidecar.ps1`](../../scripts/install-sidecar.ps1).
 
-This runbook deploys a sidecar on each cluster machine **except web1** (which keeps pointing at `models.myia.io` directly) and **except the hub machine** — po-2025 since the 2026-09 migration (`192.168.0.50`), po-2023 (`192.168.0.46`) before it.
+This runbook deploys a sidecar on each cluster machine **except web1** (which keeps pointing at `models.myia.io` directly), **except the hub machine** — po-2025 since the 2026-09 migration (`192.168.0.50`), po-2023 (`192.168.0.46`) before it — and **except po-2027** (hub-direct via the WAN edge, no local container; see the bullet under the matrix).
 
 ## Architecture reminder — one binary, three modes
 
@@ -63,6 +63,7 @@ After the sidecar is installed, repoint `ANTHROPIC_BASE_URL` to the **local** si
 | myia-po-2026 | `http://192.168.0.50:3000` | — | yes | LAN — **HS matériel, hors service** (user declaration, 10/10 per Maintenance#91); the `.46` drift below is a dead record, no longer to correct |
 
 - **web1**: no sidecar — stays on `https://models.myia.io` directly.
+- **po-2027**: no sidecar either — **hub-direct via the WAN edge** (`https://models.myia.io` with `X-Claudish-Machine: myia-po-2027`, cluster key fp `6302afdc`); `docker ps -a --filter name=claudish` is empty on that seat. Measured 2026-10-16 and recorded as the #291 matrix row in `fleet-state.md` — this doc previously implied a sidecar belonged there (only web1 and the hub were excepted), which the matrix row now contradicts. Four lanes share the seat (`claudish`, `CoursIA`, `CoursIA-2`, `roo-extensions`).
 - **po-2023**: no longer the hub; it runs a relay sidecar like the others — yet has **no matrix row above**. Its config (`-Upstream` / `-Compress` / `-NoAnthropic`, plus the live `CLAUDISH_RELAY_UPSTREAM` from the container env) has never been measured into this doc; the row must be filled from that seat, not guessed from here. Noted 2026-10-16 during the per-seat LAN/WAN re-read (every other seat's row carries a live-path measurement date).
 
 ### A hub migration does not propagate to a sidecar's upstream
