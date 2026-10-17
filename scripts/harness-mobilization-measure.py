@@ -237,57 +237,91 @@ def selftest():
         failures.append("marker_regex_space")
     else:
         print("  PASS marker_regex_space")
+    # stream split pins (#486 review): a chunk boundary must never replay
+    # docs already yielded — exact count, no duplicates, on both split
+    # forms. Red against the pre-last_end `tail = text` exhaustion branch.
+    docs4 = [json.dumps({"ts": i, "v": i}).encode() for i in range(4)]
+    splits = {
+        # boundary falls exactly at the end of doc 1
+        "stream_split_at_doc_end": (docs4[0] + docs4[1], docs4[2] + docs4[3]),
+        # boundary cuts doc 2's '{"ts":' signature in half
+        "stream_split_mid_signature": (
+            docs4[0] + docs4[1] + docs4[2][:5],
+            docs4[2][5:] + docs4[3],
+        ),
+    }
+    for label, (c1, c2) in splits.items():
+        got = [d["ts"] for d in iter_docs_from_chunks([c1, c2])]
+        ok = got == [0, 1, 2, 3]
+        print(f"  {'PASS' if ok else 'FAIL'} {label}: ts={got} (want [0, 1, 2, 3])")
+        if not ok:
+            failures.append(label)
     if failures:
         sys.exit(f"selftest FAILED: {failures}")
     print("selftest: all forms green")
 
 
-def iter_archive_docs(sevenz, archive):
-    """Yield parsed JSON docs from `7zr e -so <archive>`, never touching the
-    disk: the archive is a day's concatenated req-*.json captures, and JSON is
-    self-delimiting — json.JSONDecoder.raw_decode splits the stream. The
-    stream order is the ARCHIVE order (never trust `7z l` listing order —
-    the listing is name-sorted, memory 7z-listing-sort-order-trap)."""
+def iter_docs_from_chunks(chunks):
+    """Yield parsed JSON docs from an iterable of byte chunks (the pure
+    parsing half of iter_archive_docs, split out so the selftest can drive
+    chunk boundaries without a real archive). The stream is concatenated
+    req-*.json captures; JSON is self-delimiting — raw_decode splits it."""
     import codecs
-    proc = subprocess.Popen(
-        [sevenz, "e", "-so", archive],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
     dec = json.JSONDecoder()
     inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
     tail = ""
     SIG = '{"ts":'  # every capture envelope starts with this — doc boundary anchor
-    try:
-        while True:
-            chunk = proc.stdout.read(1 << 20)
-            if not chunk:
+    for chunk in chunks:
+        text = tail + inc.decode(chunk)
+        idx = text.find(SIG)
+        n = len(text)
+        last_end = 0  # end of the last COMPLETE doc this buffer — the tail
+                      # starts here on signature exhaustion, never at 0: a
+                      # whole-buffer tail replays every doc already yielded
+                      # (one per chunk boundary, #486 review)
+        while idx != -1:
+            try:
+                obj, end = dec.raw_decode(text, idx)
+            except json.JSONDecodeError:
+                # Truncated doc (more bytes coming) or corrupt one. With
+                # >1 MB buffered past the failure it is corrupt: resync
+                # on the NEXT document signature (a plain char-skip would
+                # land inside the corrupt doc and yield nested fragments
+                # — measured: doc #2025 was a "messages":[ array). If no
+                # signature follows in this buffer, break WITH idx at the
+                # corrupt doc so the tail never rewinds over docs already
+                # yielded (a whole-buffer tail would double-count them).
+                if n - idx > (1 << 20):
+                    nxt = text.find(SIG, idx + 1)
+                    if nxt == -1:
+                        break
+                    idx = nxt
+                    continue
                 break
-            text = tail + inc.decode(chunk)
-            idx = text.find(SIG)
-            n = len(text)
-            while idx != -1:
-                try:
-                    obj, end = dec.raw_decode(text, idx)
-                except json.JSONDecodeError:
-                    # Truncated doc (more bytes coming) or corrupt one. With
-                    # >1 MB buffered past the failure it is corrupt: resync
-                    # on the NEXT document signature (a plain char-skip would
-                    # land inside the corrupt doc and yield nested fragments
-                    # — measured: doc #2025 was a "messages":[ array). If no
-                    # signature follows in this buffer, break WITH idx at the
-                    # corrupt doc so the tail never rewinds over docs already
-                    # yielded (a whole-buffer tail would double-count them).
-                    if n - idx > (1 << 20):
-                        nxt = text.find(SIG, idx + 1)
-                        if nxt == -1:
-                            break
-                        idx = nxt
-                        continue
-                    break
-                if isinstance(obj, dict):
-                    yield obj
-                idx = text.find(SIG, end)
-            tail = text[idx:] if idx != -1 else text
+            if isinstance(obj, dict):
+                yield obj
+            last_end = end
+            idx = text.find(SIG, end)
+        # idx != -1: corrupt-doc break — keep the buffer from that doc.
+        # idx == -1: every doc in this buffer was yielded — keep only what
+        # follows the last complete doc (may be a partial next doc).
+        tail = text[idx:] if idx != -1 else text[last_end:]
+
+
+def iter_archive_docs(sevenz, archive):
+    """Yield parsed JSON docs from `7zr e -so <archive>`, never touching the
+    disk: the archive is a day's concatenated req-*.json captures. Parsing
+    lives in iter_docs_from_chunks. The stream order is the ARCHIVE order
+    (never trust `7z l` listing order — the listing is name-sorted, memory
+    7z-listing-sort-order-trap)."""
+    proc = subprocess.Popen(
+        [sevenz, "e", "-so", archive],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    try:
+        yield from iter_docs_from_chunks(
+            iter(lambda: proc.stdout.read(1 << 20), b"")
+        )
     finally:
         proc.stdout.close()
         proc.wait()
