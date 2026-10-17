@@ -5,6 +5,7 @@
 ### Claude Code. Any Model.
 
 [![npm version](https://img.shields.io/npm/v/claudish.svg?style=flat-square&color=00D4AA)](https://www.npmjs.com/package/claudish)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](./package.json)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-Compatible-d97757?style=flat-square)](https://claude.ai/claude-code)
 
 **Use your existing AI subscriptions with Claude Code.** Works with Anthropic Max, Gemini Advanced, ChatGPT Plus/Codex, Kimi, GLM, OllamaCloud — plus 580+ models via OpenRouter and local models for complete privacy.
@@ -254,7 +255,6 @@ claudish --help-ai > claudish-agent-guide.md
 **Resources:**
 - Full AI agent guide: `claudish --help-ai`
 - Skill document: `skills/claudish-usage/SKILL.md` (in repository root)
-- Model integration: `skills/claudish-integration/SKILL.md` (in repository root)
 
 ## Usage
 
