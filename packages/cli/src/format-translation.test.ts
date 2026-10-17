@@ -2276,7 +2276,7 @@ describe("Regression: web search remap to client WebSearch tool_use", () => {
   // wire. With the fix the suppressed call reserves nothing and the real
   // tool must ship, and the suppressed call's query must reach the client
   // as injected text.
-  test("suppressed web_search first + buffered real tool + finish=stop → [0,1,2] exact, structured query injected (review #485 probe)", async () => {
+  test("suppressed web_search first + buffered real tool + finish=stop → [0,1] exact, structured query injected (review #485 probe)", async () => {
     const createStreamingResponseHandler = await getParser();
     const adapter = await getDefaultAdapter();
     const ctx = createMockContext();
@@ -2322,6 +2322,139 @@ describe("Regression: web search remap to client WebSearch tool_use", () => {
       .filter((e) => e.data?.type === "content_block_start")
       .map((e) => e.data.index);
     expect(starts).toEqual([0, 1]);
+  });
+
+  // ─── #497: the writer's no-gap invariant, one probe per leak site ────────
+  // The block writer renumbers client indices at emit: every
+  // content_block_start takes the next client index in emission order, so a
+  // reserved-but-unspent internal index (the #484/#497 hole class) can never
+  // reach the wire from ANY site. Each probe below pins one demonstrated
+  // site; all three are red on a writer that passes internal indices
+  // through (holes surface as starts like [0,2]).
+  describe("Regression: writer no-gap invariant (#497)", () => {
+    // Two required params: the fork's inference can fill file_path from
+    // context, but offset never — so `{}` reliably FAILS validation (one
+    // required param alone gets inferred away; measured via direct probe).
+    const READ_STRICT_SCHEMA = {
+      name: "Read",
+      description: "Read a file",
+      input_schema: {
+        type: "object",
+        properties: { file_path: { type: "string" }, offset: { type: "number" } },
+        required: ["file_path", "offset"],
+      },
+    };
+
+    test("site :1470 — validation-fail warning merging into open text leaves no hole", async () => {
+      const createStreamingResponseHandler = await getParser();
+      const adapter = await getDefaultAdapter();
+      const ctx = createMockContext();
+
+      // Text opens block 0; tool 0 buffers with INVALID args (missing
+      // file_path) and its warning text merges into the open block, leaving
+      // its reservation unspent; tool 1 is valid. Pre-fix the valid tool
+      // starts at internal index 2 → client starts [0,2], the SDK dies.
+      const raw = [
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Checking."},"finish_reason":null}]}`,
+        ``,
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_bad","type":"function","function":{"name":"Read","arguments":"{}"}}]},"finish_reason":null}]}`,
+        ``,
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_ok","type":"function","function":{"name":"Read","arguments":"{\\"file_path\\":\\"notes.txt\\",\\"offset\\":0}"}}]},"finish_reason":null}]}`,
+        ``,
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":8}}`,
+        ``,
+        `data: [DONE]`,
+        ``,
+      ].join("\n");
+
+      const response = createStreamingResponseHandler(
+        ctx,
+        sseToResponse(raw),
+        adapter,
+        "glm-5.3",
+        null,
+        undefined,
+        [READ_STRICT_SCHEMA]
+      );
+
+      const events = await parseClaudeSseStream(response);
+      const starts = events
+        .filter((e) => e.data?.type === "content_block_start")
+        .map((e) => e.data.index);
+      expect(starts).toEqual([0, 1]);
+    });
+
+    test("site :648 — failure-lane suppressed flush leaves no hole", async () => {
+      const createStreamingResponseHandler = await getParser();
+      const adapter = await getDefaultAdapter();
+      const ctx = createMockContext();
+
+      // Text opens block 0; a buffered tool is in flight when [DONE] arrives
+      // with NO finish_reason — the failure lane closes the tool unspent and
+      // the error notice takes the next index. Pre-fix: starts [0,2].
+      const raw = [
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Working."},"finish_reason":null}]}`,
+        ``,
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_cut","type":"function","function":{"name":"Read","arguments":"{\\"file_path\\":\\"notes.txt\\"}"}}]},"finish_reason":null}]}`,
+        ``,
+        `data: [DONE]`,
+        ``,
+      ].join("\n");
+
+      const response = createStreamingResponseHandler(
+        ctx,
+        sseToResponse(raw),
+        adapter,
+        "glm-5.3",
+        null,
+        undefined,
+        [READ_STRICT_SCHEMA]
+      );
+
+      const events = await parseClaudeSseStream(response);
+      const starts = events
+        .filter((e) => e.data?.type === "content_block_start")
+        .map((e) => e.data.index);
+      expect(starts).toEqual([0, 1]);
+    });
+
+    test("site :696 — buffered-flush skip on failed validation leaves no hole", async () => {
+      const createStreamingResponseHandler = await getParser();
+      const adapter = await getDefaultAdapter();
+      const ctx = createMockContext();
+
+      // finish_reason="stop" runs the buffered flush: tool 0 (invalid) is
+      // skipped with its reservation unspent; tool 1 ships. Pre-fix the
+      // shipped tool starts at internal index 2 → [0,2].
+      const raw = [
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Checking."},"finish_reason":null}]}`,
+        ``,
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_bad","type":"function","function":{"name":"Read","arguments":"{}"}}]},"finish_reason":null}]}`,
+        ``,
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_ok","type":"function","function":{"name":"Read","arguments":"{\\"file_path\\":\\"notes.txt\\",\\"offset\\":0}"}}]},"finish_reason":null}]}`,
+        ``,
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":8}}`,
+        ``,
+        `data: [DONE]`,
+        ``,
+      ].join("\n");
+
+      const response = createStreamingResponseHandler(
+        ctx,
+        sseToResponse(raw),
+        adapter,
+        "glm-5.3",
+        null,
+        undefined,
+        [READ_STRICT_SCHEMA]
+      );
+
+      const events = await parseClaudeSseStream(response);
+      const starts = events
+        .filter((e) => e.data?.type === "content_block_start")
+        .map((e) => e.data.index);
+      expect(starts).toEqual([0, 1]);
+    });
   });
 
   test("GLM <searchWeb> tag + WebSearch declared → remapped tool_use, stop_reason=tool_use", async () => {
@@ -2604,6 +2737,142 @@ describe("Regression: empty-response cause classification", () => {
     // even with a very large prompt (150k tokens would classify as overflow).
     expect(text).not.toMatch(/empty response/i);
     expect(text).not.toMatch(/\/compact/);
+    expect(extractStopReason(events)).toBe("end_turn");
+  });
+
+  // ─── Three-way web-tool disposition (Hermes fix #2, 16/10) ────────────────
+  // Lane 1: the client declared the tool under the EXACT name the model
+  // called → the call forwards like any declared tool (the client executes
+  // it itself, the loop continues). Lane 2: only `WebSearch` declared →
+  // remap (pinned by the tests above). Lane 3: nothing declared →
+  // suppress-and-inject (pinned by the tests above). Pre-fix, lane 1 fell
+  // into lane 3: Hermes' declared `web_search` tool was suppressed, results
+  // injected as text with end_turn — the run dumped raw search results
+  // instead of continuing its loop (measured 15/10, ai-01).
+
+  const WEB_SEARCH_SCHEMA = {
+    name: "web_search",
+    description: "Search the web",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+  };
+
+  test("three-way lane 1: web_search declared exactly → forwarded tool_use, stop_reason=tool_use, no injection", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_fwd","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"shapley 1967 balanced sets\\"}"}}]},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":6}}`,
+      ``,
+      `data: [DONE]`,
+      ``,
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [WEB_SEARCH_SCHEMA] // the EXACT name is declared — lane 1
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // The client's own tool_use ships under its own name, arguments intact
+    expect(extractToolNames(events)).toContain("web_search");
+    const input = events
+      .filter((e) => e.data?.type === "content_block_delta" && e.data?.delta?.type === "input_json_delta")
+      .map((e) => e.data?.delta?.partial_json ?? "")
+      .join("");
+    expect(input).toContain("shapley 1967");
+
+    // No interception: nothing injected, and the loop continues
+    expect(extractText(events)).not.toContain("[Web search");
+    expect(extractStopReason(events)).toBe("tool_use");
+
+    // #498 CR: the forwarded call must own a real, contiguous index. The
+    // naive merge onto #485's main gave lane 1 the suppressed sentinel (-1)
+    // and the wire carried content_block_start at index -1 — the #484 class.
+    const startIndices = events
+      .filter((e) => e.data?.type === "content_block_start")
+      .map((e) => e.data?.index);
+    expect(startIndices).toEqual([0]);
+  });
+
+  test("three-way lane 2 twin: only WebSearch declared → remapped, not forwarded verbatim", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_rmp","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"bondareva 1963\\"}"}}]},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":6}}`,
+      ``,
+      `data: [DONE]`,
+      ``,
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [{ name: "WebSearch", description: "Web search", input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } }] // WebSearch only — NOT the exact name
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // Remap wins: the synthetic WebSearch tool_use ships, not a verbatim web_search
+    const names = extractToolNames(events);
+    expect(names).toContain("WebSearch");
+    expect(names).not.toContain("web_search");
+    expect(extractStopReason(events)).toBe("tool_use");
+  });
+
+  test("three-way lane 3 twin: nothing declared → suppressed, injected, end_turn", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_sup","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"core 1962\\"}"}}]},"finish_reason":null}]}`,
+      ``,
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":6}}`,
+      ``,
+      `data: [DONE]`,
+      ``,
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [
+        // a tool is declared, but no web tool — lane 3
+        { name: "Read", description: "Read a file", input_schema: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] } },
+      ]
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // Suppressed and injected (SearXNG unavailable here → the degradation
+    // notice carries the query), the turn ends — subagent semantics unchanged
+    expect(extractToolNames(events)).toHaveLength(0);
+    expect(extractText(events)).toContain("core 1962");
     expect(extractStopReason(events)).toBe("end_turn");
   });
 });
