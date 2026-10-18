@@ -14,8 +14,9 @@ Read-only, REST only (GraphQL is chronically exhausted on jsboige —
 memory github-graphql-rest-first), bounded by construction:
 
   - one listing pass (`state=closed&sort=updated&direction=desc`),
-    page-capped (`--max-pages`, default 10 = 1000 PRs), stopped as soon
-    as a page holds no PR merged inside the window;
+    page-capped (`--max-pages`, default 10 = 1000 PRs), stopped when a
+    page's oldest item was last updated before the window (updated_at
+    >= merged_at, so nothing past it can be merged in-window);
   - ONE reviews call per in-window merged PR (`--max-prs` cap per month,
     default 250), single page (100 reviews — more is a review storm this
     metric does not need; if a PR returns exactly 100 its counts are
@@ -77,22 +78,35 @@ def month_key(iso):
     return iso[:7]  # 2026-10-17T... -> 2026-10
 
 
-def list_merged_prs(repo, window_start, max_pages):
-    """Yield closed PRs merged at/after window_start, newest-updated
-    first. Page-capped; stops at the first page with no in-window PR."""
-    for page in range(1, max_pages + 1):
-        items = gh_rest("repos/%s/pulls?state=closed&sort=updated"
-                        "&direction=desc&per_page=%d&page=%d"
-                        % (repo, PAGE, page))
+def walk_closed_pages(pages, window_start):
+    """Pager core: yield in-window merged PRs from a sequence of pages
+    (newest-updated first, as the API sorts them). Stops when a page's
+    OLDEST item was last updated before window_start — updated_at >=
+    merged_at, so nothing past that point can be merged in-window; that
+    is the exact bound. A page full of PRs updated in-window but NOT
+    merged in-window (bulk closes of stale PRs, audit comments on old
+    merges) must NOT stop the walk — the old "first page with no
+    in-window merge" rule did exactly that, silently dropping every
+    in-window merge on later pages."""
+    for items in pages:
         if not items:
             return
-        hit = False
         for pr in items:
             if pr.get("merged_at") and pr["merged_at"] >= window_start:
-                hit = True
                 yield pr
-        if not hit:
-            return  # walked past the window — no reason to page further
+        if items[-1].get("updated_at", "") < window_start:
+            return  # oldest item of the page predates the window
+
+
+def list_merged_prs(repo, window_start, max_pages):
+    """Yield closed PRs merged at/after window_start, newest-updated
+    first, one gh_rest page at a time through walk_closed_pages."""
+    def pager():
+        for page in range(1, max_pages + 1):
+            yield gh_rest("repos/%s/pulls?state=closed&sort=updated"
+                          "&direction=desc&per_page=%d&page=%d"
+                          % (repo, PAGE, page))
+    yield from walk_closed_pages(pager(), window_start)
 
 
 def fetch_reviews(repo, number):
@@ -205,6 +219,22 @@ def selftest():
     ]
     months = aggregate(corpus)
     sep, oct_ = months["2026-09"], months["2026-10"]
+    # pager form: page 1 holds ONLY in-window-updated, not-in-window-
+    # merged PRs (bulk close / audit comments on old merges) — the old
+    # "first page with no in-window merge" rule stopped there and lost
+    # page 2. Red on that rule, green on the updated_at bound.
+    def pgrp(n, merged, updated):
+        return {"number": n, "merged_at": merged, "updated_at": updated,
+                "user": {"login": "alice"}}
+    pager_pages = [
+        [pgrp(900, "2026-09-01T00:00:00Z", "2026-10-05T00:00:00Z"),  # old merge, fresh comment
+         pgrp(901, None, "2026-10-04T00:00:00Z")],                    # bulk-closed, never merged
+        [pgrp(902, "2026-10-03T00:00:00Z", "2026-10-06T00:00:00Z"),  # in-window merge
+         pgrp(903, "2026-10-02T00:00:00Z", "2026-09-20T00:00:00Z")], # in-window merge, oldest < window -> stop
+        [pgrp(904, "2026-10-01T12:00:00Z", "2026-10-07T00:00:00Z")], # never reached
+    ]
+    walked = [p["number"] for p in
+              walk_closed_pages(iter(pager_pages), "2026-10-01T00:00:00Z")]
     checks = [
         ("sep merged", sep["merged"], 1),
         ("sep formal", sep["formal"], 2),
@@ -218,6 +248,9 @@ def selftest():
         # PR2: CR 23:00 -> merge 00:30 = 1.5h ; PR4 excluded (post-merge) ;
         # PR5: CR Oct3 01:00 -> merge Oct4 00:00 = 23h
         ("oct ages", oct_["ages_h"], [1.5, 23.0]),
+        # pager: page 1 (no in-window merge) must NOT stop the walk;
+        # page 2's oldest updated_at < window must; page 3 never fetched
+        ("pager survives page-1 noise", walked, [902, 903]),
     ]
     fails = [(l, got, want) for l, got, want in checks if got != want]
     for l, got, want in checks:
