@@ -53,12 +53,31 @@ function findPython(): string {
   throw new Error(`no python interpreter for decision-refs test: ${lastError}`);
 }
 
+// Environment class, posix-path-shim precedent: a seat whose bun-spawn PATH
+// carries no python3/python (measured po-2025, 2026-10-18: both entries sat in
+// the machine's test:strict baseline purely for that gap) SKIPS STRUCTURED
+// instead of failing. A missing interpreter is an environment fact, not a code
+// verdict — it must not live in a fail baseline. The skip is loud (stderr
+// banner names the class and the override) and DECISION_REFS_PYTHON still
+// forces a specific interpreter.
+const PYTHON_BIN: string | null = (() => {
+  try {
+    return findPython();
+  } catch {
+    process.stderr.write(
+      "[decision-refs] SKIP (environment class: no python interpreter in bun-spawn " +
+        "PATH; set DECISION_REFS_PYTHON to override) — posix-path-shim precedent\n",
+    );
+    return null;
+  }
+})();
+
 function runScript(args: string[]): { status: number | null; stdout: string; stderr: string } {
   const r = spawnSync(findPython(), ["-I", SCRIPT, ...args], { encoding: "utf8", cwd: REPO });
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
-describe("verify-decision-refs.py (#445 option b)", () => {
+(PYTHON_BIN ? describe : describe.skip)("verify-decision-refs.py (#445 option b)", () => {
   const fixtureRel = join(".tmp", "decision-refs-fixture.md");
 
   afterAll(() => {
