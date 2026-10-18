@@ -80,11 +80,21 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 | Client | `ANTHROPIC_BASE_URL=http://192.168.0.50:3000` **direct to hub** (settings.json + live process env) — the sidecar serves zero streams; the stale upstream is latent, not load-bearing | VERIFIED 23/09 (process env + `activeStreams=0`) |
 | Plan | repoint `.46`→`.50` at the next **planned drained recreate**, via `[PROPOSAL]` + single ACK (coordinator arbitration 22/09 23:36Z) — never as an isolated gesture on an unused container | DECLARED (coordinator dispatch) |
 
+## po-2024 — SIDECAR (native process, no container)
+
+| Item | Value | Status |
+| --- | --- | --- |
+| Sidecar | **native bun process** (`bun packages/cli/src/fork/server/standalone-proxy.ts --port 3914 --host 127.0.0.1`, CWD `D:\Dev\claudish`), launched at logon by HKCU Run `Claudish-Sidecar` → `~/.start-claudish-sidecar.ps1` — the launcher reads the cluster proxy key from `~/.claude/settings.json` at runtime (never hardcoded) and rotates `~/.claudish/sidecar-{stdout,stderr}.log` to `.prev` on every launch. **No claudish Docker container runs on this machine** (`docker ps` shows no running entry) | VERIFIED 18/10 21:5xZ (registry Run key + `Get-NetTCPConnection` port owner + live `/health`) |
+| Endpoint / role | `127.0.0.1:3914`, upstream `http://192.168.0.50:3000` (hub direct) — `relay-nominal`, instanceId `9b070c83` born 18/10 14:20:09Z (the MiniMax-key rotation kill/relaunch; both 18/10 hub-outage episodes in the current log: `DOWN after 2 failure(s) → AUTONOMOUS`, 1 in-flight request recovered `served LOCALLY`, recovered `relay resumed`) | VERIFIED 18/10 (live `/health` + sidecar log) |
+| `CLAUDISH_NO_ANTHROPIC` | `=1`, set by the launcher on every start (defense in depth) | VERIFIED 18/10 (launcher file read) |
+| MiniMax key (rotation 18/10) | lives in `~/.claudish/config.json` → `apiKeys.MINIMAX_CODING_API_KEY` (len 125), **sha256[:8] `52f299f3`** (= fleet fp spelled `52f299f3482a`); config mtime 18/10 16:19 local, process relaunched 16:20:09. Service proof: the 18/10 AUTONOMOUS windows served **44 MiniMax-M3 with 0 real 401** (episode 1, measured 19:17Z) and the whole current log since 14:20Z holds **0** MiniMax 401 | VERIFIED 18/10 (sha256 recomputed locally; key value never printed) |
+| Sonnet failover | `CLAUDISH_FAILOVER_SONNET=glm-5.3`, `AUTO=1` (armed 02/10, PROPOSAL + ACK ai-01 17:28Z — AUTO arms on a genuine plan wall only); boot proof in `sidecar-stderr.log`: `[Failover] configured=1 armed=[none] auto=on` | VERIFIED 18/10 (launcher + stderr read) |
+| Reboot crossing | host boot 14/10 08:36 local — the sidecar has **not** crossed a reboot since the 18/10 rotation; every input it needs is persistent (launcher registry key + `config.json`), so a logon relaunch is expected to come up whole | DECLARED 18/10 (inputs verified persistent; the crossing itself untested) |
+
 ## Other machines
 
 | Machine | State | Status |
 | --- | --- | --- |
-| po-2024 | nominal, traffic on new hub | DECLARED |
 | po-2027 | **hub-direct via the WAN edge — no local claudish container** (`docker ps -a --filter name=claudish` empty). Client `ANTHROPIC_BASE_URL=https://models.myia.io` with `X-Claudish-Machine: myia-po-2027` + `x-proxy-key` fp `6302afdc` = the current RX96 cluster key, **not** the pre-rotation `780f0142`; `CLAUDE_CODE_SUBAGENT_MODEL=haiku`, `ENABLE_TOOL_SEARCH=true`, `ANTHROPIC_CUSTOM_MODEL_OPTION=qwen3.8-max`. Four lanes share it (`claudish`, `CoursIA`, `CoursIA-2`, `roo-extensions`) | VERIFIED 16/10 (live `~/.claude/settings.json`; edge `/health` **200 in 81 ms**; authenticated `/v1/messages` probes `frognano-4b` **200 in 0.85 s**, `swift-1.5-27b` **200 in 0.65 s**; unauthenticated probe **401**) |
 
 ## Change log
