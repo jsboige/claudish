@@ -39,6 +39,8 @@ Usage
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import re
 import sys
 from pathlib import Path
@@ -90,6 +92,46 @@ EXTERNAL_ALLOWLIST = {
     "mergeStateStatus",        # GitHub GraphQL schema field (gh pr view)
     "CronList",               # Claude Code built-in tool (session scheduler)
 }
+
+# Scoped external allowlist: per-doc-path adjudications for tokens that can
+# never resolve inside this repo. The GLOBAL set above applies everywhere and
+# is reserved for cross-doc vocabulary; a token that is external only in a
+# specific doc family (e.g. docs/reference/*.md narrating fleet operations)
+# is adjudicated in scripts/decision-refs-external.json so the blast radius
+# of each entry is the smallest doc set that justifies it. A token listed
+# there is masked ONLY for matching docs -- everywhere else it still goes
+# red -- and the run summary reports the masked count so the mask itself
+# stays visible (an allowlist nobody can see is a hole, not a filter).
+SCOPED_ALLOWLIST_PATH = Path(__file__).resolve().parent / "decision-refs-external.json"
+
+
+def load_scoped_allowlist() -> list[tuple[str, set[str]]]:
+    """Return [(path_pattern, tokens)] from the sidecar JSON; [] when absent."""
+    if not SCOPED_ALLOWLIST_PATH.is_file():
+        return []
+    try:
+        data = json.loads(SCOPED_ALLOWLIST_PATH.read_text(encoding="utf-8"))
+        return [
+            (scope["match"], set(scope.get("tokens", {})))
+            for scope in data.get("scopes", [])
+        ]
+    except (OSError, ValueError, KeyError, TypeError):
+        # A malformed allowlist must degrade to NO allowlisting (stay loud),
+        # never to silently masking everything.
+        return []
+
+
+def scoped_allowlist_for(doc: Path) -> set[str]:
+    """Union of token sets whose pattern matches this doc's repo-relative path."""
+    try:
+        rel = doc.resolve().relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return set()
+    tokens: set[str] = set()
+    for pattern, scoped in load_scoped_allowlist():
+        if fnmatch.fnmatch(rel, pattern):
+            tokens |= scoped
+    return tokens
 
 
 def build_code_corpus() -> str:
@@ -166,8 +208,12 @@ def classify(token: str) -> tuple[str, str]:
     return "skip", "unclassifiable"
 
 
-def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str]):
-    """Yield (line_no, token, class, verdict) for every non-skipped token."""
+def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str], allow: set[str] | None = None):
+    """Yield (line_no, token, class, verdict) for every non-skipped token.
+
+    Verdicts: ok | UNVERIFIED | external (masked by the doc's scoped
+    allowlist -- reported, never silent).
+    """
     for line_no, line in enumerate(
         doc.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
     ):
@@ -175,6 +221,9 @@ def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str]):
             token = match.group(1)
             cls, _note = classify(token)
             if cls == "skip" or token in EXTERNAL_ALLOWLIST:
+                continue
+            if allow and token in allow:
+                yield line_no, token, cls, "external"
                 continue
             if cls == "path":
                 # Decision-layer docs cite files by bare basename (the prefixed
@@ -263,13 +312,18 @@ def run(paths: list[str]) -> int:
     files = repo_file_set()
     unverified = 0
     checked = 0
+    external = 0
     for doc in docs:
-        for line_no, token, cls, verdict in verify_doc(doc, code, docs_corpus, files):
+        allow = scoped_allowlist_for(doc)
+        for line_no, token, cls, verdict in verify_doc(doc, code, docs_corpus, files, allow):
             checked += 1
+            if verdict == "external":
+                external += 1
+                continue
             if verdict != "ok":
                 unverified += 1
                 print(f"UNVERIFIED {doc.as_posix()}:{line_no} [{cls}] `{token}`")
-    print(f"{checked} tokens checked, {unverified} unverified")
+    print(f"{checked} tokens checked, {unverified} unverified, {external} external-allowlisted")
     return 1 if unverified else 0
 
 
@@ -298,6 +352,21 @@ def selftest() -> int:
             token: verdict
             for _line, token, _cls, verdict in verify_doc(fixture, code, "", set())
         }
+        # Scoped-allowlist pin: a LISTED token is masked ("external"), an
+        # unlisted near-twin stays red. An allowlist that swallowed a class
+        # (prefix match, over-broad pattern) would pass the twin too, and
+        # this pin catches it.
+        pin_doc = Path(tmp) / "pin.md"
+        pin_doc.write_text(
+            "Listed `ExternalTokenA` and unlisted twin `ExternalTokenB`.\n",
+            encoding="utf-8",
+        )
+        pin = {
+            token: verdict
+            for _line, token, _cls, verdict in verify_doc(
+                pin_doc, code, "", set(), {"ExternalTokenA"}
+            )
+        }
     must_pass = ["CLAUDISH_FIRST_EVENT_TIMEOUT_MS", "withFirstUsefulEventWatchdog",
                  "Get-FailoverLineFingerprint", "packages/cli/scripts/smoke/"]
     must_fail = ["resolveEverythingMagically", "CLAUDISH_IMAGINARY_FLAG_XYZ",
@@ -316,6 +385,12 @@ def selftest() -> int:
         elif token not in results:
             print(f"SELFTEST FAIL: false reference `{token}` was skipped, not checked")
             ok = False
+    if pin.get("ExternalTokenA") != "external":
+        print(f"SELFTEST FAIL: allowlisted token was not masked: {pin.get('ExternalTokenA')}")
+        ok = False
+    if pin.get("ExternalTokenB") != "UNVERIFIED":
+        print(f"SELFTEST FAIL: unlisted twin was not flagged: {pin.get('ExternalTokenB')}")
+        ok = False
     print("SELFTEST PASS" if ok else "SELFTEST FAIL")
     return 0 if ok else 2
 
