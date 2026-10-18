@@ -55,7 +55,8 @@ skill **`worker-issues`**.
 - **Panne machine** (gel, docker mort) : Event Log System AVANT le proxy (Id 26 commit
   charge, Kernel-Processor-Power). Leviers : pagefile, cap WSL2.
 - **Déploiement** : règles d'appel (`Invoke-ClaudishDrainedRestart -Recreate -EnvFile`
-  obligatoire, détaché + poll `OUTCOME`, jamais inline, jamais de handle bloquant sur
+  obligatoire, détaché + poll `OUTCOME` — grep **sans ancre**, préfixe `[ts]`, détail
+  dans `ops-scripts.md` §drain `-Detach` — jamais inline, jamais de handle bloquant sur
   `drain.log`) : `CLAUDE.md` §« Never-Hang Constraints » + `reference.md` §« Pièges ».
   Spécificités absentes du CLAUDE.md : jumeau `<id>_<nom>` Created ⇒ `docker rm`
   avant retry ; bind-mount seul changé ⇒ `compose up -d` no-op silencieux → drain à
