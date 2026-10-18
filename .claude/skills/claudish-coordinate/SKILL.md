@@ -36,7 +36,8 @@ de #445 ; tout levier nomme le contrôle qu'il touche (en principe aucun : on vi
 | | |
 |---|---|
 | Machine | `myia-ai-01`, coordinateur |
-| Workers | `po-2023` (= `po-203`), `po-2024`, `po-2025` · `po-2026` **HS matériel** depuis le 10/10 (Maintenance#91) |
+| Workers | `po-2023` (= `po-203`), `po-2024`, `po-2025`, `po-2027` (hub-direct via le WAN) · `po-2026` **HS matériel** depuis le 10/10 (Maintenance#91) |
+| WAN | `models.myia.io` : IIS po-2023 → `.50:3000` ; porte po-2027 + crons hors site |
 | Périmètre | workspace `claudish` seul (`/coordinate` de roo-extensions est un autre mandat) |
 | Hub | `http://192.168.0.50:3000` — **po-2025** depuis le 05/09 |
 | Relais | `http://192.168.0.46:3000` (po-2023) — maillon de flotte, **ni le hub ni mon chemin** |
@@ -55,7 +56,7 @@ silence : la corriger dans le geste qui la rend fausse.
 
 ```
 CronCreate(cron: "37 */12 * * *",
-           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7. Mandat user du 18/09 : endosser le rôle de coordinateur — faire avancer les issues en dispatchant une file PROFONDE (~10 grains ordonnés, avec grains de repli) à chacun des 4 workers (po-2023, po-2024, po-2025, po-2026 — mandats user 04/10 et 05/10, Phase 4c), et faire des reviews/merges exigeants. Aucun cycle idle.",
+           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7. Mandat user du 18/09 : endosser le rôle de coordinateur — faire avancer les issues en dispatchant une file PROFONDE (~10 grains ordonnés, avec grains de repli) à chacun des 4 workers (po-2023, po-2024, po-2025, po-2027 — mandats user 04/10 et 05/10, Phase 4c), et faire des reviews/merges exigeants. Aucun cycle idle.",
            recurring: true)
 ```
 
@@ -80,6 +81,7 @@ roosync_messages(action:"inbox", status:"all", limit:20)
 curl -s --max-time 6 http://192.168.0.50:3000/health     # HUB
 curl -s --max-time 6 http://192.168.0.46:3000/health     # RELAIS (pas le hub)
 curl -s --max-time 5 http://localhost:3002/health        # sidecar
+curl -s -m 8 -o /dev/null -w '%{http_code}\n' https://models.myia.io/health  # WAN
 docker ps --format '{{.Names}}\t{{.Status}}'
 docker image inspect claudish-claudish-proxy --format 'created={{.Created}}'
 ```
@@ -89,7 +91,6 @@ docker image inspect claudish-claudish-proxy --format 'created={{.Created}}'
   `docker ps -q | xargs -r docker inspect --format '{{.State.StartedAt}}  {{.Name}}' | sort` — départs
   groupés = daemon ou hôte (`LastBootUpTime`, System 41/6008/1074, `nvlddmkm`) ; un départ isolé seul rend
   la question « qui ? » sensée.
-- `/health` sans `activeStreams` = image antérieure à #37.
 - **Une capture locale ne prouve pas une bascule** (un repli isolé `[1/2]` en écrit aussi) — discriminant :
   `docker logs claudish-sidecar --tail 800 --timestamps 2>&1 | grep -E "\[Relay\] (upstream|forward failed)"`,
   fenêtre bornée, épisodes **comptés** (`→ AUTONOMOUS` / `healthy again`). Jamais « le hub est tombé » : une
@@ -103,8 +104,7 @@ docker image inspect claudish-claudish-proxy --format 'created={{.Created}}'
 
 `claudish_traffic(container:"claudish-sidecar", since:"6h", bucket_minutes:60)` (MCP, #72) par défaut ; il
 rend `UNKNOWN` sur un corpus roté — Docker a déjà servi l'ancien fichier de log après rotation : croiser
-avec `--tail N` (N ≤ 800) et borner la fenêtre (reference.md § Phase 3). `traffic-live.ps1` exige
-`-Container claudish-sidecar` et ne rend plus de verdict.
+avec `--tail N` (N ≤ 800) et borner la fenêtre (reference.md § Phase 3).
 
 Règles de verdict :
 - **Jamais de leak-policy depuis les logs du sidecar** : en NOMINAL, il est muet sur mon propre trafic. La
