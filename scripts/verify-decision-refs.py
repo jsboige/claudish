@@ -282,6 +282,7 @@ FIXTURE = """## Fixture section
 - False flag `CLAUDISH_CHANNEL_IMAGINARY_XYZ` (contains NN: must be checked, not skipped).
 - False .psm1 symbol `Get-ImaginaryPsm1Symbol` (must be flagged, not waved through by the new glob).
 - Real directory reference `packages/cli/scripts/smoke/` (trailing slash — a slash-bearing symbol that resolves to an existing dir is a citation, not a dead pointer).
+- Dead directory citation `packages/cli/scripts/zz-no-such-dir/` and dead file `docs/reference/zz-no-such-file.md` (the acceptance pair of the dir/path clauses — a clause that never fires red certifies nothing).
 """
 
 
@@ -300,7 +301,9 @@ def selftest() -> int:
     must_pass = ["CLAUDISH_FIRST_EVENT_TIMEOUT_MS", "withFirstUsefulEventWatchdog",
                  "Get-FailoverLineFingerprint", "packages/cli/scripts/smoke/"]
     must_fail = ["resolveEverythingMagically", "CLAUDISH_IMAGINARY_FLAG_XYZ",
-                 "CLAUDISH_CHANNEL_IMAGINARY_XYZ", "Get-ImaginaryPsm1Symbol"]
+                 "CLAUDISH_CHANNEL_IMAGINARY_XYZ", "Get-ImaginaryPsm1Symbol",
+                 "packages/cli/scripts/zz-no-such-dir/",   # dead dir: dir clause must NOT wave it
+                 "docs/reference/zz-no-such-file.md"]      # dead file: path branch must flag it
     ok = True
     for token in must_pass:
         if results.get(token) != "ok":
