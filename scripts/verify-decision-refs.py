@@ -182,7 +182,7 @@ def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str]):
                 # tree by suffix as well as by exact relative path.
                 if (
                     token in repo_files
-                    or (REPO_ROOT / token).resolve().is_file()
+                    or (REPO_ROOT / token).resolve().exists()
                     or any(p.endswith("/" + token) for p in repo_files)
                 ):
                     yield line_no, token, cls, "ok"
@@ -204,6 +204,11 @@ def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str]):
                 and all(seg in corpus for seg in token.split(".") if seg)
             ) or any(
                 seg == token for p in repo_files for seg in p.split("/")
+            ) or (
+                # A slash-bearing "symbol" that resolves to an existing
+                # directory is a dir citation (e.g. `packages/cli/scripts/
+                # smoke/`) — is_file-only path checks flagged these dead.
+                "/" in token and (REPO_ROOT / token).resolve().is_dir()
             )
             yield line_no, token, cls, "ok" if found else "UNVERIFIED"
 
@@ -276,6 +281,7 @@ FIXTURE = """## Fixture section
 - False symbol `resolveEverythingMagically` and false flag `CLAUDISH_IMAGINARY_FLAG_XYZ`.
 - False flag `CLAUDISH_CHANNEL_IMAGINARY_XYZ` (contains NN: must be checked, not skipped).
 - False .psm1 symbol `Get-ImaginaryPsm1Symbol` (must be flagged, not waved through by the new glob).
+- Real directory reference `packages/cli/scripts/smoke/` (trailing slash — a slash-bearing symbol that resolves to an existing dir is a citation, not a dead pointer).
 """
 
 
@@ -292,7 +298,7 @@ def selftest() -> int:
             for _line, token, _cls, verdict in verify_doc(fixture, code, "", set())
         }
     must_pass = ["CLAUDISH_FIRST_EVENT_TIMEOUT_MS", "withFirstUsefulEventWatchdog",
-                 "Get-FailoverLineFingerprint"]
+                 "Get-FailoverLineFingerprint", "packages/cli/scripts/smoke/"]
     must_fail = ["resolveEverythingMagically", "CLAUDISH_IMAGINARY_FLAG_XYZ",
                  "CLAUDISH_CHANNEL_IMAGINARY_XYZ", "Get-ImaginaryPsm1Symbol"]
     ok = True
