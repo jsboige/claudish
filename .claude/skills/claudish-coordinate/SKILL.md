@@ -16,7 +16,6 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 1
 - **La cadence appartient au user** (arbitrage de dépense — historique complet : reference.md § en-tête).
   Ne jamais la changer seul. Quand il la change : `CronCreate` **et** patch de ce fichier dans le même
   geste (la Phase 0 réarme à la valeur écrite ici).
-- `ScheduleWakeup` (≤ 1 h) ne peut pas porter ce cycle ; ne pas en armer par-dessus.
 - Armé juste après un créneau, le cron **tire en rattrapage** (pas un double-fire) : mener ce cycle
   économiquement et le dire au bilan.
 
