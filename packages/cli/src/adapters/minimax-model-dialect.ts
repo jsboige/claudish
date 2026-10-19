@@ -24,10 +24,22 @@ const DEFAULT_FORCED_BUDGET = 16000;
  *  an Anthropic signature is a long opaque base64 blob and never matches. */
 const MINIMAX_OWN_SIGNATURE = /^[0-9a-f]{64}$/;
 
+/**
+ * M3.1-Flash thinking-depth levels (Anthropic-compat doc, output_config.effort):
+ * low | medium | high | xhigh | max — Flash defaults to MAX when omitted, which
+ * is the single biggest output-token driver on the Flash lane (measured
+ * 2026-10-19: median thinking 1.5k chars but 23 responses >5k tokens with a
+ * budget_tokens cap armed — the budget field is NOT in the doc and the API
+ * ignores it; effort is the real lever).
+ */
+export const MINIMAX_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type MiniMaxEffortLevel = (typeof MINIMAX_EFFORT_LEVELS)[number];
+
 type MiniMaxThinkingPolicy =
   | { kind: "passthrough" }
   | { kind: "disabled" }
-  | { kind: "forced"; budget: number };
+  | { kind: "forced"; budget: number }
+  | { kind: "effort"; level: MiniMaxEffortLevel };
 
 /**
  * Read CLAUDISH_MINIMAX_THINKING on every call rather than caching it (same
@@ -40,7 +52,9 @@ function readThinkingPolicy(): MiniMaxThinkingPolicy {
   if (!raw || raw === "passthrough" || raw === "client" || raw === "default")
     return { kind: "passthrough" };
   if (raw === "disabled" || raw === "off" || raw === "false") return { kind: "disabled" };
-  let m = raw.match(/^forced:(\d+)$/);
+  let m = raw.match(/^effort:(low|medium|high|xhigh|max)$/);
+  if (m) return { kind: "effort", level: m[1] as MiniMaxEffortLevel };
+  m = raw.match(/^forced:(\d+)$/);
   if (m) {
     const budget = Number.parseInt(m[1], 10);
     if (Number.isFinite(budget) && budget > 0) return { kind: "forced", budget };
@@ -84,12 +98,28 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    * something this policy addresses. CLAUDISH_MINIMAX_THINKING:
    *
    *   passthrough (default) — send exactly what the client asked for
-   *   disabled              — force `thinking: {"type":"disabled"}`
+   *   disabled              — force `thinking: {"type":"disabled"}` (⚠ M3.1-Flash
+   *                           rejects this with 400/2013 — it cannot think less
+   *                           than adaptive; use effort:low on Flash)
    *   forced[:<n>]          — force `{"type":"enabled","budget_tokens":<n>}`
    *                           (default n=16000) when the client did not itself
    *                           ask for thinking; a client that asked (enabled OR
    *                           adaptive — `clientRequestedThinking`) keeps its
-   *                           own setting untouched
+   *                           own setting untouched. ⚠ budget_tokens is NOT in
+   *                           the Anthropic-compat doc and M3.1-Flash ignores
+   *                           it (measured 2026-10-19: cap 4000, 23 responses
+   *                           >5k thinking tokens) — kept for older models only.
+   *   effort:<level>        — M3.1-Flash only: inject
+   *                           `output_config: {"effort": low|medium|high|xhigh|max}`
+   *                           — the documented thinking-depth slider. Flash
+   *                           defaults to MAX when the field is absent, the
+   *                           dominant output-token driver on the Flash lane.
+   *                           Applied regardless of the client's own thinking
+   *                           request; ignored with a log line for non-Flash
+   *                           models. Shares `forced`'s filter semantics
+   *                           (shouldFilterThinking/preserveThinkingBlock):
+   *                           Flash always thinks, so the #295/#324
+   *                           continuation chain needs its blocks preserved.
    *
    * Rewrites apply on the anthropic wire only (`ctx.wireFormat ===
    * "anthropic-sse"`): on OpenAI-shaped routings the `thinking` object is not
@@ -114,7 +144,23 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
     }
 
     const policy = readThinkingPolicy();
-    if (ctx?.wireFormat === "anthropic-sse" && policy.kind !== "passthrough") {
+    if (ctx?.wireFormat === "anthropic-sse" && policy.kind === "effort") {
+      // output_config.effort is the documented M3.1-Flash thinking-depth knob
+      // (low..max, default max when omitted). Flash-only per the doc: M3 does
+      // not document the field, so sending it there is noise at best.
+      if (/m3\.1/i.test(String(this.modelId ?? ""))) {
+        const prior = (request.output_config ?? {}) as Record<string, unknown>;
+        request.output_config = { ...prior, effort: policy.level };
+        log(
+          `[MiniMaxModelDialect] thinking depth effort=${policy.level} (output_config.effort, model ${this.modelId})`
+        );
+      } else {
+        log(
+          `[MiniMaxModelDialect] effort policy ignored for ${this.modelId} — output_config.effort is M3.1-Flash only`
+        );
+      }
+    }
+    if (ctx?.wireFormat === "anthropic-sse" && policy.kind !== "passthrough" && policy.kind !== "effort") {
       // `adaptive` is a request too — an `=== "enabled"` test overwrote it.
       const clientEnabled = clientRequestedThinking(originalRequest?.thinking);
       const maxTokensRaw = Number(request.max_tokens ?? 0);
@@ -130,7 +176,7 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
       } else if (budgetFits) {
         request.thinking = { type: "enabled", budget_tokens: policy.budget };
         log(
-          `[MiniMaxModelDialect] thinking forced (client=${originalRequest?.thinking?.type ?? "absent"}), budget ${policy.budget}`
+          `[MiniMaxModelDialect] thinking forced (client=${originalRequest?.thinking?.type ?? "absent"}), budget ${policy.budget} — NOTE: budget_tokens is not in the MiniMax doc and is ignored by M3.1-Flash; prefer effort:<level>`
         );
       } else {
         log(
@@ -182,7 +228,11 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    * so there is nothing to pass through anyway.
    */
   override shouldFilterThinking(): boolean {
-    return readThinkingPolicy().kind !== "forced";
+    // `effort` shares forced's shape: M3.1-Flash ALWAYS thinks (omitted thinking
+    // = on, doc 2026-10-19), so the same tool-continuation chain that #295/#324
+    // measured for `forced` applies — blocks pass through, history preserved.
+    const kind = readThinkingPolicy().kind;
+    return kind !== "forced" && kind !== "effort";
   }
 
   /**
@@ -217,7 +267,8 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    * readThinkingPolicy().
    */
   override preserveThinkingBlock(block: unknown): boolean {
-    if (readThinkingPolicy().kind !== "forced") return false;
+    const kind = readThinkingPolicy().kind;
+    if (kind !== "forced" && kind !== "effort") return false;
     const sig = (block as { signature?: unknown } | null)?.signature;
     if (typeof sig !== "string" || sig === "") return true; // M2.5 unsigned shape
     return MINIMAX_OWN_SIGNATURE.test(sig);
