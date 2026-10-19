@@ -219,11 +219,18 @@ def classify(token: str) -> tuple[str, str]:
     return "skip", "unclassifiable"
 
 
+def _masked(token: str, allow: set[str] | None) -> str:
+    """Verdict for a token that did not resolve: external if listed, else red."""
+    return "external" if allow and token in allow else "UNVERIFIED"
+
+
 def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str], allow: set[str] | None = None):
     """Yield (line_no, token, class, verdict) for every non-skipped token.
 
     Verdicts: ok | UNVERIFIED | external (masked by the doc's scoped
-    allowlist -- reported, never silent).
+    allowlist -- reported, never silent). The allowlist masks a token only
+    once it has FAILED to resolve: a listed token that resolves stays "ok",
+    which is what lets --audit-allowlist see a stale entry.
     """
     for line_no, line in enumerate(
         doc.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
@@ -232,9 +239,6 @@ def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str], allow: set
             token = match.group(1)
             cls, _note = classify(token)
             if cls == "skip" or token in EXTERNAL_ALLOWLIST:
-                continue
-            if allow and token in allow:
-                yield line_no, token, cls, "external"
                 continue
             if cls == "path":
                 # Decision-layer docs cite files by bare basename (the prefixed
@@ -247,7 +251,7 @@ def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str], allow: set
                 ):
                     yield line_no, token, cls, "ok"
                 else:
-                    yield line_no, token, cls, "UNVERIFIED"
+                    yield line_no, token, cls, _masked(token, allow)
                 continue
             # Symbols may live in code OR in the doc's own detail layer; env
             # knobs are READ BY CODE by definition, so an env token verifies
@@ -270,7 +274,7 @@ def verify_doc(doc: Path, code: str, docs: str, repo_files: set[str], allow: set
                 # smoke/`) — is_file-only path checks flagged these dead.
                 "/" in token and (REPO_ROOT / token).resolve().is_dir()
             )
-            yield line_no, token, cls, "ok" if found else "UNVERIFIED"
+            yield line_no, token, cls, "ok" if found else _masked(token, allow)
 
 
 def repo_file_set() -> set[str]:
@@ -320,6 +324,8 @@ def audit_allowlist() -> int:
     it can run in any cycle without gating anything.
     """
     stale_total = 0
+    code = build_code_corpus()
+    files = repo_file_set()
     for pattern, tokens in load_scoped_allowlist():
         masked: set[str] = set()
         # Walk the pattern's literal prefix as the directory root, then
@@ -335,7 +341,8 @@ def audit_allowlist() -> int:
             if not fnmatch.fnmatch(rel, pattern):
                 continue
             allow = scoped_allowlist_for(doc)
-            for _line, token, _cls, verdict in verify_doc(doc, "", "", set(), allow):
+            docs_corpus = build_docs_corpus([doc])
+            for _line, token, _cls, verdict in verify_doc(doc, code, docs_corpus, files, allow):
                 if verdict == "external":
                     masked.add(token)
         stale = sorted(tokens - masked)
@@ -415,6 +422,18 @@ def selftest() -> int:
                 pin_doc, code, "", set(), {"ExternalTokenA"}
             )
         }
+        # Stale-entry pin: a LISTED token that resolves must stay "ok".
+        # Masking before resolving hides a stale entry from --audit-allowlist
+        # forever -- listing `CLAUDE.md` turned 28 real references on
+        # docs/reference/ "external" (64 -> 92) with the audit reporting none.
+        stale_doc = Path(tmp) / "stale.md"
+        stale_doc.write_text("Listed but resolving `CLAUDE.md`.\n", encoding="utf-8")
+        stale_pin = {
+            token: verdict
+            for _line, token, _cls, verdict in verify_doc(
+                stale_doc, code, "", set(), {"CLAUDE.md"}
+            )
+        }
     # Scope pin: the SAME listed token must be masked ("external") in a doc
     # whose repo-relative path matches the pattern, and stay UNVERIFIED in a
     # doc that does not. This pins the fnmatch gate in scoped_allowlist_for
@@ -428,8 +447,8 @@ def selftest() -> int:
     shutil.rmtree(scope_root, ignore_errors=True)
     in_scope = scope_root / "docs" / "reference" / "pin.md"
     out_scope = scope_root / "other" / "pin.md"
-    in_scope.parent.mkdir(parents=True)
-    out_scope.parent.mkdir(parents=True)
+    in_scope.parent.mkdir(parents=True, exist_ok=True)
+    out_scope.parent.mkdir(parents=True, exist_ok=True)
     in_scope.write_text("Listed `ExternalTokenA` in-scope.\n", encoding="utf-8")
     out_scope.write_text("Listed `ExternalTokenA` out-of-scope.\n", encoding="utf-8")
     entries = [(".tmp/selftest-scope/docs/reference/*", {"ExternalTokenA"})]
@@ -472,6 +491,9 @@ def selftest() -> int:
             "SELFTEST FAIL: out-of-scope doc was masked by the scoped allowlist "
             f"(fnmatch gate leak): {scope_pin.get(str(out_scope))}"
         )
+        ok = False
+    if stale_pin.get("CLAUDE.md") != "ok":
+        print(f"SELFTEST FAIL: listed token that resolves was masked: {stale_pin.get('CLAUDE.md')}")
         ok = False
     print("SELFTEST PASS" if ok else "SELFTEST FAIL")
     return 0 if ok else 2
