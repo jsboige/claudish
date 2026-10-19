@@ -723,6 +723,80 @@ Describe 'Get-WedgeDecision (pure decision table)' {
     }
 }
 
+Describe 'Test-GuiZombieKillOptIn (#530 gap 1: the kill consent, same semantics, its own file)' {
+    It 'absent file, empty file and wrong token are all inert — only the exact token arms the kill' {
+        Test-GuiZombieKillOptIn -ClaudishHome $TestDrive | Should -BeFalse
+        Set-Content -Path (Join-Path $TestDrive (Get-GuiZombieKillOptInFileName)) -Value '' -NoNewline
+        Test-GuiZombieKillOptIn -ClaudishHome $TestDrive | Should -BeFalse
+        Set-Content -Path (Join-Path $TestDrive (Get-GuiZombieKillOptInFileName)) -Value 'yes please' -NoNewline
+        Test-GuiZombieKillOptIn -ClaudishHome $TestDrive | Should -BeFalse
+        Set-Content -Path (Join-Path $TestDrive (Get-GuiZombieKillOptInFileName)) -Value "  enabled `n"
+        Test-GuiZombieKillOptIn -ClaudishHome $TestDrive | Should -BeTrue
+    }
+
+    It 'is a SEPARATE consent from the wedge watch and the relaunch preflight — one consent never carries another' {
+        $drive = Join-Path $TestDrive ([guid]::NewGuid().ToString('n'))
+        New-Item -ItemType Directory -Path $drive -Force | Out-Null
+        # The preflight's token present: arms the preflight, NOT the kill.
+        Set-Content -Path (Join-Path $drive (Get-RelaunchPreflightOptInFileName)) -Value 'enabled'
+        Test-RelaunchPreflightOptIn -ClaudishHome $drive | Should -BeTrue
+        Test-GuiZombieKillOptIn -ClaudishHome $drive | Should -BeFalse
+        # And the kill's own file arms only the kill.
+        Set-Content -Path (Join-Path $drive (Get-GuiZombieKillOptInFileName)) -Value 'enabled'
+        Remove-Item (Join-Path $drive (Get-RelaunchPreflightOptInFileName)) -Force
+        Test-RelaunchPreflightOptIn -ClaudishHome $drive | Should -BeFalse
+        Test-GuiZombieKillOptIn -ClaudishHome $drive | Should -BeTrue
+    }
+}
+
+Describe 'Get-EngineZombieDecision (pure decision table, #530 gap 1)' {
+    # Pure function: every input injected, no I/O. The wiring (probes, state
+    # persistence, consent) is pinned in claudish-watchdog-relaunch.Tests.ps1;
+    # this Describe pins the verdict table itself, same split as Get-WedgeDecision.
+    It 'engine healthy: none, streak reset, never a kill' {
+        $d = Get-EngineZombieDecision -EngineUp $true -GuiPresent $true -ConsecutiveZombie 2 -KillArmed $true
+        $d.Action | Should -Be 'none'
+        $d.Streak | Should -Be 0
+        $d.Kill | Should -BeFalse
+    }
+
+    It 'engine down, GUI absent: none — the relaunch path owns it, not a zombie' {
+        $d = Get-EngineZombieDecision -EngineUp $false -GuiPresent $false -ConsecutiveZombie 2 -KillArmed $true
+        $d.Action | Should -Be 'none'
+        $d.Streak | Should -Be 0
+        $d.Kill | Should -BeFalse
+        $d.Reason | Should -Match 'relaunch path owns'
+    }
+
+    It 'below threshold: arm, counted, no kill even with consent present' {
+        $d = Get-EngineZombieDecision -EngineUp $false -GuiPresent $true -ConsecutiveZombie 1 -KillArmed $true
+        $d.Action | Should -Be 'arm'
+        $d.Streak | Should -Be 2
+        $d.Kill | Should -BeFalse
+        $d.Reason | Should -Match '2/3'
+    }
+
+    It 'at threshold without consent: escalate, Kill stays false — detection only' {
+        $d = Get-EngineZombieDecision -EngineUp $false -GuiPresent $true -ConsecutiveZombie 2 -KillArmed $false
+        $d.Action | Should -Be 'escalate'
+        $d.Streak | Should -Be 3
+        $d.Kill | Should -BeFalse
+    }
+
+    It 'at threshold with consent: escalate AND Kill true — the only branch that may act' {
+        $d = Get-EngineZombieDecision -EngineUp $false -GuiPresent $true -ConsecutiveZombie 2 -KillArmed $true
+        $d.Action | Should -Be 'escalate'
+        $d.Streak | Should -Be 3
+        $d.Kill | Should -BeTrue
+    }
+
+    It 'the threshold is a parameter, not a constant — the boundary belongs to the caller' {
+        $d = Get-EngineZombieDecision -EngineUp $false -GuiPresent $true -ConsecutiveZombie 0 -ZombieThreshold 1
+        $d.Action | Should -Be 'escalate'
+        $d.Streak | Should -Be 1
+    }
+}
+
 Describe 'Static guardrails over scripts/' {
     It 'REGRESSION: no script passes -LogonType to Register-ScheduledTask' {
         # Pins the defect tree-wide, not just in the module that fixed it.
@@ -895,6 +969,81 @@ Describe 'Static guardrails over scripts/' {
         })
         $hits.Count | Should -BeGreaterThan 0
         $fn.Extent.Text | Should -Match 'docker\s+(stop|restart|kill)'
+    }
+
+    It 'AC4 (#530 gap 1): the zombie-watch path contains no actuator except the consent-gated GUI kill' {
+        # The zombie DETECTION is detector-only like the wedge path. The KILL
+        # half ships deliberately (#530): behind gui-zombie-kill.enabled
+        # consent, Stop-Process on "Docker Desktop" ONLY — never the service,
+        # never docker, never wsl, never a restart of anything. The guard
+        # encodes exactly that contract: the wedge guard's whole forbidden set
+        # stays forbidden across BOTH files (watchdog + psm1, since the
+        # decision table lives in the module), and Stop-* is allowed only as
+        # Stop-Process naming "Docker Desktop".
+        $zombieFnCount = 0
+        $offenders = @()
+        foreach ($file in @(
+            (Join-Path $script:ScriptsRoot 'claudish-watchdog.ps1'),
+            (Join-Path $script:ScriptsRoot 'lib\claudish-engine.psm1')
+        )) {
+            $tokens = $null; $errs = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errs)
+            $fns = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -match 'Zombie'
+            }, $true)
+            $zombieFnCount += @($fns).Count
+            foreach ($fn in $fns) {
+                foreach ($call in $fn.FindAll({
+                    param($n) $n -is [System.Management.Automation.Language.CommandAst]
+                }, $true)) {
+                    $name = $call.GetCommandName()
+                    if (-not $name) { continue }
+                    if ($name -match '^(Restart-|Stop-)' -or $name -eq 'wsl.exe' -or $name -eq 'wsl' -or
+                        $name -eq 'Invoke-ClaudishDrainedRestart' -or $name -eq 'Start-DockerEngine') {
+                        # The one sanctioned exception: the consent-gated GUI kill.
+                        if ($name -eq 'Stop-Process' -and $call.Extent.Text -match 'Docker Desktop') { continue }
+                        $offenders += ('{0}:{1}:{2} {3}' -f (Split-Path $file -Leaf), $fn.Name, $call.Extent.StartLineNumber, $name)
+                    }
+                    $flags = $call.CommandElements |
+                        Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } |
+                        ForEach-Object { $_.ParameterName }
+                    if ($flags -contains 'Verb') {
+                        $offenders += ('{0}:{1}:{2} -Verb' -f (Split-Path $file -Leaf), $fn.Name, $call.Extent.StartLineNumber)
+                    }
+                }
+                if ($fn.Extent.Text -match 'docker\s+(stop|restart|kill)') {
+                    $offenders += ('{0}:{1}: docker stop/restart/kill' -f (Split-Path $file -Leaf), $fn.Name)
+                }
+            }
+        }
+        $zombieFnCount | Should -BeGreaterThan 0 -Because 'the guard must have something to guard'
+        $offenders | Should -BeNullOrEmpty
+    }
+
+    It 'the zombie actuator detector actually detects (positive control)' {
+        # Without this, deleting the zombie functions would make the guard above
+        # pass for the wrong reason — same discipline as the wedge/preflight
+        # guards. Both offender shapes: a Stop-Service (forbidden outright) and
+        # a Stop-Process on anything but "Docker Desktop".
+        $tokens = $null; $errs = $null
+        $bad = [System.Management.Automation.Language.Parser]::ParseInput(
+            'function Invoke-ZombieBad { Stop-Service com.docker.service -Force; Stop-Process -Name "com.docker.backend" }',
+            [ref]$tokens, [ref]$errs)
+        $fn = $bad.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -match 'Zombie'
+        }, $true)[0]
+
+        $hits = @($fn.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst]
+        }, $true) | Where-Object {
+            ($_.GetCommandName() -match '^(Restart-|Stop-)') -and
+            -not ($_.GetCommandName() -eq 'Stop-Process' -and $_.Extent.Text -match 'Docker Desktop')
+        })
+        $hits.Count | Should -Be 2
     }
 
     It 'AC1: no probe path names localhost' {
