@@ -628,3 +628,51 @@ describe("ComposedHandler — message_start seed is per-session (#518)", () => {
     }
   });
 });
+
+describe("#518 seed map guards (coordinator probe)", () => {
+  function sse(promptTokens: number): string {
+    const chunks = [
+      { id: "c1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] },
+      { id: "c1", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: 5, total_tokens: promptTokens + 5 } },
+    ];
+    return [...chunks.map((c) => `data: ${JSON.stringify(c)}`), "data: [DONE]", ""].join("\n\n");
+  }
+  async function seedOf(res: Response): Promise<number> {
+    const start = (await res.text()).split("\n").filter((l) => l.startsWith("data: ") && !l.startsWith("data: [DONE]"))
+      .map((l) => JSON.parse(l.slice(6))).find((e: any) => e.type === "message_start") as any;
+    return start.message.usage.input_tokens;
+  }
+  function harness(next: () => string) {
+    const original = (globalThis as any).fetch;
+    (globalThis as any).fetch = (async () => new Response(next(), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+    const handler = new ComposedHandler(overflowTransport(), "glm-5.3", "glm-5.3", 8468, {});
+    const app = new Hono();
+    app.post("/v1/messages", async (c: any) => handler.handle(c, JSON.parse(await c.req.text())));
+    const post = (sid: string) => app.request("/v1/messages", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "glm-5.3", max_tokens: 1024, stream: true, metadata: { user_id: sid }, messages: [{ role: "user", content: "hi" }] }) });
+    return { post, restore: () => { (globalThis as any).fetch = original; } };
+  }
+
+  test("a zero prompt_tokens report does not erase the session's seed", async () => {
+    const script = [sse(166_322), sse(0), sse(1)];
+    let i = 0;
+    const h = harness(() => script[i++]);
+    try {
+      await seedOf(await h.post("a"));
+      await seedOf(await h.post("a"));
+      expect(await seedOf(await h.post("a"))).toBe(166_322);
+    } finally { h.restore(); }
+  });
+
+  test("an active session survives 256 newer ones; the stalest is evicted", async () => {
+    const h = harness(() => sse(5_000));
+    try {
+      await seedOf(await h.post("a"));                                   // a recorded first (oldest)
+      for (let k = 1; k <= 255; k++) await seedOf(await h.post(`s${k}`)); // map full: a, s1..s255
+      expect(await seedOf(await h.post("a"))).toBe(5_000);               // a refreshed -> newest
+      await seedOf(await h.post("s256"));                                 // 257th -> evicts s1, not a
+      expect(await seedOf(await h.post("a"))).toBe(5_000);
+      expect(await seedOf(await h.post("s1"))).toBe(100);
+    } finally { h.restore(); }
+  });
+});

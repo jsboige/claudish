@@ -318,6 +318,11 @@ export class ComposedHandler implements ModelHandler {
    * happened to finish last — seeding from it announced a 233-token turn at
    * 166322 (another tenant's context, measured 18/10). Bounded: see
    * rememberSessionInput.
+   *
+   * Known edge: sub-agents share their parent's session_id (#317 measurement),
+   * so one served by the SAME model inherits the parent's count on its first
+   * turn — same-session by the key's definition, not a foreign tenant; the
+   * terminal delta overwrites it in the nominal case.
    */
   private readonly sessionInputSeeds = new Map<string, number>();
   /** Full routed model string (e.g. "zai@glm-4.7"). Used for provider routing and display echo. */
