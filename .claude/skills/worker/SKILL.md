@@ -32,6 +32,15 @@ skill **`worker-issues`**.
      silence ; le reste → INFO. Dures : watermark mis à jour après relais ; **JAMAIS tronquer les
      journaux** (trace durable des éditions d'infra) ; consent kill
      (`session-watch.kill.enabled`) : ≥24 h de journal sain avant armement, consigné.
+   - **Veille quota MiniMax** (mandat user 19/10, jusqu'au reset ~25/10 23:05Z) : lire
+     `/console/usage` via playwright (profil persistant = auth survivante), extraire
+     h5_pct / week_pct / week_reset_h / credits, **appender** l'entrée NDJSON dans
+     `~/.claudish/minimax-plan-watch.log` (jamais tronquer), puis projeter l'épuisement :
+     `eta_h = (100-week_pct)/(week_pct/elapsed_h)` sur la fenêtre courante.
+     WARN dashboard si `eta_h < week_reset_h - 36` (mur avant reset avec <36 h de marge) ;
+     ASK (registre, pas de geste) si `eta_h < 48` — leviers = armer la cascade haiku
+     (`CLAUDISH_FAILOVER_ACTIVE`, recreate) ou throttler la lane ; **jamais armer au mur**.
+     Console injoignable/session expirée → entrée `type:"reading-error"` + WARN une fois.
 4. **Commit + PR AVANT le rapport** — ne jamais annoncer un travail non commité.
    `git pull origin main` d'abord ; conventional commits. Body PR/commentaire :
    `--body-file <f>` — `--body @f` publie le chemin (6 corps vides au 13/10) ;
