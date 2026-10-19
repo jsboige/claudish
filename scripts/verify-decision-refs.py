@@ -35,6 +35,7 @@ Usage
 -----
   python -I scripts/verify-decision-refs.py CLAUDE.md [.claude/skills/worker/SKILL.md ...]
   python -I scripts/verify-decision-refs.py --selftest
+  python -I scripts/verify-decision-refs.py --audit-allowlist   # stale scoped entries (exit 0)
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -121,14 +123,23 @@ def load_scoped_allowlist() -> list[tuple[str, set[str]]]:
         return []
 
 
-def scoped_allowlist_for(doc: Path) -> set[str]:
-    """Union of token sets whose pattern matches this doc's repo-relative path."""
+def scoped_allowlist_for(
+    doc: Path, entries: list[tuple[str, set[str]]] | None = None
+) -> set[str]:
+    """Union of token sets whose pattern matches this doc's repo-relative path.
+
+    `entries` defaults to the sidecar JSON -- the selftest injects its own
+    list so the fnmatch gate itself is what gets pinned (a pin that only
+    feeds a hand-built set to verify_doc would never see this function).
+    """
+    if entries is None:
+        entries = load_scoped_allowlist()
     try:
         rel = doc.resolve().relative_to(REPO_ROOT).as_posix()
     except ValueError:
         return set()
     tokens: set[str] = set()
-    for pattern, scoped in load_scoped_allowlist():
+    for pattern, scoped in entries:
         if fnmatch.fnmatch(rel, pattern):
             tokens |= scoped
     return tokens
@@ -299,6 +310,43 @@ def repo_file_set() -> set[str]:
     return files
 
 
+def audit_allowlist() -> int:
+    """Report scoped-allowlist tokens that no matching doc ever needs masked.
+
+    A stale entry (the token no longer appears backticked in any doc covered
+    by its scope, or now resolves in code) costs nothing per run but rots the
+    allowlist's meaning: the next reader has no way to tell a live
+    adjudication from a leftover. Informational only -- exit 0 regardless, so
+    it can run in any cycle without gating anything.
+    """
+    stale_total = 0
+    for pattern, tokens in load_scoped_allowlist():
+        masked: set[str] = set()
+        # Walk the pattern's literal prefix as the directory root, then
+        # confirm each candidate against the full fnmatch pattern.
+        root = REPO_ROOT
+        for part in pattern.split("/"):
+            if any(ch in part for ch in "*?["):
+                break
+            root = root / part
+        candidates = root.rglob("*.md") if root.is_dir() else []
+        for doc in candidates:
+            rel = doc.resolve().relative_to(REPO_ROOT).as_posix()
+            if not fnmatch.fnmatch(rel, pattern):
+                continue
+            allow = scoped_allowlist_for(doc)
+            for _line, token, _cls, verdict in verify_doc(doc, "", "", set(), allow):
+                if verdict == "external":
+                    masked.add(token)
+        stale = sorted(tokens - masked)
+        if stale:
+            stale_total += len(stale)
+            print(f"STALE in scope `{pattern}`: {', '.join(stale)}")
+    if not stale_total:
+        print("allowlist audit: no stale tokens")
+    return 0
+
+
 # --- entry points -----------------------------------------------------------
 
 def run(paths: list[str]) -> int:
@@ -367,6 +415,31 @@ def selftest() -> int:
                 pin_doc, code, "", set(), {"ExternalTokenA"}
             )
         }
+    # Scope pin: the SAME listed token must be masked ("external") in a doc
+    # whose repo-relative path matches the pattern, and stay UNVERIFIED in a
+    # doc that does not. This pins the fnmatch gate in scoped_allowlist_for
+    # itself -- the allowlisted/unlisted pin above feeds verify_doc by hand
+    # and would keep passing if the gate degraded to `if True:` (mask
+    # applied to EVERY doc, silently unflagging out-of-scope hits).
+    # The fixtures must live under REPO_ROOT (scoped_allowlist_for resolves
+    # repo-relative paths), so they go to the gitignored .tmp/ and are
+    # removed again right after -- the repo tree is never touched.
+    scope_root = REPO_ROOT / ".tmp" / "selftest-scope"
+    shutil.rmtree(scope_root, ignore_errors=True)
+    in_scope = scope_root / "docs" / "reference" / "pin.md"
+    out_scope = scope_root / "other" / "pin.md"
+    in_scope.parent.mkdir(parents=True)
+    out_scope.parent.mkdir(parents=True)
+    in_scope.write_text("Listed `ExternalTokenA` in-scope.\n", encoding="utf-8")
+    out_scope.write_text("Listed `ExternalTokenA` out-of-scope.\n", encoding="utf-8")
+    entries = [(".tmp/selftest-scope/docs/reference/*", {"ExternalTokenA"})]
+    scope_pin = {}
+    for doc in (in_scope, out_scope):
+        allow = scoped_allowlist_for(doc, entries)
+        for _line, token, _cls, verdict in verify_doc(doc, "", "", set(), allow):
+            if token == "ExternalTokenA":
+                scope_pin[str(doc)] = verdict
+    shutil.rmtree(scope_root, ignore_errors=True)
     must_pass = ["CLAUDISH_FIRST_EVENT_TIMEOUT_MS", "withFirstUsefulEventWatchdog",
                  "Get-FailoverLineFingerprint", "packages/cli/scripts/smoke/"]
     must_fail = ["resolveEverythingMagically", "CLAUDISH_IMAGINARY_FLAG_XYZ",
@@ -391,6 +464,15 @@ def selftest() -> int:
     if pin.get("ExternalTokenB") != "UNVERIFIED":
         print(f"SELFTEST FAIL: unlisted twin was not flagged: {pin.get('ExternalTokenB')}")
         ok = False
+    if scope_pin.get(str(in_scope)) != "external":
+        print(f"SELFTEST FAIL: in-scope doc was not masked: {scope_pin.get(str(in_scope))}")
+        ok = False
+    if scope_pin.get(str(out_scope)) != "UNVERIFIED":
+        print(
+            "SELFTEST FAIL: out-of-scope doc was masked by the scoped allowlist "
+            f"(fnmatch gate leak): {scope_pin.get(str(out_scope))}"
+        )
+        ok = False
     print("SELFTEST PASS" if ok else "SELFTEST FAIL")
     return 0 if ok else 2
 
@@ -398,6 +480,8 @@ def selftest() -> int:
 def main(argv: list[str]) -> int:
     if argv[:1] == ["--selftest"]:
         return selftest()
+    if argv[:1] == ["--audit-allowlist"]:
+        return audit_allowlist()
     if not argv:
         print(__doc__)
         return 2
