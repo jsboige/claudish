@@ -17,12 +17,27 @@ export interface TeamManifest {
   shuffleOrder: string[];
 }
 
+/**
+ * Failure details attached to a FAILED ModelStatus (#538). The MCP failure
+ * report (mcp-server.ts formatTeamResult) renders exactly these five fields —
+ * before this type existed the report block read `m.error.*` that no producer
+ * ever set, so the promised stderr snippet and log path never appeared.
+ */
+export interface ModelStatusError {
+  model: string;
+  command: string;
+  stderrSnippet: string;
+  errorLogPath: string;
+  workDir: string;
+}
+
 export interface ModelStatus {
   state: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "TIMEOUT";
   exitCode: number | null;
   startedAt: string | null;
   completedAt: string | null;
   outputSize: number;
+  error?: ModelStatusError;
 }
 
 export interface TeamStatus {
@@ -123,6 +138,31 @@ function isSentinelModel(model: string): boolean {
   if (SENTINEL_MODELS.has(lower)) return true;
   if (lower.startsWith("claude-")) return true;
   return false;
+}
+
+/** Bounded stderr excerpt kept inside status.json — the full stderr goes to errors/<id>.log. */
+const STDERR_SNIPPET_MAX = 500;
+
+/**
+ * Build the error details for a FAILED run (#538). Pure — runModels' finish()
+ * calls it with the values the spawn closure already holds, so every field the
+ * MCP failure report renders is backed by a real measurement of the failed
+ * child (spawn site has model, argv, collected stderr, log path and cwd).
+ */
+export function failureDetails(
+  entry: { model: string },
+  args: string[],
+  stderr: string,
+  errorLogPath: string,
+  workDir: string
+): ModelStatusError {
+  return {
+    model: entry.model,
+    command: `claudish ${args.join(" ")}`,
+    stderrSnippet: stderr.slice(0, STDERR_SNIPPET_MAX),
+    errorLogPath,
+    workDir,
+  };
 }
 
 // ─── Core Functions ───────────────────────────────────────────────────────────
@@ -266,6 +306,7 @@ export async function runModels(
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
     });
+    const workDir = process.cwd();
 
     // Count bytes flowing through stdout for accurate outputSize tracking
     let byteCount = 0;
@@ -307,6 +348,11 @@ export async function runModels(
           exitCode: exitCode ?? 1,
           completedAt: new Date().toISOString(),
           outputSize,
+          // #538: attach the details the MCP failure report renders. Completed
+          // runs carry no error field; a FAILED run always does.
+          ...(exitCode === 0
+            ? {}
+            : { error: failureDetails(entry, args, stderr, errorLogPath, workDir) }),
         });
 
         opts.onStatusChange?.(anonId, statusCache.models[anonId]);
@@ -325,7 +371,9 @@ export async function runModels(
           return;
         }
 
-        if (stderr) {
+        if (stderr || code !== 0) {
+          // #538: a FAILED run writes its log even when stderr is empty, so the
+          // errorLogPath advertised in status.error always exists on disk.
           writeFileSync(errorLogPath, stderr, "utf-8");
         }
 

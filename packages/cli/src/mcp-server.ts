@@ -273,7 +273,7 @@ function fuzzyScore(text: string, query: string): number {
   return queryIndex === lowerQuery.length ? score / lowerText.length : 0;
 }
 
-function formatTeamResult(
+export function formatTeamResult(
   status: import("./team-orchestrator.js").TeamStatus,
   sessionPath: string
 ): string {
