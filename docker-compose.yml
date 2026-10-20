@@ -114,6 +114,10 @@ services:
       # above — it postdated this list, so "=0" in a .env never reached a
       # container (#304). Only an explicit "0" disarms; empty = pin active.
       - CLAUDISH_NATIVE_MODEL_PIN=${CLAUDISH_NATIVE_MODEL_PIN:-}
+      # #555 kill switch: a native-nominal request carrying no Anthropic
+      # credential resolves as the sonnet ROLE instead of a bare 403. Only an
+      # explicit "0" disarms (restores the 403); empty = reroute on.
+      - CLAUDISH_NATIVE_CREDENTIALLESS_REROUTE=${CLAUDISH_NATIVE_CREDENTIALLESS_REROUTE:-}
       # #305 AC-1 instrument: "1" logs the auth header NAMES a native request
       # carries (never values). Off when empty. Read per request, but like every
       # name here it enters the container only at a recreate.

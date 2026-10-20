@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import { log, logStderr } from "./logger.js";
 import type { ProxyServer } from "./types.js";
-import { NativeHandler, stripProxyOwnHeaders } from "./handlers/native-handler.js";
+import { NativeHandler, applyProxyKeySwap, stripProxyOwnHeaders } from "./handlers/native-handler.js";
 import {
   nativeAuthHeaderNames,
   nativeCredentialRefusalResponse,
@@ -39,7 +39,8 @@ import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
 import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
 import { isKeylessExempt, keylessRefusalMessage } from "./handlers/shared/keyless-exempt.js";
-import { resolveProxyKeys, matchesProxyKey } from "./handlers/shared/proxy-keys.js";
+import { resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
+import { inboundKeyFor } from "./handlers/shared/inbound-keys.js";
 import {
   initProxyKeyRotationTracking,
   noteProxyKeyAuthentication,
@@ -964,6 +965,50 @@ export async function createProxyServer(
    */
   const keylessNativeRequest = (c: Context, requestedModel: string): boolean =>
     isKeylessExempt(c.req.raw) && nominalIsNative(requestedModel);
+
+  /**
+   * #555 step 2b — the name a request is RESOLVED under. A request whose
+   * nominal is the native lane, but which carries no Anthropic credential the
+   * native lane could send (#296 shape A/B), resolves as the `sonnet` ROLE
+   * instead of being answered by a bare 403.
+   *
+   * Why: the bare role names (`opus[1m]` …) remove the explicit non-native ids
+   * proxy-only seats used to name. On the hub `modelMap.opus` is native, so a
+   * bare `opus` from any seat without an Anthropic credential was a non-quota
+   * 403 with no cascade (measured 20/10). Same doctrine as
+   * CLAUDISH_NO_ANTHROPIC (native → modelMap.sonnet), keyed on the REQUEST
+   * instead of the machine.
+   *
+   * Resolved as the ROLE name, not as `modelMap.sonnet`'s concrete target, so
+   * the whole sonnet trajectory follows — role, bucket, cascade, notices — and
+   * a wall of the substitute is never recorded against the native bucket (that
+   * would divert the opus of ai-01, which HAS a credential). The body keeps
+   * the client's name: capture and telemetry still say what was asked.
+   *
+   * Never fires for: an Anthropic-shaped credential (ai-01 — shape null); a
+   * keyless request (#412 — it may only spend its own credential); a scoped
+   * inbound key (#400 — its allowlist judged the ASKED name, the substitute is
+   * not on it); a sonnet nominal that is itself native (nothing servable to
+   * go to — the 403 stays honest); monitor mode; the kill switch
+   * `CLAUDISH_NATIVE_CREDENTIALLESS_REROUTE=0` (read per request — restores
+   * the bare 403). Call it ONCE per request: it logs its decision.
+   */
+  const CREDENTIALLESS_NATIVE_ROLE = "sonnet";
+  const resolutionModelFor = (c: Context, requestedModel: string): string => {
+    if (process.env.CLAUDISH_NATIVE_CREDENTIALLESS_REROUTE === "0") return requestedModel;
+    if (monitorMode) return requestedModel;
+    if (isKeylessExempt(c.req.raw) || inboundKeyFor(c.req.raw)) return requestedModel;
+    if (!nominalIsNative(requestedModel)) return requestedModel;
+    if (!resolveRoleMappedModel(CREDENTIALLESS_NATIVE_ROLE, modelMap)) return requestedModel;
+    if (nominalIsNative(CREDENTIALLESS_NATIVE_ROLE)) return requestedModel;
+    const shape = nativeHandler.credentialRefusalShape(c.req.header());
+    if (!shape) return requestedModel;
+    log(
+      `[Proxy] native '${requestedModel}' carries no Anthropic credential (shape=${shape}) → resolved as role '${CREDENTIALLESS_NATIVE_ROLE}'`,
+      true
+    );
+    return CREDENTIALLESS_NATIVE_ROLE;
+  };
 
   const getHandlerForRequest = async (
     requestedModel: string,
@@ -2049,16 +2094,20 @@ export async function createProxyServer(
           400
         );
       }
+      // #555 — counted under the same name the serving route resolves it by:
+      // a native request without an Anthropic credential counts as `sonnet`
+      // (estimation) instead of a 403 the serving path would not give.
+      const routeModel = resolutionModelFor(c, body.model);
       // #412 — same suppression as the serving routes: this resolution writes
       // the dwell pin too, and the keyless guard just below must see the
       // handler the request would ACTUALLY get, not a swapped one.
       const handler = await getHandlerForRequest(
-        body.model,
+        routeModel,
         0,
         extractSessionKey(body),
         undefined,
         undefined,
-        keylessNativeRequest(c, body.model)
+        keylessNativeRequest(c, routeModel)
       );
 
       // #412 — same invariant on the counting path as on the serving one, and
@@ -2094,29 +2143,19 @@ export async function createProxyServer(
         // #282 — same strip as NativeHandler.handle: the proxy's own headers
         // (cluster key, attribution, hop list) never reach api.anthropic.com.
         stripProxyOwnHeaders(reqHeaders);
-        // Proxy key override (same logic as NativeHandler)
-        let credentialSubstituted = false;
-        if (proxyKeys.length > 0) {
-          const authHeader = c.req.header("authorization");
-          const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
-          const clientAuthToken = c.req.header("x-api-key") || bearerToken;
-          if (matchesProxyKey(clientAuthToken, proxyKeys)) {
-            // #439 — this swap is one of the sites that ACCEPT a proxy key:
-            // count it when it is the retiring one (no-op outside a window).
-            // The middleware's mark on c.req.raw (exemption branch, which
-            // count_tokens crosses — /v1/*) keeps one request = one count.
-            noteProxyKeyAuthentication(clientAuthToken, c.req.header(), c.req.raw);
-            delete reqHeaders["x-api-key"];
-            delete reqHeaders["authorization"];
-            if (anthropicApiKey) {
-              credentialSubstituted = true;
-              if (anthropicApiKey.startsWith("sk-ant-oat")) {
-                reqHeaders["authorization"] = `Bearer ${anthropicApiKey}`;
-              } else {
-                reqHeaders["x-api-key"] = anthropicApiKey;
-              }
-            }
-          }
+        // Proxy key override (the helper NativeHandler.handle uses)
+        const { matchedToken, credentialSubstituted } = applyProxyKeySwap(
+          reqHeaders,
+          c.req.header(),
+          proxyKeys,
+          anthropicApiKey
+        );
+        if (matchedToken) {
+          // #439 — this swap is one of the sites that ACCEPT a proxy key:
+          // count it when it is the retiring one (no-op outside a window).
+          // The middleware's mark on c.req.raw (exemption branch, which
+          // count_tokens crosses — /v1/*) keeps one request = one count.
+          noteProxyKeyAuthentication(matchedToken, c.req.header(), c.req.raw);
         }
 
         // #296 — same credential guard as NativeHandler.handle: refuse locally
@@ -2287,30 +2326,35 @@ export async function createProxyServer(
         if (declared) log(`[Capability] session=${sessionKey.slice(0, 8)} declared ${JSON.stringify(declared)}`);
       }
 
+      // #555 — the name this request is RESOLVED under (role, bucket, handler,
+      // cascade); the body keeps the client's own. Differs from body.model
+      // only for a native nominal without an Anthropic credential.
+      const routeModel = resolutionModelFor(c, body.model);
+
       // #275: the nominal bucket computed once for the failover cascade AND the
       // notices — both must key on the same meter or a notice announces a
       // diversion the session never took.
-      const requestRole = roleFromModelName(body.model);
+      const requestRole = roleFromModelName(routeModel);
       const requestBucket =
-        requestRole && getFailoverRule(requestRole) ? await nominalBucketOfModel(body.model) : undefined;
+        requestRole && getFailoverRule(requestRole) ? await nominalBucketOfModel(routeModel) : undefined;
       // #412 — the SAME suppression as the cascade below: this resolution is
       // not a dry run (it writes the per-session dwell pin and decides the
       // billing-header strip), so letting it swap behind a keyless native
       // request would both mislabel the log and write fleet state.
       const handler = await getHandlerForRequest(
-        body.model,
+        routeModel,
         0,
         sessionKey,
         requestBucket,
         undefined,
-        keylessNativeRequest(c, body.model)
+        keylessNativeRequest(c, routeModel)
       );
       logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
       stripBillingHeaderFromBody(body, handler instanceof NativeHandler);
 
       // Route through the budget-failover cascade (nominal → step0 → step1 …),
       // then inject onset/recovery notices. See handleWithCascade / applyFailoverNotices.
-      const response = await handleWithCascade(c, body, body.model, requestBucket);
+      const response = await handleWithCascade(c, body, routeModel, requestBucket);
       const noticed = await applyFailoverNotices(
         response,
         requestRole,
@@ -2410,22 +2454,24 @@ export async function createProxyServer(
         }
       }
 
+      // #555: same resolution name as /v1/messages (see there).
+      const routeModel = resolutionModelFor(c, anthropicBody.model);
       // #275: same one-bucket-per-request rule as /v1/messages (see there).
-      const requestRole = roleFromModelName(anthropicBody.model);
+      const requestRole = roleFromModelName(routeModel);
       const requestBucket =
         requestRole && getFailoverRule(requestRole)
-          ? await nominalBucketOfModel(anthropicBody.model)
+          ? await nominalBucketOfModel(routeModel)
           : undefined;
       // #412 — the OpenAI-compatible ingress resolves the handler for the same
       // two reasons as /v1/messages (log label + billing strip, plus the dwell
       // pin it writes as a side effect), so it carries the same suppression.
       const handler = await getHandlerForRequest(
-        anthropicBody.model,
+        routeModel,
         0,
         extractSessionKey(anthropicBody),
         requestBucket,
         undefined,
-        keylessNativeRequest(c, anthropicBody.model)
+        keylessNativeRequest(c, routeModel)
       );
       logRequest(anthropicBody, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
       stripBillingHeaderFromBody(anthropicBody, handler instanceof NativeHandler);
@@ -2436,7 +2482,7 @@ export async function createProxyServer(
       // client) — the notice rides the response header, NOT the content, so an
       // empty model output stays visibly empty instead of being masked by the
       // notice-as-answer.
-      let response = await handleWithCascade(c, anthropicBody, anthropicBody.model, requestBucket);
+      let response = await handleWithCascade(c, anthropicBody, routeModel, requestBucket);
       response = await applyFailoverNotices(
         response,
         requestRole,

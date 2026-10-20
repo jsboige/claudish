@@ -50,6 +50,42 @@ export function stripProxyOwnHeaders(headers: Record<string, string>): void {
   }
 }
 
+/**
+ * The proxy-key swap, in ONE place: when the client authenticated with one of
+ * our proxy keys, that key is removed from the forwarded headers and replaced
+ * by the stored Anthropic key when there is one. Mutates `headers` (the copy
+ * bound for api.anthropic.com); reads the client's ORIGINAL headers.
+ *
+ * Returns the matched token so the callers that ACCEPT the key can count it
+ * (#439 `noteProxyKeyAuthentication`) — counting is theirs, not this
+ * function's: the #555 predicate below runs it as a dry run and must not count.
+ *
+ * Shared by `NativeHandler.handle`, the native `count_tokens` path and the
+ * #555 predicate, so the three readings of "what credential would leave" can
+ * never drift.
+ */
+export function applyProxyKeySwap(
+  headers: Record<string, string>,
+  originalHeaders: Record<string, string | undefined>,
+  proxyKeys: string[] | undefined,
+  storedApiKey: string | undefined
+): { matchedToken?: string; credentialSubstituted: boolean } {
+  if (!proxyKeys?.length) return { credentialSubstituted: false };
+  const authHeader = originalHeaders["authorization"];
+  const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
+  const clientAuthToken = originalHeaders["x-api-key"] || bearerToken;
+  if (!matchesProxyKey(clientAuthToken, proxyKeys)) return { credentialSubstituted: false };
+  delete headers["x-api-key"];
+  delete headers["authorization"];
+  if (!storedApiKey) return { matchedToken: clientAuthToken, credentialSubstituted: false };
+  if (storedApiKey.startsWith("sk-ant-oat")) {
+    headers["authorization"] = `Bearer ${storedApiKey}`;
+  } else {
+    headers["x-api-key"] = storedApiKey;
+  }
+  return { matchedToken: clientAuthToken, credentialSubstituted: true };
+}
+
 export class NativeHandler implements ModelHandler {
   private apiKey?: string;
   private baseUrl: string;
@@ -63,6 +99,29 @@ export class NativeHandler implements ModelHandler {
     this.advisorModels = advisorModels;
     this.advisorCollector = advisorCollector;
     this.proxyKeys = proxyKeys;
+  }
+
+  /**
+   * #555 step 2b — would `handle()` refuse this request for want of an
+   * Anthropic credential (#296 shape A/B)? A dry run of the exact swap
+   * `handle()` performs (same helper, same predicate), with no side effect: no
+   * #439 count, no log, nothing forwarded. The route asks this BEFORE resolving
+   * a handler, so a role whose nominal is native can be served elsewhere
+   * instead of answered by a bare 403.
+   */
+  credentialRefusalShape(originalHeaders: Record<string, string | undefined>): "A" | "B" | null {
+    const headers: Record<string, string> = {};
+    for (const name of ["authorization", "x-api-key"]) {
+      const value = originalHeaders[name];
+      if (typeof value === "string") headers[name] = value;
+    }
+    const { credentialSubstituted } = applyProxyKeySwap(
+      headers,
+      originalHeaders,
+      this.proxyKeys,
+      this.apiKey
+    );
+    return nativeCredentialRefusalShape(headers, credentialSubstituted);
   }
 
   async handle(c: Context, payload: any): Promise<Response> {
@@ -226,31 +285,19 @@ export class NativeHandler implements ModelHandler {
     // Anthropic key (proxy key is for the local proxy only, not for
     // api.anthropic.com). When no proxy key is configured (pass-through
     // mode), everything flows through unmodified.
-    let credentialSubstituted = false;
-    if (this.proxyKeys?.length) {
-      const bearerToken = originalHeaders["authorization"]?.startsWith("Bearer ")
-        ? originalHeaders["authorization"].slice(7)
-        : originalHeaders["authorization"];
-      const clientAuthToken = originalHeaders["x-api-key"] || bearerToken;
-      if (matchesProxyKey(clientAuthToken, this.proxyKeys)) {
-        // #439 — this swap is one of the sites that ACCEPT a proxy key:
-        // count it when it is the retiring one (no-op outside a window).
-        // The raw request carries the middleware's mark when the fork
-        // middleware already counted this authentication (exemption
-        // branch) — then this site skips, keeping one request = one count.
-        noteProxyKeyAuthentication(clientAuthToken, originalHeaders, c.req.raw);
-        // Strip proxy key from forwarded headers
-        delete headers["x-api-key"];
-        delete headers["authorization"];
-        if (this.apiKey) {
-          credentialSubstituted = true;
-          if (this.apiKey.startsWith("sk-ant-oat")) {
-            headers["authorization"] = `Bearer ${this.apiKey}`;
-          } else {
-            headers["x-api-key"] = this.apiKey;
-          }
-        }
-      }
+    const { matchedToken, credentialSubstituted } = applyProxyKeySwap(
+      headers,
+      originalHeaders,
+      this.proxyKeys,
+      this.apiKey
+    );
+    if (matchedToken) {
+      // #439 — this swap is one of the sites that ACCEPT a proxy key:
+      // count it when it is the retiring one (no-op outside a window).
+      // The raw request carries the middleware's mark when the fork
+      // middleware already counted this authentication (exemption
+      // branch) — then this site skips, keeping one request = one count.
+      noteProxyKeyAuthentication(matchedToken, originalHeaders, c.req.raw);
     }
 
     // #296 — the credential state that would now leave for api.anthropic.com
