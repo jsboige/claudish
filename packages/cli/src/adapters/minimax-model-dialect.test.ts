@@ -135,12 +135,18 @@ describe("MiniMaxModelDialect — temperature clamp still applies", () => {
 // r10324/r10416), M2.5's varies but stays a 64-hex digest (m25-turn1), and
 // m25-turn2/3 carry no signature at all. An Anthropic signature is a long
 // opaque base64 blob and never 64-hex.
+const M3_SIG = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const M25_SIG = "7caa0d3cc2a449ac1cc68507504693f566245c7b5db3558f6041585e15a848f8";
+const ANTHROPIC_BLOB =
+  "Eo8BCpoKBgcKBWRvbGxhEgxPcmljZSB0b2tlbjKgAZf2hkh6gH0S2kJDZm9vYmFyYmF6cXV1eDNjdmJubWw4cHl0enIxOXF3dHFvcnN0dXYzeHl6MjBzdHJpbmdfZm9vYmFy";
+
 // effort:<level> — the DOCUMENTED M3.1-Flash thinking-depth knob
 // (output_config.effort, low..max, defaults to MAX when omitted — Anthropic-
-// compat doc, 2026-10-19). Added after measuring that budget_tokens is not in
-// the doc and Flash ignores it (cap 4000 armed, 23 responses >5k thinking
-// tokens): effort is the real lever, Flash-gated, sharing `forced`'s filter
-// semantics because Flash always thinks.
+// compat doc, 2026-10-19). budget_tokens is not in the doc; whether Flash
+// honors it is unmeasured (forced never rewrites a client-requested budget,
+// and production clients send 31999 — the 4000 cap reached 2 of 3 303
+// requests): effort is the first lever reaching the client-enabled requests,
+// Flash-gated, sharing `forced`'s filter semantics because Flash always thinks.
 describe("MiniMaxModelDialect — effort policy (M3.1-Flash thinking depth)", () => {
   const flash = () => new MiniMaxModelDialect("MiniMax-M3.1-Flash");
 
@@ -208,11 +214,6 @@ describe("MiniMaxModelDialect — effort policy (M3.1-Flash thinking depth)", ()
     ).toBe(false);
   });
 });
-
-const M3_SIG = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-const M25_SIG = "7caa0d3cc2a449ac1cc68507504693f566245c7b5db3558f6041585e15a848f8";
-const ANTHROPIC_BLOB =
-  "Eo8BCpoKBgcKBWRvbGxhEgxPcmljZSB0b2tlbjKgAZf2hkh6gH0S2kJDZm9vYmFyYmF6cXV1eDNjdmJubWw4cHl0enIxOXF3dHFvcnN0dXYzeHl6MjBzdHJpbmdfZm9vYmFy";
 
 describe("MiniMaxModelDialect — preserveThinkingBlock (#324 B1 discriminant)", () => {
   it("forced: M3's own digest signature (SHA-256 of the empty string) is preserved", () => {

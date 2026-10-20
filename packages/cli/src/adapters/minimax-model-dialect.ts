@@ -28,9 +28,10 @@ const MINIMAX_OWN_SIGNATURE = /^[0-9a-f]{64}$/;
  * M3.1-Flash thinking-depth levels (Anthropic-compat doc, output_config.effort):
  * low | medium | high | xhigh | max — Flash defaults to MAX when omitted, which
  * is the single biggest output-token driver on the Flash lane (measured
- * 2026-10-19: median thinking 1.5k chars but 23 responses >5k tokens with a
- * budget_tokens cap armed — the budget field is NOT in the doc and the API
- * ignores it; effort is the real lever).
+ * 2026-10-19: median thinking 1.5k chars, 23 responses >5k tokens). budget_tokens
+ * is not in the Anthropic-compat doc; whether Flash honors it is unmeasured
+ * (forced never rewrites a client-requested budget, and production clients
+ * send 31999) — effort is the first lever that reaches those requests.
  */
 export const MINIMAX_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type MiniMaxEffortLevel = (typeof MINIMAX_EFFORT_LEVELS)[number];
@@ -84,9 +85,11 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    * natively by MiniMax's Anthropic-compatible endpoint.
    *
    * Unlike Qwen/GLM/DeepSeek (which think BY DEFAULT and need an off switch),
-   * MiniMax does not reason without a `thinking` request: absent or disabled
-   * gives `[text]`; enabled (any budget) or adaptive gives `[thinking, text]`
-   * on a small prompt (live probes through the hub, 2026-09-23).
+   * M3 does not reason without a `thinking` request: absent or disabled gives
+   * `[text]`; enabled (any budget) or adaptive gives `[thinking, text]` on a
+   * small prompt (live probes through the hub, 2026-09-23 — M3; M3.1-Flash
+   * differs on both ends: it thinks with the field omitted, and `disabled`
+   * is a 400/2013).
    *
    * ⚠ This switch does NOT make the production haiku lane reason. Hub corpus,
    * every MiniMax-M3 response 2026-09-23 11:38Z→19:49Z (887, all paired):
@@ -105,10 +108,11 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    *                           (default n=16000) when the client did not itself
    *                           ask for thinking; a client that asked (enabled OR
    *                           adaptive — `clientRequestedThinking`) keeps its
-   *                           own setting untouched. ⚠ budget_tokens is NOT in
-   *                           the Anthropic-compat doc and M3.1-Flash ignores
-   *                           it (measured 2026-10-19: cap 4000, 23 responses
-   *                           >5k thinking tokens) — kept for older models only.
+   *                           own setting untouched. ⚠ budget_tokens is not in
+   *                           the Anthropic-compat doc; whether M3.1-Flash
+   *                           honors it is unmeasured (forced never rewrites a
+   *                           client-requested budget, and production clients
+   *                           send 31999) — kept for older models only.
    *   effort:<level>        — M3.1-Flash only: inject
    *                           `output_config: {"effort": low|medium|high|xhigh|max}`
    *                           — the documented thinking-depth slider. Flash
@@ -176,7 +180,7 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
       } else if (budgetFits) {
         request.thinking = { type: "enabled", budget_tokens: policy.budget };
         log(
-          `[MiniMaxModelDialect] thinking forced (client=${originalRequest?.thinking?.type ?? "absent"}), budget ${policy.budget} — NOTE: budget_tokens is not in the MiniMax doc and is ignored by M3.1-Flash; prefer effort:<level>`
+          `[MiniMaxModelDialect] thinking forced (client=${originalRequest?.thinking?.type ?? "absent"}), budget ${policy.budget} — NOTE: budget_tokens is not in the MiniMax doc; on M3.1-Flash prefer effort:<level>`
         );
       } else {
         log(
