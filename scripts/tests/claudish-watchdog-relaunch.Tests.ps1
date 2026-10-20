@@ -149,7 +149,13 @@ Describe 'Start-DockerEngine (defaults stay live)' {
         # Without this, deleting a fallback would leave every wiring test green
         # and production calling a $null scriptblock. The positive control is
         # the parse itself: the function must exist and contain the live
-        # commands in its fallback assignments.
+        # commands in its fallback assignments. Each assertion is anchored on
+        # ITS OWN assignment ($Var = { live command }), never on the whole
+        # function text: a comment naming a seam (the watchdog's line-751
+        # note names Test-EngineRelaunchReady) satisfied the old whole-source
+        # match while the fallback line was deleted or hollowed (review
+        # mutants M1/M2, 2026-10-19) — an assignment-shaped pattern cannot be
+        # satisfied by a comment.
         $tokens = $null; $errs = $null
         $ast = [System.Management.Automation.Language.Parser]::ParseFile(
             $script:WatchdogPath, [ref]$tokens, [ref]$errs)
@@ -161,11 +167,11 @@ Describe 'Start-DockerEngine (defaults stay live)' {
         }, $true) | Select-Object -First 1
 
         $fn | Should -Not -BeNullOrEmpty -Because 'the guard must have something to guard'
-        $fn.Extent.Text | Should -Match 'Test-DockerEngine'
-        $fn.Extent.Text | Should -Match 'Start-Service\s+com\.docker\.service'
-        $fn.Extent.Text | Should -Match 'Get-Process\s+"Docker Desktop"'
-        $fn.Extent.Text | Should -Match 'Test-EngineRelaunchReady'
-        $fn.Extent.Text | Should -Match 'Start-ScheduledTask\s+-TaskName\s+\$n'
-        $fn.Extent.Text | Should -Match 'Start-Sleep\s+-Seconds\s+10'
+        $fn.Extent.Text | Should -Match '\$EngineProbe\s*=\s*\{\s*Test-DockerEngine\s*\}'
+        $fn.Extent.Text | Should -Match '\$ServiceStarter\s*=\s*\{\s*try\s*\{\s*Start-Service\s+com\.docker\.service'
+        $fn.Extent.Text | Should -Match '\$GuiProcessProbe\s*=\s*\{\s*Get-Process\s+"Docker Desktop"'
+        $fn.Extent.Text | Should -Match '\$RelaunchReady\s*=\s*\{\s*Test-EngineRelaunchReady\s*\}'
+        $fn.Extent.Text | Should -Match '\$TaskStarter\s*=\s*\{\s*param\(\$n\)\s*Start-ScheduledTask\s+-TaskName\s+\$n'
+        $fn.Extent.Text | Should -Match '\$RecoveryTick\s*=\s*\{\s*Start-Sleep\s+-Seconds\s+10\s*\}'
     }
 }
