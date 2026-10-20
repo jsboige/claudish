@@ -2187,7 +2187,26 @@ export async function createProxyServer(
     try {
       // readRequestBody inflates a gzipped body (WAN external sidecar → hub);
       // identical to c.req.json() on the uncompressed LAN/direct path.
-      const body = await readRequestBody(c);
+      // #548 — an empty / non-JSON / non-object body is the CLIENT's error: a
+      // terminal 400, not a retryable 500 (Claude Code loops on "API error ·
+      // Retrying" against a 5xx, and a sidecar's local 500 would pollute the
+      // hub-500 signal the relays arm hysteresis on). Answered before the
+      // relay branch, handler selection and any upstream call.
+      let body: any;
+      try {
+        body = await readRequestBody(c);
+      } catch (parseErr) {
+        return c.json(
+          wrapAnthropicError(400, `Invalid request body: ${(parseErr as Error)?.message ?? parseErr}`, "invalid_request_error"),
+          400
+        );
+      }
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        return c.json(
+          wrapAnthropicError(400, "Invalid request body: expected a JSON object", "invalid_request_error"),
+          400
+        );
+      }
 
       // #306 — opt-in admission freeze, BEFORE the relay branch: the freeze
       // belongs to THIS container's restart, so a frozen admission must not
