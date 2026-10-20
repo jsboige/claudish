@@ -1,16 +1,17 @@
-# Bound the container's stdout/stderr log files. Docker's default json-file
-# driver is UNBOUNDED, and on Docker Desktop (WSL2) those files live inside
-# docker_data.vhdx, which never shrinks — so a log-spewing episode grows the
-# host disk with no ceiling and stays INVISIBLE to `docker system df` (log
-# files are not part of the writable layer it counts). Measured fleet incident
-# 2026-10-19 (po-203): docker_data.vhdx +33 Go in 24 h, D: reached 0, Docker
-# bootstrap EIO — post-fix `system df` showed BuildCache 0 / Containers 5.6 Go,
-# leaving logs as the unaccounted writer class. 50m x 4 caps any future
-# episode at 200 Mo per container while keeping generous diagnostic history.
-# This bounds DISK, not content: debug logging stays verbose by doctrine
-# (suppression happens at registration level, never streaming-data level).
+# Bound the container's stdout/stderr log files. Whether the default is
+# unbounded depends on each host's daemon config (json-file default: UNBOUNDED;
+# `local`: already rotated+compressed) — read it per machine with
+#   docker inspect <c> --format '{{.HostConfig.LogConfig.Type}}'
+# Options WITHOUT a driver line keep each machine's own driver and bound it:
+# json-file gets the cap directly, `local` re-bounds to the same ceiling.
+# On Docker Desktop (WSL2) the files live inside docker_data.vhdx, which never
+# shrinks, and stay INVISIBLE to `docker system df` (not part of the writable
+# layer it counts) — so an unbounded default has no operator-visible signal.
+# 50m x 4 caps any episode at 200 Mo per container while keeping weeks of
+# diagnostic history (busiest fleet sidecar measured ~8 Mo/day). This bounds
+# DISK, not content: debug logging stays verbose by doctrine (suppression
+# happens at registration level, never streaming-data level).
 x-logging: &default-logging
-  driver: json-file
   options:
     max-size: "50m"
     max-file: "4"
