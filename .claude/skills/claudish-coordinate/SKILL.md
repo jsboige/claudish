@@ -100,7 +100,7 @@ docker image inspect claudish-claudish-proxy --format 'created={{.Created}}'
   Seul un épisode sans cause mérite une enquête.
 - **`settings.json` de chaque machine (user 20/10, mandat répété)** : `scripts/settings-matrix.py`
   (instantanés RooSync) + la ligne de forme postée par chaque lane. Drapeaux : non couvert, > 48 h, clé
-  de crédit renseignée, valeurs divergentes. Je dois savoir ce que contient chaque fichier (reference.md).
+  de crédit renseignée, hors canon, divergences. Je dois savoir ce que contient chaque fichier (reference.md).
 
 ### Phase 3 — Trafic et leak-policy
 

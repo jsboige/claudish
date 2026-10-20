@@ -31,6 +31,12 @@ DEFAULT_MACHINES = [
 # A present, non-empty value here makes the client send a credential of its own
 # choosing instead of its Anthropic login: the #296 shape-B class (po-2028, 20/10).
 CREDENTIAL_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+# Values with a decided canon: a machine off it is flagged, whatever the others hold.
+# The fleet compaction window stays at Swift's limit (swift-1.5-27b, 262 144 tokens,
+# onboarded as a haiku lane); ai-01 alone runs slightly higher on purpose (user 20/10).
+CANON = {
+    "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW": {"*": "263000", "myia-ai-01": "330000"},
+}
 # Values compared across the fleet; any divergence is listed.
 COMPARED = (
     "env.ANTHROPIC_CUSTOM_MODEL_OPTION",
@@ -38,7 +44,6 @@ COMPARED = (
     "env.ANTHROPIC_DEFAULT_SONNET_MODEL",
     "env.ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "env.ANTHROPIC_DEFAULT_FABLE_MODEL",
-    "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW",
     "model",
     "outputStyle",
 )
@@ -125,6 +130,11 @@ def main():
         for key in COMPARED:
             if key in harmonization:
                 seen[key].setdefault(json.dumps(harmonization[key], ensure_ascii=False), []).append(machine)
+        for key, canon in CANON.items():
+            expected = canon.get(machine, canon["*"])
+            actual = harmonization.get(key)
+            if actual != expected:
+                flags.append(f"{machine}: {key} = {json.dumps(actual)} off canon (expected {json.dumps(expected)})")
         masked = snap.get("maskedEnvKeys", {})
         for key, marker in sorted(masked.items()):
             state = presence(marker)
