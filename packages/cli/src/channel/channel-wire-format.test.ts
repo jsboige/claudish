@@ -337,6 +337,22 @@ describe("Channel notification wire format", () => {
   );
 
   test(
+    "the PATH shim served: a self-exiting fake session reaches running -> completed",
+    async () => {
+      // Every other test here accepts "failed" as a terminal event, so a shim
+      // that never launches the fake (wrong PATH delimiter, unresolvable
+      // wrapper, bad quoting) still yields well-formed `failed` frames and
+      // passes. fake-claudish `--lines N` exits 0, so only a SERVED shim can
+      // produce this pair -- this pin is what makes the shim load-bearing.
+      const captured = await captureSessionFrames({ shimArgs: ["--lines", "2"] });
+      const events = captured.notifications.map((n) => n.params.meta.event);
+      expect(events).toContain("running");
+      expect(events[events.length - 1]).toBe("completed");
+    },
+    20_000
+  );
+
+  test(
     "session lifecycle ends with a terminal event (completed/failed/cancelled)",
     async () => {
       const captured = await captureSessionFrames({ shimArgs: ["--lines", "2"] });
