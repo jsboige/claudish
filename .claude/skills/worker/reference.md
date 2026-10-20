@@ -81,7 +81,13 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      dashboard.
    - **Veille quota MiniMax** (mandat user 19/10 « lander les crédits », actif
      jusqu'au reset ~25/10 23:05Z — ensuite évaluer reconduction avant retrait) :
-     à chaque cycle, lire `https://platform.minimax.io/console/usage` via MCP
+     organe **mono-observateur** — seul le siège hub (po-2025, celui dont le
+     profil playwright persistant porte la session console) lit la console ;
+     les autres sièges worker ne relancent PAS playwright (quatre lectures
+     d'une même console, quatre journaux qui ne fusionnent jamais), ils lisent
+     `~/.claudish/minimax-plan-watch.log` ou la ligne dashboard du siège hub.
+     À chaque cycle de CE siège : lire
+     `https://platform.minimax.io/console/usage` via MCP
      playwright (profil persistant : l'auth survit aux sessions ; si page =
      login/« no active subscription » **avec données vides**, c'est un rendu
      transitoire — attendre 3-5 s et re-snapshotter avant de conclure). Extraire
@@ -97,9 +103,11 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      `eta_h = (100 − week_pct) / pace` ; `projected_pct_at_reset = pace × 168`.
      Seuils : WARN dashboard si `eta_h < week_reset_h` ET marge
      `week_reset_h − eta_h > 24` (mur avant reset certain, marge > 1 j) ;
-     **ASK registre** (jamais de geste auto) si `eta_h < 48` — leviers :
-     armer `CLAUDISH_FAILOVER_ACTIVE` (cascade haiku Kimi-K3 définie mais INERTE
-     tant que vide — recreate drainé requis, #310) ou throttler la lane
+     **ASK registre** (jamais de geste auto) si `eta_h < 48`. Leviers — nommés
+     comme des leviers, pas comme leur état d'un soir donné : réduire la
+     profondeur de réflexion (`CLAUDISH_MINIMAX_THINKING=effort:<level>` une
+     fois #545 atterri), armer la cascade haiku (`CLAUDISH_FAILOVER_ACTIVE`,
+     recreate drainé #310), limiter la concurrence de la lane
      (`mmc@MiniMax-M3.1-Flash:N` dans le modelMap, drain restart) ;
      **jamais config-armer au mur** (tue l'auto-recovery). Crédits = 0 :
      mur hebdo = erreur 429 nue pour la lane haiku, pas de décharge douce.
