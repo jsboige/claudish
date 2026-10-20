@@ -2068,12 +2068,16 @@ export async function createProxyServer(
       }
       // #412 — same suppression as the serving routes: this resolution writes
       // the dwell pin too, and the keyless guard just below must see the
-      // handler the request would ACTUALLY get, not a swapped one.
+      // handler the request would ACTUALLY get, not a swapped one. Same bucket
+      // as the serving routes too (#552 review, B2): with `undefined` the
+      // resolution fell back to the nominal's bucket, so a machine-armed
+      // caller counted against the nominal instead of the model that answers,
+      // and the nominal landing deleted its session's dwell pin.
       const handler = await getHandlerForRequest(
         body.model,
         0,
         extractSessionKey(body),
-        undefined,
+        await requestBucketOf(c, body.model),
         undefined,
         keylessNativeRequest(c, body.model)
       );

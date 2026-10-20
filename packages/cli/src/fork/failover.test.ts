@@ -339,6 +339,70 @@ describe("failover — machine-scoped config arm (role@machine)", () => {
     const text = consumeStreamNotice("haiku", "s-wall", "minimax-coding")!;
     expect(text).toContain("because the nominal Haiku model temporarily exhausted");
   });
+
+  // ── #552 review, non-blocking pins ──
+
+  const captureStderr = (fn: () => void): string[] => {
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as any).write = (chunk: any) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      fn();
+    } finally {
+      (process.stderr as any).write = realWrite;
+    }
+    return lines;
+  };
+
+  it("N: the startup banner names the live machine arm and its step", () => {
+    const lines = captureStderr(() =>
+      initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" })
+    );
+    const banner = lines.filter((l) => l.includes("[Failover] configured="));
+    expect(banner.length).toBe(1);
+    expect(banner[0]).toContain("haiku@myia-po-2027→Swift local");
+  });
+
+  it("T: a re-init without the arm drops the machine arm", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    expect(machineArmBucket("haiku", "myia-po-2027")).toBe("machine:myia-po-2027");
+    initFailover({ ...HAIKU_LOCAL });
+    expect(machineArmBucket("haiku", "myia-po-2027")).toBeUndefined();
+  });
+
+  it("U: resetFailoverForTests() drops the machine arm", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    resetFailoverForTests();
+    expect(machineArmBucket("haiku", "myia-po-2027")).toBeUndefined();
+  });
+
+  it("W: the step note appears exactly once in the session notice", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    const text = consumeStreamNotice("haiku", "s-note", machineArmBucket("haiku", "myia-po-2027"))!;
+    expect(text.split("A much smaller model than the nominal.").length - 1).toBe(1);
+  });
+
+  it("the role-wide config arm reads as operator routing, with no machine named", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku" });
+    const text = consumeStreamNotice("haiku", "s-rolewide", "minimax-coding")!;
+    expect(text).toContain("because the operator routes the Haiku role away from its nominal model");
+    expect(text).not.toContain("temporarily exhausted");
+  });
+
+  it("a second @ in the machine is ignored with a log, never armed", () => {
+    const lines = captureStderr(() =>
+      initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@m1@m2, haiku@myia-po-2027@" })
+    );
+    expect(lines.filter((l) => l.includes("Ignoring malformed machine")).length).toBe(2);
+    expect(machineArmBucket("haiku", "m1@m2")).toBeUndefined();
+    expect(machineArmBucket("haiku", "m1")).toBeUndefined();
+    expect(machineArmBucket("haiku", "myia-po-2027@")).toBeUndefined();
+    expect(machineArmBucket("haiku", "myia-po-2027")).toBeUndefined();
+    expect(isFailoverActive("haiku")).toBe(false);
+  });
 });
 
 // ── Resolution walk ────────────────────────────────────────────────────────────

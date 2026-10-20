@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { resetFailoverForTests } from "./fork/failover.js";
+import { getSessionDwellPinForTests, resetFailoverForTests } from "./fork/failover.js";
 import { createProxyServer } from "./proxy-server.js";
 import type { ProxyServer } from "./types.js";
 
@@ -99,8 +99,11 @@ const MACHINE_ARM_ENV = {
   CLAUDISH_FAILOVER_ACTIVE: "haiku@m-cal",
 } as Record<string, string>;
 
-async function postMessage(machine?: string): Promise<Response> {
-  return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
+async function postMessage(
+  machine?: string,
+  opts: { session?: string; stream?: boolean; path?: string } = {}
+): Promise<Response> {
+  return realFetch(`http://127.0.0.1:${PROXY_PORT}${opts.path ?? "/v1/messages"}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -110,8 +113,9 @@ async function postMessage(machine?: string): Promise<Response> {
     body: JSON.stringify({
       model: "claude-haiku-4-5",
       max_tokens: 64,
-      stream: false,
+      stream: opts.stream ?? false,
       messages: [{ role: "user", content: "say hi" }],
+      ...(opts.session ? { metadata: { user_id: opts.session } } : {}),
     }),
   });
 }
@@ -246,5 +250,81 @@ describe("machine-scoped config arm (role@machine) through the real routes", () 
     expect(other.status).toBe(200);
     expect(calls.nm).toBe(1);
     expect(other.headers.get("x-claudish-failover-notice")).toBeNull();
+  });
+
+  // #552 review B1 — one role, two live buckets: the dwell pin an armed request
+  // writes belongs to `machine:m-cal`. A follow-up of the SAME session without
+  // the header resolves in the nominal's (unarmed) bucket, so it must go
+  // nominal — a bucket-blind pin served it the step with no streaming notice,
+  // since consumeStreamNotice gates on isFailoverActive(role, bucket).
+  // Mutation proof: hold the pin regardless of its bucket ⇒ step 2 goes red
+  // (s0 paid, nm not).
+  test("M6 (B1): an armed session's follow-up without the header goes nominal, and its pin survives", async () => {
+    await spin();
+    const armed = await postMessage("m-cal", { session: "sess-b1" });
+    expect(armed.status).toBe(200);
+    expect(calls.s0).toBe(1);
+    expect(getSessionDwellPinForTests("haiku", "sess-b1")).toMatchObject({
+      stepIndex: 0,
+      bucket: "machine:m-cal",
+    });
+
+    const bare = await postMessage(undefined, { session: "sess-b1", stream: true });
+    expect(bare.status).toBe(200);
+    const sse = await bare.text();
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(1);
+    expect(sse).not.toContain("[claudish]");
+    // The nominal landing in the other bucket leaves the armed bucket's pin alone.
+    expect(getSessionDwellPinForTests("haiku", "sess-b1")).toMatchObject({
+      stepIndex: 0,
+      bucket: "machine:m-cal",
+    });
+
+    const again = await postMessage("m-cal", { session: "sess-b1" });
+    expect(again.status).toBe(200);
+    expect(calls.s0).toBe(2);
+    expect(calls.nm).toBe(1);
+  });
+
+  // #552 review B2 — count_tokens resolves in the same bucket as the serving
+  // routes. Its resolution writes the dwell pin, so the bucket is observable:
+  // from the armed machine a fresh session is pinned at the step in
+  // `machine:m-cal`; with the nominal's bucket (the pre-fix `undefined`) it
+  // resolved nominal and wrote no pin. Mutation proof: pass `undefined` as the
+  // bucket on the count_tokens route ⇒ the first expectation goes red.
+  test("M7 (B2): count_tokens from the armed machine resolves against the step and keeps the pin", async () => {
+    await spin();
+    const counted = await postMessage("m-cal", {
+      session: "sess-b2",
+      path: "/v1/messages/count_tokens",
+    });
+    expect(counted.status).toBe(200);
+    expect(typeof ((await counted.json()) as any).input_tokens).toBe("number");
+    expect(getSessionDwellPinForTests("haiku", "sess-b2")).toMatchObject({
+      stepIndex: 0,
+      bucket: "machine:m-cal",
+    });
+    // Counting pays no upstream on this lane (local estimate).
+    expect(calls.s0).toBe(0);
+    expect(calls.nm).toBe(0);
+
+    const served = await postMessage("m-cal", { session: "sess-b2" });
+    expect(served.status).toBe(200);
+    expect(calls.s0).toBe(1);
+    expect(getSessionDwellPinForTests("haiku", "sess-b2")).toMatchObject({
+      stepIndex: 0,
+      bucket: "machine:m-cal",
+    });
+
+    const recount = await postMessage("m-cal", {
+      session: "sess-b2",
+      path: "/v1/messages/count_tokens",
+    });
+    expect(recount.status).toBe(200);
+    expect(getSessionDwellPinForTests("haiku", "sess-b2")).toMatchObject({
+      stepIndex: 0,
+      bucket: "machine:m-cal",
+    });
   });
 });

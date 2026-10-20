@@ -537,10 +537,18 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
       const at = piece.indexOf("@");
       const role = (at >= 0 ? piece.slice(0, at) : piece) as FailoverRole;
       const machine = at >= 0 ? piece.slice(at + 1) : null;
-      if (!FAILOVER_ROLES.includes(role) || machine === "") {
-        logStderr(
-          `[Failover] Ignoring ${machine === "" ? "empty machine" : "unknown role"} in CLAUDISH_FAILOVER_ACTIVE: '${piece}'`
-        );
+      // A second `@` (`haiku@m1@m2`, `haiku@m@`) would otherwise become a machine
+      // name no X-Claudish-Machine header can ever carry — an arm that silently
+      // never bites (#552 review).
+      const flaw = !FAILOVER_ROLES.includes(role)
+        ? "unknown role"
+        : machine === ""
+          ? "empty machine"
+          : machine?.includes("@")
+            ? "malformed machine"
+            : null;
+      if (flaw) {
+        logStderr(`[Failover] Ignoring ${flaw} in CLAUDISH_FAILOVER_ACTIVE: '${piece}'`);
         continue;
       }
       const rule = rules.get(role);
@@ -998,8 +1006,17 @@ export function resolveFailoverTarget(
 // never under one.
 
 /** Live dwell pins: role → session → the step it must keep serving until `until`.
- * Set only while armed at a step (stepIndex >= 0) — nominal is never pinned. */
-const dwellPins = new Map<FailoverRole, Map<string, { stepIndex: number; until: number }>>();
+ * Set only while armed at a step (stepIndex >= 0) — nominal is never pinned.
+ * `bucket` is the bucket the pin was resolved in: a pin holds only for a request
+ * of that same bucket. One role can carry two live buckets in different arm
+ * states (a `role@machine` arm diverts `machine:<name>` while the nominal's own
+ * bucket stays unarmed), and a bucket-blind pin would serve the step to the
+ * unarmed bucket — with no streaming notice, since consumeStreamNotice gates on
+ * isFailoverActive(role, bucket) (#552 review, B1). */
+const dwellPins = new Map<
+  FailoverRole,
+  Map<string, { stepIndex: number; until: number; bucket: string | undefined }>
+>();
 /** Timestamp of the FIRST verified nominal success since the last arm (onNominalSuccess), keyed by
  * role|bucket like the other #275 state. A live dwell pin yields once this is
  * older than `recoveryGraceMs`, so an ACTIVE conversation returns to the
@@ -1060,7 +1077,7 @@ export function getSessionDwellMs(): number {
 export function getSessionDwellPinForTests(
   role: FailoverRole,
   sessionKey: string
-): { stepIndex: number; until: number } | null {
+): { stepIndex: number; until: number; bucket: string | undefined } | null {
   const pin = dwellPins.get(role)?.get(sessionKey);
   if (!pin || pin.until <= Date.now()) return null;
   return { ...pin };
@@ -1110,7 +1127,13 @@ export function resolveFailoverTargetForSession(
 
   const now = Date.now();
   const pins = dwellPins.get(role);
-  const pin = pins?.get(sessionKey);
+  const storedPin = pins?.get(sessionKey);
+  // #552 B1: a pin resolved in another bucket does not exist for this request —
+  // neither held nor deleted here. The request resolves in its own bucket (an
+  // unarmed one goes nominal), and the other bucket's pin survives for that
+  // bucket's next request.
+  const foreignPin = storedPin !== undefined && storedPin.bucket !== bucket;
+  const pin = foreignPin ? undefined : storedPin;
   // #276: set when a live pin's step died of a NON-QUOTA error — the dwell is
   // forfeited below instead of re-pinned at the walk's next step.
   let pinnedDiedNonQuota = false;
@@ -1228,8 +1251,8 @@ export function resolveFailoverTargetForSession(
     // cascade attempt (swap + loop read) and identical results must not churn
     // the map or the log.
     const prev = m.get(sessionKey);
-    if (!prev || prev.stepIndex !== resolved.stepIndex) {
-      m.set(sessionKey, { stepIndex: resolved.stepIndex, until: now + dwell });
+    if (!prev || prev.stepIndex !== resolved.stepIndex || prev.bucket !== bucket) {
+      m.set(sessionKey, { stepIndex: resolved.stepIndex, until: now + dwell, bucket });
       dwellPins.set(role, m);
       pruneDwellPins(role);
       logStderr(
@@ -1238,7 +1261,9 @@ export function resolveFailoverTargetForSession(
     } else {
       prev.until = Math.max(prev.until, now + dwell);
     }
-  } else if (pins) {
+  } else if (pins && !foreignPin) {
+    // A foreign-bucket request landing on its nominal says nothing about the
+    // pinned bucket — that pin stays (#552 B1).
     pins.delete(sessionKey); // back at nominal: no pin
     // The #276 forfeit served its purpose — the session is back at the nominal
     // (which is never pinned); let ordinary dwell apply on a future re-arm.
