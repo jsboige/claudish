@@ -32,8 +32,9 @@ DEFAULT_MACHINES = [
 # choosing instead of its Anthropic login: the #296 shape-B class (po-2028, 20/10).
 CREDENTIAL_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # Values with a decided canon: a machine off it is flagged, whatever the others hold.
-# The fleet compaction window stays at Swift's limit (swift-1.5-27b, 262 144 tokens,
-# onboarded as a haiku lane); ai-01 alone runs slightly higher on purpose (user 20/10).
+# The fleet compaction window sits 856 tokens ABOVE Swift's limit (swift-1.5-27b,
+# 262 144 tokens, onboarded as a haiku lane) -- an open arbitration (coordinator
+# registry Q58), not a settled fit. ai-01 alone runs higher on purpose (user 20/10).
 CANON = {
     "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW": {"*": "263000", "myia-ai-01": "330000"},
 }
@@ -81,6 +82,8 @@ def latest_snapshot(shared, machine):
         if not entry.startswith("v"):
             continue
         snap = read_snapshot(os.path.join(cdir, entry, "claude-settings", "claude-settings.json"))
+        # ISO-8601 strings compare in date order; RSM parses dates and tie-breaks
+        # lexically -- same winner unless two versions share a collectedAt.
         if snap and (best is None or snap.get("collectedAt", "") > best.get("collectedAt", "")):
             best = snap
     return best
@@ -152,5 +155,7 @@ def main():
         print(f"  - {flag}")
 
 
+# Exit status is always 0, flags included: this is a per-cycle reading instrument,
+# not a gate. A CI consumer that wants a failing mode must add one explicitly.
 if __name__ == "__main__":
     main()

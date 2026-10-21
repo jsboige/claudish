@@ -131,7 +131,7 @@ Sonnet/GLM ou Haiku/MiniMax ; une 6ᵉ lane n'est pas une faute d'office, mais e
   signature, une **bascule** 100 % budget → 100 % Opus à une heure donnée ; 0 `agent-*.jsonl` = session
   interactive. Boucle de détection : reference.md § Phase 3.
 - **Inter-machines (user 20/10)** : aucune restriction en dur, chaque machine s'authentifie elle-même ; Opus
-  hors ai-01 reste exceptionnel (durable : CoursIA-3 seul). Signaler un Opus qui **dure** hors ai-01, pas
+  hors ai-01 reste exceptionnel (durable : CoursIA-3 seul ; po-2025 20/10 = temporaire autorisé, suivi jusqu'au retour). Signaler un Opus qui **dure** hors ai-01, pas
   un usage ponctuel. Sous-agent : `cc_is_subagent=true`, dans le corps de la requête.
 
 **Burst ou mur** : lire `D:\claudish-captures\upstream-errors.log`. Le code `1308` est un mur (il arme la
