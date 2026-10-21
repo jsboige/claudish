@@ -20,15 +20,15 @@
  *                 `traceEnabled()` guards in diagnostics.ts -> case 1 fails).
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { spawn, type ChildProcess } from "node:child_process";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { type ChildProcess, spawn } from "node:child_process";
 
 // #175 — spawn the CURRENT runtime, never a bare "bun" (npm shim has no .exe
 // for CreateProcess). Same trick as channel-wire-format.test.ts.
 const BUN = process.execPath;
-import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname, delimiter } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -49,11 +49,9 @@ beforeAll(() => {
     );
   } else {
     const shimPath = join(shimDir, "claudish");
-    writeFileSync(
-      shimPath,
-      `#!/bin/sh\nexec bun run "${FAKE_CLAUDISH_TS}" "$@"\n`,
-      { mode: 0o755 }
-    );
+    writeFileSync(shimPath, `#!/bin/sh\nexec bun run "${FAKE_CLAUDISH_TS}" "$@"\n`, {
+      mode: 0o755,
+    });
   }
   process.env.PATH = `${shimDir}${delimiter}${ORIGINAL_PATH}`;
 });
@@ -75,7 +73,7 @@ afterAll(() => {
 async function runFakeSession(opts: {
   traceFile: string;
   trace: boolean;
-}): Promise<{ stderr: string }> {
+}): Promise<{ stderr: string; terminalSeen: boolean }> {
   const env: Record<string, string | undefined> = {
     ...process.env,
     CLAUDISH_MCP_TOOLS: "all",
@@ -84,7 +82,9 @@ async function runFakeSession(opts: {
   if (opts.trace) {
     env.CLAUDISH_CHANNEL_TRACE = "1";
   } else {
-    delete env.CLAUDISH_CHANNEL_TRACE;
+    // Absent is the production shape — undefined drops the key from spawn's
+    // env (and keeps biome's noDelete happy; `delete` was flagged in review).
+    env.CLAUDISH_CHANNEL_TRACE = undefined;
   }
 
   const proc: ChildProcess = spawn(BUN, ["run", SERVER_ENTRY, "--mcp"], {
@@ -113,7 +113,7 @@ async function runFakeSession(opts: {
     }
   });
 
-  const send = (rpc: object) => proc.stdin!.write(JSON.stringify(rpc) + "\n");
+  const send = (rpc: object) => proc.stdin!.write(`${JSON.stringify(rpc)}\n`);
   send({
     jsonrpc: "2.0",
     id: 1,
@@ -150,51 +150,54 @@ async function runFakeSession(opts: {
   await new Promise((r) => setTimeout(r, 200));
 
   proc.kill("SIGTERM");
-  await new Promise<void>((r) => proc.on("exit", () => r()));
-  return { stderr };
+  // If the child already exited (broken server entry), the exit event has
+  // fired and a fresh listener never settles — the file would hang until an
+  // external timeout. Only await a process that is still alive. (Same class
+  // as channel-wire-format.test.ts:195-197, pre-existing on main — that
+  // sibling is out of scope here, tracked for a follow-up.)
+  if (proc.exitCode === null) {
+    await new Promise<void>((r) => proc.on("exit", () => r()));
+  }
+  return { stderr, terminalSeen };
 }
 
 describe("#567 trace gate", () => {
-  test(
-    "OFF: a pointed TRACE_FILE stays a dead letter when CLAUDISH_CHANNEL_TRACE is absent",
-    async () => {
-      const dir = mkdtempSync(join(tmpdir(), "claudish-trace-off-"));
-      const traceFile = join(dir, "trace.log");
+  test("OFF: a pointed TRACE_FILE stays a dead letter when CLAUDISH_CHANNEL_TRACE is absent", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-trace-off-"));
+    const traceFile = join(dir, "trace.log");
+    try {
+      const { stderr, terminalSeen } = await runFakeSession({ traceFile, trace: false });
+      // The session ran — asserted in BOTH cases so the OFF pin can only
+      // be green after a real session, never because the harness was dead
+      // (review blocking item 1: vacuity probe used to stay green here).
+      expect(terminalSeen).toBe(true);
+      // The trace file is the only thing that must not have happened.
+      expect(existsSync(traceFile)).toBe(false);
+      // And no trace records leaked to stderr either.
+      expect(stderr).not.toContain("[channel-trace]");
+    } finally {
       try {
-        const { stderr } = await runFakeSession({ traceFile, trace: false });
-        // The session ran (a shim-served fake reaches a terminal event); the
-        // trace file is the only thing that must not have happened.
-        expect(existsSync(traceFile)).toBe(false);
-        // And no trace records leaked to stderr either.
-        expect(stderr).not.toContain("[channel-trace]");
-      } finally {
-        try {
-          rmSync(dir, { recursive: true, force: true });
-        } catch {}
-      }
-    },
-    30_000
-  );
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+  }, 30_000);
 
-  test(
-    "ON control: with CLAUDISH_CHANNEL_TRACE=1 the same spawn writes [channel-trace] records",
-    async () => {
-      const dir = mkdtempSync(join(tmpdir(), "claudish-trace-on-"));
-      const traceFile = join(dir, "trace.log");
+  test("ON control: with CLAUDISH_CHANNEL_TRACE=1 the same spawn writes [channel-trace] records", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-trace-on-"));
+    const traceFile = join(dir, "trace.log");
+    try {
+      const { terminalSeen } = await runFakeSession({ traceFile, trace: true });
+      expect(terminalSeen).toBe(true);
+      expect(existsSync(traceFile)).toBe(true);
+      const content = readFileSync(traceFile, "utf-8");
+      // Session-scoped record, not the 30-char startup banner — the banner
+      // alone satisfies the old assertions with no session at all.
+      expect(content).toContain("fired sid=");
+      expect(content.length).toBeGreaterThan(20);
+    } finally {
       try {
-        await runFakeSession({ traceFile, trace: true });
-        expect(existsSync(traceFile)).toBe(true);
-        const content = readFileSync(traceFile, "utf-8");
-        expect(content).toContain("[channel-trace]");
-        // The wire tap announces itself at startup; at least one state-change
-        // or wire record must follow a full session.
-        expect(content.length).toBeGreaterThan(20);
-      } finally {
-        try {
-          rmSync(dir, { recursive: true, force: true });
-        } catch {}
-      }
-    },
-    30_000
-  );
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+  }, 30_000);
 });
