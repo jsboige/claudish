@@ -45,7 +45,7 @@ jobs:
         run: |
           {
             echo "### Test suite (packages/cli, bun 1.4.0, ubuntu-latest)"
-            echo "Non-gating until green on the runner (#570)."
+            echo "**Non-gating:** the job concludes success even when tests fail (continue-on-error) — a green check here is NOT a green suite. Read the counts below (#570)."
             echo '```'
             grep -E '^ *[0-9]+ (pass|fail|skip)|^Ran [0-9]+ test' test-output.txt || echo "(no summary lines captured — see the test step log)"
             echo '```'
