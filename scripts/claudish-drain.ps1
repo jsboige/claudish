@@ -723,6 +723,28 @@ function Invoke-ClaudishDrainedRestartImpl {
     $restartDoneAt = Get-Date
     $restartSecs = [int](($restartDoneAt - $restartAt).TotalSeconds)
     Write-DrainLog "RESTART ($Reason): $verb returned in ${restartSecs}s — SIGTERM delivered within this window"
+
+    # No-op detection (measured 2026-10-22 01:27Z, hub): `-Recreate` runs
+    # `docker compose up -d`, which returns 0 WITHOUT touching the container
+    # when the compose file did not change — and a config-only edit lives in a
+    # bind mount, which compose never compares. That run wrote `OUTCOME
+    # success` while the process still held the OLD config (StartedAt 7 h old,
+    # uptimeSec 25741, and the inbound key it was meant to activate answered
+    # 401). A false success on a config change is worse than a failure: nobody
+    # retries it. Docker stamps `.State.StartedAt` at the current run's start,
+    # so comparing it against the instant just before the verb is the cheapest
+    # honest instrument.
+    $prevEapNoOp = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $startedAtRaw = [string](@(docker inspect --format '{{.State.StartedAt}}' $Container 2>$null) | Select-Object -First 1)
+    } finally { $ErrorActionPreference = $prevEapNoOp }
+    $noOp = Test-ClaudishRestartWasNoOp -StartedAtRaw $startedAtRaw -ReferenceUtc $restartAt.ToUniversalTime()
+    if ($noOp -eq $true) {
+        Write-DrainLog "RESTART ($Reason): $verb was a NO-OP — container StartedAt is '$startedAtRaw', older than the gesture ($($restartAt.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))); the container was not restarted"
+        Write-DrainOutcome "no-op" "${Reason}: $verb left the container untouched (StartedAt '$startedAtRaw') — a config-only change in a bind mount is invisible to compose; use a plain drained 'docker restart' (no -Recreate), or make the compose file change"
+        return $false
+    }
     Start-Sleep -Seconds 20
 
     $after = Get-ClaudishActiveStreams -Url $Url

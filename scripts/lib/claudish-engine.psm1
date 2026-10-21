@@ -2388,6 +2388,57 @@ function Test-DockerLogsSinceCoherence {
 
     return @{ Verdict = 'stale'; Reason = ('newest container line {0} is at-or-after --since {1}, but the --since window holds no such line — the pre-rotation segment was served' -f $tailParsed.Ts, $SinceUtc) }
 }
+
+function Test-ClaudishRestartWasNoOp {
+    <#
+        PURE decision function: no I/O, no clock, no network.
+
+        Answers ONE question: after a restart verb returned 0, did the
+        container actually start again? Docker reports `.State.StartedAt` for
+        the CURRENT run — a verb that touched nothing leaves the old value in
+        place.
+
+        Measured 2026-10-22 01:27Z on the hub: `-Recreate -EnvFile …` ran
+        `docker compose up -d`; compose found no service-definition change and
+        returned 0 WITHOUT replacing the container (a config-only edit lives in
+        a bind mount, which compose never compares). The drain then wrote
+        `OUTCOME success` while the process still held the OLD config —
+        StartedAt 7 h old, uptimeSec 25741, and the new inbound key it was
+        meant to activate answered 401. A false success on a config change is
+        worse than a failure: nobody retries it.
+
+        Returns $null when the timestamp cannot be read (shim/fixture text, a
+        format this parser does not know, an inspect that failed): the caller
+        keeps its previous behaviour rather than inventing a verdict from
+        noise — an unreadable instrument must never be reported as "the
+        gesture failed".
+
+        - StartedAtRaw : raw `docker inspect --format '{{.State.StartedAt}}'`
+                         value (RFC3339 with nanoseconds, e.g.
+                         2026-10-21T23:43:20.912677448Z).
+        - ReferenceUtc : the instant taken immediately BEFORE the verb.
+        - ToleranceSec : how much older than the reference a legitimate start
+                         may look (coarse inspection). Default 60.
+    #>
+    param(
+        [AllowEmptyString()][string]$StartedAtRaw,
+        [Parameter(Mandatory)][datetime]$ReferenceUtc,
+        [int]$ToleranceSec = 60
+    )
+
+    if (-not $StartedAtRaw) { return $null }
+    # .NET Framework (PS 5.1) rejects 9 fractional digits — cut to seconds.
+    $m = [regex]::Match($StartedAtRaw.Trim(), '^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
+    if (-not $m.Success) { return $null }
+
+    $started = [datetime]::MinValue
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if (-not [datetime]::TryParseExact($m.Groups[1].Value, 'yyyy-MM-ddTHH:mm:ss', $inv, $styles, [ref]$started)) { return $null }
+
+    $refUtc = $ReferenceUtc.ToUniversalTime()
+    return ($started -lt $refUtc.AddSeconds(-1 * $ToleranceSec))
+}
 #endregion
 
 Export-ModuleMember -Function @(
@@ -2448,4 +2499,5 @@ Export-ModuleMember -Function @(
     'Get-ClaudishOptInFileName'
     'Get-ClaudishOptInToken'
     'Get-ClaudishMachineName'
+    'Test-ClaudishRestartWasNoOp'
 )

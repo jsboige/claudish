@@ -74,10 +74,16 @@ if exist "%SHIM_DIR%\ps_out.txt" type "%SHIM_DIR%\ps_out.txt"
 exit /b 0
 
 :inspect
+echo %* | findstr /C:"State.StartedAt" >nul
+if not errorlevel 1 goto :inspect_startedat
 if exist "%SHIM_DIR%\inspect_out.txt" (type "%SHIM_DIR%\inspect_out.txt") else (echo true)
 if not exist "%SHIM_DIR%\inspect_exit.txt" exit /b 0
 set /p IE=<"%SHIM_DIR%\inspect_exit.txt"
 exit /b %IE%
+
+:inspect_startedat
+if exist "%SHIM_DIR%\startedat_out.txt" type "%SHIM_DIR%\startedat_out.txt"
+exit /b 0
 
 :image
 if exist "%SHIM_DIR%\image_out.txt" (type "%SHIM_DIR%\image_out.txt") else (echo 2026-09-24T22:47:44.000000000Z)
@@ -148,7 +154,7 @@ exit /b %CE%
 
     function Reset-DrainFixture {
         Remove-Item -LiteralPath $script:CallsLog -Force -ErrorAction SilentlyContinue
-        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'inspect_exit.txt', 'compose_exit.txt', 'compose_stderr.txt', 'image_out.txt', 'start_exit.txt', 'rm_exit.txt') {
+        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'inspect_exit.txt', 'compose_exit.txt', 'compose_stderr.txt', 'image_out.txt', 'start_exit.txt', 'rm_exit.txt', 'startedat_out.txt') {
             Remove-Item -LiteralPath (Join-Path $script:ShimDir $f) -Force -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $script:TestLog -Force -ErrorAction SilentlyContinue
@@ -357,6 +363,36 @@ Describe 'Invoke-ClaudishDrainedRestart — terminal OUTCOME lines (#233 AC3)' {
         $r = Invoke-ClaudishDrainedRestart -Reason 'happy' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
         $r | Should -BeTrue
         (Get-DrainLogText) | Should -Match 'OUTCOME success'
+    }
+
+    It 'a verb that left the container untouched is OUTCOME no-op, never success (2026-10-22)' {
+        # `compose up -d` returns 0 without replacing the container when the
+        # compose file did not change — and a config-only edit lives in a bind
+        # mount compose never compares. Measured on the hub: OUTCOME success was
+        # written while StartedAt stayed 7 h old and the new key 401'd.
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'startedat_out.txt'), "2026-09-01T00:00:00.000000000Z", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'noop' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeFalse
+        $log = Get-DrainLogText
+        $log | Should -Match 'NO-OP'
+        $log | Should -Match 'OUTCOME no-op'
+        $log | Should -Not -Match 'OUTCOME success'
+    }
+
+    It 'a container that started at the gesture is a success, not a no-op' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        $fresh = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000000000Z')
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'startedat_out.txt'), $fresh, (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'fresh' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match 'OUTCOME success'
+        $log | Should -Not -Match 'OUTCOME no-op'
     }
 
     It 'a previous RECREATE with no OUTCOME after it logs PREVIOUS RUN INTERRUPTED' {

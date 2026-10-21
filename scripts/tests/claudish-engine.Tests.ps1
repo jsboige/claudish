@@ -1502,3 +1502,42 @@ Describe 'Invoke-GitBounded — dubious ownership (SYSTEM vs operator tree)' {
         }
     }
 }
+
+Describe 'Test-ClaudishRestartWasNoOp' {
+    # Regression for the 2026-10-22 01:27Z hub run: `-Recreate` ran
+    # `docker compose up -d`, compose returned 0 without replacing the
+    # container (bind-mount-only change), and the drain wrote OUTCOME success
+    # while the old config was still loaded.
+
+    BeforeAll {
+        $script:Ref = [datetime]::SpecifyKind([datetime]'2026-10-22T01:27:56', [System.DateTimeKind]::Utc)
+    }
+
+    It 'flags a StartedAt older than the gesture' {
+        Test-ClaudishRestartWasNoOp -StartedAtRaw '2026-10-21T16:21:54.297089524Z' -ReferenceUtc $script:Ref | Should -BeTrue
+    }
+
+    It 'accepts a StartedAt at the gesture, nanoseconds and all' {
+        Test-ClaudishRestartWasNoOp -StartedAtRaw '2026-10-22T01:27:58.912677448Z' -ReferenceUtc $script:Ref | Should -BeFalse
+    }
+
+    It 'accepts a StartedAt within the tolerance window' {
+        Test-ClaudishRestartWasNoOp -StartedAtRaw '2026-10-22T01:27:20.000000000Z' -ReferenceUtc $script:Ref -ToleranceSec 60 | Should -BeFalse
+    }
+
+    It 'returns $null for unreadable instrument output rather than inventing a verdict' {
+        Test-ClaudishRestartWasNoOp -StartedAtRaw 'true' -ReferenceUtc $script:Ref | Should -BeNullOrEmpty
+        Test-ClaudishRestartWasNoOp -StartedAtRaw '' -ReferenceUtc $script:Ref | Should -BeNullOrEmpty
+    }
+
+    It 'reads Docker zero-time as never-started, therefore untouched' {
+        Test-ClaudishRestartWasNoOp -StartedAtRaw '0001-01-01T00:00:00Z' -ReferenceUtc $script:Ref | Should -BeTrue
+    }
+
+    It 'a local-time reference is compared in UTC, not by wall clock' {
+        # The drain passes the local instant; Docker answers in UTC. A naive
+        # comparison would read every restart as a no-op east of Greenwich.
+        $localRef = $script:Ref.ToLocalTime()
+        Test-ClaudishRestartWasNoOp -StartedAtRaw '2026-10-22T01:27:58.000000000Z' -ReferenceUtc $localRef | Should -BeFalse
+    }
+}
