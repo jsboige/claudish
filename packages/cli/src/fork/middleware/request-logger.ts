@@ -186,18 +186,25 @@ export function logRequest(
     const safeSrc = src.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40);
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const file = `${captureDir}/req-${process.pid}-${String(n).padStart(4, "0")}-${ts}-${safeSrc}.json`;
-    // Absent header → NO `hops` key at all, never an empty array: "no relay
-    // hop" and "capture written before this field existed" must stay
-    // distinguishable when the corpus is read back.
+    // `hops` is ALWAYS written — `[]` on a direct request — so the corpus stays
+    // readable three ways: `[]` = direct, non-empty = relayed by that sidecar,
+    // key ABSENT = capture written before #566 (unknown, not "direct"). Omitting
+    // the key would make the first two indistinguishable from the third.
+    //
+    // Order matters: `hops` comes AFTER model/pid/attribution, just before the
+    // body. It is a client-supplied value, and the leak-policy method reads
+    // attribution from the head of the capture (machine + model within the
+    // first 300-400 bytes) — seating it earlier lets a long fake chain push
+    // `model` out of that window (measured: offset 73 → 618).
     const payload = JSON.stringify({
       ts,
       src,
       machine,
-      ...(hops.length ? { hops } : {}),
       ...(inboundKey ? { inbound_key: inboundKey } : {}),
       model,
       pid: process.pid,
       ...extractAttributionFields(body),
+      hops,
       body,
     });
     // Never block the request path: fire-and-forget with a silent catch.
