@@ -23,12 +23,22 @@ jobs:
       - name: Install dependencies (frozen)
         run: bun install --frozen-lockfile
 
+      # Bun >= 1.4 on POSIX freezes os.homedir() at boot (a runtime HOME
+      # assignment no longer moves it; the builtin namespace is readonly —
+      # measured, see test-preload.ts). The home sandbox must therefore be
+      # set by the LAUNCHER, before bun boots: preset HOME + the preload's
+      # preset mode accept it as the sandbox (#570).
       # Non-gating while the suite is not green on the runner (#570): the
       # failure count is reported in the log and the step summary; flip this
       # to gating (drop continue-on-error) once a run is green.
       - name: Run test suite (packages/cli)
         continue-on-error: true
-        run: bun test --cwd packages/cli 2>&1 | tee test-output.txt; test ${PIPESTATUS[0]} -eq 0
+        env:
+          CLAUDISH_TEST_PRESET_HOME: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/claudish-test-home"
+          HOME="$RUNNER_TEMP/claudish-test-home" bun test --cwd packages/cli 2>&1 | tee test-output.txt
+          test ${PIPESTATUS[0]} -eq 0
 
       - name: Suite summary
         if: always()

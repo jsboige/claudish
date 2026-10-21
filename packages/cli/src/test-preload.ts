@@ -16,10 +16,24 @@
  * files resolve paths from homedir(), and every proxy a test starts also
  * writes tokens-<port>.json there.
  *
- * Bun's os.homedir() re-reads USERPROFILE on Windows on every call (HOME is
- * ignored there) and HOME on POSIX, so setting both here is enough — measured
- * on Bun 1.3.13 before writing this. If that ever stops being true the guard
- * below throws, and the run stops before a single test can touch the real home.
+ * Two homedir() regimes, one guard (first Linux run: CI workflow #570, run
+ * 39545462714 — 149 load deaths, zero tests executed):
+ *
+ * - Bun re-reads USERPROFILE on Windows on every call (HOME is ignored there)
+ *   and HOME on POSIX *when HOME is set before boot*. Setting both here at
+ *   runtime is enough on the seats this suite historically ran on (win32,
+ *   Bun 1.3.x — measured before writing this).
+ * - On Bun ≥ 1.4 / POSIX, a runtime `process.env.HOME` assignment no longer
+ *   moves `os.homedir()` (it resolves through the passwd database / a
+ *   boot-time snapshot), and the builtin namespace is frozen — patching
+ *   `os.homedir` throws `Attempted to assign to readonly property` (measured,
+ *   probe 21/10). The sandbox then has to come from the LAUNCHER: run bun
+ *   with `HOME=<isolated dir>` already set and `CLAUDISH_TEST_PRESET_HOME=1`.
+ *   The guard accepts that as the sandbox (the real home is out of reach by
+ *   construction — homedir() never resolves to it).
+ *
+ * If neither regime holds the guard below throws, and the run stops before a
+ * single test can touch the real home.
  */
 import { afterAll } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
@@ -29,7 +43,8 @@ import { join } from "node:path";
 const SANDBOX_PREFIX = "claudish-test-home-";
 
 const realHome = homedir();
-const sandbox = mkdtempSync(join(tmpdir(), SANDBOX_PREFIX));
+const preset = process.env.CLAUDISH_TEST_PRESET_HOME === "1";
+const sandbox = preset ? realHome : mkdtempSync(join(tmpdir(), SANDBOX_PREFIX));
 
 process.env.USERPROFILE = sandbox;
 process.env.HOME = sandbox;
@@ -61,8 +76,14 @@ for (const name of readdirSync(tmpdir())) {
 
 // afterAll in a preload runs once, after the last test file. process "exit"
 // and "beforeExit" hooks do not fire under `bun test` (measured, Bun 1.3.13).
+// In preset mode the sandbox IS the launcher-provided HOME (a whole runner
+// dir on CI) — never rmtree a HOME; clean only the .claudish state inside it.
 afterAll(() => {
   try {
-    rmSync(sandbox, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    if (preset) {
+      rmSync(join(sandbox, ".claudish"), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } else {
+      rmSync(sandbox, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    }
   } catch {}
 });
