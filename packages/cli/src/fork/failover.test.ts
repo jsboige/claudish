@@ -47,6 +47,7 @@ import {
   resolveDelegationOwner,
   setRoleNominalResolver,
   setRoleNominalBucketResolver,
+  machineArmBucket,
   NATIVE_BUCKET,
 } from "./failover.js";
 import type { DelegationOwner } from "./failover.js";
@@ -273,6 +274,137 @@ describe("failover — arming", () => {
   });
 });
 
+// ── Machine-scoped config arm (`role@machine`) ─────────────────────────────────
+//
+// The operator diverts ONE machine's role to its cascade (a calibration load
+// on our own vLLM from one machine) without moving any other machine: the
+// role-wide form diverts every machine of the fleet.
+
+describe("failover — machine-scoped config arm (role@machine)", () => {
+  const HAIKU_LOCAL = {
+    CLAUDISH_FAILOVER_HAIKU: "vllm-myia@qwen3.6-35b-a3b>role:sonnet",
+    CLAUDISH_FAILOVER_HAIKU_LABEL: "Swift local>Sonnet role",
+    CLAUDISH_FAILOVER_HAIKU_DIRECTION: "degraded>improved",
+    CLAUDISH_FAILOVER_HAIKU_NOTE: "A much smaller model than the nominal.>",
+    CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3",
+  } as NodeJS.ProcessEnv;
+
+  it("arms the role for that machine's bucket only — never role-wide", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    const mine = machineArmBucket("haiku", "myia-po-2027");
+    expect(mine).toBe("machine:myia-po-2027");
+    expect(isFailoverActive("haiku", mine)).toBe(true);
+    expect(resolveFailoverTarget("haiku", mine).step?.target).toBe("vllm-myia@qwen3.6-35b-a3b");
+    // Every other reading of the role stays nominal.
+    expect(isFailoverActive("haiku")).toBe(false);
+    expect(isFailoverActive("haiku", "minimax-coding")).toBe(false);
+    expect(machineArmBucket("haiku", "myia-po-2025")).toBeUndefined();
+    expect(machineArmBucket("haiku", null)).toBeUndefined();
+    expect(machineArmBucket("sonnet", "myia-po-2027")).toBeUndefined();
+    expect(getActiveFailovers()).toEqual([]); // role-less notices never announce it
+  });
+
+  it("matches the machine header case-insensitively", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@MYIA-PO-2027" });
+    expect(machineArmBucket("haiku", " Myia-Po-2027 ")).toBe("machine:myia-po-2027");
+  });
+
+  it("coexists with role-wide arms and ignores an empty machine or an unconfigured role", () => {
+    initFailover({
+      ...HAIKU_LOCAL,
+      ...OPUS_TO_QWEN,
+      CLAUDISH_FAILOVER_ACTIVE: "opus, haiku@m1 haiku@m2, haiku@, fable@m1",
+    });
+    expect(isFailoverActive("opus")).toBe(true);
+    expect(machineArmBucket("haiku", "m1")).toBe("machine:m1");
+    expect(machineArmBucket("haiku", "m2")).toBe("machine:m2");
+    expect(isFailoverActive("haiku")).toBe(false); // `haiku@` is not a role-wide arm
+    expect(machineArmBucket("fable", "m1")).toBeUndefined(); // no fable cascade
+  });
+
+  it("the session notice states the operator routing (not an exhaustion) and carries the step note", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    const text = consumeStreamNotice("haiku", "s-po2027", machineArmBucket("haiku", "myia-po-2027"))!;
+    expect(text).toContain("Swift local");
+    expect(text).toContain("the operator routes the Haiku role of myia-po-2027 away from its nominal model");
+    expect(text).not.toContain("temporarily exhausted");
+    expect(text).toContain("A much smaller model than the nominal.");
+    // Other machines' sessions get nothing.
+    expect(consumeStreamNotice("haiku", "s-other", "minimax-coding")).toBeNull();
+  });
+
+  it("a real wall still reads as an exhaustion (wording unchanged off the config arm)", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_AUTO: "1" });
+    armFailover("haiku", "HTTP 402", "minimax-coding");
+    const text = consumeStreamNotice("haiku", "s-wall", "minimax-coding")!;
+    expect(text).toContain("because the nominal Haiku model temporarily exhausted");
+  });
+
+  // ── #552 review, non-blocking pins ──
+
+  const captureStderr = (fn: () => void): string[] => {
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as any).write = (chunk: any) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      fn();
+    } finally {
+      (process.stderr as any).write = realWrite;
+    }
+    return lines;
+  };
+
+  it("N: the startup banner names the live machine arm and its step", () => {
+    const lines = captureStderr(() =>
+      initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" })
+    );
+    const banner = lines.filter((l) => l.includes("[Failover] configured="));
+    expect(banner.length).toBe(1);
+    expect(banner[0]).toContain("haiku@myia-po-2027→Swift local");
+  });
+
+  it("T: a re-init without the arm drops the machine arm", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    expect(machineArmBucket("haiku", "myia-po-2027")).toBe("machine:myia-po-2027");
+    initFailover({ ...HAIKU_LOCAL });
+    expect(machineArmBucket("haiku", "myia-po-2027")).toBeUndefined();
+  });
+
+  it("U: resetFailoverForTests() drops the machine arm", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    resetFailoverForTests();
+    expect(machineArmBucket("haiku", "myia-po-2027")).toBeUndefined();
+  });
+
+  it("W: the step note appears exactly once in the session notice", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    const text = consumeStreamNotice("haiku", "s-note", machineArmBucket("haiku", "myia-po-2027"))!;
+    expect(text.split("A much smaller model than the nominal.").length - 1).toBe(1);
+  });
+
+  it("the role-wide config arm reads as operator routing, with no machine named", () => {
+    initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku" });
+    const text = consumeStreamNotice("haiku", "s-rolewide", "minimax-coding")!;
+    expect(text).toContain("because the operator routes the Haiku role away from its nominal model");
+    expect(text).not.toContain("temporarily exhausted");
+  });
+
+  it("a second @ in the machine is ignored with a log, never armed", () => {
+    const lines = captureStderr(() =>
+      initFailover({ ...HAIKU_LOCAL, CLAUDISH_FAILOVER_ACTIVE: "haiku@m1@m2, haiku@myia-po-2027@" })
+    );
+    expect(lines.filter((l) => l.includes("Ignoring malformed machine")).length).toBe(2);
+    expect(machineArmBucket("haiku", "m1@m2")).toBeUndefined();
+    expect(machineArmBucket("haiku", "m1")).toBeUndefined();
+    expect(machineArmBucket("haiku", "myia-po-2027@")).toBeUndefined();
+    expect(machineArmBucket("haiku", "myia-po-2027")).toBeUndefined();
+    expect(isFailoverActive("haiku")).toBe(false);
+  });
+});
+
 // ── Resolution walk ────────────────────────────────────────────────────────────
 
 describe("resolveFailoverTarget — cascade walk", () => {
@@ -456,13 +588,74 @@ describe("per-step backoff", () => {
     expect(resolveFailoverTarget("opus").stepIndex).toBe(0); // step 0 probed again
   });
 
-  it("two failures extend the TTL to ~30 minutes", () => {
+  it("two failure EPISODES extend the TTL to ~30 minutes", () => {
     markStepFailed("opus", 0, "one");
+    clock += 11 * 60 * 1000; // bench elapsed — the re-probe fails: a second episode
     markStepFailed("opus", 0, "two");
     clock += 20 * 60 * 1000; // 20 min — within 30 min TTL
     expect(resolveFailoverTarget("opus").stepIndex).toBe(1);
     clock += 15 * 60 * 1000; // 35 min total — past 30 min TTL
     expect(resolveFailoverTarget("opus").stepIndex).toBe(0);
+  });
+
+  // #553: N requests in flight on one step that fail together are ONE episode.
+  // Measured on the hub 20/10 00:19Z: Kimi (haiku[1]) count 2 → 4 (a 4 h bench)
+  // within one second; the cascade then paid DeepSeek PAYG for those hours.
+  it("#553: concurrent failures on a benched step climb ONE rung, not N", () => {
+    for (let i = 0; i < 5; i++) markStepFailed("opus", 0, `in-flight ${i}`);
+    clock += 9 * 60 * 1000;
+    expect(resolveFailoverTarget("opus").stepIndex).toBe(1); // still benched
+    clock += 2 * 60 * 1000; // 11 min — first rung (10 min), not the fifth (24 h)
+    expect(resolveFailoverTarget("opus").stepIndex).toBe(0);
+  });
+
+  it("#553: a late in-flight failure refreshes the bench without escalating it", () => {
+    markStepFailed("opus", 0, "first");
+    clock += 5 * 60 * 1000; // a long stream selected before the bench dies now
+    markStepFailed("opus", 0, "late in-flight");
+    clock += 9 * 60 * 1000; // 14 min after the first, 9 after the refresh
+    expect(resolveFailoverTarget("opus").stepIndex).toBe(1);
+    clock += 2 * 60 * 1000; // 11 min after the refresh — still the 10 min rung
+    expect(resolveFailoverTarget("opus").stepIndex).toBe(0);
+  });
+
+  it("#553: a failure while a known reset is pending is the same episode", () => {
+    const resetAt = new Date(clock + 2 * 3600_000);
+    markStepFailed("opus", 0, "wall with a reset", resetAt);
+    clock = resetAt.getTime() - 5 * 60_000; // TTL rung long gone, the reset still binds
+    markStepFailed("opus", 0, "in-flight while walled", resetAt);
+    clock = resetAt.getTime() + 6 * 60_000; // reset passed, 11 min after the last failure
+    // FIRST rung (10 min) from the last failure → probeable; a second rung (30 min)
+    // would still hold the step here.
+    expect(resolveFailoverTarget("opus").stepIndex).toBe(0);
+  });
+
+  it("#553: a failure on a DIFFERENT concrete is a new episode", () => {
+    markStepFailed("opus", 0, "on A", undefined, { concrete: "prov@model-a" });
+    markStepFailed("opus", 0, "on B", undefined, { concrete: "prov@model-b" });
+    clock += 11 * 60 * 1000; // past the first rung
+    expect(resolveFailoverTarget("opus").stepIndex).toBe(1); // second rung holds
+    clock += 20 * 60 * 1000; // 31 min — past the second rung
+    expect(resolveFailoverTarget("opus").stepIndex).toBe(0);
+  });
+
+  it("#553: the held mark says so in the [Failover] line", () => {
+    const realWrite = process.stderr.write.bind(process.stderr);
+    const lines: string[] = [];
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      markStepFailed("opus", 0, "first");
+      markStepFailed("opus", 0, "concurrent");
+    } finally {
+      process.stderr.write = realWrite;
+    }
+    const step = lines.filter((l) => l.includes("[Failover] step opus[0]"));
+    expect(step.length).toBe(2);
+    expect(step[0]).toContain("count=1 ttl=");
+    expect(step[1]).toContain("count=1 (same episode) ttl=");
   });
 
   it("step failures survive the role-arm TTL cycle (the corrected invariant)", () => {
@@ -471,7 +664,8 @@ describe("per-step backoff", () => {
     initFailover({ ...OPUS_CASCADE, CLAUDISH_FAILOVER_AUTO: "1" });
     expect(armFailover("opus", "weekly wall")).toBe(true);
     markStepFailed("opus", 0, "qwen weekly");
-    markStepFailed("opus", 0, "qwen weekly"); // count=2 → 30 min TTL
+    clock += 11 * 60 * 1000; // first bench elapsed; the re-probe fails too
+    markStepFailed("opus", 0, "qwen weekly"); // second episode: count=2 → 30 min TTL
     // Advance past the 10-min role-arm TTL; the role disarms then re-arms, but the
     // step's 30-min backoff must hold — Qwen must not be re-probed every 10 min.
     clock += 11 * 60 * 1000;
@@ -2457,6 +2651,19 @@ describe("#274 — role-step resolution", () => {
     });
 
     it("without a bucket resolver the bare nominal is served (no bucket to test)", () => {
+      initFailover(env274({ CLAUDISH_FAILOVER_ACTIVE: "opus", CLAUDISH_FAILOVER_AUTO: "1" }));
+      setRoleNominalResolver((r) => (r === "sonnet" ? "glm-5.3" : undefined));
+      armFailover("sonnet", "test wall", "glm-coding");
+      const { step } = resolveFailoverTarget("opus");
+      expect(step!.target).toBe("glm-5.3");
+    });
+
+    // #554 point 3: the full reset must drop an injected bucket resolver. A
+    // stale one names `glm-coding` here, so the delegation would join sonnet's
+    // cascade instead of serving the bare nominal (the case just above).
+    it("resetFailoverForTests() drops an injected bucket resolver", () => {
+      setRoleNominalBucketResolver((m) => (m === "glm-5.3" ? "glm-coding" : undefined));
+      resetFailoverForTests();
       initFailover(env274({ CLAUDISH_FAILOVER_ACTIVE: "opus", CLAUDISH_FAILOVER_AUTO: "1" }));
       setRoleNominalResolver((r) => (r === "sonnet" ? "glm-5.3" : undefined));
       armFailover("sonnet", "test wall", "glm-coding");
