@@ -294,9 +294,16 @@ export function formatTeamResult(
         result += `- **Command:** \`${m.error.command}\`\n`;
         result += `- **Exit code:** ${m.exitCode}\n`;
         if (m.error.stderrSnippet) {
-          result += `- **Error output:**\n\`\`\`\n${m.error.stderrSnippet}\n\`\`\`\n`;
+          // The report is machine-readable output an agent may copy wholesale:
+          // run the captured child stderr through the same sanitize() the
+          // report_error tool applies to this exact stream.
+          result += `- **Error output:**\n\`\`\`\n${sanitize(m.error.stderrSnippet)}\n\`\`\`\n`;
         }
-        result += `- **Full error log:** ${m.error.errorLogPath}\n`;
+        // The producer only fills this once the file exists on disk; an empty
+        // path means the write failed, so do not advertise a dangling file.
+        if (m.error.errorLogPath) {
+          result += `- **Full error log:** ${m.error.errorLogPath}\n`;
+        }
         result += `- **Working directory:** ${m.error.workDir}\n`;
       }
       result += "\n";

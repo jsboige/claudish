@@ -328,61 +328,73 @@ export async function runModels(
 
     const completionPromise = new Promise<void>((resolve) => {
       let exitCode: number | null = null;
-      let resolved = false;
+      let exitKnown = false;
+      let streamClosed = false;
+      let settled = false;
 
-      const finish = () => {
-        if (resolved) return;
-        // Don't overwrite TIMEOUT state — timeout handler may have fired
-        // between proc "exit" and outputStream "close" events
+      // #538: settle the run only once BOTH signals are in — the child's exit
+      // (real exit code, stderr fully drained) and the output stream's close
+      // (response file flushed). Settling on either alone is a race: stdout
+      // close routinely wins over "exit", which recorded exitCode=1 for real
+      // exit-3 failures (27/30 measured) and advertised a log path whose file
+      // did not exist yet, while never writing one at all for an exit-0 child
+      // misclassified FAILED.
+      const settle = () => {
+        if (settled || !exitKnown || !streamClosed) return;
+        settled = true;
+
+        // Don't overwrite TIMEOUT state — the timeout handler may have fired
+        // and killed the child before these events landed.
         if (statusCache.models[anonId].state === "TIMEOUT") {
-          resolved = true;
           resolve();
           return;
         }
-        resolved = true;
 
-        const outputSize = byteCount;
+        // #538: the error log is written HERE, where the status that
+        // advertises it is produced, so path and file cannot disagree.
+        // A FAILED run writes its log even when stderr is empty. The dir is
+        // created if missing and the write is guarded — throwing out of a
+        // process event handler would kill the whole orchestrator.
+        let advertisedLogPath = "";
+        if (exitCode !== 0) {
+          try {
+            mkdirSync(join(sessionPath, "errors"), { recursive: true });
+            writeFileSync(errorLogPath, stderr, "utf-8");
+            advertisedLogPath = errorLogPath;
+          } catch {
+            // Unwritable session dir: keep the details, advertise no path.
+            advertisedLogPath = "";
+          }
+        }
 
         updateModelStatus(anonId, {
           state: exitCode === 0 ? "COMPLETED" : "FAILED",
           exitCode: exitCode ?? 1,
           completedAt: new Date().toISOString(),
-          outputSize,
+          outputSize: byteCount,
           // #538: attach the details the MCP failure report renders. Completed
           // runs carry no error field; a FAILED run always does.
           ...(exitCode === 0
             ? {}
-            : { error: failureDetails(entry, args, stderr, errorLogPath, workDir) }),
+            : { error: failureDetails(entry, args, stderr, advertisedLogPath, workDir) }),
         });
 
         opts.onStatusChange?.(anonId, statusCache.models[anonId]);
         resolve();
       };
 
-      // "close" always fires after the stream ends or errors — single resolution point
-      outputStream.on("close", finish);
+      outputStream.on("close", () => {
+        streamClosed = true;
+        settle();
+      });
 
-      proc.on("exit", (code) => {
-        // CRITICAL FIX: guard against overwriting TIMEOUT state
-        const current = statusCache.models[anonId];
-        if (current?.state === "TIMEOUT") {
-          resolved = true;
-          resolve();
-          return;
-        }
-
-        if (stderr || code !== 0) {
-          // #538: a FAILED run writes its log even when stderr is empty, so the
-          // errorLogPath advertised in status.error always exists on disk.
-          writeFileSync(errorLogPath, stderr, "utf-8");
-        }
-
+      // proc "close" (not "exit"): it fires after the process ended AND its
+      // stdio streams closed, so the exit code and the drained stderr are
+      // both known here.
+      proc.on("close", (code) => {
+        exitKnown = true;
         exitCode = code;
-        // If the stream already closed before exit fired, finish immediately
-        if (outputStream.destroyed) {
-          finish();
-        }
-        // Otherwise wait for outputStream "close" to call finish()
+        settle();
       });
     });
 
