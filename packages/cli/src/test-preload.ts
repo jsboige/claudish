@@ -33,33 +33,34 @@
  * Preset mode has to PROVE its claim (review B1 on #574): `homedir()` is the
  * preset HOME, so comparing it to itself proves nothing, and an inherited
  * `CLAUDISH_TEST_PRESET_HOME=1` on a seat would otherwise run the whole suite —
- * and afterAll's rmSync — against the operator's real ~/.claudish. The
- * reference real home is therefore the passwd entry (`os.userInfo()`), which
- * does not follow `HOME`, and the preset sandbox must be a throwaway location
- * (tmpdir, RUNNER_TEMP) or run under GitHub Actions. Both conditions live in
- * `test-sandbox.ts`, where unit tests pin them.
+ * and afterAll's rmSync — against the operator's real ~/.claudish. The passwd
+ * entry is no escape hatch: `os.userInfo().homedir` follows `$HOME` too (libuv
+ * checks HOME before getpwuid — measured on the CI runner, where the preset
+ * HOME and userInfo() were the same path). What survives is the LOCATION: the
+ * preset sandbox must be throwaway (tmpdir or RUNNER_TEMP) and carry the
+ * `claudish-test-home` basename, or run under GitHub Actions. Both conditions
+ * live in `test-sandbox.ts`, where unit tests pin them.
  *
  * If neither regime holds the guard below throws, and the run stops before a
  * single test can touch the real home.
  */
 import { afterAll } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
-import { homedir, tmpdir, userInfo } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { presetRefusal, resolveRealHome } from "./test-sandbox";
+import { presetRefusal } from "./test-sandbox";
 
 const SANDBOX_PREFIX = "claudish-test-home-";
 
 // What homedir() resolves to right now: the launcher's preset on bun >= 1.4 /
 // POSIX (frozen at boot), the real home otherwise.
 const envHome = homedir();
-// The passwd entry — independent of HOME/USERPROFILE, so it stays the real home
-// even when the launcher preset one.
-const passwdHome = userInfo().homedir;
 const preset = process.env.CLAUDISH_TEST_PRESET_HOME === "1";
 const sandbox = preset ? envHome : mkdtempSync(join(tmpdir(), SANDBOX_PREFIX));
-// Preset mode's real home is the passwd entry, NOT homedir() (which is the sandbox).
-const realHome = resolveRealHome({ preset, envHome, passwdHome });
+// In non-preset mode homedir() was re-read at runtime, so envHome IS the real
+// home. In preset mode it is unknown — the guard below is what proves the
+// sandbox is throwaway, and this value is only a best-effort record.
+const realHome = envHome;
 
 process.env.USERPROFILE = sandbox;
 process.env.HOME = sandbox;
@@ -70,22 +71,13 @@ process.env.CLAUDISH_TEST_HOME_SANDBOX = sandbox;
 // Which evidence let this run proceed. A test pinning the guard reads it, so a
 // future bundle can never pass the pin by silently weakening the proof:
 // - "env-home": the runtime HOME/USERPROFILE assignment moved homedir() (seats);
-// - "passwd-distinct": the launcher's sandbox differs from the passwd home (POSIX preset);
-// - "throwaway-windows": Windows preset, where userInfo() follows USERPROFILE, so the
-//   throwaway location of the sandbox is the guard that caught an inherited preset.
-process.env.CLAUDISH_TEST_SANDBOX_PROOF = !preset
-  ? "env-home"
-  : process.platform === "win32"
-    ? "throwaway-windows"
-    : "passwd-distinct";
+// - "preset-throwaway": the launcher pre-set HOME and the sandbox proved itself
+//   throwaway by location (CI, and any seat that opts in the same way).
+process.env.CLAUDISH_TEST_SANDBOX_PROOF = preset ? "preset-throwaway" : "env-home";
 
 if (preset) {
   const refusal = presetRefusal({
     sandbox,
-    passwdHome,
-    // POSIX: the passwd entry does not follow HOME. Windows: libuv derives it
-    // from USERPROFILE, so it follows the launcher preset and proves nothing.
-    passwdIsIndependent: process.platform !== "win32",
     tmpDir: tmpdir(),
     runnerTemp: process.env.RUNNER_TEMP,
     githubActions: process.env.GITHUB_ACTIONS === "true",

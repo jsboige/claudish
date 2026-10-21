@@ -4,16 +4,16 @@
  * suite is once again writing the operator's real ~/.claudish.
  *
  * The third test reads the preload's proof marker instead of assuming one
- * regime: on POSIX the launcher's sandbox must differ from the passwd home; on
- * Windows `os.userInfo()` follows USERPROFILE, so preset mode proves itself by
- * a throwaway location instead. The marker makes that explicit, so weakening a
- * branch of the guard cannot pass this file silently.
+ * regime: when homedir() re-read HOME at runtime, the sandbox is provably
+ * distinct from the real home; in preset mode homedir() IS the launcher's HOME
+ * on every platform (bun >= 1.4 freezes it, and userInfo() follows HOME too),
+ * so the proof is the sandbox's throwaway LOCATION and the test re-checks it.
  */
 import { describe, expect, test } from "bun:test";
 import { homedir, tmpdir } from "node:os";
-import { resolve, sep } from "node:path";
+import { basename, resolve, sep } from "node:path";
 
-const PROOFS = ["env-home", "passwd-distinct", "throwaway-windows"];
+const PROOFS = ["env-home", "preset-throwaway"];
 
 describe("#242 — tests never see the operator's real home", () => {
   test("the preload ran: a sandbox, the real home and the proof are recorded", () => {
@@ -31,17 +31,17 @@ describe("#242 — tests never see the operator's real home", () => {
     const sandbox = resolve(process.env.CLAUDISH_TEST_HOME_SANDBOX!);
     const realHome = resolve(process.env.CLAUDISH_TEST_REAL_HOME!);
     const proof = process.env.CLAUDISH_TEST_SANDBOX_PROOF;
-    if (proof === "throwaway-windows") {
-      // Equality is expected here (userInfo follows USERPROFILE); the preload
-      // refused unless the sandbox sat in a throwaway location. Re-check it.
+    if (proof === "preset-throwaway") {
+      // homedir() IS the launcher's HOME here, on every platform, so equality
+      // with realHome is expected and proves nothing. The preload refused unless
+      // the sandbox was a throwaway test sandbox — re-check both halves of that.
       const under = (base: string) =>
         sandbox === resolve(base) || sandbox.startsWith(resolve(base) + sep);
       const runnerTemp = process.env.RUNNER_TEMP;
-      const throwaway =
-        process.env.GITHUB_ACTIONS === "true" ||
-        under(tmpdir()) ||
-        (runnerTemp ? under(runnerTemp) : false);
-      expect(throwaway).toBe(true);
+      expect(under(tmpdir()) || (runnerTemp ? under(runnerTemp) : false)).toBe(true);
+      const name = basename(sandbox);
+      const conventional = name === "claudish-test-home" || name.startsWith("claudish-test-home-");
+      expect(process.env.GITHUB_ACTIONS === "true" || conventional).toBe(true);
       return;
     }
     expect(sandbox).not.toBe(realHome);
