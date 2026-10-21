@@ -29,11 +29,20 @@ describe("#565 — decideContextAdmission", () => {
   });
 
   test("an entry with a non-finite or zero limit is not a declared window either", () => {
-    const windows: DeclaredWindow[] = [
+    // Each shape ALONE: with [NaN, 0] the NaN initialises `largest` and the
+    // zero can never beat it, so a dropped validity filter still falls open by
+    // an accident of ordering (mutation n6 survived — review 21/10). A lone
+    // zero limit is the shape where the filter is the only thing deciding.
+    const zeroOnly: DeclaredWindow[] = [{ name: "zero", limit: 0 }];
+    expect(decideContextAdmission(payloadOf(4_000_000), zeroOnly).refuse).toBe(false);
+    const nanOnly: DeclaredWindow[] = [{ name: "broken", limit: Number.NaN }];
+    expect(decideContextAdmission(payloadOf(4_000_000), nanOnly).refuse).toBe(false);
+    // And the pair, which was the original (vacuous-by-ordering) shape.
+    const both: DeclaredWindow[] = [
       { name: "broken", limit: Number.NaN },
       { name: "zero", limit: 0 },
     ];
-    expect(decideContextAdmission(payloadOf(4_000_000), windows).refuse).toBe(false);
+    expect(decideContextAdmission(payloadOf(4_000_000), both).refuse).toBe(false);
   });
 
   test("the LARGEST declared window is the one weighed — a small step alone would over-refuse", () => {
@@ -101,6 +110,14 @@ describe("#565 — refusal wording never reads as a quota wall", () => {
     expect(text).toContain("1100000");
     expect(text).toContain("262144");
     expect(text).toContain("vllm-myia");
+  });
+
+  test("claims only what the census weighed — DECLARED windows, never every candidate", () => {
+    // Review 21/10 (non-blocking 1): an undeclared candidate on the path (nominal,
+    // step, or a FallbackHandler provider swap) is INVISIBLE to the census, not
+    // exonerated. The text must not assert knowledge it does not have.
+    expect(text).toContain("DECLARED");
+    expect(text).not.toContain("No candidate can serve");
   });
 
   test("LOAD-BEARING: isQuotaExhaustion does not match it — a context refusal must never arm a cascade", () => {

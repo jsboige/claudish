@@ -255,7 +255,8 @@ export function decideContextAdmission(
 export function contextAdmissionRefusalText(estTokens: number, largest: DeclaredWindow): string {
   return (
     `[claudish] Input of ~${estTokens} tokens exceeds every declared context window on this route ` +
-    `(largest declared: ${largest.limit} — ${largest.name}). No candidate can serve this request; ` +
+    `(largest declared: ${largest.limit} — ${largest.name}). No DECLARED window on this route can ` +
+    `take it (undeclared candidates are not weighed); ` +
     `the context gauge has been advanced accordingly. Condense the conversation before retrying.`
   );
 }

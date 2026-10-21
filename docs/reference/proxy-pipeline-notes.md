@@ -182,7 +182,10 @@ any handler exists**, in both ingresses (`/v1/messages` and the translated `/v1/
   count — a provider that declares nothing is not assumed unbounded, it is invisible, and a path with
   no declared window falls open to today's behaviour (every built-in provider, today). The largest
   declared window is the one weighed: a 32k step on the path must not refuse a prompt a 262k sibling
-  can take (`K22`).
+  can take (`K22`). A `role:<r>` delegation step carries no `@` provider and is therefore **not
+  weighed** — the omission is fail-open by construction (a delegated role's declared windows can only
+  be missed, never over-refused on), and the refusal text says "no DECLARED window", never "no
+  candidate can serve".
 - **Native carve-out**: a bare (non-`@`, non-`/`) nominal is the native lane, whose 1M window declares
   nothing — a smaller substitute step must never veto the model the client actually named (`K24`).
 - **Estimate**: `estimateClampTokens`, the media-aware #441 estimator (a 1 MB screenshot scores ~1.6k,
@@ -196,8 +199,9 @@ any handler exists**, in both ingresses (`/v1/messages` and the translated `/v1/
   (pinned) — a context refusal is not a wall and must not arm a cascade.
 
 Kill switch `CLAUDISH_CONTEXT_ADMISSION=0` (read per request, compose-injected). Pins:
-`handlers/shared/context-admission.test.ts` (decision, wording, knob) and `K20/K20b/K22/K23/K24` in
-`proxy-server-step-skip-route.test.ts`, each with a mutation proof (`n1`–`n4`).
+`handlers/shared/context-admission.test.ts` (decision, wording, knob) and `K20/K20b/K20c/K22/K23/K24` in
+`proxy-server-step-skip-route.test.ts`, each with a mutation proof (`n1`–`n4`); `K20c` runs the
+translated OpenAI ingress end-to-end (a run, not a reading).
 
 Boundary note: #441's "the clamp stands down when the prompt leaves no output budget" stays reachable
 only in the band `window − margin − 4096 < est ≤ window + margin`; above it the admission census has

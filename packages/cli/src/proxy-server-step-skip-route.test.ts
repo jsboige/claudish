@@ -588,7 +588,8 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
     //    at admission (K20) and never reaches the endpoint, so the stand-down
     //    is pinned in the band that still reaches upstream — est just under the
     //    window, where `contextLimit − est − max(2048, est/64)` goes negative
-    //    (262 144 − 258 250 − 4 035 ≈ −141) but the census does not refuse.
+    //    (262 144 − 258 250 − 4 035 ≈ −141 body-only; ≈ −160 with the JSON
+    //    wrapper, review 21/10 — same sign, same stand-down branch) but the census does not refuse.
     await postMessage({ model: "ctx-ep@fake-ctx", maxTokens: 16384, content: "z".repeat(1_033_000) });
     expect(upstreamBodies.ctx[2].max_tokens).toBe(16_384);
   }, 30_000);
@@ -861,6 +862,33 @@ describe("#565 — a request no declared window can take is refused at admission
     expect(raw).toContain("event: message_stop"); // never-hang invariant
     expect(raw).toContain("exceeds every declared context window");
     expect(calls.ctx ?? 0).toBe(0);
+  }, 30_000);
+
+  test("K20c (/v1/chat/completions): the translated ingress refuses at admission too — zero upstream calls, [DONE]-terminated", async () => {
+    await spin();
+    resetCascade(cascadeEnv("ctx-ep@fake-ctx>s1-ep@fake-s1"));
+
+    // The both-ingresses claim was structurally verified (shared handleWithCascade)
+    // but never RUN for the OpenAI wire — review 21/10, non-blocking 3.
+    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "ctx-ep@fake-ctx",
+        stream: true,
+        messages: [{ role: "user", content: "x".repeat(1_200_000) }], // est ≈ 300k
+      }),
+    });
+    expect(r.status).toBe(200);
+    const raw = await r.text();
+    // A well-formed OpenAI SSE stream that TERMINATES — never a hung stream.
+    expect(raw).toContain("data: ");
+    expect(raw.trimEnd().endsWith("data: [DONE]")).toBe(true);
+    expect(raw).toContain("exceeds every declared context window");
+    // The whole point survives the translation: no round-trip on any candidate.
+    expect(calls.ctx ?? 0).toBe(0);
+    expect(calls.s1 ?? 0).toBe(0);
+    expect(calls.nm ?? 0).toBe(0);
   }, 30_000);
 
   test("K22: the LARGEST declared window decides — a servable prompt is not refused by a small step", async () => {
