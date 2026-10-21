@@ -45,6 +45,58 @@ BeforeAll {
     # now parses under 5.1 and is asserted under BOTH interpreters below. The
     # list stays as the mechanism for any future pwsh-7-only interactive tool.
     $script:Pwsh7OnlyScripts = @()
+
+    # --- AST predicates shared by the zombie actuator guard and its two
+    # positive controls (#530 gap 1 review). Deciding on the call TEXT is how
+    # mutation M6 survived: `-Name "Docker Desktop","com.docker.service"`
+    # names the GUI in its text while also killing the service.
+
+    # Forbidden actuator binaries, compared on the LEAF name so that
+    # `taskkill`, `taskkill.exe` and `C:\Windows\System32\taskkill.exe` are one
+    # entry. Mutation M8 was `taskkill /IM "Docker Desktop.exe" /F`, which sat
+    # in NO forbidden set at all.
+    function Test-ForbiddenActuatorName {
+        param([string]$Name)
+        if (-not $Name) { return $false }
+        $leaf = ($Name -split '[\\/]')[-1]
+        if ($leaf -match '(?i)\.exe$') { $leaf = $leaf.Substring(0, $leaf.Length - 4) }
+        return (@('taskkill', 'wsl', 'kill') -contains $leaf.ToLowerInvariant())
+    }
+
+    # The ONE sanctioned actuator: Stop-Process whose -Name/-ProcessName carries
+    # EXACTLY ONE argument, and that argument is the bare literal
+    # 'Docker Desktop'. An array literal, a variable, a second value, or the
+    # colon-form argument are all offenders: the contract is "the GUI, alone".
+    function Test-ZombieGuiKillAst {
+        param($Call)
+        if ($Call.GetCommandName() -ne 'Stop-Process') { return $false }
+        $elements = @($Call.CommandElements)
+        $values = New-Object System.Collections.ArrayList
+        $i = 0
+        while ($i -lt $elements.Count) {
+            $el = $elements[$i]
+            if ($el -is [System.Management.Automation.Language.CommandParameterAst] -and
+                ($el.ParameterName -eq 'Name' -or $el.ParameterName -eq 'ProcessName')) {
+                if ($null -ne $el.Argument) {
+                    [void]$values.Add($el.Argument)
+                    $i++
+                    continue
+                }
+                $i++
+                while ($i -lt $elements.Count -and
+                       $elements[$i] -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+                    [void]$values.Add($elements[$i])
+                    $i++
+                }
+                continue
+            }
+            $i++
+        }
+        if ($values.Count -ne 1) { return $false }
+        $arg = $values[0]
+        if ($arg -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+        return ($arg.Value -ceq 'Docker Desktop')
+    }
 }
 
 Describe 'Get-ClaudishMachineName (#345: probes must not arrive header-less)' {
@@ -1000,10 +1052,10 @@ Describe 'Static guardrails over scripts/' {
                 }, $true)) {
                     $name = $call.GetCommandName()
                     if (-not $name) { continue }
-                    if ($name -match '^(Restart-|Stop-)' -or $name -eq 'wsl.exe' -or $name -eq 'wsl' -or
+                    if ($name -match '^(Restart-|Stop-)' -or (Test-ForbiddenActuatorName $name) -or
                         $name -eq 'Invoke-ClaudishDrainedRestart' -or $name -eq 'Start-DockerEngine') {
                         # The one sanctioned exception: the consent-gated GUI kill.
-                        if ($name -eq 'Stop-Process' -and $call.Extent.Text -match 'Docker Desktop') { continue }
+                        if (Test-ZombieGuiKillAst $call) { continue }
                         $offenders += ('{0}:{1}:{2} {3}' -f (Split-Path $file -Leaf), $fn.Name, $call.Extent.StartLineNumber, $name)
                     }
                     $flags = $call.CommandElements |
@@ -1025,12 +1077,20 @@ Describe 'Static guardrails over scripts/' {
     It 'the zombie actuator detector actually detects (positive control)' {
         # Without this, deleting the zombie functions would make the guard above
         # pass for the wrong reason — same discipline as the wedge/preflight
-        # guards. Both offender shapes: a Stop-Service (forbidden outright) and
-        # a Stop-Process on anything but "Docker Desktop".
+        # guards. Four offender shapes, one per way the contract can break, each
+        # named after the review that found it: a Stop-Service (forbidden
+        # outright), a Stop-Process on anything but the GUI, **M6** a -Name list
+        # that names the GUI and the service together, and **M8** taskkill,
+        # which sat in NO forbidden set at all.
         $tokens = $null; $errs = $null
-        $bad = [System.Management.Automation.Language.Parser]::ParseInput(
-            'function Invoke-ZombieBad { Stop-Service com.docker.service -Force; Stop-Process -Name "com.docker.backend" }',
-            [ref]$tokens, [ref]$errs)
+        $bad = [System.Management.Automation.Language.Parser]::ParseInput(@'
+function Invoke-ZombieBad {
+    Stop-Service com.docker.service -Force
+    Stop-Process -Name "com.docker.backend"
+    Stop-Process -Name "Docker Desktop","com.docker.service"
+    taskkill /IM "Docker Desktop.exe" /F
+}
+'@, [ref]$tokens, [ref]$errs)
         $fn = $bad.FindAll({
             param($n)
             $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -1040,10 +1100,39 @@ Describe 'Static guardrails over scripts/' {
         $hits = @($fn.FindAll({
             param($n) $n -is [System.Management.Automation.Language.CommandAst]
         }, $true) | Where-Object {
-            ($_.GetCommandName() -match '^(Restart-|Stop-)') -and
-            -not ($_.GetCommandName() -eq 'Stop-Process' -and $_.Extent.Text -match 'Docker Desktop')
+            $n = $_.GetCommandName()
+            $n -and (($n -match '^(Restart-|Stop-)') -or (Test-ForbiddenActuatorName $n)) -and
+            -not (Test-ZombieGuiKillAst $_)
         })
-        $hits.Count | Should -Be 2
+        $hits.Count | Should -Be 4
+    }
+
+    It 'the sanctioned GUI kill is ONE bare value — an array or a second name is an offender' {
+        # The negative half of the pair above, and the exact reading of the
+        # review: `-Name` must carry exactly one argument, a bare string
+        # constant 'Docker Desktop'. A single-element array, a variable, or any
+        # second value is refused — the contract is "the GUI, alone".
+        $tokens = $null; $errs = $null
+        $src = @'
+function Invoke-ZombieShapes {
+    Stop-Process -Name "Docker Desktop"
+    Stop-Process -Name @("Docker Desktop")
+    Stop-Process -Name $procName
+    Stop-Process -Name "Docker Desktop","com.docker.service"
+    stop-process -Name 'Docker Desktop'
+}
+'@
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errs)
+        $fn = $ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -match 'Zombie'
+        }, $true)[0]
+        $calls = @($fn.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst]
+        }, $true))
+        $calls.Count | Should -Be 5
+        @($calls | Where-Object { Test-ZombieGuiKillAst $_ }).Count | Should -Be 2  # the two bare single-value forms
     }
 
     It 'AC1: no probe path names localhost' {
