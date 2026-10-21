@@ -35,7 +35,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 // runs — the same machine class as the e2e claude.exe shim fix (e19f0634).
 // process.execPath is the absolute path of the very binary running this suite.
 const BUN = process.execPath;
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,13 +100,21 @@ interface CapturedFrames {
 async function captureSessionFrames(opts: {
   shimArgs?: string[]; // extra args passed to fake-claudish via spawn
   timeoutMs?: number;
+  // Extra child env entries; an undefined value DELETES the inherited one
+  // (needed so the trace-off pin cannot be satisfied by the runner's own env).
+  extraEnv?: Record<string, string | undefined>;
 }): Promise<CapturedFrames> {
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    CLAUDISH_MCP_TOOLS: "all",
+    ...opts.extraEnv,
+  };
+  for (const [k, v] of Object.entries(opts.extraEnv ?? {})) {
+    if (v === undefined) delete childEnv[k];
+  }
   const proc: ChildProcess = spawn(BUN, ["run", SERVER_ENTRY, "--mcp"], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: {
-      ...process.env,
-      CLAUDISH_MCP_TOOLS: "all",
-    },
+    env: childEnv,
   });
 
   const captured: CapturedFrames = {
@@ -503,5 +511,69 @@ describe("MCP capability declaration", () => {
       expect(hasChannel).toBe(false);
     },
     15_000
+  );
+});
+
+// ─── #567: the trace is OFF by default and writes NOTHING when off ──────────
+//
+// docs/reference/channel-mode.md promises "Off by default, zero production
+// overhead" — unenforced before this pin. The OFF case sets
+// CLAUDISH_CHANNEL_TRACE_FILE anyway: the file mirror lives inside emit(),
+// which only runs from the wrapped paths (wrapStateChange returns the callback
+// UNCHANGED when the env var is off), so an always-on regression must fail on
+// "the file must not exist", not on "the runner had no env var set".
+describe("Channel trace gate (#567)", () => {
+  test(
+    "OFF (default): trace unset writes no trace file even when TRACE_FILE is set",
+    async () => {
+      const traceDir = mkdtempSync(join(tmpdir(), "claudish-trace-off-"));
+      const traceFile = join(traceDir, "channel-trace.log");
+      try {
+        const captured = await captureSessionFrames({
+          shimArgs: ["--lines", "3"],
+          extraEnv: {
+            CLAUDISH_CHANNEL_TRACE: undefined, // delete inherited, if any
+            CLAUDISH_CHANNEL_TRACE_FILE: traceFile,
+          },
+        });
+        // Positive control: a real session ran (frames flowed) — otherwise the
+        // OFF assertion would be vacuous (a dead child writes nothing either).
+        expect(captured.notifications.length).toBeGreaterThan(0);
+        // The pin: zero bytes written, not merely not-read — the path must not
+        // exist at all.
+        expect(existsSync(traceFile)).toBe(false);
+        // The stderr lane stayed clean too.
+        expect(captured.stderr).not.toContain("[channel-trace]");
+      } finally {
+        rmSync(traceDir, { recursive: true, force: true });
+      }
+    },
+    20_000
+  );
+
+  test(
+    "ON control: CLAUDISH_CHANNEL_TRACE=1 + TRACE_FILE writes a non-empty trace",
+    async () => {
+      const traceDir = mkdtempSync(join(tmpdir(), "claudish-trace-on-"));
+      const traceFile = join(traceDir, "channel-trace.log");
+      try {
+        const captured = await captureSessionFrames({
+          shimArgs: ["--lines", "3"],
+          extraEnv: {
+            CLAUDISH_CHANNEL_TRACE: "1",
+            CLAUDISH_CHANNEL_TRACE_FILE: traceFile,
+          },
+        });
+        expect(captured.notifications.length).toBeGreaterThan(0);
+        // The file mirror exists, is non-empty, and carries the trace prefix —
+        // proving the OFF case gates on a real mechanism, not a harness blind
+        // spot (same mutation discipline as the #534 shim pin).
+        expect(existsSync(traceFile)).toBe(true);
+        expect(statSync(traceFile).size).toBeGreaterThan(0);
+      } finally {
+        rmSync(traceDir, { recursive: true, force: true });
+      }
+    },
+    20_000
   );
 });
