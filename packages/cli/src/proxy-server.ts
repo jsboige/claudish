@@ -73,6 +73,7 @@ import {
   isWiringError,
   roleFromModelName,
   getFailoverRule,
+  machineArmBucket,
   classifyNominalBucket,
   providerBucketOf,
   resolveFailoverTargetForSession,
@@ -887,6 +888,22 @@ export async function createProxyServer(
     // No chain: a bare name with no routable provider is the native lane
     // (matches the isNative predicate of step 6 below).
     return providerBucketOf(target);
+  };
+
+  /**
+   * The ONE bucket an ingress request keys every failover decision on (#275):
+   * undefined when its role has no cascade; the `machine:<name>` bucket when
+   * the role is config-armed for the caller's X-Claudish-Machine
+   * (`role@machine` in CLAUDISH_FAILOVER_ACTIVE) — that machine's requests
+   * divert, with the notice, while every other machine stays on the nominal;
+   * else the nominal's real bucket.
+   */
+  const requestBucketOf = async (c: Context, requestedModel: string): Promise<string | undefined> => {
+    const role = roleFromModelName(requestedModel);
+    if (!role || !getFailoverRule(role)) return undefined;
+    return (
+      machineArmBucket(role, c.req.header("x-claudish-machine")) ?? (await nominalBucketOfModel(requestedModel))
+    );
   };
 
   /**
@@ -2036,7 +2053,25 @@ export async function createProxyServer(
   // Token counting
   app.post("/v1/messages/count_tokens", async (c) => {
     try {
-      const body = await c.req.json();
+      // #548 — same client-error terminal 400 as /v1/messages: c.req.json()
+      // throws a SyntaxError on empty / non-JSON input that the catch below
+      // maps to a retryable 500 (which relays count toward hub hysteresis).
+      // Answered before the freeze gate, handler resolution and any forward.
+      let body: any;
+      try {
+        body = await c.req.json();
+      } catch (parseErr) {
+        return c.json(
+          wrapAnthropicError(400, `Invalid request body: ${(parseErr as Error)?.message ?? parseErr}`, "invalid_request_error"),
+          400
+        );
+      }
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        return c.json(
+          wrapAnthropicError(400, "Invalid request body: expected a JSON object", "invalid_request_error"),
+          400
+        );
+      }
       // #306 review — same admission freeze as the serving routes: messages
       // are refused during the window, so counting for a message that can no
       // longer be admitted is the asymmetry po-2024 flagged. Same 503 +
@@ -2051,12 +2086,16 @@ export async function createProxyServer(
       }
       // #412 — same suppression as the serving routes: this resolution writes
       // the dwell pin too, and the keyless guard just below must see the
-      // handler the request would ACTUALLY get, not a swapped one.
+      // handler the request would ACTUALLY get, not a swapped one. Same bucket
+      // as the serving routes too (#552 review, B2): with `undefined` the
+      // resolution fell back to the nominal's bucket, so a machine-armed
+      // caller counted against the nominal instead of the model that answers,
+      // and the nominal landing deleted its session's dwell pin.
       const handler = await getHandlerForRequest(
         body.model,
         0,
         extractSessionKey(body),
-        undefined,
+        await requestBucketOf(c, body.model),
         undefined,
         keylessNativeRequest(c, body.model)
       );
@@ -2211,7 +2250,26 @@ export async function createProxyServer(
     try {
       // readRequestBody inflates a gzipped body (WAN external sidecar → hub);
       // identical to c.req.json() on the uncompressed LAN/direct path.
-      const body = await readRequestBody(c);
+      // #548 — an empty / non-JSON / non-object body is the CLIENT's error: a
+      // terminal 400, not a retryable 500 (Claude Code loops on "API error ·
+      // Retrying" against a 5xx, and a sidecar's local 500 would pollute the
+      // hub-500 signal the relays arm hysteresis on). Answered before the
+      // relay branch, handler selection and any upstream call.
+      let body: any;
+      try {
+        body = await readRequestBody(c);
+      } catch (parseErr) {
+        return c.json(
+          wrapAnthropicError(400, `Invalid request body: ${(parseErr as Error)?.message ?? parseErr}`, "invalid_request_error"),
+          400
+        );
+      }
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        return c.json(
+          wrapAnthropicError(400, "Invalid request body: expected a JSON object", "invalid_request_error"),
+          400
+        );
+      }
 
       // #306 — opt-in admission freeze, BEFORE the relay branch: the freeze
       // belongs to THIS container's restart, so a frozen admission must not
@@ -2291,8 +2349,7 @@ export async function createProxyServer(
       // notices — both must key on the same meter or a notice announces a
       // diversion the session never took.
       const requestRole = roleFromModelName(body.model);
-      const requestBucket =
-        requestRole && getFailoverRule(requestRole) ? await nominalBucketOfModel(body.model) : undefined;
+      const requestBucket = await requestBucketOf(c, body.model);
       // #412 — the SAME suppression as the cascade below: this resolution is
       // not a dry run (it writes the per-session dwell pin and decides the
       // billing-header strip), so letting it swap behind a keyless native
@@ -2352,7 +2409,26 @@ export async function createProxyServer(
   // translated ingress into the same pipeline. See CLAUDE.md.
   app.post("/v1/chat/completions", async (c) => {
     try {
-      const openaiBody = await readRequestBody(c);
+      // #548 — same client-error terminal 400 as /v1/messages, in this route's
+      // OpenAI error envelope: readRequestBody() throws a SyntaxError on
+      // empty / non-JSON input that the catch below maps to a retryable 500
+      // (which relays count toward hub hysteresis). Answered before the
+      // freeze gate, the relay branch and any upstream call.
+      let openaiBody: any;
+      try {
+        openaiBody = await readRequestBody(c);
+      } catch (parseErr) {
+        return c.json(
+          { error: { message: `Invalid request body: ${(parseErr as Error)?.message ?? parseErr}`, type: "invalid_request_error", param: null, code: null } },
+          400
+        );
+      }
+      if (openaiBody === null || typeof openaiBody !== "object" || Array.isArray(openaiBody)) {
+        return c.json(
+          { error: { message: "Invalid request body: expected a JSON object", type: "invalid_request_error", param: null, code: null } },
+          400
+        );
+      }
 
       // #306 — same admission freeze as /v1/messages, same placement before
       // the relay branch, for the same reason.
@@ -2412,10 +2488,7 @@ export async function createProxyServer(
 
       // #275: same one-bucket-per-request rule as /v1/messages (see there).
       const requestRole = roleFromModelName(anthropicBody.model);
-      const requestBucket =
-        requestRole && getFailoverRule(requestRole)
-          ? await nominalBucketOfModel(anthropicBody.model)
-          : undefined;
+      const requestBucket = await requestBucketOf(c, anthropicBody.model);
       // #412 — the OpenAI-compatible ingress resolves the handler for the same
       // two reasons as /v1/messages (log label + billing strip, plus the dwell
       // pin it writes as a side effect), so it carries the same suppression.

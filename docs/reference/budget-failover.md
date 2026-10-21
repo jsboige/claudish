@@ -21,8 +21,8 @@ The cluster runs on weekly-metered plans (Anthropic, MiniMax, Z.AI). When a plan
 | `CLAUDISH_FAILOVER_<ROLE>` | Routing target for the role. Any spec `getHandlerForRequest` accepts. |
 | `..._LABEL` | Human name used in the notice. Defaults to the target string. |
 | `..._DIRECTION` | `degraded` (default) · `improved` · `lateral`. Unset means degraded — never flatter the substitute. |
-| `..._NOTE` | Extra guidance appended to that role's notice line. |
-| `CLAUDISH_FAILOVER_ACTIVE` | Roles armed **now**, comma-separated, or `none`. Use to conserve a plan *before* it dies. |
+| `..._NOTE` | Extra guidance appended to that role's notice line — the condensation notice and the per-session stream notice alike. |
+| `CLAUDISH_FAILOVER_ACTIVE` | Roles armed **now**, comma-separated, or `none`. Use to conserve a plan *before* it dies. A `role@machine` piece (e.g. `haiku@myia-po-2027`) arms the role **only for requests whose `X-Claudish-Machine` names that machine** (case-insensitive); every other machine stays on the nominal. The route keys those requests on a `machine:<name>` bucket, so the cascade and the notices follow unchanged, and the per-session notice states the operator routing instead of an exhaustion. |
 | `CLAUDISH_FAILOVER_AUTO` | `1` = also arm on genuine upstream quota exhaustion. |
 
 **With nothing set, every code path is inert** — no routing change, no notice, zero added bytes. Configuring a target does **not** activate it; arming is separate and deliberate.
@@ -146,6 +146,16 @@ Each step tracks its own failure count plus last-failure timestamp in
 `stepFailures: Map<role, StepFailure[]>`. `stepTtlMs(count)` indexes
 `BACKOFF_MS = [10m, 30m, 1h, 4h, 24h]` (caps at 24h). A TTL-failed step is skipped by
 `resolveFailoverTarget` until its TTL elapses.
+
+**One rung per failure EPISODE, never per concurrent failure (#553).** The ladder is meant to grow
+with repeated episodes: a re-probe that fails after the bench elapsed. A mark that lands while the
+step's record still binds (TTL or known reset not yet elapsed — the step is already benched) on the
+same concrete comes from requests that were in flight before the bench and failed together. Such a
+mark refreshes `lastFailure` (and the other record fields) but keeps the count. Its `[Failover] step`
+line reads `count=N (same episode)`. Measured trigger, hub 20/10 00:19Z: `haiku[1]` (Kimi) went
+count 2 → 4, i.e. a 4 h bench, within one second, and the cascade paid the next steps for those
+hours. A mark on a different concrete (a `role:` step whose delegation moved, #331) is a new episode
+and escalates. Pins: `failover.test.ts` "#553: …" (4 mutations executed).
 
 **Reset-time dominance.** The backoff assumes the wall's duration is unknown. When it IS known —
 body-parsed, or declared via `..._RESET` — `StepFailure.resetAt` holds the step skipped until that
