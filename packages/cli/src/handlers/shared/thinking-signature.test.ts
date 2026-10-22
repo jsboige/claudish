@@ -133,11 +133,13 @@ describe("stripUnsignedThinkingBlocks", () => {
   });
 
   test("preserves the documented foreign 64-hex signature gap (MiniMax)", () => {
-    // A non-empty signature is preserved even when it is a foreign one: guessing
-    // which non-empty signatures are genuine is how real thinking gets deleted.
-    // This value never arrives here in practice — Anthropic-wire emission strips
-    // thinking via shouldFilterThinking(); the coupling is documented in the
-    // module header.
+    // A non-empty signature is preserved even when it is a foreign one: on the
+    // MiniMax path these 64-hex blocks ARE the model's own thinking (the dialect
+    // re-sends them via preserveThinkingBlock()), so guessing which non-empty
+    // signatures are genuine is how real thinking gets deleted. They do reach
+    // the client under the `forced` policy (composed-handler-minimax-thinking
+    // .test.ts:131) — the reason to keep them is what they mean on that wire.
+    // Stripping them on the NATIVE path is #597's separate, pinned change.
     const minimaxSignature = "7caa0d3cc2a449ac1cc68507504693f566245c7b5db3558f6041585e15a848f8";
     const messages = [
       {

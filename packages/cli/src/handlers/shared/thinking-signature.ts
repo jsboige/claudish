@@ -12,8 +12,10 @@
  * Anthropic-shaped `{ type: "thinking" }` blocks so Claude Code can render it —
  * but `openai-sse` has no signature to give them, so the client stores
  * `signature: ""`. While a session stays on a foreign provider that is
- * harmless: on the Anthropic wire, thinking is stripped at EMIT
- * (`shouldFilterThinking()` → `createAnthropicPassthroughStream`). The blocks
+ * harmless: at EMIT our own filter drops thinking under every policy except
+ * `forced` and `effort` (`shouldFilterThinking()` = `kind !== "forced" &&
+ * kind !== "effort"`), so the unsigned blocks are mostly not even echoed back.
+ * The blocks
  * only become poison when a LATER turn in the same session routes to a real
  * Anthropic model, because `NativeHandler` forwards the conversation verbatim —
  * which is the entire point of a native passthrough. One mixed-provider session
@@ -32,15 +34,29 @@
  * still will not accept. MiniMax does exactly that — a 64-hex digest, visible
  * as `7caa0d3cc2a449ac…` in `minimax-m25-turn1-thinking-text-tool.sse`.
  *
- * It never reaches the client: a foreign signature is stripped at emit, so it
- * is never stored in the conversation and can never come back here. The only
- * thinking blocks that survive to the client carry NO signature.
+ * That foreign signature CAN reach the client, and the fork's pins say so:
+ * thinking is not stripped unconditionally at emit — `shouldFilterThinking()`
+ * filters by policy kind (`kind !== "forced" && kind !== "effort"`), so a
+ * client that asked for thinking receives its `thinking_delta`s on every
+ * `anthropic-sse` path (`composed-handler-minimax-thinking.test.ts:95`), and
+ * under `forced` the block arrives WITH its signature — the client must be able
+ * to echo it back or the chain can never restart
+ * (`composed-handler-minimax-thinking.test.ts:131`). An earlier draft of this
+ * header claimed the opposite, imported from upstream `0e8f3b05`; that claim is
+ * false in this fork and was corrected in review (#596).
  *
- * The consequence worth remembering: if `shouldFilterThinking()` is ever
- * narrowed — scoped to a model list, say — foreign signatures start reaching
- * the client and this filter silently stops being sufficient. The two are
- * coupled through the wire, not through anything either file says. That is why
- * the MiniMax dialect overrides `shouldFilterThinking()` unconditionally.
+ * So why is a 64-hex digest left alone HERE? Because the same shape means two
+ * different things depending on the wire. On the MiniMax path those blocks are
+ * the model's own thinking, preserved and re-sent by the dialect
+ * (`preserveThinkingBlock()`); stripping them would delete real reasoning. On
+ * the NATIVE path such a block is worthless — Anthropic never signed it and it
+ * 400s the request — but removing it belongs to #597, with its own pins, not to
+ * a guess made inside a filter that cannot tell the two apart.
+ *
+ * The coupling that does hold: if `shouldFilterThinking()` is narrowed further,
+ * more thinking reaches the client and this absent-signature filter alone stops
+ * being sufficient to make a history native-safe. The two files are coupled
+ * through the wire, not through anything either file says.
  *
  * ─── Role scope ────────────────────────────────────────────────────────────
  *
