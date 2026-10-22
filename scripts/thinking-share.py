@@ -22,9 +22,15 @@ Reading rules (each one cost a wrong number once):
     first match reports 0.
   * `thinking_tokens` is a SUBSET of `output_tokens` (a breakdown of the same
     total), never an addition to it.
-  * A response without the field is EXCLUDED from the ratio, never counted as
-    zero: those are non-terminal writes or pre-breakdown files, and folding them
-    in at zero silently halves the share.
+  * A response without the field is EXCLUDED from the ratio — from BOTH the
+    numerator and the denominator — and reported separately as
+    `responses_without_field` / `output_tokens_excluded`. Folding those files
+    into the denominator at thinking=0 makes the share a silent LOWER BOUND
+    (caught by review on this script's first version: a fixture of
+    out=100/thk=50 plus out=100/without printed 25.0% where the covered
+    population is at 50.0%).
+  * The p50/p90 columns are over the covered population only — the same
+    population the share is computed on, never a mix.
   * The capture timestamp uses DASHES (`T06-18-15-927Z`), not colons: a
     `T06:18` pattern matches nothing and reads as a missing day.
   * `--day` is a filename prefix match, so it works on the live loose day and on
@@ -41,7 +47,10 @@ import re
 import statistics
 import sys
 
-DEFAULT_DIR = os.environ.get("CLAUDISH_CAPTURE_DIR_HOST", r"D:\claudish-captures")
+# Host-side default. The canonical pair is CLAUDISH_CAPTURE_HOST_DIR (host bind)
+# vs CLAUDISH_CAPTURE_DIR (in-container, see docs/settings-reference.md); a host
+# script reads the host one.
+DEFAULT_DIR = os.environ.get("CLAUDISH_CAPTURE_HOST_DIR", r"D:\claudish-captures")
 
 OUT_RX = re.compile(rb'"output_tokens":(\d+)')
 THK_RX = re.compile(rb'"thinking_tokens":(\d+)')
@@ -90,7 +99,11 @@ def main():
         return 2
 
     with_thk = [r for r in rows if r[2] is not None]
-    total_out = sum(r[1] for r in rows)
+    without = [r for r in rows if r[2] is None]
+    # The ratio is over the COVERED population only: responses that carry the
+    # field. The without-field files are reported separately — in the
+    # denominator they would read as thinking=0 and drag the share down.
+    total_out = sum(r[1] for r in with_thk)
     total_thk = sum(r[2] for r in with_thk)
     thk_out = [r[1] for r in with_thk]
     thk_vals = [r[2] for r in with_thk]
@@ -100,7 +113,9 @@ def main():
         "model_filter": args.model,
         "responses": len(rows),
         "responses_with_thinking_field": len(with_thk),
+        "responses_without_field": len(without),
         "output_tokens_total": total_out,
+        "output_tokens_excluded": sum(r[1] for r in without),
         "thinking_tokens_total": total_thk,
         "thinking_share_pct": round(100.0 * total_thk / max(1, total_out), 1),
         "thinking_p50": statistics.median(thk_vals) if thk_vals else None,
@@ -114,9 +129,11 @@ def main():
         return 0
 
     print(f"day={args.day} model={args.model or '*'} responses={result['responses']} "
-          f"with_thinking_field={result['responses_with_thinking_field']}")
-    print(f"output total={total_out} thinking total={total_thk} "
-          f"share={result['thinking_share_pct']}% of output")
+          f"with_thinking_field={result['responses_with_thinking_field']} "
+          f"without_field={result['responses_without_field']} "
+          f"(excluded output={result['output_tokens_excluded']})")
+    print(f"covered output total={total_out} thinking total={total_thk} "
+          f"share={result['thinking_share_pct']}% of covered output")
     if thk_vals:
         print(f"per-response thinking: p50={result['thinking_p50']} "
               f"p90={result['thinking_p90']} max={result['thinking_max']}")
