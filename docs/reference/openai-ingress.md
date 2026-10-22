@@ -80,13 +80,17 @@ ingress. Pins: `openai-request-to-anthropic.test.ts` (mapping matrix),
 
 **A reasoning model can spend the whole `max_tokens` budget before any text** (measured
 2026-10-22, RSM condensation probe): `/v1/chat/completions` with `model: "claude-sonnet-5-5"`
-served by the GLM lane at `max_tokens: 2000` returned an **empty `content` with
+served by the GLM lane at `max_tokens: 2000` returned **no text with
 `finish_reason: "length"`** after 25.6 s — `reasoning_content` is billed out of the same
 `max_tokens` as `content`, and the reasoning consumed it all before a text block started.
-A programmatic consumer that reads only `choices[0].message.content` sees an empty answer and
-no error. Mitigations: raise `max_tokens`, send `enable_thinking: false` / `reasoning_effort`
-controls (mapped per #435), or use `/v1/messages` and read the `text` blocks — thinking
-blocks arrive separately there.
+The shape differs by mode, and so does the consumer failure: **non-streaming renders
+`content: null`** (`anthropic-to-openai.ts`, `content.join("") || null` — a consumer calling
+`content.trim()` throws a TypeError instead of reading an empty string), while **streaming
+delivers `content: ""`** (the role seed is then the only content delta). Neither is an error
+the client can see. Mitigations: raise `max_tokens`, send `enable_thinking: false` /
+`reasoning_effort` controls (mapped per #435), or use `/v1/messages` — the budget is shared
+there too, so the text is not restored, but the exhaustion becomes *visible* (a `thinking`
+block plus `stop_reason: "max_tokens"`) instead of silent.
 
 **Never-hang holds on this path**: a malformed stream degrades to a single terminal chunk plus
 `[DONE]` rather than stalling the consumer.
