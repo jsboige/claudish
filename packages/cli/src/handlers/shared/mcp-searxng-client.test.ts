@@ -10,7 +10,11 @@
  */
 
 import { describe, test, expect, beforeEach, beforeAll, afterAll } from "bun:test";
-import { installLocalFetchShim } from "../../test-support/local-fetch-shim.js";
+import {
+  installLocalFetchShim,
+  internalResponseCacheOf,
+  rewrapInternalResponse,
+} from "../../test-support/local-fetch-shim.js";
 import {
   callMcpTool,
   mcpWebSearch,
@@ -160,6 +164,53 @@ describe("mcp-searxng-client", () => {
     const msg: any = await res.json();
     expect(msg.id).toBe(999);
     expect(msg.result?.content?.[0]?.text).toBe("mock search results");
+  });
+
+  test("the shim rewraps the CI-observed internal _Response shape (#593 pin)", async () => {
+    // Shape verbatim from run 39798841822: the internal object PASSES
+    // `instanceof Response` while its body methods throw "Expected a Response
+    // object, but received '_Response'", and it carries an own Symbol(cache) =
+    // [status, body-string, headers-object]. The first shipped shim gated on
+    // `instanceof` and let exactly this object through untouched — the
+    // fetch-path pin above is what caught it on the runner.
+    const internal: any = Object.create(Response.prototype);
+    const cacheSym = Symbol("cache");
+    // defineProperty throughout: Response.prototype's accessors are getter-only,
+    // so plain assignment throws ("Attempted to assign to readonly property").
+    Object.defineProperty(internal, cacheSym, {
+      value: [
+        200,
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 777,
+          result: { content: [{ type: "text", text: "synthetic" }] },
+        }),
+        { "Content-Type": "application/json" },
+      ],
+    });
+    Object.defineProperty(internal, "json", {
+      value: () =>
+        Promise.reject(new TypeError("Expected a Response object, but received '_Response'")),
+    });
+    Object.defineProperty(internal, "text", {
+      value: () =>
+        Promise.reject(new TypeError("Expected a Response object, but received '_Response'")),
+    });
+
+    // The trap the first shim fell into: identity passes, detection must not.
+    expect(internal instanceof Response).toBe(true);
+    expect(internalResponseCacheOf(internal)).toBeTruthy();
+
+    const rebuilt = rewrapInternalResponse(internal);
+    expect(rebuilt).not.toBe(internal);
+    expect(rebuilt instanceof Response).toBe(true);
+    expect(rebuilt.status).toBe(200);
+    const msg: any = await rebuilt.json();
+    expect(msg.id).toBe(777);
+    expect(msg.result?.content?.[0]?.text).toBe("synthetic");
+
+    // A spec Response carries no own symbols — the detector leaves it alone.
+    expect(internalResponseCacheOf(new Response("x"))).toBeNull();
   });
 
   test("JSON response → ok:true with text, sends Bearer auth", async () => {
