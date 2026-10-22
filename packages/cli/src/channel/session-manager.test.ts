@@ -174,6 +174,25 @@ describe("SessionManager", () => {
     manager.cancelSession(id);
   });
 
+  test("killing a session that never read its stdin surfaces no EPIPE (#570)", async () => {
+    // CI run 39618911322 (ubuntu): a child killed before consuming its stdin
+    // made the stdin write stream's destroy-time flush fail with EPIPE, and
+    // the unhandled stream error failed this suite (attributed to the
+    // listSessions test above). createSession's stdin error handler owns the
+    // write side; this pin replays the exact killing sequence.
+    const id = quickSession(manager, ["--sleep", "3"]);
+    manager.cancelSession(id);
+    await waitUntil(() => {
+      const info = manager.getSession(id);
+      return ["cancelled", "completed", "failed"].includes(info.status);
+    });
+    // Let the destroyed stdin stream run its error path inside this test —
+    // with the handler removed, the EPIPE surfaces as an unhandled error.
+    await new Promise((r) => setTimeout(r, 100));
+    const info = manager.getSession(id);
+    expect(["cancelled", "failed"]).toContain(info.status);
+  });
+
   test("listSessions excludes completed sessions when includeCompleted=false", async () => {
     const id = quickSession(manager);
     // Wait until the session completes
