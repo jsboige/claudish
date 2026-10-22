@@ -11,9 +11,12 @@ the terminal `message_delta` carries the breakdown:
              "cache_read_input_tokens":128,
              "output_tokens_details":{"thinking_tokens":945}}
 
-Measured 2026-10-22 on the MiniMax-M3.1-Flash lane: 50.4% of output tokens were
-thinking (2 329 019 / 4 616 802 over 4 404 responses, p50 259 tokens). That is
-the number any `CLAUDISH_MINIMAX_THINKING` effort decision has to move.
+Measured 2026-10-22 on the MiniMax-M3.1-Flash lane, covered population: 60.8% of
+output tokens were thinking (2 866 014 / 4 714 631 over 5 627 responses carrying
+the field; 1 195 without it, reported apart — #606 review). The first version's
+50.4% folded the uncovered files in at zero and was a lower bound. That share is
+the number any `CLAUDISH_MINIMAX_THINKING` effort decision has to move. Read it
+with its coverage: a share over few covered responses says little.
 
 Reading rules (each one cost a wrong number once):
 
