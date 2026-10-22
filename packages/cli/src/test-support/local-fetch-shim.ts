@@ -75,12 +75,16 @@ function rebuildFromCache(cache: unknown[]): Response {
   return new Response(body == null ? null : (body as BodyInit), init);
 }
 
-export function rewrapInternalResponse(res: any): Response {
+export async function rewrapInternalResponse(res: any): Promise<Response> {
   // Layer 1 — the own-cache triple (the runner's native shape).
   const cache = internalResponseCacheOf(res);
   if (cache) return rebuildFromCache(cache);
 
-  // Layer 2 — getter copy: no body methods called on the transited object.
+  // Layer 2 — buffered copy on healthy seats (no own cache symbol there):
+  // read the body ONCE via text() and rebuild. Never hand the original's
+  // live stream to the new Response — wiring a one-shot stream across the
+  // rewrap truncates under the caller's abort timing (measured: the #3388
+  // retry test, "JSON Parse error: Unexpected EOF" on win32).
   try {
     const headers: Record<string, string> = {};
     const h = res.headers;
@@ -89,7 +93,8 @@ export function rewrapInternalResponse(res: any): Response {
         headers[key] = value;
       });
     }
-    return new Response(res.body ?? null, {
+    const bodyText = await res.text();
+    return new Response(bodyText, {
       status: res.status,
       statusText: res.statusText,
       headers,
@@ -98,9 +103,8 @@ export function rewrapInternalResponse(res: any): Response {
     // layer 3
   }
 
-  // Layers 1-2 read getters only, so reaching here means the transited
-  // object's shape changed outright — surface it as a visible 599 rather
-  // than letting a class-identity error leak into the client under test.
+  // Layers 1-2 exhausted — surface it as a visible 599 rather than letting
+  // a class-identity error leak into the client under test.
   return new Response(null, {
     status: 599,
     statusText: "local-fetch-shim: unrewrappable response",

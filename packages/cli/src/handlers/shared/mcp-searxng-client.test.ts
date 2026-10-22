@@ -202,7 +202,7 @@ describe("mcp-searxng-client", () => {
     expect(internal instanceof Response).toBe(true);
     expect(internalResponseCacheOf(internal)).toBeTruthy();
 
-    const rebuilt = rewrapInternalResponse(internal);
+    const rebuilt = await rewrapInternalResponse(internal);
     expect(rebuilt).not.toBe(internal);
     expect(rebuilt instanceof Response).toBe(true);
     expect(rebuilt.status).toBe(200);
@@ -211,8 +211,9 @@ describe("mcp-searxng-client", () => {
     expect(msg.result?.content?.[0]?.text).toBe("synthetic");
 
     // A freshly constructed Response rewraps content-equivalently on every
-    // seat — via the cache triple on the runner, via getters elsewhere.
-    const plain = rewrapInternalResponse(new Response("plain-body", { status: 201 }));
+    // seat — via the cache triple on the runner, buffered via text()
+    // elsewhere.
+    const plain = await rewrapInternalResponse(new Response("plain-body", { status: 201 }));
     expect(plain.status).toBe(201);
     expect(await plain.text()).toBe("plain-body");
   });
