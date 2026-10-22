@@ -193,6 +193,31 @@ describe("SessionManager", () => {
     expect(["cancelled", "failed"]).toContain(info.status);
   });
 
+  test("the stdin write-side error handler is attached — deterministic pin (#570 CR)", () => {
+    // ai-01 CR 22/10: the race pin above does not discriminate on every
+    // seat — the detached-handler mutant survived 3/3 runs on ai-01's
+    // win32. An EventEmitter with NO "error" listener throws
+    // synchronously on emit("error"): reaching the live session's stdin
+    // and emitting both death shapes needs no timing and no platform luck.
+    // Detached handler => the emit itself throws => this pin is red.
+    const id = quickSession(manager, ["--sleep", "3"]);
+    const entry = (manager as any).sessions.get(id);
+    const stdin = entry.process.stdin as import("node:events").EventEmitter;
+    expect(stdin).toBeTruthy();
+
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    expect(() => stdin.emit("error", epipe)).not.toThrow(); // handler present
+
+    const eio = Object.assign(new Error("boom"), { code: "EIO" });
+    expect(() => stdin.emit("error", eio)).not.toThrow();
+    // EIO is not EPIPE: it lands in the session's stderr record
+    expect(String(entry.stderr)).toContain("stdin write error: boom");
+    // EPIPE is swallowed by the handler's early return, never logged
+    expect(String(entry.stderr)).not.toContain("write EPIPE");
+
+    manager.cancelSession(id);
+  });
+
   test("listSessions excludes completed sessions when includeCompleted=false", async () => {
     const id = quickSession(manager);
     // Wait until the session completes
