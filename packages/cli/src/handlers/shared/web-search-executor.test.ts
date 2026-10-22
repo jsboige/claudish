@@ -8,13 +8,21 @@
  * header — LAN deployments with a credless URL stay byte-identical.
  */
 
-import { describe, test, expect, afterEach } from "bun:test";
+import { describe, test, expect, afterEach, afterAll } from "bun:test";
+import { installLocalFetchShim } from "../../test-support/local-fetch-shim.js";
 import {
   searxngConfig,
   executeWebSearch,
   searxngLatencyStats,
   _resetSearxngTelemetry,
 } from "./web-search-executor.js";
+
+// #593: same-process Bun.serve mocks answering with `new Response(...)`
+// hand bun 1.4.0/linux fetchers an internal _Response whose body methods
+// throw — the "401 despite creds" test went red on CI ubuntu for that
+// reason alone. The shim normalizes local fetches to spec Responses.
+const uninstallFetchShim = installLocalFetchShim();
+afterAll(() => uninstallFetchShim());
 
 const ORIGINAL_URL = process.env.SEARXNG_URL;
 const ORIGINAL_MCP = process.env.SEARXNG_MCP_URL;

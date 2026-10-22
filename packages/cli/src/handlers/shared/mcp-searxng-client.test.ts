@@ -9,7 +9,8 @@
  * mode resolves to { ok: false, error }.
  */
 
-import { describe, test, expect, beforeEach, afterAll } from "bun:test";
+import { describe, test, expect, beforeEach, beforeAll, afterAll } from "bun:test";
+import { installLocalFetchShim } from "../../test-support/local-fetch-shim.js";
 import {
   callMcpTool,
   mcpWebSearch,
@@ -17,6 +18,12 @@ import {
   isMcpSearxngAvailable,
   _resetMcpClientState,
 } from "./mcp-searxng-client.js";
+
+// #593: bun 1.4.0/linux hands an in-process fetch to this file's Bun.serve
+// the handler's own `new Response(...)` object (internal _Response) whose
+// .json()/.text() reject — a property of the test environment, not of the
+// client. The shim normalizes every local fetch into a spec Response.
+const uninstallFetchShim = installLocalFetchShim();
 
 type MockBehavior =
   | "json-ok"
@@ -120,6 +127,7 @@ beforeEach(() => {
 
 afterAll(() => {
   server.stop(true);
+  uninstallFetchShim();
   delete process.env.SEARXNG_MCP_URL;
   delete process.env.MCP_AUTH;
 });
@@ -131,6 +139,27 @@ describe("mcp-searxng-client", () => {
     const res = await callMcpTool("searxng_web_search", { query: "x" }, 1000);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain("not configured");
+  });
+
+  test("local fetch of a new Response mock is a spec Response (#593 pin)", async () => {
+    // Mechanism pin for the #593 class: on bun 1.4.0/linux an in-process
+    // fetch returns the handler's internal _Response (body methods throw
+    // "Failed to parse JSON" / "Expected a Response object"). With the shim
+    // installed the response MUST be instanceof the global Response and its
+    // body MUST parse. This is the mutation detector for the shim: remove
+    // the install above and this goes red on CI ubuntu (1.4.0/linux). On
+    // seats whose fetch already returns spec Responses (win32 1.3.14/1.4.0)
+    // it is green with or without the shim — the linux half rides CI.
+    const res = await fetch(MOCK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 999, method: "tools/call", params: {} }),
+    });
+    expect(res instanceof Response).toBe(true);
+    expect(res.status).toBe(200);
+    const msg: any = await res.json();
+    expect(msg.id).toBe(999);
+    expect(msg.result?.content?.[0]?.text).toBe("mock search results");
   });
 
   test("JSON response → ok:true with text, sends Bearer auth", async () => {
