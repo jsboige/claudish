@@ -48,6 +48,36 @@ COMPARED = (
     "model",
     "outputStyle",
 )
+# Model display labels (user mandate 22/10). The picker row shows
+# ANTHROPIC_DEFAULT_<ROLE>_MODEL_NAME; when that variable is missing Claude Code
+# falls back to the built-in Anthropic name for the pinned id -- the
+# "Sonnet 5.5 (1M)" a seat displayed while actually serving glm. Canon (coordinator
+# ACK, 22/10): _NAME "Rôle <Role>" plus a generic _DESCRIPTION naming no concrete
+# model, for the 4 roles; a custom option exists only where a lane uses it
+# (myia-po-2025, Sol).
+ROLES = ("opus", "sonnet", "haiku", "fable")
+# Opus is native-Anthropic in nominal, so its canon description legitimately says
+# "Anthropic"; the other roles are cascade-served and must not carry Anthropic
+# marketing wording.
+NATIVE_NOMINAL_ROLES = ("opus",)
+CUSTOM_OPTION_MACHINES = ("myia-po-2025",)
+# A canon description starts with "Rôle " and may still mention "Anthropic natif"
+# (fable's canon wording says exactly that, to deny it); a description NOT in the
+# canon shape that names Anthropic is the marketing drift ("Anthropic Fable 5.1
+# (SOTA)", still live on seats as of 22/10).
+CANON_DESCRIPTION_PREFIX = "Rôle "
+
+LABEL_KEYS = tuple(
+    key
+    for role in ROLES
+    for key in (
+        "env.ANTHROPIC_DEFAULT_%s_MODEL_NAME" % role.upper(),
+        "env.ANTHROPIC_DEFAULT_%s_MODEL_DESCRIPTION" % role.upper(),
+    )
+) + (
+    "env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+    "env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+)
 
 
 def read_snapshot(path):
@@ -103,6 +133,60 @@ def age_hours(iso, now):
     return (now - then).total_seconds() / 3600
 
 
+def label_lines(harmonization):
+    """Printable inventory of the display-label keys. None of them is secret.
+
+    A key the snapshot does not carry is shown as the collector blind spot, not
+    skipped: until RSM publishes these names, absence must read as "invisible
+    to this instrument", never as compliance.
+    """
+    lines = []
+    for key in LABEL_KEYS:
+        value = harmonization.get(key)
+        if value is None:
+            lines.append("  %s: not published (collector blind spot)" % key)
+        else:
+            lines.append("  %s = %s" % (key, json.dumps(value, ensure_ascii=False)))
+    return lines
+
+
+def label_flags(harmonization, machine):
+    """Canon flags for the display labels. Fires live wherever the snapshot can
+    see the key; a role pinned but with no published _NAME is the exact
+    "Sonnet 5.5 (1M)" fallback class.
+    """
+    flags = []
+    for role in ROLES:
+        upper = role.upper()
+        name_key = "env.ANTHROPIC_DEFAULT_%s_MODEL_NAME" % upper
+        desc_key = "env.ANTHROPIC_DEFAULT_%s_MODEL_DESCRIPTION" % upper
+        pinned = harmonization.get("env.ANTHROPIC_DEFAULT_%s_MODEL" % upper)
+        if pinned is not None and not harmonization.get(name_key):
+            flags.append(
+                "role %s: pinned to %s with no published _MODEL_NAME -- the picker "
+                "falls back to the built-in Anthropic name (the \"Sonnet 5.5 (1M)\" class)"
+                % (role, json.dumps(pinned))
+            )
+        if role not in NATIVE_NOMINAL_ROLES:
+            description = harmonization.get(desc_key)
+            if (
+                isinstance(description, str)
+                and "anthropic" in description.lower()
+                and not description.startswith(CANON_DESCRIPTION_PREFIX)
+            ):
+                flags.append(
+                    "role %s: description names Anthropic on a cascade-served role: %s"
+                    % (role, json.dumps(description, ensure_ascii=False))
+                )
+    option = harmonization.get("env.ANTHROPIC_CUSTOM_MODEL_OPTION")
+    if option and machine not in CUSTOM_OPTION_MACHINES:
+        flags.append(
+            "custom option %s outside canon machines %s"
+            % (json.dumps(option, ensure_ascii=False), CUSTOM_OPTION_MACHINES)
+        )
+    return flags
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--shared", default=os.environ.get("ROOSYNC_SHARED_PATH", ""))
@@ -138,6 +222,9 @@ def main():
             actual = harmonization.get(key)
             if actual != expected:
                 flags.append(f"{machine}: {key} = {json.dumps(actual)} off canon (expected {json.dumps(expected)})")
+        for line in label_lines(harmonization):
+            print(line)
+        flags.extend("%s: %s" % (machine, flag) for flag in label_flags(harmonization, machine))
         masked = snap.get("maskedEnvKeys", {})
         for key, marker in sorted(masked.items()):
             state = presence(marker)
