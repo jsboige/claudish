@@ -862,6 +862,85 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
   }, 30_000);
 });
 
+// ─── #598 — a walk into a CONNECTION-DEAD step advances once ──────────────────
+//
+// RED ON PURPOSE until the #598 fix lands (the code deliberately follows
+// #609): these pins state the DESIRED behavior, not today's. Measured driver
+// (2026-10-22, hub, 194/194 sonnet walks): the site-wide egress/DNS outage
+// killed the nominal with a connect-class failure (#298 A synthesizes HTTP
+// 400 connection_error), the walk fired, and its step 0 (same z.ai family,
+// same dead egress) died connect-class too — transport failures deliberately
+// write no state (#299 B), so the walk's firstServable kept re-picking step 0
+// and step 1 (qwen, alive on its own egress) was NEVER tried: the original
+// 400 surfaced 194 times while a servable step sat one position deeper.
+//
+//  - W30: a walk step that dies CONNECTION-class advances ONCE to the next
+//    servable step, same request — RED today (the original surfaces, W2
+//    semantics: one walk attempt, bounded);
+//  - W31: a walk step that dies QUOTA-class (402 plan wall) does NOT
+//    advance — that is state, not transport; GREEN today and it must STAY
+//    green (the guard against widening the advance to every refusal);
+//  - W32: every walkable step dead connection-class → at most ONE advance,
+//    then the ORIGINAL error surfaces unchanged, still zero state — RED
+//    today only on `calls.s1`; the surfaced status and the zero-state pins
+//    are already today's behavior.
+// NOT proposed (issue #598): writing plan state on a transport failure, or
+// an unbounded walk — the one-advance bound and the W15 budget pin hold.
+describe("#598 — a walk into a connection-dead step advances once (RED until the fix)", () => {
+  test("W30: walk step 0 dies connection_error → step 1 serves in the SAME request", async () => {
+    await spin();
+    resetWalk();
+    // The nominal's egress died (#298 A shape) AND the walk's step 0 sits on
+    // the same dead egress; step 1 draws on a different one and is alive.
+    endpointStatus.nm = 400;
+    endpointStatus.s0 = 400;
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200); // RED today: 400 (the original) surfaces
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(1); // the dead nominal, paid once
+    expect(calls.s0).toBe(1); // the walk's first attempt — paid, and dead
+    expect(calls.s1).toBe(1); // RED today: 0 — the advance never fires
+    // The advance is NOT a plan event: still zero state on every plane.
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
+  }, 30_000);
+
+  test("W31 control: walk step 0 dies QUOTA (402 plan wall) → NO advance, original surfaces", async () => {
+    await spin();
+    resetWalk();
+    // Nominal overloads (529, the stub default); step 0 answers a plan wall.
+    // A quota refusal is STATE, not transport — the advance must stay
+    // connection-class-only, or it re-buys the exact behavior #299 B
+    // rejected (walking past state the resolver owns).
+    endpointStatus.s0 = 402;
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(529); // the original overload, never the step's wall
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(0); // GREEN today, must STAY green after the fix
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
+  }, 30_000);
+
+  test("W32: EVERY walkable step dead connection-class → ONE advance, then the original, zero state", async () => {
+    await spin();
+    resetWalk();
+    endpointStatus.nm = 400;
+    endpointStatus.s0 = 400;
+    endpointStatus.s1 = 400; // the advance target dies too
+    const r1 = await postMessage("claude-sonnet-5");
+    // The ORIGINAL connection error surfaces — unchanged, never the step's.
+    expect(r1.status).toBe(400);
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(1); // RED today: 0 — the one advance, paid once
+    expect(calls.native).toBe(0); // never deeper, never native
+    // Bounded: one advance per request, and still no state on any plane.
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
+  }, 30_000);
+});
+
 // ─── predicate pins ───────────────────────────────────────────────────────────
 //
 // The 503 and 429-with-overloaded-body clauses CANNOT be produced at route
