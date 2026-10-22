@@ -115,6 +115,23 @@ def test_empty_name_string_is_the_same_fallback():
     assert "role haiku" in flags, flags
 
 
+def test_absent_name_is_not_flagged_while_the_collector_is_blind():
+    """No snapshot carries a label key: an absent _NAME is unverifiable, not a
+    violation (the first live run printed 32 such flags, 4 roles x 8 seats)."""
+    harmonization = {"env.ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5[1m]"}
+    assert smx.label_flags(harmonization, "myia-po-2023", names_visible=False) == []
+
+
+def test_empty_name_is_flagged_even_while_the_collector_is_blind():
+    """A present-but-empty _NAME was seen by the snapshot: still flagged."""
+    harmonization = {
+        "env.ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5[1m]",
+        "env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "",
+    }
+    flags = _joined(smx.label_flags(harmonization, "myia-po-2023", names_visible=False))
+    assert "role haiku" in flags, flags
+
+
 def test_unpinned_role_without_name_stays_silent():
     """No pinned model id, no name: nothing displayed for that role, no flag."""
     flags = smx.label_flags({}, "myia-po-2023")

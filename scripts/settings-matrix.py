@@ -150,10 +150,15 @@ def label_lines(harmonization):
     return lines
 
 
-def label_flags(harmonization, machine):
+def label_flags(harmonization, machine, names_visible=True):
     """Canon flags for the display labels. Fires live wherever the snapshot can
     see the key; a role pinned but with no published _NAME is the exact
     "Sonnet 5.5 (1M)" fallback class.
+
+    `names_visible=False` means no snapshot of the run carries any label key:
+    the collector does not publish them, so an ABSENT _NAME says nothing about
+    the seat and is not flagged here (main() prints one fleet line instead). A
+    present-but-empty _NAME is still flagged -- the snapshot did see that one.
     """
     flags = []
     for role in ROLES:
@@ -161,10 +166,14 @@ def label_flags(harmonization, machine):
         name_key = "env.ANTHROPIC_DEFAULT_%s_MODEL_NAME" % upper
         desc_key = "env.ANTHROPIC_DEFAULT_%s_MODEL_DESCRIPTION" % upper
         pinned = harmonization.get("env.ANTHROPIC_DEFAULT_%s_MODEL" % upper)
-        if pinned is not None and not harmonization.get(name_key):
+        if (
+            pinned is not None
+            and not harmonization.get(name_key)
+            and (names_visible or name_key in harmonization)
+        ):
             flags.append(
-                "role %s: pinned to %s with no published _MODEL_NAME -- the picker "
-                "falls back to the built-in Anthropic name (the \"Sonnet 5.5 (1M)\" class)"
+                "role %s: pinned to %s with no published _MODEL_NAME -- a seat without "
+                "one shows the built-in Anthropic name (the \"Sonnet 5.5 (1M)\" class)"
                 % (role, json.dumps(pinned))
             )
         if role not in NATIVE_NOMINAL_ROLES:
@@ -198,8 +207,21 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
     flags, seen = [], {key: {} for key in COMPARED}
+    snaps = {machine: latest_snapshot(args.shared, machine) for machine in args.machines}
+    # Until the collector publishes the label keys, every pinned role reads as
+    # name-less on every seat: 4 flags x 8 machines carrying no information,
+    # burying the flags that do (measured on the first run, 22/10). One fleet
+    # line instead, until any snapshot carries a label key.
+    names_visible = any(
+        key in snap.get("harmonization", {}) for snap in snaps.values() if snap for key in LABEL_KEYS
+    )
+    if not names_visible:
+        flags.append(
+            "label keys published by no snapshot (collector blind spot) -- picker-fallback "
+            "check suspended fleet-wide, an absent _MODEL_NAME is unverifiable"
+        )
     for machine in args.machines:
-        snap = latest_snapshot(args.shared, machine)
+        snap = snaps[machine]
         print(f"=== {machine}")
         if not snap:
             print("  NOT COVERED: no claude-settings snapshot published")
@@ -224,7 +246,9 @@ def main():
                 flags.append(f"{machine}: {key} = {json.dumps(actual)} off canon (expected {json.dumps(expected)})")
         for line in label_lines(harmonization):
             print(line)
-        flags.extend("%s: %s" % (machine, flag) for flag in label_flags(harmonization, machine))
+        flags.extend(
+            "%s: %s" % (machine, flag) for flag in label_flags(harmonization, machine, names_visible)
+        )
         masked = snap.get("maskedEnvKeys", {})
         for key, marker in sorted(masked.items()):
             state = presence(marker)
