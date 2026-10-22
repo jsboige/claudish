@@ -317,7 +317,7 @@ beforeEach(() => {
         line.includes("[Failover]") ||
         line.includes("[StepBusy]") ||
         line.includes("[ContextGuard]") ||
-line.includes("[ContextAdmission]") ||
+        line.includes("[ContextAdmission]") ||
         line.includes("[MediaCap]") // #575
       ) {
         markerLog.push(line);
@@ -332,7 +332,7 @@ line.includes("[ContextAdmission]") ||
         line.includes("[Failover]") ||
         line.includes("[StepBusy]") ||
         line.includes("[ContextGuard]") ||
-line.includes("[ContextAdmission]") ||
+        line.includes("[ContextAdmission]") ||
         line.includes("[MediaCap]") // #575
       ) {
         markerLog.push(line);
