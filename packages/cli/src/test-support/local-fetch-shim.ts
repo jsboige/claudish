@@ -1,41 +1,48 @@
 /**
  * Normalize same-process Bun.serve mock responses across seats (#593).
  *
- * MEASURED on the ubuntu-24.04 runner (bun 1.4.0, run 39798841822): a fetch()
- * aimed at a Bun.serve running in the SAME process can return bun's internal
- * `_Response` — the handler's own `new Response(...)` object. That object
- * PASSES `instanceof Response` (the pin's instanceof assertion was green while
- * `res.json()` rejected "Expected a Response object, but received '_Response'")
- * and carries an own `Symbol(cache)` holding `[status, body-as-string,
- * plain-headers]`. Its getters work; its body methods throw.
+ * MEASURED, three CI runs deep:
  *
- * NOT reproducible everywhere: bun 1.4.0 on WSL2 linux returns clean spec
- * Responses for the same code (no own symbols, `json()` OK — checked as a
- * plain script and under `bun test`, on `localhost` and `127.0.0.1`). The
- * trigger is runner-specific and unidentified, so detection here is by SHAPE,
- * never by platform or `instanceof` — the first version of this shim gated on
- * `instanceof Response`, which made it a no-op on exactly the seat it targeted.
+ * 1. On the ubuntu-24.04 runner (bun 1.4.0), a fetch() aimed at a Bun.serve
+ *    in the SAME process returns the handler's own Response object. That
+ *    object PASSES `instanceof Response` (identity assert green) and its
+ *    getters work — but its body methods THROW: `.json()` fails with
+ *    "Expected a Response object, but received '_Response'" /
+ *    "Failed to parse JSON". First shim gated the rewrap on
+ *    `!(res instanceof Response)` → no-op on exactly that seat (run
+ *    39798841822).
+ * 2. On the SAME runner, EVERY constructed Response carries an own
+ *    `Symbol(cache)` holding `[status, body, headers]` — `new Response("x")`
+ *    built in test code included (run 39841666124: the uniqueness assert
+ *    received the triple). The cache marker is universal there and cannot
+ *    discriminate "internal". On win32/WSL seats no Response carries any own
+ *    symbol at all. Second shim gated on the marker → still a no-op there.
+ * 3. What the transit breaks is the BODY METHODS, not construction: freshly
+ *    constructed Responses never sent through fetch work fine on the same
+ *    runner (the broad suite is green on constructed Responses everywhere
+ *    else).
  *
- * A spec Response has NO own symbols (measured win32 + WSL), so the own
- * `Symbol(cache)` triple is an unambiguous internal marker:
- *   1. own symbol (name containing "cache") holding `[status, body, headers]`
- *      — rebuild a global Response from those values, calling NOTHING on the
- *      internal object;
- *   2. getter copy — `res.body` / `res.headers` / `res.status` getters into a
- *      new Response (for an internal object whose cache is not an own symbol);
+ * So the shim REWRAPS UNCONDITIONALLY: every result of a local fetch becomes
+ * a FRESH Response that never transited the serve path —
+ *   1. own `Symbol(cache)` triple `[status, body, headers]` (the runner's
+ *      native shape) rebuilds without calling anything on the object;
+ *   2. getter copy — `res.body` / `res.headers` / `res.status` into a new
+ *      Response (healthy seats, where layer 1 finds no cache);
  *   3. a visible 599 fallback if the shape changed outright.
  *
- * Inert wherever fetch already returns spec Responses (win32, WSL, real
- * networks): no own cache symbol → layer-0 pass-through, byte-identical.
+ * The rebuilt object is content-equivalent (status, body, headers verbatim),
+ * so healthy seats (win32, WSL, real networks) behave identically — they just
+ * pay one extra Response construction per local fetch in these test files.
  */
 
 type Uninstall = () => void;
 
 /**
- * The internal marker: an OWN symbol whose name contains "cache" and whose
- * value is `[status:number, body, headers?]`. `Symbol(getResponseCache)` (a
- * function on the same object) is skipped by the Array.isArray check.
- * Returns null for every spec Response — they carry no own symbols.
+ * Read the own `Symbol(cache)` triple `[status, body, headers?]` if present.
+ * NOT a discriminator: on the ubuntu runner every Response carries it
+ * (measured, run 39841666124); on win32/WSL none does.
+ * `Symbol(getResponseCache)` (function-valued) is skipped by the
+ * Array.isArray check.
  */
 export function internalResponseCacheOf(res: unknown): unknown[] | null {
   if (typeof res !== "object" || res === null) return null;
@@ -53,7 +60,7 @@ export function internalResponseCacheOf(res: unknown): unknown[] | null {
         return v;
       }
     } catch {
-      // unreadable symbol — not the marker
+      // unreadable symbol — not the cache
     }
   }
   return null;
@@ -65,15 +72,15 @@ function rebuildFromCache(cache: unknown[]): Response {
   if (headers && typeof headers === "object" && !Array.isArray(headers)) {
     init.headers = headers as Record<string, string>;
   }
-  return new Response(body == null ? null : String(body), init);
+  return new Response(body == null ? null : (body as BodyInit), init);
 }
 
 export function rewrapInternalResponse(res: any): Response {
-  // Layer 1 — the own-cache triple (the runner's actual shape).
+  // Layer 1 — the own-cache triple (the runner's native shape).
   const cache = internalResponseCacheOf(res);
   if (cache) return rebuildFromCache(cache);
 
-  // Layer 2 — getter copy: no body methods called on the internal object.
+  // Layer 2 — getter copy: no body methods called on the transited object.
   try {
     const headers: Record<string, string> = {};
     const h = res.headers;
@@ -91,18 +98,18 @@ export function rewrapInternalResponse(res: any): Response {
     // layer 3
   }
 
-  // Layers 1-2 read getters only, so reaching here means the internal
+  // Layers 1-2 read getters only, so reaching here means the transited
   // object's shape changed outright — surface it as a visible 599 rather
   // than letting a class-identity error leak into the client under test.
   return new Response(null, {
     status: 599,
-    statusText: "local-fetch-shim: unrewrappable internal response",
+    statusText: "local-fetch-shim: unrewrappable response",
   });
 }
 
 /**
  * Install the normalizing fetch wrapper. Returns the uninstall function.
- * Install once per test file (beforeAll/imports), uninstall in afterAll.
+ * Install once per test file (imports/beforeAll), uninstall in afterAll.
  */
 export function installLocalFetchShim(): Uninstall {
   const raw = globalThis.fetch;
@@ -110,12 +117,11 @@ export function installLocalFetchShim(): Uninstall {
 
   const wrapped = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const res = await raw(input, init);
-    // Internal marker FIRST: the runner's _Response passes `instanceof`, so
-    // the identity check alone cannot be the gate (that was the first shim's
-    // defect — measured, run 39798841822).
-    if (internalResponseCacheOf(res)) return rewrapInternalResponse(res);
-    if (res instanceof Response) return res; // spec Response — untouched
-    return rewrapInternalResponse(res); // foreign object: getters, else 599
+    // Unconditional: the transit through in-process fetch is what breaks the
+    // body methods on the runner, and no marker discriminates there (every
+    // constructed Response carries Symbol(cache) on that seat). A fresh
+    // Response that never transited works everywhere.
+    return rewrapInternalResponse(res);
   };
   globalThis.fetch = wrapped as typeof fetch;
 

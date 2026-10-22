@@ -166,13 +166,14 @@ describe("mcp-searxng-client", () => {
     expect(msg.result?.content?.[0]?.text).toBe("mock search results");
   });
 
-  test("the shim rewraps the CI-observed internal _Response shape (#593 pin)", async () => {
-    // Shape verbatim from run 39798841822: the internal object PASSES
+  test("the shim rewraps any local response — transit-shaped or freshly constructed (#593 pin)", async () => {
+    // Shape verbatim from run 39798841822: the transit object PASSES
     // `instanceof Response` while its body methods throw "Expected a Response
     // object, but received '_Response'", and it carries an own Symbol(cache) =
-    // [status, body-string, headers-object]. The first shipped shim gated on
-    // `instanceof` and let exactly this object through untouched — the
-    // fetch-path pin above is what caught it on the runner.
+    // [status, body-string, headers-object]. Both earlier shims gated on a
+    // discriminator (instanceof, then the marker) and each was falsified by
+    // the runner — run 39841666124 showed EVERY constructed Response carries
+    // Symbol(cache) there, so the cache is a rebuild SOURCE, never a gate.
     const internal: any = Object.create(Response.prototype);
     const cacheSym = Symbol("cache");
     // defineProperty throughout: Response.prototype's accessors are getter-only,
@@ -197,7 +198,7 @@ describe("mcp-searxng-client", () => {
         Promise.reject(new TypeError("Expected a Response object, but received '_Response'")),
     });
 
-    // The trap the first shim fell into: identity passes, detection must not.
+    // The trap the first shim fell into: identity passes, the rewrap must not care.
     expect(internal instanceof Response).toBe(true);
     expect(internalResponseCacheOf(internal)).toBeTruthy();
 
@@ -209,8 +210,11 @@ describe("mcp-searxng-client", () => {
     expect(msg.id).toBe(777);
     expect(msg.result?.content?.[0]?.text).toBe("synthetic");
 
-    // A spec Response carries no own symbols — the detector leaves it alone.
-    expect(internalResponseCacheOf(new Response("x"))).toBeNull();
+    // A freshly constructed Response rewraps content-equivalently on every
+    // seat — via the cache triple on the runner, via getters elsewhere.
+    const plain = rewrapInternalResponse(new Response("plain-body", { status: 201 }));
+    expect(plain.status).toBe(201);
+    expect(await plain.text()).toBe("plain-body");
   });
 
   test("JSON response → ok:true with text, sends Bearer auth", async () => {
