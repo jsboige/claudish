@@ -1508,36 +1508,41 @@ Describe 'Test-ClaudishRestartWasNoOp' {
     # `docker compose up -d`, compose returned 0 without replacing the
     # container (bind-mount-only change), and the drain wrote OUTCOME success
     # while the old config was still loaded.
+    #
+    # CLOCK-FREE (review 2026-10-22): the verdict compares StartedAt read
+    # immediately before the verb with StartedAt read immediately after — both
+    # from the Docker daemon's clock. No host clock, no tolerance window, no
+    # time-zone conversion: a WSL2 VM clock lagging the host can no longer make
+    # a genuine restart read as a no-op.
 
-    BeforeAll {
-        $script:Ref = [datetime]::SpecifyKind([datetime]'2026-10-22T01:27:56', [System.DateTimeKind]::Utc)
+    It 'an untouched container (StartedAt equal before and after) is a no-op' {
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw '2026-10-21T16:21:54.297089524Z' -StartedAtAfterRaw '2026-10-21T16:21:54.297089524Z' | Should -BeTrue
     }
 
-    It 'flags a StartedAt older than the gesture' {
-        Test-ClaudishRestartWasNoOp -StartedAtRaw '2026-10-21T16:21:54.297089524Z' -ReferenceUtc $script:Ref | Should -BeTrue
+    It 'a restarted container (StartedAt differs) is not a no-op, nanoseconds and all' {
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw '2026-10-21T16:21:54.297089524Z' -StartedAtAfterRaw '2026-10-22T01:27:58.912677448Z' | Should -BeFalse
     }
 
-    It 'accepts a StartedAt at the gesture, nanoseconds and all' {
-        Test-ClaudishRestartWasNoOp -StartedAtRaw '2026-10-22T01:27:58.912677448Z' -ReferenceUtc $script:Ref | Should -BeFalse
+    It 'a restart whose after-reading looks OLDER than wall-clock time is still a restart (VM skew)' {
+        # The case the clock-free verdict exists for: Docker Desktop's WSL2 VM
+        # clock can lag the host after a sleep. A genuine restart can then
+        # stamp a StartedAt that looks "older than now" — equality with the
+        # BEFORE reading is the only honest discriminant.
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw '2026-10-22T01:20:00.000000000Z' -StartedAtAfterRaw '2026-10-22T01:15:00.000000000Z' | Should -BeFalse
     }
 
-    It 'accepts a StartedAt within the tolerance window' {
-        Test-ClaudishRestartWasNoOp -StartedAtRaw '2026-10-22T01:27:20.000000000Z' -ReferenceUtc $script:Ref -ToleranceSec 60 | Should -BeFalse
+    It 'compares at second granularity (fractional-part spelling cannot fake a restart)' {
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw '2026-10-21T16:21:54.297089524Z' -StartedAtAfterRaw '2026-10-21T16:21:54.000000000Z' | Should -BeTrue
     }
 
-    It 'returns $null for unreadable instrument output rather than inventing a verdict' {
-        Test-ClaudishRestartWasNoOp -StartedAtRaw 'true' -ReferenceUtc $script:Ref | Should -BeNullOrEmpty
-        Test-ClaudishRestartWasNoOp -StartedAtRaw '' -ReferenceUtc $script:Ref | Should -BeNullOrEmpty
+    It 'returns $null when EITHER side is unreadable rather than inventing a verdict' {
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw 'true' -StartedAtAfterRaw '2026-10-22T01:27:58.000000000Z' | Should -BeNullOrEmpty
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw '2026-10-21T16:21:54.000000000Z' -StartedAtAfterRaw 'true' | Should -BeNullOrEmpty
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw '' -StartedAtAfterRaw '2026-10-22T01:27:58.000000000Z' | Should -BeNullOrEmpty
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw '2026-10-21T16:21:54.000000000Z' -StartedAtAfterRaw '' | Should -BeNullOrEmpty
     }
 
-    It 'reads Docker zero-time as never-started, therefore untouched' {
-        Test-ClaudishRestartWasNoOp -StartedAtRaw '0001-01-01T00:00:00Z' -ReferenceUtc $script:Ref | Should -BeTrue
-    }
-
-    It 'a local-time reference is compared in UTC, not by wall clock' {
-        # The drain passes the local instant; Docker answers in UTC. A naive
-        # comparison would read every restart as a no-op east of Greenwich.
-        $localRef = $script:Ref.ToLocalTime()
-        Test-ClaudishRestartWasNoOp -StartedAtRaw '2026-10-22T01:27:58.000000000Z' -ReferenceUtc $localRef | Should -BeFalse
+    It 'reads Docker zero-time on the after side as never-started, therefore untouched' {
+        Test-ClaudishRestartWasNoOp -StartedAtBeforeRaw '2026-10-21T16:21:54.000000000Z' -StartedAtAfterRaw '0001-01-01T00:00:00Z' | Should -BeTrue
     }
 }

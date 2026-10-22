@@ -82,7 +82,20 @@ set /p IE=<"%SHIM_DIR%\inspect_exit.txt"
 exit /b %IE%
 
 :inspect_startedat
-if exist "%SHIM_DIR%\startedat_out.txt" type "%SHIM_DIR%\startedat_out.txt"
+:: StartedAt is read TWICE by the clock-free no-op verdict (before the verb,
+:: then after). `startedat_out.txt` serves the FIRST call (the "before"
+:: reading); `startedat2_out.txt`, when present, serves every later call (the
+:: "after" reading). No startedat2 file means the container never restarted —
+:: both reads are identical.
+if exist "%SHIM_DIR%\startedat_used.flag" goto :inspect_startedat_next
+if not exist "%SHIM_DIR%\startedat_out.txt" goto :inspect_startedat_mark
+type "%SHIM_DIR%\startedat_out.txt"
+:inspect_startedat_mark
+type nul > "%SHIM_DIR%\startedat_used.flag"
+exit /b 0
+:inspect_startedat_next
+if exist "%SHIM_DIR%\startedat2_out.txt" type "%SHIM_DIR%\startedat2_out.txt"
+if not exist "%SHIM_DIR%\startedat2_out.txt" if exist "%SHIM_DIR%\startedat_out.txt" type "%SHIM_DIR%\startedat_out.txt"
 exit /b 0
 
 :image
@@ -154,7 +167,7 @@ exit /b %CE%
 
     function Reset-DrainFixture {
         Remove-Item -LiteralPath $script:CallsLog -Force -ErrorAction SilentlyContinue
-        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'inspect_exit.txt', 'compose_exit.txt', 'compose_stderr.txt', 'image_out.txt', 'start_exit.txt', 'rm_exit.txt', 'startedat_out.txt') {
+        foreach ($f in 'ps_out.txt', 'inspect_out.txt', 'inspect_exit.txt', 'compose_exit.txt', 'compose_stderr.txt', 'image_out.txt', 'start_exit.txt', 'rm_exit.txt', 'startedat_out.txt', 'startedat2_out.txt', 'startedat_used.flag') {
             Remove-Item -LiteralPath (Join-Path $script:ShimDir $f) -Force -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath $script:TestLog -Force -ErrorAction SilentlyContinue
@@ -382,11 +395,16 @@ Describe 'Invoke-ClaudishDrainedRestart — terminal OUTCOME lines (#233 AC3)' {
         $log | Should -Not -Match 'OUTCOME success'
     }
 
-    It 'a container that started at the gesture is a success, not a no-op' {
+    It 'a container that restarted at the gesture is a success, not a no-op' {
         Reset-DrainFixture
         [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        # Before the verb the container carries the OLD StartedAt; after it the
+        # shim answers with the new run's timestamp (startedat2). The clock-free
+        # verdict needs BOTH readings — a single static value can only ever
+        # mean "untouched".
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'startedat_out.txt'), "2026-09-01T00:00:00.000000000Z", (New-Object System.Text.ASCIIEncoding))
         $fresh = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.000000000Z')
-        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'startedat_out.txt'), $fresh, (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'startedat2_out.txt'), $fresh, (New-Object System.Text.ASCIIEncoding))
 
         $r = Invoke-ClaudishDrainedRestart -Reason 'fresh' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
         $r | Should -BeTrue

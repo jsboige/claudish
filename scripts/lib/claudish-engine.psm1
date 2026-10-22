@@ -2407,37 +2407,58 @@ function Test-ClaudishRestartWasNoOp {
         meant to activate answered 401. A false success on a config change is
         worse than a failure: nobody retries it.
 
-        Returns $null when the timestamp cannot be read (shim/fixture text, a
-        format this parser does not know, an inspect that failed): the caller
-        keeps its previous behaviour rather than inventing a verdict from
-        noise — an unreadable instrument must never be reported as "the
+        CLOCK-FREE (review 2026-10-22): StartedAt comes from the Docker
+        daemon's clock — inside the WSL2 VM on Docker Desktop, which is NOT
+        the Windows host's clock and can drift after a host sleep. Comparing
+        StartedAt with a host-side `Get-Date` made a genuine restart read as a
+        no-op whenever the VM lagged past the tolerance, and the caller was
+        then told to restart again: a second stream-killing gesture. Reading
+        StartedAt immediately BEFORE the verb and again immediately AFTER it
+        compares the daemon with itself — drift cancels, and any difference is
+        a new run. Equal ⇒ no-op, whatever the clocks say.
+
+        Returns $null when either timestamp cannot be read (shim/fixture text,
+        a format this parser does not know, an inspect that failed): the
+        caller keeps its previous behaviour rather than inventing a verdict
+        from noise — an unreadable instrument must never be reported as "the
         gesture failed".
 
-        - StartedAtRaw : raw `docker inspect --format '{{.State.StartedAt}}'`
-                         value (RFC3339 with nanoseconds, e.g.
-                         2026-10-21T23:43:20.912677448Z).
-        - ReferenceUtc : the instant taken immediately BEFORE the verb.
-        - ToleranceSec : how much older than the reference a legitimate start
-                         may look (coarse inspection). Default 60.
+        - StartedAtBeforeRaw : raw `docker inspect --format '{{.State.StartedAt}}'`
+                               value taken immediately BEFORE the verb
+                               (RFC3339 with nanoseconds, e.g.
+                               2026-10-21T23:43:20.912677448Z).
+        - StartedAtAfterRaw  : the same inspect, immediately after the verb.
+
+        A Docker zero-time on the after side (0001-01-01T00:00:00Z, "never
+        started") is never a success: it yields the no-op verdict.
     #>
     param(
-        [AllowEmptyString()][string]$StartedAtRaw,
-        [Parameter(Mandatory)][datetime]$ReferenceUtc,
-        [int]$ToleranceSec = 60
+        [AllowEmptyString()][string]$StartedAtBeforeRaw,
+        [AllowEmptyString()][string]$StartedAtAfterRaw
     )
 
-    if (-not $StartedAtRaw) { return $null }
-    # .NET Framework (PS 5.1) rejects 9 fractional digits — cut to seconds.
-    $m = [regex]::Match($StartedAtRaw.Trim(), '^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
-    if (-not $m.Success) { return $null }
+    if (-not $StartedAtBeforeRaw -or -not $StartedAtAfterRaw) { return $null }
 
-    $started = [datetime]::MinValue
+    # .NET Framework (PS 5.1) rejects 9 fractional digits — compare at
+    # seconds, which also makes the comparison immune to how a fixture spells
+    # the fractional part.
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
-    if (-not [datetime]::TryParseExact($m.Groups[1].Value, 'yyyy-MM-ddTHH:mm:ss', $inv, $styles, [ref]$started)) { return $null }
+    $parsed = @{}
+    foreach ($side in @('before', 'after')) {
+        $raw = if ($side -eq 'before') { $StartedAtBeforeRaw } else { $StartedAtAfterRaw }
+        $m = [regex]::Match($raw.Trim(), '^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
+        if (-not $m.Success) { return $null }
+        $dt = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($m.Groups[1].Value, 'yyyy-MM-ddTHH:mm:ss', $inv, $styles, [ref]$dt)) { return $null }
+        $parsed[$side] = $dt
+    }
 
-    $refUtc = $ReferenceUtc.ToUniversalTime()
-    return ($started -lt $refUtc.AddSeconds(-1 * $ToleranceSec))
+    # Zero-time on the after side = the container never started: not a success.
+    if ($parsed['after'] -eq [datetime]::MinValue) { return $true }
+
+    # Both readings come from the same daemon clock: any difference is a new run.
+    return ($parsed['before'] -eq $parsed['after'])
 }
 #endregion
 
