@@ -47,6 +47,7 @@ import {
   resolveDelegationOwner,
   setRoleNominalResolver,
   setRoleNominalBucketResolver,
+  earliestWalledReprobeAt,
   machineArmBucket,
   NATIVE_BUCKET,
 } from "./failover.js";
@@ -801,6 +802,22 @@ describe("#553 defect 2: own-capacity backoff", () => {
     markStepFailed("opus", 0, "own 502", undefined, { nonQuota: true });
     clock += 9 * 60_000; // the default 10 min rung holds (not the own 30 s one)
     expect(resolveFailoverTarget("opus").stepIndex).toBe(1);
+  });
+
+  it("pin 7: the wall-surface re-probe horizon reads the RECORDED ladder — an own bench is announced in 30 s, never 10 min", () => {
+    // Third read site (review of 05:1xZ, blocking m3): `earliestWalledReprobeAt`
+    // feeds the retry-after of the wall-surface 429 (proxy-server.ts:1944), and
+    // Claude Code sleeps for what it announces. Re-deriving the ladder at read
+    // time here would tell the client to wait 600 s through a bench that ends in
+    // 30 — twenty times longer than the mark says.
+    markStepFailed("opus", 0, "own 502", undefined, { nonQuota: true });
+    expect(earliestWalledReprobeAt("opus")!.getTime() - clock).toBe(30_000);
+
+    // The READ side takes the class from the failure RECORD, never from the
+    // declaration: a mark the classifier called QUOTA on the same own step keeps
+    // the 10-min rung, exactly like an ordinary step.
+    markStepFailed("opus", 0, "quota-shaped on our own step");
+    expect(earliestWalledReprobeAt("opus")!.getTime() - clock).toBe(600_000);
   });
 });
 
