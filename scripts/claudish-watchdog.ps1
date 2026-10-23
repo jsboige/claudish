@@ -1015,9 +1015,13 @@ if (-not $inspect.Ok -or $containerStatus -ne "running") {
 
 # The engine answered and the container is running: whatever FATAL streak the
 # state file carries is over, and the escalation marker (if any) must not
-# survive into a healthy fleet view. One reset here covers every later path of
-# this cycle (hang, degraded, healthy) — the per-branch resets remain for the
-# branches that recover mid-cycle.
+# survive into a healthy fleet view. This ONE reset covers every later path of
+# the cycle (proactive, healthy, degraded, hang): none of them can recover the
+# ENGINE mid-cycle — inspect just confirmed it answers — so no branch below
+# resets again (#618 review: the per-branch resets were no-ops, always seeing
+# prev=0 after this line). The RECOVERED reset above stays load-bearing: that
+# path exits before this line. Both sites are pinned by the Main-wiring AST
+# guard in claudish-watchdog-fatal-streak.Tests.ps1.
 if ($inspect.Ok -and $containerStatus -eq "running") { Reset-EngineFatalStreak }
 
 # Step 2: Uptime check
@@ -1067,7 +1071,8 @@ if ($uptimeHours -ge $ProactiveRestartHours) {
         $result = Test-ProxyWithTools -Url $ProxyUrl -TimeoutSec 60
         Write-Log "After proactive restart: $($result.Detail)"
         Set-State -ConsecutiveHangs 0
-        Reset-EngineFatalStreak
+        # No engine-FATAL reset here: the early reset on the running path
+        # already cleared it — the engine answered all cycle (#618 review).
         exit $(if ($result.Ok) { 0 } else { 1 })
     }
 }
@@ -1081,7 +1086,6 @@ $consecutive = [int]$state.consecutiveHangs
 if ($result.Ok) {
     Write-Log "OK (uptime=${uptimeHours}h). $($result.Detail)"
     Set-State -ConsecutiveHangs 0
-    Reset-EngineFatalStreak
     Invoke-LoopbackWedgeWatch -ServingHealthy $true
     # #185: the healthy cycle is the only moment the execute probe of the
     # relaunch preflight CAN run — it needs the Desktop GUI up, the exact
@@ -1095,9 +1099,8 @@ if (-not $result.Hang) {
     # Real failure, wrong remedy. Log it loudly and leave the container alone.
     Write-Log "DEGRADED (uptime=${uptimeHours}h): $($result.Detail) — NO restart (a restart cannot fix this)"
     Set-State -ConsecutiveHangs 0
-    # The engine answered (inspect + a real streaming probe reached the proxy):
-    # degraded serving is not an engine FATAL, so the streak is over.
-    Reset-EngineFatalStreak
+    # No engine-FATAL accounting: the engine answered (inspect + a real
+    # streaming probe reached the proxy) — the early reset already ran.
     exit 0
 }
 
