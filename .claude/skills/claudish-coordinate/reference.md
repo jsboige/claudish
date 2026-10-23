@@ -189,10 +189,13 @@ déclencheur. La seule parade réelle est que le user ou un pair le remarque.
 
 ```
 roosync_dashboard(action:"read", type:"workspace", section:"all")   # jamais section:"status" seul
-roosync_messages(action:"inbox", status:"all", limit:20)
+roosync_messages(action:"inbox", status:"unread", from:":claudish", limit:20)   # DMs des lanes claudish
+roosync_messages(action:"inbox", status:"unread", priority:"URGENT", limit:20)  # filet : URGENT de toute lane
 ```
 
 Lire l'inbox **avant** d'écrire quoi que ce soit qui suppose une attente : un go attendu peut déjà y dormir.
+
+**Filtrée, pas brute (#445, mesure du 23/10 sur ai-01).** L'inbox brute `status:"all", limit:20` rendait ~25 KB sur 187 non lus ; `from:":claudish"` en rendait **3** (~2 KB) — les trois DMs à traiter. Le filet `priority:"URGENT"` couvre le DM urgent d'une autre lane (0 ce jour-là). Un appel `deep:true` filtré, après traitement, a rendu 0 lui aussi : contrôle faible (deux zéros), le rappel après la Phase 2 reste dû. Marquer lu **un par un** (`mark_read`) : `bulk_mark_read` avec `workspace` est refusé (assertion d'identité), et sans `workspace` son rayon sur les autres lanes d'ai-01 n'est pas établi — il n'existe pas de `mark_unread`.
 
 ⚠️ **L'index inbox démarre froid et ment.** Reproduit sur ai-01 le 28/08 sous test contrôlé : deux appels **à paramètres identiques** (`status:"all", limit:20`), même machine, même workspace, 5 min d'écart → **14 messages** puis **130**. Le premier appel avait masqué 12 messages du 27/08, dont plusieurs HIGH de po-2023. Corrobore le signalement de po-2025 (`0` puis `103`) et écarte l'hypothèse d'un artefact de `limit`.
 
