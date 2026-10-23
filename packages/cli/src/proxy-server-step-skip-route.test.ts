@@ -48,7 +48,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createProxyServer } from "./proxy-server.js";
+import { createProxyServer, lagProbeWindows } from "./proxy-server.js";
 import {
   resetFailoverForTests,
   setRoleNominalResolver,
@@ -1073,27 +1073,26 @@ describe("#565 — a request no declared window can take is refused at admission
   }, 30_000);
 });
 
-describe("#587 — /health publishes the event-loop delay percentiles (gate instrument)", () => {
-  test("H1: a fresh server exposes eventLoopP50Ms/P99/Max as non-negative numbers beside instanceId, with no upstream configured", async () => {
+describe("#587 — /health publishes time-localized event-loop lag (gate instrument)", () => {
+  test("H1: a fresh server exposes eventLoopMax60sMs/BlockedMs5m/Max as non-negative numbers beside instanceId, with no upstream configured", async () => {
     await spin();
     resetCascade();
     const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
     expect(r.status).toBe(200); // not stalled — the health surface is otherwise unchanged
     const body: any = await r.json();
     expect(typeof body.instanceId).toBe("string"); // the #156 identity field is still there
-    for (const k of ["eventLoopP50Ms", "eventLoopP99Ms", "eventLoopMaxMs"]) {
+    for (const k of ["eventLoopMax60sMs", "eventLoopBlockedMs5m", "eventLoopMaxMs"]) {
       expect(typeof body[k]).toBe("number");
       expect(body[k]).toBeGreaterThanOrEqual(0);
     }
   }, 30_000);
 
-  test("H2: the percentiles MOVE when this process's loop is blocked — cumulative max, ≥ one 20 ms bucket", async () => {
+  test("H2: the WINDOWED metrics move on a block — kills the =0 mutants the percentiles survived", async () => {
     await spin();
     resetCascade();
-    const before: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
     // ~200 ms of synchronous loop blocking on this process — the exact class
-    // the gate must discriminate (a blocked loop is what a cached /health
-    // alone would NOT survive; see the 12:05Z design note on the issue).
+    // the gate must discriminate. The probe records ONE ~180 ms sample; the
+    // windowed max must carry it, the floored sum must count it.
     const t0 = Date.now();
     while (Date.now() - t0 < 200) {
       /* spin the loop */
@@ -1104,7 +1103,42 @@ describe("#587 — /health publishes the event-loop delay percentiles (gate inst
     // at 4 s+ and always see the recorded block; this mirrors that.
     await new Promise((r) => setTimeout(r, 120));
     const after: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
-    expect(after.eventLoopMaxMs).toBeGreaterThan(Math.max(before.eventLoopMaxMs, 0));
-    expect(after.eventLoopMaxMs).toBeGreaterThanOrEqual(20); // ≥ one resolution bucket
+    expect(after.eventLoopMax60sMs).toBeGreaterThanOrEqual(20); // ≥ one resolution bucket
+    expect(after.eventLoopBlockedMs5m).toBeGreaterThanOrEqual(20); // the block, above the 50 ms floor
+    // The cumulative high-water mark dominates any windowed read of the
+    // same history — pins the max/max60s relationship.
+    expect(after.eventLoopMaxMs).toBeGreaterThanOrEqual(after.eventLoopMax60sMs);
+  }, 30_000);
+
+  test("H3: a windowed max RETIRES — the sample is seen inside the window and gone after it", async () => {
+    await spin();
+    resetCascade();
+    const saved = { ...lagProbeWindows };
+    try {
+      // Shorten the windows so the retirement fits inside a test (a 60 s
+      // window cannot expire here); /health reads them at call time, so
+      // there is no re-boot to do.
+      lagProbeWindows.maxMs = 1_500;
+      lagProbeWindows.blockedMs = 1_500;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 120) {
+        /* spin the loop — one ~100 ms sample, above the 50 ms block floor */
+      }
+      await new Promise((r) => setTimeout(r, 120));
+      const inside: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
+      expect(inside.eventLoopMax60sMs).toBeGreaterThanOrEqual(50); // the block, not jitter
+      expect(inside.eventLoopBlockedMs5m).toBeGreaterThanOrEqual(50);
+      // Wait past the shortened window: the sample is older than the edge
+      // now, the backwards walk stops before reaching it.
+      await new Promise((r) => setTimeout(r, 2_000));
+      const retired: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
+      // Sub-floor jitter may keep fresh 1-3 ms samples inside the window —
+      // what must be gone is anything BLOCK-SIZED. The blocked sum floors
+      // at 50 ms, so an empty window reads exactly 0.
+      expect(retired.eventLoopMax60sMs).toBeLessThan(50);
+      expect(retired.eventLoopBlockedMs5m).toBe(0);
+    } finally {
+      Object.assign(lagProbeWindows, saved);
+    }
   }, 30_000);
 });
