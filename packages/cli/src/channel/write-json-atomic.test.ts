@@ -1,7 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import * as nodeFs from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { writeJsonAtomic } from "./write-json-atomic.js";
 
@@ -58,5 +59,83 @@ describe("writeJsonAtomic", () => {
     }
     expect(JSON.parse(readFileSync(target, "utf-8"))).toEqual({ seq: 19 });
     expect(readdirSync(dir)).toEqual(["meta.json"]);
+  });
+});
+
+describe("writeJsonAtomic (atomicity, through the fs seam)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "claudish-atomic-seam-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("the target is never written directly: one tmp write, one rename in the same directory", () => {
+    const target = join(dir, "meta.json");
+    const writes: string[] = [];
+    const renames: Array<[string, string]> = [];
+    const seam = {
+      writeFileSync: (p: string, data: string, enc: BufferEncoding) => {
+        writes.push(p);
+        return nodeFs.writeFileSync(p, data, enc);
+      },
+      renameSync: (from: string, to: string) => {
+        renames.push([from, to]);
+        return nodeFs.renameSync(from, to);
+      },
+      unlinkSync: (p: string) => nodeFs.unlinkSync(p),
+    };
+
+    writeJsonAtomic(target, { ok: true }, seam);
+
+    // RED on the direct-write mutant (writeFileSync(filePath, data)): the
+    // target path must never reach writeFileSync, only the temp file.
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).not.toBe(target);
+    expect(renames).toHaveLength(1);
+    expect(renames[0][0]).toBe(writes[0]);
+    expect(renames[0][1]).toBe(target);
+    expect(dirname(renames[0][0])).toBe(dirname(target));
+    expect(JSON.parse(readFileSync(target, "utf-8"))).toEqual({ ok: true });
+  });
+
+  test("a win32 rename failure (EPERM) falls back to the direct write and cleans the temp", () => {
+    const target = join(dir, "meta.json");
+    const seam = {
+      writeFileSync: nodeFs.writeFileSync.bind(nodeFs),
+      renameSync: () => {
+        throw Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" });
+      },
+      unlinkSync: nodeFs.unlinkSync.bind(nodeFs),
+    };
+
+    expect(() => writeJsonAtomic(target, { s: 1 }, seam)).not.toThrow();
+
+    // never worse than the replaced code: the write landed, no residue
+    expect(JSON.parse(readFileSync(target, "utf-8"))).toEqual({ s: 1 });
+    expect(readdirSync(dir)).toEqual(["meta.json"]);
+  });
+
+  test("if the fallback write fails too, it throws exactly like the old direct write", () => {
+    const target = join(dir, "meta.json");
+    const seam = {
+      writeFileSync: (p: string, data: string, enc: BufferEncoding) => {
+        if (p === target) {
+          throw Object.assign(new Error("ENOSPC: no space left"), { code: "ENOSPC" });
+        }
+        return nodeFs.writeFileSync(p, data, enc);
+      },
+      renameSync: () => {
+        throw Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
+      },
+      unlinkSync: nodeFs.unlinkSync.bind(nodeFs),
+    };
+
+    expect(() => writeJsonAtomic(target, { s: 2 }, seam)).toThrow(/ENOSPC/);
+    // the temp file was still cleaned up
+    expect(readdirSync(dir)).toEqual([]);
   });
 });
