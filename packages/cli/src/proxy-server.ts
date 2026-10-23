@@ -1833,6 +1833,18 @@ export async function createProxyServer(
               { served: Response } | { served: null; status: number; errBody: string }
             > => {
               const modelBeforeAttempt = body.model;
+              // #628 review (bloquant, classe #331): the delegation owner is
+              // STATE-DEPENDENT — resolveRoleStep reads the target nominal's
+              // bucket wall, and can arm it. Resolved AFTER the attempt, a wall
+              // moved by another request during the round-trip would credit a
+              // step that never served (a false recovery that brings a benched
+              // step back). Resolve BEFORE the call, as `main` did, and credit
+              // only when the resolved concrete is still the one attempted —
+              // the guard also closes `main`'s residual window between
+              // resolution and the call.
+              const targetDelegation = target.step.roleRef
+                ? resolveDelegationOwner(role, target.step)
+                : null;
               try {
                 const targetHandler = await getHandlerForRequest(
                   target.concrete,
@@ -1849,10 +1861,11 @@ export async function createProxyServer(
                   // bookkeeping (a success resets a step's failure count; it
                   // never arms).
                   if (!target.step.roleRef) resetStepSuccess(role, target.stepIndex);
-                  const targetDelegation = target.step.roleRef
-                    ? resolveDelegationOwner(role, target.step)
-                    : null;
-                  if (targetDelegation) {
+                  // Only credit the owner that actually served: a delegation
+                  // resolved to a different concrete (or to null ⇒ cannot
+                  // serve) during the round-trip must not lift a wall or reset
+                  // a step on a success it did not produce.
+                  if (targetDelegation && targetDelegation.concrete === target.concrete) {
                     if (targetDelegation.owner.nominal) {
                       // #367 (same class as the W19 bucketer): the walk's
                       // delegated concrete is already concrete — classify, no
@@ -1896,7 +1909,23 @@ export async function createProxyServer(
             // #299 B rejected (pin W31). The bound is structural — this block
             // runs once per request, and the advanced attempt never advances in
             // turn.
-            if (isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody)) {
+            // The budget bounds the WALK, not its entry: the advance is a paid
+            // attempt too, so re-check the elapsed time before buying it.
+            // Reaching here already means one more connection failure was
+            // absorbed; a budget that admitted the first attempt and not the
+            // second is the intended shape (worst case: nominal + 1 walk +
+            // the advance's own connect timeout, all inside the budget).
+            const advanceElapsedMs = Date.now() - cascadeStartedAtMs;
+            if (
+              isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody) &&
+              walkBudgetMs > 0 &&
+              advanceElapsedMs > walkBudgetMs
+            ) {
+              log(
+                `[Failover] WALK-ADVANCE ${role} skipped — budget ${advanceElapsedMs}ms > ${walkBudgetMs}ms`,
+                true
+              );
+            } else if (isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody)) {
               const nextWalk = await resolveTransientStep(role, {
                 bucketOf: concreteStepBucketOf,
                 nominalBucket: bucket ?? undefined,

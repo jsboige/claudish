@@ -60,11 +60,13 @@ import { isOverloadWalkClass } from "./handlers/composed-handler.js";
 import {
   armFailover,
   classifyNominalBucket,
+  earliestWalledReprobeAt,
   isBucketWalled,
   isFailoverActive,
   markStepFailed,
   providerBucketOf,
   resetFailoverForTests,
+  setRoleNominalBucketResolver,
   setRoleNominalResolver,
 } from "./fork/failover.js";
 import type { ProxyServer } from "./types.js";
@@ -117,6 +119,9 @@ let endpointDelay: Record<string, number> = {};
 /** Endpoints whose 429 body is a BURST (no overload wording) rather than an
  *  overload-shaped 429 — W7's negative control needs both spellings. */
 let burst429: Record<string, boolean> = {};
+/** W33: when set to a bucket, the next `tr` hit walls it BEFORE answering —
+ *  a concurrent request changing the delegation owner mid-attempt. */
+let wallOnTrHit: string | null = null;
 
 function healthySSE(): Response {
   const chunk = (delta: any, finish_reason: string | null = null) =>
@@ -280,6 +285,7 @@ beforeEach(() => {
   endpointStatus = {};
   endpointDelay = {};
   burst429 = {};
+  wallOnTrHit = null;
   configExisted = existsSync(REAL_CONFIG_PATH);
   configBackup = configExisted ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
   mkdirSync(CONFIG_DIR, { recursive: true });
@@ -300,6 +306,13 @@ beforeEach(() => {
     for (const key of ["tr", "t2"] as const) {
       if (url.startsWith(`${UPSTREAM_BASE}/${key}/`)) {
         calls[key] = (calls[key] ?? 0) + 1;
+        // W33 (#628 review): a CONCURRENT request walls the target's nominal
+        // bucket while this attempt is in flight, then the attempt serves 200
+        // — the state change the delegation-owner resolution must not observe.
+        if (key === "tr" && wallOnTrHit) {
+          armFailover("opus", "W33: a concurrent request walled opus's nominal DURING the attempt", wallOnTrHit);
+          wallOnTrHit = null;
+        }
         const st = endpointStatus[key] ?? 200;
         if (st === 0 || st === 200) return healthySSE();
         if (st === 402) return quotaWall();
@@ -938,6 +951,61 @@ describe("#598 — a walk into a connection-dead step advances once (RED until t
     // Bounded: one advance per request, and still no state on any plane.
     expect(isFailoverActive("sonnet")).toBe(false);
     expect(isBucketWalled(bucketOfNominal())).toBe(false);
+  }, 30_000);
+
+  // #628 review (ai-01, 23:45Z) — the delegation owner is STATE-DEPENDENT
+  // (resolveRoleStep reads the target nominal's bucket wall), so RESOLVING IT
+  // AFTER the upstream attempt credits an owner that did not serve — the #331
+  // class: a step comes back benched-free on someone else's success. The first
+  // version of #598 moved the resolution into the success branch, one full
+  // round-trip later than `main` did it.
+  //
+  // Shape: sonnet[0] = role:opus, opus's nominal = tr, opus[0] = t2 (marked,
+  // count 1, TTL 10 min). The walk serves tr and answers 200. DURING the
+  // attempt a concurrent request walls tr's bucket. Resolved after the attempt,
+  // the owner of sonnet[0] becomes opus's step 0 (TTL-failed ⇒ skipped by
+  // resolveSkippingFailed, then served by the all-failed last-step fallback),
+  // and `resetStepSuccess("opus", 0)` clears a record this request never paid.
+  //
+  // Instrument: `earliestWalledReprobeAt("opus")` reads `lastFailure + ttl` off
+  // every live step record — the record the late resolution clears is the ONLY
+  // thing this request can change there. RED under the mutation (resolution
+  // moved back after the `await`); green with the resolution at the top of the
+  // attempt + the `concrete === target.concrete` guard.
+  test("W33 (#628): a concurrent wall mid-attempt must not re-point the owner credit", async () => {
+    await spin({ sonnet: SONNET_NOMINAL, opus: "tr-ep@fake-tr" });
+    resetWalk({
+      CLAUDISH_FAILOVER_SONNET: "role:opus>s1-ep@fake-s1",
+      CLAUDISH_FAILOVER_OPUS: "t2-ep@fake-t2",
+    });
+    setRoleNominalResolver((r) =>
+      r === "sonnet" ? SONNET_NOMINAL : r === "opus" ? "tr-ep@fake-tr" : undefined
+    );
+    // One bucketter on both sides: the arm below and resolveRoleStep's own
+    // `nominalBucket` lookup must name the SAME key, or the concurrent wall is
+    // invisible to the delegation and this pin measures nothing (measured:
+    // green under the mutant until this line was added).
+    setRoleNominalBucketResolver((nominal) => providerBucketOf(nominal));
+    markStepFailed("opus", 0, "W33: opus's step 0 benched before the walk");
+    expect(earliestWalledReprobeAt("opus")).toBeDefined(); // the record this pin defends
+    // The mid-attempt state change: tr's bucket is walled while the walk's
+    // attempt is in flight, and the attempt still answers 200.
+    const bucketOfTr = providerBucketOf("tr-ep@fake-tr");
+    wallOnTrHit = bucketOfTr;
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    // The walk served opus's NOMINAL — the attempt's own concrete.
+    expect(calls.nm).toBe(1);
+    expect(calls.tr).toBe(1);
+    expect(calls.s1).toBe(0);
+    expect(calls.t2).toBeUndefined(); // the target's step was never paid
+    // THE PIN: no step record was cleared by a success that did not serve it.
+    expect(earliestWalledReprobeAt("opus")).toBeDefined();
+    // And the wall the CONCURRENT request made is untouched by this result:
+    // a success credits the owner, it never disarms a bucket (TTL owns that).
+    expect(isBucketWalled(bucketOfTr)).toBe(true);
   }, 30_000);
 });
 
