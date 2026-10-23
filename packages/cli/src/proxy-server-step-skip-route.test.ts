@@ -1072,3 +1072,39 @@ describe("#565 — a request no declared window can take is refused at admission
     expect(markerLog.some((l) => l.includes("[ContextAdmission] REFUSE"))).toBe(false);
   }, 30_000);
 });
+
+describe("#587 — /health publishes the event-loop delay percentiles (gate instrument)", () => {
+  test("H1: a fresh server exposes eventLoopP50Ms/P99/Max as non-negative numbers beside instanceId, with no upstream configured", async () => {
+    await spin();
+    resetCascade();
+    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    expect(r.status).toBe(200); // not stalled — the health surface is otherwise unchanged
+    const body: any = await r.json();
+    expect(typeof body.instanceId).toBe("string"); // the #156 identity field is still there
+    for (const k of ["eventLoopP50Ms", "eventLoopP99Ms", "eventLoopMaxMs"]) {
+      expect(typeof body[k]).toBe("number");
+      expect(body[k]).toBeGreaterThanOrEqual(0);
+    }
+  }, 30_000);
+
+  test("H2: the percentiles MOVE when this process's loop is blocked — cumulative max, ≥ one 20 ms bucket", async () => {
+    await spin();
+    resetCascade();
+    const before: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
+    // ~200 ms of synchronous loop blocking on this process — the exact class
+    // the gate must discriminate (a blocked loop is what a cached /health
+    // alone would NOT survive; see the 12:05Z design note on the issue).
+    const t0 = Date.now();
+    while (Date.now() - t0 < 200) {
+      /* spin the loop */
+    }
+    // Settle: bun can run the incoming socket I/O before the overdue probe
+    // tick in the first turn after the block, so the /health that measures
+    // must not be the very first post-spin event. Production readers poll
+    // at 4 s+ and always see the recorded block; this mirrors that.
+    await new Promise((r) => setTimeout(r, 120));
+    const after: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
+    expect(after.eventLoopMaxMs).toBeGreaterThan(Math.max(before.eventLoopMaxMs, 0));
+    expect(after.eventLoopMaxMs).toBeGreaterThanOrEqual(20); // ≥ one resolution bucket
+  }, 30_000);
+});

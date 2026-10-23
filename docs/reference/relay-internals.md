@@ -121,6 +121,15 @@ tunnel never appear. Joined to `/health`'s `instanceId` + `uptimeSec` for proces
 `instanceId` change *bounds* a replacement between two observations; it does not date it, absent a
 corroborating timestamped event.
 
+**`/health` also publishes `eventLoopP50Ms`/`eventLoopP99Ms` (~5 min rolling) and `eventLoopMaxMs`
+(cumulative since start) — the #587 gate instrument** for the "relays flip AUTONOMOUS while the hub
+loop was merely busy" class: if these stay at a few ms during an episode, neither a cached `/health`
+nor a separate listener would have answered it, and the A/B choice is moot. It is a manual 20 ms tick
+probe, **not** `perf_hooks.monitorEventLoopDelay` — that API is a measured stub on the production
+runtime (a 200 ms synchronous block records 0 on oven/bun 1.3.14, script and test context alike).
+Appended keys only (#156/#439 discipline); nothing in the data path or the health route gates on
+them.
+
 **Client impact beyond the 502s — #410 owns the defect; the *timing tie* now holds.** The Zod
 rejection is real and measured: `config.json` carried `maxConcurrency: 16`, the image then in
 service (07/10) caps at 8, and an endpoint failing validation is dropped whole (by design, with a

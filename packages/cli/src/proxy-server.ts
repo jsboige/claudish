@@ -2078,6 +2078,35 @@ export async function createProxyServer(
   // fork/server/stream-registry.ts for the full rationale.
   const streamTracker = createStreamTracker();
   const startedAt = Date.now();
+  // #587 gate — event-loop lag probe. bun's perf_hooks.monitorEventLoopDelay
+  // is a measured STUB on the hub's production runtime (a 200 ms synchronous
+  // block records 0 on oven/bun 1.3.14, script context, top-level and inside
+  // a timer callback alike), so the gate cannot ride it. A repeating 20 ms
+  // timer measures how late it fires instead — the same quantity, portable.
+  // Percentiles read a ~5 min rolling ring; max is the cumulative high-water
+  // mark since process start. Observation only: nothing gates on these.
+  const LAG_TICK_MS = 20;
+  const LAG_RING = 15_000;
+  const lagRing = new Float64Array(LAG_RING);
+  let lagCount = 0;
+  let lagMaxCumulative = 0;
+  const lagState = { lastTick: Date.now() };
+  const lagTimer = setInterval(() => {
+    const now = Date.now();
+    const lag = now - lagState.lastTick - LAG_TICK_MS;
+    if (lag > 0) {
+      lagRing[lagCount++ % LAG_RING] = lag;
+      if (lag > lagMaxCumulative) lagMaxCumulative = lag;
+    }
+    lagState.lastTick = now;
+  }, LAG_TICK_MS);
+  lagTimer.unref?.();
+  const lagPercentileMs = (p: number): number => {
+    const n = Math.min(lagCount, LAG_RING);
+    if (n === 0) return 0;
+    const slice = Array.from(lagRing.subarray(0, n)).sort((a, b) => a - b);
+    return Math.round(slice[Math.min(n - 1, Math.floor((p / 100) * n))] * 10) / 10;
+  };
   app.use("*", streamTracker.middleware);
 
   // Liveness, not mere existence. This was a constant-time JSON handler that
@@ -2126,6 +2155,17 @@ export async function createProxyServer(
         // Omitted entirely when no window is open (that absence IS the
         // signal). Appended last: nothing renamed, older parsers unaffected.
         ...(previousKeyHitsSnapshot() ?? {}),
+        // #587 — event-loop lag percentiles (~5 min rolling) and the
+        // cumulative max since start, the gate instrument for the "relays
+        // flip while the hub's data path is busy" class: if these stay at
+        // a few ms during an episode, neither a cached /health nor a
+        // separate listener would have answered it — the cause is not this
+        // loop. 0 on a fresh process; nothing renamed, nothing gates on
+        // these numbers. Manual 20 ms tick probe — see the init site for
+        // why perf_hooks is not used here.
+        eventLoopP50Ms: lagPercentileMs(50),
+        eventLoopP99Ms: lagPercentileMs(99),
+        eventLoopMaxMs: Math.round(lagMaxCumulative * 10) / 10,
       },
       stalled ? 503 : 200
     );
@@ -2696,6 +2736,7 @@ export async function createProxyServer(
     // this closure, and /health stops answering once close() drops the socket.
     getActiveStreams: () => streamTracker.getActiveStreams(),
     shutdown: async () => {
+      clearInterval(lagTimer);
       return new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
