@@ -110,11 +110,18 @@ import {
   sessionBudgetRefusalAnthropic,
 } from "./fork/session-budget.js";
 import {
+  encodeStepSkipHeader,
   readStepSkip,
   stepSkipDisabled,
   readStepBusyWaitMs,
   markCascadeStepAttempt,
 } from "./handlers/shared/step-skip.js";
+import {
+  endpointPrefixOf,
+  evaluateEndpointTokenBudget,
+  formatBudgetFacts,
+  withBudgetRelease,
+} from "./handlers/shared/endpoint-token-budget.js";
 import {
   decideContextAdmission,
   contextAdmissionRefusalText,
@@ -1696,12 +1703,132 @@ export async function createProxyServer(
           markCascadeStepAttempt(c, 0);
         }
       }
+      // #654 — in-flight token budget per endpoint, evaluated BEFORE the
+      // upstream call: a local engine saturates on CONTEXT, not request count
+      // (six ~200K-token bodies ≈ 1.2M KV against 750,747 available — measured
+      // 2026-10-24, engine-side). The budget rides the #431 `busy` skip wire,
+      // never the failure path. Inert unless the endpoint carries its knobs
+      // (AC1); estimator bytes/3.5 (AC3); an identical resubmission REPLACES
+      // its predecessor's estimate instead of adding one (AC5, arbitrated
+      // 24/10 — a budget counting the measured 56% client echo as fresh
+      // demand would trip on its own echo and divert a lane that has room).
+      // A refusal only ever DIVERTS: a non-last step advances (skip semantics
+      // — no mark, no wall, no arm, engine never sees the request); the
+      // nominal synthesizes the same 529 the bounded busy wait produces and
+      // lets the #299-B walk machinery own the diversion; a lane with no
+      // diversion (last step, unconfigured role, walk off) serves anyway —
+      // the budget bounds admission, it never refuses a servable request.
+      const budgetPrefix = endpointPrefixOf(
+        attemptConcreteNow ??
+          (stepIndex === -1 ? resolveNominalTarget(requestedModel).target : undefined)
+      );
+      const budgetDecision = budgetPrefix
+        ? evaluateEndpointTokenBudget(
+            budgetPrefix,
+            body,
+            { machine: machineHeader, session: sessionKey },
+            process.env,
+            Date.now(),
+            (info) => logStderr(info)
+          )
+        : null;
+      let releaseBudget: (() => void) | undefined;
+      let budgetSynthResponse: Response | undefined;
+      if (budgetDecision) {
+        const budgetDetail = formatBudgetFacts(
+          budgetDecision.facts,
+          budgetDecision.refused,
+          budgetDecision.reason
+        );
+        if (budgetDecision.facts.resubmit >= 2) {
+          log(
+            `[EndpointBudget] ${budgetPrefix} resubmit=${budgetDecision.facts.resubmit} in flight (${budgetDetail}) — estimate replaces its predecessor (#654 AC5)`,
+            true // forceConsole — operational event, countable marker (AC5b)
+          );
+        }
+        if (budgetDecision.refused) {
+          const canSkipStep =
+            role != null &&
+            rule != null &&
+            stepIndex >= 0 &&
+            stepIndex < rule.steps.length - 1 &&
+            attempt + 1 < maxAttempts &&
+            !stepSkipDisabled();
+          if (canSkipStep) {
+            log(
+              `[Failover] SKIP ${role}[${stepIndex}] reason=busy ${budgetDetail} ` +
+                `(${attemptConcreteNow ?? "?"}) — advancing to next step, no failure mark (endpoint token budget #654)`,
+              true // forceConsole — operational event (#431/#654)
+            );
+            skippedSteps.add(stepIndex);
+            continue;
+          }
+          const canWalkNominal =
+            role != null &&
+            stepIndex === -1 &&
+            rule != null &&
+            rule.steps.length > 0 &&
+            !keylessNative &&
+            !(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`) &&
+            (process.env.CLAUDISH_FAILOVER_OVERLOAD_WALK || "").trim() !== "0";
+          if (canWalkNominal) {
+            // Same wire shape as ComposedHandler's bounded busy 529: the
+            // #299-B walk block below picks it up (`isOverloadWalkClass` on
+            // the 529), diverts one-shot to the first servable step, writes
+            // no state — and when nothing is servable it surfaces this 529,
+            // which the client retries on its own.
+            log(
+              `[Failover] budget-skip nominal ${requestedModel} (${budgetDetail}) — overload-class diversion (#654)`,
+              true // forceConsole — operational event
+            );
+            budgetSynthResponse = new Response(
+              JSON.stringify(
+                wrapAnthropicError(
+                  529,
+                  `${budgetPrefix} busy — in-flight token budget exceeded (${budgetDetail})`,
+                  "overloaded_error"
+                )
+              ),
+              {
+                status: 529,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Retry-After": "2",
+                  "x-claudish-step-skip": encodeStepSkipHeader("busy", budgetDetail),
+                },
+              }
+            );
+          } else {
+            logStderr(
+              `[EndpointBudget] ${budgetPrefix} over budget with no diversion — serving anyway (${budgetDetail})`
+            );
+          }
+        }
+      }
       // #317: FRESH attempt token per upstream attempt — the usage sink keys
       // the max-ledger on it, and two paid attempts of one request must land
       // in two slots or the second under-counts. No-op when both bars are off.
-      openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
-      response = await handler.handle(c, body);
-      if (pinnedModel && !response.ok) body.model = modelBeforePin;
+      // The budget synth path (nominal → 529 for the walk block) must NOT
+      // reach the handler — the engine never sees a refused attempt (AC2).
+      // NB: `response` outlives the iteration (declared above the loop), so
+      // the gate here is the LOCAL flag, never `response` truthiness — a
+      // previous iteration's cancelled skip response is stale state.
+      if (budgetSynthResponse) {
+        response = budgetSynthResponse;
+      } else {
+        if (budgetDecision) releaseBudget = budgetDecision.commit();
+        openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+        response = await handler.handle(c, body);
+        if (pinnedModel && !response.ok) body.model = modelBeforePin;
+      }
+      if (releaseBudget && response) {
+        // The lease lives exactly as long as the attempt's bytes: the wrapper
+        // releases on stream end, consumer cancel, or error (a skipped/
+        // cancelled body releases through its cancel hook; a bodyless
+        // response immediately). Below this point every path — skip advance,
+        // walk, notice wrap, return — carries the tracked body or drains it.
+        response = withBudgetRelease(response, releaseBudget);
+      }
       // #431 AC1/AC3 — a step that cannot take THIS request skips forward.
       // Two shapes, one header: `context` rides the overflow recovery turn
       // (HTTP 200 — classified from upstream or short-circuited by the learned
