@@ -983,7 +983,6 @@ describe("deep probe: quota wall vs hub death", () => {
 
   it("sends NO machine header when CLAUDISH_MACHINE is unset or empty (#345)", async () => {
     const prev = process.env.CLAUDISH_MACHINE;
-
     try {
       // compose injects every listed name as at least "", and "" is NOT nullish
       // (#310) — an unset/empty name must yield NO header, never a `X-Claudish-

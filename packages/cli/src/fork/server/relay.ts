@@ -837,8 +837,13 @@ function machineName(): string {
 }
 
 /**
- * Role-shaped Anthropic id: the hub resolves `haiku` and answers with whatever
- * its cascade serves, which is the question the probe actually asks (#613).
+ * Role-shaped Anthropic id, so the probe measures the HUB's servability **on its
+ * haiku lane** rather than one provider's (#613): `modelMap.haiku` when that
+ * mapping is non-native, otherwise `modelMap.sonnet` through the
+ * `CLAUDISH_NO_ANTHROPIC` reroute (`noAnthropicDecision`, pinned in
+ * `proxy-server-role-map.test.ts`), and the haiku cascade only when its bucket is
+ * walled, a config arm covers it (`haiku@<machine>` — the probe's own
+ * `X-Claudish-Machine` decides) or a transient overload walks it once.
  */
 const DEFAULT_PROBE_MODEL = "claude-haiku-4-5-20251001";
 
@@ -863,8 +868,11 @@ function probeModel(): string {
  * relay. Only run during recovery, so its handful of budget tokens is negligible.
  *
  * **A quota wall is liveness, not death.** The probe asks the hub for a model
- * and the hub answers with whatever its cascade serves ({@link probeModel});
- * when that lane's plan is spent the hub answers 429/402 —
+ * and the hub answers on whatever its haiku lane serves ({@link probeModel}) —
+ * `modelMap.haiku`, the sonnet reroute, or a cascade step — so this moves the
+ * dependency off z.ai but does not remove one: a non-walk-class 5xx from the
+ * haiku nominal still fails the probe. When that lane's plan is spent the hub
+ * answers 429/402 —
  * which it can only do by being alive, authenticating the request, routing it and
  * reaching the provider. Reading that as "hub down" holds the recovery gate shut
  * for as long as the wall lasts, and AUTONOMOUS is the worse place to wait: the
