@@ -341,14 +341,26 @@ describe("#619 — a dwell pin yields back to a recovered earlier step", () => {
     await pinOnStepOne("sess-625", s0);
     s0.mode = "ok";
 
-    // Well past the grace, the session STAYS on step 1: the recovery it could
-    // point at happened before it ever landed here, so it proves nothing about
-    // the step this conversation is currently served by.
+    // The reviewer's measured flap (5 follow-up requests, each re-skipping the
+    // step it was yielded to). With the ordering guard NONE of them pays that
+    // attempt: every one is served by s1, and step 0 sees no new round-trip.
     await new Promise((r) => setTimeout(r, GRACE_MS + 80));
-    const r2 = await postMessage({ session: "sess-625" });
-    expect(r2.status).toBe(200);
-    expect(await responseText(r2)).toContain("ok-from-s1");
-    expect(getSessionDwellPinForTests("sonnet", "sess-625")?.stepIndex).toBe(1);
+    for (let i = 0; i < 5; i++) {
+      const r = await postMessage({ session: "sess-625" });
+      expect(r.status).toBe(200);
+      expect(await responseText(r)).toContain("ok-from-s1");
+      expect(getSessionDwellPinForTests("sonnet", "sess-625")?.stepIndex).toBe(1);
+    }
+    // Two s0 round-trips for the whole scenario: the healthy turn and the one
+    // refusal that created the pin. A flapping pin would add one per follow-up
+    // (media would re-send the prompt, context would pay a learned-cap-less
+    // 400, busy would pay the full STEP_BUSY_WAIT_MS).
+    expect(calls.s0).toBe(2);
+    expect(calls.s1).toBe(6); // 1 pinning turn + 5 follow-ups
+    // Exactly ONE "skipped" yield in the whole run — the pinning request's.
+    expect(
+      markerLog.filter((l) => l.includes("DWELL sonnet") && l.includes("skipped for this request")).length
+    ).toBe(1);
     expect(
       markerLog.some((l) => l.includes("DWELL sonnet") && l.includes("step 0") && l.includes("recovered"))
     ).toBe(false);
