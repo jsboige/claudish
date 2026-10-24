@@ -130,6 +130,14 @@ services:
       # read-only config bind, so leaving it empty would restore the
       # `cache write skipped (EROFS)` the volume exists to fix.
       - CLAUDISH_MODEL_CACHE_PATH=${CLAUDISH_MODEL_CACHE_PATH:-/var/cache/claudish/all-models.json}
+      # #651 — durable home for the LEARNED context caps. In memory they died
+      # with every recreate, reopening the band between the engine's real window
+      # and the reported floor until a refusal re-taught them (measured 24/10 on
+      # this hub). Same reason as the line above: the config bind is read-only,
+      # so the store lives on the writable model-cache volume. Unset = that
+      # volume path; an EXPLICIT empty (=`CLAUDISH_OVERFLOW_CAPS_PATH=` in .env,
+      # hence the `-` rather than `:-`) = memory-only, the pre-#651 behaviour.
+      - CLAUDISH_OVERFLOW_CAPS_PATH=${CLAUDISH_OVERFLOW_CAPS_PATH-/var/cache/claudish/overflow-caps.json}
       # Native credential guard kill switch (#296): only an explicit "0" disarms;
       # empty = guard on. Listed here because the env file only interpolates —
       # a name absent from this list never reaches the container.

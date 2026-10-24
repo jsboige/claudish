@@ -22,6 +22,12 @@
  */
 
 import { parseContextOverflow } from "./stream-parsers/openai-responses-sse.js";
+import {
+  overflowCapsPath,
+  readOverflowCapsFile,
+  writeOverflowCapsFile,
+  type OverflowCapRecord,
+} from "./overflow-caps-store.js";
 
 export interface ContextOverflowMatch {
   matched: boolean;
@@ -190,10 +196,53 @@ export function contextLimitMarginTokens(est: number): number {
 // the unavoidable cost of not hardcoding a variable provider limit.
 
 const overflowCaps = new Map<string, number>();
+/** Durable side: same keys, plus when/why each cap was learned (#651). */
+const overflowCapRecords = new Map<string, OverflowCapRecord>();
+/** Armed by `initOverflowCapsPersistence()`; undefined = memory only. */
+let overflowCapsStorePath: string | undefined;
 
-export function rememberOverflowCap(providerName: string, model: string, tokens: number): void {
+/**
+ * #651 - restore the caps learned by a previous process and arm write-through.
+ *
+ * Called once at proxy startup. Returns what it did so the caller can log it: a
+ * silent restore is indistinguishable from a store that was never read. A
+ * missing or corrupt file restores nothing and disarms nothing - the next
+ * refusal re-learns, which is exactly today's behaviour.
+ */
+export function initOverflowCapsPersistence(
+  path: string | undefined = overflowCapsPath()
+): { path?: string; loaded: number } {
+  overflowCapsStorePath = path;
+  if (!path) return { loaded: 0 };
+  const restored = readOverflowCapsFile(path);
+  for (const [key, record] of restored) {
+    overflowCaps.set(key, record.cap);
+    overflowCapRecords.set(key, record);
+  }
+  return { path, loaded: restored.size };
+}
+
+/** Test/teardown hook: forget the armed path without touching the caps. */
+export function disarmOverflowCapsPersistence(): void {
+  overflowCapsStorePath = undefined;
+}
+
+export function rememberOverflowCap(
+  providerName: string,
+  model: string,
+  tokens: number,
+  evidence?: string
+): void {
   if (!Number.isFinite(tokens) || tokens <= 0) return;
-  overflowCaps.set(`${providerName}::${model}`, Math.floor(tokens));
+  const key = `${providerName}::${model}`;
+  const cap = Math.floor(tokens);
+  overflowCaps.set(key, cap);
+  // #651 - write-through only when a durable store is armed: a unit test or a
+  // dev launcher (no env) keeps this module strictly in-memory.
+  if (overflowCapsStorePath) {
+    overflowCapRecords.set(key, { cap, at: new Date().toISOString(), evidence });
+    writeOverflowCapsFile(overflowCapsStorePath, overflowCapRecords);
+  }
 }
 
 export function getOverflowCap(providerName: string, model: string): number | undefined {
@@ -202,6 +251,8 @@ export function getOverflowCap(providerName: string, model: string): number | un
 
 export function resetOverflowCapsForTests(): void {
   overflowCaps.clear();
+  overflowCapRecords.clear();
+  overflowCapsStorePath = undefined;
 }
 
 // The reported-usage floor lives in its own leaf module: the Responses parser needs

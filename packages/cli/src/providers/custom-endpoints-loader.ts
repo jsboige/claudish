@@ -33,6 +33,8 @@ import {
   registerRuntimeProvider,
   registerRuntimeProfile,
   registerDeclaredContextLimit,
+  getDeclaredContextLimit,
+  getDerivedContextLimit,
 } from "./runtime-providers.js";
 import { ComposedHandler } from "../handlers/composed-handler.js";
 import { OpenAIProviderTransport } from "./transport/openai.js";
@@ -176,7 +178,8 @@ function buildSimpleHandler(
       tokenStrategy: "delta-aware",
       omitReasoningContent: ep.omitReasoningContent,
       maxOutputTokens: ep.maxOutputTokens,
-      contextLimit: ep.contextLimit,
+      contextLimit: getDeclaredContextLimit(ctx.provider.name),
+      derivedContextLimit: getDerivedContextLimit(ctx.provider.name),
       ...ctx.sharedOpts,
     });
   }
@@ -196,7 +199,8 @@ function buildSimpleHandler(
   return new ComposedHandler(transport, ctx.targetModel, finalModel, ctx.port, {
     adapter,
     maxOutputTokens: ep.maxOutputTokens,
-    contextLimit: ep.contextLimit,
+    contextLimit: getDeclaredContextLimit(ctx.provider.name),
+    derivedContextLimit: getDerivedContextLimit(ctx.provider.name),
     ...ctx.sharedOpts,
   });
 }
@@ -217,7 +221,8 @@ function buildComplexHandler(
       return new ComposedHandler(transport, ctx.targetModel, finalModel, ctx.port, {
         adapter,
         maxOutputTokens: ep.maxOutputTokens,
-        contextLimit: ep.contextLimit,
+        contextLimit: getDeclaredContextLimit(ctx.provider.name),
+        derivedContextLimit: getDerivedContextLimit(ctx.provider.name),
         ...ctx.sharedOpts,
       });
     }
@@ -239,7 +244,8 @@ function buildComplexHandler(
         tokenStrategy: "delta-aware",
         omitReasoningContent: ep.omitReasoningContent,
         maxOutputTokens: ep.maxOutputTokens,
-        contextLimit: ep.contextLimit,
+        contextLimit: getDeclaredContextLimit(ctx.provider.name),
+        derivedContextLimit: getDerivedContextLimit(ctx.provider.name),
         ...ctx.sharedOpts,
       });
     }
@@ -259,7 +265,8 @@ function buildComplexHandler(
       return new ComposedHandler(transport, ctx.targetModel, finalModel, ctx.port, {
         adapter,
         maxOutputTokens: ep.maxOutputTokens,
-        contextLimit: ep.contextLimit,
+        contextLimit: getDeclaredContextLimit(ctx.provider.name),
+        derivedContextLimit: getDerivedContextLimit(ctx.provider.name),
         ...ctx.sharedOpts,
       });
     }
