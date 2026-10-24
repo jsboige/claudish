@@ -51,6 +51,18 @@
            worse than the wedge; #172 AC4). The log line names the manual
            gesture; the worker cycle relays it.
 
+      R3 also covers a THIRD class, measured 2026-10-24 afternoon: the WSL
+      SERVICE itself is wedged. A plain `wsl -d <distro> -- /bin/true` times
+      out while `wsl --list --running` still answers (a metadata call) and
+      vmmemWSL keeps its RAM; Docker's backend log says `bootstrapping main
+      distribution: Wsl/Service/WSAETIMEDOUT`. No Docker rung can reach that
+      layer - a distro termination returned, and the GUI was relaunched, and
+      the engine still answered `Docker Desktop is unable to start`. Detected
+      here by a bounded 20 s probe, escalated with the measured recipe
+      (`wsl --shutdown`, then stop the Desktop chain and relaunch the GUI),
+      never acted: `wsl --shutdown` tears down every distro on the host and
+      one measured rebuild is not a proven one.
+
     Single-observer rule: this script is THE watcher for the
     localhost-path / docker-engine condition on a sidecar host. Do not add a
     second one; extend this file instead. It is INERT until an operator
@@ -253,6 +265,33 @@ function Test-DesktopBackendPresent {
     return [bool](Get-Process -Name 'com.docker.backend' -ErrorAction SilentlyContinue)
 }
 
+function Test-WslServiceResponsive {
+    # 'ok' | 'timeout'. Separate class, measured 2026-10-24 13:0x local: the
+    # engine would not start at all (`Docker Desktop is unable to start`, backend
+    # log: bootstrapping main distribution: Wsl/Service/WSAETIMEDOUT) while a
+    # plain `wsl -d Ubuntu -- ps` ALSO timed out - the host<->VM channel was
+    # wedged, with `wsl --list --running` still answering (metadata call) and
+    # vmmemWSL holding 24.5 GB. `wsl --terminate docker-desktop` cannot fix that
+    # class, and neither could a GUI relaunch; `wsl --shutdown` then a Desktop
+    # chain restart brought the engine up in ~10 s.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'wsl'
+    $psi.Arguments = '-d docker-desktop -- /bin/true'
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        return 'ok'   # cannot even launch: not this class, do not divert
+    }
+    if (-not $p.WaitForExit(20000)) {
+        try { $p.Kill() } catch { }
+        return 'timeout'
+    }
+    return 'ok'
+}
+
 # ---------------- main ----------------
 
 New-Item -ItemType Directory -Force -Path $ClaudishHome | Out-Null
@@ -261,6 +300,26 @@ $actions = @()
 
 # --- R1: loopback path (wslrelay squatter). Explicit [::1] - see .DESCRIPTION.
 $ipv6Alive = Test-HttpAlive -Url "http://[::1]:$Port/health" -TimeoutSec 8
+
+# Second instrument BEFORE declaring the loopback dead (peer review, po-2028
+# Maintenance, 2026-10-24). .NET sends a Host header that a literal IPv6
+# address does not satisfy on some builds - Invoke-WebRequest returns 400 where
+# curl.exe returns 200 on the same address, same second. Test-HttpAlive already
+# treats any status as alive, so that class cannot fire here; this is the belt
+# for the NEXT variant, because a probe that lies in the DOWN direction costs a
+# phantom R1 kill. Anything that answers with a 3-digit status is alive.
+$curlHttp = ''
+if (-not $ipv6Alive) {
+    try {
+        $raw = & curl.exe -s -o NUL -w '%{http_code}' --max-time 8 "http://[::1]:$Port/health" 2>$null
+        $curlHttp = (($raw | Out-String).Trim())
+    } catch { }
+    if ($curlHttp -match '^\d{3}$') {
+        $ipv6Alive = $true
+        $actions += "PROBE_DOTNET_BLIND curl_http=$curlHttp"
+    }
+}
+
 if (-not $ipv6Alive) {
     $squatters = Get-LoopbackSquatters
     foreach ($s in $squatters) {
@@ -298,6 +357,15 @@ if ($engine -eq 'up') {
         $actions += "ENGINE_GUARD_DRAIN_IN_FLIGHT failures=$($State.EngineFailures)"
     } elseif (-not $cooldownElapsed) {
         $actions += "ENGINE_GUARD_COOLDOWN failures=$($State.EngineFailures) since_last_action_min=$([int]$sinceAction)"
+    } elseif ((Test-WslServiceResponsive) -eq 'timeout') {
+        # The WSL service wedge preempts every Docker rung: a distro termination
+        # cannot reach a wedged host<->VM channel (measured: terminate + GUI
+        # relaunch both failed, `wsl --shutdown` then a chain restart fixed it).
+        # ESCALATE only - `wsl --shutdown` tears down EVERY distro on the host,
+        # and one measured rebuild is not a proven one (#172 AC4).
+        $actions += 'R3_ESCALATE_WSL_SERVICE_WEDGED operator_gesture=wsl --shutdown ; stop com.docker.backend+com.docker.build+Docker Desktop+wslrelay ; relaunch "C:\Program Files\Docker\Docker\Docker Desktop.exe"'
+        $State.EngineFailures = 0
+        $State.LastEngineActionUtc = ([DateTimeOffset]::UtcNow).UtcDateTime
     } elseif ($State.EngineActionsSinceDown -ge 1) {
         # R2 is ONCE per outage episode, never a repeated teardown. Measured on
         # this host 2026-10-24: the morning termination WAS followed by an
@@ -357,4 +425,4 @@ $detail = ($actions -join '; ')
 # (powershell -File on an absent path) with no line to show for it.
 $copyMtime = ''
 try { $copyMtime = (Get-Item $PSCommandPath).LastWriteTimeUtc.ToString('o') } catch { }
-Write-WdLog ("verdict=$verdict engine=$engine port=$Port pid=$PID copy_mtime=$copyMtime" + $(if ($detail) { " actions=$detail" } else { '' }))
+Write-WdLog ("verdict=$verdict engine=$engine curl=$curlHttp port=$Port pid=$PID copy_mtime=$copyMtime" + $(if ($detail) { " actions=$detail" } else { '' }))
