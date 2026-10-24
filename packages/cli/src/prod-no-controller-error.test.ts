@@ -35,7 +35,6 @@ function stripCommentsAndStrings(src: string): string {
   const out: string[] = [];
   type State = "code" | "line" | "block" | "squote" | "dquote" | "tpl";
   let state: State = "code";
-  let prev = "";
   for (let i = 0; i < src.length; i++) {
     const ch = src[i];
     const next = src[i + 1] ?? "";
@@ -68,7 +67,6 @@ function stripCommentsAndStrings(src: string): string {
       continue;
     }
     out.push(ch === "\n" ? "\n" : " ");
-    prev = ch;
   }
   return out.join("");
 }
