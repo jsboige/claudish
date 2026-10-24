@@ -3,6 +3,10 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import { log, logStderr } from "./logger.js";
 import type { ProxyServer } from "./types.js";
+// #587/#615 — lag-probe read windows, module-level so the retirement pin can
+// shorten them (a 60 s window cannot expire inside a test); /health reads
+// these at CALL TIME, never a cached value.
+export const lagProbeWindows = { maxMs: 60_000, blockedMs: 300_000 };
 import { NativeHandler, stripProxyOwnHeaders } from "./handlers/native-handler.js";
 import {
   nativeAuthHeaderNames,
@@ -17,7 +21,7 @@ import { LocalTransport } from "./providers/transport/local.js";
 import { LocalModelAdapter } from "./adapters/local-adapter.js";
 import { PoeProvider } from "./providers/transport/poe.js";
 import type { ModelHandler } from "./handlers/types.js";
-import { ComposedHandler, isOverloadWalkClass, setVisionAuthPolicy, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
+import { ComposedHandler, isOverloadWalkClass, isConnectionWalkClass, setVisionAuthPolicy, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import {
   resolveProvider,
   parseUrlModel,
@@ -1816,56 +1820,130 @@ export async function createProxyServer(
             nominalBucket: bucket ?? undefined,
           }).catch(() => null);
           if (walk) {
-            const walkDelegation = walk.step.roleRef
-              ? resolveDelegationOwner(role, walk.step)
-              : null;
             log(
               `[Failover] WALK ${role} one-shot (HTTP ${response.status} on nominal ${requestedModel}) → ${walk.concrete} (step ${walk.stepIndex})`,
               true
             );
-            const modelBeforeWalk = body.model;
-            try {
-              const walkHandler = await getHandlerForRequest(
-                walk.concrete,
-                0,
-                sessionKey,
-                bucket,
-                walk.concrete
-              );
-              // #317: the walk is a paid upstream attempt too — fresh token.
-              openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
-              const walkResp = await walkHandler.handle(c, body);
-              if (walkResp.ok) {
-                // The step proved itself — mirror the loop's success
-                // bookkeeping (a success resets a step's failure count; it
-                // never arms).
-                if (!walk.step.roleRef) resetStepSuccess(role, walk.stepIndex);
-                if (walkDelegation) {
-                  if (walkDelegation.owner.nominal) {
-                    // #367 (same class as the W19 bucketer): the walk's
-                    // delegated concrete is already concrete — classify, no
-                    // request-side re-mapping.
-                    const ownerBucket = await concreteStepBucketOf(walkDelegation.concrete);
-                    onNominalSuccess(walkDelegation.owner.role, ownerBucket);
-                  } else {
-                    resetStepSuccess(walkDelegation.owner.role, walkDelegation.owner.stepIndex);
-                  }
-                }
-                body.model = modelBeforeWalk;
-                return walkResp;
-              }
-              // Not ok: the step's own incident must not become the client's
-              // answer, and its unread body is a connection held open for
-              // nothing — drain it before surfacing the ORIGINAL overload.
+            // #598: ONE paid walk attempt, factored so the connection-class
+            // advance below reuses the exact bookkeeping. A served attempt
+            // mirrors the loop's success (a success resets the step's failure
+            // count; it never arms); a failed one writes NO state, ever
+            // (#299 B). The failure is returned CLASSIFIED — the step's own
+            // wire shape decides whether the walk may advance, and only its
+            // body carries it.
+            const attemptWalkStep = async (
+              target: NonNullable<typeof walk>
+            ): Promise<
+              { served: Response } | { served: null; status: number; errBody: string }
+            > => {
+              const modelBeforeAttempt = body.model;
+              // #628 review (bloquant, classe #331): the delegation owner is
+              // STATE-DEPENDENT — resolveRoleStep reads the target nominal's
+              // bucket wall, and can arm it. Resolved AFTER the attempt, a wall
+              // moved by another request during the round-trip would credit a
+              // step that never served (a false recovery that brings a benched
+              // step back). Resolve BEFORE the call, as `main` did, and credit
+              // only when the resolved concrete is still the one attempted —
+              // the guard also closes `main`'s residual window between
+              // resolution and the call.
+              const targetDelegation = target.step.roleRef
+                ? resolveDelegationOwner(role, target.step)
+                : null;
               try {
-                await walkResp.body?.cancel();
+                const targetHandler = await getHandlerForRequest(
+                  target.concrete,
+                  0,
+                  sessionKey,
+                  bucket,
+                  target.concrete
+                );
+                // #317: the walk is a paid upstream attempt too — fresh token.
+                openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+                const targetResp = await targetHandler.handle(c, body);
+                if (targetResp.ok) {
+                  // The step proved itself — mirror the loop's success
+                  // bookkeeping (a success resets a step's failure count; it
+                  // never arms).
+                  if (!target.step.roleRef) resetStepSuccess(role, target.stepIndex);
+                  // Only credit the owner that actually served: a delegation
+                  // resolved to a different concrete (or to null ⇒ cannot
+                  // serve) during the round-trip must not lift a wall or reset
+                  // a step on a success it did not produce.
+                  if (targetDelegation && targetDelegation.concrete === target.concrete) {
+                    if (targetDelegation.owner.nominal) {
+                      // #367 (same class as the W19 bucketer): the walk's
+                      // delegated concrete is already concrete — classify, no
+                      // request-side re-mapping.
+                      const ownerBucket = await concreteStepBucketOf(targetDelegation.concrete);
+                      onNominalSuccess(targetDelegation.owner.role, ownerBucket);
+                    } else {
+                      resetStepSuccess(
+                        targetDelegation.owner.role,
+                        targetDelegation.owner.stepIndex
+                      );
+                    }
+                  }
+                  return { served: targetResp };
+                }
+                // Not ok: the step's own incident must not become the client's
+                // answer, and its unread body is a connection held open for
+                // nothing. READ it rather than cancelling it — the body is both
+                // the classifier's input (#598) and the drain.
+                const targetErrBody = await targetResp.text().catch(() => "");
+                return { served: null, status: targetResp.status, errBody: targetErrBody };
               } catch {
-                // already gone — nothing to drain
+                // The attempt itself threw — no class, so no advance: the
+                // original overload stands.
+                return { served: null, status: 0, errBody: "" };
+              } finally {
+                body.model = modelBeforeAttempt;
               }
-            } catch {
-              // The walk attempt itself threw — the original overload stands.
+            };
+            const firstAttempt = await attemptWalkStep(walk);
+            if (firstAttempt.served) return firstAttempt.served;
+            // #598 — a step that died CONNECTION-class has told us the HOST was
+            // unreachable, not that its plan is walled. Measured 2026-10-22:
+            // the nominal's egress and walk step 0's were the same dead host,
+            // so 194/194 sonnet walks re-picked step 0 and step 1 was never
+            // tried — a transport failure writes no state by design (#299 B),
+            // so `firstServable` keeps finding that same dead step servable.
+            // Advance ONCE, to the next servable step, still writing no plan
+            // state. Deliberately NOT on a 402/429/503/529: that is capacity
+            // the resolver owns, and stepping over it would re-buy exactly what
+            // #299 B rejected (pin W31). The bound is structural — this block
+            // runs once per request, and the advanced attempt never advances in
+            // turn.
+            // The budget bounds the WALK, not its entry: the advance is a paid
+            // attempt too, so re-check the elapsed time before buying it.
+            // Reaching here already means one more connection failure was
+            // absorbed; a budget that admitted the first attempt and not the
+            // second is the intended shape (worst case: nominal + 1 walk +
+            // the advance's own connect timeout, all inside the budget).
+            const advanceElapsedMs = Date.now() - cascadeStartedAtMs;
+            if (
+              isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody) &&
+              walkBudgetMs > 0 &&
+              advanceElapsedMs > walkBudgetMs
+            ) {
+              log(
+                `[Failover] WALK-ADVANCE ${role} skipped — budget ${advanceElapsedMs}ms > ${walkBudgetMs}ms`,
+                true
+              );
+            } else if (isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody)) {
+              const nextWalk = await resolveTransientStep(role, {
+                bucketOf: concreteStepBucketOf,
+                nominalBucket: bucket ?? undefined,
+                afterStepIndex: walk.stepIndex,
+              }).catch(() => null);
+              if (nextWalk) {
+                log(
+                  `[Failover] WALK-ADVANCE ${role} — step ${walk.stepIndex} (${walk.concrete}) died connection-class; one extra attempt at ${nextWalk.concrete} (step ${nextWalk.stepIndex})`,
+                  true
+                );
+                const advanced = await attemptWalkStep(nextWalk);
+                if (advanced.served) return advanced.served;
+              }
             }
-            body.model = modelBeforeWalk;
           }
           return response;
         }
@@ -2162,6 +2240,80 @@ export async function createProxyServer(
   // fork/server/stream-registry.ts for the full rationale.
   const streamTracker = createStreamTracker();
   const startedAt = Date.now();
+  // #587 gate — event-loop lag probe. bun's perf_hooks.monitorEventLoopDelay
+  // is a measured STUB on the hub's production runtime (a 200 ms synchronous
+  // block records 0 on oven/bun 1.3.14, script context, top-level and inside
+  // a timer callback alike), so the gate cannot ride it. A repeating 20 ms
+  // timer measures how late it fires instead — the same quantity, portable.
+  //
+  // #615 review redesign: the percentiles are GONE. A setInterval does not
+  // catch up after a block — one long block leaves ONE sample, so p99 never
+  // moved (measured: 2 s block, p99 unchanged at 26), and reading them cost
+  // two Array.from().sort() per /health call (7.89 ms on a full ring) on the
+  // very loop being measured. What the relay-flip question needs is a signal
+  // localizable IN TIME, joinable with the sidecars' AUTONOMOUS lines on the
+  // same clock:
+  //   - a [EventLoop] log line the moment a tick runs ≥ LAG_LOG_THRESHOLD_MS
+  //     late (docker logs -t timestamps it; one line per block, not per tick);
+  //   - /health eventLoopMax60sMs — a windowed max that RETIRES;
+  //   - /health eventLoopBlockedMs5m — the sum of lag over the window, floored
+  //     at LAG_BLOCK_FLOOR_MS so an idle Windows seat's timer granularity (a
+  //     20 ms interval fires at ~31 ms → every tick "lags" ~11 ms) does not
+  //     read as five minutes of blockage — see docs/reference/relay-internals.md;
+  //   - eventLoopMaxMs stays as the cumulative high-water mark — one 03:00 GC
+  //     pause can pin it forever, so date episodes with the windowed max.
+  // Samples are sparse (positive lags only) with per-sample timestamps: a
+  // window read walks backwards from the newest sample and stops at the first
+  // one older than the edge — O(samples in window), no sort, no allocation.
+  // Observation only: nothing gates on these.
+  const LAG_TICK_MS = 20;
+  const LAG_RING = 15_000;
+  const LAG_LOG_THRESHOLD_MS = 250;
+  const LAG_BLOCK_FLOOR_MS = 50;
+  const lagRing = new Float64Array(LAG_RING);
+  const lagTsRing = new Float64Array(LAG_RING);
+  let lagCount = 0;
+  let lagMaxCumulative = 0;
+  // #615 review point 2: the probe runs on the MONOTONIC clock. `Date.now()`
+  // is wall time, so an NTP resync (or the WSL2 VM clock catching up after
+  // host load) steps it forward and manufactures a phantom `[EventLoop] lag=`
+  // line — precisely the false positive that would correlate with an
+  // AUTONOMOUS flip caused by the same host event — while a backward step
+  // silently drops samples. `performance.now()` cannot step. The log line
+  // still gets its wall time from `docker logs -t`, which is the clock the
+  // sidecars' transitions are read on.
+  const lagState = { lastTick: performance.now() };
+  const lagTimer = setInterval(() => {
+    const now = performance.now();
+    const lag = now - lagState.lastTick - LAG_TICK_MS;
+    if (lag > 0) {
+      const slot = lagCount % LAG_RING;
+      lagRing[slot] = lag;
+      lagTsRing[slot] = now;
+      lagCount++;
+      if (lag > lagMaxCumulative) lagMaxCumulative = lag;
+      if (lag >= LAG_LOG_THRESHOLD_MS) logStderr(`[EventLoop] lag=${Math.round(lag)}ms`);
+    }
+    lagState.lastTick = now;
+  }, LAG_TICK_MS);
+  lagTimer.unref?.();
+  const lagWindowed = (windowMs: number, mode: "max" | "blockedSum"): number => {
+    // Walk sample indices newest→oldest (monotone in lagCount); modulo maps an
+    // index to its ring slot once the ring has wrapped. Timestamps are monotone
+    // in the index, so the first sample older than the edge ends the walk.
+    const edge = performance.now() - windowMs;
+    const oldest = Math.max(0, lagCount - LAG_RING);
+    let out = 0;
+    for (let idx = lagCount - 1; idx >= oldest; idx--) {
+      const slot = idx % LAG_RING;
+      if (lagTsRing[slot] < edge) break;
+      const lag = lagRing[slot];
+      if (mode === "max") {
+        if (lag > out) out = lag;
+      } else if (lag >= LAG_BLOCK_FLOOR_MS) out += lag;
+    }
+    return Math.round(out * 10) / 10;
+  };
   app.use("*", streamTracker.middleware);
 
   // Liveness, not mere existence. This was a constant-time JSON handler that
@@ -2210,6 +2362,22 @@ export async function createProxyServer(
         // Omitted entirely when no window is open (that absence IS the
         // signal). Appended last: nothing renamed, older parsers unaffected.
         ...(previousKeyHitsSnapshot() ?? {}),
+        // #587 — event-loop lag, time-localized (#615 review redesign: the
+        // percentiles are gone — one long block leaves ONE sample so p99
+        // never moved, and two sorts per call cost 7.89 ms on this very
+        // loop). eventLoopMax60sMs is the windowed max (it retires);
+        // eventLoopBlockedMs5m the floored sum of lag over the window
+        // (weighs a block by its length; the 50 ms floor keeps an idle
+        // Windows seat's ~11 ms timer granularity from reading as
+        // blockage — see docs/reference/relay-internals.md); eventLoopMaxMs
+        // the cumulative high-water mark since start — a single 03:00 GC
+        // pause can pin it forever, so date episodes with the windowed max
+        // and the [EventLoop] log line (timestamped by docker logs -t, it
+        // joins with the sidecars' AUTONOMOUS flips on the same clock).
+        // 0 on a fresh process; nothing renamed, nothing gates on these.
+        eventLoopMax60sMs: lagWindowed(lagProbeWindows.maxMs, "max"),
+        eventLoopBlockedMs5m: lagWindowed(lagProbeWindows.blockedMs, "blockedSum"),
+        eventLoopMaxMs: Math.round(lagMaxCumulative * 10) / 10,
       },
       stalled ? 503 : 200
     );
@@ -2780,6 +2948,7 @@ export async function createProxyServer(
     // this closure, and /health stops answering once close() drops the socket.
     getActiveStreams: () => streamTracker.getActiveStreams(),
     shutdown: async () => {
+      clearInterval(lagTimer);
       return new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
