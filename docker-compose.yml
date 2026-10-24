@@ -215,6 +215,12 @@ services:
       - CLAUDISH_CONNECT_RETRY_MAX=${CLAUDISH_CONNECT_RETRY_MAX:-}
       - CLAUDISH_CONNECT_RETRY_DELAYS_MS=${CLAUDISH_CONNECT_RETRY_DELAYS_MS:-}
       - CLAUDISH_STALL_THRESHOLD_MS=${CLAUDISH_STALL_THRESHOLD_MS:-}
+      # #630 — bound on the proxy's graceful shutdown (ms), the complement of
+      # stop_grace_period above: how long shutdown() waits for consumable work
+      # (a request fully received whose response is still being written) before
+      # cutting. Read once per shutdown; must stay under stop_grace_period or
+      # the runtime kill answers first. Empty = 30000.
+      - CLAUDISH_SHUTDOWN_GRACE_MS=${CLAUDISH_SHUTDOWN_GRACE_MS:-}
       # Auth & native lane: key-rotation overlap + #219 auto-pin.
       - CLAUDISH_PROXY_KEY_PREVIOUS=${CLAUDISH_PROXY_KEY_PREVIOUS:-}
       - CLAUDISH_NATIVE_PIN_AUTO=${CLAUDISH_NATIVE_PIN_AUTO:-}
