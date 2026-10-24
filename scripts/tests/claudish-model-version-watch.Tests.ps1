@@ -397,6 +397,31 @@ Describe 'Test-VersionEventEmitted (#661 b - one event per fact, not one per 6h 
         [System.IO.File]::WriteAllText($garb, "not json`n" + '{"kind":"major-ask","family":"gpt-sol","from":"gpt-6-sol","to":"gpt-7-sol"}' + "`n")
         (Test-VersionEventEmitted -EventsPath $garb -Kind major-ask -Family gpt-sol -From 'gpt-6-sol' -To 'gpt-7-sol') | Should -Be $true
     }
+    It '#665 r1: two same-tuple facts on two providers are two facts — both emit on run one, neither on the rerun' {
+        # The r1 finding, restated as a pin: the provider-less key swallowed the
+        # SECOND provider's fact before it had ever been emitted once. Here both
+        # facts share (kind, family, from, to) and differ only by provider.
+        $two = Join-Path $script:dedupDir 'two-providers.log'
+        $d1 = @{ EventsPath = $two; Kind = 'info'; Family = 'glm'; From = 'glm-5.3'; To = 'glm-5.3.1'; Provider = 'zai' }
+        $d2 = @{ EventsPath = $two; Kind = 'info'; Family = 'glm'; From = 'glm-5.3'; To = 'glm-5.3.1'; Provider = 'glm-coding' }
+        # Empty log: BOTH facts are new — 2 events on the first run.
+        (Test-VersionEventEmitted @d1) | Should -Be $false
+        (Test-VersionEventEmitted @d2) | Should -Be $false
+        Write-VersionEvent -EventsPath $two -Kind info -Family glm -From 'glm-5.3' -To 'glm-5.3.1' -Provider 'zai' -Detail 'probe would-repin spelling zai@glm-5.3 on zai'
+        Write-VersionEvent -EventsPath $two -Kind info -Family glm -From 'glm-5.3' -To 'glm-5.3.1' -Provider 'glm-coding' -Detail 'probe would-repin spelling glm-coding@glm-5.3 on glm-coding'
+        # Rerun: both are now known facts — 0 new events. And each fact does
+        # NOT dedup the other's provider.
+        (Test-VersionEventEmitted @d1) | Should -Be $true
+        (Test-VersionEventEmitted @d2) | Should -Be $true
+    }
+    It 'legacy lines written before the provider field existed stay facts, and never satisfy a provider-scoped query' {
+        $legacy = Join-Path $script:dedupDir 'legacy.log'
+        [System.IO.File]::WriteAllText($legacy, '{"ts":"2026-10-24T00:00:00.0000000Z","kind":"info","family":"glm","from":"glm-5.3","to":"glm-5.3.1","detail":"pre-#665 line"}' + "`n")
+        # Same tuple, no provider in the query → the legacy fact dedups (same key: '').
+        (Test-VersionEventEmitted -EventsPath $legacy -Kind info -Family glm -From 'glm-5.3' -To 'glm-5.3.1') | Should -Be $true
+        # A provider-scoped query is a DIFFERENT fact — never satisfied by a legacy line.
+        (Test-VersionEventEmitted -EventsPath $legacy -Kind info -Family glm -From 'glm-5.3' -To 'glm-5.3.1' -Provider 'zai') | Should -Be $false
+    }
 }
 
 Describe 'Compare-RoleModelsToRouting (role-alias drift, 2026-10-05, reworked CR c.5993885265)' {
@@ -1224,7 +1249,8 @@ Describe 'model-version-watch.ps1 - the probe runs before the Codex network phas
 
     It 'every report-only event site is dedup-gated; the observation log lines stay (#661 b)' {
         $text = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\model-version-watch.ps1'))
-        # four re-observed report-only sites, each gated on (kind, family, from, to):
+        # four re-observed report-only sites, each gated on (kind, family,
+        # from, to, provider):
         # probe major-ask, probe would-repin info, Codex ineligible info, Codex major-ask
         ([regex]::Matches($text, 'Test-VersionEventEmitted -EventsPath \$eventsPath')).Count | Should -Be 4
         # the gate suppressed the EVENT, never the per-run LOG observation — an

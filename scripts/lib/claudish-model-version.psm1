@@ -345,12 +345,16 @@ function Write-VersionEvent {
     # NDJSON append, no BOM (5.1 Add-Content -Encoding UTF8 writes one).
     # Consumed by the worker cycle, which relays pending events to the
     # workspace dashboard — a scheduled task cannot call the MCP itself.
+    # `provider` (#665 r1) is part of the fact's identity for the per-provider
+    # report-only kinds: the same transition on two providers is TWO facts.
+    # Family-grouped sites (Codex major-ask) leave it ''.
     param(
         [Parameter(Mandatory = $true)][string]$EventsPath,
         [Parameter(Mandatory = $true)][ValidateSet('minor-applied', 'major-ask', 'role-alias-ask', 'probe-fail', 'error', 'info')][string]$Kind,
         [Parameter(Mandatory = $true)][string]$Family,
         [string]$From = '',
         [string]$To = '',
+        [string]$Provider = '',
         [string]$Detail = ''
     )
     $evt = @{
@@ -359,6 +363,7 @@ function Write-VersionEvent {
         family  = $Family
         from    = $From
         to      = $To
+        provider = $Provider
         detail  = $Detail
     } | ConvertTo-Json -Compress
     [System.IO.File]::AppendAllText($EventsPath, $evt + "`n", (New-Object System.Text.UTF8Encoding($false)))
@@ -366,18 +371,25 @@ function Write-VersionEvent {
 
 function Test-VersionEventEmitted {
     # Dedup for the 6h cadence, the Test-RoleAliasAskEmitted model generalized:
-    # an event already in the log with the same (kind, family, from, to) is the
-    # SAME FACT re-observed — report-only decisions never change the state they
-    # describe, so re-emitting them every run floods the relay channel forever.
-    # The run LOG still prints every observation; only the EVENT is suppressed.
-    # The identifying tuple is the transition (from -> to): once the operator
-    # acts, the tuple changes and the new fact does emit.
+    # an event already in the log with the same (kind, family, from, to,
+    # provider) is the SAME FACT re-observed — report-only decisions never
+    # change the state they describe, so re-emitting them every run floods the
+    # relay channel forever. The run LOG still prints every observation; only
+    # the EVENT is suppressed. The identifying tuple is the transition
+    # (from -> to) PLUS the provider it was observed on: two providers carrying
+    # the same transition are two facts, and #665 r1 measured the provider-less
+    # key swallowing the second one on its very FIRST run. Family-grouped sites
+    # (Codex major-ask) dedup at the family level with provider ''.
+    # Legacy lines written before the field existed read as provider '' via the
+    # guarded property access — a missing property must not throw under
+    # Set-StrictMode, and a legacy fact stays a fact.
     param(
         [Parameter(Mandatory = $true)][string]$EventsPath,
         [Parameter(Mandatory = $true)][string]$Kind,
         [Parameter(Mandatory = $true)][string]$Family,
         [string]$From = '',
-        [string]$To = ''
+        [string]$To = '',
+        [string]$Provider = ''
     )
     if (-not (Test-Path -LiteralPath $EventsPath)) { return $false }
     foreach ($line in @([System.IO.File]::ReadAllLines($EventsPath))) {
@@ -385,7 +397,10 @@ function Test-VersionEventEmitted {
         if (-not $t) { continue }
         try { $evt = $t | ConvertFrom-Json } catch { continue }
         if ($null -eq $evt) { continue }
-        if ("$($evt.kind)" -eq $Kind -and "$($evt.family)" -eq $Family -and "$($evt.from)" -eq $From -and "$($evt.to)" -eq $To) {
+        $evtProvider = ''
+        $prop = $evt.PSObject.Properties['provider']
+        if ($null -ne $prop) { $evtProvider = "$($prop.Value)" }
+        if ("$($evt.kind)" -eq $Kind -and "$($evt.family)" -eq $Family -and "$($evt.from)" -eq $From -and "$($evt.to)" -eq $To -and $evtProvider -eq $Provider) {
             return $true
         }
     }
@@ -708,7 +723,13 @@ function Get-ProviderProbeTargets {
 
         # Wire detection mirrors the loader's: simple entries key on `format`,
         # complex on `transport`. The wire decides the auth-header DEFAULT —
-        # an explicit authScheme always wins (custom-endpoints-loader.ts).
+        # an explicit authScheme always wins. This mirrors the
+        # complex-anthropic and openai-bearer paths the live config uses, NOT
+        # every transport shape: an OpenAI-transport endpoint is always served
+        # Bearer regardless of authScheme (OpenAIProviderTransport.getHeaders
+        # ignores the field), and simple endpoints are hard-coded bearer in
+        # buildProviderDefinition — neither shape exists on the hub today; if
+        # one appears, align the probe with the TRANSPORT, not the config.
         $wire = ''
         if ($entry.PSObject.Properties['format']) { $wire = [string]$entry.format }
         elseif ($entry.PSObject.Properties['transport']) { $wire = [string]$entry.transport }
