@@ -3007,8 +3007,13 @@ export async function createProxyServer(
       // anything on the dead-client path: an operator can raise it toward
       // `stop_grace_period` (long `stream:false` turns, `/compact`) without
       // stretching the dead-client window.
-      const raw = Number(process.env.CLAUDISH_SHUTDOWN_GRACE_MS ?? "30000");
-      const graceMs = Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
+      // Compose injects this name as "" when unset (#310) — and Number("") is
+      // 0, so a `?? default` read would turn an unset knob into an instant
+      // cut. Same empty-safe shape as the first-event watchdog: "", garbage
+      // and negatives all mean the default; "0" stays a deliberate instant cut.
+      const rawGrace = process.env.CLAUDISH_SHUTDOWN_GRACE_MS;
+      const parsedGrace = Number(rawGrace);
+      const graceMs = !rawGrace || !Number.isFinite(parsedGrace) || parsedGrace < 0 ? 30_000 : parsedGrace;
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
       server.closeIdleConnections?.();
       const deadline = Date.now() + graceMs;
