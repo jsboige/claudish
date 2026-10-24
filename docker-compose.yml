@@ -106,6 +106,12 @@ services:
       # the probe) never runs. Listed here because the env file only
       # interpolates: a name absent from this list never reaches the container.
       - CLAUDISH_MACHINE=${CLAUDISH_MACHINE:-}
+      # Deep-probe model for relay recovery (#613). Empty = the built-in
+      # role-shaped default (claude-haiku-4-5-20251001), which the hub resolves on
+      # its own haiku lane so a z.ai-only outage cannot pin a sidecar AUTONOMOUS.
+      # Set to a concrete (e.g. glm-5.3) to restore the pre-#613 behavior. Listed
+      # here because the env file only interpolates.
+      - CLAUDISH_RELAY_PROBE_MODEL=${CLAUDISH_RELAY_PROBE_MODEL:-}
       # Native credential guard kill switch (#296): only an explicit "0" disarms;
       # empty = guard on. Listed here because the env file only interpolates —
       # a name absent from this list never reaches the container.
