@@ -127,43 +127,6 @@ $StatePath = Join-Path $ClaudishHome 'sidecar-host-watchdog.state.json'
 $ConsentFileName = 'sidecar-host-watchdog.enabled'
 $LogMaxBytes = 2MB
 
-# Module resolution: the scheduled task runs a STABLE COPY outside the repo
-# (~/.claudish/bin + ~/.claudish/bin/lib), so a branch switch cannot remove
-# the script mid-day; `lib\` next to the copy is the first candidate, then
-# the in-repo layouts for manual runs from a checkout.
-$moduleCandidates = @(
-    (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1'),
-    (Join-Path $PSScriptRoot '..\lib\claudish-engine.psm1')
-)
-$EngineModule = $null
-foreach ($cand in $moduleCandidates) {
-    if (Test-Path $cand) { $EngineModule = $cand; break }
-}
-if (-not $EngineModule) {
-    # LOUD to the LOG FILE too, not stdout alone: a scheduled task discards
-    # stdout, and on 2026-10-24 exactly this failure left 2.5 h of silence
-    # with every run dying before its first log line.
-    $msg = 'sidecar-watchdog module_missing inert_exit candidates=' + ($moduleCandidates -join ',')
-    try { Add-Content -Path $LogPath -Value (('{0} {1}' -f ([DateTimeOffset]::UtcNow).ToString('o'), $msg)) -Encoding Ascii } catch { }
-    Write-Output $msg
-    exit 1
-}
-try {
-    Import-Module $EngineModule -Force -ErrorAction Stop
-} catch {
-    $msg = 'sidecar-watchdog module_import_failed inert_exit ' + $_.Exception.Message
-    try { Add-Content -Path $LogPath -Value (('{0} {1}' -f ([DateTimeOffset]::UtcNow).ToString('o'), $msg)) -Encoding Ascii } catch { }
-    Write-Output $msg
-    exit 1
-}
-
-# Consent BEFORE any probe: a machine that never opted in is not even
-# measured (the 09-20 lesson: a guard that armed by accident armed on every
-# machine in the fleet).
-if (-not (Test-ClaudishOptIn -ClaudishHome $ClaudishHome -FileName $ConsentFileName)) {
-    exit 0
-}
-
 function Write-WdLog {
     param([string]$Message)
     # ASCII only - Add-Content encoding stability across 5.1 seats.
@@ -181,9 +144,23 @@ function Read-WdState {
     if (Test-Path $StatePath) {
         try {
             $raw = Get-Content $StatePath -Raw | ConvertFrom-Json
+            # Instant-exact parse of BOTH ISO forms. A bare [datetime] cast is
+            # Kind-broken on 5.1, each form in its own direction: "...Z" is
+            # CONVERTED to local wall time (Kind=Local), "+02:00" has the
+            # offset STRIPPED unapplied (Kind=Local, 15:40 literal). The
+            # Kind-blind tick subtraction downstream then read the last
+            # engine action 2h off (measured 2026-10-24: since_last_action
+            # -44..-81 min against a 30-min cooldown gate - R3 fired 76 min
+            # late). [DateTimeOffset]::Parse yields the correct instant for
+            # both forms; .UtcDateTime is Kind=Utc, making the subtraction
+            # sound.
+            $lastAction = [datetime]::MinValue
+            if ($null -ne $raw.lastEngineActionUtc -and "$($raw.lastEngineActionUtc)" -ne '') {
+                $lastAction = [DateTimeOffset]::Parse([string]$raw.lastEngineActionUtc, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+            }
             return @{
                 EngineFailures = [int]$raw.engineFailures
-                LastEngineActionUtc = [datetime]$raw.lastEngineActionUtc
+                LastEngineActionUtc = $lastAction
                 EngineActionsSinceDown = [int]$raw.engineActionsSinceDown
             }
         } catch { }
@@ -194,7 +171,10 @@ function Read-WdState {
 function Write-WdState {
     param([hashtable]$State)
     try {
-        $last = if ($State.LastEngineActionUtc -eq [datetime]::MinValue) { $null } else { $State.LastEngineActionUtc.ToString('o') }
+        # Normalize to Kind=Utc before formatting: whatever Kind a caller
+        # stored, the file always carries the "...Z" form so every reader
+        # (and a hand reset) round-trips to the same instant.
+        $last = if ($State.LastEngineActionUtc -eq [datetime]::MinValue) { $null } else { $State.LastEngineActionUtc.ToUniversalTime().ToString('o') }
         $obj = @{ engineFailures = $State.EngineFailures; lastEngineActionUtc = $last; engineActionsSinceDown = $State.EngineActionsSinceDown }
         New-Item -ItemType Directory -Force -Path $ClaudishHome | Out-Null
         [System.IO.File]::WriteAllText($StatePath, ($obj | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
@@ -290,6 +270,50 @@ function Test-WslServiceResponsive {
         return 'timeout'
     }
     return 'ok'
+}
+
+# Dot-sourced by the Pester suite (scripts/tests/claudish-sidecar-host-watchdog.Tests.ps1):
+# define the functions above, run nothing below. Everything past this point
+# either calls `exit` (which, in a dot-sourced script, kills the test
+# runner's whole session) or touches the machine, so the guard sits AFTER the
+# last function definition and BEFORE the first guard block.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# Module resolution: the scheduled task runs a STABLE COPY outside the repo
+# (~/.claudish/bin + ~/.claudish/bin/lib), so a branch switch cannot remove
+# the script mid-day; `lib\` next to the copy is the first candidate, then
+# the in-repo layouts for manual runs from a checkout.
+$moduleCandidates = @(
+    (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1'),
+    (Join-Path $PSScriptRoot '..\lib\claudish-engine.psm1')
+)
+$EngineModule = $null
+foreach ($cand in $moduleCandidates) {
+    if (Test-Path $cand) { $EngineModule = $cand; break }
+}
+if (-not $EngineModule) {
+    # LOUD to the LOG FILE too, not stdout alone: a scheduled task discards
+    # stdout, and on 2026-10-24 exactly this failure left 2.5 h of silence
+    # with every run dying before its first log line.
+    $msg = 'sidecar-watchdog module_missing inert_exit candidates=' + ($moduleCandidates -join ',')
+    try { Add-Content -Path $LogPath -Value (('{0} {1}' -f ([DateTimeOffset]::UtcNow).ToString('o'), $msg)) -Encoding Ascii } catch { }
+    Write-Output $msg
+    exit 1
+}
+try {
+    Import-Module $EngineModule -Force -ErrorAction Stop
+} catch {
+    $msg = 'sidecar-watchdog module_import_failed inert_exit ' + $_.Exception.Message
+    try { Add-Content -Path $LogPath -Value (('{0} {1}' -f ([DateTimeOffset]::UtcNow).ToString('o'), $msg)) -Encoding Ascii } catch { }
+    Write-Output $msg
+    exit 1
+}
+
+# Consent BEFORE any probe: a machine that never opted in is not even
+# measured (the 09-20 lesson: a guard that armed by accident armed on every
+# machine in the fleet).
+if (-not (Test-ClaudishOptIn -ClaudishHome $ClaudishHome -FileName $ConsentFileName)) {
+    exit 0
 }
 
 # ---------------- main ----------------
