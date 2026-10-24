@@ -35,6 +35,8 @@ import { createResponsesStreamHandler } from "./shared/stream-parsers/openai-res
 import { createAnthropicPassthroughStream } from "./shared/stream-parsers/anthropic-sse.js";
 import { createOllamaJsonlStream } from "./shared/stream-parsers/ollama-jsonl.js";
 import { createGeminiSseStream } from "./shared/stream-parsers/gemini-sse.js";
+import { requestNumberFor } from "../fork/middleware/request-logger.js";
+import { wallMarkerLine } from "./shared/traffic-markers.js";
 import { withFirstUsefulEventWatchdog, boundRetryUpstream } from "./shared/first-event-watchdog.js";
 import {
   preStreamPolicyRefusal,
@@ -1177,7 +1179,10 @@ export class ComposedHandler implements ModelHandler {
         });
         log(`[${this.provider.displayName}] Error: ${errorText}`);
         const hint = getRecoveryHint(response.status, errorText, this.provider.displayName);
-        logStderr(`Error [${this.provider.displayName}]: HTTP ${response.status}. ${hint}`);
+        // c.req, never the bare Context: Hono's Context has no `.raw`, so passing
+        // it whole falls back to the global counter and mislabels the wall line
+        // under concurrency (review #632) — the keyed carrier is the HonoRequest.
+        logStderr(wallMarkerLine(this.provider.displayName, response.status, requestNumberFor(c.req), hint));
 
         // Extract structured error type from provider response body if present
         let providerErrorType: string | undefined;
@@ -1971,8 +1976,25 @@ export function isOverloadWalkClass(status: number, errorText: string): boolean 
   // `"connection_error"` code in the body (`connection-error.ts`) — same
   // "unreachable, not walled" class as an overload, and the client cannot
   // retry its way out of it any better than a 529.
-  if (status === 400 && errorText.includes('"connection_error"')) return true;
+  if (isConnectionWalkClass(status, errorText)) return true;
   return status === 529 || isTransientOverload(status, errorText);
+}
+
+/**
+ * #598 — the CONNECTION class ALONE: HTTP 400 carrying the proxy's own
+ * `"connection_error"` synthesis (#298 A). Strictly narrower than
+ * {@link isOverloadWalkClass}, and that narrowing is the whole point: a step
+ * that dies here has said nothing about its PLAN — the host was unreachable —
+ * whereas a 529/429/503 answers about capacity the resolver owns (#299 B).
+ *
+ * Only this class lets the walk advance past a dead step. The measured driver
+ * (2026-10-22): the nominal's egress died and walk step 0 sat on it, so
+ * 194/194 sonnet walks re-picked step 0 while step 1 was never tried; a
+ * transport failure writes no state by design, so `firstServable` keeps
+ * finding the same dead step servable.
+ */
+export function isConnectionWalkClass(status: number, errorText: string): boolean {
+  return status === 400 && errorText.includes('"connection_error"');
 }
 
 /**

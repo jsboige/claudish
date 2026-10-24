@@ -60,6 +60,21 @@ a process replacement **bounded to that interval** (an id change dates nothing b
 returned NOMINAL 32 s later. **The replacement is corroborated hub-side, and its cause is a Docker
 Desktop engine recovery — see below.**
 
+**Measured again on 2026-10-23, and it inverts the reading.** 19 AUTONOMOUS transitions on the
+po-203 relay (04:11→08:39Z) looked like a hub outage. The hub-side cross-check eliminated the hub:
+po-2025's watchdog persisted 21 OK probes with a monotone `uptimeSec`, its capture store showed no
+gap across 10 031 captures, and **1 525 po-203 captures were served during the very episodes the
+relay called down**. What the flap measured was **upstream latency through the `:18182` tube**, not
+availability: headers ran 3 893-10 899 ms over 04:46→07:31Z (12 episodes), then 247-343 ms after
+07:46Z while heartbeats kept failing (6 episodes — tube or seat, **not established**: no portproxy
+telemetry). The 2026-10-08 case above is the counter-example that keeps this honest: **same
+instrument, opposite verdict**, which is exactly why the three hub-side proofs (persisted watchdog
+probes with monotone uptime, per-10-minute capture gaps, presence of the flapping seat in the
+captures) are required before either reading. Discriminator on the seat itself: **slow headers +
+failing heartbeats = slow upstream; fast headers + failing heartbeats = local tube/seat.** A
+`/health` heartbeat timeout is never, on its own, evidence the hub is down — it shares the tube and
+the host with everything else.
+
 **What the hub-side journal holds (po-2025, `~/.claudish/docker-events.log` — the durable collector
 of issue #169).** At 08:50:56Z a `container start claudish-proxy` **carrying the same container id**
 (`32c3f1378a91`) — and between 06:34:11Z and that event **no `create`, `stop`, `die`, `kill` or
@@ -120,6 +135,25 @@ ingress*. The instrument that does not is the **ingress IIS log** (`W3SVC49/u_ex
 tunnel never appear. Joined to `/health`'s `instanceId` + `uptimeSec` for process identity, an
 `instanceId` change *bounds* a replacement between two observations; it does not date it, absent a
 corroborating timestamped event.
+
+**`/health` also publishes `eventLoopMax60sMs` (windowed max, retires), `eventLoopBlockedMs5m`
+(floored sum of lag over ~5 min — weighs a block by its length) and `eventLoopMaxMs` (cumulative
+high-water since start) — the #587 gate instrument** for the "relays flip AUTONOMOUS while the hub
+loop was merely busy" class: if these stay at a few ms during an episode, neither a cached `/health`
+nor a separate listener would have answered it, and the A/B choice is moot. A tick ≥ 250 ms late
+additionally logs one `[EventLoop] lag=<n>ms` line (timestamped by `docker logs -t`), joinable with
+the sidecars' `→ AUTONOMOUS` transitions on the same clock. It is a manual 20 ms tick
+probe, **not** `perf_hooks.monitorEventLoopDelay` — that API is a measured stub on the production
+runtime (a 200 ms synchronous block records 0 on oven/bun 1.3.14, script and test context alike).
+⚠ **Windows seats read with a floor**: the 20 ms interval fires at ~31 ms there (timer granularity),
+so every tick "lags" ~11 ms — p50-style readings carry that floor, and it is why the blocked sum
+floors at 50 ms. The hub (Linux) is unaffected. **The probe runs on the MONOTONIC clock**
+(`performance.now()`, #615 review): `Date.now()` is wall time, so an NTP resync or the WSL2 VM clock
+catching up after host load would step it forward and manufacture a phantom `[EventLoop]` line — the
+false positive that would then correlate with an AUTONOMOUS flip caused by the same host event — while
+a backward step silently drops samples. The line's wall time comes from `docker logs -t`, which is the
+clock the sidecar transitions are read on. Appended keys only (#156/#439 discipline); nothing
+in the data path or the health route gates on them.
 
 **Client impact beyond the 502s — #410 owns the defect; the *timing tie* now holds.** The Zod
 rejection is real and measured: `config.json` carried `maxConcurrency: 16`, the image then in

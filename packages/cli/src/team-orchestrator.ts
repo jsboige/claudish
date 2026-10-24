@@ -6,8 +6,10 @@ import {
   existsSync,
   readdirSync,
   createWriteStream,
+  lstatSync,
+  realpathSync,
 } from "node:fs";
-import path, { join, resolve } from "node:path";
+import path, { basename, dirname, join, resolve } from "node:path";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -104,15 +106,87 @@ export function isWithinDir(base: string, target: string, p: PathModuleLike): bo
 }
 
 /**
+ * Real path of `candidate`, resolving the nearest EXISTING ancestor and re-appending
+ * the non-existent tail verbatim — so a session directory that does not exist yet is
+ * still adjudicated by where its parent really lives (#586).
+ *
+ * `lstatSync` rather than `statSync` is deliberate: a dangling symlink counts as
+ * existing, so `realpathSync` throws on it and the caller refuses a path it cannot
+ * vouch for instead of silently accepting its un-resolved spelling.
+ *
+ * Returns null when nothing along the chain can be resolved.
+ */
+function realpathOfNearestExisting(candidate: string): string | null {
+  let existing = candidate;
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      lstatSync(existing);
+      break;
+    } catch {
+      const parent = dirname(existing);
+      if (parent === existing) break;
+      tail.unshift(basename(existing));
+      existing = parent;
+    }
+  }
+  try {
+    return join(realpathSync(existing), ...tail);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Validate that sessionPath is within cwd (prevents path traversal in MCP tools).
- * Returns the resolved absolute path.
+ * Returns the resolved absolute path, in the caller's spelling.
+ *
+ * The comparison is on REAL paths, never on spellings (#586). A lexical check gets
+ * both directions wrong: it accepts a symlink that sits inside cwd and points out of
+ * it (a traversal hole), and it refuses a legitimate alternate spelling of cwd (a
+ * symlinked checkout, or macOS' /var → /private/var).
  */
 export function validateSessionPath(sessionPath: string): string {
   const resolved = resolve(sessionPath);
-  if (!isWithinDir(process.cwd(), resolved, path)) {
-    throw new Error(`Session path must be within current directory: ${sessionPath}`);
-  }
+  const outside = () => new Error(`Session path must be within current directory: ${sessionPath}`);
+
+  const real = realpathOfNearestExisting(resolved);
+  if (real === null) throw outside(); // a dangling symlink leads nowhere we can vouch for
+  if (!isWithinDir(realpathSync(process.cwd()), real, path)) throw outside();
+
   return resolved;
+}
+
+// ─── Child stdin guard ───────────────────────────────────────────────────────
+
+/** The slice of a child's stdin this module needs — injectable for tests. */
+export interface StdinLike {
+  on(event: "error", listener: (err: NodeJS.ErrnoException) => void): unknown;
+}
+
+/**
+ * Guard the write end of a child's stdin (#586, ported from upstream 03409b25).
+ *
+ * A slot cancelled — or a child that exits — before it drains stdin closes the
+ * pipe under a pending write. Node surfaces that as an `error` event on the
+ * stream, and an unhandled `error` event is an uncaught exception in the
+ * ORCHESTRATOR, not in the child: one cancelled slot would take down the whole
+ * run instead of just itself.
+ *
+ * EPIPE means only "the reader went away", which the exit/close handlers
+ * already report, so it is swallowed. Any other stdin error is forwarded to the
+ * slot's captured stderr, so it lands in the error log next to the child's own
+ * output instead of vanishing.
+ */
+export function attachStdinErrorGuard(
+  stdin: StdinLike | null | undefined,
+  anonId: string,
+  appendStderr: (text: string) => void
+): void {
+  stdin?.on("error", (err: NodeJS.ErrnoException) => {
+    if (err?.code === "EPIPE") return;
+    appendStderr(`[claudish] stdin error for slot ${anonId}: ${err?.message ?? String(err)}\n`);
+  });
 }
 
 // ─── Sentinel Model Validation ───────────────────────────────────────────────
@@ -322,7 +396,11 @@ export async function runModels(
       stderr += chunk.toString();
     });
 
-    // Pipe input to stdin
+    // Pipe input to stdin — the error guard must be attached BEFORE the write:
+    // a listener added afterwards never sees the failure it was meant to catch.
+    attachStdinErrorGuard(proc.stdin, anonId, (text) => {
+      stderr += text;
+    });
     proc.stdin?.write(inputContent);
     proc.stdin?.end();
 

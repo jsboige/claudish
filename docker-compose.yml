@@ -23,20 +23,31 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
-    # How long Docker waits after SIGTERM before SIGKILL.
+    # How long Docker waits after SIGTERM before SIGKILL — the OUTER bound.
     #
-    # This is the bound on the proxy's graceful shutdown, and the ONLY one: the
-    # SIGTERM handler in `standalone-proxy.ts` waits for in-flight responses to
-    # finish without an internal deadline, deliberately — a timer there would be
-    # a second, invisible answer to a question this field already answers, and
-    # an operator who needs out now sends the signal twice.
+    # The inner bound lives in the app: `CLAUDISH_SHUTDOWN_GRACE_MS` (default
+    # 30s) plus a 250ms settlement window, added because the pre-#630 path
+    # awaited ALL open connections with no deadline of its own (measured: 482ms
+    # with no client, 21 401ms with a single half-written request). That 21s is
+    # paid with the listener already closed, so an internal bound is worth the
+    # second answer it costs — and this field is no longer the only one.
+    # (Whether a draining container can hold a WSL VM past its power-off
+    # deadline is NOT established: in the one incident checked, ai-01 on
+    # 2026-10-24, the sidecar exited 0.16s after SIGTERM.)
+    #
+    # This field still matters as the backstop when the process is wedged below
+    # the app (an unresponsive event loop cannot honour its own grace), and an
+    # operator who needs out now sends the signal twice.
     #
     # Docker's default is 10s. A response stream lasts E[S] ~ 18s (measured on
     # the hub over 45.9h, M/G/inf on 95706 samples), so the default would kill
     # the majority of them mid-body and surface client-side as the very error
     # the graceful path exists to remove: `Connection lost mid-response`.
     # 120s covers the distribution with margin; it is paid only at shutdown, and
-    # only for as long as streams are actually still running.
+    # only for as long as streams are actually still running. Now that the app
+    # bounds itself at 30s it is never reached on a healthy process — lowering
+    # it is therefore safe, but it is a separate, announced change: a value that
+    # cuts streams mid-body is the one mistake this field can make.
     stop_grace_period: 120s
     ports:
       # Host port is per-machine: 3000 is already taken on some sidecar hosts.
@@ -73,6 +84,14 @@ services:
       - type: bind
         source: ${CLAUDISH_CAPTURE_HOST_DIR:-D:\claudish-captures}
         target: /captures
+      # Model-catalog disk cache. The config bind above is deliberately read-only
+      # (it carries the provider API keys), so the catalog refresh had nowhere to
+      # persist: every refresh logged `cache write skipped (EROFS)`. A named
+      # volume gives it a writable home, survives recreates, and exposes nothing
+      # on the host. Paired with CLAUDISH_MODEL_CACHE_PATH.
+      - type: volume
+        source: claudish-model-cache
+        target: /var/cache/claudish
     environment:
       - NODE_ENV=production
       - CLAUDISH_PROXY_KEY=${CLAUDISH_PROXY_KEY:-}
@@ -106,12 +125,23 @@ services:
       # the probe) never runs. Listed here because the env file only
       # interpolates: a name absent from this list never reaches the container.
       - CLAUDISH_MACHINE=${CLAUDISH_MACHINE:-}
+      # Writable home for the model-catalog disk cache (volume declared below).
+      # The default points INSIDE the container on purpose: ~/.claudish is the
+      # read-only config bind, so leaving it empty would restore the
+      # `cache write skipped (EROFS)` the volume exists to fix.
+      - CLAUDISH_MODEL_CACHE_PATH=${CLAUDISH_MODEL_CACHE_PATH:-/var/cache/claudish/all-models.json}
       # Deep-probe model for relay recovery (#613). Empty = the built-in
       # role-shaped default (claude-haiku-4-5-20251001), which the hub resolves on
       # its own haiku lane so a z.ai-only outage cannot pin a sidecar AUTONOMOUS.
       # Set to a concrete (e.g. glm-5.3) to restore the pre-#613 behavior. Listed
       # here because the env file only interpolates.
       - CLAUDISH_RELAY_PROBE_MODEL=${CLAUDISH_RELAY_PROBE_MODEL:-}
+      # Second-attempt model for the deep probe (#636 review): on a hub with no
+      # modelMap the haiku-shaped id stays NATIVE, so the probe gets a 503
+      # refusal or a 401 and the sidecar would never return to NOMINAL. The
+      # same tick retries on this model, which the hub resolves on the sonnet
+      # role. Empty = the built-in glm-5.3.
+      - CLAUDISH_RELAY_PROBE_FALLBACK_MODEL=${CLAUDISH_RELAY_PROBE_FALLBACK_MODEL:-}
       # Native credential guard kill switch (#296): only an explicit "0" disarms;
       # empty = guard on. Listed here because the env file only interpolates —
       # a name absent from this list never reaches the container.
@@ -221,6 +251,12 @@ services:
       - CLAUDISH_CONNECT_RETRY_MAX=${CLAUDISH_CONNECT_RETRY_MAX:-}
       - CLAUDISH_CONNECT_RETRY_DELAYS_MS=${CLAUDISH_CONNECT_RETRY_DELAYS_MS:-}
       - CLAUDISH_STALL_THRESHOLD_MS=${CLAUDISH_STALL_THRESHOLD_MS:-}
+      # #630 — bound on the proxy's graceful shutdown (ms), the complement of
+      # stop_grace_period above: how long shutdown() waits for consumable work
+      # (a request fully received whose response is still being written) before
+      # cutting. Read once per shutdown; must stay under stop_grace_period or
+      # the runtime kill answers first. Empty = 30000.
+      - CLAUDISH_SHUTDOWN_GRACE_MS=${CLAUDISH_SHUTDOWN_GRACE_MS:-}
       # Auth & native lane: key-rotation overlap + #219 auto-pin.
       - CLAUDISH_PROXY_KEY_PREVIOUS=${CLAUDISH_PROXY_KEY_PREVIOUS:-}
       - CLAUDISH_NATIVE_PIN_AUTO=${CLAUDISH_NATIVE_PIN_AUTO:-}
@@ -262,3 +298,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  claudish-model-cache:

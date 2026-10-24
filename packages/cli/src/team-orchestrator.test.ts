@@ -14,15 +14,22 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import {
   mkdtempSync,
+  mkdirSync,
   writeFileSync,
   existsSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, win32, posix } from "node:path";
+import { join, resolve, win32, posix, dirname } from "node:path";
+import { EventEmitter } from "node:events";
+import { fileURLToPath } from "node:url";
 import type { VoteResult } from "./team-orchestrator.js";
+
+/** This file's own directory — lets a pin read the module under test as text. */
+const here = dirname(fileURLToPath(import.meta.url));
 
 // ─── Dynamic imports (resolved at runtime so the module doesn't need to exist
 //     until the tests actually run) ──────────────────────────────────────────
@@ -432,6 +439,181 @@ describe("team-orchestrator", () => {
       const { validateSessionPath } = await getOrchestrator();
 
       expect(() => validateSessionPath("../../etc/hosts")).toThrow();
+    });
+  });
+
+  // ── validateSessionPath: #586 — real paths, not spellings ────────────────
+  //
+  // One pin per code path of the realpath walk. A lexical comparison gets both
+  // directions wrong: it ACCEPTS a link inside cwd that points out of it, and it
+  // REFUSES an alternate spelling of cwd. Both sides are pinned here.
+  //
+  // These tests chdir into their own sandbox, so "cwd" is a directory this file
+  // owns — nothing is created inside the repository checkout.
+
+  describe("validateSessionPath — symlinks and alternate spellings of cwd", () => {
+    let sandbox: string;
+    let previousCwd: string;
+
+    /** Directory links need no elevation on win32 as junctions; POSIX uses "dir". */
+    function makeDirLink(target: string, linkPath: string): void {
+      symlinkSync(target, linkPath, process.platform === "win32" ? "junction" : "dir");
+    }
+
+    beforeEach(() => {
+      previousCwd = process.cwd();
+      sandbox = makeTempDir();
+      mkdirSync(join(sandbox, "base", "inside"), { recursive: true });
+      mkdirSync(join(sandbox, "outside"), { recursive: true });
+      process.chdir(join(sandbox, "base"));
+    });
+
+    afterEach(() => {
+      process.chdir(previousCwd);
+      rmSync(sandbox, { recursive: true, force: true });
+    });
+
+    it("accepts an existing directory inside cwd", async () => {
+      const { validateSessionPath } = await getOrchestrator();
+
+      const inside = join(process.cwd(), "inside");
+      expect(validateSessionPath(inside)).toBe(inside);
+    });
+
+    it("accepts a not-yet-created directory whose parent exists (one tail component)", async () => {
+      const { validateSessionPath } = await getOrchestrator();
+
+      const pending = join(process.cwd(), "inside", "session-001");
+      expect(validateSessionPath(pending)).toBe(pending);
+    });
+
+    it("accepts a path several levels below the nearest existing ancestor", async () => {
+      const { validateSessionPath } = await getOrchestrator();
+
+      const deep = join(process.cwd(), "inside", "a", "b", "c");
+      expect(validateSessionPath(deep)).toBe(deep);
+    });
+
+    it("accepts an alternate spelling of cwd reached through a symlink", async () => {
+      const { validateSessionPath } = await getOrchestrator();
+      const link = join(sandbox, "cwd-alias");
+      makeDirLink(process.cwd(), link);
+
+      // The spelling is outside base lexically, but resolves INSIDE cwd.
+      const aliased = join(link, "inside");
+      expect(() => validateSessionPath(aliased)).not.toThrow();
+      expect(validateSessionPath(aliased)).toBe(aliased);
+    });
+
+    it("refuses a symlink that sits inside cwd and points OUTSIDE it", async () => {
+      const { validateSessionPath } = await getOrchestrator();
+      const escapeHatch = join(process.cwd(), "escape");
+      makeDirLink(join(sandbox, "outside"), escapeHatch);
+
+      // Lexically inside cwd; really outside. This is the traversal hole.
+      expect(() => validateSessionPath(join(escapeHatch, "loot"))).toThrow(
+        /must be within current directory/
+      );
+    });
+
+    it("refuses a dangling symlink — a path it cannot resolve is not a path it can vouch for", async () => {
+      const { validateSessionPath } = await getOrchestrator();
+      const dangling = join(process.cwd(), "dangling");
+      makeDirLink(join(sandbox, "does-not-exist-anywhere"), dangling);
+
+      expect(() => validateSessionPath(join(dangling, "session"))).toThrow(
+        /must be within current directory/
+      );
+    });
+
+    it("still refuses a plainly outside path resolved against the real cwd", async () => {
+      const { validateSessionPath } = await getOrchestrator();
+
+      expect(() => validateSessionPath(join(sandbox, "outside"))).toThrow(
+        /must be within current directory/
+      );
+    });
+  });
+
+  // ── attachStdinErrorGuard: #586 — a cancelled slot must not kill the run ──
+  //
+  // The defect: `startModels()` wrote to the child's stdin with no `error`
+  // listener. A slot cancelled (or a child exiting) before it drains stdin
+  // closes the pipe under the write, Node emits `error` on the stream, and an
+  // unhandled `error` event is an uncaught exception in the ORCHESTRATOR.
+
+  describe("attachStdinErrorGuard", () => {
+    /** A stream stub carrying only the surface the guard touches. */
+    function fakeStdin(): EventEmitter {
+      return new EventEmitter();
+    }
+
+    function withCode(message: string, code: string): NodeJS.ErrnoException {
+      return Object.assign(new Error(message), { code });
+    }
+
+    it("CONTROL: an unguarded stream throws on `error` — this is the defect being fixed", () => {
+      const bare = fakeStdin();
+
+      // Reproduction, not decoration: Node's EventEmitter throws for an
+      // unhandled `error` event, and inside startModels that throw is the
+      // orchestrator's, not the child's.
+      expect(() => bare.emit("error", withCode("write EPIPE", "EPIPE"))).toThrow();
+    });
+
+    it("swallows EPIPE — the reader went away, which exit/close already reports", async () => {
+      const { attachStdinErrorGuard } = await getOrchestrator();
+      const stdin = fakeStdin();
+      const lines: string[] = [];
+
+      attachStdinErrorGuard(stdin as never, "anon-1", (t) => lines.push(t));
+      expect(() => stdin.emit("error", withCode("write EPIPE", "EPIPE"))).not.toThrow();
+      expect(lines).toEqual([]);
+    });
+
+    it("forwards any other stdin error to the slot's stderr sink", async () => {
+      const { attachStdinErrorGuard } = await getOrchestrator();
+      const stdin = fakeStdin();
+      const lines: string[] = [];
+
+      attachStdinErrorGuard(stdin as never, "anon-7", (t) => lines.push(t));
+      stdin.emit("error", withCode("no space left on device", "ENOSPC"));
+
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("anon-7");
+      expect(lines[0]).toContain("no space left on device");
+      expect(lines[0].endsWith("\n")).toBe(true);
+    });
+
+    it("still reports an error carrying no code and no message", async () => {
+      const { attachStdinErrorGuard } = await getOrchestrator();
+      const stdin = fakeStdin();
+      const lines: string[] = [];
+
+      attachStdinErrorGuard(stdin as never, "anon-9", (t) => lines.push(t));
+      stdin.emit("error", {});
+
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("anon-9");
+    });
+
+    it("tolerates a missing stdin (spawn failure leaves it undefined)", async () => {
+      const { attachStdinErrorGuard } = await getOrchestrator();
+
+      expect(() => attachStdinErrorGuard(undefined, "anon-1", () => {})).not.toThrow();
+      expect(() => attachStdinErrorGuard(null, "anon-1", () => {})).not.toThrow();
+    });
+
+    it("WIRING: the guard is attached BEFORE the write in startModels", () => {
+      // A listener added after the write never sees the failure it was meant
+      // to catch, so ordering is the property that matters — not mere presence.
+      const source = readFileSync(join(here, "team-orchestrator.ts"), "utf8");
+      const guardAt = source.indexOf("attachStdinErrorGuard(proc.stdin");
+      const writeAt = source.indexOf("proc.stdin?.write(inputContent)");
+
+      expect(guardAt).toBeGreaterThan(-1);
+      expect(writeAt).toBeGreaterThan(-1);
+      expect(guardAt).toBeLessThan(writeAt);
     });
   });
 
