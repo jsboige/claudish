@@ -61,7 +61,15 @@ export interface DiskCacheV2 {
   models: Array<{ id: string }>;
 }
 
-export const ALL_MODELS_CACHE_PATH = join(homedir(), ".claudish", "all-models.json");
+/**
+ * Cache path. In a container the config bind (`~/.claudish`) is deliberately
+ * read-only — it carries provider API keys — so the refresh cannot persist
+ * there (EROFS, `docs/reference/ops-scripts.md`). `CLAUDISH_MODEL_CACHE_PATH`
+ * points it at a writable volume instead; empty/unset keeps the historical
+ * `~/.claudish/all-models.json`.
+ */
+export const ALL_MODELS_CACHE_PATH =
+  (process.env.CLAUDISH_MODEL_CACHE_PATH ?? "").trim() || join(homedir(), ".claudish", "all-models.json");
 
 /**
  * Read the cache from disk, normalizing legacy v1 files to a v2 shape.
