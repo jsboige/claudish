@@ -19,7 +19,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { respMarkerLine, ttftMarkerLine } from "../../handlers/shared/traffic-markers.js";
+import { respMarkerLine, ttftMarkerLine, wallMarkerLine } from "../../handlers/shared/traffic-markers.js";
 import {
   __resetCaptureDirMemo,
   createResponseCapture,
@@ -177,5 +177,53 @@ describe("emission sites use the shared builders (anti-re-inlining guard)", () =
       src("../../handlers/shared/response-capture.ts"),
       "response-capture.ts must call respMarkerLine"
     ).toContain("respMarkerLine(");
+  });
+});
+
+describe("wall line — the two-pass client-error instrument's exact join key (#601)", () => {
+  // docs/reference/traffic-analysis.md §"Client-visible final errors": pass 1
+  // collects wall candidates, pass 2 asks whether a [resp] closed THAT request.
+  // Without reqN the question is answered by temporal adjacency, which is only
+  // opposable where interleaving is visible — an under-count risk on a busy
+  // hub. Dropping reqN from the builder (or re-inlining the old template)
+  // turns this block red.
+  const WALL_RE = /^Error \[([^\]]+)\]: HTTP (\d{3}) reqN=(\d+)\. (.*)$/;
+
+  test("carries the request's own reqN — exact join with `[resp] … reqN=K`", () => {
+    const line = wallMarkerLine("GLM Coding", 429, 42, "Rate limited…");
+    expect(line).toBe("Error [GLM Coding]: HTTP 429 reqN=42. Rate limited…");
+    const m = WALL_RE.exec(line);
+    expect(m).not.toBeNull();
+    expect([m![1], m![2], m![3], m![4]]).toEqual([
+      "GLM Coding",
+      "429",
+      "42",
+      "Rate limited…",
+    ]);
+  });
+
+  test("no `[claudish] ` prefix and no trailing newline — logStderr adds both", () => {
+    expect(wallMarkerLine("X", 500, 1, "h")).toBe("Error [X]: HTTP 500 reqN=1. h");
+  });
+
+  test("a recovery hint with dots and spaces stays in the last field", () => {
+    const m = WALL_RE.exec(
+      wallMarkerLine("Kimi Coding", 429, 7, "Quota wall: plan exhausted. Reset 24/10 08:39Z.")
+    );
+    expect(m).not.toBeNull();
+    expect(m![3]).toBe("7");
+    expect(m![4]).toBe("Quota wall: plan exhausted. Reset 24/10 08:39Z.");
+  });
+
+  test("composed-handler emits it through the builder, with the request's own number", () => {
+    const src = readFileSync(
+      join(import.meta.dir, "../../handlers/composed-handler.ts"),
+      "utf8"
+    );
+    expect(src).toContain("wallMarkerLine(");
+    // the number comes from the raw Request, never the global counter
+    expect(src).toContain("requestNumberFor(c)");
+    // the pre-#601 inline template must be gone (re-inlining = red)
+    expect(src).not.toContain("]: HTTP ${response.status}. ${hint}");
   });
 });
