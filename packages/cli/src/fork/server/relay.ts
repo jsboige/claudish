@@ -862,6 +862,28 @@ function probeModel(): string {
 }
 
 /**
+ * Second-attempt model for the deep probe (#636 review). The haiku-shaped id is
+ * only served through `modelMap` / the `CLAUDISH_NO_ANTHROPIC` reroute: on a hub
+ * WITHOUT a modelMap it stays NATIVE, and the probe — which sends no
+ * `authorization`, by design — gets a `503` refusal or a `401`. Reading that as
+ * "hub down" keeps the sidecar AUTONOMOUS forever after its next hub cut, with
+ * no outage to explain it. The same tick therefore retries on a model the hub
+ * resolves on the SONNET role (`glm-5.3`), the pre-#613 probe model.
+ *
+ * Read per call like every runtime knob here; empty/unset = the built-in
+ * default. An explicit value is NOT required to differ from
+ * {@link probeModel} — an identical retry is left in place on purpose: a
+ * transient 5xx otherwise waits a full prober interval for its second chance.
+ */
+const DEFAULT_PROBE_FALLBACK_MODEL = "glm-5.3";
+
+function probeFallbackModel(): string {
+  const v = process.env.CLAUDISH_RELAY_PROBE_FALLBACK_MODEL;
+  const trimmed = typeof v === "string" ? v.trim() : "";
+  return trimmed || DEFAULT_PROBE_FALLBACK_MODEL;
+}
+
+/**
  * Deep probe (port of scripts/claudish-watchdog.ps1 Test-ProxyWithTools): a real
  * tool-call stream must complete with a terminal `message_stop`. Confirms the
  * WHOLE pipeline works — not just that /health answers — before returning to
@@ -895,9 +917,43 @@ function probeModel(): string {
  * genuine hub absence. It is fixed on correctness and observability, not on a
  * measured incident.
  *
+ * **A failed first attempt gets exactly one retry in the SAME tick**, on
+ * {@link probeFallbackModel} (#636 review): the haiku-shaped id is native-only
+ * on a hub without a modelMap, where the credential-less probe collects a 503
+ * or a 401 — a wiring shape that would otherwise pin a sidecar AUTONOMOUS
+ * indefinitely. The probe is TRUE if either attempt passes, and every line
+ * names the model that decided it. Bound: two fetches per tick, never a third.
+ *
  * Exported for the regression test only.
  */
 export async function deepProbe(state: RelayState): Promise<boolean> {
+  const first = probeModel();
+  const firstResult = await probeAttempt(state, first);
+  if (firstResult.ok) return true;
+  const fallback = probeFallbackModel();
+  log(
+    `[Relay] deep probe: first attempt on ${first} failed (${firstResult.reason}) — ` +
+      `second attempt on ${fallback} in the same tick`,
+    true
+  );
+  const secondResult = await probeAttempt(state, fallback);
+  // No second "OK" line here: the attempt already logged one, naming the model
+  // that passed. The line above names the model that failed. Two OK lines per
+  // recovery would read as two probes.
+  if (secondResult.ok) return true;
+  log(
+    `[Relay] deep probe failed on both models: ${first} (${firstResult.reason}), ` +
+      `${fallback} (${secondResult.reason})`,
+    true
+  );
+  return false;
+}
+
+/** One deep-probe request. No logging of the verdict — the caller owns it. */
+async function probeAttempt(
+  state: RelayState,
+  model: string
+): Promise<{ ok: boolean; reason: string }> {
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (state.proxyKey) headers["x-proxy-key"] = state.proxyKey;
@@ -908,7 +964,7 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
     const machine = machineName();
     if (machine) headers["X-Claudish-Machine"] = machine;
     const body = JSON.stringify({
-      model: probeModel(),
+      model,
       max_tokens: 100,
       stream: true,
       tools: [
@@ -945,17 +1001,15 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
       if (isQuotaExhaustion(res.status, errBody)) {
         log(
           `[Relay] deep probe: upstream answered ${res.status} naming a quota/plan wall — ` +
-            `that IS liveness (it routed the request to answer), returning to NOMINAL`,
+            `that IS liveness (it routed the request to answer), returning to NOMINAL (model=${model})`,
           true
         );
-        return true;
+        return { ok: true, reason: "quota wall = liveness" };
       }
-      log(`[Relay] deep probe failed: upstream HTTP ${res.status}`, true);
-      return false;
+      return { ok: false, reason: `upstream HTTP ${res.status}` };
     }
     if (!res.body) {
-      log(`[Relay] deep probe failed: HTTP ${res.status} with no body`, true);
-      return false;
+      return { ok: false, reason: `HTTP ${res.status} with no body` };
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -971,28 +1025,26 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
         // without a probe" (that silence produced a retracted false reading
         // about where the probe is served, 06/10). One bounded line per
         // probe, on the deep-probe path only — never per heartbeat.
-        log(`[Relay] deep probe OK — message_stop after ${Date.now() - startedAt}ms`, true);
+        log(
+          `[Relay] deep probe OK — message_stop after ${Date.now() - startedAt}ms (model=${model})`,
+          true
+        );
         try {
           await reader.cancel();
         } catch {
           /* ignore */
         }
-        return true;
+        return { ok: true, reason: "" };
       }
       if (acc.length > 200_000) break; // bound memory
     }
     // Reached only by a stream that ended (or overran) without a terminal frame.
-    log(
-      `[Relay] deep probe failed: stream ended after ${acc.length} bytes without message_stop`,
-      true
-    );
-    return false;
+    return { ok: false, reason: `stream ended after ${acc.length} bytes without message_stop` };
   } catch (e) {
-    // Every other exit already logged its reason; this one carries the last.
-    // Without these lines a sidecar held in AUTONOMOUS behind a healthy hub gave
-    // no signal at all — the gate was invisible in the logs.
-    log(`[Relay] deep probe failed: ${String(e).slice(0, 200)}`, true);
-    return false;
+    // Every other exit names its reason; this one carries the last. Without
+    // these lines a sidecar held in AUTONOMOUS behind a healthy hub gave no
+    // signal at all — the gate was invisible in the logs.
+    return { ok: false, reason: String(e).slice(0, 200) };
   }
 }
 
