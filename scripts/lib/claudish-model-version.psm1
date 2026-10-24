@@ -364,6 +364,34 @@ function Write-VersionEvent {
     [System.IO.File]::AppendAllText($EventsPath, $evt + "`n", (New-Object System.Text.UTF8Encoding($false)))
 }
 
+function Test-VersionEventEmitted {
+    # Dedup for the 6h cadence, the Test-RoleAliasAskEmitted model generalized:
+    # an event already in the log with the same (kind, family, from, to) is the
+    # SAME FACT re-observed — report-only decisions never change the state they
+    # describe, so re-emitting them every run floods the relay channel forever.
+    # The run LOG still prints every observation; only the EVENT is suppressed.
+    # The identifying tuple is the transition (from -> to): once the operator
+    # acts, the tuple changes and the new fact does emit.
+    param(
+        [Parameter(Mandatory = $true)][string]$EventsPath,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$Family,
+        [string]$From = '',
+        [string]$To = ''
+    )
+    if (-not (Test-Path -LiteralPath $EventsPath)) { return $false }
+    foreach ($line in @([System.IO.File]::ReadAllLines($EventsPath))) {
+        $t = $line.Trim()
+        if (-not $t) { continue }
+        try { $evt = $t | ConvertFrom-Json } catch { continue }
+        if ($null -eq $evt) { continue }
+        if ("$($evt.kind)" -eq $Kind -and "$($evt.family)" -eq $Family -and "$($evt.from)" -eq $From -and "$($evt.to)" -eq $To) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Invoke-DrainDetachedRestart {
     <#
         .SYNOPSIS
@@ -678,6 +706,24 @@ function Get-ProviderProbeTargets {
         elseif ($entry.PSObject.Properties['baseUrl']) { $baseUrl = [string]$entry.baseUrl }
         if ($entry.PSObject.Properties['apiPath']) { $apiPath = [string]$entry.apiPath }
 
+        # Wire detection mirrors the loader's: simple entries key on `format`,
+        # complex on `transport`. The wire decides the auth-header DEFAULT —
+        # an explicit authScheme always wins (custom-endpoints-loader.ts).
+        $wire = ''
+        if ($entry.PSObject.Properties['format']) { $wire = [string]$entry.format }
+        elseif ($entry.PSObject.Properties['transport']) { $wire = [string]$entry.transport }
+        $authScheme = ''
+        if ($entry.PSObject.Properties['authScheme']) { $authScheme = [string]$entry.authScheme }
+        if ([string]::IsNullOrWhiteSpace($authScheme)) {
+            if ($wire -eq 'anthropic') { $authScheme = 'x-api-key' } else { $authScheme = 'bearer' }
+        }
+        # Only complex endpoints may carry `headers` (extra request headers,
+        # applied AFTER the auth header — the transports merge in that order).
+        $extraHeaders = $null
+        if ($null -ne $entry.PSObject.Properties['headers'] -and $null -ne $entry.headers) {
+            $extraHeaders = $entry.headers
+        }
+
         # `${VAR}` is a reference; anything else is the literal key. The literal
         # is carried for the probe and NEVER logged (see Format-ProviderProbeLine).
         $keyName = ''
@@ -688,24 +734,57 @@ function Get-ProviderProbeTargets {
         elseif ($apiKey.Length -gt 0) { $keyInline = $apiKey }
 
         $targets += @{
-            Prefix    = $prefix
-            Probeable = $true
-            Kind      = 'custom'
-            Url       = (Get-ModelsUrl -BaseUrl $baseUrl -ApiPath $apiPath)
-            KeyName   = $keyName
-            KeyInline = $keyInline
-            Reason    = ''
+            Prefix       = $prefix
+            Probeable    = $true
+            Kind         = 'custom'
+            Url          = (Get-ModelsUrl -BaseUrl $baseUrl -ApiPath $apiPath)
+            KeyName      = $keyName
+            KeyInline    = $keyInline
+            AuthScheme   = $authScheme
+            ExtraHeaders = $extraHeaders
+            Reason       = ''
         }
     }
     return $targets
 }
 
+function Get-ProbeHeaders {
+    # Pure header build, mirroring the transports the proxy itself uses
+    # (anthropic-compat.ts getHeaders): the auth header comes from
+    # $AuthScheme — 'bearer' -> Authorization: Bearer, anything else ->
+    # x-api-key — and $ExtraHeaders apply AFTER it (Object.assign order: an
+    # extra header may legitimately override the auth header). Pure so the
+    # suite can pin every shape without touching the wire.
+    param(
+        [string]$Key,
+        [string]$AuthScheme = 'bearer',
+        $ExtraHeaders = $null
+    )
+    $headers = @{ Accept = 'application/json' }
+    if ($Key.Length -gt 0) {
+        if ($AuthScheme -eq 'x-api-key') { $headers['x-api-key'] = $Key }
+        else { $headers['Authorization'] = "Bearer $Key" }
+    }
+    if ($null -ne $ExtraHeaders) {
+        foreach ($p in @($ExtraHeaders.PSObject.Properties)) {
+            $headers[[string]$p.Name] = [string]$p.Value
+        }
+    }
+    return $headers
+}
+
 function Invoke-ProbeHttpGet {
     # Default transport. Separated so the suite can inject a fake and stay off
-    # the wire (production: 5.1, hence -UseBasicParsing).
-    param([string]$Url, [string]$Key, [int]$TimeoutSec = 15)
-    $headers = @{ Accept = 'application/json' }
-    if ($Key.Length -gt 0) { $headers['Authorization'] = "Bearer $Key" }
+    # the wire (production: 5.1, hence -UseBasicParsing). Header contract:
+    # Get-ProbeHeaders (authScheme + extra headers, same as the proxy).
+    param(
+        [string]$Url,
+        [string]$Key,
+        [int]$TimeoutSec = 15,
+        [string]$AuthScheme = 'bearer',
+        $ExtraHeaders = $null
+    )
+    $headers = Get-ProbeHeaders -Key $Key -AuthScheme $AuthScheme -ExtraHeaders $ExtraHeaders
     $resp = Invoke-WebRequest -Uri $Url -Headers $headers -Method Get -TimeoutSec $TimeoutSec -UseBasicParsing
     return @{ Status = [int]$resp.StatusCode; Body = [string]$resp.Content }
 }
@@ -759,7 +838,7 @@ function Invoke-ProviderCatalogProbe {
         [scriptblock]$Fetcher = $null,
         [int]$TimeoutSec = 15
     )
-    if ($null -eq $Fetcher) { $Fetcher = { param($u, $k, $t) Invoke-ProbeHttpGet -Url $u -Key $k -TimeoutSec $t } }
+    if ($null -eq $Fetcher) { $Fetcher = { param($u, $k, $t, $s, $h) Invoke-ProbeHttpGet -Url $u -Key $k -TimeoutSec $t -AuthScheme $s -ExtraHeaders $h } }
     $outcomes = @()
     foreach ($t in @($Targets)) {
         if (-not $t.Probeable) {
@@ -782,7 +861,22 @@ function Invoke-ProviderCatalogProbe {
         }
 
         try {
-            $r = & $Fetcher $t.Url $key $TimeoutSec
+            # AuthScheme/ExtraHeaders are read shape-safely: a target built
+            # before #661 (or by a fixture) lacks the keys, and under strict
+            # mode a bare $t.AuthScheme throws on a missing key — the probe
+            # would read "request failed" instead of authenticating.
+            $scheme = ''
+            $extras = $null
+            if ($t -is [System.Collections.IDictionary]) {
+                if ($t.Contains('AuthScheme')) { $scheme = [string]$t['AuthScheme'] }
+                if ($t.Contains('ExtraHeaders')) { $extras = $t['ExtraHeaders'] }
+            } else {
+                $sp = $t.PSObject.Properties['AuthScheme']
+                if ($null -ne $sp) { $scheme = [string]$sp.Value }
+                $hp = $t.PSObject.Properties['ExtraHeaders']
+                if ($null -ne $hp) { $extras = $hp.Value }
+            }
+            $r = & $Fetcher $t.Url $key $TimeoutSec $scheme $extras
             $status = 0
             if ($null -ne $r -and $null -ne $r.Status) { $status = [int]$r.Status }
             if ($status -eq 401 -or $status -eq 403) {
@@ -912,4 +1006,5 @@ Export-ModuleMember -Function `
     Get-ModelsUrl, Get-ProviderProbeTargets, Invoke-ProviderCatalogProbe, `
     Format-ProviderProbeLine, Compare-ProbedProviderToFamilies, Get-ProbeIds, `
     Split-ProbeDecisions, Get-ApiKeyValue, `
+    Get-ProbeHeaders, Test-VersionEventEmitted, `
     Invoke-DrainDetachedRestart
