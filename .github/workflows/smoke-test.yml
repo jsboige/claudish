@@ -17,7 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Pinned with the rest of the test side: a newer bun rewrites package.json
+      # on install. The pin lives in `.bun-version` at the repo root.
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --cwd packages/cli
