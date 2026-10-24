@@ -132,7 +132,12 @@ probe, **not** `perf_hooks.monitorEventLoopDelay` — that API is a measured stu
 runtime (a 200 ms synchronous block records 0 on oven/bun 1.3.14, script and test context alike).
 ⚠ **Windows seats read with a floor**: the 20 ms interval fires at ~31 ms there (timer granularity),
 so every tick "lags" ~11 ms — p50-style readings carry that floor, and it is why the blocked sum
-floors at 50 ms. The hub (Linux) is unaffected. Appended keys only (#156/#439 discipline); nothing
+floors at 50 ms. The hub (Linux) is unaffected. **The probe runs on the MONOTONIC clock**
+(`performance.now()`, #615 review): `Date.now()` is wall time, so an NTP resync or the WSL2 VM clock
+catching up after host load would step it forward and manufacture a phantom `[EventLoop]` line — the
+false positive that would then correlate with an AUTONOMOUS flip caused by the same host event — while
+a backward step silently drops samples. The line's wall time comes from `docker logs -t`, which is the
+clock the sidecar transitions are read on. Appended keys only (#156/#439 discipline); nothing
 in the data path or the health route gates on them.
 
 **Client impact beyond the 502s — #410 owns the defect; the *timing tie* now holds.** The Zod

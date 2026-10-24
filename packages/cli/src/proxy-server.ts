@@ -2116,9 +2116,17 @@ export async function createProxyServer(
   const lagTsRing = new Float64Array(LAG_RING);
   let lagCount = 0;
   let lagMaxCumulative = 0;
-  const lagState = { lastTick: Date.now() };
+  // #615 review point 2: the probe runs on the MONOTONIC clock. `Date.now()`
+  // is wall time, so an NTP resync (or the WSL2 VM clock catching up after
+  // host load) steps it forward and manufactures a phantom `[EventLoop] lag=`
+  // line — precisely the false positive that would correlate with an
+  // AUTONOMOUS flip caused by the same host event — while a backward step
+  // silently drops samples. `performance.now()` cannot step. The log line
+  // still gets its wall time from `docker logs -t`, which is the clock the
+  // sidecars' transitions are read on.
+  const lagState = { lastTick: performance.now() };
   const lagTimer = setInterval(() => {
-    const now = Date.now();
+    const now = performance.now();
     const lag = now - lagState.lastTick - LAG_TICK_MS;
     if (lag > 0) {
       const slot = lagCount % LAG_RING;
@@ -2126,7 +2134,7 @@ export async function createProxyServer(
       lagTsRing[slot] = now;
       lagCount++;
       if (lag > lagMaxCumulative) lagMaxCumulative = lag;
-      if (lag >= LAG_LOG_THRESHOLD_MS) logStderr(`[EventLoop] lag=${lag}ms`);
+      if (lag >= LAG_LOG_THRESHOLD_MS) logStderr(`[EventLoop] lag=${Math.round(lag)}ms`);
     }
     lagState.lastTick = now;
   }, LAG_TICK_MS);
@@ -2135,7 +2143,7 @@ export async function createProxyServer(
     // Walk sample indices newest→oldest (monotone in lagCount); modulo maps an
     // index to its ring slot once the ring has wrapped. Timestamps are monotone
     // in the index, so the first sample older than the edge ends the walk.
-    const edge = Date.now() - windowMs;
+    const edge = performance.now() - windowMs;
     const oldest = Math.max(0, lagCount - LAG_RING);
     let out = 0;
     for (let idx = lagCount - 1; idx >= oldest; idx--) {

@@ -89,7 +89,8 @@ const realFetch = globalThis.fetch;
 let calls: Record<string, number> = {};
 /** Captured upstream request bodies by endpoint tag (nm/s0/s1/b0/b1/cap/capa). */
 let upstreamBodies: Record<string, any[]> = {};
-/** All countable markers — [Failover], [StepBusy], [ContextGuard] and [MediaCap] (both
+/** All countable markers — [Failover], [StepBusy], [ContextGuard], [EventLoop]
+ * and [MediaCap] (both
  * console.log and stderr are hooked: `log(..., true)` reaches console.log
  * while logStderr reaches stderr). */
 let markerLog: string[] = [];
@@ -318,6 +319,7 @@ beforeEach(() => {
         line.includes("[StepBusy]") ||
         line.includes("[ContextGuard]") ||
         line.includes("[ContextAdmission]") ||
+        line.includes("[EventLoop]") || // #615 review point 1
         line.includes("[MediaCap]") // #575
       ) {
         markerLog.push(line);
@@ -333,6 +335,7 @@ beforeEach(() => {
         line.includes("[StepBusy]") ||
         line.includes("[ContextGuard]") ||
         line.includes("[ContextAdmission]") ||
+        line.includes("[EventLoop]") || // #615 review point 1
         line.includes("[MediaCap]") // #575
       ) {
         markerLog.push(line);
@@ -1140,5 +1143,42 @@ describe("#587 — /health publishes time-localized event-loop lag (gate instrum
     } finally {
       Object.assign(lagProbeWindows, saved);
     }
+  }, 30_000);
+
+  test("H4 (#615 review point 1): the dated [EventLoop] line — one at ≥250 ms, NONE below the threshold", async () => {
+    await spin();
+    resetCascade();
+    // Below the threshold first: ~100 ms of blocking must stay SILENT. This
+    // half is the one that pins the gate itself — a mutant that zeroes the
+    // threshold (or the whole branch) still produces the strong half's line,
+    // so only "quiet under 250 ms" proves the number is doing work.
+    const tQuiet = Date.now();
+    while (Date.now() - tQuiet < 100) {
+      /* spin the loop */
+    }
+    // Let the overdue tick actually fire before reading the markers.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(markerLog.filter((l) => l.includes("[EventLoop]")).length).toBe(0);
+
+    // Above the threshold: ≥300 ms of synchronous blocking. One late tick ⇒
+    // one line, on the stderr channel `docker logs -t` timestamps — the only
+    // signal joinable with the sidecars' `→ AUTONOMOUS` transitions.
+    const tBlock = Date.now();
+    while (Date.now() - tBlock < 400) {
+      /* spin the loop */
+    }
+    await new Promise((r) => setTimeout(r, 150));
+    const lines = markerLog.filter((l) => l.includes("[EventLoop] lag="));
+    expect(lines.length).toBeGreaterThanOrEqual(1);
+    // Every emitted line carries a number at or above the 250 ms gate — no
+    // sub-threshold line sneaks out, and the number is the BLOCK, not the
+    // ~11 ms Windows timer-granularity floor.
+    const lags = lines.map((l) => {
+      const m = l.match(/\[EventLoop\] lag=(\d+)ms/);
+      expect(m).not.toBeNull();
+      return Number(m![1]);
+    });
+    expect(Math.max(...lags)).toBeGreaterThanOrEqual(250);
+    expect(Math.min(...lags)).toBeGreaterThanOrEqual(250);
   }, 30_000);
 });
