@@ -83,8 +83,10 @@ Describe 'sidecar-host-watchdog state round-trip' {
 
     It 'Write-WdState always emits the "...Z" form so any seat and any hand reset round-trips' {
         Write-WdState @{ EngineFailures = 3; LastEngineActionUtc = ([DateTimeOffset]::UtcNow).UtcDateTime; EngineActionsSinceDown = 1 }
-        $raw = Get-Content $script:StatePath -Raw | ConvertFrom-Json
-        $raw.lastEngineActionUtc | Should -Match 'Z$'
+        # Assert on the FILE TEXT: under pwsh 7, ConvertFrom-Json turns the stamp
+        # into a DateTime, whose string form carries no "Z" whatever the file says.
+        $text = Get-Content $script:StatePath -Raw
+        $text | Should -Match '"lastEngineActionUtc"\s*:\s*"[^"]+Z"'
         # And the written form reads back to the same instant (write+read loop).
         $s = Read-WdState
         [Math]::Abs((([DateTimeOffset]::UtcNow).UtcDateTime - $s.LastEngineActionUtc).TotalSeconds) | Should -BeLessThan 120

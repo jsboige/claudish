@@ -965,7 +965,19 @@ function ConvertFrom-WatchdogStateJson {
     $stampRaw = $null
     if ($raw.PSObject.Properties['lastEngineActionUtc']) { $stampRaw = $raw.lastEngineActionUtc }
     if ($null -ne $stampRaw -and "$stampRaw" -ne '') {
-        $lastAction = [DateTimeOffset]::Parse([string]$stampRaw, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+        if ($stampRaw -is [datetime]) {
+            # PowerShell 7's ConvertFrom-Json has ALREADY parsed the ISO string
+            # (Kind=Utc for "...Z", Local for an offset form). Its [string] form
+            # is "10/24/2026 10:00:00": no offset, no sub-second part, so a
+            # re-parse lands on local wall time, 2 h off on a UTC+2 seat
+            # (measured on 7.6.6 / fr-FR, review #639 r2). Keep the instant.
+            $lastAction = $stampRaw.ToUniversalTime()
+        } elseif ($stampRaw -is [DateTimeOffset]) {
+            $lastAction = $stampRaw.UtcDateTime
+        } else {
+            # Windows PowerShell 5.1 leaves the stamp a String.
+            $lastAction = [DateTimeOffset]::Parse([string]$stampRaw, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+        }
     }
     $failures = 0
     if ($raw.PSObject.Properties['engineFailures'] -and $null -ne $raw.engineFailures) { $failures = [int]$raw.engineFailures }
