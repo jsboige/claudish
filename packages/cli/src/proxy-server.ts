@@ -2758,6 +2758,25 @@ export async function createProxyServer(
   const actualPort = typeof addr === "object" && addr?.port ? addr.port : port;
   if (actualPort !== port) port = actualPort;
 
+  // In-flight request counter for the shutdown bound (#630). Counted HERE, at
+  // the server, because this is the only layer that sees both shapes that
+  // matter: a response a client is still waiting for (must not be cut) and a
+  // socket whose client vanished mid-request (must not hold the stop). The
+  // stream tracker cannot answer this — `stream:false` work (`/compact`) never
+  // registers as a stream, and a half-written request never registers at all.
+  let inFlightRequests = 0;
+  server.on("request", (_req, res) => {
+    inFlightRequests++;
+    let counted = true;
+    const done = () => {
+      if (!counted) return;
+      counted = false;
+      inFlightRequests--;
+    };
+    res.on("close", done);
+    res.on("finish", done);
+  });
+
   log(`[Proxy] Server started on port ${port}`);
 
   // Warm pricing cache in background (non-blocking)
@@ -2780,7 +2799,43 @@ export async function createProxyServer(
     // this closure, and /health stops answering once close() drops the socket.
     getActiveStreams: () => streamTracker.getActiveStreams(),
     shutdown: async () => {
-      return new Promise<void>((resolve) => server.close(() => resolve()));
+      // #630: `server.close()` drops the listening socket immediately, then
+      // waits for EVERY connection to end — including one whose client died
+      // mid-request. Measured 2026-10-24 on the real path (hub po-2025):
+      // `shutdown()` did not resolve until the client socket was destroyed
+      // (3046 ms, resolving exactly at the destroy, with a partial POST held
+      // open), and a throwaway container carrying one half-written request took
+      // 21 401 ms to stop against 482 ms with no client at all. With
+      // `stop_grace_period: 120s` a recreate can therefore spend up to two
+      // minutes with the hub down, and the drain's true-zero cannot prevent it:
+      // that instrument counts tracked STREAMS, while a half-written request
+      // never registers and a `stream:false` turn (`/compact`) is not a stream.
+      //
+      // So wait for work a client can still CONSUME, on a bound, then cut.
+      // An idle keep-alive socket is worth nothing to wait for (measured 483 ms
+      // to stop with one open) and a dead client's socket is worse: it is the
+      // exact shape an agent killed mid-turn leaves behind.
+      // 30 s is the compromise: a `stream:false` turn (`/compact`) longer than
+      // that IS cut earlier than the 120 s runtime kill would have cut it, so an
+      // operator who runs long non-streaming turns raises this — it must stay
+      // under `stop_grace_period`, or the bound never fires.
+      const raw = Number(process.env.CLAUDISH_SHUTDOWN_GRACE_MS ?? "30000");
+      const graceMs = Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
+      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+      server.closeIdleConnections?.();
+      const deadline = Date.now() + graceMs;
+      while ((inFlightRequests > 0 || streamTracker.getActiveStreams() > 0) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      server.closeAllConnections?.();
+      // The cut above does not reach a connection still being PARSED — Bun's
+      // compat leaves a half-written request out of the connection registry, so
+      // the close callback would wait for that client forever (measured: still
+      // 3017 ms after a 300 ms grace, resolving only when the client itself
+      // destroyed the socket). Settle on a bound instead: whoever called
+      // shutdown is exiting or re-binding, and an unbounded wait here is the
+      // 120 s outage this whole path exists to avoid.
+      await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 250))]);
     },
   };
 }
