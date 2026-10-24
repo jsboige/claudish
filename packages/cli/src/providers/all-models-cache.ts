@@ -67,9 +67,17 @@ export interface DiskCacheV2 {
  * there (EROFS, `docs/reference/ops-scripts.md`). `CLAUDISH_MODEL_CACHE_PATH`
  * points it at a writable volume instead; empty/unset keeps the historical
  * `~/.claudish/all-models.json`.
+ *
+ * Read PER CALL, never captured in a module constant: the house rule for
+ * runtime knobs, and here it is load-bearing. A constant evaluated at import
+ * splits the cache in two the moment the variable moves — the writers land on
+ * the override while a reader that memoized the old path (catalog-query's
+ * mtime watch) keeps stat-ing the historical file and reports "unchanged"
+ * forever.
  */
-export const ALL_MODELS_CACHE_PATH =
-  (process.env.CLAUDISH_MODEL_CACHE_PATH ?? "").trim() || join(homedir(), ".claudish", "all-models.json");
+export function allModelsCachePath(): string {
+  return (process.env.CLAUDISH_MODEL_CACHE_PATH ?? "").trim() || join(homedir(), ".claudish", "all-models.json");
+}
 
 /**
  * Read the cache from disk, normalizing legacy v1 files to a v2 shape.
@@ -79,10 +87,10 @@ export const ALL_MODELS_CACHE_PATH =
  * `{version: 2, lastUpdated, entries: [], models}` so callers can treat both
  * the same way.
  *
- * @param path Override the cache path. Defaults to `ALL_MODELS_CACHE_PATH`.
+ * @param path Override the cache path. Defaults to `allModelsCachePath()`.
  *             Only tests should pass this.
  */
-export function readAllModelsCache(path: string = ALL_MODELS_CACHE_PATH): DiskCacheV2 | null {
+export function readAllModelsCache(path: string = allModelsCachePath()): DiskCacheV2 | null {
   if (!existsSync(path)) return null;
 
   let raw: unknown;
@@ -118,12 +126,12 @@ export function readAllModelsCache(path: string = ALL_MODELS_CACHE_PATH): DiskCa
  *
  * @param data Partial DiskCacheV2. Any omitted fields are filled from the
  *             existing file (if present) rather than reset to defaults.
- * @param path Override the cache path. Defaults to `ALL_MODELS_CACHE_PATH`.
+ * @param path Override the cache path. Defaults to `allModelsCachePath()`.
  *             Only tests should pass this.
  */
 export function writeAllModelsCache(
   data: Partial<DiskCacheV2>,
-  path: string = ALL_MODELS_CACHE_PATH
+  path: string = allModelsCachePath()
 ): void {
   const existing = readAllModelsCache(path);
 
