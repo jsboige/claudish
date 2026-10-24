@@ -983,6 +983,7 @@ describe("deep probe: quota wall vs hub death", () => {
 
   it("sends NO machine header when CLAUDISH_MACHINE is unset or empty (#345)", async () => {
     const prev = process.env.CLAUDISH_MACHINE;
+
     try {
       // compose injects every listed name as at least "", and "" is NOT nullish
       // (#310) — an unset/empty name must yield NO header, never a `X-Claudish-
@@ -1003,6 +1004,64 @@ describe("deep probe: quota wall vs hub death", () => {
       if (prev === undefined) delete process.env.CLAUDISH_MACHINE;
       else process.env.CLAUDISH_MACHINE = prev;
     }
+  });
+
+  // #613: the probe must measure the HUB's servability, not one provider's. A
+  // concrete z.ai model gates recovery on z.ai — a z.ai-only outage with a
+  // healthy hub keeps every sidecar AUTONOMOUS while the hub serves fine.
+  describe("probe model (#613)", () => {
+    const bodyModel = (): string => JSON.parse(lastFetch!.init.body as string).model;
+
+    it("asks for a role-shaped id, not the z.ai sonnet nominal", async () => {
+      fetchImpl = async () => new Response("nope", { status: 500 });
+      await deepProbe(state());
+      // RED on the pre-#613 code: the body carried the literal "glm-5.3", which
+      // the hub resolves on the SONNET role — one provider deciding recovery.
+      expect(bodyModel()).toBe("claude-haiku-4-5-20251001");
+      expect(bodyModel()).not.toBe("glm-5.3");
+    });
+
+    it("honors CLAUDISH_RELAY_PROBE_MODEL, read per call", async () => {
+      const prev = process.env.CLAUDISH_RELAY_PROBE_MODEL;
+      try {
+        process.env.CLAUDISH_RELAY_PROBE_MODEL = "glm-5.3"; // exact pre-#613 behavior
+        fetchImpl = async () => new Response("nope", { status: 500 });
+        await deepProbe(state());
+        expect(bodyModel()).toBe("glm-5.3");
+
+        process.env.CLAUDISH_RELAY_PROBE_MODEL = "swift-1.5-27b";
+        await deepProbe(state());
+        expect(bodyModel()).toBe("swift-1.5-27b");
+      } finally {
+        if (prev === undefined) delete process.env.CLAUDISH_RELAY_PROBE_MODEL;
+        else process.env.CLAUDISH_RELAY_PROBE_MODEL = prev;
+      }
+    });
+
+    it("treats empty and whitespace as unset", async () => {
+      const prev = process.env.CLAUDISH_RELAY_PROBE_MODEL;
+      try {
+        // compose injects every listed name as at least "" (#310) — empty is not
+        // a model name, it must not reach the hub as one.
+        process.env.CLAUDISH_RELAY_PROBE_MODEL = "   ";
+        fetchImpl = async () => new Response("nope", { status: 500 });
+        await deepProbe(state());
+        expect(bodyModel()).toBe("claude-haiku-4-5-20251001");
+      } finally {
+        if (prev === undefined) delete process.env.CLAUDISH_RELAY_PROBE_MODEL;
+        else process.env.CLAUDISH_RELAY_PROBE_MODEL = prev;
+      }
+    });
+
+    it("stays a DEEP probe: a tool call and a stream are still requested", async () => {
+      fetchImpl = async () => new Response("nope", { status: 500 });
+      await deepProbe(state());
+      const b = JSON.parse(lastFetch!.init.body as string);
+      // The anti-flap design is not in question here — only the model is (#613).
+      expect(b.stream).toBe(true);
+      expect(Array.isArray(b.tools)).toBe(true);
+      expect(b.tools.length).toBeGreaterThan(0);
+    });
   });
 });
 

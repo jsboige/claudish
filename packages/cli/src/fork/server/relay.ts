@@ -837,13 +837,34 @@ function machineName(): string {
 }
 
 /**
+ * Role-shaped Anthropic id: the hub resolves `haiku` and answers with whatever
+ * its cascade serves, which is the question the probe actually asks (#613).
+ */
+const DEFAULT_PROBE_MODEL = "claude-haiku-4-5-20251001";
+
+/**
+ * Probe model, read per call like every runtime knob here. The probe must
+ * measure the HUB's servability, not one provider's (#613): a concrete z.ai
+ * model gates recovery on z.ai, so a z.ai-only outage with a healthy hub
+ * keeps every sidecar AUTONOMOUS while the hub serves fine. Empty/unset =
+ * {@link DEFAULT_PROBE_MODEL}; `CLAUDISH_RELAY_PROBE_MODEL=glm-5.3` restores
+ * the pre-#613 behavior byte for byte.
+ */
+function probeModel(): string {
+  const v = process.env.CLAUDISH_RELAY_PROBE_MODEL;
+  const trimmed = typeof v === "string" ? v.trim() : "";
+  return trimmed || DEFAULT_PROBE_MODEL;
+}
+
+/**
  * Deep probe (port of scripts/claudish-watchdog.ps1 Test-ProxyWithTools): a real
  * tool-call stream must complete with a terminal `message_stop`. Confirms the
  * WHOLE pipeline works — not just that /health answers — before returning to
  * relay. Only run during recovery, so its handful of budget tokens is negligible.
  *
- * **A quota wall is liveness, not death.** The probe asks the hub for one specific
- * model (`glm-5.3`); when that model's plan is spent the hub answers 429/402 —
+ * **A quota wall is liveness, not death.** The probe asks the hub for a model
+ * and the hub answers with whatever its cascade serves ({@link probeModel});
+ * when that lane's plan is spent the hub answers 429/402 —
  * which it can only do by being alive, authenticating the request, routing it and
  * reaching the provider. Reading that as "hub down" holds the recovery gate shut
  * for as long as the wall lasts, and AUTONOMOUS is the worse place to wait: the
@@ -879,7 +900,7 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
     const machine = machineName();
     if (machine) headers["X-Claudish-Machine"] = machine;
     const body = JSON.stringify({
-      model: "glm-5.3",
+      model: probeModel(),
       max_tokens: 100,
       stream: true,
       tools: [
