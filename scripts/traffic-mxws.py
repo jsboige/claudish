@@ -20,6 +20,22 @@ WS_RE = re.compile(r"Primary working directory:\s*(.+?)[\r\n]")
 FN_REQ = re.compile(r"^req-\d+-r?(\d+)-(\d{4}-\d{2}-\d{2})T[\d\-]+Z.*\.json$")
 FN_RESP = re.compile(r"^resp-\d+-r(\d+)-(\d{4}-\d{2}-\d{2})T([\d\-]+)-\d+Z-(\w+)-([a-z0-9.\-]+)\.sse$")
 
+def _load_usage_reader():
+    """Lecteur d'usage partage (#600/#607) : la regle du triplet coherent vit
+    dans lane-out-trend.py ; ce script ne fait que la deleguer."""
+    import importlib.util
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / "usage_reader.py"
+    spec = importlib.util.spec_from_file_location("usage_reader", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_UR = _load_usage_reader()
+
+
 def machine_short(m):
     return (m or "?").replace("myia-", "")
 
@@ -96,10 +112,13 @@ for f in glob.glob(os.path.join(CAP, "resp-*.sse")):
             s = fh.read()
     except Exception:
         continue
-    ins = [int(x) for x in re.findall(r'"input_tokens":(\d+)', s)]
-    outs = [int(x) for x in re.findall(r'"output_tokens":(\d+)', s)]
-    inp = max(ins) if ins else 0
-    out = max(outs) if outs else 0
+    # #607 (le defaut G10 de #600) : un max PAR CHAMP melange le seed de
+    # message_start (input_tokens = tour precedent) et le triplet terminal —
+    # deux instantanes jamais emis ensemble — et double le prompt. Le bloc
+    # coherent decide, ENTIER.
+    u = _UR.usage_triplet(s)
+    inp = _UR.prompt_of(u) if u else 0
+    out = u[1] if u else 0
     resp_tokens[(day, reqN)] = (model, inp, out)
     dmt = day_model_tokens[day][model]
     dmt[0] += 1
