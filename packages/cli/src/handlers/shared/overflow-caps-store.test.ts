@@ -30,6 +30,8 @@ import {
   rememberOverflowCap,
   resetOverflowCapsForTests,
   disarmOverflowCapsPersistence,
+  forgetOverflowCapsForProvider,
+  overflowCapsMaxAgeMs,
 } from "./context-overflow.js";
 
 let dir: string;
@@ -134,7 +136,7 @@ describe("context-overflow integration (restore + write-through)", () => {
   test("init restores what a previous process learned, keyed as the in-memory map is", () => {
     writeFileSync(
       capsFile(),
-      JSON.stringify({ version: 1, caps: { "Vllm-myia::swift-1.5-27b": { cap: 229645, at: "t" } } })
+      JSON.stringify({ version: 1, caps: { "Vllm-myia::swift-1.5-27b": { cap: 229645, at: new Date().toISOString() } } })
     );
     const armed = initOverflowCapsPersistence(capsFile());
     expect(armed.loaded).toBe(1);
@@ -144,7 +146,7 @@ describe("context-overflow integration (restore + write-through)", () => {
   test("a new observation writes through with its evidence, preserving older entries", () => {
     writeFileSync(
       capsFile(),
-      JSON.stringify({ version: 1, caps: { "old::model": { cap: 111, at: "old", evidence: "keep me" } } })
+      JSON.stringify({ version: 1, caps: { "old::model": { cap: 111, at: new Date().toISOString(), evidence: "keep me" } } })
     );
     initOverflowCapsPersistence(capsFile());
     rememberOverflowCap("Vllm-myia", "swift-1.5-27b", 229_645.7, "HTTP 400 input_tokens=262145");
@@ -169,9 +171,105 @@ describe("context-overflow integration (restore + write-through)", () => {
 
   test("a cap restored from disk short-circuits like a freshly learned one (the #651 purpose)", () => {
     // The state after a recreate, before this change: memory empty, cap lost.
-    writeFileSync(capsFile(), JSON.stringify({ version: 1, caps: { "Vllm-myia::model": { cap: 229645, at: "t" } } }));
+    writeFileSync(
+      capsFile(),
+      JSON.stringify({ version: 1, caps: { "Vllm-myia::model": { cap: 229645, at: new Date().toISOString() } } })
+    );
     expect(getOverflowCap("Vllm-myia", "model")).toBeUndefined();
     initOverflowCapsPersistence(capsFile());
     expect(getOverflowCap("Vllm-myia", "model")).toBe(229645);
+  });
+});
+
+describe("expiry (#660 r1) — a restored cap is bounded by its own stamp", () => {
+  const HOUR = 3_600_000;
+  // Ages with wide margins on both sides of the 24 h default: no clock
+  // injection needed, and a slow test runner cannot flip either pin.
+  const iso = (ageMs: number) => new Date(Date.now() - ageMs).toISOString();
+
+  test("older than the TTL is NOT restored; younger IS — and both are counted", () => {
+    writeFileSync(
+      capsFile(),
+      JSON.stringify({
+        version: 1,
+        caps: {
+          "p::stale": { cap: 120_000, at: iso(30 * 24 * HOUR) },
+          "p::fresh": { cap: 90_000, at: iso(HOUR) },
+        },
+      })
+    );
+    const armed = initOverflowCapsPersistence(capsFile());
+    expect(armed.loaded).toBe(1);
+    expect(armed.expired).toBe(1);
+    expect(getOverflowCap("p", "stale")).toBeUndefined();
+    expect(getOverflowCap("p", "fresh")).toBe(90_000);
+  });
+
+  test("a stamp that cannot be parsed is not restored — its age cannot be bounded", () => {
+    writeFileSync(capsFile(), JSON.stringify({ version: 1, caps: { "p::m": { cap: 120_000, at: "t" } } }));
+    const armed = initOverflowCapsPersistence(capsFile());
+    expect(armed.loaded).toBe(0);
+    expect(armed.expired).toBe(1);
+    expect(getOverflowCap("p", "m")).toBeUndefined();
+  });
+
+  test("CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS=0 means no expiry — the 30-day record comes back", () => {
+    writeFileSync(
+      capsFile(),
+      JSON.stringify({ version: 1, caps: { "p::stale": { cap: 120_000, at: iso(30 * 24 * HOUR) } } })
+    );
+    const armed = initOverflowCapsPersistence(capsFile(), {
+      env: { CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS: "0" } as any,
+    });
+    expect(armed.loaded).toBe(1);
+    expect(armed.expired).toBe(0);
+    expect(getOverflowCap("p", "stale")).toBe(120_000);
+  });
+
+  test("unparsable or negative values fall back to the default, never to 'off'", () => {
+    expect(overflowCapsMaxAgeMs({} as any)).toBe(24 * HOUR);
+    expect(overflowCapsMaxAgeMs({ CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS: "garbage" } as any)).toBe(24 * HOUR);
+    expect(overflowCapsMaxAgeMs({ CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS: "-5" } as any)).toBe(24 * HOUR);
+    expect(overflowCapsMaxAgeMs({ CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS: "3600000" } as any)).toBe(HOUR);
+    expect(overflowCapsMaxAgeMs({ CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS: "0" } as any)).toBe(0);
+  });
+});
+
+describe("derivation outranks a restored cap (#660 r1)", () => {
+  const HOUR = 3_600_000;
+  const iso = (ageMs: number) => new Date(Date.now() - ageMs).toISOString();
+
+  test("forgetOverflowCapsForProvider drops only that provider and rewrites the file", () => {
+    writeFileSync(
+      capsFile(),
+      JSON.stringify({
+        version: 1,
+        caps: {
+          "Vllm-myia::swift-1.5-27b": { cap: 229_645, at: iso(HOUR) },
+          "Vllm-myia::other-model": { cap: 111_111, at: iso(HOUR) },
+          "GLM Coding::glm-5.3": { cap: 210_000, at: iso(HOUR) },
+        },
+      })
+    );
+    initOverflowCapsPersistence(capsFile());
+
+    expect(forgetOverflowCapsForProvider("Vllm-myia")).toBe(2);
+    expect(getOverflowCap("Vllm-myia", "swift-1.5-27b")).toBeUndefined();
+    expect(getOverflowCap("Vllm-myia", "other-model")).toBeUndefined();
+    expect(getOverflowCap("GLM Coding", "glm-5.3")).toBe(210_000);
+
+    const onDisk = readOverflowCapsFile(capsFile());
+    expect([...onDisk.keys()]).toEqual(["GLM Coding::glm-5.3"]);
+  });
+
+  test("with no store armed the purge is memory-only and never throws", () => {
+    initOverflowCapsPersistence(undefined);
+    rememberOverflowCap("p", "m", 5);
+    expect(forgetOverflowCapsForProvider("p")).toBe(1);
+    expect(getOverflowCap("p", "m")).toBeUndefined();
+  });
+
+  test("purging a provider nothing was learned for is a no-op, not an error", () => {
+    expect(forgetOverflowCapsForProvider("nobody")).toBe(0);
   });
 });

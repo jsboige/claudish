@@ -122,6 +122,7 @@ import {
   buildOverflowRecoveryStream,
   buildOverflowRecoveryMessage,
   initOverflowCapsPersistence,
+  forgetOverflowCapsForProvider,
   type ContextAdmissionDecision,
   type DeclaredWindow,
 } from "./handlers/shared/context-overflow.js";
@@ -624,7 +625,7 @@ export async function createProxyServer(
   const capsRestored = initOverflowCapsPersistence();
   log(
     capsRestored.path
-      ? `[ContextLimit] learned caps restored n=${capsRestored.loaded} path=${capsRestored.path}`
+      ? `[ContextLimit] learned caps restored n=${capsRestored.loaded} expired=${capsRestored.expired} path=${capsRestored.path}`
       : "[ContextLimit] learned caps are memory-only (CLAUDISH_OVERFLOW_CAPS_PATH unset)"
   );
 
@@ -638,6 +639,19 @@ export async function createProxyServer(
       log(
         `[ContextLimit] derivation: ${derived.filter((d) => d.derived).length}/${derived.length} endpoint(s) derived from /v1/models`
       );
+    }
+    // #660 r1 — a SUCCEEDED derivation outranks any restored learned cap for
+    // that provider: the learned branch is checked first in `handle()`, so a
+    // stale cap would keep refusing what the fresh measurement just allowed.
+    // The purge is what makes "a measurement beats a claim" true at the seam
+    // where the two meet.
+    let capsPurged = 0;
+    for (const outcome of derived) {
+      if (!outcome.derived) continue;
+      capsPurged += forgetOverflowCapsForProvider(outcome.name);
+    }
+    if (capsPurged > 0) {
+      log(`[ContextLimit] derivation replaced ${capsPurged} restored learned cap(s) with the measured window`);
     }
   } catch (err) {
     // Belt and braces: deriveContextLimits swallows per-endpoint failures, and

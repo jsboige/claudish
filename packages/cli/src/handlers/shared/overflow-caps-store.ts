@@ -10,9 +10,9 @@
  * 18 821 log lines, because the engine's plain 400 is not the refusal shape
  * that teaches the cap.
  *
- * Where it lives: the CONFIG bind is mounted READ-ONLY in the container
- * (`D:/claudish-shadow/config` → `/root/.claudish`), so this file must never
- * default to `~/.claudish` there. Persistence is therefore OPT-IN by path
+ * Where it lives: the CONFIG bind is mounted READ-ONLY in the container (the
+ * host config directory → `/root/.claudish`), so this file must never default
+ * to `~/.claudish` there. Persistence is therefore OPT-IN by path
  * (`CLAUDISH_OVERFLOW_CAPS_PATH`), and the compose default points it at the
  * writable `claudish-model-cache` volume next to `all-models.json`. Unset =
  * memory only, byte-identical to today (and keeps every unit test hermetic).
@@ -23,10 +23,20 @@
  *                                              "at": "2026-10-24T07:21:04.000Z",
  *                                              "evidence": "HTTP 400 input_tokens=…" } } }
  *
- * A stale/short cap can only ever cause a recoverable turn (HTTP 200 with the
- * gauge advanced), never a hard failure — that is why plain persistence is
- * safe without an expiry policy. The timestamp and the evidence line are kept
- * so a wrong entry can be identified rather than guessed at.
+ * Expiry (#660 r1): a restored record is bounded by its own `at` stamp —
+ * `CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS`, default 24 h (the effective pre-#651
+ * lifetime, since the watchdog restarts the hub nightly), `0` = no expiry. A
+ * record whose `at` cannot be parsed is not restored at all: its age cannot be
+ * bounded, and the cost of not restoring is one relearning round-trip, never a
+ * refused request. Rationale: a cap only ever moves DOWN (`rememberOverflowCap`
+ * overwrites unconditionally and anything at/above the cap is short-circuited,
+ * so the engine can never show the cap was wrong), and the overflow classifier
+ * cannot always tell WHERE an overflow came from — vLLM uses the same wording
+ * when the COMPLETION budget is what overflowed. Persistence alone would turn
+ * such a mis-taught cap into a permanent refusal, and a cap below what the
+ * client compacts down to re-creates the `/compact` loop #565 exists to avoid.
+ * The timestamp and the evidence line are kept so a wrong entry can be
+ * identified rather than guessed at.
  */
 
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -41,7 +51,7 @@ export interface PersistedOverflowCap {
   evidence?: string;
 }
 
-/** One entry of the on-disk file. `at` is regenerated on rewrite. */
+/** One entry of the on-disk file. `at` is stamped when the cap is (re)learned; a restored record keeps its original stamp, which is exactly what the TTL is measured against (#660 r1). */
 export type OverflowCapRecord = PersistedOverflowCap;
 
 /**
