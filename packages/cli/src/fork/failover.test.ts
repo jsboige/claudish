@@ -2403,6 +2403,27 @@ describe("#619 — dwell pin yields to a recovered EARLIER cascade step", () => 
     expect(perMinute).toEqual([1, 1, 0, 0, 0, 0]);
   });
 
+  // #625 review: the stamp is evidence about a pin only if it POST-DATES it.
+  // A session pinned to step 1 AFTER step 0 already recovered pinned with that
+  // recovery on the table (here: its own request skipped step 0, #431) — the
+  // old stamp is not news and must not yank it. Red under the mutant that drops
+  // the `stamp <= pinnedAt` guard.
+  it("a pin created AFTER the recovered step's stamp outlives it (evidence must post-date the pin)", () => {
+    rebindPastBenchedStep0("sess-A"); // step 0's stamp lands at +41 min; sess-A pinned at 1 since +10 min
+    clock += 3 * 60 * 1000; // +44: past the grace, so the stamp is fully "old news"
+    expect(
+      resolveFailoverTargetForSession("sonnet", "sess-B", undefined, new Set([0])).stepIndex
+    ).toBe(1); // a fresh session that skips step 0 (#431) pins at step 1 — NOW
+    const pinB = getSessionDwellPinForTests("sonnet", "sess-B");
+    expect(pinB?.stepIndex).toBe(1);
+    expect(pinB?.pinnedAt).toBe(clock);
+    clock += 5 * 60 * 1000; // +49: the pin is live (until +54), the stamp is 8 min old
+    expect(resolveFailoverTargetForSession("sonnet", "sess-B").stepIndex).toBe(1); // holds
+    // Control, same instant: sess-A pinned BEFORE the stamp still yields to it —
+    // the guard discriminates on the pin's instant, not on the stamp's age.
+    expect(resolveFailoverTargetForSession("sonnet", "sess-A").stepIndex).toBe(0);
+  });
+
   it("a step that recovered and was MARKED again does not un-pin anyone — the mark voids the stamp", () => {
     rebindPastBenchedStep0("sess-A");
     clock += 3 * 60 * 1000; // 3 min — past the grace

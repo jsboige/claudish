@@ -1209,8 +1209,17 @@ export function resolveFailoverTarget(
  * isFailoverActive(role, bucket) (#552 review, B1). */
 const dwellPins = new Map<
   FailoverRole,
-  Map<string, { stepIndex: number; until: number; bucket: string | undefined }>
+  Map<
+    string,
+    { stepIndex: number; until: number; bucket: string | undefined; pinnedAt: number }
+  >
 >();
+/** #625 review: `pinnedAt` is the ORIGINAL instant of the current pin — set when
+ * the pin is created, never on the sliding renewal (a busy session renews every
+ * request; renewing the stamp would restore exactly the defect #619 exists to
+ * fix). It is the horizon the earlier-step recovery must POST-DATE: a session
+ * that pinned to step k *after* step j recovered chose k with the recovery
+ * already on the table, so that stamp is not evidence about this pin. */
 /** Timestamp of the FIRST verified nominal success since the last arm (onNominalSuccess), keyed by
  * role|bucket like the other #275 state. A live dwell pin yields once this is
  * older than `recoveryGraceMs`, so an ACTIVE conversation returns to the
@@ -1288,7 +1297,7 @@ export function getSessionDwellMs(): number {
 export function getSessionDwellPinForTests(
   role: FailoverRole,
   sessionKey: string
-): { stepIndex: number; until: number; bucket: string | undefined } | null {
+): { stepIndex: number; until: number; bucket: string | undefined; pinnedAt: number } | null {
   const pin = dwellPins.get(role)?.get(sessionKey);
   if (!pin || pin.until <= Date.now()) return null;
   return { ...pin };
@@ -1314,6 +1323,7 @@ function recoveredStepForPin(
   role: FailoverRole,
   rule: FailoverRule,
   pinIndex: number,
+  pinnedAt: number,
   fails: (StepFailure | undefined)[] | undefined,
   skipSteps: ReadonlySet<number> | undefined,
   now: number
@@ -1321,6 +1331,12 @@ function recoveredStepForPin(
   for (let j = 0; j < pinIndex; j++) {
     const stamp = stepRecoveredAt.get(`${role}|${j}`);
     if (stamp === undefined || now - stamp < recoveryGraceMs) continue;
+    // #625 review: only evidence that POST-DATES the pin can move it. A stamp
+    // at or before `pinnedAt` was already on the table when this session was
+    // pinned to a deeper step — the pin was a choice made with that recovery
+    // known, and re-litigating it would yank a session on stale news. The
+    // strict `>` keeps the boundary unambiguous (same-millisecond ⇒ no move).
+    if (stamp <= pinnedAt) continue;
     if (skipSteps?.has(j)) continue;
     const step = rule.steps[j];
     if (stepTtlBinds(role, fails?.[j], step)) continue;
@@ -1440,7 +1456,15 @@ export function resolveFailoverTargetForSession(
         )}s ago`
       );
     } else if (pinnedStillServable) {
-      const backStep = recoveredStepForPin(role, rule, pin.stepIndex, fails, skipSteps, now);
+      const backStep = recoveredStepForPin(
+        role,
+        rule,
+        pin.stepIndex,
+        pin.pinnedAt,
+        fails,
+        skipSteps,
+        now
+      );
       if (backStep !== undefined) {
         // #619: a servable EARLIER step holds a verified recovery older than
         // the grace — yield and re-resolve; the walk lands on it (or an even
@@ -1522,7 +1546,12 @@ export function resolveFailoverTargetForSession(
     // the map or the log.
     const prev = m.get(sessionKey);
     if (!prev || prev.stepIndex !== resolved.stepIndex || prev.bucket !== bucket) {
-      m.set(sessionKey, { stepIndex: resolved.stepIndex, until: now + dwell, bucket });
+      m.set(sessionKey, {
+        stepIndex: resolved.stepIndex,
+        until: now + dwell,
+        bucket,
+        pinnedAt: now,
+      });
       dwellPins.set(role, m);
       pruneDwellPins(role);
       logStderr(
