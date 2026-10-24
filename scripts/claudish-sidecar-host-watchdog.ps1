@@ -37,6 +37,13 @@
            elapsed, no claudish-drain is in flight, AND com.docker.backend
            is running - the respawn precondition measured on 24/10. Without
            the backend there is nobody to respawn the distro: that is R3.
+           ONCE PER OUTAGE EPISODE: the unassisted respawn held on the
+           24/10 morning occurrence (engine back < 3 min) and FAILED on the
+           11:00Z one (distro never returned, CLI then answered "Docker
+           Desktop is unable to start"; only a full chain stop + GUI
+           relaunch recovered it). A rung whose rebuild half holds 1 time
+           out of 2 gets one shot, then escalates - never a repeated
+           teardown of a component it cannot rebuild.
       R3 - engine down AND no Docker Desktop backend: ESCALATE log line
            only. Deliberately no actuator: the rebuild half of an
            engine-relaunch has never been proven here (the po-2025 2026-09-20
@@ -70,10 +77,28 @@
 
 .NOTES
     Interpreter: Windows PowerShell 5.1 (the interpreter scheduled tasks
-    actually use). Per-user scheduled task, no UAC:
-      schtasks /Create /TN ClaudishSidecarHostWatchdog /TR "powershell.exe
-        -NoProfile -ExecutionPolicy Bypass -File <repo>\scripts\claudish-sidecar-host-watchdog.ps1"
+    actually use). Per-user scheduled task, no UAC.
+
+    DEPLOY A STABLE COPY, never the repo path: on 2026-10-24 a branch switch
+    removed this file from the working tree and every scheduled run died at
+    launch (`powershell -File` on an absent path exits -196608 = 0xFFFD0000)
+    with not one log line for 2.5 h. Copy the script to
+    <ClaudishHome>\bin\ and the module to <ClaudishHome>\bin\lib\, then
+    register with stdout captured - the scheduler discards it, and the
+    launch diagnostics are the only thing that names a module that did not
+    import:
+
+      Copy-Item scripts\claudish-sidecar-host-watchdog.ps1 $HOME\.claudish\bin\ -Force
+      New-Item -ItemType Directory -Force $HOME\.claudish\bin\lib | Out-Null
+      Copy-Item scripts\lib\claudish-engine.psm1 $HOME\.claudish\bin\lib\ -Force
+      schtasks /Create /TN ClaudishSidecarHostWatchdog /TR "cmd.exe /c
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+        %USERPROFILE%\.claudish\bin\claudish-sidecar-host-watchdog.ps1
+        1>>%USERPROFILE%\.claudish\sidecar-host-watchdog.task.out 2>&1"
         /SC MINUTE /MO 5 /F
+
+    Refresh the copy after any change to this file or the module; the log's
+    `copy_mtime=` field names WHICH file actually executed.
 #>
 [CmdletBinding()]
 param(
@@ -90,13 +115,34 @@ $StatePath = Join-Path $ClaudishHome 'sidecar-host-watchdog.state.json'
 $ConsentFileName = 'sidecar-host-watchdog.enabled'
 $LogMaxBytes = 2MB
 
-$EngineModule = Join-Path $PSScriptRoot 'lib\claudish-engine.psm1'
+# Module resolution: the scheduled task runs a STABLE COPY outside the repo
+# (~/.claudish/bin + ~/.claudish/bin/lib), so a branch switch cannot remove
+# the script mid-day; `lib\` next to the copy is the first candidate, then
+# the in-repo layouts for manual runs from a checkout.
+$moduleCandidates = @(
+    (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1'),
+    (Join-Path $PSScriptRoot '..\lib\claudish-engine.psm1')
+)
+$EngineModule = $null
+foreach ($cand in $moduleCandidates) {
+    if (Test-Path $cand) { $EngineModule = $cand; break }
+}
+if (-not $EngineModule) {
+    # LOUD to the LOG FILE too, not stdout alone: a scheduled task discards
+    # stdout, and on 2026-10-24 exactly this failure left 2.5 h of silence
+    # with every run dying before its first log line.
+    $msg = 'sidecar-watchdog module_missing inert_exit candidates=' + ($moduleCandidates -join ',')
+    try { Add-Content -Path $LogPath -Value (('{0} {1}' -f ([DateTimeOffset]::UtcNow).ToString('o'), $msg)) -Encoding Ascii } catch { }
+    Write-Output $msg
+    exit 1
+}
 try {
     Import-Module $EngineModule -Force -ErrorAction Stop
 } catch {
-    # Fail safe: no module, no probe, no actuator - one line and out.
-    Write-Output "sidecar-watchdog module_import_failed inert_exit"
-    exit 0
+    $msg = 'sidecar-watchdog module_import_failed inert_exit ' + $_.Exception.Message
+    try { Add-Content -Path $LogPath -Value (('{0} {1}' -f ([DateTimeOffset]::UtcNow).ToString('o'), $msg)) -Encoding Ascii } catch { }
+    Write-Output $msg
+    exit 1
 }
 
 # Consent BEFORE any probe: a machine that never opted in is not even
@@ -126,17 +172,18 @@ function Read-WdState {
             return @{
                 EngineFailures = [int]$raw.engineFailures
                 LastEngineActionUtc = [datetime]$raw.lastEngineActionUtc
+                EngineActionsSinceDown = [int]$raw.engineActionsSinceDown
             }
         } catch { }
     }
-    return @{ EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue }
+    return @{ EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue; EngineActionsSinceDown = 0 }
 }
 
 function Write-WdState {
     param([hashtable]$State)
     try {
         $last = if ($State.LastEngineActionUtc -eq [datetime]::MinValue) { $null } else { $State.LastEngineActionUtc.ToString('o') }
-        $obj = @{ engineFailures = $State.EngineFailures; lastEngineActionUtc = $last }
+        $obj = @{ engineFailures = $State.EngineFailures; lastEngineActionUtc = $last; engineActionsSinceDown = $State.EngineActionsSinceDown }
         New-Item -ItemType Directory -Force -Path $ClaudishHome | Out-Null
         [System.IO.File]::WriteAllText($StatePath, ($obj | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
     } catch { Write-WdLog "state_write_error $($_.Exception.Message)" }
@@ -153,7 +200,11 @@ function Get-LoopbackSquatters {
         if ($c.LocalAddress -ne '127.0.0.1' -and $c.LocalAddress -ne '::1') { continue }
         $proc = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
         if ($proc -and $proc.ProcessName -eq 'wslrelay') {
-            $squatters += [pscustomobject]@{ ProcId = $c.OwningProcess; LocalAddress = $c.LocalAddress }
+            # StartTime separates the two measured wedge shapes (po-2023,
+            # 2026-10-24): a relay OLDER than the Desktop GUI is a stale
+            # chain from a previous engine generation; a relay NEWER than
+            # the GUI wedged on its own (po-2028 11:11 vs GUI 09:32).
+            $squatters += [pscustomobject]@{ ProcId = $c.OwningProcess; LocalAddress = $c.LocalAddress; StartTime = $proc.StartTime }
         }
     }
     return $squatters
@@ -214,9 +265,9 @@ if (-not $ipv6Alive) {
     $squatters = Get-LoopbackSquatters
     foreach ($s in $squatters) {
         if ($DryRun) {
-            $actions += "DRYRUN_R1_KILL_WSLRELAY pid=$($s.ProcId) addr=$($s.LocalAddress)"
+            $actions += "DRYRUN_R1_KILL_WSLRELAY pid=$($s.ProcId) addr=$($s.LocalAddress) relay_start=$($s.StartTime.ToString('o'))"
         } else {
-            $actions += "R1_KILL_WSLRELAY pid=$($s.ProcId) addr=$($s.LocalAddress)"
+            $actions += "R1_KILL_WSLRELAY pid=$($s.ProcId) addr=$($s.LocalAddress) relay_start=$($s.StartTime.ToString('o'))"
             try { Stop-Process -Id $s.ProcId -Force -Confirm:$false -ErrorAction Stop } catch { }
         }
     }
@@ -233,6 +284,7 @@ $engine = Test-DockerEngine
 if ($engine -eq 'up') {
     if ($State.EngineFailures -gt 0) { $actions += 'ENGINE_RECOVERED' }
     $State.EngineFailures = 0
+    $State.EngineActionsSinceDown = 0
 } else {
     $State.EngineFailures++
     $sinceAction = (([DateTimeOffset]::UtcNow).UtcDateTime - $State.LastEngineActionUtc).TotalMinutes
@@ -246,14 +298,43 @@ if ($engine -eq 'up') {
         $actions += "ENGINE_GUARD_DRAIN_IN_FLIGHT failures=$($State.EngineFailures)"
     } elseif (-not $cooldownElapsed) {
         $actions += "ENGINE_GUARD_COOLDOWN failures=$($State.EngineFailures) since_last_action_min=$([int]$sinceAction)"
+    } elseif ($State.EngineActionsSinceDown -ge 1) {
+        # R2 is ONCE per outage episode, never a repeated teardown. Measured on
+        # this host 2026-10-24: the morning termination WAS followed by an
+        # unassisted Desktop respawn (<3 min), the 11:00Z one was NOT - the
+        # distro stayed absent, the CLI then answered "Docker Desktop is
+        # unable to start", and only stopping the whole Desktop chain and
+        # relaunching the GUI brought the engine back. A rung whose rebuild
+        # half holds 1 time out of 2 may fire once per episode, then the
+        # human gesture (#172 AC4: teardown only where the rebuild is proven).
+        $actions += 'R3_ESCALATE_ENGINE_DOWN_AFTER_R2 operator_gesture=stop com.docker.backend/building/Docker Desktop then relaunch "C:\Program Files\Docker\Docker\Docker Desktop.exe"'
+        $State.EngineFailures = 0
+        $State.LastEngineActionUtc = ([DateTimeOffset]::UtcNow).UtcDateTime
     } elseif ($backendPresent) {
-        # R2 - the measured path: backend respawns the distro unassisted.
+        # R2 - the READ path, not a guaranteed one: the Desktop respawned the
+        # distro unassisted on the 24/10 morning occurrence and did not on the
+        # 11:00Z one - hence once per episode (branch above).
+        # BOUNDED, and logged BEFORE the action: on 2026-10-24 the unbounded
+        # `-Wait` could hold a task instance with the distro wedged (every
+        # later trigger is then refused), and a log written only at the end
+        # of a run leaves a hang invisible. A hang must leave a line and must
+        # not hold the slot.
         if ($DryRun) {
             $actions += "DRYRUN_R2_WSL_TERMINATE_DOCKER_DESKTOP failures=$($State.EngineFailures)"
         } else {
+            Write-WdLog "action=R2_WSL_TERMINATE_DOCKER_DESKTOP_BEGIN failures=$($State.EngineFailures)"
             $actions += "R2_WSL_TERMINATE_DOCKER_DESKTOP failures=$($State.EngineFailures)"
-            Start-Process -FilePath 'wsl' -ArgumentList @('--terminate', 'docker-desktop') -NoNewWindow -Wait
+            try {
+                $wp = Start-Process -FilePath 'wsl' -ArgumentList @('--terminate', 'docker-desktop') -PassThru -NoNewWindow
+                if (-not $wp.WaitForExit(60000)) {
+                    try { $wp.Kill() } catch { }
+                    $actions += 'R2_TERMINATE_KILLED_AFTER_60s'
+                }
+            } catch {
+                $actions += "R2_TERMINATE_LAUNCH_ERROR $($_.Exception.Message)"
+            }
         }
+        if (-not $DryRun) { $State.EngineActionsSinceDown++ }
         $State.EngineFailures = 0
         $State.LastEngineActionUtc = ([DateTimeOffset]::UtcNow).UtcDateTime
     } else {
@@ -266,7 +347,14 @@ if ($engine -eq 'up') {
     }
 }
 
-Write-WdState -State $State
+# A dry run measures; it must not move the state machine (its failure counters
+# and cooldown would then fire on the next real run as if work had been done).
+if (-not $DryRun) { Write-WdState -State $State }
 $verdict = if ($ipv6Alive) { 'HEALTHY' } else { 'LOOPBACK6_DOWN' }
 $detail = ($actions -join '; ')
-Write-WdLog ("verdict=$verdict engine=$engine port=$Port" + $(if ($detail) { " actions=$detail" } else { '' }))
+# copy_mtime names WHICH file executed: on 2026-10-24 a branch switch removed
+# the script from the working tree and every scheduled run died at launch
+# (powershell -File on an absent path) with no line to show for it.
+$copyMtime = ''
+try { $copyMtime = (Get-Item $PSCommandPath).LastWriteTimeUtc.ToString('o') } catch { }
+Write-WdLog ("verdict=$verdict engine=$engine port=$Port pid=$PID copy_mtime=$copyMtime" + $(if ($detail) { " actions=$detail" } else { '' }))
