@@ -1179,7 +1179,10 @@ export class ComposedHandler implements ModelHandler {
         });
         log(`[${this.provider.displayName}] Error: ${errorText}`);
         const hint = getRecoveryHint(response.status, errorText, this.provider.displayName);
-        logStderr(wallMarkerLine(this.provider.displayName, response.status, requestNumberFor(c), hint));
+        // c.req, never the bare Context: Hono's Context has no `.raw`, so passing
+        // it whole falls back to the global counter and mislabels the wall line
+        // under concurrency (review #632) — the keyed carrier is the HonoRequest.
+        logStderr(wallMarkerLine(this.provider.displayName, response.status, requestNumberFor(c.req), hint));
 
         // Extract structured error type from provider response body if present
         let providerErrorType: string | undefined;

@@ -20,6 +20,7 @@ import { readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { respMarkerLine, ttftMarkerLine, wallMarkerLine } from "../../handlers/shared/traffic-markers.js";
+import { logRequest, requestNumberFor } from "./request-logger.js";
 import {
   __resetCaptureDirMemo,
   createResponseCapture,
@@ -222,8 +223,31 @@ describe("wall line — the two-pass client-error instrument's exact join key (#
     );
     expect(src).toContain("wallMarkerLine(");
     // the number comes from the raw Request, never the global counter
-    expect(src).toContain("requestNumberFor(c)");
+    expect(src).toContain("requestNumberFor(c.req)");
+    // the Context itself is unkeyed (no `.raw`) — a call on the bare Context
+    // silently falls back to the global counter and mislabels the wall line
+    // under concurrency (review #632); the guard regex matches only a CALL
+    // (`c)` followed by an argument-list or statement terminator), so prose
+    // in comments cannot trip it
+    expect(src).not.toMatch(/requestNumberFor\(c\)(?=[,);])/);
     // the pre-#601 inline template must be gone (re-inlining = red)
     expect(src).not.toContain("]: HTTP ${response.status}. ${hint}");
+  });
+
+  test("a whole Hono Context is NOT keyed — c.req is the carrier (review #632)", () => {
+    // logRequest keys the raw Request at ingestion; the wall line must resolve
+    // through c.req (HonoRequest.raw). Passing the Context whole falls through
+    // to the global counter — which equals the LATEST request's number, not
+    // this one's. Two ingestions make the two values distinct.
+    const map = new WeakMap<Request, string>();
+    const req1 = new Request("http://x/v1/messages", { method: "POST", body: "{}" });
+    const req2 = new Request("http://x/v1/messages", { method: "POST", body: "{}" });
+    logRequest({}, "wall-pin", req1, map);
+    logRequest({}, "wall-pin", req2, map);
+    const n1 = requestNumberFor(req1);
+    expect(n1).toBeGreaterThan(0);
+    const ctx1 = { req: { raw: req1 } }; // Hono Context shape (no `.raw` of its own)
+    expect(requestNumberFor(ctx1)).toBe(requestNumberFor(req2)); // global, not req1's
+    expect(requestNumberFor(ctx1.req)).toBe(n1); // c.req resolves to THIS request
   });
 });
