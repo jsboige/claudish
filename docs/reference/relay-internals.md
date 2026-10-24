@@ -160,6 +160,18 @@ the relay-**bypassed** *local* clients are shielded from a hub outage — which 
 argument for pointing the WAN entry at a relay rather than straight at the hub
 (`models.myia.io`, IIS site id=49).
 
+**A flap also reads upstream *latency* through the `:18182` tunnel — the 2026-10-23 cross-measurement.**
+19 AUTONOMOUS transitions on the `.46` sidecar (04:11→08:39Z) against the hub's own record: 21 watchdog
+probes OK with a monotone `uptimeSec`, 10 031 captures with no gap, and **1 525 po-203 captures served
+during the very episodes** — the hub was serving while the heartbeat was timing out. The `[ttft]`
+headers split the episodes in two: 3 893-10 899 ms from 04:46 to 07:31Z (a wedged upstream — `swift` —
+traversed by the heartbeat) and 247-343 ms after 07:46Z (the hub responsive again, heartbeats still
+failing, sidecar RAM 1 158 MB); tunnel-versus-seat for those six is **not established**, the portproxy
+carrying no telemetry. Reading rule: **slow headers + failing heartbeats = slow upstream; fast headers +
+failing heartbeats = local tube or seat**, and only the hub-side crosses (persisted probes, capture
+density per 10 min, the flapping seat present in the captures) may name a hub fault. A `/health` timeout
+shares the tunnel and the host with every request it is meant to judge.
+
 ## Tests
 
 `relay.test.ts` (16 — hysteresis, header build incl. ai-01 Opus passthrough, gzip, never-hang delegation). Budget-free resilience E2E: `bun run packages/cli/src/fork/server/relay-e2e.ts` (real prober + mock hub: NOMINAL → FAILOVER → RECOVERY over real HTTP, ~2-3 min).
