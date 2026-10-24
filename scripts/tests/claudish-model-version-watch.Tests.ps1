@@ -1019,6 +1019,42 @@ Describe 'Compare-ProbedProviderToFamilies (#635 AC 2 - binding is structural)' 
     }
 }
 
+Describe 'Split-ProbeDecisions (#635 AC 2 - minor is a report, major is an ASK)' {
+    BeforeAll {
+        $script:routing3 = [pscustomobject]@{
+            'gpt-6-sol'   = @('vllm-myia@gpt-6-sol')
+            'gpt-5.6-sol' = @('vllm-myia@gpt-5.6-sol')
+        }
+        $script:outcome3 = @(@{ Prefix = 'vllm-myia@'; Status = 'probed'; Ids = @('gpt-6.1-sol', 'gpt-6-sol', 'gpt-5.6-sol'); Reason = '' })
+        $script:split3 = Split-ProbeDecisions -Decisions @(Compare-ProbedProviderToFamilies -Routing $script:routing3 -Outcomes $script:outcome3)
+    }
+
+    It 'a newer minor lands in Minors, an older major in Majors' {
+        @($script:split3.Minors).Count | Should -Be 1
+        (@($script:split3.Minors)[0].Spelling) | Should -Be 'gpt-6-sol'
+        @($script:split3.Majors).Count | Should -Be 1
+        (@($script:split3.Majors)[0].Spelling) | Should -Be 'gpt-5.6-sol'
+        (@($script:split3.Majors)[0].Action) | Should -Be 'major'
+    }
+
+    It 'a current spelling goes to neither bucket' {
+        # gpt-6.1-sol is the family latest; a routing key sitting on it must
+        # produce no bucket entry at all (no would-repin, no ask)
+        $r = [pscustomobject]@{ 'pinned' = @('vllm-myia@gpt-6.1-sol') }
+        $s = Split-ProbeDecisions -Decisions @(Compare-ProbedProviderToFamilies -Routing $r -Outcomes $script:outcome3)
+        @($s.Minors).Count | Should -Be 0
+        @($s.Majors).Count | Should -Be 0
+    }
+
+    It 'nothing to decide yields two empty buckets, never $null' {
+        $s = Split-ProbeDecisions -Decisions @()
+        $null -eq $s.Minors | Should -BeFalse
+        $null -eq $s.Majors | Should -BeFalse
+        @($s.Minors).Count | Should -Be 0
+        @($s.Majors).Count | Should -Be 0
+    }
+}
+
 Describe 'model-version-watch.ps1 - the probe runs before the Codex network phase, report-only' {
     It 'probes before section 3 and never applies a probe decision' {
         $text = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\model-version-watch.ps1'))
@@ -1033,5 +1069,16 @@ Describe 'model-version-watch.ps1 - the probe runs before the Codex network phas
         $probeDecisionsAt | Should -BeGreaterThan $probeAt
         $applyAt = $text.IndexOf('Edit-RoutingForMinor -ConfigPath', $probeDecisionsAt)
         if ($applyAt -gt 0) { $applyAt | Should -BeGreaterThan $netAt }
+        # AC 2's second half: a major on a probed provider is an ASK, emitted in
+        # this same report-only section (before the Codex network phase), never
+        # an edit.
+        $splitAt = $text.IndexOf('Split-ProbeDecisions')
+        $splitAt | Should -BeGreaterThan $probeAt
+        $askAt = $text.IndexOf('-Kind major-ask', $splitAt)
+        $askAt | Should -BeGreaterThan $splitAt
+        $askAt | Should -BeLessThan $netAt
+        # bounded to the probe section: the Codex path legitimately edits later
+        $probeSection = $text.Substring($splitAt, $netAt - $splitAt)
+        $probeSection | Should -Not -Match 'Edit-RoutingForMinor'
     }
 }

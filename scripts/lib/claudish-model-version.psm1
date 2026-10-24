@@ -847,6 +847,28 @@ function Compare-ProbedProviderToFamilies {
     return $decisions
 }
 
+function Split-ProbeDecisions {
+    # The SAME policy the Codex path applies, stated once for the probe: a minor
+    # becomes a report-only 'would-repin' (this grain never edits routing), a
+    # major becomes an ASK ('major-ask' event) because a major bump is never
+    # auto-applied, and 'current' yields nothing at all. Keeping the split here
+    # — rather than as a Where-Object inline in the runner — is what lets it be
+    # pinned: a runner-shaped filter can only be grepped, never exercised.
+    #
+    # The two paths cannot double-ask for one family: probe targets exclude the
+    # OAuth prefixes by construction (they are reported with Kind 'oauth' and an
+    # outcome of 'not probed', so no decision is ever produced for them).
+    param($Decisions)
+    $minors = @()
+    $majors = @()
+    foreach ($d in @($Decisions)) {
+        if ($null -eq $d) { continue }
+        if ($d.Action -eq 'minor') { $minors += $d }
+        elseif ($d.Action -eq 'major') { $majors += $d }
+    }
+    return @{ Minors = $minors; Majors = $majors }
+}
+
 Export-ModuleMember -Function `
     ConvertTo-ModelVersion, Get-LatestFamilyVersion, Compare-RoutingToFamilies, `
     Compare-RoleModelsToRouting, Test-RoleAliasAskEmitted, `
@@ -855,4 +877,5 @@ Export-ModuleMember -Function `
     Get-RoutingCoverage, Format-RoutingCoverageLine, `
     Get-ModelsUrl, Get-ProviderProbeTargets, Invoke-ProviderCatalogProbe, `
     Format-ProviderProbeLine, Compare-ProbedProviderToFamilies, Get-ProbeIds, `
+    Split-ProbeDecisions, `
     Invoke-DrainDetachedRestart

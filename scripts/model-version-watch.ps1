@@ -126,12 +126,25 @@ $probeOutcomes = @(Invoke-ProviderCatalogProbe -Targets $probeTargets -ApiKeys $
 foreach ($o in @($probeOutcomes | Where-Object { $_.Status -eq 'probed' })) {
     & $logTs ("[probe] {0} lists {1} ids: {2}" -f $o.Prefix, @($o.Ids).Count, ((@($o.Ids) | Sort-Object) -join ', '))
 }
-$probeDecisions = @(Compare-ProbedProviderToFamilies -Routing $config.routing -Outcomes $probeOutcomes | Where-Object { $_.Action -ne 'current' })
-foreach ($d in $probeDecisions) {
+$probeSplit = Split-ProbeDecisions -Decisions @(Compare-ProbedProviderToFamilies -Routing $config.routing -Outcomes $probeOutcomes)
+foreach ($d in @($probeSplit.Minors)) {
     & $logTs ("[probe] would-repin {0} [{1}] {2} -> {3} ({4}) — report-only" -f $d.Spelling, $d.Provider, $d.CurrentId, $d.LatestId, $d.Action)
 }
-if (-not $DryRun -and $probeDecisions.Count -gt 0) {
-    foreach ($d in $probeDecisions) {
+# A major on a probed provider is an ASK, exactly as on the Codex path: no edit,
+# one 'major-ask' event per family. The two paths cannot double-ask — probe
+# targets exclude the OAuth prefixes by construction.
+foreach ($fam in @($probeSplit.Majors | Group-Object Family)) {
+    $d0 = @($fam.Group)[0]
+    $fromIds = @($fam.Group | ForEach-Object { "$($_.Spelling)=$($_.CurrentId)" }) -join ','
+    & $logTs ("[probe] MAJOR available: {0} {1} -> {2} on {3} — NOT applied, user arbitrates" -f $fam.Name, $fromIds, $d0.LatestId, $d0.Provider)
+    if (-not $DryRun) {
+        Write-VersionEvent -EventsPath $eventsPath -Kind major-ask -Family $fam.Name `
+            -From (@($fam.Group | ForEach-Object { $_.CurrentId } | Select-Object -Unique) -join ',') `
+            -To $d0.LatestId -Detail "probed on $($d0.Provider) — spellings: $fromIds"
+    }
+}
+if (-not $DryRun -and @($probeSplit.Minors).Count -gt 0) {
+    foreach ($d in @($probeSplit.Minors)) {
         Write-VersionEvent -EventsPath $eventsPath -Kind info -Family $d.Family `
             -From $d.CurrentId -To $d.LatestId `
             -Detail "probe would-repin spelling $($d.Spelling) on $($d.Provider) ($($d.Action)) — report-only, not applied"
