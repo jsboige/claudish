@@ -17,6 +17,10 @@
 
 BeforeAll {
     $script:ScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..\claudish-sidecar-host-watchdog.ps1')).Path
+    # Read/Write-WdState delegate to the pure codec in the module; the
+    # dot-source guard stops the script before ITS import, so the suite
+    # imports it here.
+    Import-Module (Join-Path $PSScriptRoot '..\lib\claudish-engine.psm1') -Force
 }
 
 Describe 'sidecar-host-watchdog state round-trip' {
@@ -65,6 +69,16 @@ Describe 'sidecar-host-watchdog state round-trip' {
         $s.EngineFailures | Should -Be 0
         $s.LastEngineActionUtc | Should -Be ([datetime]::MinValue)
         $s.EngineActionsSinceDown | Should -Be 0
+    }
+
+    It 'an UNREADABLE state file yields $null, never silent defaults (review #639 point 1)' {
+        # The old silent catch reset every counter on every run: R2/R3 were
+        # unreachable on a fresh host, and a corrupted file would have re-armed
+        # R2 inside an episode it already acted on. $null is the contract the
+        # main block turns into state_read_error + an inert exit.
+        Set-Content -Path $script:StatePath -Value '{"engineFailures":'
+        $s = Read-WdState
+        $s | Should -BeNullOrEmpty
     }
 
     It 'Write-WdState always emits the "...Z" form so any seat and any hand reset round-trips' {
