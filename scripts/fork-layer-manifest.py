@@ -19,8 +19,10 @@ OUT = sys.argv[3] if len(sys.argv) > 3 else "docs/reference/replatform-v14-layer
 
 
 def git(*args: str) -> str:
+    # git emits UTF-8; text=True alone decodes with the locale codepage on
+    # Windows (cp1252), which turns every em dash in a commit subject into mojibake.
     return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=True
+        ["git", *args], capture_output=True, text=True, encoding="utf-8", check=True
     ).stdout
 
 
