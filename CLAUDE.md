@@ -159,6 +159,15 @@ negative case: if you are about to type one of those words, stop and use the lef
 - `claudish --probe <model>` shows the adapter composition; `--debug` writes a log to `logs/`.
 - Model syntax is `provider@model[:concurrency]` (`google@gemini-2.0-flash`, `ollama@llama3.2:3`); a bare name auto-routes by pattern. Prefix meanings: `routing.md`.
 
+### Toolchain — the bun pin
+
+The test side's bun version is pinned ONCE, in `.bun-version` at the repo root; the
+test/boot-canary/smoke workflows read it with `bun-version-file:`. Never hardcode the
+pinned version in a workflow (a second copy drifts) — `scripts/version-contract.test.ts`
+fails on any copy. Two deliberate divergences keep an explicit `bun-version:`: the
+blind-hooks job (cross-version check on a newer bun) and the hooks-loading/release jobs
+(`latest`, because that is the bun the shipped binaries are built with).
+
 ## Commit messages
 
 **The subject line is the release note.** `git cliff` copies it verbatim into `CHANGELOG.md`
@@ -210,7 +219,9 @@ Bump TWO files by hand — `package.json` and `packages/cli/package.json` (what 
 a stale value fails the publish) — then run
 `bun run --cwd packages/cli scripts/generate-version.ts`. `packages/cli/src/version.ts` is
 GENERATED from `packages/cli/package.json` and says so in its header; editing it by hand is
-silently overwritten by the next `build`.
+silently overwritten by the next `build`. The three-file agreement (root, cli package,
+version.ts) is ENFORCED by `scripts/version-contract.test.ts` — a bump that misses a file
+fails the suite instead of shipping a binary that lies about its version.
 
 **Never `git push --tags`.** Local `v7.8.2` diverges from origin's, so `--tags` exits
 non-zero on every release — after the new tag has already landed. It reports failure over
