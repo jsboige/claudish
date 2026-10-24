@@ -24,6 +24,7 @@ import {
   modelsUrlFor,
   parseCatalogModels,
   pickMaxModelLen,
+  purgeCapsReplacedByDerivation,
 } from "./context-limit-derivation.js";
 import {
   clearRuntimeRegistry,
@@ -31,6 +32,15 @@ import {
   getDerivedContextLimit,
   registerDeclaredContextLimit,
 } from "./runtime-providers.js";
+import { customEndpointCapKey, loadCustomEndpoints } from "./custom-endpoints-loader.js";
+import { OpenAIProviderTransport } from "./transport/openai.js";
+import type { RemoteProvider } from "../handlers/shared/remote-provider-types.js";
+import type { CustomEndpoint } from "../config-schema.js";
+import {
+  getOverflowCap,
+  rememberOverflowCap,
+  resetOverflowCapsForTests,
+} from "../handlers/shared/context-overflow.js";
 
 function stubFetch(answer: (url: string) => Response | Promise<Response>) {
   const calls: string[] = [];
@@ -299,5 +309,131 @@ describe("deriveContextLimits", () => {
     );
     expect(outcomes).toEqual([]);
     expect(fx.calls).toEqual([]);
+  });
+});
+
+// #660 r2 — the purge must fire under the key a REAL handler records.
+//
+// The recording site is `transport.displayName` (composed-handler.ts), which
+// for a custom endpoint is `formatDisplayName(<config key>)` — "vllm-myia"
+// records as "Vllm-myia". r1 shipped a purge keyed on the config key and
+// purged exactly nothing for every lowercase endpoint name (measured: 0
+// purged, cap intact). These pins hold the seam from BOTH sides at once: the
+// cap is learned under a transport built the way buildSimpleHandler builds
+// it, and the purge runs the exact loop createProxyServer runs.
+describe("purgeCapsReplacedByDerivation — the call-site key (#660 r2)", () => {
+  beforeEach(() => {
+    clearRuntimeRegistry();
+    resetOverflowCapsForTests();
+  });
+
+  test("a cap learned under a real transport's displayName is purged; rerun purges 0", async () => {
+    // The endpoint a hub actually runs: lowercase name, openai wire.
+    const vllm = {
+      kind: "simple",
+      url: "http://127.0.0.1:5002/v1",
+      format: "openai",
+      apiKey: "k",
+      contextLimit: 262144,
+      deriveContextLimit: true,
+    };
+    // Register through the real loader — same validation path production takes.
+    const loaded = loadCustomEndpoints(config({ "vllm-myia": vllm }));
+    expect(loaded.registered).toBe(1);
+    expect(loaded.errors).toEqual([]);
+
+    // Build the transport EXACTLY as buildSimpleHandler's openai branch does:
+    // RemoteProvider.name is the config key, and the transport derives its
+    // displayName — the key composed-handler records caps under — from it.
+    const remote: RemoteProvider = {
+      name: "vllm-myia",
+      baseUrl: "http://127.0.0.1:5002/v1",
+      apiPath: "/chat/completions",
+      apiKeyEnvVar: "CUSTOM_VLLM_MYIA_KEY",
+      prefixes: ["vllm-myia"],
+      authScheme: "bearer",
+    };
+    const transport = new OpenAIProviderTransport(remote, "swift-1.5-27b", "k");
+    // The mismatch r2 measured, stated as an invariant rather than assumed:
+    // displayName ≠ config key for a lowercase name.
+    expect(transport.displayName).toBe("Vllm-myia");
+    expect(transport.displayName).not.toBe("vllm-myia");
+
+    // A restored cap, learned under the key the handler uses.
+    rememberOverflowCap(transport.displayName, "swift-1.5-27b", 120000);
+    expect(getOverflowCap(transport.displayName, "swift-1.5-27b")).toBe(120000);
+
+    // Derivation succeeds, then the startup purge runs the shared loop.
+    const fx = stubFetch(() => json({ data: [{ id: "swift-1.5-27b", max_model_len: 262144 }] }));
+    const outcomes = await deriveContextLimits(config({ "vllm-myia": vllm }), {
+      fetchImpl: fx.impl,
+    });
+    expect(outcomes[0].derived).toBe(true);
+    expect(purgeCapsReplacedByDerivation(outcomes)).toBe(1);
+    expect(getOverflowCap(transport.displayName, "swift-1.5-27b")).toBeUndefined();
+
+    // Idempotent: nothing left to drop on a rerun.
+    expect(purgeCapsReplacedByDerivation(outcomes)).toBe(0);
+  });
+
+  test("a NOT-derived outcome purges nothing — the cap must survive a failed probe", async () => {
+    const ep = {
+      kind: "simple",
+      url: "http://h/v1",
+      format: "openai",
+      apiKey: "k",
+      deriveContextLimit: true,
+    };
+    const transport = new OpenAIProviderTransport(
+      { name: "ep", baseUrl: "http://h/v1", apiPath: "/chat/completions", apiKeyEnvVar: "X", prefixes: [] },
+      "m",
+      "k"
+    );
+    rememberOverflowCap(transport.displayName, "m", 90000);
+
+    const fx = stubFetch(() => json({}, 500));
+    const outcomes = await deriveContextLimits(config({ ep }), { fetchImpl: fx.impl });
+    expect(outcomes[0].derived).toBe(false);
+    expect(purgeCapsReplacedByDerivation(outcomes)).toBe(0);
+    expect(getOverflowCap(transport.displayName, "m")).toBe(90000);
+  });
+
+  test("capKey mirrors each transport's own displayName computation", () => {
+    const simpleOpenai = {
+      kind: "simple",
+      url: "http://h/v1",
+      format: "openai",
+      apiKey: "k",
+    } as CustomEndpoint;
+    const simpleAnthropic = {
+      kind: "simple",
+      url: "http://h",
+      format: "anthropic",
+      apiKey: "k",
+    } as CustomEndpoint;
+    const complexAnthropic = {
+      kind: "complex",
+      displayName: "Anth",
+      transport: "anthropic",
+      baseUrl: "http://h",
+      apiKey: "k",
+    } as CustomEndpoint;
+    const complexLitellm = {
+      kind: "complex",
+      displayName: "LLM",
+      transport: "litellm",
+      baseUrl: "http://h",
+      apiKey: "k",
+    } as CustomEndpoint;
+
+    // Lowercase custom name → capitalised, never the raw key (the r2 bug).
+    expect(customEndpointCapKey("vllm-myia", simpleOpenai)).toBe("Vllm-myia");
+    // Built-in names hit the transports' own maps — including on the custom
+    // wire, where the config key would have been wrong twice over.
+    expect(customEndpointCapKey("glm", simpleOpenai)).toBe("GLM");
+    expect(customEndpointCapKey("zai", simpleAnthropic)).toBe("Z.AI");
+    expect(customEndpointCapKey("minimax", complexAnthropic)).toBe("MiniMax");
+    // LiteLLM's transport hardcodes one displayName for every endpoint.
+    expect(customEndpointCapKey("anything", complexLitellm)).toBe("LiteLLM");
   });
 });

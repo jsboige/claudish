@@ -64,7 +64,7 @@ import {
 import { createHandlerForProvider } from "./providers/provider-profiles.js";
 import { applyNativePinOverride } from "./providers/native-pin-auto.js";
 import { loadCustomEndpoints } from "./providers/custom-endpoints-loader.js";
-import { deriveContextLimits } from "./providers/context-limit-derivation.js";
+import { deriveContextLimits, purgeCapsReplacedByDerivation } from "./providers/context-limit-derivation.js";
 import { getRuntimeProviders, getDeclaredContextLimit } from "./providers/runtime-providers.js";
 import { loadConfig } from "./profile-config.js";
 import { createStreamTracker, stallThresholdMs } from "./fork/server/stream-registry";
@@ -122,7 +122,6 @@ import {
   buildOverflowRecoveryStream,
   buildOverflowRecoveryMessage,
   initOverflowCapsPersistence,
-  forgetOverflowCapsForProvider,
   type ContextAdmissionDecision,
   type DeclaredWindow,
 } from "./handlers/shared/context-overflow.js";
@@ -644,12 +643,9 @@ export async function createProxyServer(
     // that provider: the learned branch is checked first in `handle()`, so a
     // stale cap would keep refusing what the fresh measurement just allowed.
     // The purge is what makes "a measurement beats a claim" true at the seam
-    // where the two meet.
-    let capsPurged = 0;
-    for (const outcome of derived) {
-      if (!outcome.derived) continue;
-      capsPurged += forgetOverflowCapsForProvider(outcome.name);
-    }
+    // where the two meet. r2: the loop lives in purgeCapsReplacedByDerivation
+    // (same module as the outcomes) — it purges under the handler's own key.
+    const capsPurged = purgeCapsReplacedByDerivation(derived);
     if (capsPurged > 0) {
       log(`[ContextLimit] derivation replaced ${capsPurged} restored learned cap(s) with the measured window`);
     }

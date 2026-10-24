@@ -30,7 +30,8 @@ import { CustomEndpointSchema, type CustomEndpoint } from "../config-schema.js";
 import type { ClaudishProfileConfig } from "../profile-config.js";
 import { log, logStderr } from "../logger.js";
 import { registerDeclaredContextLimit, registerDerivedContextLimit } from "./runtime-providers.js";
-import { resolveCustomEndpointApiKey } from "./custom-endpoints-loader.js";
+import { resolveCustomEndpointApiKey, customEndpointCapKey } from "./custom-endpoints-loader.js";
+import { forgetOverflowCapsForProvider } from "../handlers/shared/context-overflow.js";
 
 /** One entry of a `/v1/models` answer, as far as this module cares. */
 export interface CatalogModelEntry {
@@ -47,6 +48,13 @@ export interface ContextLimitOutcome {
   limit?: number;
   /** Why it was not derived — never a default in disguise. */
   reason?: string;
+  /**
+   * The overflow-cap key a handler for this endpoint records under — the
+   * transport's displayName, NOT the config key (#660 r2). The purge below
+   * uses this, never `name`, so both sides of the seam stay one key apart
+   * from zero drift.
+   */
+  capKey: string;
 }
 
 export interface DeriveContextLimitsOptions {
@@ -186,6 +194,9 @@ export async function deriveContextLimits(
     const base = endpointBaseUrl(ep);
     const url = modelsUrlFor(base, endpointApiPath(ep));
     const fallback = ep.contextLimit;
+    // #660 r2 — computed once per endpoint, pure. Attached to EVERY outcome
+    // (derived or not) so consumers never re-derive the key from `name`.
+    const capKey = customEndpointCapKey(name, ep);
     try {
       const response = await doFetch(url, {
         method: "GET",
@@ -195,7 +206,7 @@ export async function deriveContextLimits(
       if (!response.ok) {
         const reason = `/v1/models answered HTTP ${response.status}`;
         logStderr(`[ContextLimit] not derived provider=${name} reason="${reason}"${fallback ? ` — keeping declared ${fallback}` : ""}`);
-        outcomes.push({ name, derived: false, limit: fallback, reason });
+        outcomes.push({ name, derived: false, limit: fallback, reason, capKey });
         continue;
       }
       const entries = parseCatalogModels(await response.json());
@@ -203,7 +214,7 @@ export async function deriveContextLimits(
       if (picked.limit === undefined) {
         const reason = picked.reason ?? "no window could be chosen";
         logStderr(`[ContextLimit] not derived provider=${name} reason="${reason}"${fallback ? ` — keeping declared ${fallback}` : ""}`);
-        outcomes.push({ name, derived: false, limit: fallback, reason });
+        outcomes.push({ name, derived: false, limit: fallback, reason, capKey });
         continue;
       }
       registerDeclaredContextLimit(name, picked.limit);
@@ -215,13 +226,33 @@ export async function deriveContextLimits(
         `[ContextLimit] derived provider=${name} limit=${picked.limit} source=${url} max_model_len` +
           (fallback !== undefined ? ` (config said ${fallback})` : "")
       );
-      outcomes.push({ name, derived: true, limit: picked.limit });
+      outcomes.push({ name, derived: true, limit: picked.limit, capKey });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       logStderr(`[ContextLimit] not derived provider=${name} reason="${reason}"${fallback ? ` — keeping declared ${fallback}` : ""}`);
-      outcomes.push({ name, derived: false, limit: fallback, reason });
+      outcomes.push({ name, derived: false, limit: fallback, reason, capKey });
     }
   }
 
   return outcomes;
+}
+
+/**
+ * #660 r1/r2 — drop the restored learned caps a SUCCEEDED derivation replaces.
+ *
+ * The purge key is `outcome.capKey` (the transport displayName a handler
+ * records under), never `outcome.name`: for a lowercase custom endpoint the
+ * two differ ("vllm-myia" vs "Vllm-myia"), and r2 measured that mismatch
+ * purging exactly nothing. Extracted from createProxyServer so the startup
+ * path and the test pin run the same loop, byte for byte.
+ *
+ * @returns the number of caps dropped (memory + persisted file), for the log line.
+ */
+export function purgeCapsReplacedByDerivation(outcomes: readonly ContextLimitOutcome[]): number {
+  let capsPurged = 0;
+  for (const outcome of outcomes) {
+    if (!outcome.derived) continue;
+    capsPurged += forgetOverflowCapsForProvider(outcome.capKey);
+  }
+  return capsPurged;
 }
