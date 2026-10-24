@@ -728,6 +728,24 @@ function Get-ProbeIds {
     return @($ids | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
 
+function Get-ApiKeyValue {
+    # A credential by NAME, from whatever shape the config arrived in: a
+    # hashtable (tests, callers that build one) or a PSCustomObject (what
+    # ConvertFrom-Json actually hands the runner). Measured 24/10 on the live
+    # config under PS 5.1: `$ApiKeys[$name]` on a PSObject fails with
+    # "Cannot index an object of type PSObject" — the probe would have thrown on
+    # the FIRST provider that carries a credential name, on the seat it ships to.
+    param($ApiKeys, [string]$Name)
+    if ($null -eq $ApiKeys -or [string]::IsNullOrEmpty($Name)) { return '' }
+    if ($ApiKeys -is [System.Collections.IDictionary]) {
+        if ($ApiKeys.Contains($Name)) { return [string]$ApiKeys[$Name] }
+        return ''
+    }
+    $prop = $ApiKeys.PSObject.Properties[$Name]
+    if ($null -ne $prop -and $null -ne $prop.Value) { return [string]$prop.Value }
+    return ''
+}
+
 function Invoke-ProviderCatalogProbe {
     # One outcome per probeable target. Never throws: a probe failure is a
     # reported "not probed", never an incident and never an edit.
@@ -752,8 +770,8 @@ function Invoke-ProviderCatalogProbe {
         $key = ''
         if (-not [string]::IsNullOrEmpty($t.KeyInline)) { $key = $t.KeyInline }
         elseif (-not [string]::IsNullOrEmpty($t.KeyName)) {
-            if ($null -ne $ApiKeys -and $null -ne $ApiKeys[$t.KeyName]) { $key = [string]$ApiKeys[$t.KeyName] }
-            elseif ($null -ne $EnvLookup) { $key = [string](& $EnvLookup $t.KeyName) }
+            if ($null -ne $ApiKeys) { $key = Get-ApiKeyValue -ApiKeys $ApiKeys -Name $t.KeyName }
+            if ([string]::IsNullOrEmpty($key) -and $null -ne $EnvLookup) { $key = [string](& $EnvLookup $t.KeyName) }
             if ([string]::IsNullOrEmpty($key)) {
                 $outcomes += @{
                     Prefix = $t.Prefix; Status = 'not probed'; Ids = @(); Kind = $t.Kind
@@ -806,6 +824,22 @@ function Invoke-ProviderCatalogProbe {
             }
             if ($code -eq 401 -or $code -eq 403) { $msg = "HTTP $code — credential refused (not probed, NOT current)" }
             elseif ($code -gt 0) { $msg = "HTTP $code" }
+            else {
+                # No HTTP status: a transport failure. Normalise the two shapes
+                # that carry meaning into a stable English token, because the
+                # platform message is LOCALISED — measured 24/10 on this seat,
+                # PS 5.1: `vllm-myia@ (Le délai de l'opération a expiré.)` in a
+                # run log otherwise written in English. The corpus is grepped by
+                # the fleet; a French line is invisible to an English filter.
+                $timedOut = $false
+                if ($_.Exception -is [System.TimeoutException]) { $timedOut = $true }
+                else {
+                    $statusProp = $_.Exception.PSObject.Properties['Status']
+                    if ($null -ne $statusProp -and "$($statusProp.Value)" -eq 'Timeout') { $timedOut = $true }
+                }
+                if ($timedOut) { $msg = "timed out after ${TimeoutSec}s" }
+                else { $msg = "request failed: $($_.Exception.Message)" }
+            }
             $outcomes += @{ Prefix = $t.Prefix; Status = 'not probed'; Ids = @(); Kind = $t.Kind; Reason = $msg }
         }
     }
@@ -877,5 +911,5 @@ Export-ModuleMember -Function `
     Get-RoutingCoverage, Format-RoutingCoverageLine, `
     Get-ModelsUrl, Get-ProviderProbeTargets, Invoke-ProviderCatalogProbe, `
     Format-ProviderProbeLine, Compare-ProbedProviderToFamilies, Get-ProbeIds, `
-    Split-ProbeDecisions, `
+    Split-ProbeDecisions, Get-ApiKeyValue, `
     Invoke-DrainDetachedRestart

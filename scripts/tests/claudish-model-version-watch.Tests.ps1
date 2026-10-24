@@ -918,11 +918,37 @@ Describe 'Invoke-ProviderCatalogProbe (#635 AC 2 - "not probed" is never "curren
         $script:seenKey | Should -Be 'k-from-env'
     }
 
+    It 'reads a credential from a PSCustomObject - the shape ConvertFrom-Json actually produces' {
+        # MEASURED 24/10 on the live config (PS 5.1): `$ApiKeys[$name]` on the
+        # object ConvertFrom-Json returns throws "Cannot index an object of type
+        # PSObject". Every pin here used a hashtable, so the suite was green on
+        # a shape the shipping runner never has.
+        $cfgKeys = '{"QWEN_TOKEN_PLAN_API_KEY":"k-json","VLLM_API_KEY":"k2"}' | ConvertFrom-Json
+        Get-ApiKeyValue -ApiKeys $cfgKeys -Name 'QWEN_TOKEN_PLAN_API_KEY' | Should -Be 'k-json'
+        $script:seenKey = ''
+        $f = { param($u, $k, $t) $script:seenKey = $k; @{ Status = 200; Body = '{"data":[{"id":"m"}]}' } }
+        $o = @(Invoke-ProviderCatalogProbe -Targets @($script:targets[1]) -ApiKeys $cfgKeys -EnvLookup $script:noEnv -Fetcher $f)
+        $o[0].Status | Should -Be 'probed'
+        $script:seenKey | Should -Be 'k-json'
+        # the same function still serves the hashtable shape used everywhere else
+        Get-ApiKeyValue -ApiKeys $script:keys -Name 'QWEN_TOKEN_PLAN_API_KEY' | Should -Be 'k-qwen'
+    }
+
     It 'a timeout/connection error is a reason, not a throw' {
         $f = { param($u, $k, $t) throw 'The operation has timed out.' }
         $o = @(Invoke-ProviderCatalogProbe -Targets @($script:targets[0]) -ApiKeys $script:keys -EnvLookup $script:noEnv -Fetcher $f)
         $o[0].Status | Should -Be 'not probed'
         $o[0].Reason | Should -Match 'timed out'
+    }
+
+    It 'a TimeoutException is normalised to English, not passed through in the platform language' {
+        # MEASURED 24/10 on this seat (PS 5.1, French locale): the live probe
+        # logged `vllm-myia@ (Le délai de l'opération a expiré.)` into a run log
+        # the fleet greps in English.
+        $f = { param($u, $k, $t) throw (New-Object System.TimeoutException 'Le délai de l''opération a expiré.') }
+        $o = @(Invoke-ProviderCatalogProbe -Targets @($script:targets[0]) -ApiKeys $script:keys -EnvLookup $script:noEnv -Fetcher $f -TimeoutSec 7)
+        $o[0].Status | Should -Be 'not probed'
+        $o[0].Reason | Should -Be 'timed out after 7s'
     }
 
     It 'a non-probeable target is reported without any wire call' {
