@@ -1318,7 +1318,9 @@ export async function createProxyServer(
       if (sessionKey && isCapabilityVocabEnabled(process.env)) {
         const declared = liftCapabilityDeclaration(sessionKey, body);
         if (declared) {
-          log(`[Capability] session=${sessionKey.slice(0, 8)} declared ${JSON.stringify(declared)}`);
+          log(
+            `[Capability] session=${sessionKey.slice(0, 8)} declared ${JSON.stringify(declared)}`
+          );
         }
       }
 

@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CAPABILITY_VOCAB_FENCE,
   appendCapabilityQueryToMessage,
   buildCapabilityQuery,
   isCapabilityVocabEnabled,
   liftCapabilityDeclaration,
   parseCapabilityDeclaration,
   resetCapabilityVocabForTests,
-  CAPABILITY_VOCAB_FENCE,
 } from "./capability-vocabulary";
 
 function fence(json: string): string {
@@ -16,12 +16,15 @@ function fence(json: string): string {
 describe("capability vocabulary — parseCapabilityDeclaration (#83)", () => {
   test("no marker in text → null", () => {
     expect(parseCapabilityDeclaration("plain assistant prose, no fence at all")).toBeNull();
-    expect(parseCapabilityDeclaration("```json\n{\"v\":1,\"vision\":true}\n```")).toBeNull();
+    expect(parseCapabilityDeclaration('```json\n{"v":1,"vision":true}\n```')).toBeNull();
   });
 
   test("full valid declaration parses with every field", () => {
     const decl = parseCapabilityDeclaration(
-      'Working on it.\n' + fence('{"v":1,"vision":true,"context_tokens_min":200000,"reasoning_depth":"high","tool_call_density":"low","cost_class":"budget"}')
+      "Working on it.\n" +
+        fence(
+          '{"v":1,"vision":true,"context_tokens_min":200000,"reasoning_depth":"high","tool_call_density":"low","cost_class":"budget"}'
+        )
     );
     expect(decl).toEqual({
       v: 1,
@@ -34,7 +37,9 @@ describe("capability vocabulary — parseCapabilityDeclaration (#83)", () => {
   });
 
   test("subset declaration parses; unknown fields are dropped", () => {
-    const decl = parseCapabilityDeclaration(fence('{"v":1,"vision":false,"jailbreak":"please","extra":{"nested":1}}'));
+    const decl = parseCapabilityDeclaration(
+      fence('{"v":1,"vision":false,"jailbreak":"please","extra":{"nested":1}}')
+    );
     expect(decl).toEqual({ v: 1, vision: false });
   });
 
@@ -45,23 +50,31 @@ describe("capability vocabulary — parseCapabilityDeclaration (#83)", () => {
 
   test("mistyped and out-of-enum fields are dropped, not fatal", () => {
     const decl = parseCapabilityDeclaration(
-      fence('{"vision":"true","context_tokens_min":-5,"reasoning_depth":"extreme","cost_class":"free","tool_call_density":"high"}')
+      fence(
+        '{"vision":"true","context_tokens_min":-5,"reasoning_depth":"extreme","cost_class":"free","tool_call_density":"high"}'
+      )
     );
     expect(decl).toEqual({ v: 1, tool_call_density: "high" });
   });
 
   test("float context floor is floored; non-finite rejected", () => {
-    expect(parseCapabilityDeclaration(fence('{"context_tokens_min":123.9}'))).toEqual({ v: 1, context_tokens_min: 123 });
+    expect(parseCapabilityDeclaration(fence('{"context_tokens_min":123.9}'))).toEqual({
+      v: 1,
+      context_tokens_min: 123,
+    });
     expect(parseCapabilityDeclaration(fence('{"context_tokens_min":Infinity}'))).toBeNull();
   });
 
   test("last complete block wins (a re-emitted declaration is the newest statement)", () => {
-    const text = fence('{"vision":true}') + "\nsummary text\n" + fence('{"vision":false,"cost_class":"any"}');
+    const text =
+      fence('{"vision":true}') + "\nsummary text\n" + fence('{"vision":false,"cost_class":"any"}');
     expect(parseCapabilityDeclaration(text)).toEqual({ v: 1, vision: false, cost_class: "any" });
   });
 
   test("unclosed fence does not parse", () => {
-    expect(parseCapabilityDeclaration("```" + CAPABILITY_VOCAB_FENCE + '\n{"vision":true}')).toBeNull();
+    expect(
+      parseCapabilityDeclaration("```" + CAPABILITY_VOCAB_FENCE + '\n{"vision":true}')
+    ).toBeNull();
   });
 
   test("malformed JSON → null", () => {
@@ -94,7 +107,13 @@ describe("capability vocabulary — buildCapabilityQuery (#83)", () => {
 
   test("names every vocabulary field so the channel is self-describing", () => {
     const q = buildCapabilityQuery();
-    for (const field of ["vision", "context_tokens_min", "reasoning_depth", "tool_call_density", "cost_class"]) {
+    for (const field of [
+      "vision",
+      "context_tokens_min",
+      "reasoning_depth",
+      "tool_call_density",
+      "cost_class",
+    ]) {
       expect(q).toContain('"' + field + '"');
     }
   });
@@ -115,9 +134,16 @@ describe("capability vocabulary — buildCapabilityQuery (#83)", () => {
   test("round trip: a declaration written per the query's instruction parses back", () => {
     const q = buildCapabilityQuery();
     // The instruction the query gives, followed to the letter for one field set.
-    const declaration = "```" + CAPABILITY_VOCAB_FENCE + '\n{"v":1,"context_tokens_min":200000,"cost_class":"budget"}\n```';
+    const declaration =
+      "```" +
+      CAPABILITY_VOCAB_FENCE +
+      '\n{"v":1,"context_tokens_min":200000,"cost_class":"budget"}\n```';
     expect(q).toContain("fenced code block tagged");
-    expect(parseCapabilityDeclaration(declaration)).toEqual({ v: 1, context_tokens_min: 200000, cost_class: "budget" });
+    expect(parseCapabilityDeclaration(declaration)).toEqual({
+      v: 1,
+      context_tokens_min: 200000,
+      cost_class: "budget",
+    });
   });
 });
 
@@ -147,7 +173,11 @@ describe("capability vocabulary — wiring: the session channel (grain 2, #83)",
     return { model: "claude-sonnet-5", stream: false, messages: [...messages] };
   }
   function collectedMessage(): any {
-    return { type: "message", role: "assistant", content: [{ type: "text", text: "Condensed summary." }] };
+    return {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "Condensed summary." }],
+    };
   }
 
   test("lift registers once per session — the second call short-circuits without rescanning", () => {
@@ -215,20 +245,41 @@ describe("capability vocabulary — wiring: the session channel (grain 2, #83)",
 
   test("max-asks env knob: 0 disables asking, 1 asks once", () => {
     resetCapabilityVocabForTests();
-    expect(appendCapabilityQueryToMessage(collectedMessage(), "sess-k0", { CLAUDISH_CAPABILITY_VOCAB: "1", CLAUDISH_CAPABILITY_QUERY_MAX_ASKS: "0" } as NodeJS.ProcessEnv)).toBe(false);
-    expect(appendCapabilityQueryToMessage(collectedMessage(), "sess-k1a", { CLAUDISH_CAPABILITY_VOCAB: "1", CLAUDISH_CAPABILITY_QUERY_MAX_ASKS: "1" } as NodeJS.ProcessEnv)).toBe(true);
-    expect(appendCapabilityQueryToMessage(collectedMessage(), "sess-k1a", { CLAUDISH_CAPABILITY_VOCAB: "1", CLAUDISH_CAPABILITY_QUERY_MAX_ASKS: "1" } as NodeJS.ProcessEnv)).toBe(false);
+    expect(
+      appendCapabilityQueryToMessage(collectedMessage(), "sess-k0", {
+        CLAUDISH_CAPABILITY_VOCAB: "1",
+        CLAUDISH_CAPABILITY_QUERY_MAX_ASKS: "0",
+      } as NodeJS.ProcessEnv)
+    ).toBe(false);
+    expect(
+      appendCapabilityQueryToMessage(collectedMessage(), "sess-k1a", {
+        CLAUDISH_CAPABILITY_VOCAB: "1",
+        CLAUDISH_CAPABILITY_QUERY_MAX_ASKS: "1",
+      } as NodeJS.ProcessEnv)
+    ).toBe(true);
+    expect(
+      appendCapabilityQueryToMessage(collectedMessage(), "sess-k1a", {
+        CLAUDISH_CAPABILITY_VOCAB: "1",
+        CLAUDISH_CAPABILITY_QUERY_MAX_ASKS: "1",
+      } as NodeJS.ProcessEnv)
+    ).toBe(false);
   });
 
   test("null session key → lift null, append false (no state created)", () => {
     resetCapabilityVocabForTests();
-    expect(liftCapabilityDeclaration(null, payloadWith(assistantMsg(fence('{"v":1,"vision":true}'))))).toBeNull();
+    expect(
+      liftCapabilityDeclaration(null, payloadWith(assistantMsg(fence('{"v":1,"vision":true}'))))
+    ).toBeNull();
     expect(appendCapabilityQueryToMessage(collectedMessage(), null, ENV_ON)).toBe(false);
   });
 
   test("message without a text block gets the query pushed as a new text block (mirror of the failover notice append)", () => {
     resetCapabilityVocabForTests();
-    const msg = { type: "message", role: "assistant", content: [{ type: "thinking", thinking: "…" }] };
+    const msg = {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "…" }],
+    };
     expect(appendCapabilityQueryToMessage(msg, "sess-shape", ENV_ON)).toBe(true);
     expect(msg.content.length).toBe(2);
     expect(msg.content[1].type).toBe("text");
@@ -252,11 +303,7 @@ describe("capability vocabulary — wiring: the session channel (grain 2, #83)",
       "Bash marker / IN / OUT",
       "I will now check the bash marker to verify the tool state.",
     ].join("\n");
-    const other = [
-      "```claudish-needs",
-      "{this is not json at all",
-      "```",
-    ].join("\n");
+    const other = ["```claudish-needs", "{this is not json at all", "```"].join("\n");
 
     let threw = false;
     try {
@@ -274,7 +321,10 @@ describe("capability vocabulary — wiring: the session channel (grain 2, #83)",
     expect(appendCapabilityQueryToMessage(collectedMessage(), key, ENV_ON)).toBe(true);
     // And a VALID declaration later in the same session still registers.
     expect(
-      liftCapabilityDeclaration(key, payloadWith(assistantMsg("Recovered.\n" + fence('{"v":1,"cost_class":"budget"}'))))
+      liftCapabilityDeclaration(
+        key,
+        payloadWith(assistantMsg("Recovered.\n" + fence('{"v":1,"cost_class":"budget"}')))
+      )
     ).toEqual({ v: 1, cost_class: "budget" });
   });
 

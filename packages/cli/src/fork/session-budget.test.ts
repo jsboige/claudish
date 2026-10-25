@@ -17,19 +17,19 @@
  * Pin 6 (relay 429 passthrough) lives in relay.test.ts.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { isQuotaExhaustion } from "./failover.js";
 import {
+  ATTEMPT_SETTLE_MS,
+  SESSION_BUDGET_WINDOW_MS,
   admitSessionBudget,
   openSessionBudgetAttempt,
   recordSessionBudgetOutput,
+  resetSessionBudgetForTests,
   sessionBudgetConsumed,
   sessionBudgetRefusalAnthropic,
-  resetSessionBudgetForTests,
   setSessionBudgetClockForTests,
-  SESSION_BUDGET_WINDOW_MS,
-  ATTEMPT_SETTLE_MS,
 } from "./session-budget.js";
-import { isQuotaExhaustion } from "./failover.js";
 
 const SID_SWARM = "bc377615-b7bb-4c44-a6f9-636a7855949f"; // the 27/09 swarm session, measured
 const SID_OTHER = "9f005d56-b7bb-0000-0000-000000000000";
@@ -183,7 +183,9 @@ describe("session budget ceiling (#317 option B)", () => {
     clockMs += 2 * 60 * 60 * 1000; // refuse at t0+2h
     const admission = admitSessionBudget(MACHINE, SID_SWARM, ENV_CEILING)!;
     expect(admission.refused).toBe(true);
-    const expectedSec = Math.ceil((SESSION_BUDGET_WINDOW_MS - (ATTEMPT_SETTLE_MS + 1 + 2 * 60 * 60 * 1000)) / 1000);
+    const expectedSec = Math.ceil(
+      (SESSION_BUDGET_WINDOW_MS - (ATTEMPT_SETTLE_MS + 1 + 2 * 60 * 60 * 1000)) / 1000
+    );
     expect(admission.retryAfterSec).toBe(expectedSec); // ≈ 21h58m
   });
 
