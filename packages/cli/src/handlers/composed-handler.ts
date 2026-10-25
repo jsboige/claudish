@@ -295,6 +295,15 @@ export interface ComposedHandlerOptions {
    * Keep the cap for the client-visible budget it guarantees; do not read it as
    * a rescue for an over-window prompt, and re-measure before restoring the old
    * wording if the engine is ever pinned back to a build that refuses.
+   *
+   * The learned-cap short-circuit this endpoint has carried since #651 is itself
+   * gated (#676): when a window is KNOWN — `stated ?? derived ?? declared`, i.e.
+   * a limit the engine stated in its own refusal, else the `/v1/models`
+   * derivation, else a hand-typed literal — the estimate must corroborate
+   * against it before the short-circuit fires. With no window known, the learned
+   * cap stays the only evidence and behaviour is unchanged. So a cap learned
+   * from one refusal can no longer throw away, on its own, a prompt inside the
+   * [cap, window) band that #674 is about.
    */
   maxOutputTokens?: number;
   /**
