@@ -17,7 +17,8 @@ import {
   hasExtractableFunctionTag,
   validateAndRepairToolCall,
 } from "../tool-call-recovery.js";
-import { isWebSearchToolCall, warnWebSearchUnsupported } from "../web-search-detector.js";
+import { isWebSearchToolCall } from "../web-search-detector.js";
+import { executeWebSearch, extractSearchQuery } from "../web-search-executor.js";
 import { type BlockRef, createBlockWriter } from "./block-writer.js";
 import { messageStartUsage } from "./message-start-usage.js";
 import { sseDataPayload } from "./sse-line.js";
@@ -105,6 +106,39 @@ export interface StreamingState {
   finishReason: string | null;
 }
 
+/**
+ * Whether the direct-HTTP SearXNG backend is configured at all. Read once at
+ * module load, like the executor's per-call `searxngConfig()` reads its env —
+ * a late container env injection changes the next process, not this one.
+ */
+const SEARXNG_AVAILABLE = !!process.env.SEARXNG_URL;
+
+/**
+ * Whether the client declared a WebSearch tool in this request.
+ * When it did, provider-side web search calls (web_search tool calls, GLM
+ * <searchWeb> tags) are remapped to a synthetic WebSearch tool_use with
+ * stop_reason "tool_use" — the client then runs its own WebSearch, gets the
+ * results as a tool_result, and the agentic loop continues.
+ */
+function clientDeclaresWebSearch(toolSchemas?: any[]): boolean {
+  return !!toolSchemas?.some((s) => s?.name === "WebSearch");
+}
+
+/**
+ * Whether the client declared a tool under this EXACT name (lane 1 of the
+ * three-way disposition). A provider web-tool call the client declared
+ * verbatim (`web_search`, `brave_web_search`, …) is the client's OWN tool:
+ * the client can execute it itself, so the call forwards like any declared
+ * tool instead of being intercepted. Interception (remap or
+ * suppress-and-inject) only applies when the exact name is NOT declared —
+ * measured 15/10 on Hermes (ai-01): its declared `web_search` tool was
+ * suppressed, results injected as text with end_turn, and the run dumped
+ * raw search results instead of continuing its loop.
+ */
+function clientDeclaresToolExactly(name: string, toolSchemas?: any[]): boolean {
+  return !!toolSchemas?.some((s) => s?.name === name);
+}
+
 export interface ToolState {
   id: string;
   name: string;
@@ -113,6 +147,14 @@ export interface ToolState {
   closed: boolean;
   arguments: string; // Accumulated JSON arguments string
   buffered: boolean; // Whether we're buffering args until tool call completes
+  /**
+   * Web-search disposition (three-way): suppressed calls never emit a tool
+   * block — their SearXNG results are injected as a text block instead; they
+   * hold no client index (blockIndex -1). remapped calls are re-emitted as
+   * the client's WebSearch tool_use.
+   */
+  suppressed: boolean;
+  remapped: boolean;
   /**
    * The block this tool is currently streaming into, or null when it has none
    * (buffered and not yet flushed, or its block was superseded — see the
@@ -368,6 +410,44 @@ export function createStreamingResponseHandler(
             writer.append(writer.openText(), text);
           };
 
+          // Emit a synthetic WebSearch tool_use block. Used to remap provider
+          // web search calls (web_search tool calls, GLM <searchWeb> tags) to
+          // the client's own WebSearch tool so the agentic loop continues
+          // (stop_reason "tool_use") instead of ending the turn on raw results.
+          const emitWebSearchToolUse = (query: string, t?: ToolState) => {
+            // -1 = suppressed at creation, holds no client index (review #485):
+            // it is not nullish, so without this guard a -1 reaching the remap
+            // path would emit content_block_start index:-1. Unreachable today
+            // (a suppressed call never reaches the remap), but the sentinel
+            // gets its guard at its one consumer.
+            const blockIndex = t && t.blockIndex >= 0 ? t.blockIndex : writer.reserve();
+            const id = t?.id ?? `tool_websearch_${Date.now()}_${blockIndex}`;
+            const ref = writer.openTool({ id, name: "WebSearch", index: blockIndex });
+            writer.append(ref, JSON.stringify({ query }));
+            writer.close(ref);
+            if (t) {
+              t.ref = ref;
+              t.started = true;
+              t.closed = true;
+            } else {
+              // Register so hasStructuredTools counts it → stop_reason "tool_use".
+              // Negative key avoids collisions with provider tool_call indices.
+              state.tools.set(-(blockIndex + 1), {
+                id,
+                name: "WebSearch",
+                blockIndex,
+                started: true,
+                closed: true,
+                suppressed: false,
+                remapped: true,
+                arguments: JSON.stringify({ query }),
+                buffered: false,
+                ref,
+              });
+            }
+            log(`[Stream] Remapped provider web search → WebSearch tool_use (query="${query}")`);
+          };
+
           send("message_start", {
             type: "message_start",
             message: {
@@ -486,6 +566,43 @@ export function createStreamingResponseHandler(
                 );
               }
 
+              // Check for text-based web search tags (GLM emits <searchWeb><query>...</query></searchWeb>)
+              // These must be intercepted before text-based tool call extraction, since we want to
+              // execute SearXNG and replace the search tags with results, not pass them through.
+              // A tag has no called name, so lane 1 (exact-name forward) has no subject here —
+              // tags keep lanes 2/3 only.
+              let searchWebResults: string | null = null;
+              let pendingSearchRemap: string | null = null;
+              const searchWebMatch = state.accumulatedText.match(
+                /<searchWeb>\s*<query>([\s\S]*?)<\/query>\s*<\/searchWeb>/i
+              );
+              if (searchWebMatch) {
+                const searchQuery = searchWebMatch[1].trim();
+                if (searchQuery && clientDeclaresWebSearch(toolSchemas)) {
+                  // Remap to the client's WebSearch tool — emitted as a tool_use
+                  // block after the text blocks close, keeping the agent loop alive.
+                  log(
+                    `[Stream] GLM searchWeb detected: "${searchQuery}" — remapping to client WebSearch tool_use`
+                  );
+                  pendingSearchRemap = searchQuery;
+                } else {
+                  log(
+                    `[Stream] GLM searchWeb detected: "${searchQuery}" — intercepting via SearXNG`
+                  );
+                  if (searchQuery && SEARXNG_AVAILABLE) {
+                    searchWebResults = await executeWebSearch(searchQuery);
+                  } else {
+                    searchWebResults = searchQuery
+                      ? `[Web search for "${searchQuery}" could not be executed. SearXNG is not configured.]`
+                      : "[Web search was requested but no query was provided.]";
+                  }
+                }
+                // Remove the search tags from accumulated text so they don't appear in output
+                state.accumulatedText = state.accumulatedText
+                  .replace(/<searchWeb>[\s\S]*?<\/searchWeb>/i, "")
+                  .trim();
+              }
+
               // Check for text-based tool calls before finalizing
               // Some models (like Qwen) output tool calls as text instead of structured tool_calls
               //
@@ -599,10 +716,66 @@ export function createStreamingResponseHandler(
                 }
               }
 
+              // GLM <searchWeb> remapped to the client's WebSearch tool —
+              // emitted as a tool_use block so stop_reason becomes "tool_use".
+              // Suppressed on a failure ending: no NEW tool block leaves a failed
+              // turn.
+              if (pendingSearchRemap && ending !== "failure") {
+                emitWebSearchToolUse(pendingSearchRemap);
+              }
+
+              // Inject SearXNG results if we intercepted GLM <searchWeb> tags.
+              // Sent as a separate text block after the (now-cleaned) model output.
+              if (searchWebResults) {
+                const ref = writer.openText();
+                writer.append(ref, searchWebResults);
+                writer.close(ref);
+              }
+
+              // Suppressed web-search tool calls on a NON-tool_calls ending (the
+              // model asked to search but finished with "stop"): the finish_reason
+              // spend path never ran, so the search would be silently dropped AND
+              // its reserved index would leak a hole (Hermes IndexError, 15/10).
+              // Same injection, same wording as the tool_calls path.
+              for (const t of Array.from(state.tools.values())) {
+                if (t.suppressed && !t.closed) {
+                  const query = extractSearchQuery(t.arguments);
+                  let resultText: string;
+                  if (query && SEARXNG_AVAILABLE) {
+                    resultText = await executeWebSearch(query);
+                  } else {
+                    resultText = query
+                      ? `[Web search for "${query}" could not be executed. The search service (SearXNG) is not configured. Set SEARXNG_URL env var to enable.]`
+                      : "[Web search was requested but no query was provided.]";
+                  }
+                  const ref =
+                    t.blockIndex >= 0
+                      ? writer.openText({ index: t.blockIndex })
+                      : writer.openText();
+                  writer.append(ref, resultText);
+                  writer.close(ref);
+                  t.closed = true;
+                }
+              }
+
               // Whatever is still open — thinking, text, or a tool — closes here.
               // This replaces the hand-written reasoning-then-text pair, which could
               // only ever close the two kinds it named.
               writer.closeCurrent();
+
+              // Remapped web search tools that never saw finish_reason="tool_calls"
+              // (e.g. the provider ended with "stop") — emit them now so the
+              // query isn't silently dropped and stop_reason becomes "tool_use".
+              for (const t of Array.from(state.tools.values())) {
+                if (t.remapped && !t.closed) {
+                  const query = extractSearchQuery(t.arguments);
+                  if (query) {
+                    emitWebSearchToolUse(query, t);
+                  } else {
+                    t.closed = true;
+                  }
+                }
+              }
 
               // Handle buffered-but-unsent structured tool calls.
               // Some models (e.g., Gemini via LiteLLM) send tool calls with finish_reason="stop"
@@ -686,7 +859,12 @@ export function createStreamingResponseHandler(
                 });
               } else {
                 // Set stop_reason based on whether we sent ANY tool calls (text-based or structured)
-                const hasStructuredTools = Array.from(state.tools.values()).some((t) => t.started);
+                // A suppressed web-search call is not a dispatched tool — its
+                // results were injected as text. Only a started, non-suppressed
+                // block makes the turn's stop_reason "tool_use".
+                const hasStructuredTools = Array.from(state.tools.values()).some(
+                  (t) => t.started && !t.suppressed
+                );
                 // A turn the PROVIDER cut off must not be reported as a turn the model
                 // chose to end. Anthropic's contract for a cut-off turn is "max_tokens";
                 // reporting "end_turn" presents a truncated (or, when reasoning consumed
@@ -979,21 +1157,60 @@ export function createStreamingResponseHandler(
                           if (!t) {
                             // The hand-written "close thinking, then close text"
                             // pair that used to stand here is `openTool`'s job now.
+                            // Three-way disposition (Hermes fix #2): lane 1 —
+                            // exact-name declaration wins, the call forwards like
+                            // any declared tool. Lanes 2/3 (remap to WebSearch,
+                            // suppress-and-inject) only when the exact name is
+                            // not declared.
+                            const isWebSearch = isWebSearchToolCall(restoredName);
+                            const declaredExactly =
+                              isWebSearch && clientDeclaresToolExactly(restoredName, toolSchemas);
+                            const remapToWebSearch =
+                              isWebSearch &&
+                              !declaredExactly &&
+                              clientDeclaresWebSearch(toolSchemas);
+                            const suppressWebSearch =
+                              isWebSearch && !remapToWebSearch && !declaredExactly;
+                            if (isWebSearch) {
+                              log(
+                                `[Stream] Web search tool call detected: "${restoredName}" — ${
+                                  declaredExactly
+                                    ? "forwarding verbatim (client declared this exact tool)"
+                                    : remapToWebSearch
+                                      ? "remapping to client WebSearch tool_use"
+                                      : `intercepting via SearXNG (available=${SEARXNG_AVAILABLE})`
+                                }`
+                              );
+                            }
                             t = {
                               id: tc.id || `tool_${Date.now()}_${idx}`,
                               name: restoredName,
                               // Reserved, not opened: a buffered tool keeps its place
                               // in the index order and emits at finish_reason time.
-                              blockIndex: writer.reserve(),
+                              // Only a SUPPRESSED web-search call never emits a
+                              // block, so it reserves nothing (-1): its index would
+                              // otherwise leak a hole to the client when the turn
+                              // ends without the finish_reason="tool_calls" spend
+                              // path. The sentinel follows the disposition, not the
+                              // name: lane 1 (exact-name declared) forwards and
+                              // MUST own a real index (#498 CR, #484 class).
+                              blockIndex: suppressWebSearch ? -1 : writer.reserve(),
                               started: false,
                               closed: false,
                               // Seeded, not empty: fragments that arrived for this
                               // index before the name did are drained in here.
                               arguments: state.pendingToolArgs.get(idx) ?? "",
                               ref: null,
-                              // Buffer if we have schemas to validate the
-                              // completed arguments against.
-                              buffered: !!toolSchemas && toolSchemas.length > 0,
+                              // Buffer if we have schemas to validate the completed
+                              // arguments against — lane 1 (exact-name declared)
+                              // buffers like any declared tool, validation applies
+                              // to it too; intercepted calls carry no client schema.
+                              buffered:
+                                !!toolSchemas &&
+                                toolSchemas.length > 0 &&
+                                (!isWebSearch || declaredExactly),
+                              suppressed: suppressWebSearch,
+                              remapped: remapToWebSearch,
                             };
                             if (t.arguments) {
                               log(
@@ -1002,9 +1219,6 @@ export function createStreamingResponseHandler(
                             }
                             state.pendingToolArgs.delete(idx);
                             state.tools.set(idx, t);
-                            if (isWebSearchToolCall(restoredName)) {
-                              warnWebSearchUnsupported(restoredName, target);
-                            }
                           } else if (t.name !== restoredName) {
                             // A LATER fragment completed the name. The tool was
                             // created from the first fragment, so its name is a
@@ -1020,14 +1234,17 @@ export function createStreamingResponseHandler(
                               );
                             } else {
                               t.name = restoredName;
-                              t.buffered = !!toolSchemas && toolSchemas.length > 0;
+                              t.buffered = !!toolSchemas && toolSchemas.length > 0 && !t.remapped;
                               if (isWebSearchToolCall(restoredName)) {
-                                warnWebSearchUnsupported(restoredName, target);
+                                log(
+                                  `[Stream] Web search tool call detected: "${restoredName}" — name completed by a later fragment, re-evaluated at the decode point`
+                                );
                               }
                             }
                           }
-                          // Only send content_block_start immediately if NOT buffering
-                          if (!t.started && !t.buffered) {
+                          // Only send content_block_start immediately if NOT buffering.
+                          // Suppressed and remapped tools never stream their blocks live.
+                          if (!t.started && !t.buffered && !t.suppressed && !t.remapped) {
                             t.ref = writer.openTool({
                               id: t.id,
                               name: t.name,
@@ -1052,10 +1269,12 @@ export function createStreamingResponseHandler(
                           );
                         }
                         if (tc.function?.arguments && t) {
-                          // Always accumulate arguments
+                          // Always accumulate arguments — suppressed/remapped tools
+                          // too: their disposition is decided, but the query lives
+                          // in these arguments.
                           t.arguments += tc.function.arguments;
-                          // Only stream immediately if NOT buffering
-                          if (!t.buffered) {
+                          // Only stream immediately if NOT buffering/suppressed/remapped
+                          if (!t.buffered && !t.suppressed && !t.remapped) {
                             if (!t.ref || !writer.append(t.ref, tc.function.arguments)) {
                               // OpenAI's wire lets `tool_calls[0]` and `tool_calls[1]`
                               // fragments interleave; Anthropic's allows one open
@@ -1080,6 +1299,46 @@ export function createStreamingResponseHandler(
 
                   if (chunk.choices?.[0]?.finish_reason === "tool_calls") {
                     for (const t of Array.from(state.tools.values())) {
+                      if (t.remapped) {
+                        if (!t.closed) {
+                          const query = extractSearchQuery(t.arguments);
+                          if (query) {
+                            emitWebSearchToolUse(query, t);
+                          } else {
+                            // No usable query — degrade to the suppression path
+                            // (text injection below) rather than emit a broken tool_use.
+                            t.remapped = false;
+                            t.suppressed = true;
+                          }
+                        }
+                        if (t.closed) continue;
+                      }
+                      if (t.suppressed) {
+                        // Execute web search via SearXNG and inject results
+                        if (!t.closed) {
+                          const query = extractSearchQuery(t.arguments);
+                          let resultText: string;
+                          if (query && SEARXNG_AVAILABLE) {
+                            resultText = await executeWebSearch(query);
+                          } else {
+                            resultText = query
+                              ? `[Web search for "${query}" could not be executed. The search service (SearXNG) is not configured. Set SEARXNG_URL env var to enable.]`
+                              : "[Web search was requested but no query was provided.]";
+                          }
+                          // The suppressed tool never opened its block, so its
+                          // reserved index is unspent — the text takes it.
+                          // (-1 = suppressed at creation, nothing held: bare
+                          // openText takes the next free index.)
+                          const ref =
+                            t.blockIndex >= 0
+                              ? writer.openText({ index: t.blockIndex })
+                              : writer.openText();
+                          writer.append(ref, resultText);
+                          writer.close(ref);
+                          t.closed = true;
+                        }
+                        continue;
+                      }
                       if (!t.closed) {
                         // Validate and potentially repair tool arguments
                         if (toolSchemas && toolSchemas.length > 0) {
