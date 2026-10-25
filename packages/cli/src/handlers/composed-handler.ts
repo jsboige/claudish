@@ -56,6 +56,7 @@ import { resumeFromToolResults } from "../code-mode/resume.js";
 import { loadQuickJSModule } from "../code-mode/sandbox/quickjs-loader.js";
 import { getCodeModeStores, peekCodeModeStores } from "../code-mode/stores.js";
 import { conversationMessages } from "../code-mode/types.js";
+import { recordSessionBudgetOutput } from "../fork/session-budget.js";
 import { getHookEngine } from "../hooks/index.js";
 import { type RawStreamTap, statsNames } from "../hooks/raw.js";
 import type { UpstreamFacts } from "../hooks/registry.js";
@@ -3298,6 +3299,11 @@ export class ComposedHandler implements ModelHandler {
     // update rather than read from the tracker's pricing lookup, whose
     // credential-decided answer is the process-wide last-signed arm.
     const onTokenUpdate = (input: number, output: number, detail?: UsageCacheDetail) => {
+      // #317: upstream output tokens feed the per-session budget counter (the
+      // attempt token was attached to c.req.raw by the route before the paid
+      // attempt). Never throws; a no-op when the instrument is inert (no token
+      // attached) — so an unarmed fleet runs this identical path for free.
+      recordSessionBudgetOutput(c.req.raw, output);
       const strategy = this.options.tokenStrategy || "standard";
       switch (strategy) {
         case "accumulate-both":

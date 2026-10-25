@@ -14,6 +14,21 @@ import {
   HOPS_HEADER,
   type RelayState,
 } from "./fork/server/relay.js";
+// #641 G6 — fork extensions carried onto the branch: the per-session output-token
+// ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
+// are INERT without their env knobs, so their presence changes nothing on a
+// fleet that never opts in.
+import { extractSessionKey } from "./fork/failover.js";
+import {
+  admitSessionBudget,
+  openSessionBudgetAttempt,
+  sessionBudgetRefusalAnthropic,
+} from "./fork/session-budget.js";
+import {
+  appendCapabilityQueryToMessage,
+  isCapabilityVocabEnabled,
+  liftCapabilityDeclaration,
+} from "./fork/capability-vocabulary.js";
 import { getInstanceId } from "./instance-id.js";
 import { markKeylessExempt } from "./handlers/shared/keyless-exempt.js";
 import { matchesProxyKey, resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
@@ -877,6 +892,34 @@ export async function createProxyServer(
     return getOpenRouterHandler(target, invocationMode);
   };
 
+  /**
+   * #83 grain 2: append the capability query to a collected (non-streaming)
+   * response — the condensation rail. Streaming passes through untouched
+   * (condensation is the non-stream path). The gate is re-read per call
+   * (`CLAUDISH_CAPABILITY_VOCAB`, default off), so an operator can flip it
+   * without a restart; never throws (a broken body simply serves as-is).
+   */
+  const applyCapabilityQueryAtCondensation = async (
+    response: Response,
+    sessionKey: string | null,
+    wantsStreaming: boolean
+  ): Promise<Response> => {
+    if (wantsStreaming || !response.ok) return response;
+    if (!sessionKey || !isCapabilityVocabEnabled(process.env)) return response;
+    try {
+      const message = await response.clone().json();
+      if (appendCapabilityQueryToMessage(message, sessionKey, process.env)) {
+        log(`[Capability] query appended to condensation (session=${sessionKey.slice(0, 8)})`);
+        const headers = new Headers(response.headers);
+        headers.set("Content-Type", "application/json");
+        return new Response(JSON.stringify(message), { status: response.status, headers });
+      }
+      return response;
+    } catch {
+      return response;
+    }
+  };
+
   const app = new Hono();
   app.use("*", cors());
 
@@ -1256,6 +1299,29 @@ export async function createProxyServer(
         return await withAdvisor(nativeHandler).handle(c, body);
       }
 
+      // #317 option B — per-session output-token ceiling. Admission runs BEFORE
+      // any handler resolution: a refused request pays no upstream and writes no
+      // failover state (not even the dwell pin the resolution below writes).
+      // Inert without CLAUDISH_SESSION_BUDGET_* (null admission, zero work), and
+      // never reached on a relayed request — the relay branch returned above, so
+      // a sidecar never counts what the hub serves.
+      const sessionKey = extractSessionKey(body);
+      const machineHeader = c.req.header("x-claudish-machine") ?? null;
+      {
+        const admission = admitSessionBudget(machineHeader, sessionKey, process.env);
+        if (admission?.refused) return sessionBudgetRefusalAnthropic(admission);
+      }
+
+      // #83 grain 2: capability vocabulary — lift the session's declaration from
+      // trailing assistant history, once per session (the same #91 p4 dwell seam
+      // the budget keys on), gated CLAUDISH_CAPABILITY_VOCAB (default off).
+      if (sessionKey && isCapabilityVocabEnabled(process.env)) {
+        const declared = liftCapabilityDeclaration(sessionKey, body);
+        if (declared) {
+          log(`[Capability] session=${sessionKey.slice(0, 8)} declared ${JSON.stringify(declared)}`);
+        }
+      }
+
       // The advisor wrapper goes on the RESOLVED handler (FallbackHandler
       // included), once per request, around the hooks. See `withAdvisor` and
       // `withRequestHooks` above.
@@ -1264,12 +1330,20 @@ export async function createProxyServer(
         advisorPresence
       );
 
+      // #317: the attempt token is attached right before the paid attempt — the
+      // usage sink keys its max-ledger on it. No-op when both bars are off.
+      openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+
       // Route. The `await` is load-bearing: `return handler.handle(...)` hands
       // the promise back BEFORE it settles, so a rejection escapes this
       // try/catch entirely and lands in Hono's error handler instead. That is
       // how connect failures bypassed every message we build here.
       try {
-        return await handler.handle(c, body);
+        return await applyCapabilityQueryAtCondensation(
+          await handler.handle(c, body),
+          sessionKey,
+          body.stream === true
+        );
       } catch (handlerError) {
         handlerThrew = true;
         throw handlerError;
