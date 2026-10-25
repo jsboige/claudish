@@ -837,15 +837,44 @@ export class ComposedHandler implements ModelHandler {
     // recoverable turn. The first rejection per (provider, model) per process
     // lifetime is unavoidable: the cap is learned, not configured, because the
     // provider-side maximum prompt size is variable and undocumented.
+    //
+    // #674 corroboration: `est >= cap` alone is NOT evidence the engine will
+    // refuse. Measured 25/10 on this lane's own log: 35 short-circuits in 24 h
+    // at caps 225-241k, while the same day's SERVED corpus holds 21 bodies with
+    // est >= 230k whose real count was 209k-262k — every one under the window,
+    // so the [cap, window) band mixes doomed and served prompts. The /4
+    // estimate spans 0.99-1.13x of the real count at p01-p95 (outlier 0.57x),
+    // and the cost is asymmetric: a false fire forces a compaction turn a
+    // served prompt never needed, while a missed fire costs one ~1 s round-trip
+    // whose 400 returns the SAME recoverable turn. So when a window is KNOWN,
+    // the estimate must corroborate before the short-circuit fires. Two units,
+    // never mixed (same rule as the derived branch below): the trigger stays in
+    // payload units (est >= cap), the window is judged in the media-aware clamp
+    // units every other window comparison uses — a 1.4 MB screenshot scores
+    // 350k there and 1.6k here, and the refusal must not flip on that
+    // difference. No window known → the cap stays the only evidence, unchanged.
+    // (The exact count that would let the [cap, window) band fire safely is
+    // #674's remaining build.)
     const overflowCap = getOverflowCap(this.provider.displayName, this.targetModel);
     if (overflowCap !== undefined) {
       const est = estimatePayloadTokens(requestPayload);
       if (est >= overflowCap) {
-        logStderr(
-          `[ContextGuard] short-circuit provider=${this.provider.displayName} model=${this.targetModel} est=${est} cap=${overflowCap} (learned) — no upstream call`,
-          true
-        );
-        return this.buildOverflowRecoveryResponse(c, payload, est, undefined, overflowCap);
+        const knownWindow = this.options.derivedContextLimit ?? this.options.contextLimit;
+        const corroborated =
+          knownWindow === undefined ||
+          knownWindow <= 0 ||
+          overflowCap >= knownWindow ||
+          estimateClampTokens(claudeRequest) >= knownWindow;
+        if (corroborated) {
+          logStderr(
+            `[ContextGuard] short-circuit provider=${this.provider.displayName} model=${this.targetModel} est=${est} cap=${overflowCap}${knownWindow !== undefined && knownWindow > 0 && overflowCap < knownWindow ? ` window=${knownWindow} (corroborated)` : " (learned)"} — no upstream call`,
+            true
+          );
+          return this.buildOverflowRecoveryResponse(c, payload, est, undefined, overflowCap);
+        }
+        // Not corroborated: fall through to the upstream. Its 400 (if doomed)
+        // returns the same recoverable turn one round-trip later; its 200 (if
+        // served) is a turn the old gate would have thrown away.
       }
     } else if (this.options.derivedContextLimit !== undefined && this.options.derivedContextLimit > 0) {
       // #651 — a window MEASURED from the engine's own `/v1/models` pre-seeds

@@ -304,11 +304,33 @@ describe("ComposedHandler — a MEASURED window pre-seeds the cap (#651)", () =>
     expect(fx.getCalls()).toBeGreaterThanOrEqual(1);
   });
 
-  test("the learned cap still wins when both exist (the two units are never mixed)", async () => {
+  test("a window ABOVE the estimate no longer lets the cap refuse alone (#674 corroboration)", async () => {
+    // The 25/10 measurement inverted this test's premise: `est >= cap` fires
+    // on prompts the engine serves (21 served bodies at est >= 230k, real
+    // 209k-262k, same day). With a KNOWN window above the estimate, the
+    // short-circuit must stand down and let the upstream answer — its 400
+    // returns the same recoverable turn one round-trip later; its 200 is a
+    // turn the old gate threw away.
     rememberOverflowCap("GLM Coding", "glm-5.3", 1_000);
     const fx = countingFetch(200, "not relevant");
     const res = await runHandle(overflowPayload(true, 40_000), fx.impl as typeof fetch, {
-      derivedContextLimit: 10_000_000, // a huge measured window must not mask the learned cap
+      derivedContextLimit: 10_000_000, // a huge measured window: nothing here is over it
+    });
+    expect(fx.getCalls()).toBe(1); // upstream called — no refusal on the estimate alone
+    expect(res.headers.get("x-claudish-step-skip") ?? "").not.toContain("cap=1000");
+  });
+
+  test("the cap still fires when the window corroborates (both estimators agree it is over)", async () => {
+    // The other half of the #674 contract: corroboration is not disarmament.
+    // Here the measured window sits BELOW the request's estimate, so the two
+    // pieces of evidence agree — zero round-trips, exactly the old behavior.
+    // Units stay separate: the trigger is payload units (est >= cap), the
+    // window is judged in clamp units (this payload is text-only, so both
+    // estimators score it at ~10k).
+    rememberOverflowCap("GLM Coding", "glm-5.3", 1_000);
+    const fx = countingFetch(200, "not relevant");
+    const res = await runHandle(overflowPayload(true, 40_000), fx.impl as typeof fetch, {
+      derivedContextLimit: 500, // measured, and far below this request
     });
     expect(fx.getCalls()).toBe(0);
     expect(res.headers.get("x-claudish-step-skip") ?? "").toContain("cap=1000");
