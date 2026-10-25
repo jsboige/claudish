@@ -49,10 +49,7 @@ export interface PolicyRetryOpts {
  * anthropic-compat providers (Z.AI, MiniMax, Kimi) whose error objects carry
  * only `type` + `message` with no code.
  */
-export function isPolicyRefusal(
-  code?: string | null,
-  message?: string | null
-): boolean {
+export function isPolicyRefusal(code?: string | null, message?: string | null): boolean {
   if (code === "invalid_prompt") return true;
   return /prompt (?:was )?flagged|flagged as (?:potentially )?violating|violat\w+ (?:the )?(?:usage|content|acceptable[- ]use) policy/i.test(
     message ?? ""

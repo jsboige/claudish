@@ -13,14 +13,14 @@ import type { Context } from "hono";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
 import { log } from "../../../logger.js";
 import { redactForClient } from "../../../redact.js";
-import { sseDataPayload } from "./sse-line.js";
-import { type UpstreamReaderSlot, cancelEndsUpstreamWork } from "./upstream-cancel.js";
 import {
+  POLICY_RETRY_BACKOFF_MS,
   isPolicyRefusal,
   logPolicyRefusal,
   policyRefusalNotice,
-  POLICY_RETRY_BACKOFF_MS,
 } from "./policy-refusal.js";
+import { sseDataPayload } from "./sse-line.js";
+import { type UpstreamReaderSlot, cancelEndsUpstreamWork } from "./upstream-cancel.js";
 
 /**
  * Backoff ladder for the pre-visible transparent re-forward (#170).
@@ -229,13 +229,22 @@ export function createAnthropicPassthroughStream(
    * `noticeText` (#65) appends one labeled text block before the tail — the only
    * signal of WHAT was refused, so the agent can adapt instead of guessing.
    */
-  const finalizeAbandonedStream = (controller: any, noticeText?: string): void => {
+  const finalizeAbandonedStream = (
+    controller: any,
+    noticeText?: string,
+    contentWasForwarded?: boolean
+  ): void => {
     if (isClosed || sawMessageStop) return;
     const send = (event: string, data: unknown): void => {
       controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
     };
     try {
-      if (!sawMessageStart) {
+      // #286: a synthetic message_start after a body that was already
+      // DELIVERED is a lie — on the OpenAI wire (relayed /v1/chat/completions)
+      // sawMessageStart never arms while the real chunks went through. Only a
+      // stream that delivered NOTHING opens its turn synthetically; the
+      // terminal tail below still closes either way (never-hang intact).
+      if (!sawMessageStart && !contentWasForwarded) {
         send("message_start", {
           type: "message_start",
           message: {
@@ -420,22 +429,24 @@ export function createAnthropicPassthroughStream(
             };
 
             /**
-             * Surface an in-stream error as a terminal turn: the generic class
-             * keeps its pre-existing redacted `event: error` frame (the client
-             * redaction pin holds that shape), and BOTH classes get the
-             * never-hang tail — message_start if the upstream never opened,
-             * open block closed, message_delta + message_stop — so the client
-             * never receives a stream that stopped without ending. The policy
-             * class surfaces as the labeled notice block alone (#65): the
-             * refusal text must read as the assistant's answer, not as a
-             * transport error the agent would retry blind.
+             * Surface an in-stream error. The generic class keeps the branch's
+             * pre-existing shape EXACTLY - a redacted `event: error` frame and
+             * a close, no terminal pair (the #106 regression pin holds that a
+             * stream terminated by error must NOT carry a message_stop: Claude
+             * Code ends the turn on the error event itself). The policy class
+             * (#65) surfaces as a real terminal turn - the labeled notice is
+             * the only signal of WHAT was refused, so it must read as the
+             * assistant's answer, not as a transport error the agent would
+             * retry blind.
              */
             const closeWithTerminalTail = (
               controller: any,
               errMsg: string,
               notice?: string
             ): void => {
-              if (!isClosed && notice === undefined) {
+              if (notice !== undefined) {
+                finalizeAbandonedStream(controller, notice);
+              } else if (!isClosed) {
                 controller.enqueue(
                   encoder.encode(
                     `event: error\ndata: ${JSON.stringify({
@@ -445,7 +456,6 @@ export function createAnthropicPassthroughStream(
                   )
                 );
               }
-              finalizeAbandonedStream(controller, notice);
               isClosed = true;
               if (pingInterval) {
                 clearInterval(pingInterval);
@@ -496,8 +506,7 @@ export function createAnthropicPassthroughStream(
                 if (canRetry) {
                   policyRetryAttempts++;
                   const backoffMs =
-                    policyRetryBackoff[policyRetryAttempts - 1] +
-                    Math.floor(Math.random() * 1_000);
+                    policyRetryBackoff[policyRetryAttempts - 1] + Math.floor(Math.random() * 1_000);
                   log(
                     `[AnthropicSSE] invalid_prompt before any client-visible event — transparent retry ${policyRetryAttempts}/${policyRetryBackoff.length} in ${backoffMs}ms (${path})`,
                     true
@@ -599,12 +608,8 @@ export function createAnthropicPassthroughStream(
                 // A socket reset with nothing forwarded yet is recoverable
                 // (#170). Otherwise rethrow so the graceful finalization in
                 // the outer catch runs unchanged.
-                if (
-                  await tryPreVisibleReforward(
-                    `read error: ${String(readFail).slice(0, 80)}`
-                  )
-                ) {
-                  continue readLoop;
+                if (await tryPreVisibleReforward(`read error: ${String(readFail).slice(0, 80)}`)) {
+                  continue; // bare: no inner loop to escape here
                 }
                 throw readFail;
               }
@@ -615,7 +620,7 @@ export function createAnthropicPassthroughStream(
                 // that emitted anything fails the gate and falls through to
                 // normal end-of-stream handling.
                 if (await tryPreVisibleReforward("upstream closed with no event")) {
-                  continue readLoop;
+                  continue; // bare: no inner loop to escape here
                 }
                 break;
               }
@@ -708,11 +713,8 @@ export function createAnthropicPassthroughStream(
                       // dispatch first; the generic class keeps its surface.
                       if (data.error) {
                         if (
-                          (await handleInStreamError(
-                            controller,
-                            data.error,
-                            "in-stream-error"
-                          )) === "retried"
+                          (await handleInStreamError(controller, data.error, "in-stream-error")) ===
+                          "retried"
                         ) {
                           continue readLoop;
                         }
@@ -844,11 +846,12 @@ export function createAnthropicPassthroughStream(
             }
 
             if (!isClosed) {
-              // A body that ended without message_stop still owes the client a
-              // terminal pair (#286: a full OpenAI body piped through this
-              // passthrough on the relay lane has no anthropic events at all).
-              // No-op when the upstream closed the message itself.
-              finalizeAbandonedStream(controller);
+              // Claude Code requires message_stop as the terminal event — a
+              // body that ended without it gets the synthetic tail (#286 port):
+              // full synthetic open only when NOTHING was delivered, otherwise
+              // just the terminal pair (a synthetic message_start after a
+              // delivered body would be a lie about what the client holds).
+              finalizeAbandonedStream(controller, undefined, forwardedAnyData);
               isClosed = true;
               if (pingInterval) {
                 clearInterval(pingInterval);

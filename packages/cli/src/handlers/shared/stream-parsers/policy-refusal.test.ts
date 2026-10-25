@@ -140,7 +140,11 @@ describe("#65 anthropic-sse lane — in-stream policy refusal", () => {
       "event: message_start\n" +
       `data: ${JSON.stringify({
         type: "message_start",
-        message: { id: "msg_recovered", model: "glm-5.3", usage: { input_tokens: 5, output_tokens: 0 } },
+        message: {
+          id: "msg_recovered",
+          model: "glm-5.3",
+          usage: { input_tokens: 5, output_tokens: 0 },
+        },
       })}\n\n` +
       "event: content_block_start\n" +
       `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n` +
@@ -157,7 +161,16 @@ describe("#65 anthropic-sse lane — in-stream policy refusal", () => {
       return sseResponse(recovered);
     });
     expect(calls).toBe(1);
-    expect(lines.some((l) => l.includes("[PolicyRefusal]") && l.includes("lane=anthropic") && l.includes("model=glm-5.3") && l.includes("provider=zai") && l.includes("action=retry"))).toBe(true);
+    expect(
+      lines.some(
+        (l) =>
+          l.includes("[PolicyRefusal]") &&
+          l.includes("lane=anthropic") &&
+          l.includes("model=glm-5.3") &&
+          l.includes("provider=zai") &&
+          l.includes("action=retry")
+      )
+    ).toBe(true);
     expect(lines.some((l) => l.includes("transparent retry 1/2"))).toBe(true);
     expect(output).toContain("recovered from flag");
     // exactly ONE message_start — the retried stream's (the refused attempt
@@ -214,6 +227,10 @@ describe("#65 anthropic-sse lane — in-stream policy refusal", () => {
     expect(calls).toBe(0);
     expect(lines.some((l) => l.includes("[PolicyRefusal]"))).toBe(false);
     expect(output).toContain("rate limit");
-    expect(output).toContain("event: message_stop");
+    // Branch contract (#106 regression pin): a stream terminated by a generic
+    // in-stream error carries the error frame as its LAST event — Claude Code
+    // ends the turn on the error event itself, so no synthetic message_stop
+    // follows it. The trunk's generic-tail variant does not apply here.
+    expect(output).not.toContain("message_stop");
   });
 });
