@@ -27,6 +27,7 @@ import {
   resetFailoverForTests,
   resolveFailoverTarget,
   resolveFailoverTargetForSession,
+  resolveTransientStep,
   getSessionDwellPinForTests,
   getDwellYieldTombstoneCountForTests,
   DWELL_TOMBSTONES_MAX,
@@ -534,6 +535,25 @@ describe("#693 — per-machine step exclusion (CLAUDISH_FAILOVER_STEP_EXCLUDE)",
     resolveFailoverTargetForSession("haiku", "s-po2023", "minimax-coding");
     resolveFailoverTargetForSession("haiku", "s-po2023", "minimax-coding", undefined, "myia-po-2023");
     expect(getSessionDwellPinForTests("haiku", "s-po2023")?.stepIndex).toBe(0);
+  });
+
+  it("the #299-B overload walk skips the machine's excluded step (review pin: mutation left the suite green)", async () => {
+    // The body and the doc claim the exclusion rides EVERY walk — armed,
+    // session, AND the transient overload walk. The first two were pinned;
+    // deleting the guard inside resolveTransientStep left the whole family
+    // green (verified during review of #694), so this pin holds the third.
+    initFailover(MANDATE_ENV);
+    // Machine-blind (the one-shot walk's own resolution) and every other
+    // machine keep step 0 — the walk is unchanged for them.
+    const blind = await resolveTransientStep("haiku");
+    expect(blind?.stepIndex).toBe(0);
+    const po2023 = await resolveTransientStep("haiku", { machine: "myia-po-2023" });
+    expect(po2023?.stepIndex).toBe(0);
+    // The excluded machine's overload walk starts past the engine — the same
+    // subtraction as its armed walk, landing on the role:sonnet delegation.
+    const ai01 = await resolveTransientStep("haiku", { machine: "myia-ai-01" });
+    expect(ai01?.stepIndex).toBe(1);
+    expect(ai01?.step.roleRef).toBe("sonnet");
   });
 });
 
