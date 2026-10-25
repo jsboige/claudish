@@ -47,10 +47,26 @@ const OVERFLOW_CODES = new Set(["context_length_exceeded", "1261"]);
  */
 const OVERFLOW_PHRASES = [
   "prompt exceeds max length", // GLM Coding 1261
-  "maximum context length", // OpenAI
+  "maximum context length", // OpenAI — ALSO the vLLM shape below (#674)
   "input exceeds the context window of", // Anthropic native
   "prompt is too long", // Anthropic native
 ];
+
+// The vLLM refusal that rides `maximum context length` above is worth quoting,
+// because its wording is the only place the engine states its own rule and it
+// carries an exact count we would otherwise have to probe for (#674, measured
+// 2026-10-25, three occurrences: 04:14:30Z / 08:15:00Z / 08:15:09Z):
+//
+//   {"error":{"message":"This model's maximum context length is 262144 tokens.
+//    However, your prompt contains at least 262145 input tokens, which exceeds
+//    this limit EVEN WITHOUT ANY OUTPUT TOKENS. … (parameter=input_tokens,
+//    value=262145)","type":"BadRequestError","param":"input_tokens","code":400}}
+//
+// Two facts to keep: admission is decided on the PROMPT alone (`max_tokens` is
+// trimmed to the remaining window, never validated — see `composed-handler.ts`
+// `maxOutputTokens`), and the classification comes from the PHRASE, not from a
+// code — this body's `code` is the literal 400, so `OVERFLOW_CODES` plays no
+// part here.
 
 /**
  * Strict matcher for prompt-size refusals. Accepts the RAW upstream error body
