@@ -182,6 +182,16 @@ function stripMediaData(payload: unknown): { stripped: unknown; count: number } 
  * is safe (it only shrinks max_tokens further); UNDER-estimating re-arms the
  * vLLM 400 this clamp exists to prevent. 2048 ≈ 0.8% of the Swift window
  * (262 144).
+ *
+ * MEASURED CORRECTION (2026-10-25, #674): the `est/64` term (1.56%) does NOT
+ * track that tokenizer drift — over 1 111 served swift responses paired
+ * req→resp, `real/est` is x1.068 at p50, x1.118 at p95, x1.196 at p99 (min
+ * 0.57, max 3.18). Deliberately left as-is rather than enlarged: the ratio is
+ * content-dependent, so any factor big enough to cover the tail over-reserves
+ * on the median and truncates answers the engine would have served — and on the
+ * shipping engine this clamp cannot rescue an over-window prompt anyway
+ * (admission is decided by the prompt alone; the engine trims the generation).
+ * The band it cannot see is #674's exact-counting case.
  */
 export const CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS = 2048;
 
