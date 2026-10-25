@@ -406,6 +406,137 @@ describe("failover — machine-scoped config arm (role@machine)", () => {
   });
 });
 
+// ── #693 — per-machine step exclusion ──────────────────────────────────────────
+
+describe("#693 — per-machine step exclusion (CLAUDISH_FAILOVER_STEP_EXCLUDE)", () => {
+  // The mandate shape (hub 2026-10-25): ONE global haiku cascade, but ai-01's
+  // ~330k condensation prompts must never land on the local engine when the
+  // nominal walls — its walk starts at role:sonnet. Everyone else keeps vllm
+  // as step 0.
+  const MANDATE_ENV = {
+    CLAUDISH_FAILOVER_HAIKU: "vllm-myia@swift-1.5-27b!own>role:sonnet>ds@deepseek-payg",
+    CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3>kc@k3.1-pro",
+    CLAUDISH_FAILOVER_ACTIVE: "haiku",
+    CLAUDISH_FAILOVER_STEP_EXCLUDE: "vllm-myia@swift-1.5-27b:myia-ai-01",
+  } as NodeJS.ProcessEnv;
+
+  const captureStderr = (fn: () => void): string[] => {
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as any).write = (chunk: any) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      fn();
+    } finally {
+      (process.stderr as any).write = realWrite;
+    }
+    return lines;
+  };
+
+  beforeEach(() => {
+    setRoleNominalResolver((r) => (r === "sonnet" ? "gc@glm-5.3" : undefined));
+  });
+
+  it("the named machine's walk skips the excluded step; every other machine keeps it", () => {
+    const lines = captureStderr(() => initFailover(MANDATE_ENV));
+    expect(lines.some((l) => l.includes("STEP-EXCLUDE haiku[0]") && l.includes("myia-ai-01"))).toBe(
+      true
+    );
+    // The excluded machine lands on role:sonnet — its delegation resolves to
+    // the sonnet nominal, exactly the mandated "Minimax > Role Sonnet" tail.
+    const ai01 = resolveFailoverTarget("haiku", "minimax-coding", undefined, "myia-ai-01");
+    expect(ai01.stepIndex).toBe(1);
+    expect(ai01.step!.roleRef).toBe("sonnet");
+    expect(ai01.step!.target).toBe("gc@glm-5.3");
+    // Machine-blind (canary, notices) and every other machine keep step 0 —
+    // the `!own` class suffix must not break target matching either.
+    expect(resolveFailoverTarget("haiku", "minimax-coding").stepIndex).toBe(0);
+    expect(
+      resolveFailoverTarget("haiku", "minimax-coding", undefined, "myia-po-2023").stepIndex
+    ).toBe(0);
+    // Unarmed-role resolutions stay nominal whatever the machine.
+    resetFailoverForTests({
+      ...MANDATE_ENV,
+      CLAUDISH_FAILOVER_ACTIVE: undefined,
+    } as NodeJS.ProcessEnv);
+    expect(
+      resolveFailoverTarget("haiku", "minimax-coding", undefined, "myia-ai-01")
+    ).toEqual({ step: null, stepIndex: -1 });
+  });
+
+  it("matches machine and target case-insensitively, and accepts several machines", () => {
+    // Comma separates ENTRIES; machines within one entry are space-separated.
+    initFailover({
+      ...MANDATE_ENV,
+      CLAUDISH_FAILOVER_STEP_EXCLUDE: "VLLM-MYIA@Swift-1.5-27b:Myia-AI-01 myia-po-2028",
+    } as NodeJS.ProcessEnv);
+    for (const m of ["myia-ai-01", "MYIA-AI-01", " myia-po-2028 "]) {
+      expect(resolveFailoverTarget("haiku", "minimax-coding", undefined, m).stepIndex).toBe(1);
+    }
+    expect(resolveFailoverTarget("haiku", "minimax-coding", undefined, "myia-po-2023").stepIndex).toBe(0);
+  });
+
+  it("an unknown target or malformed entry is ignored with a log — inert, never arming", () => {
+    const lines = captureStderr(() =>
+      initFailover({
+        ...MANDATE_ENV,
+        CLAUDISH_FAILOVER_STEP_EXCLUDE: "vllm-myia@nope-model:myia-ai-01, justgarbage, targetonly:",
+      } as NodeJS.ProcessEnv)
+    );
+    expect(lines.some((l) => l.includes("no cascade step matches"))).toBe(true);
+    expect(lines.filter((l) => l.includes("Ignoring malformed CLAUDISH_FAILOVER_STEP_EXCLUDE")).length).toBe(2);
+    // Nothing armed a diversion, no walk changed.
+    expect(resolveFailoverTarget("haiku", "minimax-coding", undefined, "myia-ai-01").stepIndex).toBe(0);
+  });
+
+  it("an exclusion naming EVERY step of a role is dropped at load (machine-stranding refused)", () => {
+    const lines = captureStderr(() =>
+      initFailover({
+        ...MANDATE_ENV,
+        CLAUDISH_FAILOVER_STEP_EXCLUDE:
+          "vllm-myia@swift-1.5-27b:myia-ai-01, role:sonnet:myia-ai-01, ds@deepseek-payg:myia-ai-01",
+      } as NodeJS.ProcessEnv)
+    );
+    expect(lines.some((l) => l.includes("named every step"))).toBe(true);
+    // The walk for myia-ai-01 is back to the global one.
+    expect(resolveFailoverTarget("haiku", "minimax-coding", undefined, "myia-ai-01").stepIndex).toBe(0);
+  });
+
+  it("the last-step PAYG fallback refuses an EXCLUDED last step — the raw refusal surfaces", () => {
+    initFailover({
+      CLAUDISH_FAILOVER_HAIKU: "gc@glm-5.3>ds@deepseek-payg",
+      CLAUDISH_FAILOVER_ACTIVE: "haiku",
+      CLAUDISH_FAILOVER_STEP_EXCLUDE: "ds@deepseek-payg:myia-ai-01",
+    } as NodeJS.ProcessEnv);
+    // Every earlier step TTL-failed: the fallback is the only candidate left.
+    markStepFailed("haiku", 0, "glm walled");
+    expect(resolveFailoverTarget("haiku", "minimax-coding", undefined, "myia-ai-01")).toEqual({
+      step: null,
+      stepIndex: -1,
+    });
+    // A machine without the exclusion keeps the PAYG bet.
+    expect(resolveFailoverTarget("haiku", "minimax-coding", undefined, "myia-po-2023").stepIndex).toBe(1);
+  });
+
+  it("a dwell pin on a step newly excluded for the machine yields and re-pins at the machine's walk", () => {
+    initFailover(MANDATE_ENV);
+    // A machine-blind resolution (notice/canary seam) pins the session on step 0.
+    resolveFailoverTargetForSession("haiku", "s-ai01", "minimax-coding");
+    expect(getSessionDwellPinForTests("haiku", "s-ai01")?.stepIndex).toBe(0);
+    // The same session resolving WITH its machine header cannot hold an
+    // excluded step — it yields, walks to role:sonnet, and re-pins there.
+    const r = resolveFailoverTargetForSession("haiku", "s-ai01", "minimax-coding", undefined, "myia-ai-01");
+    expect(r.stepIndex).toBe(1);
+    expect(getSessionDwellPinForTests("haiku", "s-ai01")?.stepIndex).toBe(1);
+    // Another machine's session keeps its step-0 pin untouched.
+    resolveFailoverTargetForSession("haiku", "s-po2023", "minimax-coding");
+    resolveFailoverTargetForSession("haiku", "s-po2023", "minimax-coding", undefined, "myia-po-2023");
+    expect(getSessionDwellPinForTests("haiku", "s-po2023")?.stepIndex).toBe(0);
+  });
+});
+
 // ── Resolution walk ────────────────────────────────────────────────────────────
 
 describe("resolveFailoverTarget — cascade walk", () => {
