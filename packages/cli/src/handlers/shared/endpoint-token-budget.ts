@@ -105,6 +105,20 @@ export function endpointPrefixOf(target: string | undefined): string | null {
 }
 
 /**
+ * Serialize once per gated attempt (#663 r1): the estimator and the body
+ * signature both consume the SAME serialized payload, and serializing a
+ * ~1 MB agentic body twice per attempt is a measurable tax. Returns "" only
+ * when serialization throws — same fallback both consumers had.
+ */
+function serializeForBudget(payload: unknown): string {
+  try {
+    return JSON.stringify(payload) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/**
  * AC3 estimator: bytes / 3.5, deliberately NOT the /4 `estimatePayloadTokens`
  * convention (that one undercounts 12-14% on these bodies, which is exactly
  * the #565 blind spot) and NOT the media-aware `estimateClampTokens` (base64
@@ -113,11 +127,7 @@ export function endpointPrefixOf(target: string | undefined): string | null {
  */
 export function estimateBudgetTokens(payload: unknown): number {
   if (payload === undefined || payload === null) return 0;
-  try {
-    return Math.ceil(JSON.stringify(payload).length / BUDGET_BYTES_PER_TOKEN);
-  } catch {
-    return 0;
-  }
+  return Math.ceil(serializeForBudget(payload).length / BUDGET_BYTES_PER_TOKEN);
 }
 
 /**
@@ -127,17 +137,17 @@ export function estimateBudgetTokens(payload: unknown): number {
  * force an async hash at a synchronous seam.
  */
 export function bodySignature(payload: unknown): string {
-  try {
-    const s = JSON.stringify(payload) ?? "";
-    let h = 0x811c9dc5;
-    for (let i = 0; i < s.length; i++) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return h.toString(16).padStart(8, "0");
-  } catch {
-    return "unreadable";
+  return fnv1aSerialized(serializeForBudget(payload));
+}
+
+/** FNV-1a over an already-serialized payload (the single-serialization seam). */
+function fnv1aSerialized(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
   }
+  return h.toString(16).padStart(8, "0");
 }
 
 interface LeaseRecord {
@@ -242,8 +252,11 @@ export function evaluateEndpointTokenBudget(
 ): EndpointBudgetDecision | null {
   const knobs = readEndpointBudgetKnobs(name, env);
   if (!knobs) return null;
-  const est = estimateBudgetTokens(payload);
-  const sig = `${scope.machine ?? ""}|${scope.session ?? ""}|${bodySignature(payload)}`;
+  // #663 r1: serialize the body ONCE — the estimate and the signature below
+  // both consume this string, never two full serializations of the same body.
+  const serialized = payload === undefined || payload === null ? "" : serializeForBudget(payload);
+  const est = serialized.length === 0 ? 0 : Math.ceil(serialized.length / BUDGET_BYTES_PER_TOKEN);
+  const sig = `${scope.machine ?? ""}|${scope.session ?? ""}|${fnv1aSerialized(serialized)}`;
   const sigKey = `${name}::${sig}`;
   const leases = sweepStale(name, inflight.get(name) ?? [], now, onStale);
   // AC5: an identical body still in flight is not new demand — its estimate
@@ -378,9 +391,14 @@ export function withBudgetRelease<T extends Response>(response: T, release: () =
         } else {
           controller.enqueue(r.value);
         }
-      } catch (err) {
+      } catch {
+        // Never-hang rule (#663 r1): no `controller.error()` in a production
+        // source — this wrapped body is the CLIENT-facing response, and the
+        // inner layer owns `message_stop`. Release the lease and CLOSE: a
+        // client reading to the end sees a terminated stream, never a broken
+        // pipe; this wrapper's only job is the lease.
         finish();
-        controller.error(err);
+        controller.close();
       }
     },
     cancel(reason) {

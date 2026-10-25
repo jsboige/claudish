@@ -2045,9 +2045,43 @@ export async function createProxyServer(
             const attemptWalkStep = async (
               target: NonNullable<typeof walk>
             ): Promise<
-              { served: Response } | { served: null; status: number; errBody: string }
+              | { served: Response }
+              | { served: null; status: number; errBody: string }
+              | { served: null; budgetRefused: true }
             > => {
               const modelBeforeAttempt = body.model;
+              // #654 r1 — the walk serves through the SAME endpoint budget as
+              // the loop. A walk target carrying knobs is evaluated BEFORE the
+              // call (on the hub, the budgeted vLLM endpoint is the haiku
+              // cascade's step 0 — the first servable target of a haiku
+              // overload walk, the exact traffic the budget exists to bound),
+              // a refusal is a SKIP (zero calls, no state, advance to the next
+              // servable step), and a served attempt commits its lease and
+              // wraps its response — a walk-served request holding no lease
+              // is the module's own "Σ lies low" failure.
+              const walkBudgetPrefix = endpointPrefixOf(target.concrete);
+              const walkBudget = walkBudgetPrefix
+                ? evaluateEndpointTokenBudget(
+                    walkBudgetPrefix,
+                    body,
+                    { machine: machineHeader, session: sessionKey },
+                    process.env,
+                    Date.now(),
+                    (info) => logStderr(info)
+                  )
+                : null;
+              if (walkBudget?.refused) {
+                log(
+                  `[Failover] WALK-SKIP ${role} → ${target.concrete} reason=busy ${formatBudgetFacts(
+                    walkBudget.facts,
+                    true,
+                    walkBudget.reason
+                  )} — endpoint token budget (#654)`,
+                  true
+                );
+                return { served: null, budgetRefused: true };
+              }
+              let walkRelease: (() => void) | undefined;
               // #628 review (bloquant, classe #331): the delegation owner is
               // STATE-DEPENDENT — resolveRoleStep reads the target nominal's
               // bucket wall, and can arm it. Resolved AFTER the attempt, a wall
@@ -2068,6 +2102,7 @@ export async function createProxyServer(
                   bucket,
                   target.concrete
                 );
+                if (walkBudget) walkRelease = walkBudget.commit();
                 // #317: the walk is a paid upstream attempt too — fresh token.
                 openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
                 const targetResp = await targetHandler.handle(c, body);
@@ -2094,17 +2129,22 @@ export async function createProxyServer(
                       );
                     }
                   }
-                  return { served: targetResp };
+                  return {
+                    served: walkRelease ? withBudgetRelease(targetResp, walkRelease) : targetResp,
+                  };
                 }
                 // Not ok: the step's own incident must not become the client's
                 // answer, and its unread body is a connection held open for
                 // nothing. READ it rather than cancelling it — the body is both
-                // the classifier's input (#598) and the drain.
+                // the classifier's input (#598) and the drain; the drained
+                // bytes end the lease.
                 const targetErrBody = await targetResp.text().catch(() => "");
+                walkRelease?.();
                 return { served: null, status: targetResp.status, errBody: targetErrBody };
               } catch {
                 // The attempt itself threw — no class, so no advance: the
-                // original overload stands.
+                // original overload stands. The lease (if committed) ends here.
+                walkRelease?.();
                 return { served: null, status: 0, errBody: "" };
               } finally {
                 body.model = modelBeforeAttempt;
@@ -2112,6 +2152,25 @@ export async function createProxyServer(
             };
             const firstAttempt = await attemptWalkStep(walk);
             if (firstAttempt.served) return firstAttempt.served;
+            // #654 r1 — a budget-refused target was never called: the
+            // admission gate fired before the engine, so the walk advances to
+            // the next servable step with the loop's skip semantics — no call,
+            // no mark, no wall, no arm. Bounded to ONE hop, like everything
+            // the walk buys; a second refusal surfaces the ORIGINAL overload
+            // (the budget bounds admission, it never refuses a servable
+            // request outright — the next request re-probes the nominal).
+            if ("budgetRefused" in firstAttempt && firstAttempt.budgetRefused) {
+              const budgetSkip = await resolveTransientStep(role, {
+                bucketOf: concreteStepBucketOf,
+                nominalBucket: bucket ?? undefined,
+                afterStepIndex: walk.stepIndex,
+              }).catch(() => null);
+              if (budgetSkip) {
+                const skipped = await attemptWalkStep(budgetSkip);
+                if (skipped.served) return skipped.served;
+              }
+              return response;
+            }
             // #598 — a step that died CONNECTION-class has told us the HOST was
             // unreachable, not that its plan is walled. Measured 2026-10-22:
             // the nominal's egress and walk step 0's were the same dead host,

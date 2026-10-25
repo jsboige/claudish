@@ -237,7 +237,7 @@ describe("endpoint-token-budget #654", () => {
   });
 
   // ── withBudgetRelease: the lease dies with the response body ────────────
-  test("withBudgetRelease — releases on full read, cancel, stream error; bodyless releases at once", async () => {
+  test("withBudgetRelease — releases on full read, cancel, upstream error (clean close); bodyless releases at once", async () => {
     // full read
     let n1 = 0;
     const body1 = new ReadableStream<Uint8Array>({
@@ -266,7 +266,11 @@ describe("endpoint-token-budget #654", () => {
     await reader2.cancel();
     expect(n2).toBe(1);
 
-    // upstream stream error
+    // upstream stream error (#663 r1 — never-hang): the wrapper CLOSES, it
+    // never errors the client-facing controller — `controller.error()` is
+    // forbidden in production sources, the inner layer owns message_stop, and
+    // this wrapper's only job is the lease. A client reading to the end sees
+    // a terminated stream, never a broken pipe.
     let n3 = 0;
     const body3 = new ReadableStream<Uint8Array>({
       pull(c) {
@@ -274,12 +278,37 @@ describe("endpoint-token-budget #654", () => {
       },
     });
     const res3 = withBudgetRelease(new Response(body3), () => n3++);
-    await expect(res3.text()).rejects.toThrow();
-    expect(n3).toBe(1);
+    await expect(res3.text()).resolves.toBe(""); // clean close — no throw
+    expect(n3).toBe(1); // …and the lease released
 
     // bodyless response: nothing to track, release immediately
     let n4 = 0;
     withBudgetRelease(new Response(null), () => n4++);
     expect(n4).toBe(1);
+  });
+
+  // ── #663 r1: the error case at the raw-reader level, bytes kept ─────────
+  test("withBudgetRelease — an upstream error after bytes: reader keeps them and completes done, lease released", async () => {
+    // The `.text()` pin above proves the clean close end-to-end; this one
+    // pins the reader contract directly — the old `controller.error()` shape
+    // failed HERE (the second read() rejected with "boom"): the client keeps
+    // what arrived before the error, then completes normally.
+    let n = 0;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("partial"));
+      },
+      pull(c) {
+        c.error(new Error("boom-late"));
+      },
+    });
+    const res = withBudgetRelease(new Response(body), () => n++);
+    const reader = res.body!.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(new TextDecoder().decode(first.value)).toBe("partial");
+    const second = await reader.read(); // the upstream error surfaces as done
+    expect(second.done).toBe(true);
+    expect(n).toBe(1);
   });
 });

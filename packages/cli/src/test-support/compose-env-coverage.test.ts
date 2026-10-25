@@ -105,6 +105,10 @@ const EXEMPT: ReadonlyArray<{ name: string; why: string }> = [
 ];
 const EXEMPT_NAMES = new Set(EXEMPT.map((e) => e.name));
 
+/** #654/#663 — the per-endpoint budget family shape: suffix is the endpoint
+ *  name uppercased, non-alphanumerics as `_` (`vllm-myia` → `VLLM_MYIA`). */
+const ENDPOINT_BUDGET_FAMILY_RE = /^CLAUDISH_ENDPOINT_(?:TOKEN_BUDGET|BIG_LIMIT)_[A-Z0-9_]+$/;
+
 /** Recursively collect non-test .ts files under packages/cli/src. */
 function collectSourceFiles(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
@@ -205,7 +209,18 @@ export function coverageGaps(scan: ScanResult, composeNames: Set<string>): strin
 /** Direction 2 verdict: CLAUDISH_* compose entries the code no longer reads. */
 export function deadComposeEntries(scan: ScanResult, composeNames: Set<string>): string[] {
   const required = requiredNames(scan);
-  return [...composeNames].filter((n) => !required.has(n)).sort();
+  return [...composeNames]
+    .filter((n) => !required.has(n))
+    // #663 r1 — a literal of the per-endpoint budget family IS read by the
+    // code: the family is consumed by a template whose suffix is the
+    // operator-defined endpoint name, which no static scan can enumerate.
+    // Only honored while the template read is live (dynamicEndpointBudget) —
+    // delete the read and every family literal is dead again, as it should
+    // be. Accepted price: a typo'd family literal also passes direction 2;
+    // bounded by the endpoint-name spelling itself, which the resolver
+    // rejects loudly at load.
+    .filter((n) => !(scan.dynamicEndpointBudget && ENDPOINT_BUDGET_FAMILY_RE.test(n)))
+    .sort();
 }
 
 /** A compose-injected name read with `??` whose effective RHS is not `""`. */
@@ -344,6 +359,22 @@ describe("#310 compose env coverage (all CLAUDISH_*)", () => {
       n.startsWith("CLAUDISH_ENDPOINT_TOKEN_BUDGET_") || n.startsWith("CLAUDISH_ENDPOINT_BIG_LIMIT_")
     );
     expect(familyRequired).toBe(false);
+    // #663 r1 — the two literals compose carries for the endpoint this
+    // deployment arms. Dropping either line from docker-compose.yml must go
+    // red HERE first: without the literal the knob never reaches the
+    // container (#310's whole failure mode) and nothing else watches it.
+    expect(composeNames.has("CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA")).toBe(true);
+    expect(composeNames.has("CLAUDISH_ENDPOINT_BIG_LIMIT_VLLM_MYIA")).toBe(true);
+    // …and direction 2 counts them as read (template read live) — the
+    // no-dead-knobs test would otherwise force them back out of compose.
+    expect(deadComposeEntries(scan, composeNames)).not.toContain("CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA");
+    expect(deadComposeEntries(scan, composeNames)).not.toContain("CLAUDISH_ENDPOINT_BIG_LIMIT_VLLM_MYIA");
+    // The family allowance is keyed to the live template read: kill the read
+    // (synthetic scan with dynamicEndpointBudget=false) and the literal is
+    // dead again — the allowance can never outlive the code it points at.
+    const noTemplate = scanSources([{ path: "synthetic-none.ts", text: "const x = 1;\n" }]);
+    expect(deadComposeEntries(noTemplate, new Set(["CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA"])))
+      .toEqual(["CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA"]);
     // Detector liveness on a synthetic source (same shape as the module read).
     const synthetic = scanSources([
       {

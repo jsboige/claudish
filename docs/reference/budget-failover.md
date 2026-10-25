@@ -387,12 +387,16 @@ CLAUDISH_ENDPOINT_BIG_LIMIT_<NAME>      # max concurrent requests over 100K toke
 `<NAME>` = custom-endpoint name, uppercased, `[^A-Za-z0-9]` → `_`
 (`vllm-myia` → `VLLM_MYIA`). Read **per request**; in a container a new value
 enters at the next recreate (#310 — and these names are per-endpoint, so the
-compose `environment:` allowlist cannot pre-list yours: add the line yourself,
-see `.env.sidecar.example`). **Unset = inert** (AC1); garbage and `0`-Σ are
-inert too — a typo must not invent a budget.
+compose `environment:` allowlist carries the literal for the endpoint this
+deployment arms — `VLLM_MYIA` is in compose since #663 r1 — and every other
+endpoint adds its own line; see `.env.sidecar.example`). **Unset = inert**
+(AC1); garbage and `0`-Σ are inert too — a typo must not invent a budget.
 
 Starting point from the measurement: Σ ≈ 550K (KV 750,747 minus generation
-headroom), BIG_LIMIT 3.
+headroom), BIG_LIMIT 3. ⚠ **The registry is per PROCESS**: a sidecar in
+AUTONOMOUS mode keeps its own leases — hub and sidecar calling the same engine
+each admit up to the full Σ independently. The Σ of every process's budget
+must fit the engine's KV; with two callers, budget each at most ~half.
 
 ## How a refusal travels
 
@@ -405,6 +409,13 @@ before any upstream call:
 - **Nominal** → the same 529 the bounded busy wait synthesizes, picked up by
   the **#299-B one-shot walk** (`isOverloadWalkClass` matches the 529 status
   regardless of body): first servable step, zero state, nothing benched.
+  Since #663 r1 the walk itself **evaluates each candidate step's budget**
+  before calling it (the walk bypassed the gate until then): a walk target at
+  full Σ is refused with **zero calls** and the walk advances to the next
+  servable step — same no-state semantics, one extra hop (pinned in
+  `proxy-server-step-skip-route.test.ts` B7). A walk target that fits is
+  committed and its response wrapped with the same release the direct path
+  uses.
 - **No diversion possible** (last step, unconfigured role, walk disabled) →
   **serve anyway** + `[EndpointBudget]` stderr marker: the budget bounds
   admission, it never refuses a servable request.
@@ -449,11 +460,16 @@ otherwise starve the lane forever.
 
 ## Pins and mutation proofs
 
-Unit: `endpoint-token-budget.test.ts` (16 pins — knobs, estimator incl. the
+Unit: `endpoint-token-budget.test.ts` (17 pins — knobs, estimator incl. the
 914,723 B anchor, Σ/big refusal shapes, AC4 short-pass, AC5 replace + AC5b
-copy counter, stale sweep, release semantics). Route: `proxy-server-step-skip-route.test.ts`
-B1-B6 (zero upstream calls on the budgeted endpoint, no bench after a budget
+copy counter, stale sweep, release semantics incl. the #663 r1 never-hang pin:
+an upstream stream error releases the lease AND closes the wrapper — the
+client's reader completes, never throws). Route: `proxy-server-step-skip-route.test.ts`
+B1-B7 (zero upstream calls on the budgeted endpoint, no bench after a budget
 skip, real in-flight Σ via a holder, big-cap short-pass, echo replacement,
-nominal walk). Mutations: `/3.5` → `/4` kills 8 unit pins; replacement
-disabled kills both AC5 pins; refusals-never-divert kills B1/B3/B4/B6 and
-leaves B2 (inert) + B5 (replace) green.
+nominal walk, and the #663 r1 walk-skip: a walk whose first servable step is
+a budgeted endpoint at full Σ → zero calls to it, successor serves).
+Mutations: `/3.5` → `/4` kills 8 unit pins; replacement
+disabled kills both AC5 pins; refusals-never-divert kills B1/B3/B4/B6/B7 and
+leaves B2 (inert) + B5 (replace) green; `controller.error` restored in
+`withBudgetRelease`'s catch kills the never-hang pin.

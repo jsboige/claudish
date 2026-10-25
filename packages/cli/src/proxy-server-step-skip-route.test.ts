@@ -1260,6 +1260,9 @@ describe("#651 — a window derived from /v1/models acts at admission", () => {
     const res2 = await postMessage({ model: "nodrv-ep@fake-ndr", content: big });
     expect(res2.status).toBe(200);
     expect(calls.ndr ?? 0).toBeGreaterThanOrEqual(1);
+  }, 30_000);
+});
+
 // ---- #654 — the in-flight token budget per endpoint --------------------------------
 //
 // The budget rides the #431 skip wire (reason=busy): an over-budget step is
@@ -1479,6 +1482,48 @@ describe("#654 — in-flight token budget per endpoint (busy-class skip)", () =>
       expect(calls.nm ?? 0).toBe(0); // the budgeted nominal is never called
       expect(calls.s0).toBe(1);
       expect(markerLog.some((l) => l.includes("budget-skip nominal"))).toBe(true);
+    } finally {
+      clearBudget();
+    }
+  }, 30_000);
+
+  test("B7 (#663 r1): a walk target at full Σ gets ZERO calls — the walk advances one hop, the successor serves", async () => {
+    clearBudget();
+    try {
+      await spin();
+      // B6 shape (the NOMINAL's own budget refusal triggers the #299-B walk)
+      // with the walk's FIRST step budgeted too: s0-ep at Σ=10 refuses any
+      // real body (~50 est) BEFORE its call. Before r1 the walk bypassed the
+      // gate entirely — s0 was called with the very load the budget exists
+      // to bound. The pin is the zero: admission refused, one hop forward.
+      resetFailoverForTests({ CLAUDISH_FAILOVER_SONNET: TWO_STEP });
+      setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
+      process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_NOM_EP = "10";
+      process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_S0_EP = "10";
+
+      const r = await postMessage({ session: "b7" });
+      expect(r.status).toBe(200);
+      expect(await responseText(r)).toContain("ok-from-s1");
+      expect(calls.nm ?? 0).toBe(0); // the budgeted nominal never pays a round-trip
+      expect(calls.s0 ?? 0).toBe(0); // THE PIN: the walk target was refused before its call
+      expect(calls.s1).toBe(1);
+      expect(
+        markerLog.some(
+          (l) =>
+            l.includes("[Failover] WALK-SKIP sonnet → s0-ep@fake-s0") &&
+            l.includes("sum=0/10") &&
+            l.includes("endpoint token budget")
+        )
+      ).toBe(true);
+
+      // No state written by the refusal: the nominal's budget stays armed (it
+      // is what triggers the walk), s0's lifts (read per request) — a fresh
+      // session walks again and s0 serves. A bench or wall from the walk-skip
+      // would TTL-freeze s0 for 10 min and the walk would land on s1.
+      delete process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_S0_EP;
+      const r2 = await postMessage({ session: "b7b" });
+      expect(await responseText(r2)).toContain("ok-from-s0");
+      expect(calls.s0).toBe(1);
     } finally {
       clearBudget();
     }
