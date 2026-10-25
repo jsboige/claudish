@@ -641,7 +641,10 @@ function Read-EnvFileValues {
     # The ONE reader for an env file. Callers ask for KEYS by name and never
     # enumerate the file into a log: on the hub it also carries
     # CLAUDISH_PROXY_KEY. Returns a hashtable of the requested names that are
-    # PRESENT (an absent key is absent from the result, not '').
+    # PRESENT (an absent key is absent from the result, not ''). A file that
+    # exists but cannot be read (lock, ACL) returns $null: "unreadable" and
+    # "absent" are different claims, and an empty hashtable would let a caller
+    # print "none declared" on a blind eye.
     #
     # Handles both `KEY=value` and `export KEY=value`, and strips ONE layer of
     # matching single or double quotes — the same rules the inline ROLE_MODELS
@@ -655,7 +658,7 @@ function Read-EnvFileValues {
     if (-not (Test-Path -LiteralPath $EnvFile)) { return $out }
     $wanted = @{}
     foreach ($n in $Names) { $wanted[$n] = $true }
-    try { $lines = [System.IO.File]::ReadAllLines($EnvFile) } catch { return $out }
+    try { $lines = [System.IO.File]::ReadAllLines($EnvFile) } catch { return $null }
     foreach ($line in $lines) {
         $t = $line.Trim()
         if ($t -like 'export *') { $t = $t.Substring(7).Trim() }
@@ -766,30 +769,51 @@ function Format-CascadeCoverageLine {
     )
     $list = @($Cascades)
     if ($list.Count -eq 0) {
-        return '[coverage] cascades: none declared in the env file — no role has a failover step to divert to'
+        return '[coverage] cascades (env file): none declared in the env file — no role has a failover step to divert to'
     }
     $stepCount = 0
     foreach ($c in $list) { $stepCount += @($c.Steps).Count }
     $prefixes = @($list | ForEach-Object { $_.Prefixes } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
     $parts = foreach ($c in $list) { "{0}: {1}" -f $c.Role, ((@($c.Steps)) -join ' > ') }
-    $rendered = "[coverage] cascades: {0} roles, {1} steps, prefixes {2} — {3}" -f `
+    # "(env file)" is load-bearing: the line reads the FILE, not the running
+    # container — after an edit without a recreate it shows the next state.
+    $rendered = "[coverage] cascades (env file): {0} roles, {1} steps, prefixes {2} — {3}" -f `
         $list.Count, $stepCount, ($(if ($prefixes.Count -gt 0) { $prefixes -join ',' } else { 'none' })), ($parts -join ' | ')
 
     $arms = @()
     $k = 0
-    foreach ($piece in ([string]$ArmedEnv -split ',')) {
-        $t = $piece.Trim()
-        if (-not $t) { continue }
-        $k++
-        if ($t -match '^(?<r>[A-Za-z]+)@(?<m>[A-Za-z0-9._-]+)$') {
-            $arms += ("{0}@{1}" -f $Matches['r'].ToLower(), $Matches['m'])
-        } else {
-            $arms += ("unnamed-arm #{0}" -f $k)
+    # Mirrors the proxy's CLAUDE_FAILOVER_ACTIVE parse exactly
+    # (fork/failover.ts): lower-cased whole, `none` arms nothing, split on
+    # [,\s]+, and a piece the proxy would DISCARD (unknown role, empty or
+    # malformed machine) is reported by position and never echoed.
+    $activeRaw = ([string]$ArmedEnv).Trim().ToLowerInvariant()
+    if ($activeRaw -and $activeRaw -ne 'none') {
+        foreach ($piece in ($activeRaw -split '[,\s]+')) {
+            if (-not $piece) { continue }
+            $k++
+            $at = $piece.IndexOf('@')
+            $role = if ($at -ge 0) { $piece.Substring(0, $at) } else { $piece }
+            $machine = if ($at -ge 0) { $piece.Substring($at + 1) } else { $null }
+            $flaw = if ($role -notin @('opus', 'sonnet', 'haiku', 'fable')) { 'unknown role' }
+            elseif ($machine -eq '') { 'empty machine' }
+            elseif ($null -ne $machine -and $machine.Contains('@')) { 'malformed machine' }
+            else { $null }
+            if ($flaw) {
+                # The proxy logs and ignores this piece; so does the line, by
+                # position — a role word is not secret-shaped, but a discarded
+                # piece may be anything, so it is never echoed.
+                $arms += ("ignored-arm #{0}" -f $k)
+                continue
+            }
+            if ($null -ne $machine) { $arms += ("{0}@{1}" -f $role, $machine) }
+            else { $arms += ("{0} (all machines)" -f $role) }
         }
     }
     if ($arms.Count -gt 0) { $rendered += ' — armed: ' + ($arms -join ',') } else { $rendered += ' — armed: none' }
     if (-not [string]::IsNullOrWhiteSpace($AutoEnv)) {
-        if ($AutoEnv.Trim() -eq '1') { $rendered += ' (auto=on)' } else { $rendered += ' (auto=off)' }
+        # Same regex the proxy uses for CLAUDE_FAILOVER_AUTO (failover.ts): only
+        # 1/true/yes/on (any case) is on — `AUTO=true` must not read "off".
+        if ($AutoEnv.Trim() -match '^(1|true|yes|on)$') { $rendered += ' (auto=on)' } else { $rendered += ' (auto=off)' }
     }
     return $rendered
 }

@@ -128,20 +128,27 @@ $cascadeValues = @{}
 $envNames = @('CLAUDISH_FAILOVER_ACTIVE', 'CLAUDISH_FAILOVER_AUTO')
 foreach ($r in @('fable', 'opus', 'sonnet', 'haiku')) { $envNames += "CLAUDISH_FAILOVER_$($r.ToUpper())" }
 $envVals = Read-EnvFileValues -EnvFile $EnvFile -Names $envNames
-foreach ($r in @('fable', 'opus', 'sonnet', 'haiku')) {
-    $k = "CLAUDISH_FAILOVER_$($r.ToUpper())"
-    if ($envVals.ContainsKey($k)) { $cascadeValues[$r] = $envVals[$k] }
-}
-$cascades = @(ConvertFrom-FailoverCascadeEnv -Values $cascadeValues)
-$armedEnv = ''
-if ($envVals.ContainsKey('CLAUDISH_FAILOVER_ACTIVE')) { $armedEnv = [string]$envVals['CLAUDISH_FAILOVER_ACTIVE'] }
-$autoEnv = ''
-if ($envVals.ContainsKey('CLAUDISH_FAILOVER_AUTO')) { $autoEnv = [string]$envVals['CLAUDISH_FAILOVER_AUTO'] }
-& $logTs (Format-CascadeCoverageLine -Cascades $cascades -ArmedEnv $armedEnv -AutoEnv $autoEnv)
-# An unreadable env file is stated, not assumed empty: "no cascade declared"
-# and "we could not read the file" are different claims.
-if (-not (Test-Path -LiteralPath $EnvFile)) {
-    & $logTs "cascades: no env file at $EnvFile — cascade coverage is unknown, not 'none'"
+if ($null -eq $envVals) {
+    # The file exists but could not be read (lock, ACL): $null, not @{}. The
+    # coverage line is NOT emitted — "none declared" would be a claim made on
+    # a blind eye, and "we could not read the file" is a different statement.
+    & $logTs "cascades: env file unreadable at $EnvFile — cascade coverage is unknown, not 'none'"
+    $cascades = @()
+} else {
+    foreach ($r in @('fable', 'opus', 'sonnet', 'haiku')) {
+        $k = "CLAUDISH_FAILOVER_$($r.ToUpper())"
+        if ($envVals.ContainsKey($k)) { $cascadeValues[$r] = $envVals[$k] }
+    }
+    $cascades = @(ConvertFrom-FailoverCascadeEnv -Values $cascadeValues)
+    $armedEnv = ''
+    if ($envVals.ContainsKey('CLAUDISH_FAILOVER_ACTIVE')) { $armedEnv = [string]$envVals['CLAUDISH_FAILOVER_ACTIVE'] }
+    $autoEnv = ''
+    if ($envVals.ContainsKey('CLAUDISH_FAILOVER_AUTO')) { $autoEnv = [string]$envVals['CLAUDISH_FAILOVER_AUTO'] }
+    & $logTs (Format-CascadeCoverageLine -Cascades $cascades -ArmedEnv $armedEnv -AutoEnv $autoEnv)
+    if (-not (Test-Path -LiteralPath $EnvFile)) {
+        # Absent is its own statement, distinct from unreadable above.
+        & $logTs "cascades: no env file at $EnvFile — cascade coverage is unknown, not 'none'"
+    }
 }
 $cascadePrefixes = @($cascades | ForEach-Object { $_.Prefixes } | Where-Object { $_ } | Select-Object -Unique)
 
@@ -219,6 +226,11 @@ if (-not $DryRun -and @($probeSplit.Minors).Count -gt 0) {
 # it is asked for a KEY by name and never enumerated.
 $roleModels = ''
 $roleVals = Read-EnvFileValues -EnvFile $EnvFile -Names @('CLAUDISH_FAILOVER_ROLE_MODELS')
+if ($null -eq $roleVals) {
+    # Same claim discipline as the cascades: unreadable is not "none declared".
+    & $logTs "role aliases: env file unreadable at $EnvFile — ROLE_MODELS coverage is unknown, not 'none'"
+    $roleVals = @{}
+}
 if ($roleVals.ContainsKey('CLAUDISH_FAILOVER_ROLE_MODELS')) { $roleModels = [string]$roleVals['CLAUDISH_FAILOVER_ROLE_MODELS'] }
 if ($roleModels) {
     $drift = @(Compare-RoleModelsToRouting -Routing $config.routing -RoleModels $roleModels)

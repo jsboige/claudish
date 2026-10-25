@@ -1114,9 +1114,74 @@ Describe 'Format-CascadeCoverageLine (#635 AC 3 - one line, names only)' {
     It 'a malformed arm is counted, never echoed' {
         $cascades = @(ConvertFrom-FailoverCascadeEnv -Values @{ sonnet = 'ds@deepseek-flash' })
         $line = Format-CascadeCoverageLine -Cascades $cascades -ArmedEnv 'haiku@myia-po-2027,sk-live-SECRETARM' -AutoEnv '0'
-        $line | Should -Match 'unnamed-arm #2'
+        $line | Should -Match 'ignored-arm #2'
         $line | Should -Match 'auto=off'
         ($line -match 'SECRETARM') | Should -Be $false
+    }
+    It 'the arm grammar mirrors the proxy (#666 r1): one pin per divergence' {
+        # Each row is a shape where the first version of this line disagreed
+        # with fork/failover.ts (review r1) — every pin holds the proxy's read.
+        $c = @(ConvertFrom-FailoverCascadeEnv -Values @{ sonnet = 'ds@deepseek-flash' })
+
+        # bare role (whole-role arm) — the strongest arm the fleet has; it
+        # diverts every machine, so it is NAMED, not anonymized.
+        $bare = Format-CascadeCoverageLine -Cascades $c -ArmedEnv 'haiku' -AutoEnv '1'
+        $bare | Should -Match 'armed: haiku \(all machines\)'
+        $bare | Should -Match 'auto=on'
+
+        # space-separated pieces — the proxy splits on [,\s]+, not ','
+        $sp = Format-CascadeCoverageLine -Cascades $c -ArmedEnv 'haiku@myia-po-2027 haiku@myia-po-2023' -AutoEnv '1'
+        $sp | Should -Match 'haiku@myia-po-2027,haiku@myia-po-2023'
+        ($sp -match 'ignored-arm|unnamed-arm') | Should -Be $false
+
+        # `none` arms nothing — it is the proxy's explicit off word, not a malformation
+        $none = Format-CascadeCoverageLine -Cascades $c -ArmedEnv 'none' -AutoEnv '0'
+        $none | Should -Match 'armed: none'
+        ($none -match 'ignored-arm|unnamed-arm') | Should -Be $false
+
+        # an unknown role is IGNORED by the proxy — shown by position, never live
+        $typo = Format-CascadeCoverageLine -Cascades $c -ArmedEnv 'hiaku@myia-po-2027' -AutoEnv '1'
+        $typo | Should -Match 'ignored-arm #1'
+        ($typo -match 'hiaku') | Should -Be $false
+
+        # AUTO accepts 1/true/yes/on, any case — `AUTO=true` must not read "off"
+        $auto = Format-CascadeCoverageLine -Cascades $c -ArmedEnv 'haiku@myia-po-2027' -AutoEnv 'true'
+        $auto | Should -Match 'auto=on'
+        $autoYes = Format-CascadeCoverageLine -Cascades $c -ArmedEnv 'haiku@myia-po-2027' -AutoEnv 'YES'
+        $autoYes | Should -Match 'auto=on'
+    }
+    It 'the arm grammar mirrors the proxy: the other two flaw shapes (#666 r1)' {
+        # `haiku@` (empty machine) and `haiku@m1@m2` (malformed machine) are
+        # discarded by failover.ts with a warning — the line counts them the
+        # same way and never renders them as live arms.
+        $c = @(ConvertFrom-FailoverCascadeEnv -Values @{ sonnet = 'ds@deepseek-flash' })
+        $empty = Format-CascadeCoverageLine -Cascades $c -ArmedEnv 'haiku@' -AutoEnv '1'
+        $empty | Should -Match 'ignored-arm #1'
+        ($empty -match 'haiku@[,)]|haiku \(all') | Should -Be $false
+        $double = Format-CascadeCoverageLine -Cascades $c -ArmedEnv 'haiku@m1@m2,sonnet@myia-po-2027' -AutoEnv '1'
+        $double | Should -Match 'ignored-arm #1'
+        $double | Should -Match 'sonnet@myia-po-2027'
+    }
+    It 'an unreadable env file returns null, an absent one an empty table (#666 r1)' {
+        # "Unreadable" and "absent" are different claims: the runner must be
+        # able to say which one it is instead of printing "none declared"
+        # on a blind eye.
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("mvwenv-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            $absent = Read-EnvFileValues -EnvFile (Join-Path $dir 'nope.env') -Names @('A')
+            ($null -eq $absent) | Should -Be $false
+            @($absent.Keys).Count | Should -Be 0
+
+            # an ACL is the realistic unreadable shape; a directory read as a
+            # FILE achieves the same exception without needing privileges.
+            $blocked = Join-Path $dir 'blocked.env'
+            New-Item -ItemType Directory -Path $blocked -Force | Out-Null
+            $r = Read-EnvFileValues -EnvFile $blocked -Names @('A')
+            ($null -eq $r) | Should -Be $true
+        } finally {
+            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
