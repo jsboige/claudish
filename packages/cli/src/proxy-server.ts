@@ -2,6 +2,21 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
+// #641 G2 — fork/server re-attachment (relay shell). The stream registry feeds
+// /health's liveness fields and bounds shutdown by consumable work; relay.ts is
+// the sidecar forward path. Both are fork extensions carried onto the branch
+// verbatim (see docs/reference/replatform-v14-layer-manifest.md).
+import { createStreamTracker, stallThresholdMs } from "./fork/server/stream-registry.js";
+import {
+  forwardToUpstream,
+  relayHealthFields,
+  requestLoopedBack,
+  HOPS_HEADER,
+  type RelayState,
+} from "./fork/server/relay.js";
+import { getInstanceId } from "./instance-id.js";
+import { markKeylessExempt } from "./handlers/shared/keyless-exempt.js";
+import { matchesProxyKey, resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
 import { isEffortLevel } from "./adapters/base-api-format.js";
 import {
   isAutoModeClassifierRequest,
@@ -181,6 +196,28 @@ export interface ProxyServerOptions {
    */
   advisorRuntime?: AdvisorRuntime;
   /**
+   * Bind address for the server (default: "127.0.0.1", "0.0.0.0" for Docker).
+   * Fork extension (#641 G2): the hub/sidecar containers publish a port, and a
+   * hardcoded loopback bind — the upstream default — makes the container
+   * unreachable from sibling machines (the CLAUDISH_HOST_PORT lesson).
+   */
+  hostname?: string;
+  /**
+   * Sidecar relay state — fork extension (#641 G2). Undefined → this process
+   * is the hub: no relay branch is taken and behavior is exactly as before.
+   * Set by standalone-proxy.ts from CLAUDISH_RELAY_UPSTREAM; owned by relay.ts.
+   */
+  relay?: RelayState;
+  /**
+   * Skip the startup cache warmers (pricing / recommended / catalog). Default
+   * false — warm them. A test that stubs `globalThis.fetch` while a warmed
+   * proxy runs in the same process must pass true: the warmers dispatch real
+   * fetches in the background, and one landing later resolves against
+   * whatever stub is installed THEN, poisoning an unrelated suite (measured
+   * on this branch: relay.test.ts counting a warmer's call as its own).
+   */
+  skipBackgroundWarmers?: boolean;
+  /**
    * Run hooks on this proxy's `/v1/messages` traffic. Default true. `--probe`
    * passes false: hooks never see probe traffic. Monitor mode and the
    * classifier passthrough never run hooks whatever this says.
@@ -238,6 +275,19 @@ function maybeCaptureClassifierRequest(c: Context, body: any): void {
   }
 }
 
+/**
+ * The native-lane predicate: a bare model name with neither an explicit
+ * provider (`@`) nor a vendor path (`/`) prefix. Exported (#636, carried by
+ * #641 G2) so the route a role-shaped relay probe takes is pinnable with the
+ * SAME predicate the router applies — a re-expressed copy in a test would pin
+ * the wrong route. The `noAnthropicDecision` half of #636 lands with the
+ * leak-policy reroute grain (this branch has no `CLAUDISH_NO_ANTHROPIC`
+ * reroute to extract it from yet).
+ */
+export function isNativeTarget(target: string): boolean {
+  return !target.includes("/") && !target.includes("@");
+}
+
 export async function createProxyServer(
   port: number,
   // Legacy: the OpenRouter key is now resolved through the credential authority
@@ -253,6 +303,10 @@ export async function createProxyServer(
   // Load user-declared custom endpoints from ~/.claudish/config.json and
   // register them in the runtime provider registry so they appear in lookups
   // and handler creation. Runs once per proxy lifetime; idempotent.
+  // `configSnapshot` (assigned inside the try below) keeps that ONE read
+  // shareable past its block scope — the keyless marking middleware needs the
+  // same object, not a second loadConfig() racing a config edit.
+  let configSnapshot: ReturnType<typeof loadConfig> | undefined;
   try {
     // ONE config read for both halves. The bundled catalog's suppression set is
     // `Object.keys(config.customEndpoints)`, so if the two halves ever read
@@ -261,6 +315,7 @@ export async function createProxyServer(
     // provider. Sharing the object here makes that impossible rather than
     // merely unlikely.
     const config = loadConfig();
+    configSnapshot = config;
     // Registers the bundled catalog AND the user's own `customEndpoints`, in
     // that order. Both used to happen here, which is why a custom endpoint was
     // invisible to `--probe` and the picker (#192) — those surfaces run before
@@ -762,7 +817,7 @@ export async function createProxyServer(
     // They were explicitly routed to a provider - if the handler wasn't created above,
     // it's because the API key is missing, not because it's a native model.
     const hasExplicitProvider = target.includes("@");
-    const isNative = !target.includes("/") && !hasExplicitProvider;
+    const isNative = isNativeTarget(target);
 
     if (isNative) {
       // If we mapped to a native string (unlikely) or passed through
@@ -825,6 +880,24 @@ export async function createProxyServer(
   const app = new Hono();
   app.use("*", cors());
 
+  // #641 G2 (fork extension, MARKING half only): record whether the request
+  // holds a credential of its own. The relay's forward reads this mark (#416:
+  // the cluster key authenticates the RELAY, never its client — a keyless
+  // request must reach the hub keyless, so the hub's own guard decides). The
+  // full auth middleware — enforcement, scoped inbound keys, rotation notes —
+  // is the G3 grain and replaces this block wholesale; until it lands, nothing
+  // is refused here, requests are only marked.
+  app.use("*", (c, next) => {
+    const keys = resolveProxyKeys(
+      process.env.CLAUDISH_PROXY_KEY ?? configSnapshot?.proxyKey,
+      process.env.CLAUDISH_PROXY_KEY_PREVIOUS
+    );
+    if (!matchesProxyKey(c.req.header("x-proxy-key"), keys)) {
+      markKeylessExempt(c.req.raw);
+    }
+    return next();
+  });
+
   // Signing-credential redaction (`redact.ts`): every request gets a lease, and
   // every credential value a handler signs with for it is registered there
   // (`ComposedHandler`'s `fetchHeaders`). The lease belongs to the INBOUND
@@ -875,6 +948,16 @@ export async function createProxyServer(
     await next();
   });
 
+  // #641 G2 (fork extension): per-request stream registry. /health reads it to
+  // answer "serving, and moving" instead of "process alive" (the 2026-09-02
+  // outage shape: a constant-time JSON /health answered ok from a hub serving
+  // nobody for 2h27), and shutdown waits on it to bound the exit by CONSUMABLE
+  // work — streams still writing — rather than by open sockets. See
+  // fork/server/stream-registry.ts.
+  const streamTracker = createStreamTracker();
+  app.use("*", streamTracker.middleware);
+  const startedAt = Date.now();
+
   // Terminal-safety backstop. Hono's DEFAULT error handler is literally
   // `console.error(err)` + a text/plain "Internal Server Error" (see
   // hono/dist/hono-base.js). During an interactive session claudish's stderr IS
@@ -903,7 +986,43 @@ export async function createProxyServer(
       config: { mode: monitorMode ? "monitor" : "hybrid", mappings: modelMap },
     })
   );
-  app.get("/health", (c) => c.json({ status: "ok" }));
+  // Liveness, not mere existence (#641 G2, fork extension). A constant-time
+  // JSON handler touches nothing in the request pipeline, so it answers 200
+  // from a process serving nobody — exactly how the 2026-09-02 outage (hub
+  // silent 03:20:45Z → 05:47Z) stayed invisible to every sidecar prober for
+  // 2h27 while they kept relaying into it.
+  //
+  // Streams in flight and nothing moving → 503, the signal the probers
+  // already act on (2 failures, 10s apart → AUTONOMOUS). `status` stays first
+  // and the body keeps `activeStreams`, so drain scripts and watchdogs are
+  // unaffected.
+  //
+  // #156/#157 family: a relay publishes `role` + `upstream` (origin only) so
+  // a hub recreated in the wrong role is visible in one call, and
+  // `instanceId` — a random per-process nonce — lets a relay detect that the
+  // upstream's /health answered with OUR OWN id (`selfLoop`, detected in
+  // relay.ts's heartbeat; the 2026-09-19 ARR-loop shape, answered "ok" 4h40
+  // while flapping 193 times).
+  app.get("/health", (c) => {
+    const thresholdMs = stallThresholdMs();
+    const stalled = streamTracker.isStalled(thresholdMs);
+    const { role, upstream } = relayHealthFields(options.relay);
+    return c.json(
+      {
+        status: stalled ? "stalled" : "ok",
+        activeStreams: streamTracker.getActiveStreams(),
+        pendingRequests: streamTracker.getPendingRequests(),
+        msSinceProgress: streamTracker.getMsSinceProgress(),
+        stallThresholdMs: thresholdMs,
+        uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+        role,
+        upstream,
+        instanceId: getInstanceId(),
+        ...(options.relay ? { selfLoop: options.relay.selfLoop } : {}),
+      },
+      stalled ? 503 : 200
+    );
+  });
 
   // Model discovery for Claude Desktop "third-party inference" mode.
   // The app builds its model picker ONLY from a live GET /v1/models, and
@@ -1090,6 +1209,31 @@ export async function createProxyServer(
       // before detection so a drifted marker can still be discovered.
       maybeCaptureClassifierRequest(c, body);
 
+      // Sidecar relay (#641 G2, fork extension). In NOMINAL mode (upstream
+      // configured + alive) forward the raw request to the central hub and
+      // return its piped response. This branch sits BEFORE the classifier
+      // passthrough, handler resolution and any request logging, so nominal
+      // forwards are served entirely by the hub — which also means the
+      // sidecar never double-handles them. A pre-stream forward failure
+      // returns null → fall through to the normal local path for this one
+      // request (and feeds the prober's hysteresis toward AUTONOMOUS).
+      //
+      // #279 — checked BEFORE forwarding: a request whose hop list carries
+      // our own instanceId is one of our forwards coming back (boot window
+      // before the heartbeat latched selfLoop, or an A→B→A cycle heartbeat
+      // identity cannot see). Serving locally is the only reaction — never a
+      // refusal.
+      const relay = options.relay;
+      if (relay?.upstream && requestLoopedBack(c)) {
+        log(
+          `[Relay] request returned via ${HOPS_HEADER} — own id in hop list (boot window or relay cycle) — serving LOCALLY`,
+          true
+        );
+      } else if (relay?.upstream && relay.alive) {
+        const forwarded = await forwardToUpstream(c, body, relay);
+        if (forwarded) return forwarded;
+      }
+
       // Classifier passthrough (opt-in, default off): Claude Code's auto-mode
       // permission classifier is identified by CONTENT (a marker in its system
       // prompt), not model name. When enabled, reroute it to a native Claude
@@ -1169,7 +1313,10 @@ export async function createProxyServer(
   const server = Bun.serve({
     fetch: app.fetch,
     port,
-    hostname: "127.0.0.1",
+    // Fork extension (#641 G2): configurable bind — the hub and sidecar
+    // containers must reach sibling machines ("0.0.0.0"), everything else
+    // keeps the loopback default.
+    hostname: options.hostname ?? "127.0.0.1",
     // Streamed provider responses can outlive the default idle timeout.
     idleTimeout: 255,
   });
@@ -1181,27 +1328,49 @@ export async function createProxyServer(
   log(`[Proxy] Server started on port ${resolvedPort}`);
 
   // Warm pricing cache in background (non-blocking)
-  warmPricingCache().catch(() => {});
+  if (!options.skipBackgroundWarmers) warmPricingCache().catch(() => {});
 
   // Warm recommended models from Firebase in background (non-blocking)
-  warmRecommendedModels().catch(() => {});
+  if (!options.skipBackgroundWarmers) warmRecommendedModels().catch(() => {});
 
   // Warm the cloud models catalog in the background (non-blocking). Routing and
   // step 2b read wire ids from it. A request that finds neither a warm nor a
   // cached catalog waits in `ensureCatalogReady`, up to five seconds.
-  warmCatalog().catch(() => {
-    // Non-fatal: a cached catalog still answers. With none at all, an explicit
-    // spec passes through unchanged and a bare name gets the no-catalog no-route.
-  });
+  if (!options.skipBackgroundWarmers)
+    warmCatalog().catch(() => {
+      // Non-fatal: a cached catalog still answers. With none at all, an explicit
+      // spec passes through unchanged and a bare name gets the no-catalog no-route.
+    });
 
   return {
     port: resolvedPort,
     url: `http://127.0.0.1:${resolvedPort}`,
     modelRequestCount: () => modelRequestCount,
+    // #641 G2 (fork extension): what a drain script asks before picking its
+    // moment — how many streams are still writing. Reads the same registry
+    // /health publishes, so the two can never disagree.
+    getActiveStreams: () => streamTracker.getActiveStreams(),
     ...(advisorPanel ? { advisorPanel } : {}),
     shutdown: async () => {
-      // `true` = close active connections too, so a streamed request in flight
-      // can't keep the port alive after shutdown resolves.
+      // #631, ported to the Bun.serve stack (#641 G2). On the fork's
+      // @hono/node-server the shutdown gate polled each connection's Node
+      // handles (`req.complete && !res.writableEnded`): count CONSUMABLE
+      // work — a response still being written — and ignore idle keep-alive
+      // sockets, which otherwise hold the close callback forever. Bun's
+      // `stop(true)` aborts instead of waiting, so the wait moves BEFORE it:
+      // poll the stream registry (the same consumable-work registry /health
+      // reads — a request counts while its response stream is open) until it
+      // drains to zero, THEN stop. The wait is deliberately not bounded here:
+      // the container runtime's stop timeout (`stop_grace_period`) is the
+      // bound, and a shorter one in code would only re-create the abrupt kill
+      // this exists to avoid; standalone-proxy's second signal is the human
+      // way out.
+      const settleStepMs = 250;
+      while (streamTracker.getActiveStreams() > 0) {
+        await new Promise((resolve) => setTimeout(resolve, settleStepMs));
+      }
+      // `true` = close active connections too, so nothing keeps the port
+      // alive after shutdown resolves (idle keep-alives included).
       await server.stop(true);
       // The advisor chains were handed over at startup; the proxy owns them.
       if (advisorRuntime) await shutdownAdvisorChains(advisorRuntime.chains.values());
