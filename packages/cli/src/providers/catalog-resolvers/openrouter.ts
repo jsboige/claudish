@@ -333,19 +333,24 @@ export class OpenRouterCatalogResolver implements ModelCatalogResolver {
     let serverTotal: number | null = first.serverTotal;
     let cursor: string | null = first.nextCursor;
     const seenCursors = new Set<string>();
-    // "Complete" has exactly one meaning: the walk reached the server's own
-    // end. Every other exit (page failure, replayed cursor, page cap, deadline)
-    // is a partial fetch, and the persisted coverage says so.
+    // "Complete" means the walk reached the server's own end, in either of its
+    // two forms: the cursor ran out, or the server's own total was reached
+    // while a cursor was still offered (both pinned). Every other exit (page
+    // failure, replayed cursor, page cap, deadline) is a partial fetch, and
+    // the persisted coverage says so.
     let complete = cursor === null;
 
     while (cursor !== null) {
-      if (pages >= CATALOG_MAX_PAGES) break;
-      if (seenCursors.has(cursor)) break; // a server replaying a cursor must not loop us
-      seenCursors.add(cursor);
+      // The server's own count outranks the page cap (checked BEFORE it): a
+      // walk that collected serverTotal distinct models on its last allowed
+      // page reached the end and must not read as truncated.
       if (serverTotal !== null && models.length >= serverTotal) {
         complete = true;
         break;
       }
+      if (pages >= CATALOG_MAX_PAGES) break;
+      if (seenCursors.has(cursor)) break; // a server replaying a cursor must not loop us
+      seenCursors.add(cursor);
       if (deadline - Date.now() <= 0) break;
 
       const page = await this._fetchCatalogPage(base, cursor, remainingBudget());
@@ -388,9 +393,12 @@ export class OpenRouterCatalogResolver implements ModelCatalogResolver {
     }
 
     if (!complete) {
-      // Not an error: a partial catalog still serves. It is a FACT worth a line,
-      // because a truncated catalog that reports itself as whole is what let
-      // `kimi-k3.1-pro` stay invisible (#635 AC4).
+      // Not an error: a partial catalog still serves. It is a FACT worth a
+      // line, because a truncated catalog that reports itself as whole is a
+      // real hazard — it hides what the coverage now exposes. (The measured
+      // #635 incident was next to this one, not it: `kimi-k3.1-pro` sat at
+      // index 652 of page 1 and was hidden by a STALE disk cache, while this
+      // walk's own gap starts past `limit=1000`.)
       logStderr(
         `[Catalog] partial fetch: pages=${pages} fetched=${models.length} serverTotal=${
           serverTotal ?? "unknown"

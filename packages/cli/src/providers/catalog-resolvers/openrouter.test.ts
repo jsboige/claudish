@@ -799,4 +799,65 @@ describe("OpenRouterCatalogResolver.refreshCatalog — page walk (#635 AC4)", ()
     expect(outcome).toEqual({ kind: "fetch_failed", reason: "http_error" });
     expect(mockWrite).not.toHaveBeenCalled();
   });
+
+  test("ONE deadline for the whole walk: a slow pager stops inside the budget, not per page (#668 r1)", async () => {
+    // The headline property of the walk, unpinned until r1: every page costs
+    // D ms, the server always offers a fresh cursor, and the caller's T is the
+    // budget for the WHOLE refresh. At T = 2.5·D the third page's fetch is cut
+    // mid-delay by its remaining-budget signal: 3 requests, 2 pages landed,
+    // walk over at the deadline. A per-page timeout instead of the shared
+    // deadline (r1 mutant A) hands page 3 the FULL budget, its delay
+    // completes, and a third page lands past the deadline — `pages` is the
+    // deterministic discriminator; the elapsed bound is the sanity check.
+    const D = 150;
+    const T = Math.round(2.5 * D); // 375 ms
+    let seq = 0;
+    globalThis.fetch = mock(async (_input: string | URL | Request, init?: RequestInit) => {
+      requested.push(String(_input));
+      const mine = ++seq;
+      const signal = init?.signal;
+      const answer = () => v3Page([`m${mine}`], null, `cur-${mine}`);
+      if (!signal) return answer();
+      if (signal.aborted) {
+        throw signal.reason ?? new DOMException("Aborted", "AbortError");
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, D);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      return answer();
+    }) as unknown as typeof globalThis.fetch;
+
+    const t0 = Date.now();
+    const outcome = await resolver.refreshCatalog(T);
+    const elapsed = Date.now() - t0;
+
+    const cov = (outcome as { coverage: { pages: number; complete: boolean } }).coverage;
+    expect(cov.complete).toBe(false);
+    expect(cov.pages).toBe(2); // page 3 was cut mid-delay by the SHARED deadline
+    expect(requested.length).toBe(3);
+    expect(requested.length).toBeLessThan(10);
+    expect(elapsed).toBeLessThanOrEqual(T + D); // inside T + margin — never 10·D
+  });
+
+  test("serverTotal is adopted from a later page (#668 r1)", async () => {
+    // Page 1 answers without a total; page 2 declares one and ends the walk.
+    // The coverage must carry the SERVER's count, not page 1's absence of it.
+    script([() => v3Page(["a"], null, "cur-2"), () => v3Page(["b", "c"], 3, null)]);
+
+    const outcome = await resolver.refreshCatalog(5000);
+
+    expect(outcome).toEqual({
+      kind: "refreshed",
+      modelCount: 3,
+      coverage: { pages: 2, fetched: 3, serverTotal: 3, complete: true },
+    });
+  });
 });

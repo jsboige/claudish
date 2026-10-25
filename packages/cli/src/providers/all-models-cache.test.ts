@@ -237,7 +237,10 @@ describe("allModelsCachePath — CLAUDISH_MODEL_CACHE_PATH (#637)", () => {
 /**
  * Coverage metadata (#635 AC4). The disk cache must be able to say HOW MUCH of
  * the server catalog it holds — a truncated page 1 written as the whole catalog
- * is what hid `kimi-k3.1-pro` on 2026-10-24 (`total=1002` vs `limit=1000`).
+ * is a standing hazard, because nothing downstream can tell a complete cache
+ * from a clipped one. (Distinct from the measured 2026-10-24 incident:
+ * `kimi-k3.1-pro` sat at index 652 of page 1 and was hidden by a STALE cache,
+ * not by truncation — the pagination gap starts past `limit=1000`.)
  */
 describe("catalog coverage (#635 AC4)", () => {
   const coverage = { pages: 2, fetched: 1002, serverTotal: 1002, complete: true };
