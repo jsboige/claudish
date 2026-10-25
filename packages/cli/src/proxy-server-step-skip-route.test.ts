@@ -511,11 +511,15 @@ describe("#431 — a cascade step that cannot take the request skips forward", (
 
     expect(calls.s0).toBe(1);
 
-    // Second oversized request: same (provider, model) — the learned cap
-    // short-circuits BEFORE any fetch, and the skip still advances.
-    // A FRESH session: r1's dwell pin points at s1 and would bypass s0
-    // entirely — the short-circuit is only consulted when step 0 is resolved.
-    const r2 = await postMessage({ session: "sess-sc-2", content: "w".repeat(400_000) });
+    // Second oversized request: same (provider, model). #674: the canned 400
+    // STATES its window (262 144), so the resubmission must corroborate — a
+    // body merely over the LEARNED CAP (~100k est) but under the stated window
+    // is the marginal band K3b pins as served, and goes upstream. This body is
+    // over the window on both pieces of evidence: the cap short-circuits
+    // BEFORE any fetch, and the skip still advances. A FRESH session: r1's
+    // dwell pin points at s1 and would bypass s0 entirely — the short-circuit
+    // is only consulted when step 0 is resolved.
+    const r2 = await postMessage({ session: "sess-sc-2", content: "w".repeat(1_200_000) });
     expect(await responseText(r2)).toContain("ok-from-s1");
     expect(calls.s0).toBe(1); // unchanged — zero new round-trips
     expect(

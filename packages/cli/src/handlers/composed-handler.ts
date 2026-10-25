@@ -54,6 +54,7 @@ import {
   contextLimitMarginTokens,
   rememberOverflowCap,
   getOverflowCap,
+  getStatedContextLimit,
   overflowReportFloor,
   overflowReportedTokens,
   overflowRecoveryText,
@@ -859,7 +860,14 @@ export class ComposedHandler implements ModelHandler {
     if (overflowCap !== undefined) {
       const est = estimatePayloadTokens(requestPayload);
       if (est >= overflowCap) {
-        const knownWindow = this.options.derivedContextLimit ?? this.options.contextLimit;
+        // #674 — a window the engine ITSELF stated in a refusal body outranks
+        // both the startup probe (it is fresher: a rebuilt engine says so on
+        // its next refusal) and the hand-typed literal (never trusted alone,
+        // #651). All three are absent on most providers → old behavior.
+        const knownWindow =
+          getStatedContextLimit(this.provider.displayName, this.targetModel) ??
+          this.options.derivedContextLimit ??
+          this.options.contextLimit;
         const corroborated =
           knownWindow === undefined ||
           knownWindow <= 0 ||
@@ -1359,7 +1367,11 @@ export class ComposedHandler implements ModelHandler {
             this.provider.displayName,
             this.targetModel,
             est,
-            `HTTP ${response.status}${overflow.used !== undefined ? ` input_tokens=${overflow.used}` : ""}`
+            `HTTP ${response.status}${overflow.used !== undefined ? ` input_tokens=${overflow.used}` : ""}`,
+            // #674 — the refusal's OWN window statement rides the same record:
+            // it is the engine's number, observed live, and the corroboration
+            // gate consumes it above.
+            overflow.limit
           );
           // `reported`/`synthetic` make the synthetic count greppable: downstream
           // aggregators of `usage` (#41/#89 cost attribution, writeTokenFile) must be
