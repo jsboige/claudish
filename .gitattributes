@@ -1,0 +1,12 @@
+# SSE fixtures are byte-exact captures of provider wire traffic, replayed by
+# format-translation.test.ts. The SSE event separator is a blank line: the test
+# harness splits on "\n\n". A CRLF fixture never matches it ("\r\n\r\n" contains
+# no "\n\n"), so the whole capture arrives as one chunk, zero events parse, and
+# the fixture-driven describes fail on an empty parse — indistinguishable from a
+# real anthropic-sse regression. Measured on this branch 2026-10-26: converting
+# the 32 fixtures to CRLF turns exactly 11 of 126 tests red (seed passthrough,
+# 4 thinking-block filtering, 4 MiniMax M2.5, 2 in-stream #106); restoring LF
+# returns them all green. `text` also normalizes CRLF back to LF when such a
+# fixture is committed, so it cannot enter history in the first place.
+# Keep them LF on every platform.
+*.sse text eol=lf
