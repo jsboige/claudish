@@ -15,8 +15,9 @@ import {
   type RelayState,
 } from "./fork/server/relay.js";
 import { getInstanceId } from "./instance-id.js";
-import { markKeylessExempt } from "./handlers/shared/keyless-exempt.js";
-import { matchesProxyKey, resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
+import { resolveInboundKeys } from "./handlers/shared/inbound-keys.js";
+import { collectRoutedBareNames, createProxyAuthMiddleware } from "./fork/middleware/proxy-auth.js";
+import { resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
 import { isEffortLevel } from "./adapters/base-api-format.js";
 import {
   isAutoModeClassifierRequest,
@@ -880,23 +881,41 @@ export async function createProxyServer(
   const app = new Hono();
   app.use("*", cors());
 
-  // #641 G2 (fork extension, MARKING half only): record whether the request
-  // holds a credential of its own. The relay's forward reads this mark (#416:
-  // the cluster key authenticates the RELAY, never its client — a keyless
-  // request must reach the hub keyless, so the hub's own guard decides). The
-  // full auth middleware — enforcement, scoped inbound keys, rotation notes —
-  // is the G3 grain and replaces this block wholesale; until it lands, nothing
-  // is refused here, requests are only marked.
-  app.use("*", (c, next) => {
-    const keys = resolveProxyKeys(
-      process.env.CLAUDISH_PROXY_KEY ?? configSnapshot?.proxyKey,
-      process.env.CLAUDISH_PROXY_KEY_PREVIOUS
+  // #641 G3 (fork extension): FULL proxy auth, replacing G2's keyless marker
+  // wholesale. Registration order is the security property: this middleware
+  // runs BEFORE the /v1/messages route handler, hence before its relay branch
+  // — a request is authenticated where it lands, never forwarded first (same
+  // order as the fork; the relay's forward reads the same #416 keyless mark,
+  // which the auth's native-exemption branch now sets). GET and health routes
+  // stay exempt inside the middleware. Registered only when a proxy key
+  // exists — a keyless deployment keeps serving everything, as on the fork.
+  const proxyKeys = resolveProxyKeys(
+    process.env.CLAUDISH_PROXY_KEY ?? configSnapshot?.proxyKey,
+    process.env.CLAUDISH_PROXY_KEY_PREVIOUS
+  );
+  const inboundKeys = configSnapshot ? resolveInboundKeys(configSnapshot, proxyKeys) : [];
+  const routedBareNames = configSnapshot
+    ? collectRoutedBareNames(configSnapshot)
+    : (new Set<string>() as ReadonlySet<string>);
+  if (proxyKeys.length) {
+    app.use(
+      "/v1/*",
+      createProxyAuthMiddleware(proxyKeys, inboundKeys, routedBareNames)
     );
-    if (!matchesProxyKey(c.req.header("x-proxy-key"), keys)) {
-      markKeylessExempt(c.req.raw);
+    // Count logged unconditionally (lengths, never values): closing a rotation
+    // window must be as greppable as opening one (review feedback on #95).
+    log(
+      `[Proxy] Authentication enabled (Anthropic pass-through; ${proxyKeys.length} proxy key(s) accepted, lengths ${proxyKeys.map((k) => k.length).join("/")}; proxy key required for other providers)`
+    );
+    // #400 — names only (never values): the count of scoped keys must be as
+    // greppable as the proxy-key rotation state, and the hub log is what an
+    // operator greps after an external misbehaves.
+    if (inboundKeys.length) {
+      log(
+        `[Proxy] ${inboundKeys.length} scoped inbound key(s) active: ${inboundKeys.map((k) => `${k.name}→[${k.allowModels.join(",")}]`).join("; ")}`
+      );
     }
-    return next();
-  });
+  }
 
   // Signing-credential redaction (`redact.ts`): every request gets a lease, and
   // every credential value a handler signs with for it is registered there
