@@ -941,10 +941,7 @@ export async function createProxyServer(
     ? collectRoutedBareNames(configSnapshot)
     : (new Set<string>() as ReadonlySet<string>);
   if (proxyKeys.length) {
-    app.use(
-      "/v1/*",
-      createProxyAuthMiddleware(proxyKeys, inboundKeys, routedBareNames)
-    );
+    app.use("/v1/*", createProxyAuthMiddleware(proxyKeys, inboundKeys, routedBareNames));
     // Count logged unconditionally (lengths, never values): closing a rotation
     // window must be as greppable as opening one (review feedback on #95).
     log(

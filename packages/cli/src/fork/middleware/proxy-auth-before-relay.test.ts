@@ -30,8 +30,8 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "../../proxy-server.js";
-import { createRelayState } from "../server/relay.js";
 import type { ProxyServer } from "../../types.js";
+import { createRelayState } from "../server/relay.js";
 
 // Distinct range from the other in-process route tests (19700+, 19851/19951,
 // 19863, 19871, 19883/19983, 19891/19991, 19921, 19961, 19971/19972).

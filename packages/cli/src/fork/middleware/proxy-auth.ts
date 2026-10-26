@@ -14,21 +14,21 @@
 
 import type { MiddlewareHandler } from "hono";
 import { wrapAnthropicError } from "../../handlers/shared/anthropic-error.js";
-import { matchesProxyKey } from "../../handlers/shared/proxy-keys.js";
-import { noteProxyKeyAuthentication } from "../../handlers/shared/proxy-key-rotation.js";
 import {
+  type InboundKeyEntry,
   acquireInboundSlot,
   inboundInFlight,
   inboundModelAllowed,
-  matchesInboundKey,
   markInboundKey,
+  matchesInboundKey,
   releaseInboundSlot,
-  type InboundKeyEntry,
 } from "../../handlers/shared/inbound-keys.js";
 import { markKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
+import { noteProxyKeyAuthentication } from "../../handlers/shared/proxy-key-rotation.js";
+import { matchesProxyKey } from "../../handlers/shared/proxy-keys.js";
 import { logStderr } from "../../logger.js";
-import { parseModelSpec } from "../../providers/model-parser.js";
 import type { ClaudishProfileConfig } from "../../profile-config.js";
+import { parseModelSpec } from "../../providers/model-parser.js";
 
 /**
  * #410 — the bare model names that leave the native lane: routing-map keys
@@ -76,9 +76,7 @@ export function createProxyAuthMiddleware(
     const apiKeyHeader = c.req.header("x-api-key");
     const proxyKeyHeader = c.req.header("x-proxy-key");
 
-    const bearerToken = authHeader?.startsWith("Bearer ")
-      ? authHeader.slice(7)
-      : authHeader;
+    const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
 
     const provided = proxyKeyHeader || apiKeyHeader || bearerToken;
 
