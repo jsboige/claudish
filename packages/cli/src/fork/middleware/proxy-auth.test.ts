@@ -1,14 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { createProxyAuthMiddleware, collectRoutedBareNames } from "./proxy-auth.js";
-import { matchesProxyKey, resolveProxyKeys } from "../../handlers/shared/proxy-keys.js";
 import {
+  type InboundKeyEntry,
   inboundInFlight,
   inboundKeyFor,
-  type InboundKeyEntry,
 } from "../../handlers/shared/inbound-keys.js";
-import { createStreamTracker } from "../server/stream-registry.js";
+import { matchesProxyKey, resolveProxyKeys } from "../../handlers/shared/proxy-keys.js";
 import { isQuotaExhaustion } from "../failover.js";
+import { createStreamTracker } from "../server/stream-registry.js";
+import { collectRoutedBareNames, createProxyAuthMiddleware } from "./proxy-auth.js";
 
 function buildApp(
   keys: string[],
@@ -22,7 +22,11 @@ function buildApp(
   return app;
 }
 
-function post(app: Hono, headers: Record<string, string> = {}, model = "gpt-4o"): Promise<Response> {
+function post(
+  app: Hono,
+  headers: Record<string, string> = {},
+  model = "gpt-4o"
+): Promise<Response> {
   // `await` — Hono's request() is `Response | Promise<Response>` on this base.
   return Promise.resolve(
     app.request("/v1/messages", {
@@ -120,7 +124,9 @@ describe("proxy-auth middleware — scoped inbound keys (#400)", () => {
   it("an allowlisted model passes with the scoped key", async () => {
     const app = build();
     expect((await post(app, { "x-api-key": "scoped-secret" }, "swift-1.5-27b")).status).toBe(200);
-    expect((await post(app, { authorization: "Bearer scoped-secret" }, "qwen3.6-35b-a3b")).status).toBe(200);
+    expect(
+      (await post(app, { authorization: "Bearer scoped-secret" }, "qwen3.6-35b-a3b")).status
+    ).toBe(200);
   });
 
   it("a NON-allowlisted model is a labeled 403 — subscriptions and native stay fleet-internal", async () => {
@@ -148,8 +154,12 @@ describe("proxy-auth middleware — scoped inbound keys (#400)", () => {
 
   it("explicit provider@model forms only pass on an EXACT raw allowlist hit (no cross-transport riding)", async () => {
     const app = build();
-    expect((await post(app, { "x-proxy-key": "scoped-secret" }, "or@swift-1.5-27b")).status).toBe(403);
-    expect((await post(app, { "x-proxy-key": "scoped-secret" }, "frognano@frognano-4b")).status).toBe(403);
+    expect((await post(app, { "x-proxy-key": "scoped-secret" }, "or@swift-1.5-27b")).status).toBe(
+      403
+    );
+    expect(
+      (await post(app, { "x-proxy-key": "scoped-secret" }, "frognano@frognano-4b")).status
+    ).toBe(403);
     const explicit: InboundKeyEntry[] = [
       { name: "explicit", key: "s2", allowModels: ["frognano@frognano-4b"] },
     ];
@@ -352,8 +362,7 @@ describe("proxy-auth middleware — per-key concurrency cap (#400)", () => {
 describe("proxy-auth middleware — routed bare names off the native exemption (#410)", () => {
   const fleetKeys = ["fleet-key"];
   const routed = new Set(["frognano-4b", "mini", "local-fast", "swift-1.5-27b"]);
-  const build = (inboundKeys: InboundKeyEntry[] = []) =>
-    buildApp(fleetKeys, inboundKeys, routed);
+  const build = (inboundKeys: InboundKeyEntry[] = []) => buildApp(fleetKeys, inboundKeys, routed);
 
   it("a routed bare name with NO credential is a plain 401 — the measured hole, closed", async () => {
     const app = build();
@@ -407,9 +416,7 @@ describe("collectRoutedBareNames (#410)", () => {
         keyless: { url: "http://x" },
       },
     });
-    expect([...names].sort()).toEqual(
-      ["frognano-4b", "glm-5.3", "mini", "qwen3.6-35b-a3b"].sort()
-    );
+    expect([...names].sort()).toEqual(["frognano-4b", "glm-5.3", "mini", "qwen3.6-35b-a3b"].sort());
   });
 
   it("empty/absent config yields an empty set", () => {
