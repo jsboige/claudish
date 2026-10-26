@@ -761,11 +761,9 @@ describe("#320 CLAUDISH_RELAY_HEADER_TIMEOUT_MS — configurable, empty-safe, bo
     }
   }, 20_000);
 
-  // #641 G2: skipped on the branch — the re-forward the deadline governs is
-  // INVOKED from anthropic-sse's stream walk (the parser grain, #641 G4).
-  // Until G4 attaches it, `retryUpstream` is declared-but-inert on this
-  // branch and this pin cannot pass. Re-arm with G4.
-  it.skip("a re-forward draws on the turn's ONE header deadline, not a fresh budget (#323 B2)", async () => {
+  // #641 G4: re-armed — anthropic-sse's stream walk now invokes the re-forward
+  // the deadline governs.
+  it("a re-forward draws on the turn's ONE header deadline, not a fresh budget (#323 B2)", async () => {
     // Original forward: headers arrive instantly, the body dies pre-visible
     // (#170's trigger). The re-forward target is mute — only its abort ends it.
     // With the turn-wide 600ms deadline: ladder delay 400ms + ~200ms remaining
@@ -1523,12 +1521,10 @@ async function drainResponse(r: Response | null): Promise<string> {
   return out;
 }
 
-// #641 G2: this whole block is skipped on the branch — every pin below
-// exercises the pre-visible re-forward, which anthropic-sse (the parser
-// grain, #641 G4) invokes. `retryUpstream` is declared-but-inert there until
-// G4 lands; these pins re-arm with it. Positive control: the kill-switch test
-// at 0 stays meaningful only once the mechanism itself exists.
-describe.skip("forwardToUpstream — pre-visible re-forward (#170)", () => {
+// #641 G4: re-armed — anthropic-sse's stream walk now invokes the pre-visible
+// re-forward these pins exercise. Positive control: the kill-switch test at 0
+// stays meaningful only once the mechanism itself exists.
+describe("forwardToUpstream — pre-visible re-forward (#170)", () => {
   it("recovers a hub death that landed before any client-visible event", async () => {
     let calls = 0;
     fetchImpl = async () => {
@@ -1665,9 +1661,9 @@ function openaiChunkSse(marker: string): string {
   );
 }
 
-// #641 G2: skipped on the branch — the wire-agnostic re-forward predicates
-// run inside the parser's stream walk (#641 G4). Re-arm with G4.
-describe.skip("forwardToUpstream — wire-agnostic re-forward predicates (#286)", () => {
+// #641 G4: re-armed — the wire-agnostic re-forward predicates run inside the
+// parser's stream walk, now wired.
+describe("forwardToUpstream — wire-agnostic re-forward predicates (#286)", () => {
   it("OpenAI wire: graceful end after the full body → NO re-forward, single copy, no empty-response tail", async () => {
     let calls = 0;
     fetchImpl = async () => {

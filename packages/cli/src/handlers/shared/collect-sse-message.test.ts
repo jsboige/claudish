@@ -361,6 +361,42 @@ describe("collectSseMessage degenerate input", () => {
   });
 });
 
+describe("collectSseMessage never-throws contract (#658)", () => {
+  test("never throws when the stream REJECTS mid-read — partial content survives", async () => {
+    // The never-hang promise lives in the OUTER catch: a socket that dies
+    // while the body is being read must not propagate to a `stream: false`
+    // caller (notably /compact), which would see an API error instead of a
+    // well-formed message. The other tests in this file never reject the
+    // reader — this one does. Measured on the trunk: a
+    // `catch (err) { throw err; }` mutant passes every other test here, so
+    // without this case the guarantee is unpinned.
+    // The partial chunk is DELIVERED first and the error raised in `pull`
+    // (when the queue is empty): `controller.error()` inside `start` would
+    // discard the queued chunk instead, which pins nothing about preservation.
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+              'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}\n\n'
+          )
+        );
+      },
+      pull(controller) {
+        controller.error(new Error("upstream socket died mid-read"));
+      },
+    });
+    const res = new Response(body, { status: 200 });
+
+    const msg = await collectSseMessage(res, "m"); // must RESOLVE, not reject
+
+    expect(msg.type).toBe("message");
+    expect(msg.content).toEqual([{ type: "text", text: "partial answer" }]);
+    expect(msg.stop_reason).toBe("end_turn");
+  });
+});
+
 test("sseResponseToJson returns the same collected message as JSON", async () => {
   const direct = await collectSseMessage(framesResponse(textTurnFrames), "fallback");
   const response = await sseResponseToJson(framesResponse(textTurnFrames), "fallback");
