@@ -13,6 +13,7 @@ import type { Context } from "hono";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
 import { log } from "../../../logger.js";
 import { redactForClient } from "../../../redact.js";
+import { messageStartUsage } from "./message-start-usage.js";
 import {
   POLICY_RETRY_BACKOFF_MS,
   isPolicyRefusal,
@@ -83,6 +84,8 @@ interface AnthropicPassthroughOpts {
   providerName?: string;
   /** Feeds the [ttft] marker (fork traffic analysis). Inert until that grain lands. */
   headerLatencyMs?: number;
+  /** Last request's context size — seeds a synthetic message_start after an error. */
+  priorInputTokens?: number;
 }
 
 /**
@@ -255,7 +258,7 @@ export function createAnthropicPassthroughStream(
             model: opts.modelName,
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+            usage: messageStartUsage(opts.priorInputTokens),
           },
         });
       }
@@ -429,31 +432,32 @@ export function createAnthropicPassthroughStream(
             };
 
             /**
-             * Surface an in-stream error. The generic class keeps the branch's
-             * pre-existing shape EXACTLY - a redacted `event: error` frame and
-             * a close, no terminal pair (the #106 regression pin holds that a
-             * stream terminated by error must NOT carry a message_stop: Claude
-             * Code ends the turn on the error event itself). The policy class
-             * (#65) surfaces as a real terminal turn - the labeled notice is
-             * the only signal of WHAT was refused, so it must read as the
-             * assistant's answer, not as a transport error the agent would
-             * retry blind.
+             * An HTTP-200 in-stream error still needs a valid terminal turn:
+             * Claude Code reports a bare `error` event without message_stop as
+             * an empty/malformed response. Before any content, synthesize a
+             * labeled assistant message; mid-stream, preserve what was sent,
+             * close the open block, and append the terminal pair. A policy
+             * refusal uses its own label; the generic error gets a rate-limit-
+             * aware or provider-error label (#106 no-crash hardening).
              */
             const closeWithTerminalTail = (
               controller: any,
               errMsg: string,
               notice?: string
             ): void => {
-              if (notice !== undefined) {
-                finalizeAbandonedStream(controller, notice);
-              } else if (!isClosed) {
-                controller.enqueue(
-                  encoder.encode(
-                    `event: error\ndata: ${JSON.stringify({
-                      type: "error",
-                      error: { type: "api_error", message: redactForClient(errMsg) },
-                    })}\n\n`
-                  )
+              // A ping is data on the relay's OpenAI wire, but it must not
+              // suppress the synthetic Anthropic message envelope.
+              const contentWasForwarded = sawMessageStart;
+              if (!isClosed && !sawMessageStop) {
+                const isRateLimit =
+                  /rate.?limit|\b1302\b|\b429\b|too many requests|overloaded/i.test(errMsg);
+                finalizeAbandonedStream(
+                  controller,
+                  notice ??
+                    (isRateLimit
+                      ? "[The model provider is rate limited right now. The proxy retried and exhausted fallback capacity — please try again in a moment.]"
+                      : `[Upstream provider error: ${redactForClient(errMsg)}]`),
+                  contentWasForwarded
                 );
               }
               isClosed = true;
