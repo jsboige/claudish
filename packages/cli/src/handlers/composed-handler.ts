@@ -3418,6 +3418,9 @@ export class ComposedHandler implements ModelHandler {
           // on this wire (qtoken@'s qwen / glm / deepseek models).
           adapter: (this.modelAdapter ?? adapter) as BaseAPIFormat,
           onToolCallObserved: observeToolCall,
+          // Same seed contract as the other parsers: a synthetic opening after
+          // an in-stream error must retain the previous context size.
+          priorInputTokens,
         });
 
       case "gemini-sse": {

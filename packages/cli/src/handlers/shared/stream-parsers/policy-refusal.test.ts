@@ -212,7 +212,7 @@ describe("#65 anthropic-sse lane — in-stream policy refusal", () => {
     expect(output).toContain("event: message_stop");
   });
 
-  test("non-policy in-stream errors keep the pre-existing generic surface (no marker, no retry)", async () => {
+  test("non-policy in-stream errors keep the generic surface (no marker, no retry, terminal pair)", async () => {
     let calls = 0;
     const rateLimit =
       "event: error\n" +
@@ -227,10 +227,13 @@ describe("#65 anthropic-sse lane — in-stream policy refusal", () => {
     expect(calls).toBe(0);
     expect(lines.some((l) => l.includes("[PolicyRefusal]"))).toBe(false);
     expect(output).toContain("rate limit");
-    // Branch contract (#106 regression pin): a stream terminated by a generic
-    // in-stream error carries the error frame as its LAST event — Claude Code
-    // ends the turn on the error event itself, so no synthetic message_stop
-    // follows it. The trunk's generic-tail variant does not apply here.
-    expect(output).not.toContain("message_stop");
+    // Hardened #106 contract (ported with the seed/instream grain): a stream
+    // terminated by a generic in-stream error must END with a valid terminal
+    // message — a bare `event: error` with no message_stop is what Claude
+    // Code reads as "empty or malformed response (HTTP 200)". The generic
+    // surface keeps its own (rate-limit-aware) label, not the policy-refusal
+    // notice.
+    expect(output).toContain("message_stop");
+    expect(output).not.toContain("[Upstream policy refusal");
   });
 });
