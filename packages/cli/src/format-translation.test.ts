@@ -3308,3 +3308,459 @@ describe("OpenAI SSE: a required argument whose value is an empty string is pres
     expect(extractToolNames(events)).not.toContain("Edit");
   });
 });
+
+// ─── Regression: web search remap (agentic blocking fix) ───────────────────
+//
+// CoursIA incident 2026-06-10: provider-side web search (web_search tool call
+// or GLM <searchWeb> tag) was suppressed and replaced with a text block +
+// stop_reason "end_turn" — the agent ended its turn on raw search results and
+// the agentic loop stalled. The fix remaps these to a synthetic WebSearch
+// tool_use (stop_reason "tool_use") whenever the client declared WebSearch,
+// so Claude Code runs its own WebSearch and the conversation continues.
+
+describe("Regression: web search remap to client WebSearch tool_use", () => {
+  async function getParser() {
+    const mod = await import("./handlers/shared/openai-compat.js");
+    return mod.createStreamingResponseHandler;
+  }
+
+  async function getDefaultAdapter() {
+    const mod = await import("./adapters/base-api-format.js");
+    return new mod.DefaultAPIFormat("test-model");
+  }
+
+  function sseToResponse(content: string): Response {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(content));
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  }
+
+  const WEBSEARCH_SCHEMA = {
+    name: "WebSearch",
+    description: "Search the web",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+  };
+  const READ_SCHEMA = {
+    name: "Read",
+    description: "Read a file",
+    input_schema: {
+      type: "object",
+      properties: { file_path: { type: "string" } },
+      required: ["file_path"],
+    },
+  };
+
+  // Provider emits a structured web_search tool call (GLM/z.ai dialect)
+  const WEB_SEARCH_TOOLCALL_SSE = [
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Let me look that up."},"finish_reason":null}]}`,
+    "",
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_1","type":"function","function":{"name":"web_search","arguments":""}}]},"finish_reason":null}]}`,
+    "",
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"query\\":\\"chatterbox tts docker compose\\"}"}}]},"finish_reason":null}]}`,
+    "",
+    `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":7}}`,
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+
+  test("web_search tool call + WebSearch declared → remapped tool_use, stop_reason=tool_use", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(WEB_SEARCH_TOOLCALL_SSE),
+      adapter,
+      "glm-5.1",
+      null,
+      undefined,
+      [WEBSEARCH_SCHEMA, READ_SCHEMA]
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // The provider tool call is remapped to the client's WebSearch tool
+    const tools = extractToolNames(events);
+    expect(tools).toContain("WebSearch");
+
+    // The remapped input carries the original query
+    const inputJson = events
+      .filter(
+        (e) => e.data?.type === "content_block_delta" && e.data?.delta?.type === "input_json_delta"
+      )
+      .map((e) => e.data.delta.partial_json)
+      .join("");
+    expect(JSON.parse(inputJson)).toEqual({ query: "chatterbox tts docker compose" });
+
+    // THE fix: the turn must continue, not end on injected text
+    expect(extractStopReason(events)).toBe("tool_use");
+
+    // No raw search-results text block injected
+    expect(extractText(events)).not.toContain("[Web search");
+  });
+
+  test("web_search tool call WITHOUT WebSearch declared → suppression fallback, stop_reason=end_turn", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(WEB_SEARCH_TOOLCALL_SSE),
+      adapter,
+      "glm-5.1",
+      null,
+      undefined,
+      [READ_SCHEMA] // no WebSearch in the request
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // No tool_use leaks through (web_search must not reach the client)
+    expect(extractToolNames(events)).toHaveLength(0);
+
+    // Results (or a graceful degradation notice) are injected as text
+    expect(extractText(events)).toContain("[Web search");
+
+    // Legitimate end_turn: without WebSearch declared the client could not
+    // execute a remapped tool anyway (e.g. sub-agents without web tools).
+    expect(extractStopReason(events)).toBe("end_turn");
+  });
+
+  // The Hermes IndexError shape (measured 15/10, hub capture
+  // msg_1792076842247: thinking + text carrying a <searchWeb> tag + a
+  // structured web_search tool call, ending with finish_reason "stop").
+  // Pre-fix: the suppressed call reserved index 2 and never spent it, the
+  // tag injection took index 3 — the client saw blocks 0,1,3, and the
+  // Anthropic Python SDK died on the gap with IndexError: list index out
+  // of range. The search itself was also silently dropped on this ending.
+  test("web_search call + <searchWeb> tag + finish=stop → contiguous indices, no hole (Hermes IndexError 15/10)", async () => {
+    // Network hermeticity: the injections go through the REAL executeWebSearch
+    // chain. On seats whose .env SEARXNG_URL is reachable this pin waited out
+    // the 5s attempt timeout per query (measured ai-01/po-2025, review of
+    // queue 20261018T0000Z grain 3). Pin the backend to an unreachable
+    // loopback with a short attempt budget: degradation text still carries the
+    // query, which is what the assertions below discriminate on.
+    const SAVED_ENV = {
+      url: process.env.SEARXNG_URL,
+      mcp: process.env.SEARXNG_MCP_URL,
+      timeout: process.env.SEARXNG_ATTEMPT_TIMEOUT_MS,
+    };
+    process.env.SEARXNG_URL = "http://127.0.0.1:1";
+    process.env.SEARXNG_MCP_URL = "";
+    process.env.SEARXNG_ATTEMPT_TIMEOUT_MS = "200";
+    try {
+      const createStreamingResponseHandler = await getParser();
+      const adapter = await getDefaultAdapter();
+      const ctx = createMockContext();
+
+      const raw = [
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"checking"},"finish_reason":null}]}`,
+        "",
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Let me verify <searchWeb><query>shapley 1967 balanced sets</query></searchWeb>"},"finish_reason":null}]}`,
+        "",
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_2","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"bondareva 1963\\"}"}}]},"finish_reason":null}]}`,
+        "",
+        `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":7}}`,
+        "",
+        "data: [DONE]",
+        "",
+      ].join("\n");
+
+      const response = createStreamingResponseHandler(
+        ctx,
+        sseToResponse(raw),
+        adapter,
+        "glm-5.3",
+        null,
+        undefined,
+        [READ_SCHEMA] // no WebSearch in the request
+      );
+
+      const events = await parseClaudeSseStream(response);
+
+      // No tool_use leaks through
+      expect(extractToolNames(events)).toHaveLength(0);
+
+      // Both searches deliver their injection (or graceful degradation notice).
+      // The query substring is what discriminates the STRUCTURED call's
+      // injection from the <searchWeb> tag path: on the pre-fix tree only the
+      // tag path injected, so this query never reached the client.
+      const text = extractText(events);
+      expect(text).toContain("[Web search");
+      expect(text).toContain("bondareva 1963");
+
+      // Exact block coverage, not just contiguity — on the pre-fix tree this
+      // shape yields [0,1] (the structured search silently dropped), and the
+      // hole shape yields [0,1,3]. Both must fail this assertion.
+      const starts = events
+        .filter((e) => e.data?.type === "content_block_start")
+        .map((e) => e.data.index);
+      expect(starts).toEqual([0, 1, 2]);
+
+      expect(extractStopReason(events)).toBe("end_turn");
+    } finally {
+      // delete-idiom: under bun, `process.env.K = undefined` stores the STRING
+      // "undefined", leaking it into every test file that runs after this one
+      // (follow-up to #513 review). Same shape as the dialect-test restores.
+      if (SAVED_ENV.url === undefined) delete process.env.SEARXNG_URL;
+      else process.env.SEARXNG_URL = SAVED_ENV.url;
+      if (SAVED_ENV.mcp === undefined) delete process.env.SEARXNG_MCP_URL;
+      else process.env.SEARXNG_MCP_URL = SAVED_ENV.mcp;
+      if (SAVED_ENV.timeout === undefined) delete process.env.SEARXNG_ATTEMPT_TIMEOUT_MS;
+      else process.env.SEARXNG_ATTEMPT_TIMEOUT_MS = SAVED_ENV.timeout;
+    }
+  });
+
+  // The coordinator's discriminating probe (review #485, table row 1):
+  // a suppressed web_search call arrives FIRST, then text, then a buffered
+  // real tool, and the turn ends finish_reason "stop". On origin/main the
+  // suppressed call reserves index 0 and never spends it (text lands at 1,
+  // tool at 2) — the reported IndexError class, measured with this exact
+  // wire. With the fix the suppressed call reserves nothing and the real
+  // tool must ship, and the suppressed call's query must reach the client
+  // as injected text.
+  test("suppressed web_search first + buffered real tool + finish=stop → [0,1] exact, structured query injected (review #485 probe)", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_first","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"shapley 1967 balanced sets\\"}"}}]},"finish_reason":null}]}`,
+      "",
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Checking sources."},"finish_reason":null}]}`,
+      "",
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_rd","type":"function","function":{"name":"Read","arguments":"{\\"file_path\\":\\"notes.txt\\"}"}}]},"finish_reason":null}]}`,
+      "",
+      `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":9}}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [READ_SCHEMA] // no WebSearch in the request
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // The real buffered tool ships (buffered-flush on a "stop" ending)
+    expect(extractToolNames(events)).toContain("Read");
+
+    // The suppressed call's query reaches the client as injected text
+    const text = extractText(events);
+    expect(text).toContain("shapley 1967");
+
+    // Exact coverage — the hole IS the crash. Measured on origin/main with
+    // this exact wire: the suppressed call's reservation puts the text at
+    // index 1 and the tool at 2, i.e. starts [1,2] with a HOLE at index 0 —
+    // the Anthropic SDK dies on the gap. The fix reserves nothing for a
+    // suppressed call: starts [0,1], no hole.
+    const starts = events
+      .filter((e) => e.data?.type === "content_block_start")
+      .map((e) => e.data.index);
+    expect(starts).toEqual([0, 1]);
+  });
+});
+
+describe("Regression: three-way web-tool disposition (Hermes fix #2)", () => {
+  async function getParser() {
+    const mod = await import("./handlers/shared/openai-compat.js");
+    return mod.createStreamingResponseHandler;
+  }
+
+  async function getDefaultAdapter() {
+    const mod = await import("./adapters/base-api-format.js");
+    return new mod.DefaultAPIFormat("test-model");
+  }
+
+  function sseToResponse(content: string): Response {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(content));
+        controller.close();
+      },
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    });
+  }
+
+  // ─── Three-way web-tool disposition (Hermes fix #2, 16/10) ────────────────
+  // Lane 1: the client declared the tool under the EXACT name the model
+  // called → the call forwards like any declared tool (the client executes
+  // it itself, the loop continues). Lane 2: only `WebSearch` declared →
+  // remap (pinned by the tests above). Lane 3: nothing declared →
+  // suppress-and-inject (pinned by the tests above). Pre-fix, lane 1 fell
+  // into lane 3: Hermes' declared `web_search` tool was suppressed, results
+  // injected as text with end_turn — the run dumped raw search results
+  // instead of continuing its loop (measured 15/10, ai-01).
+
+  const WEB_SEARCH_SCHEMA = {
+    name: "web_search",
+    description: "Search the web",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+  };
+
+  test("three-way lane 1: web_search declared exactly → forwarded tool_use, stop_reason=tool_use, no injection", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_fwd","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"shapley 1967 balanced sets\\"}"}}]},"finish_reason":null}]}`,
+      "",
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":6}}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [WEB_SEARCH_SCHEMA] // the EXACT name is declared — lane 1
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // The client's own tool_use ships under its own name, arguments intact
+    expect(extractToolNames(events)).toContain("web_search");
+    const input = events
+      .filter(
+        (e) => e.data?.type === "content_block_delta" && e.data?.delta?.type === "input_json_delta"
+      )
+      .map((e) => e.data?.delta?.partial_json ?? "")
+      .join("");
+    expect(input).toContain("shapley 1967");
+
+    // No interception: nothing injected, and the loop continues
+    expect(extractText(events)).not.toContain("[Web search");
+    expect(extractStopReason(events)).toBe("tool_use");
+
+    // #498 CR: the forwarded call must own a real, contiguous index. The
+    // naive merge onto #485's main gave lane 1 the suppressed sentinel (-1)
+    // and the wire carried content_block_start at index -1 — the #484 class.
+    const startIndices = events
+      .filter((e) => e.data?.type === "content_block_start")
+      .map((e) => e.data?.index);
+    expect(startIndices).toEqual([0]);
+  });
+
+  test("three-way lane 2 twin: only WebSearch declared → remapped, not forwarded verbatim", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_rmp","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"bondareva 1963\\"}"}}]},"finish_reason":null}]}`,
+      "",
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":6}}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [
+        {
+          name: "WebSearch",
+          description: "Web search",
+          input_schema: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
+        },
+      ] // WebSearch only — NOT the exact name
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // Remap wins: the synthetic WebSearch tool_use ships, not a verbatim web_search
+    const names = extractToolNames(events);
+    expect(names).toContain("WebSearch");
+    expect(names).not.toContain("web_search");
+    expect(extractStopReason(events)).toBe("tool_use");
+  });
+
+  test("three-way lane 3 twin: nothing declared → suppressed, injected, end_turn", async () => {
+    const createStreamingResponseHandler = await getParser();
+    const adapter = await getDefaultAdapter();
+    const ctx = createMockContext();
+
+    const raw = [
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_ws_sup","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"core 1962\\"}"}}]},"finish_reason":null}]}`,
+      "",
+      `data: {"id":"c9","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":6}}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+
+    const response = createStreamingResponseHandler(
+      ctx,
+      sseToResponse(raw),
+      adapter,
+      "glm-5.3",
+      null,
+      undefined,
+      [
+        // a tool is declared, but no web tool — lane 3
+        {
+          name: "Read",
+          description: "Read a file",
+          input_schema: {
+            type: "object",
+            properties: { file_path: { type: "string" } },
+            required: ["file_path"],
+          },
+        },
+      ]
+    );
+
+    const events = await parseClaudeSseStream(response);
+
+    // Suppressed and injected (SearXNG unavailable here → the degradation
+    // notice carries the query), the turn ends — subagent semantics unchanged
+    expect(extractToolNames(events)).toHaveLength(0);
+    expect(extractText(events)).toContain("core 1962");
+    expect(extractStopReason(events)).toBe("end_turn");
+  });
+});

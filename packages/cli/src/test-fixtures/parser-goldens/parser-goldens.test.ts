@@ -78,7 +78,14 @@ describe("parser goldens: parser + response seam reproduce them", () => {
       if (golden.defect) {
         // The old wire framed the repaired delta and the stop wrongly; the seam
         // must send the same payloads, in order, each under its own event name.
-        expect(dataPayloads(replay)).toEqual(dataPayloads(golden.output));
+        // The synthetic terminal tail (#286, G4) is not what the turn SENT — it
+        // is the parser closing a body the old code left open — so the
+        // defect comparison stays on the payloads the seam produced.
+        const seamPayloads = (wire: string) =>
+          dataPayloads(wire).filter(
+            (p: any) => p?.type !== "message_delta" && p?.type !== "message_stop"
+          );
+        expect(seamPayloads(replay)).toEqual(seamPayloads(golden.output));
         expect(replay).not.toContain("event: content_block_stop\nevent: content_block_delta\n");
         expect(replay).toContain(
           'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}'
