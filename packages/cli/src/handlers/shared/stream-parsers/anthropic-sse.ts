@@ -27,6 +27,25 @@ interface AnthropicPassthroughOpts {
    * response seam, above every parser.
    */
   onToolCallObserved?: (name: string) => void;
+  /**
+   * When false, no response capture is written (default true). Used by the
+   * relay's nominal forward (#641 G2, fork extension): the hub captures
+   * centrally, so the sidecar must not double-capture. This branch has no
+   * capture stack yet (it lands with the traffic-analysis grain), so the
+   * flag is accepted and inert here — documented rather than dropped so the
+   * relay's call sites stay verbatim.
+   */
+  capture?: boolean;
+  /**
+   * Bounded retry of a refused/dead upstream (#170 pre-visible re-forward,
+   * #65 policy-refusal retry — fork extensions, declared here so the relay's
+   * call sites stay verbatim). INERT on this branch until the never-hang
+   * grain (#641 G4) wires the retry loop: the relay's own hysteresis still
+   * owns hub liveness in the meantime.
+   */
+  retryUpstream?: () => Promise<Response | null>;
+  /** Feeds the [ttft] marker (fork traffic analysis). Inert until that grain lands. */
+  headerLatencyMs?: number;
 }
 
 /**

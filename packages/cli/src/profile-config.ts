@@ -139,6 +139,21 @@ export interface ClaudishProfileConfig {
   /** Custom provider endpoints (env var name → URL) */
   endpoints?: Record<string, string>;
   /**
+   * Relay cluster key (#641 G2, fork extension): clients must send
+   * `x-proxy-key` matching this value; a sidecar injects it on its forward so
+   * the hub's auth accepts it (env CLAUDISH_PROXY_KEY takes precedence).
+   */
+  proxyKey?: string;
+  /**
+   * Scoped inbound keys (#400, fork extension): authenticate like `proxyKey`
+   * but reach ONLY the models their `allowModels` names — subscriptions stay
+   * fleet-internal, external consumers get their own revocable key. Keyed by
+   * entry NAME (what markers and captures log — never the value); `key` may
+   * be a `${VAR}` reference into `apiKeys` or env. Entries failing validation
+   * are skipped with one stderr warning. See handlers/shared/inbound-keys.ts.
+   */
+  inboundKeys?: Record<string, { key: string; allowModels: string[] }>;
+  /**
    * 1Password imports. Each entry is a glob (`op://.../*` or
    * `op://.../<section>/<fieldGlob>`) that expands to MANY env vars named by
    * field label, OR a single `op://vault/item/[section]/field` reference named
@@ -391,6 +406,17 @@ export function loadConfig(): ClaudishProfileConfig {
     }
     if (config.endpoints !== undefined) {
       merged.endpoints = config.endpoints;
+    }
+    // #641 G2 (fork extension): the relay cluster key and the scoped inbound
+    // keys (#400) live in config.json. A field present in the interface but
+    // dropped HERE ships dead — the fork's #402: the resolver was wired, the
+    // loader dropped the field, every deployed proxy resolved zero inbound
+    // keys, silently (unit tests built configs directly, bypassing the loader).
+    if (config.proxyKey !== undefined) {
+      merged.proxyKey = config.proxyKey;
+    }
+    if (config.inboundKeys !== undefined) {
+      merged.inboundKeys = config.inboundKeys;
     }
     if (config.onepassword !== undefined) {
       merged.onepassword = config.onepassword;

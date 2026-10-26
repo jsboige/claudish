@@ -231,6 +231,12 @@ export interface ProxyServer {
    */
   modelRequestCount: () => number;
   /**
+   * Streams still writing a response, from the same registry /health
+   * publishes (#641 G2, fork extension). What a drain script polls to pick
+   * its moment, and what shutdown waits on before closing the port.
+   */
+  getActiveStreams: () => number;
+  /**
    * The in-process advisor panel gateway, present only when the launch handed
    * the proxy an advisor runtime (`ProxyServerOptions.advisorRuntime`). The
    * advisor decorator calls routed panel members through it; tests drive it
