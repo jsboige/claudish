@@ -94,6 +94,21 @@ describe("session budget ceiling (#317 option B)", () => {
     expect(sessionBudgetConsumed(MACHINE, SID_SWARM)).toBe(1100);
   });
 
+  it("pin 4b (boundary): the ceiling is INCLUSIVE — consumed == ceiling refuses, one under serves", () => {
+    // The design says "at the bar the request is answered locally". Both
+    // neighbours are pinned so the comparison cannot drift: before this pin,
+    // `>=` → `>` survived the entire suite (independent mutant run, 2026-10-26,
+    // #641 review grain) because every existing pin crossed the bar strictly.
+    paidAttempt(MACHINE, SID_SWARM, 999, ENV_CEILING);
+    clockMs += ATTEMPT_SETTLE_MS + 1;
+    expect(admitSessionBudget(MACHINE, SID_SWARM, ENV_CEILING)!.refused).toBe(false);
+
+    paidAttempt(MACHINE, SID_SWARM, 1, ENV_CEILING); // 999 + 1 == 1000, the bar itself
+    clockMs += ATTEMPT_SETTLE_MS + 1;
+    expect(sessionBudgetConsumed(MACHINE, SID_SWARM)).toBe(1000);
+    expect(admitSessionBudget(MACHINE, SID_SWARM, ENV_CEILING)!.refused).toBe(true);
+  });
+
   it("pin 1: the refusal body NEVER arms isQuotaExhaustion (real predicate)", async () => {
     paidAttempt(MACHINE, SID_SWARM, 2000, ENV_CEILING);
     clockMs += ATTEMPT_SETTLE_MS + 1;
