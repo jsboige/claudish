@@ -34,6 +34,24 @@ const readPinnedBunVersion = (): string | undefined => {
       if (line.search(/\S/) === stepIndent && /^\s*-\s+/.test(line)) break;
       const pin = line.match(/^\s*bun-version:\s*"(\d+\.\d+\.\d+)"\s*$/);
       if (pin) return pin[1];
+      // #657 moved the pin to the file form (`bun-version-file: .bun-version`)
+      // — the inline match above stopped firing, the heuristic fail-opened,
+      // and the width-oracle budgets ran under the LOCAL bun: green in CI
+      // (setup-bun installs the pinned file), red on every 1.4.x seat
+      // (3017 > 1081, the documented 1.4.x figure). Read the file too.
+      const pinFile = line.match(/^\s*bun-version-file:\s*(\S+)\s*$/);
+      if (pinFile) {
+        try {
+          const fromFile = readFileSync(
+            new URL(`../../../../../${pinFile[1]}`, import.meta.url),
+            "utf8"
+          ).trim();
+          const version = fromFile.match(/^(\d+\.\d+\.\d+)$/);
+          if (version) return version[1];
+        } catch {
+          // Unreadable pin file: fail open, same as an unavailable workflow.
+        }
+      }
     }
   } catch {
     // Fail open: an unavailable workflow must not silently disable coverage.
