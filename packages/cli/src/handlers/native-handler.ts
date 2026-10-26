@@ -1,5 +1,6 @@
 import type { Context } from "hono";
 import { credentials } from "../auth/credentials/authority.js";
+import { recordSessionBudgetOutput } from "../fork/session-budget.js";
 import { requestHooksOf } from "../hooks/request-stage.js";
 import { log, maskCredential } from "../logger.js";
 import { redactForClient } from "../redact.js";
@@ -263,6 +264,15 @@ export class NativeHandler implements ModelHandler {
                     const lines: string[] = [];
                     let out = "";
                     for (const line of text.slice(0, cut).split("\n")) {
+                      // #317: the terminal message_delta carries the upstream
+                      // usage — feed the per-session budget counter. The sink
+                      // takes the max per attempt, so this is idempotent and
+                      // tolerant of an earlier partial usage line.
+                      if (line.includes('"output_tokens"')) {
+                        for (const m of line.matchAll(/"output_tokens"\s*:\s*(\d+)/g)) {
+                          recordSessionBudgetOutput(c.req.raw, Number(m[1]));
+                        }
+                      }
                       held.push(line);
                       if (line === "" || line === "\r") {
                         const event = redactSseErrorEvent(held);
@@ -315,6 +325,11 @@ export class NativeHandler implements ModelHandler {
       // a success body is parsed exactly as it arrived.
       const raw = await anthropicResponse.text();
       const data = JSON.parse(anthropicResponse.ok ? raw : redactForClient(raw));
+      // #317: non-streaming native usage feeds the session budget too.
+      {
+        const n = Number((data as any)?.usage?.output_tokens);
+        if (Number.isFinite(n) && n > 0) recordSessionBudgetOutput(c.req.raw, n);
+      }
       log("\n=== [NATIVE] Response ===");
       log(JSON.stringify(data, null, 2));
 
