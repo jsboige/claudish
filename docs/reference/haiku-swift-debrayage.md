@@ -40,17 +40,23 @@ Supply (swift = vllm-myia on ai-01, WAN front `api.medium.text-generation-webui.
 | Latency, warm | ttft 1.4–9.5 s, responses 4–15 s | same |
 | Latency under 7+ concurrent streams | **90–390 s per response** | same |
 | Silence events | 6 min total (01:47→02:38Z 27/10, engine restart window); 502 burst 01:53–01:56Z | upstream-errors.log |
-| Connect failures | **ECONNRESET wedge active at 04:10Z 27/10** — hub canaries 7/7 fail at ~21 s; fleet attempts ~16 marked non-quota in 30 min | DM `po2025-swift-econnreset-wedge-20261027T0412Z` |
+| Connect failures | ECONNRESET wedge 01:47→~05:20Z 27/10 (hairpin NAT flap, self-resolved); **zero** connect failures in the post-05:20Z window | DM `po2025-swift-econnreset-wedge-20261027T0412Z`, hub `[ttft]` scan |
+| Overflow advances (400 >262,144) | **83 STEP-ADVANCE events on 27/10** (06:0x→09:14Z, one every 1–3 min at peak), each pairing a non-quota mark on step 0 | `failover-events.log` 27/10 |
 | Corroboration, independent path | RSM condensation LLM via the same front: 3/3 connection errors at 04:14Z | dashboard append log |
 | Contention | external consumers (Jamin, Candy — persons, inbound keys) share the same engine; their traffic takes the same resets | inbound-key attribution 26/10 |
 
-Failure accounting (hub side, measured 27/10): a swift connect failure gets one retry (+250 ms, #80-2), then surfaces as a **non-quota mark on step 0** (`!own`, 30 s) with the session's dwell forfeited; the request advances to `role:sonnet` → glm (subscription). No PAYG leak measured (the deepseek responses visible in the window belong to a known external OpenAI/JS client). Net effect of a swift outage: armed machines' haiku rides the sonnet lane — a quota displacement, not a money bleed.
+Failure accounting (hub side, corrected 2026-10-27 ~09:30Z: this paragraph's 04:20Z draft said "no PAYG leak"; measured the same day, that holds **only while the sonnet lane keeps a healthy prepaid step**): a swift failure — connect error or the far more frequent **HTTP 400 context overflow** (83 advances on 27/10, the dominant shape) — gets one retry only on the connect branch (#80-2), then surfaces as a **non-quota mark on step 0** (`!own`, 30 s) with the session's dwell forfeited, and the request advances to `role:sonnet`. What that advance **costs** is decided by the sonnet lane's state, not by swift:
+
+- **sonnet lane healthy (GLM nominal)** — the advance rides the subscription. Quota displacement, the original wording, correct in this state.
+- **sonnet lane walled** — the advance lands on the cascade's last step. Measured 27/10: the Qwen step is closed by a #261 record-plane closure until 2026-11-11T16:00Z, and GLM re-walled (402) at 06:14Z, so from **06:14Z to 08:35:58Z** (GLM `RECOVERED → nominal`) every haiku advance billed PAYG. That window's fleet PAYG total: **8 706 resp / 8.73 M OUT / 28.9 M IN** over the day, of which h06–h08 (the cliff) is 4 819 resp — the bulk is the sonnet role's own overflow (the whole role was on PAYG), with haiku's share bounded by its 83 advances (≈1 % of PAYG responses, each carrying a ~170–190k-token prompt).
+
+Standing consequence while the Qwen closure holds (until 11/11): **any GLM wall sends the entire sonnet role — including haiku's overflow tail — straight to PAYG.** GLM walls daily; the exposure is structural, not exceptional (this is the Q-po2025-30 march, already arbitrated-open at user level). A widening step that adds haiku volume to step 0 adds overflow tail to exactly this exposure; Gate C's sizing must quote PAYG landings per wall-hour as a first-class number.
 
 ## 3. Design — three gates, then one ladder
 
-### Gate R — engine reliability (precondition; **currently FAILED**)
+### Gate R — engine reliability (precondition; **running green since 05:20Z 27/10** — closes 28/10 05:20Z if it holds)
 
-Rolling 24 h, measured hub-side (cheap, per cycle):
+Rolling 24 h, measured hub-side (cheap, per cycle). Window since 05:20Z 27/10 (post-wedge): **0 connect failures** (n=125 `[ttft]`), **ttft p95 8 933 ms** (< 10 s, p50 1 816 ms), **0 `UNEXPLAINED ENDING`** (the 4 logged UNEXPLAINED all sit inside the 03:40–04:08Z wedge window and do not count).
 
 - ECONNRESET / connect-failure rate on swift attempts < 2 % (instrument: three tiny canaries per cycle through the explicit `vllm-myia@swift-1.5-27b` route + the `[Failover] step haiku[0] … HTTP 400` rate from `failover-events.log`);
 - ttft p95 < 10 s at the then-current load;
@@ -82,4 +88,4 @@ What this design deliberately does **not** change: no config-arm at a quota wall
 
 ## 5. Provenance
 
-Mandate thread: user evening 26/10 (swift proposition → Q-po2025-31), ai-01 coordination 00:12Z 27/10 (option b), user night 27/10 ~04:45Z (mandate restated). Measurements: `minimax-plan-watch.log` lines 39–45, census files `.tmp/cons-evening.json` / `cons-1530.json` (2026-10-26), swift capture scans 26–27/10, DM `po2025-swift-econnreset-wedge-20261027T0412Z`. Engine incidents: 20/10 16:17Z wedge (deploy-2 incident, repli lesson), 27/10 01:47Z restart window + wedge. Related: `docs/reference/budget-failover.md` (#431, #693), `docs/reference/model-routing.md` (context limits), issue #700 (sobriety program — the demand side of this ledger).
+Mandate thread: user evening 26/10 (swift proposition → Q-po2025-31), ai-01 coordination 00:12Z 27/10 (option b), user night 27/10 ~04:45Z (mandate restated). Measurements: `minimax-plan-watch.log` lines 39–45, census files `.tmp/cons-evening.json` / `cons-1530.json` (2026-10-26), swift capture scans 26–27/10, DM `po2025-swift-econnreset-wedge-20261027T0412Z`. Engine incidents: 20/10 16:17Z wedge (deploy-2 incident, repli lesson), 27/10 01:47Z restart window + wedge. 27/10 ~09:30Z correction pass: `failover-events.log` 27/10 (83 STEP-ADVANCE, GLM wall 06:14Z → `RECOVERED` 08:35:58Z, Qwen closure until 11/11), PAYG tail-sum over 27/10 captures (8 706 resp / 8.73 M OUT / 28.9 M IN), sonnet demand p50 **159.2k** tok (n=2 436, 1 h window 27/10 07:00Z+, `prompt-size-dist.py` @ PR #708) — July sonnet p50 was 43.8k, so the 120–190k session shape is now the sonnet lane's too, not only haiku's. Related: `docs/reference/budget-failover.md` (#431, #693), `docs/reference/model-routing.md` (context limits), issue #700 (sobriety program — the demand side of this ledger).
