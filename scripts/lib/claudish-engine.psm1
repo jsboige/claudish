@@ -147,6 +147,105 @@ function Resolve-ClaudishProbeUrl {
     return ('{0}://{1}:{2}' -f $u.Scheme, $u.Host, $Port)
 }
 
+function Get-ClaudishProbeCandidates {
+    <#
+        Ordered, de-duplicated probe addresses for ONE container's port.
+
+        WHY A LIST AND NOT ONE ADDRESS. A published port has more than one door
+        on the host, and the doors do not fail together. Measured on
+        myia-po-2023, 2026-10-27: `wslrelay` (pid 10488, born 06:13 local) owned
+        BOTH loopback families — 127.0.0.1:3000 and [::1]:3000 — and answered
+        with a reset, while `com.docker.backend` (pid 28188, born 10:51) served
+        the wildcard 0.0.0.0/:: :3000, where the healthy container answered
+        /health 200 in one call. The watchdog probed `localhost` alone, read
+        "no answer" as "the container hung", and restarted a healthy container
+        without drain at 14:10:03 — then re-armed the same false hang 18 min
+        later. One address cannot tell "the proxy is down" from "this door is
+        shadowed".
+
+        ORDER IS CONSERVATIVE — the first candidate is what every machine
+        probes today: the base-url.txt override when present, then `localhost`.
+        The LAN address is appended LAST, so a machine whose loopback answers
+        keeps byte-identical behaviour and never pays the extra probe.
+
+        `localhost` stays one candidate rather than becoming explicit
+        [::1]/127.0.0.1 pairs: this list feeds the streaming probe the watchdog
+        has always run there, and Get-LoopbackProbeUrl already owns the
+        explicit-family diagnosis of the loopback pair (see its own header).
+
+        Pure apart from the host enumeration, which is injectable so the order
+        and the de-duplication are pinnable without a network.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClaudishHome,
+        [Parameter(Mandatory)][int]$Port,
+        [scriptblock]$HostEnumerator = $null
+    )
+
+    if (-not $HostEnumerator) {
+        # The host's own LAN IPv4 — the address its published port answers on.
+        # Default-gateway interfaces only, so a docker/WSL virtual adapter or an
+        # APIPA placeholder never becomes a probe target. Anything unreadable
+        # yields no extra candidate, never a failure.
+        $HostEnumerator = {
+            try {
+                @(Get-NetIPConfiguration -ErrorAction Stop |
+                    Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
+                    ForEach-Object { $_.IPv4Address.IPAddress } |
+                    Where-Object { $_ -and $_ -ne '127.0.0.1' -and $_ -notlike '169.254.*' })
+            } catch { @() }
+        }
+    }
+
+    $hosts = New-Object System.Collections.Generic.List[string]
+    $base = Get-ClaudishServingBase -ClaudishHome $ClaudishHome
+    if ($base) { $hosts.Add(([uri]$base).Host) }
+    $hosts.Add('localhost')
+    try { foreach ($h in @(& $HostEnumerator)) { if ($h) { $hosts.Add([string]$h) } } } catch { }
+
+    $seen = @{}
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($h in $hosts) {
+        if ($seen.ContainsKey($h)) { continue }
+        $seen[$h] = $true
+        $out.Add(('http://{0}:{1}' -f $h, $Port))
+    }
+    return $out.ToArray()
+}
+
+function Select-ClaudishProbeUrl {
+    <#
+        First candidate that ANSWERS /health with a 200; the first candidate
+        when none does.
+
+        Falling back to the first candidate, never to $null, matters: the caller
+        still needs an address to blame in its log line, and $null would turn
+        "nothing answers" into "no probe was configured". Selection runs once
+        per cycle, before the 90-second streaming probe, so the added cost is
+        one bounded request per candidate.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Candidates,
+        [int]$TimeoutSec = 5,
+        [scriptblock]$Probe = $null
+    )
+
+    if (-not $Candidates -or $Candidates.Count -eq 0) { return $null }
+
+    if (-not $Probe) {
+        $Probe = {
+            param($u, $t)
+            try { return ((Invoke-WebRequest -Uri "$u/health" -TimeoutSec $t -UseBasicParsing).StatusCode -eq 200) }
+            catch { return $false }
+        }
+    }
+
+    foreach ($c in $Candidates) {
+        try { if (& $Probe $c $TimeoutSec) { return $c } } catch { }
+    }
+    return $Candidates[0]
+}
+
 function Get-LoopbackProbeUrl {
     <#
         The loopback probe MUST name [::1] explicitly. It can never be
@@ -2825,6 +2924,8 @@ Export-ModuleMember -Function @(
     'Test-DockerLogsSinceCoherence'
     'Get-ClaudishServingBase'
     'Resolve-ClaudishProbeUrl'
+    'Get-ClaudishProbeCandidates'
+    'Select-ClaudishProbeUrl'
     'Get-LoopbackProbeUrl'
     'Test-LoopbackListener'
     'Test-HttpAlive'

@@ -56,7 +56,15 @@ $ProxyPort = 3000
 #
 # Resolution is per-machine and opt-in through <ClaudishHome>\base-url.txt. No
 # file = localhost = byte-identical behaviour to before, on every other machine.
-$ProxyUrl = Resolve-ClaudishProbeUrl -ClaudishHome $ClaudishHome -Port $ProxyPort
+#
+# The 27/10 mirror image of that incident, also on po-2023: `wslrelay` owned BOTH
+# loopback families and answered with a reset, while the container served the
+# wildcard (LAN) fine. Probing the dead door alone restarted the healthy
+# container every ~30 min. So the cycle probes the FIRST door that answers, and
+# says so when that is not the first candidate — a shadowed door is not a hung
+# container. Cost where nothing is wrong: one bounded /health request.
+$ProxyCandidates = Get-ClaudishProbeCandidates -ClaudishHome $ClaudishHome -Port $ProxyPort
+$ProxyUrl = Select-ClaudishProbeUrl -Candidates $ProxyCandidates -TimeoutSec 5
 $ContainerName = "claudish-proxy"
 $StreamTimeoutSec = 90
 # Every docker CLI call is bounded by this. Unbounded was the real failure on
@@ -927,6 +935,9 @@ function Reset-EngineFatalStreak {
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 Write-Log "=== Watchdog check ==="
+if ($ProxyCandidates.Count -gt 1 -and $ProxyUrl -ne $ProxyCandidates[0]) {
+    Write-Log "PROBE-SHADOW: $($ProxyCandidates[0]) did not answer /health — probing $ProxyUrl instead (same published port; a shadowed door is not a hung container)"
+}
 
 # Name the artifact that is actually executing, once per cycle.
 #
