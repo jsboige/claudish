@@ -179,6 +179,72 @@ Describe 'Resolve-ClaudishProbeUrl' {
     }
 }
 
+Describe 'Get-ClaudishProbeCandidates' {
+    It 'REGRESSION (27/10): keeps localhost FIRST and appends the LAN address as a fallback' {
+        # The order is the whole safety argument: a machine whose loopback
+        # answers keeps probing exactly what it probed before. Measured on
+        # myia-po-2023, where wslrelay held BOTH loopback families and reset
+        # them while the container served the wildcard (LAN) — the watchdog
+        # read that as a hang and restarted a healthy container every ~30 min.
+        $c = Get-ClaudishProbeCandidates -ClaudishHome $TestDrive -Port 3000 -HostEnumerator { param() @('192.168.0.46') }
+        $c | Should -Be @('http://localhost:3000', 'http://192.168.0.46:3000')
+    }
+
+    It 'puts a base-url.txt override first and still takes the PORT from the caller (#110)' {
+        Set-Content -Path (Join-Path $TestDrive 'base-url.txt') -Value 'http://192.168.0.50:3000'
+        $c = Get-ClaudishProbeCandidates -ClaudishHome $TestDrive -Port 3002 -HostEnumerator { param() @('192.168.0.46') }
+        $c | Should -Be @('http://192.168.0.50:3002', 'http://localhost:3002', 'http://192.168.0.46:3002')
+    }
+
+    It 'de-duplicates an enumerator that names a candidate already listed' {
+        Set-Content -Path (Join-Path $TestDrive 'base-url.txt') -Value 'http://192.168.0.46:3000'
+        $c = Get-ClaudishProbeCandidates -ClaudishHome $TestDrive -Port 3000 -HostEnumerator { param() @('192.168.0.46') }
+        $c | Should -Be @('http://192.168.0.46:3000', 'http://localhost:3000')
+    }
+
+    It 'yields localhost alone when the host cannot be enumerated (the fleet default)' {
+        # $TestDrive is NOT cleared between Its of the same Describe — an earlier
+        # test here writes base-url.txt, so isolation has to be explicit. And the
+        # variable cannot be called $home: PowerShell's $HOME is read-only, and an
+        # assignment to it throws SessionStateUnauthorizedAccessException.
+        $probeHome = Join-Path $TestDrive 'no-host'
+        $null = New-Item -ItemType Directory -Path $probeHome -Force
+        $c = Get-ClaudishProbeCandidates -ClaudishHome $probeHome -Port 3000 -HostEnumerator { param() @() }
+        $c | Should -Be @('http://localhost:3000')
+    }
+
+    It 'never fails when the enumerator throws' {
+        $probeHome = Join-Path $TestDrive 'throwing-host'
+        $null = New-Item -ItemType Directory -Path $probeHome -Force
+        $c = Get-ClaudishProbeCandidates -ClaudishHome $probeHome -Port 3000 -HostEnumerator { param() throw 'boom' }
+        $c | Should -Be @('http://localhost:3000')
+    }
+}
+
+Describe 'Select-ClaudishProbeUrl' {
+    It 'picks the first candidate that answers /health with 200' {
+        $url = Select-ClaudishProbeUrl -Candidates @('http://localhost:3000', 'http://192.168.0.46:3000') `
+            -Probe { param($u, $t) $u -eq 'http://192.168.0.46:3000' }
+        $url | Should -Be 'http://192.168.0.46:3000'
+    }
+
+    It 'keeps the first candidate when nothing answers, so the caller can still name it' {
+        $url = Select-ClaudishProbeUrl -Candidates @('http://localhost:3000', 'http://192.168.0.46:3000') `
+            -Probe { param($u, $t) $false }
+        $url | Should -Be 'http://localhost:3000'
+    }
+
+    It 'never fails when the probe throws on one candidate' {
+        $url = Select-ClaudishProbeUrl -Candidates @('http://localhost:3000', 'http://192.168.0.46:3000') `
+            -Probe { param($u, $t) if ($u -eq 'http://localhost:3000') { throw 'boom' } else { $true } }
+        $url | Should -Be 'http://192.168.0.46:3000'
+    }
+
+    It 'returns $null for an empty candidate list rather than inventing an address' {
+        Select-ClaudishProbeUrl -Candidates @() -Probe { param($u, $t) $true } | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Get-LoopbackProbeUrl' {
     It 'REGRESSION: names [::1] explicitly and never localhost' {
         # A localhost probe from pwsh 7 falls back IPv6 -> IPv4 fast enough to
