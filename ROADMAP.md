@@ -154,7 +154,7 @@ The 25/10 arbitration ("ai-01 = MiniMax, never swift") is machine-level, but the
 
 ## Capture pipeline port to v14 (#641 blocker 2)
 
-Status: spec delivered, not started. Coordinator-owned scheduling.
+Status: executed 27/10 — PR #722 (port: 3 verbatim files + 10 wired, 8 invariants mutation-tested) and PR #723 (the 17 mechanical lint errors) sit on `replatform/v14` awaiting coordinator review. Remaining for acceptance: the consumer read-back of a live v14 capture corpus (needs a v14 build with `CLAUDISH_CAPTURE_DIR`), and the spec doc deletion on main at merge time. The `test:strict` baseline learn for v14 is blocked: the strict runner itself is among the manifest-absent files.
 
 The go/no-go evaluation for `replatform/v14` → `main` (#641) lists the absent capture pipeline as hard blocker 2: v14 carries zero capture writers, so the traffic-measurement apparatus (`claudish_traffic`, `traffic-*.ps1`, attribution #98/#400/#566/#662, leak-policy greps, `turn-autopsy.py`) dies at landing. The port is narrow — v14 already has the parsers, `instance-id.ts`, `inbound-keys.ts` and `HOPS_HEADER`; it moves 3 files and wires 9 call sites, with producer-side format pins traveling along.
 
