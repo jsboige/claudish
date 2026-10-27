@@ -152,6 +152,23 @@ The 25/10 arbitration ("ai-01 = MiniMax, never swift") is machine-level, but the
 
 ---
 
+## Capture pipeline port to v14 (#641 blocker 2)
+
+Status: spec delivered, not started. Coordinator-owned scheduling.
+
+The go/no-go evaluation for `replatform/v14` → `main` (#641) lists the absent capture pipeline as hard blocker 2: v14 carries zero capture writers, so the traffic-measurement apparatus (`claudish_traffic`, `traffic-*.ps1`, attribution #98/#400/#566/#662, leak-policy greps, `turn-autopsy.py`) dies at landing. The port is narrow — v14 already has the parsers, `instance-id.ts`, `inbound-keys.ts` and `HOPS_HEADER`; it moves 3 files and wires 9 call sites, with producer-side format pins traveling along.
+
+**Trigger conditions** (both must hold):
+
+- Direction (B) — finishing the re-stack INTO v14 — is confirmed as the landing strategy (the NO-GO verdict on direct landing is accepted; re-stacking direction recommended, not yet user-arbitrated).
+- The coordinator schedules the blocker (it gates every GO re-evaluation of #641 alongside channel mode and context admission).
+
+**Effort**: small-to-medium — 3 file copies, 9 anchored wires, test carry-over; the real risk is silent invariant drift (reqN freeze at ingestion, hops seating, pre-strip capture), covered by the acceptance run in the spec.
+
+**Reference**: `docs/reference/capture-pipeline-port-v14.md`; go/no-go evaluation on #641 (comment 6434476328).
+
+---
+
 ## Adding a new roadmap item
 
 Each item should follow the structure above:
