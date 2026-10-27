@@ -31,6 +31,28 @@ const SECRET_KEY = "sk-blackbox-SECRET-VALUE-9f3c1d";
 process.env.API_TIMEOUT_MS = apiTimeoutMs ?? "40000";
 delete process.env.CLAUDISH_RECOVERY;
 
+// The capture-pipeline port (PR #722) wires the traffic markers into the v14
+// proxy. The whole [Request] block is UNGATED stdout on a server deployment —
+// `[claudish] [Request] …` + the `  [system] ` / `  [msg:N] ` excerpts
+// (request-logger), `  [ttft] ` (parsers), `  [resp] ` (response-capture) —
+// the channel `docker logs` exposes and every traffic-*.ps1 reader consumes.
+// THIS child is not a deployment: per the header contract above, its stdout is
+// the protocol stream and carries exactly one JSON line. Rather than forking
+// the marker channel (which would fork the pinned consumer contract the port
+// exists to preserve), the child filters EXACTLY the pinned marker prefixes.
+// The whitelist is deliberately narrow: any OTHER stdout byte — a stray
+// [Recovery] line, a banner, a future ungated marker — still fails CP-10.
+const TRAFFIC_MARKER_RE = /^(\[claudish\] \[Request\] |  \[(ttft|resp)\] |  \[(system|msg:\d+)\] )/;
+type WriteChunk = Parameters<typeof process.stdout.write>[0];
+const rawStdoutWrite = process.stdout.write.bind(process.stdout) as (
+  chunk: WriteChunk,
+  ...rest: unknown[]
+) => boolean;
+process.stdout.write = ((chunk: WriteChunk, ...rest: unknown[]): boolean => {
+  const text = typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString("utf8");
+  return TRAFFIC_MARKER_RE.test(text) || rawStdoutWrite(chunk, ...rest);
+}) as typeof process.stdout.write;
+
 const dir = mkdtempSync(join(tmpdir(), "recovery-child-"));
 const configPath = join(dir, "config.json");
 writeFileSync(
