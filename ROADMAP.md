@@ -152,6 +152,27 @@ The 25/10 arbitration ("ai-01 = MiniMax, never swift") is machine-level, but the
 
 ---
 
+## Relay verdict — continuous refutation evidence (WAN false positives)
+
+Status: not started. The **bounded** mitigation shipped — `CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS` (#714/#715, range 2000-9000 ms) and its documentation (`docs/deployment/relay-sidecar-deployment.md`, `docs/reference/relay-internals.md`) — and was deployed on the first WAN-upstream seat on 2026-10-27. This item is the structural fix the same incident exposed, deliberately not folded into that PR.
+
+The asymmetry, read from the code: `proberTick` (`relay.ts:1105`) does exactly one thing while NOMINAL — a `/health` GET — and acts on its result; `deepProbe`, the only instrument that could refute the verdict, runs **solely** in the AUTONOMOUS branch, behind 3 OK heartbeats and the 60 s cooldown. So the state that decides whether traffic reaches the hub is held by the cheapest instrument available, a false positive is cheap to enter and expensive to leave, and once flipped nothing upstream is sent — no client request can refute it. Measured 2026-10-27 on po-2027: 20 AUTONOMOUS windows, 380 requests served locally (121 answered, 259 refused by the provider wall), while the deep probe answered `message_stop` in 1.0-1.4 s every time it was finally consulted. Raising the bound shrinks the false-positive rate; it does not give the harness an instrument that can say *"the hub would have served that"*.
+
+Candidate designs (unarbitrated, listed so the arbitration has something concrete to reject):
+
+- **Low-rate real probe while NOMINAL** — a bounded tool-call stream at a period long enough to cost nothing measurable, so a false positive is contradicted before the second heartbeat failure lands.
+- **A "would-have-worked" counter** — on the first request served after a flip, replay the forward once **without diverting the client** and record the outcome; the metric is *flips contradicted within one turn*, which today does not exist at all.
+
+**Trigger conditions** (both must hold):
+
+- Either a second WAN-upstream sidecar is onboarded, **or** a flap is measured on a seat already running the `9000` bound — a false positive that survives the raised bound means the bound is the wrong *instrument*, not merely undersized.
+- The coordinator accepts one of the designs above. A liveness probe spends provider budget on every tick it runs; that cost, not the code, is why this is parked rather than done.
+
+**Effort**: small-to-medium — one probe path (or one replay seam) + counters + a hysteresis regression pin.
+
+**Reference**: `docs/reference/relay-internals.md` §heartbeat knob and §"where the liveness harness stops seeing"; issue #711, PRs #714/#715; the 27/10 measurement in `docs/deployment/relay-sidecar-deployment.md`.
+
+---
 ## Capture pipeline port to v14 (#641 blocker 2)
 
 Status: executed 27/10 — PR #722 (port: 3 verbatim files + 10 wired, 8 invariants mutation-tested) and PR #723 (the 17 mechanical lint errors) sit on `replatform/v14` awaiting coordinator review. Remaining for acceptance: the consumer read-back of a live v14 capture corpus (needs a v14 build with `CLAUDISH_CAPTURE_DIR`), and the spec doc deletion on main at merge time. The `test:strict` baseline learn for v14 is blocked: the strict runner itself is among the manifest-absent files.
