@@ -133,6 +133,22 @@ The mechanics are already live (cascade step 0 = `vllm-myia@swift-1.5-27b!own`, 
 **Effort**: small config + one drained recreate; the cost is the measurement discipline, not the change.
 
 **Reference**: `docs/reference/haiku-swift-debrayage.md`; mandate + measurements provenance therein.
+---
+
+## Workload routing — agent-sdk vs interactive, refining the 25/10 machine-level arbitration
+
+Status: design proposition, not arbitrated. No code.
+
+The 25/10 arbitration ("ai-01 = MiniMax, never swift") is machine-level, but the census says the MiniMax burn driver is a workload (52 % `agent-sdk` planned work), not the machine. The hub already sees the workload marker in the request body (`cc_entrypoint=` / `cc_workload=`, the same fields `scripts/traffic-consumption.py` buckets the census by) — so the route can divert *planned* haiku to swift while *interactive* ai-01 stays MiniMax, and the #693 `STEP_EXCLUDE` narrows from machine-wide to workload-scoped so the two rules share one vocabulary. Full design (signal verification, seam choice, composability, pins): `docs/reference/workload-routing.md`.
+
+**Trigger conditions** (both must hold):
+
+- The user refines the 25/10 arbitration to workload level (routing changes get specified, arbitrated, then built — same precedent as #82).
+- The haiku→swift unlock's reliability door passes (PR #704 porte R — engine ECONNRESET/hairpin fixed and capacity measured); this item is the mechanism inside that design's W door and does not bypass it.
+
+**Effort**: small-medium — one per-request substitution at the `resolveNativeModelPin` seam + `STEP_EXCLUDE` predicate extension + three-request pin.
+
+**Reference**: `docs/reference/workload-routing.md`; dispatch context in issue #641 QUEUE v6 (ai-01, 27/10); census ground in the MiniMax consumption investigation (ai-01, 26/10).
 
 ---
 
