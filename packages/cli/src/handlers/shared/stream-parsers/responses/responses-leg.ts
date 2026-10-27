@@ -127,6 +127,11 @@ export interface ResponsesLegContext {
   codeMode?: boolean;
   /** The clock of the EXEC_DRAIN_MS drain; tests inject a fake one. Default wall clock. */
   drainClock?: StallClock;
+  /**
+   * Fires once, on the first upstream `data:` line this leg sees (capture
+   * pipeline, #641 blocker-2 port — completes the [ttft] measurement).
+   */
+  onFirstUpstreamData?: () => void;
 }
 
 /** A held exec call (code mode). */
@@ -216,6 +221,9 @@ class ResponsesLeg {
   private cancelReader: (() => void) | undefined;
 
   constructor(private readonly ctx: ResponsesLegContext) {}
+
+  /** First upstream `data:` line seen (capture pipeline [ttft] signal). */
+  private sawUpstreamData = false;
 
   /** The exec outcome for a held exec whose input is whole. */
   private execOutcome(truncated: boolean): LegOutcome {
@@ -349,6 +357,13 @@ class ResponsesLeg {
         for (const line of lines) {
           const data = sseDataPayload(line);
           if (data === null || data === "[DONE]") continue;
+          // Capture pipeline (#641 blocker-2 port) — first-upstream-event
+          // signal, once per stream: completes the [ttft] measurement the
+          // entry module started when the handler was built.
+          if (!this.sawUpstreamData) {
+            this.sawUpstreamData = true;
+            this.ctx.onFirstUpstreamData?.();
+          }
           // Raw capture, greppable into test data — same contract as
           // [SSE:openai] / [SSE:anthropic] in the sibling parsers.
           if (getLogLevel() === "debug") {

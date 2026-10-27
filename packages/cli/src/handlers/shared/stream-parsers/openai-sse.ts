@@ -11,6 +11,11 @@ import type { Context } from "hono";
 import type { RawStreamTap } from "../../../hooks/raw.js";
 import { log } from "../../../logger.js";
 import { redactForClient } from "../../../redact.js";
+// Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [ttft]/[resp]
+// stdout markers, correlated by the request number frozen at ingestion.
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
+import { createResponseCapture } from "../response-capture.js";
+import { ttftMarkerLine } from "../traffic-markers.js";
 import {
   type ToolSchema,
   extractToolCallsFromText,
@@ -312,7 +317,14 @@ export function createStreamingResponseHandler(
    */
   observers?: {
     onToolCallObserved?: (name: string) => void;
-  }
+  },
+  /**
+   * Dispatch → upstream-response-headers latency, threaded from
+   * ComposedHandler when it measures one (for the [ttft] marker). Absent =
+   * not measured: the marker then prints `headers=-1ms total=-1ms`, the
+   * documented "no measurement" shape — never a bogus sum.
+   */
+  headerLatencyMs?: number
 ): Response {
   log(`[Streaming] ===== HANDLER STARTED for ${target} =====`);
   let isClosed = false;
@@ -323,6 +335,23 @@ export function createStreamingResponseHandler(
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const upstream: UpstreamReaderSlot = {};
+
+  // Capture pipeline (#641 blocker-2 port) — TTFT anchor and response capture.
+  // Headers are in the moment this handler is built; the first upstream `data:`
+  // line closes the measurement. reqN is resolved from the request object
+  // (assigned at ingestion by logRequest): reading the global counter here
+  // returns whichever request is CURRENT while this one waited for headers —
+  // under concurrency handlers cross-label.
+  const tHeaders = performance.now();
+  const reqN = requestNumberFor(c.req);
+  const cap = createResponseCapture("openai", target, true, reqN);
+  // The stop_reason of the terminal message_delta the client actually received
+  // (#220). Every ending path emits it through `send`, so recording it there
+  // keeps the [resp] marker in step with the stream instead of logging `stop=?`
+  // on every response. Stays undefined when no message_delta went out, and the
+  // marker then falls back to `?`: "the stream ended without one".
+  let sentStopReason: string | undefined;
+  let ttftLogged = false;
 
   return c.body(
     new ReadableStream(
@@ -351,8 +380,23 @@ export function createStreamingResponseHandler(
                 }
               }
               controller.enqueue(encoder.encode(`event: ${e}\ndata: ${JSON.stringify(d)}\n\n`));
+              // After the enqueue: a throw (controller closed under us) means the
+              // client never got this value, so it must not be reported.
+              if (e === "message_delta" && d?.delta?.stop_reason) {
+                sentStopReason = d.delta.stop_reason;
+              }
             }
           };
+
+          // Capture pipeline (#641 blocker-2 port): mirror every outgoing byte
+          // into the response capture — no-op unless CLAUDISH_CAPTURE_DIR is
+          // set. Overriding enqueue makes the tap exhaustive across every emit
+          // site (send, block-writer, [DONE] tail, error surfaces).
+          const _origEnqueue = controller.enqueue.bind(controller);
+          controller.enqueue = ((chunk: any) => {
+            cap.tap(chunk);
+            return _origEnqueue(chunk);
+          }) as any;
 
           const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2)}`;
           const state = createStreamingState();
@@ -533,6 +577,9 @@ export function createStreamingResponseHandler(
               } finally {
                 teardown();
               }
+              // Capture pipeline (#641 blocker-2 port): client abort —
+              // `closed=false` is how a cancel reads in the [resp] marker.
+              cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
               return;
             }
 
@@ -999,6 +1046,20 @@ export function createStreamingResponseHandler(
               }
             } finally {
               teardown();
+              // Capture pipeline (#641 blocker-2 port): normal/exception close —
+              // in the finally so a part-way throw still closes the capture. The
+              // enqueue override above stays installed while teardown emits the
+              // `[DONE]` tail, so the capture records it too.
+              try {
+                cap.note(`close reason=${reason}`);
+                cap.done({
+                  closed: true,
+                  stop_reason: sentStopReason,
+                  reason,
+                  text_len: state.accumulatedText.length,
+                  err: err ?? null,
+                });
+              } catch {}
             }
           };
 
@@ -1017,6 +1078,20 @@ export function createStreamingResponseHandler(
               for (const line of lines) {
                 const dataStr = line.trim() ? sseDataPayload(line) : null;
                 if (dataStr === null) continue;
+                // Capture pipeline (#641 blocker-2 port) — first-upstream-event
+                // marker, once per stream, on the first `data:` line seen.
+                if (!ttftLogged) {
+                  ttftLogged = true;
+                  process.stdout.write(
+                    ttftMarkerLine(
+                      "openai",
+                      target,
+                      reqN,
+                      headerLatencyMs,
+                      Math.round(performance.now() - tHeaders)
+                    )
+                  );
+                }
                 // Verbatim: this line IS the fixture source (see SSE_LOG_MAX_CHARS).
                 log(`[SSE:openai] ${formatRawSseLogPayload(dataStr)}`);
                 if (dataStr === "[DONE]") {

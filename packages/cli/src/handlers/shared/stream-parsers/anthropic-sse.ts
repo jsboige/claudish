@@ -13,6 +13,11 @@ import type { Context } from "hono";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
 import { log } from "../../../logger.js";
 import { redactForClient } from "../../../redact.js";
+// Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [ttft]/[resp]
+// stdout markers, correlated by the request number frozen at ingestion.
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
+import { createResponseCapture } from "../response-capture.js";
+import { ttftMarkerLine } from "../traffic-markers.js";
 import { messageStartUsage } from "./message-start-usage.js";
 import {
   POLICY_RETRY_BACKOFF_MS,
@@ -64,10 +69,9 @@ interface AnthropicPassthroughOpts {
   /**
    * When false, no response capture is written (default true). Used by the
    * relay's nominal forward (#641 G2, fork extension): the hub captures
-   * centrally, so the sidecar must not double-capture. This branch has no
-   * capture stack yet (it lands with the traffic-analysis grain), so the
-   * flag is accepted and inert here — documented rather than dropped so the
-   * relay's call sites stay verbatim.
+   * centrally, so the sidecar must not double-capture. Live since the
+   * capture-pipeline port (#641 blocker 2) — createResponseCapture consults
+   * it through `opts.capture !== false`.
    */
   capture?: boolean;
   /**
@@ -114,6 +118,17 @@ export function createAnthropicPassthroughStream(
   let pingInterval: ReturnType<typeof setInterval> | null = null;
 
   const filterThinking = opts.adapter?.shouldFilterThinking() ?? false;
+
+  // Capture pipeline (#641 blocker-2 port) — TTFT anchors and response capture.
+  // Headers arrived when this stream was built; the first upstream `data:` line
+  // completes the measurement (see the marker at the parse loop). reqN is
+  // resolved from the request object (assigned at ingestion by logRequest) —
+  // reading the global counter here would return whichever request is current
+  // while this one waited for headers, breaking req-*↔resp-* pairing.
+  const tHeaders = performance.now();
+  const reqN = requestNumberFor(c.req);
+  let ttftLogged = false;
+  const cap = createResponseCapture("anthropic", opts.modelName, opts.capture !== false, reqN);
 
   /**
    * An `event:` line held back until we know whether its `data:` line survives.
@@ -313,6 +328,10 @@ export function createAnthropicPassthroughStream(
       clearInterval(pingInterval);
       pingInterval = null;
     }
+    // Capture pipeline (#641 blocker-2 port): close the resp-* capture the way
+    // the client went away — `closed=false` is how a client abort reads in the
+    // [resp] marker (stop=client-cancel).
+    cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
   };
 
   const upstream: UpstreamReaderSlot = {};
@@ -320,6 +339,14 @@ export function createAnthropicPassthroughStream(
     new ReadableStream(
       cancelEndsUpstreamWork<Uint8Array>(upstream, {
         async start(controller) {
+          // Capture pipeline (#641 blocker-2 port): mirror every outgoing byte
+          // into the response capture. Overriding enqueue (rather than tapping
+          // each of the many emit sites) is what makes the tap exhaustive.
+          const _origEnqueue = controller.enqueue.bind(controller);
+          controller.enqueue = ((chunk: any) => {
+            cap.tap(chunk);
+            return _origEnqueue(chunk);
+          }) as typeof controller.enqueue;
           const sendPing = () => {
             if (!isClosed) {
               controller.enqueue(encoder.encode('event: ping\ndata: {"type":"ping"}\n\n'));
@@ -640,6 +667,23 @@ export function createAnthropicPassthroughStream(
                 // Tolerates both `data: {...}` and the bare `data:{...}` form.
                 const payload = sseDataPayload(line);
 
+                // Capture pipeline (#641 blocker-2 port) — first-upstream-event
+                // marker, once per stream, on the first `data:` line seen.
+                // Field order and units are load-bearing for the latency
+                // histograms built from `docker logs`.
+                if (payload !== null && !ttftLogged) {
+                  ttftLogged = true;
+                  process.stdout.write(
+                    ttftMarkerLine(
+                      "anthropic",
+                      opts.modelName,
+                      reqN,
+                      opts.headerLatencyMs,
+                      Math.round(performance.now() - tHeaders)
+                    )
+                  );
+                }
+
                 // ── Thinking-block filtering ──────────────────────────────
                 if (filterThinking && payload !== null) {
                   try {
@@ -863,6 +907,10 @@ export function createAnthropicPassthroughStream(
               }
               controller.close();
             }
+            // Capture pipeline (#641 blocker-2 port): normal close. `closed=true`
+            // + the upstream-reported stop_reason (or "?" via the marker
+            // fallback when none arrived).
+            cap.done({ closed: true, stop_reason: stopReason, sawMessageStop, path: "normal" });
           } catch (e) {
             if (cancelled) {
               endCancelled();
@@ -886,6 +934,16 @@ export function createAnthropicPassthroughStream(
               }
               controller.close();
             }
+            // Capture pipeline (#641 blocker-2 port): exception close — the
+            // capture records the synthetic tail too (the enqueue override
+            // above is still installed when it is emitted).
+            cap.note(`stream-exception ${String(e)}`);
+            cap.done({
+              closed: true,
+              stop_reason: "exception",
+              path: "catch",
+              error: String(e),
+            });
           }
         },
         // Downstream went away: cancelEndsUpstreamWork cancels the upstream reader

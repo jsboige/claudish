@@ -56,6 +56,10 @@ import { resumeFromToolResults } from "../code-mode/resume.js";
 import { loadQuickJSModule } from "../code-mode/sandbox/quickjs-loader.js";
 import { getCodeModeStores, peekCodeModeStores } from "../code-mode/stores.js";
 import { conversationMessages } from "../code-mode/types.js";
+// Capture pipeline (#641 blocker-2 port): durable trace of non-ok upstream
+// bodies + the pinned stderr wall marker (reqN-keyed) that the traffic-*.ps1
+// readers parse.
+import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
 import { getHookEngine } from "../hooks/index.js";
 import { type RawStreamTap, statsNames } from "../hooks/raw.js";
@@ -172,6 +176,7 @@ import {
 import { createStreamingResponseHandler } from "./shared/stream-parsers/openai-sse.js";
 import { notifyOnDownstreamCancel } from "./shared/stream-parsers/upstream-cancel.js";
 import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
+import { wallMarkerLine } from "./shared/traffic-markers.js";
 import {
   type ConnectionErrorInfo,
   MIN_ATTEMPT_SLOT_MS,
@@ -183,6 +188,10 @@ import {
   withConnectionRetry,
 } from "./shared/transient-retry.js";
 import { captureUpstreamError } from "./shared/upstream-error-capture.js";
+// Capture pipeline (#641 blocker-2 port): the unconditional capture-dir copy
+// of a non-ok body (captureUpstreamError above is the separate, env-gated
+// opt-in — both fire, different consumers).
+import { appendUpstreamError } from "./shared/response-capture.js";
 
 /**
  * Backoff schedule for a retryable error that arrived inside an HTTP 200 stream.
@@ -2520,6 +2529,19 @@ export class ComposedHandler implements ModelHandler {
           status: response.status,
           body: errorText,
         });
+        // Capture pipeline (#641 blocker-2 port): the unconditional durable
+        // copy — non-ok responses short-circuit before the stream parser, so
+        // they never get a resp-*.sse. This is the exact wording
+        // isQuotaExhaustion needs to arm role failover. v14 note: errorText is
+        // redacted at the read here (v14's signing-lease invariant — main
+        // captures the raw body); the quota-wall wording survives redaction,
+        // so the failover classifier still arms.
+        appendUpstreamError({
+          model: this.targetModel,
+          provider: this.provider.displayName,
+          status: response.status,
+          body: errorText,
+        });
         // A transport that parses its provider's structured errors outranks the
         // shared substring heuristics — computed ONCE here so the user-facing
         // hint and the terminal/retryable remap below cannot disagree about what
@@ -2561,8 +2583,19 @@ export class ComposedHandler implements ModelHandler {
         const msgTail = oneLineMsg
           ? ` (${oneLineMsg.length > 200 ? `${oneLineMsg.slice(0, 200)}…` : oneLineMsg})`
           : "";
+        // Capture pipeline (#641 blocker-2 port): the pinned wall-marker shape —
+        // `Error [X]: HTTP <status> reqN=<n>. <hint>` — that the traffic-*.ps1
+        // readers parse. v14's provider-message tail (the whitespace-collapsed
+        // sentence above) rides inside the hint, so the scrollback richness is
+        // kept inside the machine-readable line. `c.req`, never the bare
+        // Context: the keyed carrier is the HonoRequest (review #632).
         logStderr(
-          `Error [${this.provider.displayName}]: HTTP ${response.status}. ${hint}${msgTail}`
+          wallMarkerLine(
+            this.provider.displayName,
+            response.status,
+            requestNumberFor(c.req),
+            `${hint}${msgTail}`
+          )
         );
 
         // Extract structured error type from provider response body if present
@@ -3026,7 +3059,10 @@ export class ComposedHandler implements ModelHandler {
           streamApiError = { code, message };
         },
         hookScope?.raw.streamTap(),
-        responsesTurn
+        responsesTurn,
+        // Dispatch → headers latency, same figure stats records as latency_ms
+        // (capture pipeline, #641 blocker-2 port — feeds the [ttft] marker).
+        latencyMs
       ),
       () => {
         clientCancelled = true;
@@ -3284,7 +3320,13 @@ export class ComposedHandler implements ModelHandler {
     onApiError?: (code: string, message: string) => void,
     /** The raw `providerChunk`/`providerStreamEnd` tap for this stream, when one applies. */
     raw?: RawStreamTap,
-    responsesTurn?: ResponsesTurnWiring
+    responsesTurn?: ResponsesTurnWiring,
+    /**
+     * Dispatch → upstream-response-headers latency, for the [ttft] capture
+     * marker (#641 blocker-2 port). Absent = not measured: the marker then
+     * prints `headers=-1ms total=-1ms`, the documented "no measurement" shape.
+     */
+    headerLatencyMs?: number
   ): Response {
     // Local mutable copy so we can null it out after firing (prevents double-firing)
     // without reassigning the function parameter.
@@ -3369,7 +3411,11 @@ export class ComposedHandler implements ModelHandler {
           // Always pass the options object: without it `onToolCallObserved` is not
           // installed on the busiest wire in claudish (GLM, Kimi, Grok, DeepSeek,
           // Qwen, OpenRouter, LiteLLM).
-          { onToolCallObserved: observeToolCall }
+          { onToolCallObserved: observeToolCall },
+          // Dispatch → headers latency (capture pipeline, #641 blocker-2 port) —
+          // feeds the [ttft] marker's `headers=` field. Same figure stats
+          // already records as latency_ms.
+          headerLatencyMs
         );
 
       case "openai-responses-sse":
@@ -3400,6 +3446,9 @@ export class ComposedHandler implements ModelHandler {
             this.tokenTracker.addBilledInputTokens(input, detail, billing),
           onTurnSummary: responsesTurn?.onTurnSummary,
           codeMode: responsesTurn?.codeMode,
+          // Dispatch → headers latency (capture pipeline, #641 blocker-2 port) —
+          // feeds the [ttft] marker's `headers=` field.
+          headerLatencyMs,
         });
 
       case "anthropic-sse":
@@ -3421,6 +3470,9 @@ export class ComposedHandler implements ModelHandler {
           // Same seed contract as the other parsers: a synthetic opening after
           // an in-stream error must retain the previous context size.
           priorInputTokens,
+          // Dispatch → headers latency (capture pipeline, #641 blocker-2 port) —
+          // feeds the [ttft] marker's `headers=` field.
+          headerLatencyMs,
         });
 
       case "gemini-sse": {

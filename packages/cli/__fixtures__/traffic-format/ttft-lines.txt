@@ -1,0 +1,17 @@
+# [ttft] marker contract — MUST match ttftMarkerLine (handlers/shared/traffic-markers.ts).
+# Consumers: traffic-*.ps1 counts/joins, ad-hoc `grep '\[ttft\]'` volume checks (on a
+# NOMINAL relay these are the ONLY per-request volume lines), future field-parsing in
+# the RSM claudish_traffic tool (roo-extensions #3391).
+# Grammar (two leading spaces; label = PARSER, not provider billed):
+#   [ttft] <label> model=<model> reqN=<n> headers=<hdr|-1>ms firstEvent=<fe>ms total=<hdr+fe|-1>ms
+# Guard: change the builder -> traffic-format-producer.test.ts fails HERE, in the
+# emitting repo. Update the consumer regexes in lockstep.
+# Provenance: lines 1-2 are WILD (relay .46 myia-po-2023 docker logs 2026-10-07,
+# docker-timestamp prefix stripped); lines 3-4 are PRODUCER-BUILT to pin the
+# `responses` label (no Codex traffic on that corpus) and the unknown-latency
+# shape headers=-1 -> total=-1 (never a bogus sum).
+
+  [ttft] anthropic model=glm-5.2 reqN=0 headers=2881ms firstEvent=3ms total=2884ms
+  [ttft] openai model=glm-5.2 reqN=1 headers=4335ms firstEvent=3ms total=4338ms
+  [ttft] responses model=gpt-5.6-sol reqN=42 headers=1204ms firstEvent=87ms total=1291ms
+  [ttft] anthropic model=glm-5.2 reqN=7 headers=-1ms firstEvent=903ms total=-1ms

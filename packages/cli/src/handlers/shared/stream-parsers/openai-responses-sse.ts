@@ -17,6 +17,11 @@ import {
   relayNestedInput,
 } from "../../../code-mode/types.js";
 import type { RawStreamTap } from "../../../hooks/raw.js";
+// Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [ttft]/[resp]
+// stdout markers, correlated by the request number frozen at ingestion.
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
+import { createResponseCapture } from "../response-capture.js";
+import { ttftMarkerLine } from "../traffic-markers.js";
 import { wrapAnthropicError } from "../anthropic-error.js";
 import type { UsageCacheDetail } from "../token-tracker.js";
 import { ClaudeSseSink } from "./responses/claude-sse-sink.js";
@@ -144,6 +149,12 @@ export function createResponsesStreamHandler(
      * hooks (responses/responses-turn.ts). Absent ⇒ exec calls are ignored.
      */
     codeMode?: CodeModeTurnHooks;
+    /**
+     * Dispatch → upstream-response-headers latency, threaded from
+     * ComposedHandler when it measures one (for the [ttft] marker). Absent =
+     * not measured: the marker prints `headers=-1ms total=-1ms`.
+     */
+    headerLatencyMs?: number;
   }
 ): Response {
   if (!response.body) {
@@ -152,8 +163,25 @@ export function createResponsesStreamHandler(
   }
 
   let sink: ClaudeSseSink | undefined;
+  // Capture pipeline (#641 blocker-2 port) — response capture + TTFT anchors.
+  // reqN is resolved from the request object (assigned at ingestion by
+  // logRequest) so the [ttft]/[resp] markers label the request that spawned
+  // them even under concurrency. v14 note: this parser was refactored into
+  // `responses/` submodules upstream — the ttft signal comes back through the
+  // `onFirstUpstreamData` leg hook rather than an inline loop.
+  const tHeaders = performance.now();
+  const reqN = requestNumberFor(c.req);
+  let ttftLogged = false;
+  const cap = createResponseCapture("responses", opts.modelName, true, reqN);
   const source: ParserSource<Uint8Array> = {
     start: async (controller) => {
+      // Mirror every outgoing byte into the response capture — the override
+      // makes the tap exhaustive across the sink's every emit site.
+      const _origEnqueue = controller.enqueue.bind(controller);
+      controller.enqueue = ((chunk: any) => {
+        cap.tap(chunk);
+        return _origEnqueue(chunk);
+      }) as typeof controller.enqueue;
       sink = new ClaudeSseSink(controller, {
         modelName: opts.modelName,
         priorInputTokens: opts.priorInputTokens,
@@ -173,6 +201,28 @@ export function createResponsesStreamHandler(
         onExtraBilledInput: opts.onExtraBilledInput,
         onTurnSummary: opts.onTurnSummary,
         codeMode: opts.codeMode,
+        // Once per stream (a retried leg re-fires; the guard holds).
+        onFirstUpstreamData: () => {
+          if (!ttftLogged) {
+            ttftLogged = true;
+            process.stdout.write(
+              ttftMarkerLine(
+                "responses",
+                opts.modelName,
+                reqN,
+                opts.headerLatencyMs,
+                Math.round(performance.now() - tHeaders)
+              )
+            );
+          }
+        },
+      });
+      // Capture pipeline: normal close — `closed=true` unless the client had
+      // already gone (the cancel() below owns that variant).
+      cap.done({
+        closed: !sink.isCancelled,
+        stop_reason: sink.finalStopReason,
+        path: sink.isCancelled ? "cancel" : "normal",
       });
     },
     // Downstream went away (client disconnect, abort, or timeout). The
@@ -186,6 +236,9 @@ export function createResponsesStreamHandler(
     // stopping. No upstream reader is passed: the turn's legs read their own.
     cancel() {
       sink?.cancel();
+      // Capture pipeline: client abort — `closed=false` is how a cancel reads
+      // in the [resp] marker (stop=client-cancel).
+      cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
     },
   };
   const stream = new ReadableStream<Uint8Array>(cancelEndsUpstreamWork({}, source));

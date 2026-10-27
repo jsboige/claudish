@@ -12,6 +12,11 @@
 import type { Context } from "hono";
 import { log } from "../../../logger.js";
 import { redactForClient } from "../../../redact.js";
+// Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [resp] stdout
+// marker, correlated by the request number frozen at ingestion. Tap-only wire
+// (no [ttft] marker — no `data:` lines on this wire, same as main).
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
+import { createResponseCapture } from "../response-capture.js";
 import { messageStartUsage } from "./message-start-usage.js";
 import {
   type ParserSource,
@@ -20,7 +25,7 @@ import {
 } from "./upstream-cancel.js";
 
 export function createOllamaJsonlStream(
-  _c: Context,
+  c: Context,
   response: Response,
   opts: {
     modelName: string;
@@ -36,9 +41,21 @@ export function createOllamaJsonlStream(
   let cancelled = false;
   let pingInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Capture pipeline (#641 blocker-2 port) — reqN resolved from the request
+  // object (assigned at ingestion by logRequest), never from the global
+  // counter, so the resp-* file pairs with its req-* under concurrency.
+  const reqN = requestNumberFor(c.req);
+  const cap = createResponseCapture("ollama", opts.modelName, true, reqN);
+
   const upstream: UpstreamReaderSlot = {};
   const source: ParserSource<Uint8Array> = {
     async start(controller) {
+      // Mirror every outgoing byte into the response capture.
+      const _origEnqueue = controller.enqueue.bind(controller);
+      controller.enqueue = ((chunk: any) => {
+        cap.tap(chunk);
+        return _origEnqueue(chunk);
+      }) as typeof controller.enqueue;
       const send = (event: string, data: any) => {
         if (!isClosed) {
           controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
@@ -50,6 +67,9 @@ export function createOllamaJsonlStream(
       let promptTokens = 0;
       let completionTokens = 0;
       let lastActivity = Date.now();
+      // Capture pipeline: stop_reason of the terminal message_delta, for the
+      // [resp] marker. Stays undefined when none went out → `?`.
+      let sentStopReason: string | undefined;
 
       // Send initial message_start
       send("message_start", {
@@ -113,6 +133,8 @@ export function createOllamaJsonlStream(
             );
           } finally {
             teardown();
+            // Capture pipeline: client abort — `closed=false` in the [resp] marker.
+            cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
           }
           return;
         }
@@ -128,6 +150,7 @@ export function createOllamaJsonlStream(
               error: { type: "api_error", message: err === undefined ? err : redactForClient(err) },
             });
           } else {
+            sentStopReason = "end_turn";
             send("message_delta", {
               type: "message_delta",
               delta: { stop_reason: "end_turn", stop_sequence: null },
@@ -147,6 +170,16 @@ export function createOllamaJsonlStream(
           }
         } finally {
           teardown();
+          // Capture pipeline (#641 blocker-2 port): `closed: true` on every path
+          // that reached finalize (the controller always closes here), with the
+          // stop reason of the terminal event the client got. done() is
+          // idempotent and swallows its own errors — it can never break the stream.
+          cap.done({
+            closed: true,
+            stop_reason: reason === "error" ? "exception" : sentStopReason,
+            reason,
+            path: "finalize",
+          });
         }
       };
 
@@ -218,6 +251,8 @@ export function createOllamaJsonlStream(
         clearInterval(pingInterval);
         pingInterval = null;
       }
+      // Capture pipeline: client abort — `closed=false` in the [resp] marker.
+      cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
     },
   };
   const stream = new ReadableStream(cancelEndsUpstreamWork(upstream, source));
