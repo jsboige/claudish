@@ -371,6 +371,29 @@
 | `scripts/traffic-sessions.ps1` | 4108 | `scripts` | 3bdbe66f chore(ops): traffic-analysis scripts + capture bind-mount + docs |
 | `scripts/traffic-summary.ps1` | 5053 | `scripts` | 3bdbe66f chore(ops): traffic-analysis scripts + capture bind-mount + docs |
 | `scripts/turn-autopsy.py` | 30063 | `scripts` | 84fc14b3 feat(scripts): turn-autopsy — read turns, don't count them (#328 G12) (#424) |
+
+## CRLF contract for base↔trunk comparisons (seat pin, 2026-10-27)
+
+Every seat that compares `replatform/v14` (base) against `main` (trunk) in a
+worktree hits phantom modifications on line-ending-sensitive files: a fresh
+`git worktree add` writes CRLF where the blob is LF, so fixture files (`.sse`
+captures especially) show `M` with a whole-file diff. The 27/10 cycle counted
+three such false reds burned on review attention before the pattern was named.
+
+The contract:
+
+- **Seat pose**: `core.autocrlf = false` everywhere the fleet compares v14 —
+  `true` rewrites every checkout and turns one phantom into hundreds.
+- **A line-ending-only delta is not a change.** Verify with
+  `git diff --ignore-cr-at-eol <path>` (empty ⇒ phantom) or compare the blobs
+  directly (`git cat-file`). Never report a CRLF-only `M` as a modification.
+- **Never stage a phantom.** Commits in v14 worktrees stage by explicit path
+  list; the two `gemini-*-answer.sse` fixtures are the known repeaters (one
+  phantom each per fresh worktree, even under `autocrlf=false` — the worktree
+  writer, not the config, produces it).
+- **A red test inside a worktree with phantom-M fixtures is judged on its own
+  output**, never dismissed because "the worktree is dirty anyway" — the
+  phantoms are inert to the test runner and must stay inert to the reviewer.
 | `scripts/verify-decision-refs.py` | 23824 | `scripts` | a47ede97 feat(scripts): decision-layer reference verifier (#445 option b) (#461) |
 | `scripts/verify-machine-header.py` | 20842 | `scripts` | 76de8205 feat(scripts): read-only verification of the X-Claudish-Machine rollout (issue #1) (#336) |
 | `scripts/verify-settings-path.py` | 9572 | `scripts` | 2e90f719 feat(scripts): settings-path witness — intention déclarée vs chemin vivant (Refs #291) (#369) |
