@@ -331,6 +331,27 @@ function Test-WslServiceResponsive {
     return 'ok'
 }
 
+function Get-MemoryWitness {
+    # 2026-10-27 01:06Z wedge: the episode left NO memory trace - the tick line
+    # recorded none, so the "vmmemWSL at the 24 GB cap" hypothesis (first seen
+    # 2026-10-24, vmmemWSL 24.5 GB during the WSAETIMEDOUT class) is still
+    # untested. Two best-effort readings on every tick: a counter that cannot be
+    # read must never fail the tick (an unreadable witness is 'n/a', never an
+    # exception). Rendered to be greppable next to the verdict on one line.
+    $vmGb = 'n/a'
+    $freeGb = 'n/a'
+    try {
+        $vm = Get-Process -Name 'vmmemWSL' -ErrorAction SilentlyContinue |
+            Sort-Object WorkingSet64 -Descending | Select-Object -First 1
+        if ($vm) { $vmGb = [math]::Round($vm.WorkingSet64 / 1GB, 2) }
+    } catch { }
+    try {
+        $osNow = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        if ($osNow) { $freeGb = [math]::Round($osNow.FreePhysicalMemory / 1MB, 1) }
+    } catch { }
+    return " vmmem_gb=$vmGb host_free_gb=$freeGb"
+}
+
 # Dot-sourced by the Pester suite (scripts/tests/claudish-sidecar-host-watchdog.Tests.ps1):
 # define the functions above, run nothing below. Everything past this point
 # either calls `exit` (which, in a dot-sourced script, kills the test
@@ -584,4 +605,4 @@ $detail = ($actions -join '; ')
 # (powershell -File on an absent path) with no line to show for it.
 $copyMtime = ''
 try { $copyMtime = (Get-Item $PSCommandPath).LastWriteTimeUtc.ToString('o') } catch { }
-Write-WdLog ("verdict=$verdict v6=$ipv6Alive v4=$ipv4Alive engine=$engine curl=$curlHttp port=$Port pid=$PID copy_mtime=$copyMtime" + $(if ($detail) { " actions=$detail" } else { '' }))
+Write-WdLog ("verdict=$verdict v6=$ipv6Alive v4=$ipv4Alive engine=$engine curl=$curlHttp port=$Port pid=$PID copy_mtime=$copyMtime" + (Get-MemoryWitness) + $(if ($detail) { " actions=$detail" } else { '' }))

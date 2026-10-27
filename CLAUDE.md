@@ -15,6 +15,7 @@ Planned-but-unimplemented work — the SEP-1686 channel migration, optional `not
 | Budget failover: cascade walk, notice channels, per-step backoff, Qwen/GLM thinking measurements | `docs/reference/budget-failover.md` · `.env.sidecar.example` |
 | Negotiated capability vocabulary (#83 — wired: lift at `/v1/messages` entry + query at the condensation rail, gate `CLAUDISH_CAPABILITY_VOCAB` default off, ask cap `CLAUDISH_CAPABILITY_QUERY_MAX_ASKS` default 3) | `docs/reference/capability-vocabulary.md` |
 | Signature-based role routing (#82 — proposition de design, non arbitrée, aucun code) | `docs/reference/signature-routing.md` · entry `ROADMAP.md` |
+| Haiku → swift debrayage — staged widening (Q-po2025-31 : gates R/C mesurés avant toute levée du STEP_EXCLUDE ai-01 ; po-2028 durablement exclu) | `docs/reference/haiku-swift-debrayage.md` · entry `ROADMAP.md` |
 | OpenAI-compatible ingress (`/v1/chat/completions`) request/response translation | `docs/reference/openai-ingress.md` |
 | Traffic scripts, capture format, leak diagnostics | `docs/reference/traffic-analysis.md` |
 | Ops scripts runbook — watchdog, drained restart/recreate, docker lifecycle events, nightly compaction and the shared off-site archive namespace | `docs/reference/ops-scripts.md` |

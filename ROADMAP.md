@@ -118,6 +118,23 @@ A per-signature offload policy: compute a prompt-shape signature (tools + system
 
 ---
 
+## Haiku → swift debrayage — staged widening (Q-po2025-31)
+
+Status: design arbitrated in vehicle (option b, ai-01 coordination 2026-10-27), gates not met. No config change pending.
+
+The mechanics are already live (cascade step 0 = `vllm-myia@swift-1.5-27b!own`, three machines armed, `AUTO=1`, ai-01 STEP_EXCLUDEd, po-2028 excluded by user decision) and the six armed machines' haiku already touches zero MiniMax. The remaining surface is the one that matters: **lifting the ai-01 exclusion — 66 % of the residual MiniMax haiku burn (~1.8 B cache-read / 21.6 h)** — behind two measured gates: Gate R (engine reliability: ECONNRESET rate < 2 %, ttft p95 < 10 s, no UNEXPLAINED ENDINGs over 24 h — **failed as of 2026-10-27 04:10Z**, wedge active) and Gate C (a 30-min agent-sdk-shaped load probe at target concurrency, engine capacity numbers from the vllm lane). Each widening step is one drained recreate with a prior `global` announce; po-2028 is durably out.
+
+**Trigger conditions** (all must hold before the ai-01 proposal goes to the user):
+
+- Gate R green for 24 h (hub-seat canaries + `failover-events.log` mark rate).
+- Gate C probe passed at the agent-sdk shape (52 % of ai-01 haiku; sessions re-read 120–190k context per turn).
+- User arbitration on Q-po2025-31 lifting the STEP_EXCLUDE line.
+
+**Effort**: small config + one drained recreate; the cost is the measurement discipline, not the change.
+
+**Reference**: `docs/reference/haiku-swift-debrayage.md`; mandate + measurements provenance therein.
+---
+
 ## Workload routing — agent-sdk vs interactive, refining the 25/10 machine-level arbitration
 
 Status: design proposition, not arbitrated. No code.

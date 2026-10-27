@@ -98,3 +98,34 @@ Describe 'sidecar-host-watchdog state round-trip' {
         (Test-Path (Join-Path $script:SandboxHome 'sidecar-host-watchdog.log')) | Should -BeFalse
     }
 }
+
+Describe 'memory witness (2026-10-27 01:06Z wedge)' {
+    # The wedge left no memory trace: the tick line recorded none, so the
+    # "vmmemWSL at the 24 GB cap" hypothesis is untestable after the fact.
+    # These pins keep the reading cheap, greppable, and incapable of failing
+    # a tick.
+    BeforeEach {
+        $script:SandboxHome = Join-Path $TestDrive ([guid]::NewGuid().ToString('n'))
+        New-Item -ItemType Directory -Path $script:SandboxHome -Force | Out-Null
+        . $script:ScriptPath -ClaudishHome $script:SandboxHome
+    }
+
+    It 'renders both readings on one greppable fragment' {
+        (Get-MemoryWitness) | Should -Match '^ vmmem_gb=\S+ host_free_gb=\S+$'
+    }
+
+    It 'degrades to n/a per counter, never to an exception' {
+        Mock Get-Process { $null } -ParameterFilter { $Name -eq 'vmmemWSL' }
+        Mock Get-CimInstance { $null } -ParameterFilter { $Class -eq 'Win32_OperatingSystem' }
+        (Get-MemoryWitness) | Should -Be ' vmmem_gb=n/a host_free_gb=n/a'
+    }
+
+    It 'a throwing counter is absorbed (the verdict must be written regardless)' {
+        Mock Get-Process { throw 'boom' } -ParameterFilter { $Name -eq 'vmmemWSL' }
+        { Get-MemoryWitness } | Should -Not -Throw
+    }
+
+    It 'the tick line actually carries the witness (a green function nobody calls proves nothing)' {
+        (Get-Content $script:ScriptPath -Raw) | Should -Match 'copy_mtime=\$copyMtime"\s*\+\s*\(Get-MemoryWitness\)'
+    }
+}
