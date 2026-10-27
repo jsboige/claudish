@@ -17,6 +17,9 @@ import {
   resolveForwardHeadersTimeoutMs,
   MIN_FORWARD_HEADERS_TIMEOUT_MS,
   MAX_FORWARD_HEADERS_TIMEOUT_MS,
+  resolveHeartbeatTimeoutMs,
+  MIN_RELAY_HEARTBEAT_TIMEOUT_MS,
+  MAX_RELAY_HEARTBEAT_TIMEOUT_MS,
   type RelayState,
 } from "./relay.js";
 import { getInstanceId } from "../../instance-id.js";
@@ -808,6 +811,67 @@ describe("#320 CLAUDISH_RELAY_HEADER_TIMEOUT_MS — configurable, empty-safe, bo
     expect(out).toContain("message_stop"); // finalized with the original death, not hung
     expect(dt).toBeLessThan(800); // the ONE deadline bounded the whole turn's header legs
   }, 20_000);
+});
+
+describe("CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS — WAN-tunable liveness bound", () => {
+  // Why this exists (measured 2026-10-27, po-2027): the 4s default is a LAN
+  // calibration. On a WAN edge whose headers measured 3 897 ms / 18 118 ms, two
+  // consecutive 4s timeouts flipped the node AUTONOMOUS every ~5-8 min for 2h36
+  // and served 102 responses locally, off-hub. The deep probe — a much larger
+  // budget — answered every single time, so the edge was never down: the bound
+  // was.
+  const KEY = "CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS";
+  let saved: string | undefined;
+
+  beforeEach(() => {
+    saved = process.env[KEY];
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env[KEY];
+    else process.env[KEY] = saved;
+  });
+
+  it("unset yields the 4s LAN default", () => {
+    delete process.env[KEY];
+    expect(resolveHeartbeatTimeoutMs()).toBe(4_000);
+  });
+
+  it('"" yields the default — the Number("") === 0 trap (#310 review)', () => {
+    // Compose injects every listed name as ""; Number("") === 0 would make every
+    // unconfigured container's heartbeat time out instantly, flipping it
+    // AUTONOMOUS on the first tick. Mutation pin: drop the empty guard and this
+    // goes red with 0.
+    process.env[KEY] = "";
+    expect(resolveHeartbeatTimeoutMs()).toBe(4_000);
+  });
+
+  it("garbage yields the default, never NaN", () => {
+    process.env[KEY] = "9s"; // plausible hand-edit typo
+    expect(resolveHeartbeatTimeoutMs()).toBe(4_000);
+  });
+
+  it("the MAX stays below the 10s tick interval — a longer budget would stack ticks, not measure them", () => {
+    expect(MAX_RELAY_HEARTBEAT_TIMEOUT_MS).toBeLessThan(10_000);
+    process.env[KEY] = String(MAX_RELAY_HEARTBEAT_TIMEOUT_MS + 1);
+    expect(resolveHeartbeatTimeoutMs()).toBe(4_000);
+  });
+
+  it("below MIN yields the default — a tighter bound re-creates the false-positive class", () => {
+    process.env[KEY] = String(MIN_RELAY_HEARTBEAT_TIMEOUT_MS - 1);
+    expect(resolveHeartbeatTimeoutMs()).toBe(4_000);
+  });
+
+  it("a WAN-sized value in range is honored, floored, boundaries inclusive", () => {
+    process.env[KEY] = "9000";
+    expect(resolveHeartbeatTimeoutMs()).toBe(9_000);
+    process.env[KEY] = "6000.9";
+    expect(resolveHeartbeatTimeoutMs()).toBe(6_000);
+    process.env[KEY] = String(MIN_RELAY_HEARTBEAT_TIMEOUT_MS);
+    expect(resolveHeartbeatTimeoutMs()).toBe(MIN_RELAY_HEARTBEAT_TIMEOUT_MS);
+    process.env[KEY] = String(MAX_RELAY_HEARTBEAT_TIMEOUT_MS);
+    expect(resolveHeartbeatTimeoutMs()).toBe(MAX_RELAY_HEARTBEAT_TIMEOUT_MS);
+  });
 });
 
 describe("forwardToUpstream — streaming (never-hang delegation)", () => {

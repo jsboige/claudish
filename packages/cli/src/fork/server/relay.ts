@@ -86,6 +86,46 @@ const RECOVERY_COOLDOWN_MS = 60_000; // min time autonomous before returning to 
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const HEARTBEAT_TIMEOUT_MS = 4_000;
 /**
+ * Legal range for CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS. The MIN keeps a hand-edit
+ * from turning the prober into a coin flip on ordinary latency. MAX stays BELOW
+ * HEARTBEAT_INTERVAL_MS on purpose: the prober ticks every 10s, so a budget at
+ * or above the interval would let each tick launch another stalled heartbeat and
+ * stack waits instead of measuring them.
+ *
+ * Why the knob exists (measured 2026-10-27, first WAN-upstream sidecar, po-2027):
+ * the 4s default is calibrated against a LAN hub. Over the `models.myia.io` edge
+ * the same seat measured header latencies of 3 897 ms and 18 118 ms, while the
+ * deep probe — a far larger budget — answered message_stop in 1.0-1.4s EVERY
+ * time. Two consecutive 4s timeouts therefore flipped the node AUTONOMOUS every
+ * ~5-8 min for 2h36 (20 windows, 07:00:37Z-09:41:37Z), and each flip served the
+ * in-flight requests LOCALLY: 102 glm-5.3-flash responses off-hub, on a
+ * credential the hub never sees or audits. A liveness bound that is too tight
+ * does not detect an outage — it manufactures one.
+ */
+export const MIN_RELAY_HEARTBEAT_TIMEOUT_MS = 2_000;
+export const MAX_RELAY_HEARTBEAT_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS - 1_000;
+/**
+ * Per-tick read of CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS (never cached — same
+ * rationale as resolveForwardHeadersTimeoutMs: an operator turns this mid-incident).
+ * Empty/unset mean the default: compose injects every listed name as ""
+ * (#310 review) and Number("") === 0, so a naive parse would turn every
+ * unconfigured container into a zero-timeout heartbeat. Garbage and out-of-range
+ * values also fall back to the default rather than silently disarming the prober.
+ */
+export function resolveHeartbeatTimeoutMs(): number {
+  const raw = process.env.CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return HEARTBEAT_TIMEOUT_MS;
+  const n = Number(raw);
+  if (
+    !Number.isFinite(n) ||
+    n < MIN_RELAY_HEARTBEAT_TIMEOUT_MS ||
+    n > MAX_RELAY_HEARTBEAT_TIMEOUT_MS
+  ) {
+    return HEARTBEAT_TIMEOUT_MS;
+  }
+  return Math.floor(n);
+}
+/**
  * Pre-stream deadline (the body stream itself is unbounded). This is NOT a liveness
  * detector — the heartbeat prober owns that (10s interval, 2 failures → AUTONOMOUS).
  * Its only job is to stop a black-holed connection from hanging a request forever,
@@ -776,7 +816,9 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
   try {
     const res = await fetch(`${state.upstream}/health`, {
       method: "GET",
-      signal: AbortSignal.timeout(HEARTBEAT_TIMEOUT_MS),
+      // Per-tick resolve: a WAN edge needs a larger budget than the 4s LAN
+      // default, and the operator flips it mid-incident (#711/WAN, 2026-10-27).
+      signal: AbortSignal.timeout(resolveHeartbeatTimeoutMs()),
     });
     if (!res.ok) return false;
     // Body-read failure is a fetch failure (false), NOT "not detected" — an
