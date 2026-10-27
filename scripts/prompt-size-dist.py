@@ -83,6 +83,13 @@ BANDS = [
 # time segment, hence `[\d-]+` for seconds (see module docstring).
 TS_IN_NAME = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})")
 
+# The envelope's requested model sits in the first few hundred bytes; the body can
+# be megabytes. Reading only the head lets the role filter run BEFORE the parse —
+# see HEAD_BYTES.
+HEAD_BYTES = 2048
+HEAD_MODEL = re.compile(r'"model"\s*:\s*"([^"]*)"')
+
+
 # Accepts BOTH the dash form the captures actually use (`2026-10-25T18-00-00-204Z`)
 # and ISO colons (`2026-10-25T18:00:00.204Z`), on the filename and on the CLI alike.
 TS_KEY = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2})[-:](\d{2})")
@@ -100,6 +107,22 @@ def name_ts(name):
     """Window key read from the filename, or None when the name carries no stamp."""
     m = TS_IN_NAME.search(name)
     return f"{m.group(1)}T{m.group(2)}:{m.group(3)}" if m else None
+
+
+def head_model(path):
+    """Requested model read from the envelope head, or None when absent/unreadable.
+
+    Used ONLY as a pre-filter: a None falls through to the full parse, so a file
+    whose head is truncated is still counted by the authoritative envelope path.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(HEAD_BYTES)
+    except OSError:
+        return None
+    m = HEAD_MODEL.search(head)
+    return m.group(1) if m else None
+
 
 
 def pct(vals, p):
@@ -154,6 +177,7 @@ def main(argv=None):
 
     samples = []          # (machine, workload, requested model, body bytes)
     n_files = n_unreadable = n_no_ts = n_out_of_window = n_ts_mismatch = 0
+    n_out_of_role = 0
     spellings = collections.Counter()
 
     with os.scandir(args.captures) as it:     # scandir: 33k+ loose files, no shell glob
@@ -169,6 +193,14 @@ def main(argv=None):
                     n_no_ts += 1          # fall through: the envelope decides
                 elif (since and nkey < since) or (until and nkey >= until):
                     n_out_of_window += 1
+                    continue
+            # Head pre-filter: drop another role's file BEFORE parsing megabytes of
+            # body. The metric is untouched — every surviving file still goes
+            # through the same json.load + body measurement below.
+            if args.role:
+                hmodel = head_model(entry.path)
+                if hmodel is not None and args.role.lower() not in hmodel.lower():
+                    n_out_of_role += 1
                     continue
             try:
                 with open(entry.path, "r", encoding="utf-8", errors="replace") as f:
@@ -198,6 +230,8 @@ def main(argv=None):
     role = args.role or "(all roles)"
     print(f"captures scanned: {n_files}  (out of window {n_out_of_window},"
           f" unreadable {n_unreadable}, no ts {n_no_ts})")
+    if n_out_of_role:
+        print(f"  pre-filtered by role from the file head: {n_out_of_role}")
     if n_ts_mismatch:
         print(f"  WARN filename/envelope timestamp disagreements: {n_ts_mismatch}"
               f" (envelope used)")
