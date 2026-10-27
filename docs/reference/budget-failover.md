@@ -219,6 +219,24 @@ operator gains the reading rule. Two consequences worth keeping:
   ~18:46Z ⇒ ~2,400 responses. **Falsification:** GLM resumes serving after 18:46Z; if it does not,
   the UTC+8 reading is wrong and 02:45Z stands.
 
+**Result, measured the same evening: the UTC+8 reading survives, and one of my own projections did not.**
+The last 429 on the nominal was **18:18:36Z**. The hub disarmed the bucket and re-probed at
+**18:58:36.99Z**, and GLM served **17 s later** (`[ttft] model=glm-5.3`, 18:58:53.78Z). The announced
+`18:45:56Z` falls inside the 40-minute window the observation brackets, `[18:18:36, 18:58:53]`; the UTC
+reading (`2026-10-28T02:45:56Z`, ~8 h later) falls outside it and is **excluded**. This is not proof to
+the second — the hub's re-probe cadence, not the provider, sets the resolution — but the alternative
+is excluded by 8 hours.
+
+Two things the same episode corrected:
+
+- **The episode ran longer than the reset bound implied**, because the bound is on the wall and the
+  window is on the *next probe*: 16:32:03Z → **18:58:53Z = 2 h 26 min**, not 2 h 14.
+- **The volume projection was wrong by 43 %.** 3,427 `deepseek-flash` (PAYG) responses were served,
+  not the ~2,400 projected above: 1,596 by 18:00Z, then **1,831 in the last 59 min (~1,868/h against
+  ~1,093/h earlier)**. A constant-rate projection over a two-hour window cannot see a rate that
+  doubles inside it. The reset bound and the volume bound are different claims, and only the first
+  one held.
+
 **Critical invariant: `stepFailures` survives the role-arm TTL cycle.** The role-level auto-arm TTL
 (10 min) re-probes the nominal on expiry — but it must NOT re-probe a TTL-failed step. Without this,
 the 10-min nominal re-probe would re-probe a weekly-walled Qwen every 10 minutes, defeating the
