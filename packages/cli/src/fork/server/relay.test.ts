@@ -840,8 +840,13 @@ describe("CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS — WAN-tunable liveness bound", (
   it('"" yields the default — the Number("") === 0 trap (#310 review)', () => {
     // Compose injects every listed name as ""; Number("") === 0 would make every
     // unconfigured container's heartbeat time out instantly, flipping it
-    // AUTONOMOUS on the first tick. Mutation pin: drop the empty guard and this
-    // goes red with 0.
+    // AUTONOMOUS on the first tick.
+    //
+    // NOT a mutation pin, and the reviewer measured it (ai-01, 2026-10-27):
+    // dropping `raw.trim() === ""` leaves these tests GREEN, because 0 is
+    // already caught downstream by `n < MIN` (2000). The empty guard is a
+    // second belt over a case the range clamp covers — useful, not load-bearing.
+    // The load-bearing guard is the range clamp pinned below.
     process.env[KEY] = "";
     expect(resolveHeartbeatTimeoutMs()).toBe(4_000);
   });
