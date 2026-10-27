@@ -32,6 +32,7 @@ import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
 import { getInstanceId } from "../../instance-id.js";
 import { log, logStderr } from "../../logger.js";
+import type { SerializedBody } from "../../providers/transport/types.js";
 import { isQuotaExhaustion } from "../failover.js";
 
 /** Headers we must not blindly forward to the upstream. */
@@ -540,9 +541,10 @@ export async function forwardToUpstream(
       res = await fetch(`${state.upstream}${reqPath}`, {
         method: "POST",
         headers,
-        // v14 seam: this bun-types' BodyInit predates TS 5.7's generic
-        // Uint8Array; runtime accepts it (same wire bytes), so cast.
-        body: payload as BodyInit,
+        // v14 seam: the macOS-bridge typecheck project (lib ES2023, no DOM)
+        // has no `BodyInit` — `SerializedBody` is the trunk's deliberate
+        // fetch-body union for exactly that split (transport/types.ts).
+        body: payload as SerializedBody,
         signal: headerController.signal,
       });
       clearTimeout(headerTimer); // headers in → stop bounding; body is unbounded
@@ -748,9 +750,9 @@ export async function forwardToUpstream(
       return await fetch(`${state.upstream}${reqPath}`, {
         method: "POST",
         headers,
-        // v14 seam: this bun-types' BodyInit predates TS 5.7's generic
-        // Uint8Array; runtime accepts it (same wire bytes), so cast.
-        body: payload as BodyInit,
+        // v14 seam: same as the header-deadline site above — SerializedBody,
+        // not the DOM's BodyInit (absent from the bridge typecheck project).
+        body: payload as SerializedBody,
         signal: reforwardController.signal,
       });
     } catch {
