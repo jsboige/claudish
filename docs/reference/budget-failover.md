@@ -190,6 +190,53 @@ waste). The moment the reset passes, the step becomes probeable again, so a reco
 consumed rather than stranded behind its own backoff. Success on the step, or nominal recovery,
 clears `resetAt` with the rest of the failure state.
 
+**Z.AI states its reset in UTC+8, and the message measures itself (2026-10-27).** GLM's wall body is
+`"Usage limit reached for 5 hour. Your limit will reset at 2026-10-28 02:45:56"` — a four-digit date
+and, decisively, no timezone marker. `parseResetAtFromBody` reads it as UTC and then runs the
+self-check: a reset can never be further off than the window the same body states (`for 5 hour`).
+Read as UTC this one lands **8 h 45** ahead, i.e. outside the window, so the value is declined and
+the step falls back to `[10m, 30m, 1h, 4h]` — which is exactly what the hub logged at 17:57Z
+(`step sonnet[0] (Mistral GLM) walled — count=2 ttl=30min`) while the provider had already stated an
+absolute lift time.
+
+The anchor that settles the timezone comes from the recoveries, not from the body. Measured twice on
+27/10, the nominal recovered at **08:35:58Z** and **13:45:54Z** (`DWELL … yielded — nominal recovered
+Ns ago`, logged at 08:37:59Z and 13:47:54Z). The announced timestamp read as **UTC+8** is
+`2026-10-27T18:45:56Z` — **5 h 00 min 02 s** after the 13:45:54Z recovery, the stated window to the
+second. Read as UTC it is 8 h 45 after a window that opened at 13:45, which cannot be true. So on
+Z.AI the timestamp is Beijing time.
+
+Nothing here is a code change: declining an implausible UTC reading is the safe side, and the
+operator gains the reading rule. Two consequences worth keeping:
+
+- **A client that surfaces this text literally is 8 h late.** ai-01's Hermes bot reported it as
+  `anthropic.RateLimitError` and planned around `2026-10-28 02:45:56` — a reset that is really
+  `2026-10-27T18:45:56Z`.
+- **It bounds a PAYG episode that would otherwise look open-ended.** With the nominal walled and
+  steps 0 (Mistral, 402) and 1 (Qwen, walled until 11/11) both unavailable, `sonnet` served
+  **1,596 `deepseek-flash` (PAYG) responses between 16:32:03Z and 17:59:41Z** (~1,093/h), against
+  ~3,550 over the 12:15→13:46Z episode (~2,340/h). The UTC+8 reset predicts the episode ends
+  ~18:46Z ⇒ ~2,400 responses. **Falsification:** GLM resumes serving after 18:46Z; if it does not,
+  the UTC+8 reading is wrong and 02:45Z stands.
+
+**Result, measured the same evening: the UTC+8 reading survives, and one of my own projections did not.**
+The last 429 on the nominal was **18:18:36Z**. The hub disarmed the bucket and re-probed at
+**18:58:36.99Z**, and GLM served **17 s later** (`[ttft] model=glm-5.3`, 18:58:53.78Z). The announced
+`18:45:56Z` falls inside the 40-minute window the observation brackets, `[18:18:36, 18:58:53]`; the UTC
+reading (`2026-10-28T02:45:56Z`, ~8 h later) falls outside it and is **excluded**. This is not proof to
+the second — the hub's re-probe cadence, not the provider, sets the resolution — but the alternative
+is excluded by 8 hours.
+
+Two things the same episode corrected:
+
+- **The episode ran longer than the reset bound implied**, because the bound is on the wall and the
+  window is on the *next probe*: 16:32:03Z → **18:58:53Z = 2 h 26 min**, not 2 h 14.
+- **The volume projection was wrong by 43 %.** 3,427 `deepseek-flash` (PAYG) responses were served,
+  not the ~2,400 projected above: 1,596 by 18:00Z, then **1,831 in the last 59 min (~1,868/h against
+  ~1,093/h earlier)**. A constant-rate projection over a two-hour window cannot see a rate that
+  doubles inside it. The reset bound and the volume bound are different claims, and only the first
+  one held.
+
 **Critical invariant: `stepFailures` survives the role-arm TTL cycle.** The role-level auto-arm TTL
 (10 min) re-probes the nominal on expiry — but it must NOT re-probe a TTL-failed step. Without this,
 the 10-min nominal re-probe would re-probe a weekly-walled Qwen every 10 minutes, defeating the
