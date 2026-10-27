@@ -56,8 +56,8 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "../../proxy-server.js";
-import { createRelayState } from "./relay.js";
 import type { ProxyServer } from "../../types.js";
+import { createRelayState } from "./relay.js";
 
 // Distinct range from the other in-process route tests (19700+, 19851/19951,
 // 19863, 19871, 19883/19983, 19891/19991, 19921, 19961).
@@ -71,10 +71,14 @@ let configBackup: string | null = null;
 let configExisted = false;
 
 const SANDBOX_ENV_KEYS = [
-  "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
-  "CLAUDISH_CAPTURE_DIR", "CLAUDISH_CAPTURE_HOST_DIR",
-  "CLAUDISH_RELAY_UPSTREAM", "CLAUDISH_NO_ANTHROPIC",
-  "ANTHROPIC_API_KEY", "CLAUDE_API_KEY",
+  "CLAUDISH_PROXY_KEY",
+  "CLAUDISH_PROXY_KEY_PREVIOUS",
+  "CLAUDISH_CAPTURE_DIR",
+  "CLAUDISH_CAPTURE_HOST_DIR",
+  "CLAUDISH_RELAY_UPSTREAM",
+  "CLAUDISH_NO_ANTHROPIC",
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_API_KEY",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 

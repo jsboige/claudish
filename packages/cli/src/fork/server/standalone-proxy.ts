@@ -60,6 +60,7 @@ if (hostIdx !== -1 && args[hostIdx + 1]) {
   hostname = args[hostIdx + 1];
 }
 
+import { getRunModelMapping, loadConfig } from "../../profile-config.js";
 import { createProxyServer } from "../../proxy-server.js";
 // v14 seam (D2 doctrine — adopt upstream's mechanism): the fork's
 // `deferSignalExitToHost()` (stats-buffer) and upstream's `claimSignalExit()`
@@ -67,8 +68,7 @@ import { createProxyServer } from "../../proxy-server.js";
 // handlers must not process.exit before the pane/server owner settles its
 // own exit. Upstream already exports the claim; we take it.
 import { claimSignalExit } from "../../signal-owner.js";
-import { loadConfig, getRunModelMapping } from "../../profile-config.js";
-import { createRelayState, startUpstreamProber, type RelayState } from "./relay.js";
+import { type RelayState, createRelayState, startUpstreamProber } from "./relay.js";
 import { emitShutdownDieLine } from "./shutdown-die-log.js";
 // #641 G10 (not yet attached): `startNativePinAutoWatch` re-attaches here when
 // the routing/adapters grain lands — it pulls the fork's catalog-resolver
@@ -151,7 +151,9 @@ const gracefulExit = async (signal: string): Promise<void> => {
     process.exit(0);
   }
   shuttingDown = true;
-  console.log(`\n[claudish-proxy] ${signal} — letting in-flight responses finish (send again to exit now)...`);
+  console.log(
+    `\n[claudish-proxy] ${signal} — letting in-flight responses finish (send again to exit now)...`
+  );
   stopProber?.();
   await server.shutdown();
   emitShutdownDieLine("graceful", server.getActiveStreams());

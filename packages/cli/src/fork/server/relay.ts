@@ -24,20 +24,27 @@
  * passes `capture: false` so it never writes an orphan resp-*.sse in nominal.
  */
 
+import { gunzipSync, gzipSync } from "node:zlib";
 import type { Context } from "hono";
-import { gzipSync, gunzipSync } from "node:zlib";
-import { log, logStderr } from "../../logger.js";
-import { getInstanceId } from "../../instance-id.js";
-import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
-import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
 import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
-import { isQuotaExhaustion } from "../failover.js";
+import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
 import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
+import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
+import { getInstanceId } from "../../instance-id.js";
+import { log, logStderr } from "../../logger.js";
+import { isQuotaExhaustion } from "../failover.js";
 
 /** Headers we must not blindly forward to the upstream. */
 const HOP_BY_HOP = new Set([
-  "host", "connection", "keep-alive", "transfer-encoding", "te",
-  "trailer", "upgrade", "content-length", "content-encoding",
+  "host",
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "te",
+  "trailer",
+  "upgrade",
+  "content-length",
+  "content-encoding",
 ]);
 
 export interface RelayState {
@@ -274,9 +281,10 @@ export function redactUpstreamForLog(upstream: string): string {
  * upstream configured with userinfo (`https://user:pass@host`, the documented
  * SearXNG form) would leak a credential on it.
  */
-export function relayHealthFields(
-  relay?: RelayState
-): { role: "hub" | "relay-nominal" | "relay-autonomous"; upstream: string | null } {
+export function relayHealthFields(relay?: RelayState): {
+  role: "hub" | "relay-nominal" | "relay-autonomous";
+  upstream: string | null;
+} {
   if (!relay?.upstream) return { role: "hub", upstream: null };
   let upstream: string;
   try {
@@ -353,7 +361,10 @@ export const HOPS_HEADER = "x-claudish-hops";
 
 export function parseHops(value: string | undefined | null): string[] {
   if (!value) return [];
-  return value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  return value
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 /** Append `id` to the incoming hop list, preserving whatever arrived. */
@@ -503,9 +514,7 @@ export async function forwardToUpstream(
   // than /v1/messages. Falls back to /v1/messages when the path is missing
   // (older callers / tests) to preserve the historical behavior.
   const reqPath =
-    typeof c.req?.path === "string" && c.req.path.startsWith("/v1/")
-      ? c.req.path
-      : "/v1/messages";
+    typeof c.req?.path === "string" && c.req.path.startsWith("/v1/") ? c.req.path : "/v1/messages";
   // #323 (review B2): ONE header deadline for the whole relayed turn. Every
   // header leg — the initial attempt, its connect retry, and each #170
   // re-forward — arms `max(0, deadline − now)`, never a fresh budget: 3 legs ×
@@ -647,7 +656,10 @@ export async function forwardToUpstream(
     // role. Pass it through exactly like a 4xx: the hub spoke, the client hears it.
     // forceConsole: the fallthrough line this replaces was forceConsole, and a
     // plain log() is file-only — a no-op on a production relay (debug off).
-    log(`[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`, true);
+    log(
+      `[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`,
+      true
+    );
   }
 
   if (drainFreeze503) {
@@ -657,7 +669,10 @@ export async function forwardToUpstream(
     // capture onto the relay's local cascades (budget/PAYG where the hub's
     // subscriptions would have served), and (c) let two freezes flip the relay
     // AUTONOMOUS because the hub is being maintained. forceConsole, countable.
-    log(`[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)`, true);
+    log(
+      `[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)`,
+      true
+    );
   }
 
   // Success (2xx/3xx/4xx), a relayed 529, or a marked drain-freeze 503. Reset

@@ -21,11 +21,11 @@
  */
 
 import {
+  type FailoverRole,
+  type ServedStepRecord,
   appendFailoverNoticeToMessage,
   buildFailoverNotice,
   consumeStreamNotice,
-  type FailoverRole,
-  type ServedStepRecord,
 } from "../../fork/failover.js";
 
 export function prependNoticeToAnthropicStream(

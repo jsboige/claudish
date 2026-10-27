@@ -21,10 +21,10 @@
  * container is the runtime's job, not ours.
  */
 
-import { describe, it, expect } from "bun:test";
-import { join } from "node:path";
+import { describe, expect, it } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Absolute specifier with forward slashes: the fixture lives in a temp dir, and
 // a Windows path with backslashes is not a valid import specifier.

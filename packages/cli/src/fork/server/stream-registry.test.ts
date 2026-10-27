@@ -1,9 +1,9 @@
-import { describe, test, expect, afterEach } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import {
+  DEFAULT_STALL_THRESHOLD_MS,
   createStreamTracker,
   stallThresholdMs,
-  DEFAULT_STALL_THRESHOLD_MS,
 } from "./stream-registry";
 
 const enc = new TextEncoder();
@@ -34,11 +34,13 @@ function appWithSse(bodyFactory: () => ReadableStream<Uint8Array>) {
     await new Promise<void>(() => {});
     return new Response("unreachable");
   });
-  app.get("/sse", () =>
-    new Response(bodyFactory(), {
-      status: 200,
-      headers: { "Content-Type": "text/event-stream" },
-    })
+  app.get(
+    "/sse",
+    () =>
+      new Response(bodyFactory(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      })
   );
   app.get("/json", (c) => c.json({ ok: true }));
   return { app, tracker };
@@ -142,7 +144,6 @@ describe("stream tracker", () => {
     expect(health2).toEqual({ activeStreams: 0 });
   });
 });
-
 
 /**
  * A body that emits `chunks` and then goes quiet WITHOUT closing — the shape of

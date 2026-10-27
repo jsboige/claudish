@@ -103,7 +103,11 @@ async function main() {
   try {
     // ── Phase 1: NOMINAL — forward reaches the hub, returns message_stop ──────
     console.log("\n[Phase 1] NOMINAL forward");
-    const r = await forwardToUpstream(mockCtx({ "x-claudish-machine": "e2e-test" }), { model: "glm-5.2" }, state);
+    const r = await forwardToUpstream(
+      mockCtx({ "x-claudish-machine": "e2e-test" }),
+      { model: "glm-5.2" },
+      state
+    );
     check(r !== null, "forward returned a Response");
     const out = r ? await r.text() : "";
     check(out.includes("message_stop"), "relayed SSE terminated with message_stop (never-hang)");
@@ -114,7 +118,10 @@ async function main() {
     console.log("\n[Phase 2] FAILOVER (hub /health → 503)");
     hubHealthy = false;
     const flipped = await waitFor("autonomous", () => state.alive === false, 45_000);
-    check(flipped, `prober flipped to AUTONOMOUS (alive=false, consecutiveFail=${state.consecutiveFail})`);
+    check(
+      flipped,
+      `prober flipped to AUTONOMOUS (alive=false, consecutiveFail=${state.consecutiveFail})`
+    );
 
     // ── Phase 3: RECOVERY — hub /health recovers → deep probe → nominal ──────
     console.log("\n[Phase 3] RECOVERY (hub /health → 200, deep probe, cooldown)");
@@ -123,13 +130,18 @@ async function main() {
     // OK_THRESHOLD(3)*heartbeat(10s) + cooldown(60s) → allow up to ~120s.
     const recovered = await waitFor("nominal", () => state.alive === true, 130_000);
     check(recovered, "prober flipped back to NOMINAL (alive=true)");
-    check(hubMsgHits > msgBefore, `deep tool-call probe hit the hub (msg hits ${msgBefore} → ${hubMsgHits})`);
+    check(
+      hubMsgHits > msgBefore,
+      `deep tool-call probe hit the hub (msg hits ${msgBefore} → ${hubMsgHits})`
+    );
   } finally {
     stopProber();
     hub.stop(true);
   }
 
-  console.log(`\n[relay-e2e] ${failures === 0 ? "ALL CHECKS PASSED ✅" : `${failures} CHECK(S) FAILED ❌`}`);
+  console.log(
+    `\n[relay-e2e] ${failures === 0 ? "ALL CHECKS PASSED ✅" : `${failures} CHECK(S) FAILED ❌`}`
+  );
   process.exit(failures === 0 ? 0 : 1);
 }
 
