@@ -113,9 +113,15 @@ services:
       #   CLAUDISH_NO_ANTHROPIC   — 1 on every machine except ai-01 (leak-policy backstop)
       #   CLAUDISH_RELAY_HEADER_TIMEOUT_MS — relay header budget (#320); empty = the
       #     360s hub-contract default, NEVER 0 (Number("") trap, #310 review)
+      #   CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS — /health liveness budget; empty = the
+      #     4s LAN default. Raise it on a WAN upstream (measured 2026-10-27: a 4s
+      #     bound flapped po-2027 every ~5-8 min against an edge answering in 1-18s
+      #     and served 102 responses off-hub). Range 2s-9s; the max must stay under
+      #     the 10s tick. A recreate is needed (#310): the env is fixed at create.
       - CLAUDISH_RELAY_UPSTREAM=${CLAUDISH_RELAY_UPSTREAM:-}
       - CLAUDISH_RELAY_COMPRESS=${CLAUDISH_RELAY_COMPRESS:-}
       - CLAUDISH_RELAY_HEADER_TIMEOUT_MS=${CLAUDISH_RELAY_HEADER_TIMEOUT_MS:-}
+      - CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS=${CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS:-}
       - CLAUDISH_NO_ANTHROPIC=${CLAUDISH_NO_ANTHROPIC:-}
       # Canonical fleet id (e.g. myia-po-2024), written into the sidecar .env by
       # `install-sidecar.ps1 -Machine`. Attached to THIS process's own liveness
