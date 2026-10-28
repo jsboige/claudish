@@ -14,6 +14,13 @@
   read-only `/health`, a local append-only file with a size cap and simple
   rotation, no container write, no scheduled task, no UAC.
 
+  ONE WRITER PER LEDGER - the scheduler OR the loop, never both. A forgotten
+  interactive loop plus a scheduler tick interleave lines in one file; the
+  line format survives it, but restart detection then compares across foreign
+  lines. A lockfile would be overkill for this instrument: the guard is the
+  sentence above, and `-Report` shows the sample count and spacing so two
+  writers are visible before they mislead.
+
   Line format, one per sample - deliberately greppable and diffable:
 
     2026-10-28T00:12:34Z role=relay-nominal instance=66c786a1 up=22089 streams=1
@@ -25,8 +32,11 @@
 
   `-Report` reads the same file and prints: per-role sample counts, every
   transition with its timestamp, restart boundaries (a change of `instance`
-  or a decrease of `up`), and gaps longer than three intervals - which are
-  the only way to tell a quiet night from a blind instrument.
+  or a decrease of `up`), and gaps longer than three TICKS - which are the
+  only way to tell a quiet night from a blind instrument. The tick is derived
+  from the ledger's own spacing (see Show-Report), not from `-IntervalSec`,
+  because the sanctioned deployment shape is `-Once` under an external
+  scheduler whose period this script does not know.
 
 .PARAMETER BaseUrl
   Local proxy root. Default http://localhost:3000 (the seat's own sidecar).
@@ -166,10 +176,12 @@ function Show-Report {
         return
     }
 
-    $samples = @()
+    # List, not `+=`: the ledger caps at 1 MiB (~15k lines) and `$a += x`
+    # re-allocates the whole array per line - quadratic on every report.
+    $samples = [System.Collections.Generic.List[object]]::new()
     foreach ($candidate in $lines) {
         $rec = ConvertFrom-LogLine $candidate
-        if ($rec -and $rec.stamp) { $samples += [pscustomobject]$rec }
+        if ($rec -and $rec.stamp) { $samples.Add([pscustomobject]$rec) }
     }
     if ($samples.Count -eq 0) {
         Write-Output "mode-watch: $($lines.Count) line(s) in the ledger but none parsed - the format changed under the reader."
@@ -216,18 +228,54 @@ function Show-Report {
     foreach ($r in $restarts) { Write-Output "  $r" }
 
     # Gaps: the instrument's own blind spots, which no reader can infer from a
-    # role column. Threshold is 3x the sampling interval if the median spacing
-    # says what that is, else 3 minutes.
-    $gaps = @()
+    # role column. The threshold adapts to the ledger's OWN cadence, because
+    # the sanctioned deployment is `-Once` under a scheduler ticking every
+    # 10-15 min: a fixed 3x `-IntervalSec` (default 60 s) would flag every
+    # single tick as a hole and turn this section into noise exactly when the
+    # ledger came from the recommended shape.
+    #   - three deltas or more: 3x the MEDIAN - a real hole is an outlier by
+    #     construction and cannot move the middle value;
+    #   - two deltas: 3x the MINIMUM - with only two, the median is the hole's
+    #     own midpoint and would hide the very gap it is measuring;
+    #   - one sample (no delta): 3x `-IntervalSec`, the only number left.
+    # The printed threshold names its basis, so no reader has to guess.
+    $deltas = @()
     for ($i = 1; $i -lt $samples.Count; $i++) {
         $a = [DateTime]::Parse($samples[$i - 1].stamp, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
         $b = [DateTime]::Parse($samples[$i].stamp, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
-        $delta = ($b - $a).TotalSeconds
-        if ($delta -gt ($IntervalSec * 3)) {
-            $gaps += ("{0}  {1}s unobserved (watcher not running)" -f $samples[$i].stamp, [int]$delta)
+        $deltas += ($b - $a).TotalSeconds
+    }
+    # A statistic of 0 means the stamps are at or below their second resolution
+    # (several ticks in the same second): 3x0 is not a threshold, so the
+    # declared interval is the best statement left - fall back to the fixed one.
+    $stat = $null
+    $label = $null
+    if ($deltas.Count -ge 3) {
+        $sortedD = @($deltas | Sort-Object)
+        $n = $sortedD.Count
+        if ($n % 2 -eq 1) { $stat = [double]$sortedD[($n - 1) / 2] }
+        else { $stat = ([double]$sortedD[[int]($n / 2) - 1] + [double]$sortedD[[int]($n / 2)]) / 2 }
+        $label = "median"
+    }
+    elseif ($deltas.Count -eq 2) {
+        $stat = [double](@($deltas | Sort-Object)[0])
+        $label = "minimum"
+    }
+    if ($null -ne $stat -and $stat -gt 0) {
+        $threshold = 3 * $stat
+        $basis = ("adaptive: 3x {0} spacing {1}s" -f $label, [int]$stat)
+    }
+    else {
+        $threshold = $IntervalSec * 3
+        $basis = ("fixed: 3x -IntervalSec {0}s" -f $IntervalSec)
+    }
+    $gaps = @()
+    for ($i = 0; $i -lt $deltas.Count; $i++) {
+        if ($deltas[$i] -gt $threshold) {
+            $gaps += ("{0}  {1}s unobserved (watcher not running)" -f $samples[$i + 1].stamp, [int]$deltas[$i])
         }
     }
-    Write-Output ("gaps >{0}s : {1}" -f ($IntervalSec * 3), $gaps.Count)
+    Write-Output ("gaps >{0}s : {1}  ({2})" -f [int]$threshold, $gaps.Count, $basis)
     foreach ($g in $gaps) { Write-Output "  $g" }
     $script:ReportExitCode = 0
 }

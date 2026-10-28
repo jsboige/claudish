@@ -370,6 +370,45 @@ Describe 'claudish-mode-watch' {
             $r.Out | Should -Match '120s unobserved'
         }
 
+        It 'derives the tick from the ledger, not -IntervalSec (scheduler at 300s: 0 gaps on a default report)' {
+            # The sanctioned deployment is -Once under a 10-15 min scheduler.
+            # A fixed 3x60s threshold would flag every tick as a hole, turning
+            # the one section that exists to catch a dead watcher into noise.
+            # Companion case requested by the po-2023 review (28/10).
+            $root = New-LedgerRoot
+            $ledger = Join-Path $root 'ledger.log'
+            Write-Ledger $ledger @(
+                '2026-10-28T00:00:00Z role=relay-nominal instance=aaaa1111 up=100 streams=0',
+                '2026-10-28T00:05:00Z role=relay-nominal instance=aaaa1111 up=400 streams=0',
+                '2026-10-28T00:10:00Z role=relay-nominal instance=aaaa1111 up=700 streams=0',
+                '2026-10-28T00:15:00Z role=relay-nominal instance=aaaa1111 up=1000 streams=0'
+            )
+
+            $r = Invoke-Watch -Ledger $ledger -Report
+
+            $r.Out | Should -Match 'gaps >900s\s+: 0'
+            $r.Out | Should -Match 'adaptive: 3x median spacing 300s'
+            ([regex]::Matches($r.Out, 'unobserved \(watcher not running\)')).Count | Should -Be 0
+        }
+
+        It 'a real hole still shows through a scheduler-paced ledger (median, not mean)' {
+            # A hole is an outlier by construction; the median must ignore it
+            # while the gap it represents is still reported.
+            $root = New-LedgerRoot
+            $ledger = Join-Path $root 'ledger.log'
+            Write-Ledger $ledger @(
+                '2026-10-28T00:00:00Z role=relay-nominal instance=aaaa1111 up=100 streams=0',
+                '2026-10-28T00:05:00Z role=relay-nominal instance=aaaa1111 up=400 streams=0',
+                '2026-10-28T00:25:00Z role=relay-nominal instance=aaaa1111 up=500 streams=0',
+                '2026-10-28T00:30:00Z role=relay-nominal instance=aaaa1111 up=800 streams=0'
+            )
+
+            $r = Invoke-Watch -Ledger $ledger -Report
+
+            $r.Out | Should -Match 'gaps >900s\s+: 1'
+            $r.Out | Should -Match '2026-10-28T00:25:00Z\s+1200s unobserved \(watcher not running\)'
+        }
+
         It 'echoes the ledger path it read (the blast radius is the path you passed)' {
             $root = New-LedgerRoot
             $ledger = Join-Path $root 'ledger.log'
