@@ -168,6 +168,14 @@ Candidate designs (unarbitrated, listed so the arbitration has something concret
 - Either a second WAN-upstream sidecar is onboarded, **or** a flap is measured on a seat already running the `9000` bound — a false positive that survives the raised bound means the bound is the wrong *instrument*, not merely undersized.
 - The coordinator accepts one of the designs above. A liveness probe spends provider budget on every tick it runs; that cost, not the code, is why this is parked rather than done.
 
+**The minimal form of the second design — one replay per switch, nothing else** (the shape to implement *if* the trigger fires; recorded here so the arbitration can price it without designing it):
+
+- **Seam**: once per AUTONOMOUS *entry*, on the first request that got served locally, and only **after** the client's answer is complete. One replay of the identical body down the existing forward path, bounded by the heartbeat bound, result reduced to a boolean.
+- **What it answers**: `flipContradicted` — *did the hub that this node just declared dead serve the very request it refused to send it?* Logged as one greppable line, never a capture (a replay is a measurement, not traffic), and never counted as a served turn.
+- **Cost**: one request per flip, zero on a seat that does not flap — which is why this form is priced against the periodic probe, not beside it. A quiet seat pays nothing.
+- **Not in scope, on purpose**: no client diversion (the local answer has already been produced), no re-arm (the hysteresis machine owns that path and a replay is not a liveness measurement), no second replay for the same entry, and nothing that can throw — a replay that fails is `flipContradicted=false`, not an error on a request that already succeeded.
+- **Acceptance**: synthetic flap with the hub reachable by replay → `flipContradicted=1` and the **client still received the local answer**; genuine outage → `0`; every terminating path still emits `message_stop`; and a pin that a second request in the same AUTONOMOUS entry does *not* replay.
+
 **Effort**: small-to-medium — one probe path (or one replay seam) + counters + a hysteresis regression pin.
 
 **Reference**: `docs/reference/relay-internals.md` §heartbeat knob and §"where the liveness harness stops seeing"; issue #711, PRs #714/#715; the 27/10 measurement in `docs/deployment/relay-sidecar-deployment.md`.
