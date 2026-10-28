@@ -51,6 +51,10 @@ BeforeAll {
             # reachable through the mount is the point of the 2026-10-28 pin.
             [hashtable]$MountedConfigApiKeys,
             [switch]$NoExplicitHome,
+            # Spell the mount SOURCE the way Docker Desktop records a Windows
+            # bind mount (`/run/desktop/mnt/host/c/...`), while the file really
+            # sits at the readable TestDrive path: the fourth false NO-FUEL.
+            [switch]$WslMountSpelling,
             [string]$HostHomeFallback
         )
         $global:SRAState.DockerVersion = $DockerVersion
@@ -82,6 +86,10 @@ BeforeAll {
                 (New-Object System.Text.UTF8Encoding($false))
             )
             $global:SRAState.MountLines = @("$mountHome|/root/.claudish")
+            if ($WslMountSpelling) {
+                $wsl = ($mountHome -replace '\\', '/') -replace '^([A-Za-z]):', '/run/desktop/mnt/host/$1'
+                $global:SRAState.MountLines = @("$wsl|/root/.claudish")
+            }
         }
         else {
             $global:SRAState.MountLines = @()
@@ -286,6 +294,25 @@ Describe 'seat-readiness-audit' {
             $r.Out | Should -Match 'seat-readiness: UNKNOWN'
             $r.Out | Should -Match 'container env unreadable'
         }
+
+        # Every verdict path carries the home line, early returns included: the
+        # three false NO-FUELs of 2026-10-28 were each a home the reader could
+        # not see. Measured on po-2025 2026-10-28 21:3xZ: the NO-PATH this seat
+        # legitimately returns (hub, no sidecar) printed no home at all.
+        It 'THE PIN: every early verdict (NO-PATH and both UNKNOWNs) names the config home it read' {
+            $noPath = Invoke-Audit -PsLine $null -EnvLines (New-SeatEnv 'zai@glm-4.5-air>ds@deepseek-flash')
+            $noPath.Out | Should -Match 'config home\s+:\s+\S+ \(.+\)'
+            $dockerDown = Invoke-Audit -DockerVersion $null -EnvLines (New-SeatEnv 'zai@glm-4.5-air>ds@deepseek-flash')
+            $dockerDown.Out | Should -Match 'config home\s+:\s+\S+ \(.+\)'
+            $noEnv = Invoke-Audit -EnvLines @()
+            $noEnv.Out | Should -Match 'config home\s+:\s+\S+ \(.+\)'
+        }
+
+        It 'the NO-PATH home line states its source, so the reader can falsify it' {
+            $r = Invoke-Audit -NoExplicitHome -PsLine $null -EnvLines (New-SeatEnv 'zai@glm-4.5-air>ds@deepseek-flash')
+            $r.Code | Should -Be 2
+            $r.Out | Should -Match 'config home\s+:\s+\S+ \(host default'
+        }
     }
 
     Context 'a config-file apiKey is fuel too (the false NO-FUEL of 2026-10-28)' {
@@ -405,6 +432,34 @@ Describe 'seat-readiness-audit' {
             $r.Code | Should -Be 1
             $r.Out | Should -Match 'config home\s+: .*\(explicit -ClaudishHome\)'
             $r.Out | Should -Not -Match 'INCONCLUSIVE'
+        }
+
+        # FOURTH false NO-FUEL of 2026-10-28, measured on po-2025 (the hub): its
+        # own container reports the mount source as
+        # `/run/desktop/mnt/host/d/claudish-shadow/config` - faithful, and
+        # unreadable from the Windows host, where the file is at
+        # D:\claudish-shadow\config. The audit read nothing and called the
+        # serving hub NO-FUEL (exit 1). Same lesson as the three before it: a
+        # source consulted against a path that does not resolve answers
+        # "no fuel" in exactly the same words as a real famine.
+        It 'THE PIN: a Docker-Desktop WSL mount source is translated for the host, and the translation is NAMED' {
+            $r = Invoke-Audit -EnvLines (New-NoHomeKeyEnv) -NoExplicitHome -WslMountSpelling `
+                -MountedConfigApiKeys @{ DEEPSEEK_API_KEY = 'sk-FAKE-DS-42' }
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'seat-readiness: READY'
+            $r.Out | Should -Match 'translated from /run/desktop/mnt/host/'
+            $r.Out | Should -Match 'unreadable on this host'
+            $r.Out | Should -Match "bucket 'deepseek' has config apiKey 'DEEPSEEK_API_KEY' set"
+            $r.Out | Should -Not -Match 'sk-FAKE-DS-42'
+        }
+
+        It 'without the translation the same seat reads NO-FUEL - only the path spelling differs' {
+            # The mutation: same env, same file, readable mount source. If the
+            # translation were doing nothing, both verdicts would agree.
+            $r = Invoke-Audit -EnvLines (New-NoHomeKeyEnv) -NoExplicitHome `
+                -MountedConfigApiKeys @{ DEEPSEEK_API_KEY = 'sk-FAKE-DS-42' }
+            $r.Code | Should -Be 0
+            $r.Out | Should -Not -Match 'translated from'
         }
     }
 }
