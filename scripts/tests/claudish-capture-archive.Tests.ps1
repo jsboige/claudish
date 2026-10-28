@@ -865,6 +865,364 @@ Describe 'off-site sha256 manifest (#389) — engine functions' {
     }
 }
 
+Describe 'Get-CompactionLockDecision + ConvertFrom-CompactionLockContent (#741)' {
+    It 'takes the lock when nothing is held' {
+        $d = Get-CompactionLockDecision -LockExists $false
+        $d.Action | Should -Be 'take'
+    }
+
+    It 'waits while a live holder is inside the ceiling' {
+        $d = Get-CompactionLockDecision -LockExists $true -LockPid 1234 -LockAgeSec 60 -PidAlive $true
+        $d.Action | Should -Be 'wait'
+        $d.Reason | Should -Match 'pid 1234'
+        $d.Reason | Should -Match '60s old'
+    }
+
+    It 'steals from a holder that is gone (the crashed run -- the core of the fix)' {
+        (Get-CompactionLockDecision -LockExists $true -LockPid 1234 -LockAgeSec 60 -PidAlive $false).Action |
+            Should -Be 'steal'
+    }
+
+    It 'steals from a live-looking pid past the ceiling (Windows recycles pids)' {
+        $d = Get-CompactionLockDecision -LockExists $true -LockPid 1234 -LockAgeSec 20000 -PidAlive $true
+        $d.Action | Should -Be 'steal'
+        $d.Reason | Should -Match 'recycled'
+    }
+
+    It 'steals an unattributable lock rather than waiting on nothing' {
+        (Get-CompactionLockDecision -LockExists $true -LockPid 0 -LockAgeSec 0 -PidAlive $true).Action |
+            Should -Be 'steal'
+    }
+
+    It 'the default ceiling is 4 h, an hour past the scheduled task 3 h ExecutionTimeLimit' {
+        # A wait verdict must never outlast the run it is waiting on. A manual
+        # run is not bound by the scheduler's limit, hence one hour of margin.
+        (Get-CompactionLockDecision -LockExists $true -LockPid 1 -LockAgeSec 14401 -PidAlive $true).Action |
+            Should -Be 'steal'
+        (Get-CompactionLockDecision -LockExists $true -LockPid 1 -LockAgeSec 14399 -PidAlive $true).Action |
+            Should -Be 'wait'
+    }
+
+    It 'parses the "<pid>|<startedUtc>|<host>" shape and derives the age' {
+        $i = ConvertFrom-CompactionLockContent -Content "4242|2026-10-28T00:00:00Z|myia-po-2025" `
+                -NowUtc ([datetime]'2026-10-28T00:10:00Z')
+        $i.Pid      | Should -Be 4242
+        $i.Host     | Should -Be 'myia-po-2025'
+        $i.HasStart | Should -BeTrue
+        $i.AgeSec   | Should -Be 600
+    }
+
+    It 'returns nothing for content it cannot attribute (torn write, foreign file, empty)' {
+        ConvertFrom-CompactionLockContent -Content ''                       | Should -BeNullOrEmpty
+        ConvertFrom-CompactionLockContent -Content 'not-a-pid|2026-10-28T00:00:00Z' | Should -BeNullOrEmpty
+        ConvertFrom-CompactionLockContent -Content '0|2026-10-28T00:00:00Z' | Should -BeNullOrEmpty
+        ConvertFrom-CompactionLockContent -Content '1234'                   | Should -BeNullOrEmpty
+    }
+
+    It 'keeps the pid when the timestamp is unreadable, with a zero age (never a false fresh holder)' {
+        $i = ConvertFrom-CompactionLockContent -Content '4242|yesterday-ish' -NowUtc ([datetime]'2026-10-28T00:00:00Z')
+        $i.Pid      | Should -Be 4242
+        $i.HasStart | Should -BeFalse
+        $i.AgeSec   | Should -Be 0
+    }
+}
+
+Describe 'compress-captures.ps1 single-writer lock (#741) -- end to end' {
+    # The measured incident (night of 27->28/10): the scheduled night and a
+    # manual run packed the same canonical name; the second died rc=2 in 93 s
+    # on a file the first still held, and that night produced no archive at all.
+    BeforeAll {
+        $script:FakeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-fake7z-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:FakeRoot -Force | Out-Null
+        $script:Fake7z = Join-Path $script:FakeRoot 'fake7z.bat'
+        [System.IO.File]::WriteAllText($script:Fake7z, @'
+@echo off
+setlocal
+set "MODE=%~1"
+set "TARGET="
+for %%F in (%*) do if /i "%%~xF"==".7z" set "TARGET=%%~fF"
+if /i "%MODE%"=="a" goto add
+if /i "%MODE%"=="t" goto test
+exit /b 1
+:add
+if not defined TARGET exit /b 1
+echo fake> "%TARGET%"
+exit /b 0
+:test
+if not defined TARGET exit /b 2
+if not exist "%TARGET%" exit /b 2
+set "FIRST="
+set /p FIRST=<"%TARGET%"
+if /i "%FIRST%"=="corpse" exit /b 2
+exit /b 0
+'@, (New-Object System.Text.ASCIIEncoding))
+        function Invoke-CompactionRun {
+            param([string]$CaptureDir, [string]$GDriveDir)
+            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+        }
+        function New-LockSandbox {
+            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-741-{0}" -f ([guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'gd')  -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap\archive') -Force | Out-Null
+            return $tmp
+        }
+        function Add-LooseCapture {
+            param([string]$CaptureDir, [int]$DaysBack)
+            $day = (Get-Date).ToUniversalTime().Date.AddDays(-$DaysBack).ToString('yyyy-MM-dd')
+            $p = Join-Path $CaptureDir "req-1-1-$($day)T00-00-00.json"
+            [System.IO.File]::WriteAllText($p, 'loose')
+            return $day
+        }
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:FakeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'a live holder makes the second run exit 0 without touching anything (the 93 s collision)' {
+        $tmp = New-LockSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            # A LIVE foreign pid: this test process. The child must see it alive.
+            [System.IO.File]::WriteAllText((Join-Path $cap 'archive\.compress-captures.lock'),
+                ("{0}|{1}|tester" -f $PID, (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')))
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -Be 0                     # not a failed night: the holder works
+            $log | Should -Match 'LOCK held'
+            $log | Should -Not -Match 'QUARANTINE'
+            # It touched NOTHING: no archive, no upload, loose files intact.
+            Test-Path (Join-Path $cap "archive\captures-$($day)-testbox.7z") | Should -BeFalse
+            Test-Path (Join-Path $gd  "captures-$($day)-testbox.7z") | Should -BeFalse
+            Test-Path (Join-Path $cap "req-1-1-$($day)T00-00-00.json") | Should -BeTrue
+            # And it left the holder's lock alone.
+            Test-Path (Join-Path $cap 'archive\.compress-captures.lock') | Should -BeTrue
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'a lock with a torn timestamp ages from the FILE mtime, so it cannot wait forever' {
+        # Without the fallback a pid-only lock reports age 0 on every read: a
+        # live (possibly recycled) pid would then wait for all eternity.
+        $tmp = New-LockSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $lockFile = Join-Path $cap 'archive\.compress-captures.lock'
+            [System.IO.File]::WriteAllText($lockFile, ("{0}|torn" -f $PID))   # live pid, no timestamp
+            (Get-Item -LiteralPath $lockFile).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddHours(-5)
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -Be 0
+            $log | Should -Match 'stale lock stolen'
+            (Get-Item (Join-Path $gd "captures-$($day)-testbox.7z")).Length | Should -Be 6
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'the same torn lock with a FRESH mtime still waits (the fallback does not steal blindly)' {
+        $tmp = New-LockSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            [System.IO.File]::WriteAllText((Join-Path $cap 'archive\.compress-captures.lock'), ("{0}|torn" -f $PID))
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -Be 0
+            $log | Should -Match 'LOCK held'
+            Test-Path (Join-Path $cap 'archive\captures-*.7z') | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'a stale lock (dead pid) is stolen and the night proceeds' {
+        $tmp = New-LockSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $p = Start-Process -FilePath (Get-Process -Id $PID).Path `
+                   -ArgumentList '-NoProfile', '-Command', 'exit 0' -PassThru
+            $null = $p.WaitForExit(10000)
+            [System.IO.File]::WriteAllText((Join-Path $cap 'archive\.compress-captures.lock'),
+                ("{0}|{1}|gone" -f $p.Id, (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')))
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -Be 0
+            $log | Should -Match 'stale lock stolen'
+            $log | Should -Not -Match 'LOCK held'
+            (Get-Item (Join-Path $gd "captures-$($day)-testbox.7z")).Length | Should -Be 6
+            # A normal exit releases it, so the next night starts clean.
+            Test-Path (Join-Path $cap 'archive\.compress-captures.lock') | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe 'compress-captures.ps1 pre-pack probe + loose purge order (#741)' {
+    # Two more measured defects: a corpse under the canonical name cost the
+    # whole night (7z refused the append, the quarantine ran only afterwards),
+    # and the loose purge ran BEFORE the off-site copy, so one held file killed
+    # the run torn in two.
+    BeforeAll {
+        $script:FakeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-fake7z-{0}" -f ([guid]::NewGuid().ToString('N')))
+        New-Item -ItemType Directory -Path $script:FakeRoot -Force | Out-Null
+        $script:Fake7z = Join-Path $script:FakeRoot 'fake7z.bat'
+        [System.IO.File]::WriteAllText($script:Fake7z, @'
+@echo off
+setlocal
+set "MODE=%~1"
+set "TARGET="
+for %%F in (%*) do if /i "%%~xF"==".7z" set "TARGET=%%~fF"
+if /i "%MODE%"=="a" goto add
+if /i "%MODE%"=="t" goto test
+exit /b 1
+:add
+if not defined TARGET exit /b 1
+rem A corpse is unreadable as an archive even for `a`: refuse the append.
+set "FIRST="
+set /p FIRST=<"%TARGET%"
+if /i "%FIRST%"=="corpse" exit /b 2
+echo fake> "%TARGET%"
+exit /b 0
+:test
+if not defined TARGET exit /b 2
+if not exist "%TARGET%" exit /b 2
+set "FIRST="
+set /p FIRST=<"%TARGET%"
+if /i "%FIRST%"=="corpse" exit /b 2
+exit /b 0
+'@, (New-Object System.Text.ASCIIEncoding))
+        function Invoke-CompactionRun {
+            param([string]$CaptureDir, [string]$GDriveDir)
+            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+        }
+        function New-ProbeSandbox {
+            $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-741b-{0}" -f ([guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'gd')  -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $tmp 'cap\archive') -Force | Out-Null
+            return $tmp
+        }
+        function Add-LooseCapture {
+            param([string]$CaptureDir, [int]$DaysBack)
+            $day = (Get-Date).ToUniversalTime().Date.AddDays(-$DaysBack).ToString('yyyy-MM-dd')
+            $p = Join-Path $CaptureDir "req-1-1-$($day)T00-00-00.json"
+            [System.IO.File]::WriteAllText($p, 'loose')
+            return $day
+        }
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:FakeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'quarantines a corpse under the canonical name BEFORE the pack, and the night still succeeds' {
+        # Pre-fix: `7z a` refuses (rc=2), the quarantine runs afterwards, the day
+        # produces no archive and the night exits non-zero. Post-fix: a 2-second
+        # probe moves the corpse aside first and the day is archived.
+        $tmp = New-ProbeSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            [System.IO.File]::WriteAllText((Join-Path $cap "archive\captures-$($day)-testbox.7z"), 'corpse')
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -Be 0                              # the night SUCCEEDED
+            $log | Should -Match 'QUARANTINE .*canonical archive fails 7z t'
+            $log | Should -Match 'packing fresh'
+            # The corpse is out of the namespace and the day is archived, uploaded,
+            # and then reclaimed locally by the retention purge (KeepLocalDays 0)
+            # only because its off-site copy matches at the same size -- the full
+            # proof chain, end to end. The quarantined partial goes with it: the
+            # #418 purge deletes a partial whose day is off-site at the recorded
+            # size, which is exactly what just happened.
+            $log | Should -Match ("OK  {0}: 1 files" -f $day)
+            (Get-Item (Join-Path $gd "captures-$($day)-testbox.7z")).Length | Should -Be 6
+            $log | Should -Match 'QUARANTINE purge: 1 partial\(s\) deleted'
+            $log | Should -Match 'PURGE retention=0d: 1 local archive\(s\) deleted'
+            @(Get-ChildItem (Join-Path $cap 'archive') -Filter "captures-$($day)-testbox.7z.partial-*" -File).Count | Should -Be 0
+            # And the loose originals of a now-valid archive are gone.
+            Test-Path (Join-Path $cap "req-1-1-$($day)T00-00-00.json") | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'a VALID canonical is appended to, not quarantined (the probe must not eat the update path)' {
+        $tmp = New-ProbeSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            [System.IO.File]::WriteAllText((Join-Path $cap "archive\captures-$($day)-testbox.7z"), 'fake')   # valid
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -Be 0
+            $log | Should -Not -Match 'QUARANTINE'
+            @(Get-ChildItem (Join-Path $cap 'archive') -Filter '*.partial-*' -File).Count | Should -Be 0
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'a loose file held open no longer tears the night: upload happens, the file is kept, exit stays 0' {
+        # THE measured shape of defect 3: the purge ran before the upload, so a
+        # file another process holds open (CPython open() shares no DELETE) left
+        # the day half-deleted with NO off-site copy.
+        $tmp = New-ProbeSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            $loose = Join-Path $cap "req-1-1-$($day)T00-00-00.json"
+            $handle = [System.IO.File]::Open($loose, [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            try {
+                Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+                $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+                $LASTEXITCODE | Should -Be 0
+                $log | Should -Match 'held open -> kept'
+                # The off-site copy exists even though the loose file survived:
+                # the purge now runs LAST, so it cannot abort anything.
+                (Get-Item (Join-Path $gd "captures-$($day)-testbox.7z")).Length | Should -Be 6
+                $log | Should -Match 'GDRIVE .*uploaded'
+                Test-Path -LiteralPath $loose | Should -BeTrue
+            } finally { $handle.Dispose() }
+            # Once released, the next run reclaims it (self-healing, no operator).
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            Test-Path -LiteralPath $loose | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'wiring: the pre-pack probe sits BEFORE the pack, and the loose purge AFTER the off-site copy' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        $probe = $text.IndexOf('canonical archive fails 7z t')
+        $pack  = $text.IndexOf('& $SevenZip a -t7z')
+        $probe | Should -BeGreaterThan 0
+        $pack  | Should -BeGreaterThan 0
+        $probe | Should -BeLessThan $pack
+
+        $upload = $text.IndexOf('Copy-Item -LiteralPath $archivePath -Destination $GDriveDir')
+        $purge  = $text.IndexOf('loose purge LAST')
+        $upload | Should -BeGreaterThan 0
+        $purge  | Should -BeGreaterThan 0
+        $purge  | Should -BeGreaterThan $upload
+
+        # The blind pipeline delete is gone for good: it cannot survive one held file.
+        $text | Should -Not -Match '\$files \| Remove-Item'
+    }
+
+    It 'wiring: the lock is acquired after the early exits and released before the final exit' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        $early = $text.IndexOf('nothing to do (no completed past days')
+        $lock  = $text.IndexOf('single-writer lock (#741)')
+        $rel   = $text.IndexOf('Remove-Item -LiteralPath $lockPath -Force')
+        $end   = $text.LastIndexOf('exit $errors')
+        $early | Should -BeGreaterThan 0
+        $lock  | Should -BeGreaterThan $early
+        $rel   | Should -BeGreaterThan $lock
+        $rel   | Should -BeLessThan $end
+        $text | Should -Match 'ConvertFrom-CompactionLockContent'
+        $text | Should -Match 'Get-CompactionLockDecision'
+    }
+}
+
 Describe 'compress-captures.ps1 off-site sha manifest wiring (#389) — end to end' {
     BeforeAll {
         # Same fake-7z contract as the #208/#322 suites: `a` writes a deterministic
