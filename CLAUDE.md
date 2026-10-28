@@ -189,7 +189,7 @@ Substitutes the *model itself* for a whole **role** (`opus`/`sonnet`/`haiku`/`fa
 | `lane-matrix.py` | per-lane day/hour response series (Epic #116 P1, sqlite) |
 | `compaction-trend.py` | compaction cost across all lanes (#89) |
 | `prompt-size-dist.py` | per-role/machine prompt-size distribution (#116 map, #565 input) — capture-only, no ordinal join |
-| `compress-captures.ps1` · `claudish-watchdog.ps1` | nightly 7z + GDrive backup · health/proactive-restart/hang recovery |
+| `compress-captures.ps1` · `claudish-watchdog.ps1` | nightly 7z + GDrive backup (single-writer lock, probe-before-append, purge after off-site — #741) · health/proactive-restart/hang recovery |
 | `claudish-drain.ps1` | restart without dropping agent turns — deploying needs `-Recreate -EnvFile`; agent callers `-Detach` |
 | `docker-events-collect.ps1` | container lifecycle events (~35 min, #169) — 🔴 never widen the filter (`exec_*` carries credentials, #192) |
 | `failover-events-collect.ps1` | persists `[Failover]` markers (recreate destroys docker logs, #347) — 🔴 past-window `[Failover]` counts read THIS log, never `docker logs` |

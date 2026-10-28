@@ -2886,8 +2886,110 @@ function Test-ClaudishRestartWasNoOp {
 }
 #endregion
 
+#region Compaction single-writer lock (#741)
+function ConvertFrom-CompactionLockContent {
+    <#
+        Parses the content of <ArchiveDir>\.compress-captures.lock, written as
+        "<pid>|<startedUtc>|<host>" on one line.
+
+        Returns $null when the content is not in that shape (torn write, an
+        empty or foreign file squatting the name): the caller then treats the
+        lock as unattributable rather than inventing a live holder out of noise.
+        AgeSec is 0 when the timestamp cannot be read, and a lone pid therefore
+        never looks recent by accident.
+    #>
+    param(
+        [AllowEmptyString()][string]$Content,
+        [datetime]$NowUtc = [datetime]::UtcNow
+    )
+    if (-not $Content) { return $null }
+    $parts = @($Content.Trim() -split '\|')
+    if ($parts.Count -lt 2) { return $null }
+    $lockPid = 0
+    if (-not [int]::TryParse($parts[0].Trim(), [ref]$lockPid)) { return $null }
+    if ($lockPid -le 0) { return $null }
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    $started = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($parts[1].Trim(), 'yyyy-MM-ddTHH:mm:ssZ', $inv, $styles, [ref]$started)) {
+        $started = [datetime]::MinValue
+    }
+    $hasStart = ($started -ne [datetime]::MinValue)
+    $ageSec = 0L
+    if ($hasStart) {
+        $ageSec = [long][Math]::Max(0, ($NowUtc.ToUniversalTime() - $started).TotalSeconds)
+    }
+    return [pscustomobject]@{
+        Pid        = $lockPid
+        StartedUtc = $started
+        HasStart   = $hasStart
+        AgeSec     = $ageSec
+        Host       = $(if ($parts.Count -ge 3) { $parts[2].Trim() } else { '' })
+    }
+}
+
+function Get-CompactionLockDecision {
+    <#
+        Decides what a starting compaction run may do about the single-writer
+        lock (#741).
+
+        The measured incident (night of 27->28/10): the scheduled night and a
+        manual run packed the same canonical name; the second one died rc=2 in
+        93 s on a file the first still held, and that night produced no archive
+        at all. Task Scheduler's -MultipleInstances IgnoreNew only serialises
+        the SCHEDULER against itself.
+
+        Rules, in order:
+          - No lock file                      -> take.
+          - Lock carries no attributable pid  -> steal: nothing to wait on.
+          - Holder pid not running            -> steal: the run died.
+          - Holder pid running, within ceiling-> wait.
+          - Holder pid running, past ceiling  -> steal: Windows recycles pids,
+                                                 and the default ceiling (4 h)
+                                                 already exceeds the scheduled
+                                                 task's 3 h ExecutionTimeLimit,
+                                                 so a live pid on an older lock
+                                                 is a recycled number, not a run.
+
+        Action is 'take' | 'wait' | 'steal', never an exception: a lock that
+        cannot be interpreted must not be able to wedge the night forever.
+    #>
+    param(
+        [bool]$LockExists = $false,
+        [int]$LockPid = 0,
+        [long]$LockAgeSec = 0,
+        [bool]$PidAlive = $false,
+        [long]$StaleAgeSec = 14400
+    )
+    if (-not $LockExists) {
+        return [pscustomobject]@{ Action = 'take'; Reason = 'no lock held' }
+    }
+    if ($LockPid -le 0) {
+        return [pscustomobject]@{ Action = 'steal'; Reason = 'lock file carries no attributable pid' }
+    }
+    if (-not $PidAlive) {
+        return [pscustomobject]@{
+            Action = 'steal'
+            Reason = ("holder pid {0} is gone ({1}s old)" -f $LockPid, $LockAgeSec)
+        }
+    }
+    if ($LockAgeSec -gt $StaleAgeSec) {
+        return [pscustomobject]@{
+            Action = 'steal'
+            Reason = ("holder pid {0} is alive but the lock is {1}s old, past the {2}s ceiling (pid recycled)" -f $LockPid, $LockAgeSec, $StaleAgeSec)
+        }
+    }
+    return [pscustomobject]@{
+        Action = 'wait'
+        Reason = ("holder pid {0} is running ({1}s old)" -f $LockPid, $LockAgeSec)
+    }
+}
+#endregion
+
 Export-ModuleMember -Function @(
     'Get-ScriptProvenance'
+    'ConvertFrom-CompactionLockContent'
+    'Get-CompactionLockDecision'
     'Get-CaptureArchiveName'
     'Get-CaptureArchiveDay'
     'Get-CaptureArchiveMachineTag'

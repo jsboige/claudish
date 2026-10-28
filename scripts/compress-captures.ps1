@@ -14,13 +14,22 @@
   Left uncompressed, ~3-8 GB/day of loose files would fill the disk within
   months. This script packs every COMPLETED past day (UTC) into a single
   per-day .7z under <CaptureDir>\archive\, verifies the archive integrity,
-  and ONLY THEN deletes the loose originals. The current day (and any extra
+  copies it off-site, and ONLY THEN deletes the loose originals -- tolerating
+  any file another process still holds open. The current day (and any extra
   days requested via -KeepDays) is left untouched so live analysis still has
   fresh loose files to work with.
 
   Designed to run unattended (Windows Task Scheduler). Idempotent: re-running
-  appends stragglers to an existing day archive, re-verifies, and removes the
-  loose copies. Never deletes anything without a verified archive (7z t == 0).
+  appends stragglers to an existing day archive (a canonical that FAILS its
+  own integrity probe is quarantined first, then re-packed), re-verifies, and
+  removes the loose copies. Never deletes anything without a verified archive
+  (7z t == 0).
+
+  Single writer: a pid-bearing lock file (<ArchiveDir>\.compress-captures.lock)
+  makes a second run -- typically a manual one during the scheduled night --
+  exit without touching anything, instead of both packing the same canonical
+  name (measured 27->28/10: the loser died rc=2 in 93 s and the night produced
+  no archive at all).
 
 .PARAMETER CaptureDir
   Directory holding the loose req-*/resp-* capture files.
@@ -116,6 +125,25 @@ function Log([string]$msg) {
   try { Add-Content -LiteralPath $logFile -Value $line -Encoding utf8 } catch {}
 }
 
+# #322/#741: move an unreadable or partial archive out of the CANONICAL name.
+# Rename only, never delete: the suffix goes AFTER ".7z" so the captures-*.7z
+# filter, the day parser and every reader exclude it structurally, and the
+# quarantined-partial purge below is the only pass that may remove one (and
+# only with an off-site proof). Returns Ok + the new leaf name, or Ok=$false
+# with the message when the rename itself failed -- the caller escalates.
+function Invoke-ArchiveQuarantine([string]$Path) {
+  $qTs = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
+  $qPath = "$Path.partial-$qTs"
+  $n = 1
+  while (Test-Path -LiteralPath $qPath) { $n++; $qPath = "$Path.partial-$qTs-$n" }
+  try {
+    Rename-Item -LiteralPath $Path -NewName (Split-Path $qPath -Leaf) -ErrorAction Stop
+    return [pscustomobject]@{ Ok = $true; Name = (Split-Path $qPath -Leaf); Error = '' }
+  } catch {
+    return [pscustomobject]@{ Ok = $false; Name = ''; Error = $_.Exception.Message }
+  }
+}
+
 # --- preconditions -----------------------------------------------------------
 # Namespace policy FIRST: refuse before archiving, never after uploading. A run
 # that joins the shared off-site directory anonymously overwrites another
@@ -170,6 +198,63 @@ foreach ($f in $loose) {
 $daysToArchive = $byDay.Keys | Where-Object { [datetime]::ParseExact($_, 'yyyy-MM-dd', $null) -lt $cutoff } | Sort-Object
 if (-not $daysToArchive) { Log "nothing to do (no completed past days; newest is kept loose)"; Log "END"; exit 0 }
 
+# --- single-writer lock (#741) ------------------------------------------------
+# Everything below MUTATES the archive directory, and two runs can reach it at
+# once: the scheduled night (02:47 local) and a manual run. Measured 27->28/10:
+# the second pack died rc=2 in 93 s on a file the first still held, and that
+# night produced NO archive at all. Task Scheduler's -MultipleInstances
+# IgnoreNew only serialises the SCHEDULER against itself.
+#
+# Acquired here, after the early "nothing to do" exits, so a no-op run never
+# blocks a real one. Released explicitly at the single exit below; a crash or a
+# kill leaves the file behind on purpose -- the next run steals it on pid
+# liveness, so an unattributed corpse can never wedge the night (the ceiling in
+# Get-CompactionLockDecision covers pid recycling on top of that).
+$lockPath = Join-Path $ArchiveDir '.compress-captures.lock'
+if (Test-Path -LiteralPath $lockPath) {
+  $lockRaw = ''
+  try { $lockRaw = [System.IO.File]::ReadAllText($lockPath) } catch {}
+  $lockInfo = ConvertFrom-CompactionLockContent -Content $lockRaw
+  $lockPid = 0; $lockAgeSec = 0L; $lockAlive = $false
+  if ($lockInfo) {
+    $lockPid    = $lockInfo.Pid
+    $lockAgeSec = $lockInfo.AgeSec
+    # A torn write can leave a readable pid with no readable timestamp. Falling
+    # back to the FILE's mtime keeps the age real: WriteAllText never appends,
+    # so mtime marks the acquisition. Without this, such a lock would report
+    # age 0 forever and a live pid would wait for all eternity.
+    if (-not $lockInfo.HasStart) {
+      try {
+        $mtime = (Get-Item -LiteralPath $lockPath -ErrorAction Stop).LastWriteTimeUtc
+        $lockAgeSec = [long][Math]::Max(0, ((Get-Date).ToUniversalTime() - $mtime).TotalSeconds)
+      } catch {}
+    }
+    # A pid we cannot query is assumed LIVE: the ceiling still bounds the wait,
+    # whereas a wrong "gone" would put two runs on the same canonical name.
+    try { $lockAlive = [bool](Get-Process -Id $lockPid -ErrorAction SilentlyContinue) }
+    catch { $lockAlive = $true }
+  }
+  $lockVerdict = Get-CompactionLockDecision -LockExists $true -LockPid $lockPid `
+                   -LockAgeSec $lockAgeSec -PidAlive $lockAlive
+  # Our own pid in the file is a re-entrant run (dot-sourced, or a caller that
+  # invoked us from a process which already holds it): waiting on ourselves
+  # would be a permanent SKIP.
+  if ($lockInfo -and $lockInfo.Pid -eq $PID) {
+    $lockVerdict = [pscustomobject]@{ Action = 'take'; Reason = 're-entrant (this very process)' }
+  }
+  if ($lockVerdict.Action -eq 'wait') {
+    Log ("LOCK held: {0} -> this run exits without touching anything (the holder is doing this night's work)" -f $lockVerdict.Reason)
+    Log "END (errors=0)"
+    exit 0
+  }
+  if ($lockVerdict.Action -eq 'steal') { Log ("WARN  stale lock stolen: {0}" -f $lockVerdict.Reason) }
+}
+try {
+  [System.IO.File]::WriteAllText($lockPath, ("{0}|{1}|{2}" -f $PID, (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $env:COMPUTERNAME), (New-Object System.Text.UTF8Encoding($false)))
+} catch {
+  Log ("WARN  cannot write the single-writer lock ({0}) - continuing, serialised by nothing but the scheduler" -f $_.Exception.Message)
+}
+
 $totalRaw = 0L; $totalArch = 0L; $totalFiles = 0; $errors = 0
 
 foreach ($day in $daysToArchive) {
@@ -177,7 +262,28 @@ foreach ($day in $daysToArchive) {
   $rawBytes = ($files | Measure-Object -Property Length -Sum).Sum
   $archivePath = Join-Path $ArchiveDir (Get-CaptureArchiveName -Day $day -MachineTag $MachineTag)
 
-  if ($PSCmdlet.ShouldProcess("$($files.Count) files for $day", "7z archive -> $archivePath then delete loose")) {
+  if ($PSCmdlet.ShouldProcess("$($files.Count) files for $day", "7z archive -> $archivePath then purge loose after the off-site copy")) {
+    # --- #741: probe the canonical BEFORE appending to it -------------------
+    # The 27->28/10 night found a pack truncated the night before still sitting
+    # under the CANONICAL name. `7z a` refuses that corpse (rc=2 in 18 s), the
+    # run quarantined it only AFTERWARDS, and the night's archive was lost --
+    # one whole night paid for a file a two-second `7z t` would have moved
+    # aside. Probing first turns that into a successful night.
+    # `a` on a VALID canonical is a legitimate incremental update (measured
+    # 35:1 on a re-run), so this acts only when the probe is RED.
+    if (Test-Path -LiteralPath $archivePath) {
+      & $SevenZip t -bso0 -bsp0 "$archivePath" | Out-Null
+      $preRc = $LASTEXITCODE
+      if ($preRc -ne 0) {
+        $q = Invoke-ArchiveQuarantine -Path $archivePath
+        if ($q.Ok) {
+          Log ("QUARANTINE {0}: canonical archive fails 7z t (rc={1}) -> renamed to {2}, packing fresh" -f $day, $preRc, $q.Name)
+        } else {
+          Log ("WARN  {0}: canonical archive fails 7z t (rc={1}) and the quarantine rename failed ({2}) - the pack below will likely fail too" -f $day, $preRc, $q.Error)
+        }
+      }
+    }
+
     # Write an exact file list (bare names, no BOM) for 7z's @listfile.
     $listFile = Join-Path $env:TEMP ("claudish-compact-$day-{0}.lst" -f $PID)
     [System.IO.File]::WriteAllLines($listFile, ($files | ForEach-Object { $_.Name }), (New-Object System.Text.UTF8Encoding($false)))
@@ -200,10 +306,14 @@ foreach ($day in $daysToArchive) {
 
     if ($addRc -eq 0 -and $testRc -eq 0 -and (Test-Path -LiteralPath $archivePath)) {
       $archBytes = (Get-Item -LiteralPath $archivePath).Length
-      # Verified archive exists -> safe to delete the loose originals.
-      $files | Remove-Item -Force
       $ratio = if ($archBytes -gt 0) { [Math]::Round($rawBytes / $archBytes, 1) } else { 0 }
-      Log ("OK  {0}: {1} files, {2:N1} MB -> {3:N1} MB ({4}:1), loose deleted" -f `
+      # NB: the loose originals are NOT deleted here any more (#741). They are
+      # purged at the END of this day's block, after the off-site upload and its
+      # manifest record. The old order deleted them first, so anything holding
+      # one of them open (a req-*.json read by a Python scanner -- CPython's
+      # open() does not share FILE_SHARE_DELETE) killed the run BETWEEN the two
+      # and left the day half-deleted with no off-site copy.
+      Log ("OK  {0}: {1} files, {2:N1} MB -> {3:N1} MB ({4}:1), archive verified" -f `
            $day, $files.Count, ($rawBytes/1MB), ($archBytes/1MB), $ratio)
       $totalRaw += $rawBytes; $totalArch += $archBytes; $totalFiles += $files.Count
 
@@ -268,6 +378,26 @@ foreach ($day in $daysToArchive) {
           Log ("WARN  GDriveDir not mounted ({0}) -> off-site deferred, local kept" -f $GDriveDir)
         }
       }
+
+      # --- loose purge LAST (#741) -------------------------------------------
+      # The archive is verified above, so this is pure reclamation of files the
+      # archive already holds -- and it now runs after the upload, so a file it
+      # cannot delete stops nothing that matters. Tolerance is per FILE, not per
+      # run: a single held req-*.json used to abort the whole night's work for
+      # that day. Held files stay loose; the next run re-packs them into the
+      # same (valid) archive -- `7z a` deduplicates -- and tries again. Kept
+      # silent in $errors on purpose: it is self-healing, and a held file is a
+      # concurrent reader's presence, not a failed archive.
+      $looseHeld = 0
+      foreach ($f in $files) {
+        try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop }
+        catch { $looseHeld++ }
+      }
+      if ($looseHeld -gt 0) {
+        Log ("WARN  {0}: {1} loose file(s) held open -> kept (archive verified, nothing lost), retried next run" -f $day, $looseHeld)
+      } else {
+        Log ("LOOSE {0}: {1} file(s) deleted (archive verified, off-site pass done)" -f $day, $files.Count)
+      }
     } else {
       $errors++
       # #322: a failed pack leaves a PARTIAL archive on disk, and the re-upload
@@ -283,15 +413,11 @@ foreach ($day in $daysToArchive) {
       # pass now tests every archive with `7z t` before shipping it, so the two
       # guards cover each other.
       if (Test-Path -LiteralPath $archivePath) {
-        $qTs = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmss')
-        $qPath = "$archivePath.partial-$qTs"
-        $n = 1
-        while (Test-Path -LiteralPath $qPath) { $n++; $qPath = "$archivePath.partial-$qTs-$n" }
-        try {
-          Rename-Item -LiteralPath $archivePath -NewName (Split-Path $qPath -Leaf) -ErrorAction Stop
-          Log ("QUARANTINE {0}: partial archive renamed to {1} (add rc={2} test rc={3}) - loose files kept for re-pack" -f $day, (Split-Path $qPath -Leaf), $addRc, $testRc)
-        } catch {
-          Log ("WARN  {0}: quarantine rename failed ({1}) - partial LEFT under canonical name, the 7z t re-upload gate must catch it" -f $day, $_.Exception.Message)
+        $q = Invoke-ArchiveQuarantine -Path $archivePath
+        if ($q.Ok) {
+          Log ("QUARANTINE {0}: partial archive renamed to {1} (add rc={2} test rc={3}) - loose files kept for re-pack" -f $day, $q.Name, $addRc, $testRc)
+        } else {
+          Log ("WARN  {0}: quarantine rename failed ({1}) - partial LEFT under canonical name, the 7z t re-upload gate must catch it" -f $day, $q.Error)
         }
       }
       Log ("ERROR {0}: 7z add rc={1} test rc={2} -> KEEPING loose files (not deleted)" -f $day, $addRc, $testRc)
@@ -516,4 +642,8 @@ if ($totalArch -gt 0) {
        $daysToArchive.Count, $totalFiles, ($totalRaw/1MB), ($totalArch/1MB), $tr)
 }
 Log "END (errors=$errors)"
+# Release the single-writer lock (#741) -- the only exit that can follow the
+# acquisition above. A crash or a kill skips this on purpose: the file stays,
+# and the next run steals it on pid liveness (see the acquisition block).
+Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
 exit $errors
