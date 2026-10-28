@@ -227,7 +227,7 @@ describe("#416 relay — the cluster key stays at the relay", () => {
     expect(seen[0].url).toBe("/v1/messages");
     expect(seen[0].body?.model).toBe(OPUS);
     expect(seen[0].headers["x-proxy-key"]).toBeUndefined();
-    expect(seen[0].headers["authorization"]).toBe(OAUTH_BEARER);
+    expect(seen[0].headers.authorization).toBe(OAUTH_BEARER);
   });
 
   test("F2 keyed forward still carries the cluster key", async () => {
@@ -263,6 +263,6 @@ describe("#416 relay — the cluster key stays at the relay", () => {
 
     expect(seen.length).toBe(1);
     expect(seen[0].headers["x-proxy-key"]).toBeUndefined();
-    expect(seen[0].headers["authorization"]).toBe(OAUTH_BEARER);
+    expect(seen[0].headers.authorization).toBe(OAUTH_BEARER);
   });
 });

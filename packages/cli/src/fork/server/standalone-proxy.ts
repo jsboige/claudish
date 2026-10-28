@@ -120,8 +120,8 @@ const server = await createProxyServer(
 );
 
 console.log(`[claudish-proxy] Standalone proxy running on http://${hostname}:${port}`);
-console.log(`[claudish-proxy] Config: ~/.claudish/config.json`);
-console.log(`[claudish-proxy] Press Ctrl+C to stop`);
+console.log("[claudish-proxy] Config: ~/.claudish/config.json");
+console.log("[claudish-proxy] Press Ctrl+C to stop");
 
 // stats-buffer.ts registers SIGTERM/SIGINT listeners while the import graph
 // above is being evaluated — i.e. before this line runs — and they exit the

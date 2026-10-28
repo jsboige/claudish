@@ -534,7 +534,8 @@ export async function forwardToUpstream(
     // Registered for the prober's flip-abort (see RelayState.headerWaiters) —
     // only while headers are pending; a controller whose headers arrived must
     // not be aborted by a later flip (the body is unbounded by design).
-    (state.headerWaiters ??= new Set()).add(headerController);
+    state.headerWaiters ??= new Set();
+    state.headerWaiters.add(headerController);
     try {
       res = await fetch(`${state.upstream}${reqPath}`, {
         method: "POST",
@@ -657,7 +658,7 @@ export async function forwardToUpstream(
     // forceConsole: the fallthrough line this replaces was forceConsole, and a
     // plain log() is file-only — a no-op on a production relay (debug off).
     log(
-      `[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`,
+      "[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)",
       true
     );
   }
@@ -670,7 +671,7 @@ export async function forwardToUpstream(
     // subscriptions would have served), and (c) let two freezes flip the relay
     // AUTONOMOUS because the hub is being maintained. forceConsole, countable.
     log(
-      `[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)`,
+      "[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)",
       true
     );
   }
@@ -741,7 +742,8 @@ export async function forwardToUpstream(
       () => reforwardController.abort(),
       Math.max(0, headerDeadlineAt - Date.now())
     );
-    (state.headerWaiters ??= new Set()).add(reforwardController);
+    state.headerWaiters ??= new Set();
+    state.headerWaiters.add(reforwardController);
     try {
       return await fetch(`${state.upstream}${reqPath}`, {
         method: "POST",

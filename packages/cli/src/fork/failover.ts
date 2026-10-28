@@ -460,7 +460,7 @@ function parseStepResets(
   for (let i = 0; i < count && i < parts.length; i++) {
     if (!parts[i]) continue;
     const d = new Date(parts[i]);
-    if (isNaN(d.getTime())) {
+    if (Number.isNaN(d.getTime())) {
       logStderr(
         `[Failover] ${role}: unparseable reset date '${parts[i]}' for step ${i} — ignoring. Want ISO 8601, e.g. 2026-09-01T00:00:00Z.`
       );
@@ -2086,7 +2086,7 @@ export function parseResetAtFromBody(body: string): Date | undefined {
   const abs = /reset at (\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)? UTC/i.exec(text);
   if (abs) {
     const year = new Date().getUTCFullYear();
-    let d = new Date(
+    const d = new Date(
       Date.UTC(
         year,
         Number(abs[1]) - 1,
@@ -2503,7 +2503,7 @@ function buildStreamNoticeText(
     );
   }
   return (
-    prefix + remainder + `Capability is roughly equivalent; continue the work as normal.` + note
+    prefix + remainder + "Capability is roughly equivalent; continue the work as normal." + note
   );
 }
 

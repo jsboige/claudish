@@ -174,9 +174,9 @@ describe("forwardToUpstream — header building", () => {
     expect(h["x-claudish-machine"]).toBe("myia-po-2024"); // attribution survives the relay
     expect(h["x-proxy-key"]).toBe("cluster-key"); // cluster auth injected on the gate header
     expect(h["x-api-key"]).toBeUndefined(); // x-api-key MUST NOT carry the proxy key (would arm the hub native swap)
-    expect(h["authorization"]).toBe("Bearer client-oauth"); // client OAuth PRESERVED for native passthrough
+    expect(h.authorization).toBe("Bearer client-oauth"); // client OAuth PRESERVED for native passthrough
     expect(h["content-length"]).toBeUndefined(); // hop-by-hop stripped
-    expect(h["connection"]).toBeUndefined();
+    expect(h.connection).toBeUndefined();
     expect(h["transfer-encoding"]).toBeUndefined();
   });
 
@@ -222,7 +222,7 @@ describe("forwardToUpstream — header building", () => {
     expect(h["x-claudish-machine"]).toBe("myia-ai-01");
     expect(h["x-proxy-key"]).toBe("cluster-key"); // gate passes on this (NativeHandler ignores it → no swap)
     expect(h["x-api-key"]).toBeUndefined(); // stale client x-api-key dropped so hub won't swap
-    expect(h["authorization"]).toBe("Bearer sk-ant-oat-ai01-oauth"); // OAuth traverses → Anthropic passthrough
+    expect(h.authorization).toBe("Bearer sk-ant-oat-ai01-oauth"); // OAuth traverses → Anthropic passthrough
   });
 
   it("compress=true → gzips the body and sets content-encoding: gzip", async () => {
