@@ -44,12 +44,29 @@ BeforeAll {
             [string[]]$EnvLines = @(),
             [string]$PsLine = 'claudish-sidecar|running',
             [string]$DockerVersion = '24.0.7',
-            [string]$NominalBucket
+            [string]$NominalBucket,
+            [hashtable]$ConfigApiKeys
         )
         $global:SRAState.DockerVersion = $DockerVersion
         $global:SRAState.PsLine = $PsLine
         $global:SRAState.EnvLines = $EnvLines
-        $callArgs = @{}
+        # Always audit an ISOLATED mounted home. Without this, the config source
+        # (added 28/10) would read the machine's real ~/.claudish/config.json and
+        # every verdict below would depend on whose seat runs the suite - the
+        # instrument-lying-about-the-machine failure this repo keeps paying for.
+        # NOTE: not `$home` - that name IS $HOME in PowerShell and is read-only
+        # (SessionStateUnauthorizedAccessException), measured twice in this repo.
+        $auditHome = Join-Path $TestDrive ("home-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        New-Item -ItemType Directory -Path $auditHome -Force | Out-Null
+        if ($ConfigApiKeys) {
+            $json = @{ version = '1'; apiKeys = $ConfigApiKeys } | ConvertTo-Json -Depth 4
+            [System.IO.File]::WriteAllText(
+                (Join-Path $auditHome 'config.json'),
+                $json,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+        $callArgs = @{ ClaudishHome = $auditHome }
         if ($NominalBucket) { $callArgs['NominalBucket'] = $NominalBucket }
         $out = & $script:AuditPath @callArgs 2>&1 | Out-String
         [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
@@ -87,6 +104,19 @@ BeforeAll {
         if ($a[0] -eq 'ps') { return $global:SRAState.PsLine }
         if ($a[0] -eq 'inspect') { return $global:SRAState.EnvLines }
         return $null
+    }
+
+    # po-2023's measured container env (2026-10-28): NOT ONE provider credential
+    # name - the fuel lives in the mounted config.json. Kept as a function so an
+    # It body always gets a fresh copy and no Context-scope variable is involved.
+    function New-NoProviderKeyEnv {
+        @(
+            'PATH=/usr/bin',
+            'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
+            'CLAUDISH_PROXY_KEY_PREVIOUS=FAKE-CLUSTER-KEY-OLD',
+            'CLAUDISH_FAILOVER_SONNET=kc@k3',
+            'CLAUDISH_FAILOVER_ACTIVE=sonnet'
+        )
     }
 }
 
@@ -208,6 +238,58 @@ Describe 'seat-readiness-audit' {
             $r.Code | Should -Be 3
             $r.Out | Should -Match 'seat-readiness: UNKNOWN'
             $r.Out | Should -Match 'container env unreadable'
+        }
+    }
+
+    Context 'a config-file apiKey is fuel too (the false NO-FUEL of 2026-10-28)' {
+        # po-2023's measured shape: the container carries NO provider env name at
+        # all (only CLAUDISH_PROXY_KEY and its previous), the eight keys live in
+        # the mounted ~/.claudish/config.json -> apiKeys, and the same container
+        # had served on k3 in AUTONOMOUS two nights earlier. An env-only audit
+        # called that seat a parachute with no fabric.
+        # The fixture is a FUNCTION, not a Context-level variable: a variable
+        # declared here is not reliably visible inside It bodies, and the symptom
+        # is a silent empty env (UNKNOWN), not an error.
+        It 'env without provider names + a config apiKey reads READY and NAMES the source' {
+            $r = Invoke-Audit -EnvLines (New-NoProviderKeyEnv) -ConfigApiKeys @{ KIMI_CODING_API_KEY = 'sk-FAKE-KIMI-11' }
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'seat-readiness: READY'
+            $r.Out | Should -Match "bucket 'kimi' has config apiKey 'KIMI_CODING_API_KEY' set"
+            $r.Out | Should -Match 'fuel sources\s+: env \+ config \(1 apiKey name\(s\)'
+        }
+
+        It 'THE PIN: the same env without the config file reads NO-FUEL - only the second source differs' {
+            $r = Invoke-Audit -EnvLines (New-NoProviderKeyEnv)
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'seat-readiness: NO-FUEL'
+            $r.Out | Should -Match 'fuel sources\s+: env only'
+        }
+
+        It 'a custom endpoint bucket derives its credential name (custom:qwen-token-plan)' {
+            $r = Invoke-Audit -EnvLines (New-SeatEnv 'qwen-token-plan@deepseek-v4.1-flash') `
+                -ConfigApiKeys @{ QWEN_TOKEN_PLAN_API_KEY = 'sk-FAKE-QWEN-3' }
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'buckets \[custom:qwen-token-plan\]'
+            $r.Out | Should -Match "has config apiKey 'QWEN_TOKEN_PLAN_API_KEY' set"
+        }
+
+        It 'a *_CODING_API_KEY alias in ENV is recognised, not only the provider-default name' {
+            $env = @(
+                'PATH=/usr/bin',
+                'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
+                'GLM_CODING_API_KEY=sk-FAKE-GLM-5',
+                'CLAUDISH_FAILOVER_SONNET=gc@glm-5.3',
+                'CLAUDISH_FAILOVER_ACTIVE=sonnet'
+            )
+            $r = Invoke-Audit -EnvLines $env -NominalBucket 'deepseek'
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match "bucket 'zai' has env 'GLM_CODING_API_KEY' set"
+        }
+
+        It 'the value firewall covers the config source too' {
+            $r = Invoke-Audit -EnvLines (New-SeatEnv 'kc@k3') -ConfigApiKeys @{ KIMI_CODING_API_KEY = 'sk-FAKE-KIMI-11' }
+            $r.Out | Should -Not -Match 'sk-FAKE-KIMI-11'
+            $r.Out | Should -Not -Match 'FAKE-CLUSTER-KEY-9f2'
         }
     }
 

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   One-seat hub-death readiness audit: local path, ARMED cascade, resolvable fuel.
 
@@ -38,6 +38,22 @@
   -NominalBucket when that changes. An audit with a silent assumption is a
   fleet manifest that drifts.
 
+  TWO FUEL SOURCES, and neither may be silent (measured 2026-10-28).
+  Provider credentials reach the proxy by two routes. The obvious one is the
+  container env. The other is the mounted claudish home - `config.json` ->
+  `apiKeys.*`, which the proxy reads at runtime. Reading only the env produced
+  a FALSE NO-FUEL on po-2023: its container carries no provider env name at
+  all (only CLAUDISH_PROXY_KEY and its previous), yet that config holds eight
+  apiKeys, and the same container had provably served on k3 in AUTONOMOUS two
+  nights earlier (2026-10-27 17:25:06Z, logged [ttft] model=k3). A parachute
+  marked fabric-less one day after it opened is the audit crying wolf, and a
+  false NO-FUEL triggers a remediation nobody needs. Both sources are read;
+  the output names WHICH one fuelled each rung, and says so when the second is
+  unreadable - a silent fallback would hide the same class of error.
+
+  The config read follows the same firewall as the env read: NAMES and
+  presence only, values never leave the function.
+
 .PARAMETER ContainerName
   The sidecar container to inspect. Default claudish-sidecar.
 
@@ -58,7 +74,8 @@
 [CmdletBinding()]
 param(
     [string]$ContainerName = "claudish-sidecar",
-    [string]$NominalBucket = "zai"
+    [string]$NominalBucket = "zai",
+    [string]$ClaudishHome = (Join-Path $env:USERPROFILE ".claudish")
 )
 
 $ErrorActionPreference = "Stop"
@@ -137,17 +154,63 @@ function Get-BucketOfRung([string]$Rung) {
     return "unknown"
 }
 
-# Which env NAME proves fuel for a bucket. Presence of the name with a value,
-# never the value itself.
+# Which NAME proves fuel for a bucket. Presence of the name WITH a value, never
+# the value itself. The *_CODING_API_KEY aliases are not decoration: the fleet's
+# own config (po-2023, 2026-10-28) stores GLM_CODING_API_KEY,
+# KIMI_CODING_API_KEY, MINIMAX_CODING_API_KEY and QWEN_TOKEN_PLAN_API_KEY -
+# names an env-only map built from provider defaults would miss even on a seat
+# that DOES put them in env.
 $script:FuelEnvByBucket = @{
-    'zai' = @('ZAI_API_KEY', 'ZAI_API_KEY2', 'ZAI_API_KEY_2')
+    'zai' = @('ZAI_API_KEY', 'ZAI_API_KEY2', 'ZAI_API_KEY_2', 'GLM_CODING_API_KEY')
     'openrouter' = @('OPENROUTER_API_KEY')
     'deepseek' = @('DEEPSEEK_API_KEY')
-    'kimi' = @('KIMI_API_KEY', 'MOONSHOT_API_KEY')
-    'minimax' = @('MINIMAX_API_KEY', 'MINIMAX_GROUP_ID')
+    'kimi' = @('KIMI_API_KEY', 'MOONSHOT_API_KEY', 'KIMI_CODING_API_KEY')
+    'minimax' = @('MINIMAX_API_KEY', 'MINIMAX_GROUP_ID', 'MINIMAX_CODING_API_KEY')
     'google' = @('GOOGLE_API_KEY', 'GEMINI_API_KEY')
     'openai' = @('OPENAI_API_KEY')
     'anthropic-native' = @('ANTHROPIC_API_KEY')
+    'qwen-token-plan' = @('QWEN_TOKEN_PLAN_API_KEY')
+    'mistral' = @('MISTRAL_API_KEY')
+}
+
+function Get-FuelNamesForBucket([string]$Bucket) {
+    # Known buckets use the table. A custom endpoint bucket ('custom:<prefix>',
+    # from a 'provider@model' rung whose prefix is not a fleet alias) derives
+    # its name mechanically: custom:qwen-token-plan -> QWEN_TOKEN_PLAN_API_KEY.
+    # Without this, every custom endpoint reads fabric-less no matter how much
+    # fuel it carries - the same false negative, one layer down.
+    $names = [System.Collections.Generic.List[string]]::new()
+    if ($script:FuelEnvByBucket.ContainsKey($Bucket)) {
+        foreach ($n in $script:FuelEnvByBucket[$Bucket]) { $names.Add($n) }
+    }
+    if ($Bucket -match '^custom:(.+)$') {
+        $derived = (($Matches[1] -replace '[^A-Za-z0-9]', '_').ToUpperInvariant()) + '_API_KEY'
+        if (-not $names.Contains($derived)) { $names.Add($derived) }
+    }
+    return $names.ToArray()
+}
+
+function Get-ConfigApiKeyNames([string]$HomePath) {
+    # The second fuel source: the claudish home the container mounts read-only
+    # (config.json -> apiKeys.*), read by the proxy at runtime. Returns a
+    # name -> hasValue map, or $null when the file cannot be read - the caller
+    # SAYS SO rather than silently auditing one source.
+    #
+    # Firewall: only property NAMES and a presence boolean ever leave here.
+    $path = Join-Path $HomePath 'config.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $cfg = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch { return $null }
+    $map = @{}
+    if ($null -ne $cfg -and $cfg.PSObject.Properties.Name -contains 'apiKeys' -and $cfg.apiKeys) {
+        foreach ($p in $cfg.apiKeys.PSObject.Properties) {
+            $v = $p.Value
+            $map[$p.Name] = ($null -ne $v -and ([string]$v).Trim().Length -gt 0)
+        }
+    }
+    return $map
 }
 
 # --- the audit --------------------------------------------------------------
@@ -238,6 +301,17 @@ function Invoke-SeatAudit {
 
     $credentialedNonNominal = $false
     $monobucketRoles = @()
+    $reportedBuckets = @{}
+    # Second fuel source, read once. Stated in the output whether it worked or
+    # not: a source consulted silently is how the false NO-FUEL of 2026-10-28
+    # happened in the first place.
+    $configKeys = Get-ConfigApiKeyNames $ClaudishHome
+    if ($null -eq $configKeys) {
+        Write-Output ("  fuel sources     : env only - config unreadable at {0}\apiKeys (a seat whose keys live only there reads NO-FUEL on this source's silence)" -f $ClaudishHome)
+    }
+    else {
+        Write-Output ("  fuel sources     : env + config ({0} apiKey name(s) in the mounted home; values never read out)" -f $configKeys.Count)
+    }
     foreach ($role in $cascadeRoles.Keys) {
         $buckets = $rungBucketsByRole[$role]
         $nonNominal = @($buckets | Where-Object { $_ -ne $NominalBucket -and $_ -ne 'delegated' -and $_ -ne 'unknown' })
@@ -246,12 +320,21 @@ function Invoke-SeatAudit {
             continue
         }
         foreach ($b in $nonNominal) {
-            $fuelNames = @()
-            if ($script:FuelEnvByBucket.ContainsKey($b)) { $fuelNames = $script:FuelEnvByBucket[$b] }
-            foreach ($fn in $fuelNames) {
+            # One line per BUCKET, not per (role, bucket) pair: four roles sharing
+            # 'deepseek' is one fact, and a report that says it four times hides
+            # the roster it is supposed to show.
+            if ($reportedBuckets.ContainsKey($b)) { $credentialedNonNominal = $true; continue }
+            foreach ($fn in @(Get-FuelNamesForBucket $b)) {
                 if ($envInfo.HasValue[$fn]) {
                     $credentialedNonNominal = $true
+                    $reportedBuckets[$b] = $true
                     Write-Output ("  fuel             : bucket '{0}' has env '{1}' set (value never printed)" -f $b, $fn)
+                    break
+                }
+                if ($null -ne $configKeys -and $configKeys.ContainsKey($fn) -and $configKeys[$fn]) {
+                    $credentialedNonNominal = $true
+                    $reportedBuckets[$b] = $true
+                    Write-Output ("  fuel             : bucket '{0}' has config apiKey '{1}' set (value never printed)" -f $b, $fn)
                     break
                 }
             }
