@@ -2612,6 +2612,111 @@ function configArmHolding(role: FailoverRole, bucket?: string): { machine: strin
   return undefined;
 }
 
+// ─── #747 (b): history strip + request-side serving note ─────────────────────
+
+/**
+ * The serving-banner segment as it sits in ASSISTANT history — the exact
+ * shapes `buildStreamNoticeText` emits (three capability tails), matched from
+ * the `[claudish]` prefix to the tail's closing period so a FORGED copy that
+ * runs straight into model text ("…stronger output.Je vérifie", #747 case 1)
+ * strips whole. Labels contain periods ("Kimi K3.1 Pro"), so the tail anchors
+ * on the fixed sentences, never on the first `.`. The apostrophe in
+ * "nominal's" is matched with `.` — models re-type it as U+2019 when forging.
+ *
+ * Deliberately NOT covered: the operator `..._NOTE` tail (free-form text, a
+ * wrong cut would mangle real content; no fleet step carries one today), the
+ * recovery banner ("You are back on the nominal") and the condensation notice
+ * (`**[claudish] Failover model active.**`) — different shapes, never the
+ * observed imitation source (#747 evidence).
+ */
+const SERVING_NOTICE_SEGMENT = new RegExp(
+  `\\[claudish\\] You are serving this session as [^\\n]*?` +
+    `(?:Capability note: [^\\n]*?is weaker than the nominal [A-Za-z]+ model; the inherited context may reflect the nominal.s stronger output\\.` +
+    `|Capability note: [^\\n]*?is stronger than the nominal [A-Za-z]+ model\\.` +
+    `|Capability is roughly equivalent; continue the work as normal\\.)`,
+  "g"
+);
+
+/** Remove every serving-banner segment from a text (#747). Never throws;
+ * text without a full-shape match passes through unchanged. */
+export function stripServingNoticeSegments(text: string): string {
+  return text.replace(SERVING_NOTICE_SEGMENT, "");
+}
+
+/**
+ * #747 (b): strip serving banners from the ASSISTANT history of an
+ * Anthropic-shaped request body, in place, before it is forwarded upstream.
+ *
+ * The banners stay in content for the human (doctrine 2026-08-12 — the
+ * client-visible announcement is unchanged); what the MODEL must know rides
+ * the request side instead (`buildServingNoteForRequest`). Every banner left
+ * in history is an example the serving model imitates — measured 28/10:
+ * GLM-5.3 (the nominal) and Kimi each OPENED a reply with a forged banner
+ * copied from history (#747). Assistant-only by design: the stream banner
+ * enters ASSISTANT turns, and that turn-opening pattern is the imitation
+ * trigger; condensation notices ride the /compact result (other shapes) and
+ * are left alone.
+ *
+ * Whole-block banners (the stream notice's own block 0) drop the block; a
+ * banner fused into model text (forged opening, or the /compact append tail)
+ * loses the segment only. If stripping would empty a message entirely (a
+ * pathological banner-only turn our injection never produces), the message is
+ * left untouched — structure preservation beats completeness. Never throws.
+ */
+export function stripServingNoticesFromRequestBody(body: any): void {
+  try {
+    const messages = body?.messages;
+    if (!Array.isArray(messages)) return;
+    for (const message of messages) {
+      if (!message || message.role !== "assistant") continue;
+      const content = message.content;
+      if (typeof content === "string") {
+        const stripped = stripServingNoticeSegments(content);
+        if (stripped !== content && stripped.trim() !== "") message.content = stripped;
+        continue;
+      }
+      if (!Array.isArray(content)) continue;
+      let changed = false;
+      const kept: any[] = [];
+      for (const block of content) {
+        if (block && block.type === "text" && typeof block.text === "string") {
+          const stripped = stripServingNoticeSegments(block.text);
+          if (stripped.trim() === "" && stripped !== block.text) {
+            changed = true; // banner-only block (the stream notice's own block) — drop it
+            continue;
+          }
+          if (stripped !== block.text) {
+            kept.push({ ...block, text: stripped });
+            changed = true;
+            continue;
+          }
+        }
+        kept.push(block);
+      }
+      if (changed && kept.length > 0) message.content = kept;
+    }
+  } catch {
+    // Never throws — a malformed body forwards as-is (never-hang priority).
+  }
+}
+
+/**
+ * #747 (b): the serving note for the REQUEST side — the same facts the
+ * in-content banner states, delivered in the top-level `system` of every
+ * request a substitute serves, so the model still knows its capability delta
+ * once the banners are stripped from history. Non-consuming by design: unlike
+ * `consumeStreamNotice` there is no per-session dedup — the note rides EVERY
+ * substitute-served request because the history no longer carries it.
+ */
+export function buildServingNoteForRequest(
+  role: FailoverRole,
+  step: FailoverStep,
+  stepIndex: number,
+  bucket?: string
+): string {
+  return buildStreamNoticeText(role, step, stepIndex, configArmHolding(role, bucket));
+}
+
 /** One-time stream notice for a RECOVERING role: the nominal is back. */
 function buildStreamRecoveryText(role: FailoverRole, st: RecoveryState): string {
   const roleLabel = role.charAt(0).toUpperCase() + role.slice(1);

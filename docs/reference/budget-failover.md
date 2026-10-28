@@ -307,6 +307,53 @@ factual announcement (role, model, direction) is unchanged. Standing rule for an
 wording: keep it **factual**, express capability or working scope rather than risk posture, and
 never instruct an agent to reverse prior decisions.
 
+## The serving note and the history strip (#747, arbitrated 28/10)
+
+The notices above are written for TWO readers, and the split became a defect: served models
+**imitate** the banners left in assistant history. Measured 28/10 on the hub (issue #747, po-2024
+Maintenance captures): GLM-5.3 — the sonnet *nominal* — and Kimi K3.1 Pro each OPENED a reply with a
+**forged** `[claudish] You are serving…` banner copied from history (fragmented deltas prove
+model-written; a real notice arrives as one contiguous block). A forged banner names a cascade that
+never existed ("GLM-5.3, 1st sonnet fallback" — it is the nominal), misleads the operator reading
+the IDE, and misleads the model about its own identity. Removing a model fixes nothing: the nominal
+does it too.
+
+User arbitration 28/10 ("OK pour b"): **keep the client-visible banner; move what the MODEL must
+know to the request side; strip serving banners from forwarded history.** Three pieces, wired in
+`handleWithCascade` (`proxy-server.ts`):
+
+1. **The banner is unchanged for the human** — `prependNoticeToAnthropicStream` block 0 and the
+   condensation append still fire exactly as above (doctrine 2026-08-12). The instrument to tell a
+   real banner from a forged one stays: contiguous in the raw SSE = injected; fragmented =
+   model-written (`.tmp/banner-in-resp.py` pattern, #747).
+
+2. **The request-side serving note** (`buildServingNoteForRequest`, `failover.ts`): while a
+   SUBSTITUTE serves (a cascade step, `stepIndex >= 0`), the same facts the banner states are
+   appended to the top-level `system` of the forwarded request — **every such request**, not once
+   per depth: the history no longer carries the information. Nominal attempts carry no note. The
+   note is applied around the upstream call only (mutate-before / restore-on-failure, the native
+   pin's pattern) so a walk or skip advance never double-appends into a later attempt.
+
+3. **The history strip** (`stripServingNoticesFromRequestBody`, `failover.ts`): at the top of
+   `handleWithCascade` — AFTER both routes' `logRequest` (the capture keeps the client's verbatim
+   history; the banner-count instruments read it) and before any handler sees the body — every
+   assistant text block has its serving-banner segments removed: the stream notice's own block-0
+   (whole-block drop), a FORGED banner fused to model text, and the condensation append tail.
+   Assistant-only: the imitation trigger is the *turn-opening* pattern; condensation and recovery
+   notices ride other message shapes and are deliberately untouched, as is a truncated banner (no
+   full capability tail → no cut — a wrong cut would eat real content). A message that would strip
+   to empty is left alone: structure beats completeness. Never throws.
+
+Kill switches (read per request): `CLAUDISH_FAILOVER_REQUEST_NOTE=0` (no system note) and
+`CLAUDISH_FAILOVER_NOTICE_STRIP=0` (banners travel upstream again) — independent seams. Pins:
+`serving-notice-strip.test.ts` (unit) and `proxy-server-serving-note-route.test.ts` (route — the
+upstream request body is the instrument).
+
+Known residue, accepted: the system note itself contains the banner text, so a single occurrence
+per request remains model-visible — an instruction-shaped line in `system`, not a history of
+assistant turns opening with banners, which is the pattern that triggered imitation. The operator
+`..._NOTE` tail is not stripped (free-form text; no fleet step carries one).
+
 ## `CLAUDISH_GLM_THINKING` measurements
 
 Probed 2026-08-20 against the `gc@` Coding Plan (`glm-5.3`, prompt "Reponds exactement: ok",

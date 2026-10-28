@@ -102,6 +102,8 @@ import {
   extractSessionKey,
   recordServedStepForNotices,
   servedStepForNotices,
+  stripServingNoticesFromRequestBody,
+  buildServingNoteForRequest,
   type FailoverRole,
 } from "./fork/failover.js";
 import {
@@ -1392,12 +1394,34 @@ export async function createProxyServer(
    * the SAME source of truth this loop reads — so mutating failover state between attempts
    * is enough; no override target is passed in (that would race two resolutions).
    */
+  /** #747 (b): append a note to an Anthropic payload's top-level `system`
+   * (absent, string, or block array) without mutating the original value —
+   * the loop's restore is a reference swap. Never throws. */
+  const appendSystemNote = (body: any, note: string): void => {
+    try {
+      if (body.system == null) body.system = note;
+      else if (typeof body.system === "string") body.system = `${body.system}\n\n${note}`;
+      else if (Array.isArray(body.system))
+        body.system = [...body.system, { type: "text", text: note }];
+    } catch {
+      // The note is advisory — never let it fail the request.
+    }
+  };
+
   const handleWithCascade = async (
     c: Context,
     body: any,
     requestedModel: string,
     nominalBucket?: string
   ): Promise<Response> => {
+    // #747 (b): serving banners never travel upstream. Stripped HERE — after
+    // both routes' logRequest (the capture keeps the client's verbatim
+    // history; the banner-count instruments read it) and before any handler
+    // sees the body, so every attempt of every path (native lane included)
+    // forwards clean history. Kill switch: CLAUDISH_FAILOVER_NOTICE_STRIP=0.
+    if ((process.env.CLAUDISH_FAILOVER_NOTICE_STRIP || "").trim() !== "0") {
+      stripServingNoticesFromRequestBody(body);
+    }
     // #348: the walk's time budget is measured from HERE — the moment the
     // request entered the cascade. The nominal attempt's full cost (transport
     // retry ladder + patient backoff + its own latency) counts against it,
@@ -1830,7 +1854,26 @@ export async function createProxyServer(
       } else {
         if (budgetDecision) releaseBudget = budgetDecision.commit();
         openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+        // #747 (b): while a SUBSTITUTE serves, it learns its capability delta
+        // from the request side — appended to the top-level `system` of every
+        // such request (the banners are stripped from history, and the
+        // in-content banner fires once per depth for the HUMAN). Computed and
+        // applied HERE, around the upstream call only: the budget-skip and
+        // walk paths below `continue` without paying the handler, and a note
+        // applied before them would leak into the next attempt's
+        // `systemBeforeNote` and double-append. Same mutate-before /
+        // restore-on-failure pattern as the native pin above — the mutation
+        // never outlives the attempt that earned it. Nominal attempts
+        // (stepIndex -1) carry no note. Kill switch: CLAUDISH_FAILOVER_REQUEST_NOTE=0.
+        const servingNote =
+          role && stepIndex >= 0 && resolved.step &&
+          (process.env.CLAUDISH_FAILOVER_REQUEST_NOTE || "").trim() !== "0"
+            ? buildServingNoteForRequest(role, resolved.step, stepIndex, bucket)
+            : null;
+        const systemBeforeNote = body.system;
+        if (servingNote) appendSystemNote(body, servingNote);
         response = await handler.handle(c, body);
+        if (servingNote && !response.ok) body.system = systemBeforeNote;
         if (pinnedModel && !response.ok) body.model = modelBeforePin;
       }
       if (releaseBudget && response) {

@@ -253,6 +253,12 @@ services:
       # overflowed/busy cascade step surfaces its recovery turn / waits
       # unbounded instead of skipping forward). Read-per-request.
       - CLAUDISH_FAILOVER_STEP_SKIP=${CLAUDISH_FAILOVER_STEP_SKIP:-}
+      # #747 — serving-note kill switches, read per request: "0" on REQUEST_NOTE
+      # drops the system-side substitution note; "0" on NOTICE_STRIP lets
+      # serving banners travel upstream in the history again (today's
+      # pre-#747 behavior). Unset = on.
+      - CLAUDISH_FAILOVER_REQUEST_NOTE=${CLAUDISH_FAILOVER_REQUEST_NOTE:-}
+      - CLAUDISH_FAILOVER_NOTICE_STRIP=${CLAUDISH_FAILOVER_NOTICE_STRIP:-}
       # #431 — how long a CASCADE STEP attempt waits for an endpoint
       # concurrency slot before skipping forward (ms). Default 2000; 0 = off
       # (unbounded FIFO). The nominal path never reads it. Read-per-request.
