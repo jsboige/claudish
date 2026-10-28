@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Persist the local claudish proxy's RELAY MODE over time (read-only).
 
@@ -98,11 +98,9 @@ function Add-LogLine([string]$line) {
     # AppendAllText with an explicit no-BOM encoding: Out-File/-Encoding utf8
     # writes a BOM on PowerShell 5.1 and would corrupt the first line of a
     # fresh file (global rule: UTF-8 BOM breaks parsers).
-    [System.IO.File]::AppendAllText(
-        $LogPath,
-        $line + "`n",
-        (New-Object System.Text.UTF8Encoding($false))
-    )
+    # Single line on purpose: the ledger-confinement test reads the target of
+    # every write from the SAME line, so a wrapped call would escape the guard.
+    [System.IO.File]::AppendAllText($LogPath, $line + "`n", (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function New-Sample {
@@ -197,15 +195,22 @@ function Show-Report {
     Write-Output ("transitions : {0}" -f $transitions.Count)
     foreach ($t in $transitions) { Write-Output "  $t" }
 
+    # Restart detection walks forward against the last sample that HAD an
+    # instance, not against the adjacent line. An UNAVAILABLE sample carries no
+    # instance and no uptime, so an adjacent-only comparison silently swallows
+    # the restart that follows an outage - the very moment it is most likely.
     $restarts = @()
-    for ($i = 1; $i -lt $samples.Count; $i++) {
-        $prev = $samples[$i - 1]
-        $cur = $samples[$i]
-        $movedInstance = ($prev.instance -and $cur.instance -and $prev.instance -ne $cur.instance -and $cur.instance -ne "none")
-        $upWentBack = ($prev.up -match '^\d+$') -and ($cur.up -match '^\d+$') -and ([int]$cur.up -lt [int]$prev.up)
-        if ($movedInstance -or $upWentBack) {
-            $restarts += ("{0}  instance {1} -> {2}, up {3} -> {4}" -f $cur.stamp, $prev.instance, $cur.instance, $prev.up, $cur.up)
+    $prevKnown = $null
+    foreach ($cur in $samples) {
+        if (-not $cur.instance -or $cur.instance -eq "none") { continue }
+        if ($null -ne $prevKnown) {
+            $movedInstance = ($prevKnown.instance -ne $cur.instance)
+            $upWentBack = ($prevKnown.up -match '^\d+$') -and ($cur.up -match '^\d+$') -and ([int]$cur.up -lt [int]$prevKnown.up)
+            if ($movedInstance -or $upWentBack) {
+                $restarts += ("{0}  instance {1} -> {2}, up {3} -> {4}" -f $cur.stamp, $prevKnown.instance, $cur.instance, $prevKnown.up, $cur.up)
+            }
         }
+        $prevKnown = $cur
     }
     Write-Output ("restarts    : {0}" -f $restarts.Count)
     foreach ($r in $restarts) { Write-Output "  $r" }
