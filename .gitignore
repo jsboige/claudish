@@ -49,6 +49,7 @@ all-models.json
 # fleet shares it through this repo. Machine-local state below stays untracked.
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+.claude/settings.local.json
 .claudemem/
 
 # npm lockfile (we use bun.lock)
