@@ -62,17 +62,31 @@ describe("prependNoticeToAnthropicStream — SSE boundary loop", () => {
       prependNoticeToAnthropicStream(chunkedStream([head, tail]), "NOTICE-TEXT")
     );
 
+    // STRICT parse: every \n\n-delimited segment must be a well-formed event
+    // (starts with "event:"). A boundary loop that consumes too few or too many
+    // separator bytes leaves stray "\n" prefixes that this catches and the
+    // loose contains-checks do not.
+    const segments = out.split("\n\n").filter((s) => s !== "");
+    for (const seg of segments) {
+      expect(seg.startsWith("event: ")).toBe(true);
+    }
+    // Exact ordered sequence: message_start passes through untouched, the
+    // three notice frames land immediately BEFORE the first real content
+    // block (not at the very head), and the real block/delta shift to index 1.
+    expect(segments.map((s) => s.split("\ndata:")[0])).toEqual([
+      "event: message_start",
+      "event: content_block_start", // notice frame (index 0)
+      "event: content_block_delta", // notice text
+      "event: content_block_stop", // notice frame close
+      "event: content_block_start", // real block, shifted to index 1
+      "event: content_block_delta", // real delta, shifted to index 1
+    ]);
     // The notice frames lead, ahead of the first real content block.
-    const noticeAt = out.indexOf('"text":"NOTICE-TEXT"');
-    expect(noticeAt).toBeGreaterThan(-1);
+    expect(out).toContain('"text":"NOTICE-TEXT"');
     // The first real content_block event is shifted to index 1 (notice owns 0).
     expect(out).toContain('"type":"content_block_start","index":1');
     // The straddled event kept its payload intact across the chunk split.
     expect(out).toContain('"type":"text_delta","text":"hello"');
-    // Every whole event is terminated; notice frames precede the first block.
-    expect(out.indexOf("event: content_block_start")).toBeLessThan(
-      out.indexOf('"type":"content_block_delta","index":1')
-    );
   });
 
   it("flushes a trailing partial event (no closing blank line) verbatim", async () => {
@@ -90,6 +104,11 @@ describe("prependNoticeToAnthropicStream — SSE boundary loop", () => {
       )
     );
 
+    // Same strict segment parse on the whole events only.
+    const segments = out.split("\n\n").filter((s) => s !== "");
+    for (const seg of segments) {
+      expect(seg.startsWith("event: ")).toBe(true);
+    }
     // Whole event processed (shifted), partial byte-for-byte at the tail.
     expect(out).toContain('"type":"content_block_delta","index":1');
     expect(out.endsWith(partial)).toBe(true);
