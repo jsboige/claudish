@@ -24,6 +24,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Baseline measurability: without a manual trigger, no run can exist on a
+  # branch that receives no PRs (replatform/v14, a maintenance branch), so
+  # "reduced against the baseline" had no commensurable number — only local
+  # counters, which a Windows seat's CRLF checkout inflates by orders of
+  # magnitude (#723 / DM 2026-10-27 23:30Z). Dispatch runs the workflow file
+  # AS OF THE SELECTED REF, so a baseline run on X measures X's tree.
+  workflow_dispatch:
 
 # A superseded push should not keep burning a runner.
 concurrency:
