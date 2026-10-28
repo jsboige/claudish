@@ -418,10 +418,24 @@ function Invoke-SeatAudit {
         Write-Output "  cascade          : no role cascade armed by value (an empty cascade is a parachute with no fabric)"
     }
     Write-Output ("  nominal bucket   : {0} ({1})" -f $NominalBucket, $report['nominal_bucket_source'])
+    # Config home resolved and printed BEFORE any verdict branch, fabric gate
+    # included: WHICH file a fuel read would consult is part of the measurement
+    # even when the fabric is missing (fleet rule, ai-01 2026-10-28: a verdict
+    # is only readable next to the file it read - po-2027's fabric-less NO-FUEL
+    # printed no line at all before this hoist).
+    $configHome = Get-ConfigHomeResolution -Name $ContainerName -ExplicitHome $ClaudishHome -HostFallback $HostHomeFallback
+    $report['config_home'] = $configHome.Path
+    $report['config_home_source'] = $configHome.Source
+    Write-Output ("  config home      : {0} ({1})" -f $configHome.Path, $configHome.Source)
 
     if ($armed.Count -eq 0 -or $cascadeRoles.Count -eq 0) {
         Write-Output "seat-readiness: NO-FUEL"
         Write-Output "  reason: no cascade armed BY VALUE in this container (in AUTONOMOUS the sidecar runs its own cascade, never the hub's)"
+        if (-not $configHome.IsProofGrade) {
+            # Same guard as the late NO-FUEL below: a verdict read from the host
+            # default proves nothing about a container that mounts another home.
+            Write-Output ("  INCONCLUSIVE     : config source was '{0}' - not the container's mount, so this NO-FUEL is NOT a proof; re-run with -ClaudishHome <mounted path>" -f $configHome.Path)
+        }
         $script:AuditExitCode = 1
         return
     }
@@ -432,10 +446,6 @@ function Invoke-SeatAudit {
     # Second fuel source, read once. Stated in the output whether it worked or
     # not: a source consulted silently is how the false NO-FUEL of 2026-10-28
     # happened in the first place.
-    # Printed BEFORE the verdict either way: WHICH file was read is part of the
-    # measurement, not a detail (po-2025 read the host copy for a day and called
-    # a serving seat NO-FUEL). Resolved once, above, so every path carries it.
-    Write-Output $homeLine
     $configKeys = Get-ConfigApiKeyNames $configHome.Path
     if ($null -eq $configKeys) {
         Write-Output ("  fuel sources     : env only - config unreadable at {0}\apiKeys (a seat whose keys live only there reads NO-FUEL on this source's silence)" -f $configHome.Path)

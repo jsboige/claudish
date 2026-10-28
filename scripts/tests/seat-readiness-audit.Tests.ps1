@@ -215,6 +215,21 @@ Describe 'seat-readiness-audit' {
             $r.Out | Should -Match 'parachute with no fabric'
         }
 
+        It 'a fabric-less NO-FUEL still names the config home it would have read (fleet rule: verdict + file travel together)' {
+            $r = Invoke-Audit -EnvLines (New-SeatEnv '')
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'config home      : .+ \(explicit -ClaudishHome\)'
+            # Proof-grade source (explicit): no INCONCLUSIVE marker.
+            $r.Out | Should -Not -Match 'INCONCLUSIVE'
+        }
+
+        It 'the fabric-less NO-FUEL from a host-default config source is marked INCONCLUSIVE too' {
+            $r = Invoke-Audit -EnvLines (New-SeatEnv '') -NoExplicitHome
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'config home      : .+ \(host default'
+            $r.Out | Should -Match 'INCONCLUSIVE'
+        }
+
         It 'the mutation from #730: flipping the cascade to empty flips READY -> NO-FUEL' {
             $ready = Invoke-Audit -EnvLines (New-SeatEnv 'zai@glm-4.5-air>ds@deepseek-flash')
             $ready.Code | Should -Be 0
