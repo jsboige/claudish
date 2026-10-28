@@ -18,9 +18,14 @@ Counting traps this script exists to avoid
    both halves name the same `N` AND the response timestamp falls inside
    [req_ts, req_ts + MAX_STREAM_S]; everything else is reported UNMATCHED, never
    guessed.
-2. The capture directory is FLAT and holds ~500k files. `glob` dies there (>120 s,
+2. The capture directory is FLAT and holds ~145k files. `glob` dies there (>120 s,
    and returns an EMPTY set under write load — silence is not "no traffic").
-   One `os.scandir` pass, no glob, no recursion.
+   One `os.scandir` pass, no glob, no recursion — and NO `is_file()`: on a
+   Docker-Desktop bind mount each stat costs ~14 ms, measured 2026-10-28 as
+   5.6 s of CPU inside 35 min of wall clock for a 24 h run (I/O-blocked on
+   145k per-entry stats, not on work). The name decides; the regexes already
+   require a .json/.sse suffix. Body reads are bounded by --max-pairs and the
+   overflow is REPORTED, never silently dropped.
 3. A role is read from the request BODY, never inferred from the served model:
    `glm-5.3` serves sonnet, fable and haiku requests alike.
 4. PAYG is decided by an explicit MODEL -> PLAN table (below), never by "not
@@ -146,14 +151,18 @@ def read_requested_model(path: str) -> str:
     return m.group(1) if m else ""
 
 
-def scan(captures: str, since_ts: float, until_ts: float):
-    """One pass over the flat capture dir. Returns (pairs, stats)."""
+def scan(captures: str, since_ts: float, until_ts: float, max_pairs: int = 4000):
+    """One pass over the flat capture dir. Returns (pairs, stats).
+
+    No `entry.is_file()`: on a Docker-Desktop bind mount every stat costs ~14 ms
+    here (MEASURED 2026-10-28: 145k entries, 5.6 s of CPU in 35 min of wall
+    clock - the scan was I/O-blocked on per-entry stats, not on work). The name
+    decides, and the regexes already require a `.json`/`.sse` suffix, so a
+    directory can never match. Directory enumeration alone is fast.
+    """
     reqs = defaultdict(list)   # N -> [(ts, path, raw_ts)]
     resps = defaultdict(list)  # N -> [(ts, model, raw_ts)]
-    seen = 0
     for entry in os.scandir(captures):
-        if not entry.is_file():
-            continue
         name = entry.name
         if name.startswith("req-"):
             m = REQ_RE.match(name)
@@ -163,7 +172,6 @@ def scan(captures: str, since_ts: float, until_ts: float):
             if ts is None or ts < since_ts or ts > until_ts:
                 continue
             reqs[m.group(2)].append((ts, entry.path, m.group(3)))
-            seen += 1
         elif name.startswith("resp-"):
             m = RESP_RE.match(name)
             if not m:
@@ -175,11 +183,19 @@ def scan(captures: str, since_ts: float, until_ts: float):
     pairs = []
     unmatched = 0
     ambiguous = 0
+    capped = 0
     for n, items in reqs.items():
         cand = sorted(resps.get(n, []))
         for ts, path, raw in items:
             ok = [c for c in cand if ts <= c[0] <= ts + MAX_STREAM_S]
             if len(ok) == 1:
+                # The body read is the other measured cost (one open per pair).
+                # Past the bound the pair is counted as capped, NEVER silently
+                # dropped: a truncated window that reports itself complete is
+                # the same lie as a glob returning an empty set.
+                if len(pairs) >= max_pairs:
+                    capped += 1
+                    continue
                 pairs.append((read_requested_model(path), ok[0][1], raw, ok[0][2]))
             elif not ok:
                 unmatched += 1
@@ -187,7 +203,8 @@ def scan(captures: str, since_ts: float, until_ts: float):
                 ambiguous += 1
     return pairs, {"requests": sum(len(v) for v in reqs.values()),
                    "responses": sum(len(v) for v in resps.values()),
-                   "matched": len(pairs), "unmatched": unmatched, "ambiguous": ambiguous}
+                   "matched": len(pairs), "unmatched": unmatched, "ambiguous": ambiguous,
+                   "capped": capped}
 
 
 def aggregate(pairs):
@@ -205,7 +222,9 @@ def render(by_role, served, stats, hours):
     out = []
     out.append(f"PAYG by role — last {hours} h (capture pairs)")
     out.append(f"pairs: {stats['matched']} matched / {stats['requests']} requests "
-               f"({stats['unmatched']} unmatched, {stats['ambiguous']} ambiguous)")
+               f"({stats['unmatched']} unmatched, {stats['ambiguous']} ambiguous"
+               + (f", {stats['capped']} CAPPED - raise --max-pairs" if stats.get("capped") else "")
+               + ")")
     out.append("")
     out.append(f"{'role':8} {'n':>6} {'payg':>6} {'payg%':>6}  plans")
     for role in sorted(by_role, key=lambda r: -sum(by_role[r].values())):
@@ -282,6 +301,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="PAYG share per role, from capture pairs")
     ap.add_argument("--captures", default=r"D:/claudish-captures")
     ap.add_argument("--hours", type=float, default=24.0)
+    ap.add_argument("--max-pairs", type=int, default=4000,
+                    help="bound on request-body reads (one open per pair); "
+                         "overflow is reported as CAPPED, never dropped silently")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--print-table", action="store_true")
     ap.add_argument("--selftest", action="store_true")
@@ -296,7 +318,7 @@ def main(argv=None):
 
     now = time.time()
     since = now - args.hours * 3600
-    pairs, stats = scan(args.captures, since, now)
+    pairs, stats = scan(args.captures, since, now, max_pairs=args.max_pairs)
     if not pairs:
         print("no capture pair in the window — a quiet dir and an unreadable dir "
               "look alike, check --captures before concluding 'no PAYG'")
