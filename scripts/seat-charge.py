@@ -88,7 +88,12 @@ def iter_messages(paths, cutoff_iso):
                 if not isinstance(entry["message"].get("usage"), dict):
                     continue
                 ts = entry.get("timestamp") or ""
-                if ts[:4] != "2026" or ts < cutoff_iso:
+                # The cutoff compare alone carries the window: an empty or
+                # garbage timestamp sorts before any ISO cutoff and is dropped,
+                # and nothing here depends on the current year. (The original
+                # `ts[:4] != "2026"` guard expired silently on 2027-01-01 and
+                # would have emptied every window - review #735.)
+                if ts < cutoff_iso:
                     continue
                 yield ws, entry
 
@@ -266,6 +271,18 @@ SELFTEST_LINES = [
             "usage": {"input_tokens": 7, "output_tokens": 7},
         },
     },
+    # Empty timestamp (garbage line): dropped by the cutoff compare alone -
+    # the pin for the removed year guard, which would have expired 2027-01-01
+    # (review #735).
+    {
+        "timestamp": "",
+        "requestRef": "r3",
+        "requestedModel": "claude-sonnet-5-5",
+        "message": {
+            "model": "swift-1.5-27b",
+            "usage": {"input_tokens": 3, "output_tokens": 3},
+        },
+    },
 ]
 
 
@@ -276,8 +293,30 @@ def selftest():
         with open(os.path.join(ws_dir, "s.jsonl"), "w", encoding="utf-8") as fh:
             for entry in SELFTEST_LINES:
                 fh.write(json.dumps(entry) + "\n")
-        paths = glob.glob(os.path.join(tmp, "*", "*.jsonl"))
+        # A row the ORIGINAL `ts[:4] != "2026"` guard would have thrown away:
+        # same shape, dated 2027. Kept in its own file so the 2026 window above
+        # is untouched, and counted under a 2027 cutoff below - that is the only
+        # check that actually discriminates the guard's removal (an empty
+        # timestamp is dropped either way).
+        future_path = os.path.join(ws_dir, "future.jsonl")
+        with open(future_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "timestamp": "2027-03-15T10:00:00Z",
+                        "requestRef": "r4",
+                        "requestedModel": "claude-sonnet-5-5",
+                        "message": {
+                            "model": "glm-5.3",
+                            "usage": {"input_tokens": 4, "output_tokens": 4},
+                        },
+                    }
+                )
+                + "\n"
+            )
+        paths = [os.path.join(ws_dir, "s.jsonl")]
         rows, requests = aggregate(paths, "2026-10-28T00:00:00Z")
+        _, requests_2027 = aggregate(paths + [future_path], "2027-03-01T00:00:00Z")
         checks = [
             ("two requests, not four entries", requests, 2),
             (
@@ -295,7 +334,17 @@ def selftest():
                 "d--dev-selftest|claude-haiku-5-5->swift-1.5-27b" in rows,
                 False,
             ),
+            (
+                "empty timestamp dropped by the cutoff compare alone",
+                "d--dev-selftest|claude-sonnet-5-5->swift-1.5-27b" in rows,
+                False,
+            ),
             ("requested/served pair kept separate", len(rows), 2),
+            (
+                "a 2027 window still counts (the removed year guard)",
+                requests_2027,
+                1,
+            ),
         ]
         failed = 0
         for label, got, want in checks:
