@@ -54,6 +54,20 @@
   The config read follows the same firewall as the env read: NAMES and
   presence only, values never leave the function.
 
+  WHICH HOME, though - and this is where source two went wrong next
+  (2026-10-28, third false NO-FUEL of the day). The audit used to read
+  `$env:USERPROFILE\.claudish`, a HOST path. The path the proxy actually reads
+  is whatever the container mounts on its own `~/.claudish`, and on po-2025
+  that is `D:\claudish-shadow\config` - a DIFFERENT file, carrying
+  MISTRAL_API_KEY, DEEPSEEK_API_KEY and QWEN_TOKEN_PLAN_API_KEY that the host
+  copy does not have. The audit read six names from the wrong file and called a
+  READY seat NO-FUEL while the hub was serving deepseek-flash every minute.
+  Precedence, stated in the output: explicit -ClaudishHome, else the
+  container's own mount (resolved by docker inspect), else the host default -
+  and a NO-FUEL rendered from that last fallback is marked INCONCLUSIVE, never
+  a proof. Same doctrine as above, one layer down: a source consulted against
+  the wrong path lies silently.
+
 .PARAMETER ContainerName
   The sidecar container to inspect. Default claudish-sidecar.
 
@@ -75,7 +89,16 @@
 param(
     [string]$ContainerName = "claudish-sidecar",
     [string]$NominalBucket = "zai",
-    [string]$ClaudishHome = (Join-Path $env:USERPROFILE ".claudish")
+    # Empty means "resolve it": the container's own mount wins over the host
+    # default, because the host default is not the file the proxy reads on any
+    # seat that mounts a shadow config (po-2025). Pass a value to pin the path,
+    # which is also what the test suite does to stay off the real machine.
+    [string]$ClaudishHome = "",
+    # The path used when neither -ClaudishHome nor a container mount resolves.
+    # Empty means $env:USERPROFILE\.claudish. Exposed so the suite can stay off
+    # the running machine's real home (a verdict that depends on whose seat runs
+    # the tests is the failure mode this repo keeps paying for).
+    [string]$HostHomeFallback = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -213,6 +236,66 @@ function Get-ConfigApiKeyNames([string]$HomePath) {
     return $map
 }
 
+function Get-ContainerConfigHome([string]$Name) {
+    # The claudish home the CONTAINER reads, not the one the host happens to
+    # have: config.json -> apiKeys reaches the proxy through the mount whose
+    # destination is the container's ~/.claudish. Returns that host path, or
+    # $null when the container publishes no such mount (then the caller falls
+    # back and SAYS SO - the fallback is where the third false NO-FUEL came
+    # from, 2026-10-28).
+    #
+    # Paths only: a mount table carries no credential, but it is still read
+    # through the same isolated wrapper so the tests can mock docker as native.
+    try {
+        $lines = @(& docker inspect $Name --format "{{range .Mounts}}{{.Source}}|{{.Destination}}{{println}}{{end}}" 2>$null)
+    }
+    catch { return $null }
+    $fallback = $null
+    foreach ($line in $lines) {
+        if (-not $line) { continue }
+        $parts = @($line.Trim() -split '\|')
+        if ($parts.Count -lt 2) { continue }
+        $src = $parts[0].Trim()
+        $dest = $parts[1].Trim()
+        if (-not $src) { continue }
+        # Exact destination wins: it is the one ~/.claudish the proxy resolves.
+        if ($dest -eq '/root/.claudish' -or $dest -eq '/home/claudish/.claudish') { return $src }
+        if ($dest -match '(^|/)\.claudish/?$') { if (-not $fallback) { $fallback = $src } }
+    }
+    return $fallback
+}
+
+function Get-ConfigHomeResolution([string]$Name, [string]$ExplicitHome, [string]$HostFallback) {
+    # Precedence, each branch named in the output: an explicit -ClaudishHome
+    # (the test suite pins this to stay off the real machine), else the
+    # container's own mount, else the host default.
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitHome)) {
+        return [pscustomobject]@{
+            Path = $ExplicitHome
+            Source = 'explicit -ClaudishHome'
+            IsContainerMount = $false
+            IsProofGrade = $true
+        }
+    }
+    $mounted = Get-ContainerConfigHome $Name
+    if ($mounted) {
+        return [pscustomobject]@{
+            Path = $mounted
+            Source = 'container mount -> ' + $mounted
+            IsContainerMount = $true
+            IsProofGrade = $true
+        }
+    }
+    $hostHome = $HostFallback
+    if ([string]::IsNullOrWhiteSpace($hostHome)) { $hostHome = Join-Path $env:USERPROFILE '.claudish' }
+    return [pscustomobject]@{
+        Path = $hostHome
+        Source = 'host default (no container mount of ~/.claudish found)'
+        IsContainerMount = $false
+        IsProofGrade = $false
+    }
+}
+
 # --- the audit --------------------------------------------------------------
 
 function Invoke-SeatAudit {
@@ -305,9 +388,16 @@ function Invoke-SeatAudit {
     # Second fuel source, read once. Stated in the output whether it worked or
     # not: a source consulted silently is how the false NO-FUEL of 2026-10-28
     # happened in the first place.
-    $configKeys = Get-ConfigApiKeyNames $ClaudishHome
+    $configHome = Get-ConfigHomeResolution -Name $ContainerName -ExplicitHome $ClaudishHome -HostFallback $HostHomeFallback
+    $report['config_home'] = $configHome.Path
+    $report['config_home_source'] = $configHome.Source
+    # Printed BEFORE the verdict either way: WHICH file was read is part of the
+    # measurement, not a detail (po-2025 read the host copy for a day and called
+    # a serving seat NO-FUEL).
+    Write-Output ("  config home      : {0} ({1})" -f $configHome.Path, $configHome.Source)
+    $configKeys = Get-ConfigApiKeyNames $configHome.Path
     if ($null -eq $configKeys) {
-        Write-Output ("  fuel sources     : env only - config unreadable at {0}\apiKeys (a seat whose keys live only there reads NO-FUEL on this source's silence)" -f $ClaudishHome)
+        Write-Output ("  fuel sources     : env only - config unreadable at {0}\apiKeys (a seat whose keys live only there reads NO-FUEL on this source's silence)" -f $configHome.Path)
     }
     else {
         Write-Output ("  fuel sources     : env + config ({0} apiKey name(s) in the mounted home; values never read out)" -f $configKeys.Count)
@@ -355,6 +445,11 @@ function Invoke-SeatAudit {
         Write-Output "  reason: every armed cascade is monobucket-vs-nominal - no rung outside the wall"
     } else {
         Write-Output "  reason: no credential resolvable in any non-nominal rung bucket (env names checked by presence only)"
+        if (-not $configHome.IsProofGrade) {
+            # A NO-FUEL is only ever as good as the file it read. From the host
+            # default on a seat that mounts a shadow home, it proves nothing.
+            Write-Output ("  INCONCLUSIVE     : config source was '{0}' - not the container's mount, so this NO-FUEL is NOT a proof; re-run with -ClaudishHome <mounted path>" -f $configHome.Path)
+        }
     }
     $script:AuditExitCode = 1
     return
