@@ -37,6 +37,7 @@ BeforeAll {
         DockerVersion = '24.0.7'
         PsLine        = 'claudish-sidecar|running'
         EnvLines      = @()
+        MountLines    = @()
     }
 
     function Invoke-Audit {
@@ -45,7 +46,12 @@ BeforeAll {
             [string]$PsLine = 'claudish-sidecar|running',
             [string]$DockerVersion = '24.0.7',
             [string]$NominalBucket,
-            [hashtable]$ConfigApiKeys
+            [hashtable]$ConfigApiKeys,
+            # Mount table the mocked docker inspect returns. A config only
+            # reachable through the mount is the point of the 2026-10-28 pin.
+            [hashtable]$MountedConfigApiKeys,
+            [switch]$NoExplicitHome,
+            [string]$HostHomeFallback
         )
         $global:SRAState.DockerVersion = $DockerVersion
         $global:SRAState.PsLine = $PsLine
@@ -66,7 +72,34 @@ BeforeAll {
                 (New-Object System.Text.UTF8Encoding($false))
             )
         }
-        $callArgs = @{ ClaudishHome = $auditHome }
+        if ($MountedConfigApiKeys) {
+            $mountHome = Join-Path $TestDrive ("mount-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Path $mountHome -Force | Out-Null
+            $mjson = @{ version = '1'; apiKeys = $MountedConfigApiKeys } | ConvertTo-Json -Depth 4
+            [System.IO.File]::WriteAllText(
+                (Join-Path $mountHome 'config.json'),
+                $mjson,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            $global:SRAState.MountLines = @("$mountHome|/root/.claudish")
+        }
+        else {
+            $global:SRAState.MountLines = @()
+        }
+        $callArgs = @{}
+        if ($NoExplicitHome) {
+            # The host fallback is ALWAYS redirected to a sandbox: a test that
+            # let the audit reach $env:USERPROFILE\.claudish would read the real
+            # seat and pass or fail by whose machine ran it.
+            if (-not $HostHomeFallback) {
+                $HostHomeFallback = Join-Path $TestDrive ("fallback-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+                New-Item -ItemType Directory -Path $HostHomeFallback -Force | Out-Null
+            }
+            $callArgs['HostHomeFallback'] = $HostHomeFallback
+        }
+        else {
+            $callArgs['ClaudishHome'] = $auditHome
+        }
         if ($NominalBucket) { $callArgs['NominalBucket'] = $NominalBucket }
         $out = & $script:AuditPath @callArgs 2>&1 | Out-String
         [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
@@ -102,7 +135,10 @@ BeforeAll {
         if ($a.Count -eq 0) { return $null }
         if ($a[0] -eq 'info') { return $global:SRAState.DockerVersion }
         if ($a[0] -eq 'ps') { return $global:SRAState.PsLine }
-        if ($a[0] -eq 'inspect') { return $global:SRAState.EnvLines }
+        if ($a[0] -eq 'inspect') {
+            if (($a -join ' ') -match 'Mounts') { return $global:SRAState.MountLines }
+            return $global:SRAState.EnvLines
+        }
         return $null
     }
 
@@ -118,6 +154,16 @@ BeforeAll {
             'CLAUDISH_FAILOVER_ACTIVE=sonnet'
         )
     }
+    # No provider credential name in env, and the config is supplied only where
+    # the caller points it: the 2026-10-28 mount-vs-host pin builds on this.
+    function New-NoHomeKeyEnv {
+        @(
+            'PATH=/usr/bin',
+            'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
+            'CLAUDISH_FAILOVER_SONNET=ds@deepseek-flash',
+            'CLAUDISH_FAILOVER_ACTIVE=sonnet'
+        )
+    }
 }
 
 Describe 'seat-readiness-audit' {
@@ -126,6 +172,7 @@ Describe 'seat-readiness-audit' {
         $global:SRAState.DockerVersion = '24.0.7'
         $global:SRAState.PsLine = 'claudish-sidecar|running'
         $global:SRAState.EnvLines = @()
+        $global:SRAState.MountLines = @()
     }
 
     Context 'READY - the full fabric' {
@@ -317,6 +364,47 @@ Describe 'seat-readiness-audit' {
                 $r.Out | Should -Not -Match 'sk-FAKE-ZAI-77'
                 $r.Out | Should -Not -Match 'sk-FAKE-DS-42'
             }
+        }
+    }
+
+    Context 'WHICH home: the file the CONTAINER reads (third false NO-FUEL, 2026-10-28)' {
+        # po-2025 measured 2026-10-28: the container mounts
+        # D:\claudish-shadow\config on /root/.claudish, while the audit read the
+        # HOST file $env:USERPROFILE\.claudish. The two differ by exactly the
+        # three credentials the sonnet cascade needs, so a seat serving
+        # deepseek-flash every minute audited NO-FUEL. Fuel present in one file
+        # and absent in the other is the whole fixture.
+        # (fixture helper New-NoHomeKeyEnv lives in BeforeAll: a function declared
+        # in a Context is not reliably visible inside It bodies - same trap the
+        # header documents for variables.)
+
+        It 'a credential reachable only THROUGH the container mount reads READY' {
+            $r = Invoke-Audit -EnvLines (New-NoHomeKeyEnv) -NoExplicitHome `
+                -MountedConfigApiKeys @{ DEEPSEEK_API_KEY = 'sk-FAKE-DS-42' }
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'seat-readiness: READY'
+            $r.Out | Should -Match 'config home\s+: .*\(container mount -> '
+            $r.Out | Should -Match "bucket 'deepseek' has config apiKey 'DEEPSEEK_API_KEY' set"
+            $r.Out | Should -Not -Match 'sk-FAKE-DS-42'
+        }
+
+        It 'THE PIN: no mount + an empty host fallback -> NO-FUEL, marked INCONCLUSIVE (not a proof)' {
+            $r = Invoke-Audit -EnvLines (New-NoHomeKeyEnv) -NoExplicitHome
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'seat-readiness: NO-FUEL'
+            $r.Out | Should -Match 'config home\s+: .*\(host default'
+            $r.Out | Should -Match 'INCONCLUSIVE'
+            $r.Out | Should -Match 'NOT a proof'
+        }
+
+        It 'an explicit -ClaudishHome wins over the container mount (precedence, and it is proof-grade)' {
+            # The explicit sandbox home is empty while the mount carries the key:
+            # a READY here would mean the mount overrode the caller.
+            $r = Invoke-Audit -EnvLines (New-NoHomeKeyEnv) `
+                -MountedConfigApiKeys @{ DEEPSEEK_API_KEY = 'sk-FAKE-DS-42' }
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'config home\s+: .*\(explicit -ClaudishHome\)'
+            $r.Out | Should -Not -Match 'INCONCLUSIVE'
         }
     }
 }
