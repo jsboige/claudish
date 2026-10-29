@@ -46,6 +46,15 @@
  * call, not this PR's (QUEUE v17: "AC répond au trou sans changer production
  * pour le banc").
  *
+ * ⚠ SCOPE — this file lands on MAIN, and it describes MAIN's native lane.
+ * The v14 port is a DIFFERENT tree with a different passthrough: #722's own
+ * body (wire #7) states that v14's `native-handler.ts` has a real cancel path
+ * ("cap.done cancel-aware — v14's passthrough has a real cancel path, main's
+ * doesn't"). That is RAPPORTÉ (from #722's body), NOT measured here — this
+ * bench ran on main. The cancel facts below must therefore be read as "main's
+ * native lane", and the v14 bench has to re-measure the same three points
+ * before the read-back table can carry them.
+ *
  * The credential used here is a literal non-secret dummy (`sk-ant-…-stub`):
  * it only has to satisfy the Anthropic-shape predicate so the #296 refusal
  * does not fire. No real key, no key fragment, no network.
