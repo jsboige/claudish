@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Generate this machine's row of the #291 relay+sidecar control matrix, from
 live objects only - never from intent, never from a hand-maintained table.
