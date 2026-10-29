@@ -94,6 +94,7 @@ import {
   ARM_TTL_MAX_MS,
   NATIVE_BUCKET,
   parseResetAtFromBody,
+  stepFailBodyClass,
   resetStepSuccess,
   resolveTransientStep,
   onNominalSuccess,
@@ -2301,7 +2302,12 @@ export async function createProxyServer(
         }
         // Loud on purpose: advancing must never be silent, or a persistently sick
         // step is indistinguishable from a healthy cascade.
-        const why = `HTTP ${response.status} (non-quota) from step ${stepIndex}`;
+        // #739(b): the body's structured identity rides the marker (code/type
+        // tokens only — see stepFailBodyClass). Without it, two 400s from the
+        // same provider are indistinguishable after the container dies, and the
+        // unrecognized one leaves no trace anywhere to compare against.
+        const bodyClass = stepFailBodyClass(errBody);
+        const why = `HTTP ${response.status} (non-quota) from step ${stepIndex}${bodyClass ? `; body=${bodyClass}` : ""}`;
         log(`[Failover] STEP-ADVANCE ${role} — ${why}; trying next step`, true);
         // Marked, not merely skipped: the first backoff rung is 10 min, so a transient
         // blip costs one short skip of a step that has a live successor — whereas not
