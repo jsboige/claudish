@@ -45,10 +45,15 @@
 # DRY RUN before installing (Register-ScheduledTask has no -WhatIf):
 #   powershell -ExecutionPolicy Bypass -File <this file> -ClaudishHome $env:TEMP\el-dry
 # then inspect %TEMP%\el-dry\eventloop-blocked.log — the line is the one the
-# task will write, produced by the same code path. Only then install:
-#   schtasks /create /tn "ClaudishEventLoopSampler" /tr "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File D:\dev\claudish\scripts\eventloop-sampler.ps1" /sc minute /mo 1 /f
-# and verify by RE-READING the registered task, never by trusting the create:
+# task will write, produced by the same code path. The install recipe lives in
+# ONE place: docs/reference/ops-scripts.md §"Event-loop lag series" (the
+# Register-ScheduledTask form — the one the production install used; the
+# schtasks line that used to live here was a second, divergent recipe with no
+# IgnoreNew/ExecutionTimeLimit settings, removed in the #760 corrective push).
+# Before registering: Test-Path of the target ON THE MAIN CLONE (see the
+# incident below). Verify by RE-READING the registered task
 #   schtasks /query /tn "ClaudishEventLoopSampler" /v /fo list
+# never by trusting the create's own output.
 #
 # INSTALL ONLY FROM THE MAIN CLONE, AFTER MERGE (incident 29/10, Maintenance):
 # the task above was registered from a PR worktree while the script existed

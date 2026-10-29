@@ -23,12 +23,15 @@ Run standalone:   python scripts/tests/test_eventloop_trend.py
 Or under pytest:  pytest scripts/tests/test_eventloop_trend.py
 """
 
+import contextlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MOD_PATH = os.path.join(_HERE, os.pardir, "eventloop-trend.py")
@@ -98,29 +101,32 @@ def test_probe_failure_is_a_row_not_a_hole():
     os.unlink(path)
 
 
+def _capture(fn, *a, **kw):
+    buf = StringIO()
+    with contextlib.redirect_stdout(buf):
+        ret = fn(*a, **kw)
+    return ret, buf.getvalue()
+
+
 def test_a_missing_minute_is_a_hole():
     # Two ticks 10 minutes apart: the eight minutes between them are UNMEASURED.
+    # Asserted on gaps() OUTPUT (the #760 CR: a predicate copy in the test would
+    # stay green if the reader stopped printing holes altogether).
     path = write_log([row(10), row(0)])
     rows, _ = trend.read_rows(path, include_rotated=False)
     since = NOW - timedelta(hours=1)
-    out = []
-    holes = 0
-    for prev, cur in zip(rows, rows[1:]):
-        if (cur["_ts"] - prev["_ts"]).total_seconds() > trend.EXPECTED_INTERVAL_SEC * trend.GAP_FACTOR:
-            holes += 1
-    assert holes == 1, f"one hole expected between two ticks 10 min apart, got {holes}"
+    _, out = _capture(trend.gaps, rows, since)
+    assert "HOLE" in out, f"two ticks 10 min apart must print a HOLE, got: {out!r}"
+    assert "unmeasured" in out, "the hole line must say the span is unmeasured"
     os.unlink(path)
 
 
 def test_continuous_ticks_have_no_hole():
     path = write_log([row(i) for i in range(0, 10, 1)])
     rows, _ = trend.read_rows(path, include_rotated=False)
-    holes = sum(
-        1
-        for prev, cur in zip(rows, rows[1:])
-        if (cur["_ts"] - prev["_ts"]).total_seconds() > trend.EXPECTED_INTERVAL_SEC * trend.GAP_FACTOR
-    )
-    assert holes == 0, "one tick a minute is continuous"
+    since = NOW - timedelta(hours=1)
+    _, out = _capture(trend.gaps, rows, since)
+    assert "no hole" in out, f"one tick a minute is continuous, got: {out!r}"
     os.unlink(path)
 
 
@@ -153,6 +159,65 @@ def test_two_instances_are_not_merged_into_one_cumulative_mark():
     # present them as one series (the fleet-state rule: a high-water mark is
     # per-process and does not compare across a recreate).
     assert rows[0]["maxCumulativeMs"] != rows[1]["maxCumulativeMs"]
+    os.unlink(path)
+
+
+def test_hourly_output_keeps_a_recreate_split_and_counts_503():
+    # The #760 CR defect 2, asserted on hourly() OUTPUT (not on raw rows): a
+    # mid-hour recreate puts two PROCESSES in the window — no rendered row may
+    # carry both, and the stall-answered (http 503) ticks must be countable.
+    path = write_log([
+        row(20, instanceId="aaaa1111", status="stalled", max60sMs=1800.0,
+            blocked5mMs=5200.0, maxCumulativeMs=2100.0, http=503),
+        row(19, instanceId="aaaa1111", max60sMs=45.0, maxCumulativeMs=2100.0, http=200),
+        row(10, instanceId="bbbb2222", max60sMs=60.0, maxCumulativeMs=150.0, http=200),
+        row(9, instanceId="bbbb2222", max60sMs=55.0, maxCumulativeMs=150.0, http=200),
+        row(8, probe="fail", error="WebException: timeout", instanceId=None),
+    ])
+    rows, _ = trend.read_rows(path, include_rotated=False)
+    _, out = _capture(trend.hourly, rows, 2)
+    # Data lines: "YYYY-MM-DD HH:00  <inst>  n fail 503 max60s ...".
+    data = re.findall(r"^(\d{4}-\d{2}-\d{2} \d{2}:00)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s", out, re.M)
+    assert data, f"hourly() must render data rows, got: {out!r}"
+    inst_names = {d[1] for d in data}
+    assert "aaaa1111" in inst_names and "bbbb2222" in inst_names, \
+        f"both processes must appear, rows show: {inst_names}"
+    for hour, inst, n, fail, n503 in data:
+        if inst == "-":
+            assert int(fail) >= 1, \
+                "the '-' row exists for probe-fail ticks; an ok tick never lands there"
+    # Exactly one stall-answered tick exists (aaaa's first): summed over every
+    # rendered row the 503 column must total 1 — a merge into one row would
+    # still total 1, the per-row split is asserted above by inst_names.
+    assert sum(int(d[4]) for d in data) == 1, \
+        f"one http-503 tick in the window, 503 column totals {sum(int(d[4]) for d in data)}"
+    # The cumulative marks stay per-process in the rendering: 2100 belongs to
+    # aaaa's row(s) only, 150 to bbbb's, never both on one line.
+    for line in out.splitlines():
+        if re.match(r"^\d{4}-", line):
+            assert not ("2100" in line and "150" in line), \
+                f"two processes' cumulative marks on one row: {line!r}"
+    assert "2 distinct instanceId" in out, "the recreate warning must fire"
+    os.unlink(path)
+
+
+def test_episodes_output_lists_the_stall_with_its_instance():
+    # Asserted on episodes() OUTPUT: the hot tick's own fields must reach the
+    # line, not merely satisfy a predicate in the test.
+    path = write_log([
+        row(3, instanceId="aaaa1111", max60sMs=1800.5, blocked5mMs=5200.0,
+            maxCumulativeMs=2100.0, activeStreams=4),
+        row(2, instanceId="aaaa1111", max60sMs=45.0),
+    ])
+    rows, _ = trend.read_rows(path, include_rotated=False)
+    since = NOW - timedelta(hours=1)
+    count, out = _capture(trend.episodes, rows, since)
+    assert count == 1, f"one episode expected, got {count}"
+    assert "1800.5 ms" in out, f"the episode line must carry the measured max, got: {out!r}"
+    assert "aaaa1111" in out, "the episode line must name the instance"
+    for line in out.splitlines():
+        if "ms" in line and "aaaa1111" in line:
+            assert "1800.5" in line, f"only the hot tick is listed: {line!r}"
     os.unlink(path)
 
 
