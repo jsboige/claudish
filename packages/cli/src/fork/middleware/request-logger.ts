@@ -154,6 +154,17 @@ export function logRequest(
   // the capture side is what the traffic-*.ps1 analysis scripts attribute by.
   const machine = req.headers.get("x-claudish-machine") || "";
 
+  // #41 — the workspace half of the attribution chain, persisted so a seat can
+  // prove hop 1 (what ITS client actually sent) from its own capture corpus.
+  // Without it, `machine` alone leaves a seat able to prove which box emitted a
+  // request but not which workspace — and the hub-side `x-claudish-client`
+  // (machine:workspace) was unverifiable from the emitting side.
+  // Sanitized like the hop chain: the value is client-supplied and lands on
+  // disk, read back by the traffic analyzers. Bounded at 64 like one hop id.
+  const workspace = (req.headers.get("x-claudish-workspace") || "")
+    .replace(/[^a-zA-Z0-9._-]/g, "")
+    .slice(0, 64);
+
   // #566 — the relay's hop chain (the same header #156/#279 appends for loop
   // detection), captured so a relayed request is distinguishable from a direct
   // one after the fact. `src` cannot answer that: a LAN relay hop leaves no
@@ -203,6 +214,11 @@ export function logRequest(
       machine,
       ...(inboundKey ? { inbound_key: inboundKey } : {}),
       model,
+      // #41 — placed AFTER `model`, deliberately, and not next to `machine`:
+      // the leak-policy method reads machine+model from the first 300-400
+      // bytes, and this field is client-supplied (up to 64 chars). Seating it
+      // between them would spend that window on a field no leak verdict needs.
+      ...(workspace ? { workspace } : {}),
       pid: process.pid,
       // #662 — the per-process instanceId (#156) as a payload FIELD: `pid` is 1
       // in EVERY container life (the proxy is the image's command), so it cannot
