@@ -34,9 +34,9 @@
 #    rebuilt image needs -Recreate (`docker compose up -d`) instead. Both forms
 #    carry it (#124 — the standalone path used to drop the switch and silently
 #    drain into a plain restart):
-#      powershell -ExecutionPolicy Bypass -File scripts\claudish-drain.ps1 -Reason "deploy vX.Y" -Recreate -EnvFile "D:\claudish-shadow\.env"
+#      powershell -ExecutionPolicy Bypass -File scripts\claudish-drain.ps1 -Reason "deploy vX.Y" -Recreate -EnvFile "<the real .env outside the compose dir>"
 #      . "$PSScriptRoot\claudish-drain.ps1"
-#      Invoke-ClaudishDrainedRestart -Reason "deploy vX.Y" -Recreate -EnvFile "D:\claudish-shadow\.env"
+#      Invoke-ClaudishDrainedRestart -Reason "deploy vX.Y" -Recreate -EnvFile "<the real .env outside the compose dir>"
 #    Same drain, different action. Plain `docker compose up -d` would deploy
 #    the image just as well, but at the cost of every in-flight agent turn.
 #    -EnvFile is REQUIRED alongside -Recreate: docker compose interpolates
@@ -46,6 +46,17 @@
 #    cascades silently gutted). The compose dir's own .env is NOT trusted
 #    either: on the hub it holds only CLAUDISH_PROXY_KEY. The script refuses
 #    the recreate without a passing -EnvFile, before spending a drain.
+#
+#    Since #716 that guard compares SETS, not counts. A file carrying a
+#    DIFFERENT cascade of the SAME cardinality used to pass silently — the
+#    exact shape of an operator editing one cascade line, and the recreate
+#    then shipped a cascade nobody intended. Rules:
+#      - file armed set empty while container's is not -> REFUSED (unchanged);
+#      - file REMOVES or REWRITES a name the container carries -> REFUSED
+#        unless -AllowCascadeChange (the deliberate edit must be sayable);
+#      - a pure ADDITION is allowed — widening a cascade is not a gutting.
+#    The difference is logged by NAME only: CLAUDISH_FAILOVER_* values carry
+#    model ids today, but the same files hold CLAUDISH_PROXY_KEY.
 #
 # Targets PowerShell 5.1: scheduled tasks run `powershell`, not `pwsh`.
 #
@@ -123,6 +134,11 @@ param(
     # recreate. Off by default — the default path REFUSES and names the exact
     # removal command, because deleting containers is the operator's call.
     [switch]$RemoveCreatedTwins,
+    # #716 — the #141 guard compares SETS of armed cascades. Refuse when the
+    # file removes or rewrites a name the live container carries; this switch
+    # says the edit is deliberate — the sanctioned path is an explicit switch,
+    # never a cardinality that happens to match.
+    [switch]$AllowCascadeChange,
     # #312 — detached launch for agent callers: re-launch this script as a
     # hidden child with EVERY argument quoted, stdout+stderr captured to
     # per-run files under $ClaudishHome, and return on the child's proof of
@@ -147,6 +163,66 @@ param(
 )
 
 Import-Module (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1') -Force
+
+# #304/#716 — ONE vocabulary, ONE literal. Only the four cascade-carrying
+# names count as an armed state; knobs (ARM_AFTER, SESSION_DWELL_MS, ...) and
+# decorators (_LABEL/_RESET/_ACTIVE) are runtime policy, not a cascade.
+# Keep in sync with Get-ArmedCascadeCount in install-sidecar.ps1 — the Pester
+# suite pins both copies against this exact role-only alternation.
+$script:ArmedCascadePattern = '^CLAUDISH_FAILOVER_(OPUS|SONNET|HAIKU|FABLE)=.+'
+
+function Get-ArmedCascadeMap {
+    <#
+        #716 — parse armed cascades into name -> value pairs.
+        The guard used to compare CARDINALITIES (file=1 container=1), so a
+        file carrying a DIFFERENT cascade of the same count passed and the
+        recreate shipped it. Sets are what "the same armed state" means.
+
+        Values are returned so the caller can compare them; they must never
+        reach the log — CLAUDISH_FAILOVER_* holds model ids today, but the
+        same files hold CLAUDISH_PROXY_KEY.
+
+        A leading BOM is stripped: Windows editors (and a #762-shaped write)
+        can leave U+FEFF on line 1, which .NET's Trim() does not remove and
+        which would make the FIRST cascade line invisible to the count —
+        exactly the fail-open #141 exists to prevent.
+    #>
+    param(
+        [string[]]$Lines,
+        [string]$Pattern = $script:ArmedCascadePattern
+    )
+    $map = [ordered]@{}
+    foreach ($line in @($Lines)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $text = $line.Trim().TrimStart([char]0xFEFF)
+        if ($text -notmatch $Pattern) { continue }
+        $parts = $text -split '=', 2
+        $map[$parts[0]] = $parts[1].Trim()
+    }
+    return $map
+}
+
+function Compare-ArmedCascadeSets {
+    <#
+        #716 — what the file would do to the container's armed state.
+          Removed : names the container carries and the file does not
+          Changed : names both carry with DIFFERENT values
+          Added   : names only the file carries
+        Names only. Pure — no docker, no log; callers decide and report.
+    #>
+    param(
+        [System.Collections.IDictionary]$ContainerMap,
+        [System.Collections.IDictionary]$FileMap
+    )
+    $containerNames = @($ContainerMap.Keys)
+    $fileNames = @($FileMap.Keys)
+    $removed = @($containerNames | Where-Object { $fileNames -notcontains $_ })
+    $changed = @($containerNames | Where-Object {
+        $fileNames -contains $_ -and "$($FileMap[$_])" -ne "$($ContainerMap[$_])"
+    })
+    $added = @($fileNames | Where-Object { $containerNames -notcontains $_ })
+    return [pscustomobject]@{ Removed = $removed; Changed = $changed; Added = $added }
+}
 
 # #368 — the pre-gesture failover-events tick runs THIS collector against the
 # old container. Script-scope (not a function default expression) so the test
@@ -389,6 +465,8 @@ function Invoke-ClaudishDrainedRestartImpl {
         # #233 AC2 — auto-remove leftover Created-state compose twins instead
         # of refusing. Never removes a twin that ever ran.
         [switch]$RemoveCreatedTwins,
+        # #716 — set comparison of armed cascades; see the guard below.
+        [switch]$AllowCascadeChange,
         # #368 — collector script for the pre-gesture failover-events tick.
         # Default reads the script-scope $DrainFailoverTickCollector (the
         # suite sets it to '' after dot-sourcing, skipping the tick).
@@ -435,27 +513,28 @@ function Invoke-ClaudishDrainedRestartImpl {
         # job is to compare against the container compose is about to
         # replace; when docker cannot produce it, stop.
         # #304 discrimination: only the four cascade-carrying names count as
-        # armed. Knobs (ARM_AFTER, SESSION_DWELL_MS, ...) and decorators
-        # (_LABEL/_RESET/_ACTIVE/...) are injected since #304 — counting any
-        # FAILOVER name let a knob-only file pass as "armed" and gut a live
-        # cascade undetected. Keep in sync with Get-ArmedCascadeCount in
-        # install-sidecar.ps1 (pinned by claudish-drain.Tests.ps1).
-        $armedPattern = '^CLAUDISH_FAILOVER_(OPUS|SONNET|HAIKU|FABLE)=.+'
-        $envArmed = 0
-        $contArmed = 0
+        # armed ($script:ArmedCascadePattern). Knobs (ARM_AFTER,
+        # SESSION_DWELL_MS, ...) and decorators (_LABEL/_RESET/_ACTIVE/...) are
+        # injected since #304 — counting any FAILOVER name let a knob-only file
+        # pass as "armed" and gut a live cascade undetected. #716 then reads the
+        # pairs, not just the count: same cardinality, different cascade, is
+        # the shape of an operator editing one line.
+        $envMap = [ordered]@{}
+        $contMap = [ordered]@{}
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         $inspectMissed = $false
         try {
-            $envArmed = @([System.IO.File]::ReadAllLines($EnvFile) |
-                Where-Object { $_ -match $armedPattern }).Count
+            $envMap = Get-ArmedCascadeMap -Lines ([System.IO.File]::ReadAllLines($EnvFile))
             $contEnv = docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' $Container 2>$null
             if ($LASTEXITCODE -eq 0) {
-                $contArmed = @($contEnv | Where-Object { $_ -match $armedPattern }).Count
+                $contMap = Get-ArmedCascadeMap -Lines $contEnv
             } else {
                 $inspectMissed = $true
             }
         } finally { $ErrorActionPreference = $prevEap }
+        $envArmed = @($envMap.Keys).Count
+        $contArmed = @($contMap.Keys).Count
         if ($inspectMissed) {
             Write-DrainLog "RECREATE REFUSED ($Reason): docker inspect could not read container '$Container' (exit $LASTEXITCODE — absent, or docker itself failed) — cannot verify its armed cascades; nothing stopped (#372)."
             Write-DrainOutcome "refused" "${Reason}: container '$Container' unreadable by inspect — nothing stopped"
@@ -465,6 +544,27 @@ function Invoke-ClaudishDrainedRestartImpl {
             Write-DrainLog "RECREATE REFUSED ($Reason): -EnvFile '$EnvFile' carries no armed CLAUDISH_FAILOVER_* while container '$Container' has $contArmed — the recreate would wipe an armed state that exists nowhere on disk. Recover it with install-sidecar.ps1 -RebuildEnvFromContainer, then retry (#141)."
             Write-DrainOutcome "refused" "${Reason}: env file carries no armed cascade while container has $contArmed — nothing stopped"
             return $false
+        }
+        # #716 — the same-cardinality swap. A file that removes or REWRITES a
+        # name the container carries ships an armed state nobody asked for,
+        # while the count-based log line reads like a pass. Refuse by default;
+        # -AllowCascadeChange is the deliberate-edit escape. A pure addition is
+        # allowed — widening a cascade is not a gutting.
+        $cascadeDiff = Compare-ArmedCascadeSets -ContainerMap $contMap -FileMap $envMap
+        if (@($cascadeDiff.Removed).Count -gt 0 -or @($cascadeDiff.Changed).Count -gt 0) {
+            $what = @()
+            if (@($cascadeDiff.Removed).Count -gt 0) { $what += "removes $(@($cascadeDiff.Removed) -join ', ')" }
+            if (@($cascadeDiff.Changed).Count -gt 0) { $what += "rewrites $(@($cascadeDiff.Changed) -join ', ')" }
+            $whatText = $what -join '; '
+            if (-not $AllowCascadeChange) {
+                Write-DrainLog "RECREATE REFUSED ($Reason): -EnvFile '$EnvFile' $whatText against container '$Container' (both sides carry $contArmed armed cascade(s) — a same-cardinality swap passes a count comparison). Nothing was stopped. Re-run with -AllowCascadeChange if the edit is deliberate (#716)."
+                Write-DrainOutcome "refused" "${Reason}: env file $whatText — nothing stopped"
+                return $false
+            }
+            Write-DrainLog "RECREATE ($Reason): -AllowCascadeChange — -EnvFile '$EnvFile' $whatText against container '$Container' (names only; values are never logged, #716). Deliberate edit, proceeding."
+        }
+        if (@($cascadeDiff.Added).Count -gt 0) {
+            Write-DrainLog "RECREATE ($Reason): -EnvFile '$EnvFile' ADDS $(@($cascadeDiff.Added) -join ', ') — a pure addition, allowed without -AllowCascadeChange (#716)"
         }
 
         # #233 AC2 — leftover-twin preflight, BEFORE anything is stopped. An
@@ -789,6 +889,8 @@ function Invoke-ClaudishDrainedRestart {
         [string]$ComposeDir = (Split-Path -Parent $PSScriptRoot),
         [string]$FreezeClaudishHome = $ClaudishHome,
         [switch]$RemoveCreatedTwins,
+        # #716 — forwarded to the impl; the guard's deliberate-edit escape.
+        [switch]$AllowCascadeChange,
         # #368 — forwarded to the impl when bound (unbound callers fall to
         # the impl's own defaults, which read the script-scope collector path).
         [string]$FailoverTickCollectorPath,
@@ -1171,7 +1273,8 @@ function Get-DrainDetachForwardedArguments {
         [string]$ClaudishHome,
         [string]$EnvFile,
         [switch]$Recreate,
-        [switch]$RemoveCreatedTwins
+        [switch]$RemoveCreatedTwins,
+        [switch]$AllowCascadeChange
     )
     $parts = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath,
         '-Reason', $Reason,
@@ -1183,6 +1286,10 @@ function Get-DrainDetachForwardedArguments {
         '-EnvFile', $EnvFile)
     if ($Recreate) { $parts += '-Recreate' }
     if ($RemoveCreatedTwins) { $parts += '-RemoveCreatedTwins' }
+    # #716 — an operator's deliberate-edit consent must reach the CHILD: the
+    # guard runs there, and dropping it would turn every detached cascade edit
+    # into a refusal (or, worse if it were defaulted, into a silent pass).
+    if ($AllowCascadeChange) { $parts += '-AllowCascadeChange' }
     return $parts
 }
 
@@ -1233,7 +1340,8 @@ if ($MyInvocation.InvocationName -ne '.') {
         $detachParts = Get-DrainDetachForwardedArguments -ScriptPath $PSCommandPath `
             -Reason $Reason -ContainerName $ContainerName -ProxyUrl $ProxyUrl `
             -MaxWaitSec $MaxWaitSec -LogPath $LogPath -ClaudishHome $ClaudishHome `
-            -EnvFile $EnvFile -Recreate:$Recreate -RemoveCreatedTwins:$RemoveCreatedTwins
+            -EnvFile $EnvFile -Recreate:$Recreate -RemoveCreatedTwins:$RemoveCreatedTwins `
+            -AllowCascadeChange:$AllowCascadeChange
         $detachResult = Start-DrainDetached -ArgumentString (Join-DrainDetachArguments $detachParts) `
             -ClaudishHomeDir $ClaudishHome -WatchLogPath $LogPath -TimeoutSec $DetachStartupTimeoutSec
         if ($detachResult.Ok) {
@@ -1261,6 +1369,6 @@ if ($MyInvocation.InvocationName -ne '.') {
     # observe window — and the -Detach parent above treats this line (matched
     # on this child's pid) as the only proof that the launch worked.
     Write-DrainLog "START pid $PID — drained restart begins (reason: $Reason)"
-    $ok = Invoke-ClaudishDrainedRestart -Reason $Reason -Recreate:$Recreate -EnvFile $EnvFile -RemoveCreatedTwins:$RemoveCreatedTwins
+    $ok = Invoke-ClaudishDrainedRestart -Reason $Reason -Recreate:$Recreate -EnvFile $EnvFile -RemoveCreatedTwins:$RemoveCreatedTwins -AllowCascadeChange:$AllowCascadeChange
     exit $(if ($ok) { 0 } else { 1 })
 }
