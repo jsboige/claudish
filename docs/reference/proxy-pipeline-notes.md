@@ -301,14 +301,23 @@ count decides.**
 
 Pins: `handlers/shared/exact-count.test.ts` (band math, strict parse, kill switch),
 `composed-handler.test.ts` "#674 exact counting" (5 dispatch pins — refuse-locally, fits-under,
-null-probe, below-band no-probe, kill switch), `openai.test.ts` "countPromptTokens" (root URL,
+null-probe, below-band no-probe, kill switch) and "#739 exact counting on the LEARNED-cap branch"
+(4 pins — refuse-locally with `exact=` in the marker, fits is served, below-band no-probe,
+typed-literal never arms), `openai.test.ts` "countPromptTokens" (root URL,
 `{model, messages}` body, signal present, process-wide 404 memo across TWO transport instances,
 never throws, unreadable count → null, empty messages → no fetch), `proxy-server-step-skip-route.test.ts`
 `K31a–K31d` (live route, both ingresses: marker `exact=`/`cap=`, zero upstream calls, fits is
 served, one 404 for the process, `[DONE]`-terminated on the OpenAI wire).
 
 Boundary: the learned-cap branch keeps #676's corroboration (`stated ?? derived ?? declared`) —
-exact counting arms on the **derived** window branch; a hand-typed `contextLimit` still never
-refuses locally (a stale literal must not veto what the engine serves). The probe is one extra
-round-trip per banded request on an endpoint that has a tokenizer — deliberately not cached
-beyond the 404 memo, because the prompt differs every time.
+exact counting arms on **both** measured branches: the derived-window branch, and (since #739) the
+learned-cap branch when the request is over the learned cap but a MEASURED window (`stated ??
+derived`) sits above the clamp estimate, i.e. exactly the `[cap, window)` band where the cap alone
+may not refuse. Wiring it into the learned branch was necessary because that branch is an `else if`
+ahead of the derived one: the FIRST learned cap shadows the derived branch and took the tokenizer
+down with it (measured 29/10 on the haiku/swift lane — 118 of 122 context skips were provably
+post-400, `exact=` appeared zero times). A hand-typed `contextLimit` still arms **nothing** and
+never refuses locally (a stale literal must not veto what the engine serves). The probe is one
+extra round-trip per banded request on an endpoint that has a tokenizer — deliberately not cached
+beyond the 404 memo, because the prompt differs every time; paying a ~1 ms local tokenize to avoid
+a full prefill that 400s is the trade #739 measured.

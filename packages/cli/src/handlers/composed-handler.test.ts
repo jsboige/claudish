@@ -1195,3 +1195,108 @@ describe("ComposedHandler — #674 exact counting in the uncertain band", () => 
     }
   });
 });
+
+describe("ComposedHandler — #739 exact counting on the LEARNED-cap branch", () => {
+  // The 29/10 measurement: on the haiku lane's swift step, 118 of 122 context
+  // skips are provably post-400 — the learned cap stood the short-circuit down
+  // (#674 corroboration), the estimate was not allowed to refuse alone, and the
+  // fetch paid for the answer. The tokenizer never got asked, because it was
+  // wired only into the derived-window branch, which a learned cap SHADOWS
+  // (that branch is an `else if` behind this one). These pins hold the probe on
+  // the branch that actually runs, without relaxing anything #674 decided.
+  beforeEach(() => resetOverflowCapsForTests());
+  afterEach(() => resetOverflowCapsForTests());
+
+  function exactTransport(answers: Array<number | null>) {
+    let calls = 0;
+    const probes: any[][] = [];
+    const transport = {
+      name: "test-exact",
+      displayName: "Test Exact",
+      streamFormat: "openai-sse",
+      getEndpoint: () => "http://upstream.test/v1/chat/completions",
+      getHeaders: () => ({}),
+      countPromptTokens: async (messages: any[]) => {
+        probes.push(messages);
+        const answer = answers[Math.min(calls++, answers.length - 1)];
+        return answer === null ? null : { exact: answer, maxModelLen: 262_144 };
+      },
+    } as unknown as ProviderTransport;
+    return { transport, probes };
+  }
+
+  // ~250k tokens: over the learned cap (230k), inside the band of the real
+  // window (262 144 / 1.15 = 227 951), and under the window itself — the exact
+  // shape the fleet hits, where neither estimator can decide alone.
+  const BIG = 1_000_000;
+
+  test("exact >= window on a learned cap → refused locally, zero upstream calls", async () => {
+    rememberOverflowCap("Test Exact", "fake-model", 230_000);
+    const { transport, probes } = exactTransport([262_400]);
+    const fx = countingFetch(200, "should never be reached");
+    const res = await runHandleWith(transport, "fake-model", overflowPayload(false, BIG), fx.impl as typeof fetch, {
+      derivedContextLimit: 262_144,
+    });
+
+    expect(probes.length).toBe(1); // the estimate nominated the probe (#739)
+    expect(fx.getCalls()).toBe(0); // the round-trip the old path always paid
+    expect(res.status).toBe(200); // the #79 recoverable turn, never a bare 400
+    const skip = res.headers.get("x-claudish-step-skip") ?? "";
+    expect(skip).toContain("exact=262400");
+    expect(skip).toContain("cap=262144");
+  });
+
+  test("exact < window on a learned cap → served upstream, the cap may not refuse alone", async () => {
+    rememberOverflowCap("Test Exact", "fake-model", 230_000);
+    const { transport, probes } = exactTransport([240_000]);
+    const fx = countingFetch(200, "served by the upstream");
+    const res = await runHandleWith(transport, "fake-model", overflowPayload(false, BIG), fx.impl as typeof fetch, {
+      derivedContextLimit: 262_144,
+    });
+
+    expect(probes.length).toBe(1);
+    expect(fx.getCalls()).toBe(1); // #674's contract survives: the ENGINE decides
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-claudish-step-skip")).toBeNull();
+  });
+
+  test("below the band nothing is probed — one extra round-trip is not free", async () => {
+    rememberOverflowCap("Test Exact", "fake-model", 10_000);
+    const { transport, probes } = exactTransport([262_400]);
+    const fx = countingFetch(200, "ok");
+    await runHandleWith(transport, "fake-model", overflowPayload(false, 400_000), fx.impl as typeof fetch, {
+      derivedContextLimit: 262_144,
+    });
+
+    expect(probes.length).toBe(0); // ~100k is nowhere near the window: not nominated
+    expect(fx.getCalls()).toBe(1);
+  });
+
+  test("no window known → the learned cap keeps its old authority (no probe at all)", async () => {
+    // The guard on the guard: with nothing to compare an exact count against,
+    // asking would spend a round-trip and still not decide. Unchanged path.
+    rememberOverflowCap("Test Exact", "fake-model", 1_000);
+    const { transport, probes } = exactTransport([262_400]);
+    const fx = countingFetch(200, "should never be reached");
+    const res = await runHandleWith(transport, "fake-model", overflowPayload(false, BIG), fx.impl as typeof fetch);
+
+    expect(probes.length).toBe(0);
+    expect(fx.getCalls()).toBe(0); // short-circuited on the learned cap alone
+    expect(res.headers.get("x-claudish-step-skip") ?? "").toContain("cap=1000");
+  });
+
+  test("a HAND-TYPED contextLimit never arms the probe — a stale literal may not veto a served prompt", async () => {
+    // #676's boundary survives #739: only a MEASURED window (`stated ?? derived`)
+    // may convert an exact count into a local refusal. A literal typed years ago
+    // and too small would do exactly that, which is why it is excluded here.
+    rememberOverflowCap("Test Exact", "fake-model", 230_000);
+    const { transport, probes } = exactTransport([262_400]);
+    const fx = countingFetch(200, "served");
+    await runHandleWith(transport, "fake-model", overflowPayload(false, BIG), fx.impl as typeof fetch, {
+      contextLimit: 262_144, // typed, never measured
+    });
+
+    expect(probes.length).toBe(0);
+    expect(fx.getCalls()).toBe(1); // the upstream decides, as before
+  });
+});
