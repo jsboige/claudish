@@ -74,6 +74,69 @@ describe("request-logger capture (fork)", () => {
     expect(file!.split(/[/\\]/).pop()).toMatch(/^req-\d+-\d{4}-[\dT-]+-[A-Za-z0-9._-]+\.json$/);
   });
 
+  // #41 — the workspace half of the attribution chain (forward-port of #752,
+  // which this branch pre-dates). `machine` alone let a seat prove which BOX
+  // emitted a request but not which workspace: the hub's x-claudish-client
+  // (machine:workspace) was unverifiable from the emitting side, so hop 1 of
+  // the four-hop campaign had to be argued from a session env rather than read
+  // from the corpus.
+  it("persists the client workspace next to the attribution fields (#41)", async () => {
+    mkdirSync(capDir, { recursive: true });
+    process.env.CLAUDISH_CAPTURE_DIR = capDir;
+
+    logRequest(
+      { model: "claude-haiku-4-5-20251001", messages: [] },
+      "test-handler",
+      mkRequest({
+        "x-claudish-machine": "myia-po-2027",
+        "x-claudish-workspace": "claudish",
+      }),
+      new WeakMap()
+    );
+
+    const file = await waitForCapture(capDir);
+    expect(file).not.toBeNull();
+    const json = JSON.parse(readFileSync(file!, "utf8"));
+    expect(json.workspace).toBe("claudish");
+    expect(json.machine).toBe("myia-po-2027");
+    // The leak-policy method still finds machine+model in the head window:
+    // the new field sits AFTER model for exactly that reason.
+    expect(readFileSync(file!, "utf8").indexOf('"model":"')).toBeLessThan(400);
+  });
+
+  it("omits the workspace key when the header is absent, and sanitizes a hostile one (#41)", async () => {
+    mkdirSync(capDir, { recursive: true });
+    process.env.CLAUDISH_CAPTURE_DIR = capDir;
+
+    logRequest(
+      { model: "m1", messages: [] },
+      "test-handler",
+      mkRequest({ "x-claudish-machine": "myia-test" }),
+      new WeakMap()
+    );
+    const bare = await waitForCapture(capDir);
+    expect(bare).not.toBeNull();
+    const bareJson = JSON.parse(readFileSync(bare!, "utf8"));
+    // Absent, NOT the empty string: a reader must be able to tell
+    // "header not sent" (pre-campaign client) from "sent and empty".
+    expect(Object.keys(bareJson)).not.toContain("workspace");
+
+    rmSync(capDir, { recursive: true, force: true });
+    mkdirSync(capDir, { recursive: true });
+    logRequest(
+      { model: "m2", messages: [] },
+      "test-handler",
+      mkRequest({ "x-claudish-workspace": '  evil"ws  ,<script>,' + "z".repeat(200) }),
+      new WeakMap()
+    );
+    const hostile = await waitForCapture(capDir);
+    expect(hostile).not.toBeNull();
+    const hostileJson = JSON.parse(readFileSync(hostile!, "utf8"));
+    expect(hostileJson.workspace).toBeDefined();
+    expect(hostileJson.workspace).toMatch(/^[a-zA-Z0-9._-]{1,64}$/);
+    expect(hostileJson.workspace.length).toBeLessThanOrEqual(64);
+  });
+
   it("writes nothing when CLAUDISH_CAPTURE_DIR is unset", async () => {
     delete process.env.CLAUDISH_CAPTURE_DIR;
     mkdirSync(capDir, { recursive: true });
