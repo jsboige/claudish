@@ -23,7 +23,7 @@ below are load-bearing and each has a pin here:
      counters. Pin 8 pins a full delta followed by an output-only one.
   6. EVERY FILE LANDS IN ONE BUCKET. Orphans, unusable usage and unreadable
      envelopes are counted separately, and the buckets reconcile with the
-     corpus: req = paired + usage_unusable + unpaired, resp = claimed +
+     corpus: req = paired + usage_missing + resp_unreadable + unpaired, resp = claimed +
      orphan. Pins 2, 9, 10, 11.
   7. AN UNREADABLE ARCHIVE IS LOUD. A missing extractor must raise, never
      present as an empty corpus. Pin 12.
@@ -142,9 +142,11 @@ def _fresh(tmp):
 def _reconciles(counters, label):
     _check(
         counters["req"]
-        == counters["paired"] + counters["usage_unusable"] + counters["unpaired"],
+        == counters["paired"] + counters["usage_missing"]
+        + counters["resp_unreadable"] + counters["unpaired"],
         f"{label}: req {counters['req']} != paired {counters['paired']}"
-        f" + usage-unusable {counters['usage_unusable']}"
+        f" + usage-missing {counters['usage_missing']}"
+        f" + resp-unreadable {counters['resp_unreadable']}"
         f" + unpaired {counters['unpaired']}",
     )
     _check(
@@ -376,8 +378,8 @@ def main() -> int:
         _resp(tmp, 1, 2, "2026-10-28T10-10-05-000Z", "openai-glm-5.3", 400, 0, 30)
         by_machine, _by_lane, counters = _run(tmp)
         _check(
-            counters["usage_unusable"] == 1,
-            f"pin 10a: usage_unusable = {counters['usage_unusable']}, want 1",
+            counters["usage_missing"] == 1,
+            f"pin 10a: usage_missing = {counters['usage_missing']}, want 1",
         )
         _check(
             counters["unpaired"] == 0,
@@ -388,6 +390,33 @@ def main() -> int:
             f"pin 10c: an unusable response creates no seat row: {by_machine}",
         )
         _reconciles(counters, "pin 10d")
+
+        # --- pin 10b: an UNREADABLE RESPONSE is its own class ------------
+        # Measured 29/10: a concurrent cleanup deleted the corpus WHILE the
+        # measurement was reading it. Every vanished file landed in the same
+        # bucket as a response that simply carried no usage, and the run
+        # printed a plausible-looking partial corpus with no sign that it was
+        # partial. The two causes must not share a bucket.
+        _fresh(tmp)
+        _req(tmp, 1, 1, "2026-10-28T10-00-00-000Z", "seat-A", "openai/glm-5.3")
+        # A directory wearing a response filename: open() raises IsADirectory
+        # (an OSError) — the shape of a file that vanished mid-read.
+        os.makedirs(os.path.join(tmp, "resp-1-r1-2026-10-28T10-00-05-000Z-openai-glm-5.3.sse"))
+        _by_machine, _by_lane, counters = _run(tmp)
+        _check(
+            counters["resp_unreadable"] == 1,
+            f"pin 10b: resp_unreadable = {counters['resp_unreadable']}, want 1",
+        )
+        _check(
+            counters["usage_missing"] == 0,
+            f"pin 10b: an unreadable file is NOT a missing usage"
+            f" (got {counters['usage_missing']})",
+        )
+        _check(
+            counters["paired"] == 0,
+            "pin 10b: an unreadable response attributes no volume",
+        )
+        _reconciles(counters, "pin 10b")
 
         # --- pin 11: an UNREADABLE request is counted, not dropped ------
         _fresh(tmp)

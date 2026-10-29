@@ -41,12 +41,14 @@ COVERAGE — nothing is silently dropped
 Every capture file lands in exactly one bucket, and the buckets reconcile with
 the corpus (the renderer prints the identities, it does not assert them):
 
-    req  files = paired + usage_unusable + unpaired
+    req  files = paired + usage_missing + resp_unreadable + unpaired
     resp files = claimed + orphan_resp
 
     unpaired         a request no response capture claims (refused turns)
     orphan_resp      a response no request claims
-    usage_unusable   claimed, but the response carries no usable usage block
+    usage_missing    claimed, but the response carries no usable usage block
+    resp_unreadable  claimed, but the response file could not be READ (a corpus
+                     cleaned up mid-run, a locked file, a vanished volume)
     unreadable_req   the request envelope could not be opened at all; still
                      paired and counted, under "(unreadable request)"
     blank_machine    readable, but no `machine` header — external callers
@@ -269,8 +271,8 @@ def attribute(reqs, meta, resps, directory: str):
     """-> (by_machine, by_lane, counters).
 
     Row layout: [turns, cold_input, cache_creation, cache_read, output].
-    Counters reconcile with the corpus: req = paired + usage_unusable +
-    unpaired, resp = claimed + orphan_resp.
+    Counters reconcile with the corpus: req = paired + usage_missing +
+    resp_unreadable + unpaired, resp = claimed + orphan_resp.
     """
     by_machine: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
     by_lane: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
@@ -280,7 +282,8 @@ def attribute(reqs, meta, resps, directory: str):
         "unreadable_req": 0,
         "paired": 0,
         "unpaired": 0,
-        "usage_unusable": 0,
+        "usage_missing": 0,
+        "resp_unreadable": 0,
         "orphan_resp": 0,
         "claimed_resp": 0,
         "blank_machine": 0,
@@ -318,8 +321,17 @@ def attribute(reqs, meta, resps, directory: str):
                 continue
             sp = got[-1]  # the serving attempt is the LAST claim
             u, status = resp_usage(os.path.join(directory, sp[1]))
+            if status == "unreadable":
+                # The file could not be READ. Measured 29/10: a concurrent
+                # cleanup deleted the corpus WHILE this run was reading it,
+                # and every one of those responses landed in the same bucket
+                # as a response that simply carried no usage — the run then
+                # reported a plausible-looking partial corpus with no sign
+                # that it was partial. An unreadable file is its own class.
+                counters["resp_unreadable"] += 1
+                continue
             if status != "ok" or not u:
-                counters["usage_unusable"] += 1
+                counters["usage_missing"] += 1
                 continue
             cold = int(u.get("input_tokens") or 0)
             creation = int(u.get("cache_creation_input_tokens") or 0)
@@ -485,7 +497,8 @@ def render(by_machine, by_lane, counters, top: int = 12) -> str:
     out.append(f"req-files={counters['req']} resp-files={counters['resp']}")
     out.append(
         f"coverage: req {counters['req']:,} = paired {counters['paired']:,}"
-        f" + usage-unusable {counters['usage_unusable']:,}"
+        f" + usage-missing {counters['usage_missing']:,}"
+        f" + resp-unreadable {counters['resp_unreadable']:,}"
         f" + unpaired {counters['unpaired']:,}"
     )
     out.append(
