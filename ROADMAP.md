@@ -198,6 +198,21 @@ The go/no-go evaluation for `replatform/v14` → `main` (#641) lists the absent 
 
 ---
 
+## Catalog cache write on read-only mounts — honor a writable cache path
+
+Status: not started. The fallback chain (disk cache → passthrough-unchanged) works by design and nothing user-visible degrades, so this is polish plus log hygiene, not a defect fix.
+
+Docker deployments that mount `/root/.claudish` read-only make every catalog refresh log `[Catalog] cache write skipped (unwritable path): EROFS…` — `openrouter.ts:392` catches the failed `all-models.json` write. Measured on the hub seat: it fires on every catalog refresh, including mid-run (14:21:51Z on 28/10 with no restart in the window), not only at container boot. The container already carries `CLAUDISH_MODEL_CACHE_PATH=/var/cache/claudish/all-models.json`, yet the write still lands on the read-only home — either the catalog writer ignores the var or the var postdates the code path.
+
+**Trigger conditions** (either holds):
+
+- Cold-start catalog latency is measured as a problem on a read-only-mount seat (the in-container warm cache never persists), or
+- The per-refresh stderr warning is reported as operational noise by a fleet coordinator.
+
+**Effort**: small — route the catalog write through `CLAUDISH_MODEL_CACHE_PATH` (first verify why it is ignored today), or demote the warning to debug level when the fallback succeeds. One unit test with a mocked unwritable path.
+
+---
+
 ## Adding a new roadmap item
 
 Each item should follow the structure above:
