@@ -50,6 +50,16 @@
 # and verify by RE-READING the registered task, never by trusting the create:
 #   schtasks /query /tn "ClaudishEventLoopSampler" /v /fo list
 #
+# INSTALL ONLY FROM THE MAIN CLONE, AFTER MERGE (incident 29/10, Maintenance):
+# the task above was registered from a PR worktree while the script existed
+# only there — the main-clone path was absent, every tick died with
+# 0xFFFD0008-style file-not-found, and `-WindowStyle Hidden` still flashed a
+# conhost once a minute (60/h) until Maintenance disabled the task. A scheduled
+# task pointing at a path that does not exist yet is a flicker machine, not an
+# instrument. Do not register before `Test-Path` of the target passes on the
+# MAIN clone — or pass the worktree path explicitly and remove the task when
+# leaving the worktree.
+#
 # Reading the series: scripts/eventloop-trend.py (the single reader).
 #
 # Targets PowerShell 5.1 (scheduled tasks run `powershell`, not `pwsh`).
@@ -107,17 +117,25 @@ function ConvertTo-LagSample {
         # install, first dry run of the failure path).
         [Parameter(Mandatory = $false)] [AllowNull()] $Health,
         [Parameter(Mandatory = $true)] [datetime] $AtUtc,
-        [string]$ErrorText = ''
+        [string]$ErrorText = '',
+
+        # HTTP status of the probe when a response ARRIVED (200, or 503 when
+        # the loop is stalled). 0 = no response at all (timeout / refused).
+        # Carried on BOTH the ok and the fail line: a 503 whose body could not
+        # be parsed is still a 503, and that distinction is the whole point.
+        [int]$Http = 0
     )
 
     $ts = $AtUtc.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', $Invariant)
 
     if ($null -eq $Health) {
-        return [pscustomobject]@{
+        $fail = [pscustomobject]@{
             ts    = $ts
             probe = 'fail'
             error = $(if ([string]::IsNullOrWhiteSpace($ErrorText)) { 'unreachable' } else { $ErrorText })
         }
+        if ($Http -gt 0) { $fail | Add-Member -NotePropertyName http -NotePropertyValue $Http }
+        return $fail
     }
 
     function Get-Num($obj, [string]$name) {
@@ -152,6 +170,77 @@ function ConvertTo-LagSample {
         max60sMs         = Get-Num $Health 'eventLoopMax60sMs'
         blocked5mMs      = Get-Num $Health 'eventLoopBlockedMs5m'
         maxCumulativeMs  = Get-Num $Health 'eventLoopMaxMs'
+        http             = $(if ($Http -gt 0) { $Http } else { $null })
+    }
+}
+
+function Get-HealthPayload {
+    <#
+      Fetch /health ONCE and keep what a plain Invoke-RestMethod throws away
+      (#760 CR defect 1). /health answers 503 WITH a JSON body when the event
+      loop is stalled — that body carries the same fields as the 200 one, and
+      the stall tick is exactly the sample this series exists to catch. PS web
+      cmdlets THROW on any non-2xx, so the 503 body only survives inside the
+      thrown exception. This function returns:
+
+        Health — the parsed body when one arrived and parsed ($null otherwise)
+        Http   — the status code when a response arrived ($null otherwise)
+        Error  — exception type + message when nothing usable came back
+
+      Works on 5.1 and 7: the error body is read from ErrorDetails.Message
+      first (populated by the web cmdlets on both), then from the raw response
+      object (HttpWebResponse stream on 5.1, HttpResponseMessage.Content on 7).
+      Never throws: a probe failure is a RECORD, not an abort.
+    #>
+    param(
+        [string]$Url,
+        [int]$TimeoutSec
+    )
+
+    $out = @{ Health = $null; Http = $null; Error = '' }
+    try {
+        $r = Invoke-WebRequest -Uri $Url -Method Get -UseBasicParsing -TimeoutSec $TimeoutSec
+        $out.Http = [int]$r.StatusCode
+        try { $out.Health = ($r.Content | ConvertFrom-Json) } catch { $out.Health = $null }
+        return $out
+    } catch {
+        $resp = $_.Exception.Response
+        $code = $null
+        if ($null -ne $resp) {
+            try { $code = [int]$resp.StatusCode } catch { $code = $null }
+        }
+        $out.Http = $code
+
+        # The body of the error response, if the cmdlet captured one.
+        $body = $null
+        if ($null -ne $_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+            $body = $_.ErrorDetails.Message
+        } elseif ($null -ne $resp) {
+            try {
+                if ($resp.Content -is [System.Net.Http.HttpContent]) {
+                    # PowerShell 7: HttpResponseException.Response is an HttpResponseMessage.
+                    $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                } elseif ($resp.GetResponseStream) {
+                    # PowerShell 5.1: WebException.Response is an HttpWebResponse.
+                    $stream = $resp.GetResponseStream()
+                    if ($null -ne $stream) {
+                        $reader = New-Object System.IO.StreamReader($stream)
+                        $body = $reader.ReadToEnd()
+                    }
+                }
+            } catch { $body = $null }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($body)) {
+            try { $out.Health = ($body | ConvertFrom-Json) } catch { $out.Health = $null }
+        }
+        if ($null -eq $out.Health) {
+            # Exception TYPE first, message after: the message is localized on
+            # this seat ("Le délai de l'opération a expiré." — measured), the
+            # type name is stable and English everywhere.
+            $out.Error = ('{0}: {1}' -f $_.Exception.GetType().Name, $_.Exception.Message)
+        }
+        return $out
     }
 }
 
@@ -250,21 +339,16 @@ if ($LibraryOnly) { return }
 $tickUtc = (Get-Date).ToUniversalTime()
 $health = $null
 $errText = ''
+$http = 0
 
 if (-not [string]::IsNullOrWhiteSpace($HealthUrl)) {
-    try {
-        $health = Invoke-RestMethod -Uri $HealthUrl -Method Get -TimeoutSec $TimeoutSec
-    } catch {
-        $health = $null
-        # The exception TYPE first, the message after: the message is localized
-        # (measured: "Le délai de l'opération a expiré." on this seat), so a
-        # reader that greps the text learns nothing portable. The type name is
-        # stable and English on every seat.
-        $errText = ('{0}: {1}' -f $_.Exception.GetType().Name, $_.Exception.Message)
-    }
+    $probe = Get-HealthPayload -Url $HealthUrl -TimeoutSec $TimeoutSec
+    $health = $probe.Health
+    $errText = $probe.Error
+    if ($null -ne $probe.Http) { $http = [int]$probe.Http }
 }
 
-$sample = ConvertTo-LagSample -Health $health -AtUtc $tickUtc -ErrorText $errText
+$sample = ConvertTo-LagSample -Health $health -AtUtc $tickUtc -ErrorText $errText -Http $http
 $line = $sample | ConvertTo-Json -Compress -Depth 4
 Add-SamplerLine -Path $LogPath -Line $line -MaxLogBytes $MaxLogBytes -KeepRotated $KeepRotated
 

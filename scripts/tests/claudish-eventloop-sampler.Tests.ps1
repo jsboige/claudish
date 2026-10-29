@@ -134,6 +134,136 @@ Describe 'Rotation' {
     }
 }
 
+Describe 'Get-HealthPayload — real HTTP (the #760 CR defects, exercised on the wire)' {
+    <#
+      Two listeners, a refused port and a malformed body — the four wire states
+      the probe actually meets. HttpListener on 127.0.0.1 needs no elevation;
+      each mode runs in its own job so the suite never depends on the proxy.
+    #>
+    BeforeAll {
+        function New-MockHealthServer {
+            param([ValidateSet('ok', 'stalled', 'garbage')] [string]$Mode)
+            foreach ($try in 1..3) {
+                $port = Get-Random -Minimum 22000 -Maximum 39000
+                $job = Start-Job -ScriptBlock {
+                    param($Port, $Mode)
+                    $l = [System.Net.HttpListener]::new()
+                    $l.Prefixes.Add("http://127.0.0.1:$Port/")
+                    try { $l.Start() } catch { return }
+                    # Serve EXACTLY ONE request, then exit: each It makes a single
+                    # probe, and a job left waiting in GetContext() for a second
+                    # request never returns — Remove-Job -Force then hangs the
+                    # suite at teardown (measured: the first pwsh 7 run never
+                    # reached the SUMMARY line). ONE BeginGetContext, armed once:
+                    # arming a second while the first is pending makes the
+                    # listener never accept anything (measured — the whole suite
+                    # timed out at the probe), so the deadline is enforced on the
+                    # SAME handle instead of re-arming.
+                    $t = $l.BeginGetContext($null, $null)
+                    $ctx = $null
+                    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+                    while ($null -eq $ctx -and [DateTime]::UtcNow -lt $deadline) {
+                        if ($t.AsyncWaitHandle.WaitOne(1000)) { $ctx = $l.EndGetContext($t) }
+                    }
+                    if ($null -eq $ctx) { $l.Stop(); return }
+                    if ($Mode -eq 'ok') {
+                        $code = 200
+                        $body = '{"status":"ok","role":"hub","instanceId":"11111111-aaaa","uptimeSec":10,"activeStreams":2,"eventLoopMax60sMs":42.5,"eventLoopBlockedMs5m":100.0,"eventLoopMaxMs":300.0}'
+                    } elseif ($Mode -eq 'stalled') {
+                        $code = 503
+                        $body = '{"status":"stalled","role":"hub","instanceId":"11111111-aaaa","uptimeSec":10,"activeStreams":2,"eventLoopMax60sMs":1900.7,"eventLoopBlockedMs5m":8800.2,"eventLoopMaxMs":2100.0}'
+                    } else {
+                        $code = 503
+                        $body = '<html>unavailable</html>'
+                    }
+                    $buf = [System.Text.Encoding]::UTF8.GetBytes($body)
+                    $ctx.Response.StatusCode = $code
+                    $ctx.Response.ContentType = 'application/json'
+                    $ctx.Response.ContentLength64 = $buf.Length
+                    $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
+                    $ctx.Response.Close()
+                    $l.Stop()
+                } -ArgumentList $port, $Mode
+                Start-Sleep -Milliseconds 700
+                if ($job.State -eq 'Running') { return @{ Url = "http://127.0.0.1:$port/health"; Job = $job } }
+                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            }
+            return $null
+        }
+        $script:SrvOk = New-MockHealthServer -Mode 'ok'
+        $script:SrvStalled = New-MockHealthServer -Mode 'stalled'
+        $script:SrvGarbage = New-MockHealthServer -Mode 'garbage'
+        # A port that is CLOSED: bind, read the port, release.
+        $tl = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $tl.Start()
+        $script:DeadPort = ($tl.LocalEndpoint).Port
+        $tl.Stop()
+    }
+    AfterAll {
+        foreach ($s in @($script:SrvOk, $script:SrvStalled, $script:SrvGarbage)) {
+            if ($s) { Remove-Job -Job $s.Job -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It '200: parses the body and carries the status' {
+        $p = Get-HealthPayload -Url $script:SrvOk.Url -TimeoutSec 5
+        $p.Http | Should -Be 200
+        $p.Health.status | Should -Be 'ok'
+        $p.Health.instanceId | Should -Be '11111111-aaaa'
+        $p.Error | Should -Be ''
+    }
+
+    It '503 WITH a JSON body: the body SURVIVES the throw (CR defect 1) — the stall tick is a sample, not an error' {
+        $p = Get-HealthPayload -Url $script:SrvStalled.Url -TimeoutSec 5
+        $p.Http | Should -Be 503
+        $p.Health | Should -Not -BeNullOrEmpty
+        $p.Health.status | Should -Be 'stalled'
+        $p.Health.eventLoopMax60sMs | Should -Be 1900.7
+        $p.Error | Should -Be ''
+        # And the sample it produces is an ok line that SAYS it came from a 503.
+        $at = [datetime]::SpecifyKind([datetime]::Parse('2026-10-29T13:10:00'), [System.DateTimeKind]::Utc)
+        $s = ConvertTo-LagSample -Health $p.Health -AtUtc $at -Http ([int]$p.Http)
+        $s.probe | Should -Be 'ok'
+        $s.status | Should -Be 'stalled'
+        $s.http | Should -Be 503
+        $s.max60sMs | Should -Be 1900.7
+    }
+
+    It '503 with an unparseable body: fail line that still names the 503' {
+        $p = Get-HealthPayload -Url $script:SrvGarbage.Url -TimeoutSec 5
+        $p.Http | Should -Be 503
+        $p.Health | Should -BeNullOrEmpty
+        $p.Error | Should -Not -BeNullOrEmpty
+        $at = [datetime]::SpecifyKind([datetime]::Parse('2026-10-29T13:11:00'), [System.DateTimeKind]::Utc)
+        $s = ConvertTo-LagSample -Health $null -AtUtc $at -ErrorText $p.Error -Http ([int]$p.Http)
+        $s.probe | Should -Be 'fail'
+        $s.http | Should -Be 503
+    }
+
+    It 'refused connection: no Http, no Health, an error that names the exception type' {
+        $p = Get-HealthPayload -Url "http://127.0.0.1:$($script:DeadPort)/health" -TimeoutSec 5
+        $p.Http | Should -BeNullOrEmpty
+        $p.Health | Should -BeNullOrEmpty
+        $p.Error | Should -Not -BeNullOrEmpty
+    }
+}
+
+Describe 'ConvertTo-LagSample — http field' {
+    It 'omits http (null) when no response status is known' {
+        $at = [datetime]::SpecifyKind([datetime]::Parse('2026-10-29T13:12:00'), [System.DateTimeKind]::Utc)
+        $h = [pscustomobject]@{ status = 'ok'; instanceId = 'x' }
+        $s = ConvertTo-LagSample -Health $h -AtUtc $at
+        $null -eq $s.http | Should -BeTrue
+    }
+
+    It 'keeps http on a fail line (a 503 without a body is still a 503)' {
+        $at = [datetime]::SpecifyKind([datetime]::Parse('2026-10-29T13:13:00'), [System.DateTimeKind]::Utc)
+        $s = ConvertTo-LagSample -Health $null -AtUtc $at -ErrorText 'WebException: x' -Http 503
+        $s.probe | Should -Be 'fail'
+        $s.http | Should -Be 503
+    }
+}
+
 Describe 'No actuator (#173)' {
     It 'contains no restart/stop/docker verb' {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($script:ScriptPath, [ref]$null, [ref]$null)

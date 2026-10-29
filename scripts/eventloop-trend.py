@@ -3,8 +3,8 @@
 
 The sampler (scripts/eventloop-sampler.ps1) appends one NDJSON line a minute:
 `{ts, probe, status, role, instanceId, uptimeSec, activeStreams, max60sMs,
-blocked5mMs, maxCumulativeMs}`. This script answers the three questions that
-motivated the series (#739 item b):
+blocked5mMs, maxCumulativeMs, http}`. This script answers the three questions
+that motivated the series (#739 item b):
 
   * WHEN did the hub stall?          -> episodes (ticks over the proxy's own
                                         250 ms [EventLoop] log threshold)
@@ -129,33 +129,41 @@ def hourly(rows, hours):
         print(f"no sample in the last {hours} h (last sample {rows[-1]['ts']})")
         return
 
+    # Bucket by (hour, instanceId), not hour alone (#760 CR defect 2): a
+    # recreate mid-hour puts two PROCESSES in one column otherwise, and
+    # maxCumulativeMs — a per-process high-water mark — would invent a jump
+    # between them. One row per (hour, instance); instance "-" = probe-fail
+    # ticks and bodies that carried no id.
     buckets = defaultdict(list)
     for r in window:
-        buckets[r["_ts"].strftime("%Y-%m-%d %H:00")].append(r)
+        inst = r.get("instanceId") or "-"
+        buckets[(r["_ts"].strftime("%Y-%m-%d %H:00"), str(inst))].append(r)
 
-    print(f"event-loop lag — hourly, last {hours} h ({len(window)} samples)")
-    print("hour(UTC)        n  fail  max60s>=  blocked5m>=  cumulMax  instances  first..last")
-    for hour in sorted(buckets):
-        rs = buckets[hour]
+    print(f"event-loop lag — hourly per instance, last {hours} h ({len(window)} samples)")
+    print("hour(UTC)        inst      n  fail  503  max60s>=  blocked5m>=  cumulMax  first..last")
+    for hour, inst in sorted(buckets):
+        rs = buckets[(hour, inst)]
         ok = [r for r in rs if r.get("probe") == "ok"]
         fails = len(rs) - len(ok)
+        n503 = sum(1 for r in rs if num(r.get("http")) == 503)
         m60 = [num(r.get("max60sMs")) for r in ok]
         m60 = [v for v in m60 if v is not None]
         b5 = [num(r.get("blocked5mMs")) for r in ok]
         b5 = [v for v in b5 if v is not None]
         cum = [num(r.get("maxCumulativeMs")) for r in ok]
         cum = [v for v in cum if v is not None]
-        inst = {r.get("instanceId") for r in ok if r.get("instanceId")}
         print(
-            f"{hour}  {len(rs):3d}  {fails:4d}  "
+            f"{hour}  {inst[:8]:8s}  {len(rs):3d}  {fails:4d}  {n503:3d}  "
             f"{fmt(max(m60) if m60 else None, ' ms'):>9}  "
             f"{fmt(max(b5) if b5 else None, ' ms'):>11}  "
             f"{fmt(max(cum) if cum else None, ' ms'):>8}  "
-            f"{len(inst):9d}  {rs[0]['_ts']:%H:%M}..{rs[-1]['_ts']:%H:%M}"
+            f"{rs[0]['_ts']:%H:%M}..{rs[-1]['_ts']:%H:%M}"
         )
     print()
     print("max60s/blocked5m columns are LOWER bounds: a 60 s window can retire "
           "between two 60 s ticks; blocked5m is the durable one.")
+    print("503 = ticks answered by a STALLED /health (body captured since the "
+          "#760 fix): they carry the lag fields of the stall itself.")
     recreated = len({r.get("instanceId") for r in window if r.get("instanceId")})
     if recreated > 1:
         print(f"⚠ {recreated} distinct instanceId in the window — a recreate splits "
