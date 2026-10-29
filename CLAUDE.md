@@ -186,7 +186,7 @@ Substitutes the *model itself* for a whole **role** (`opus`/`sonnet`/`haiku`/`fa
 | `harness-injection-measure.py` | harness context cost — chars/token per request |
 | `turn-autopsy.py` | turn classification (#328 G12): sample · show · label · stats · aggregate |
 | `native-consumption.py` | who burns the Anthropic-native budget (OUT is the money) |
-| `uncached-attribution.py` | #445(a) — who reads the uncached volume: hub-reported input tokens by seat and by lane/model (restart-aware pairing, head/tail reads) |
+| `uncached-attribution.py` | #445(a) — who reads the uncached volume, by seat and by lane/model. Denominator = cold `input_tokens` + `cache_creation` (input alone drops cache writes); `input`/`cache_creation`/`cache_read`/`output` reported separately, restart-aware pairing, head/tail reads, every file reconciled into one bucket |
 | `native-trend.py` | cost-per-turn drift, whole days, compaction split |
 | `lane-matrix.py` | per-lane day/hour response series (Epic #116 P1, sqlite) |
 | `compaction-trend.py` | compaction cost across all lanes (#89) |
