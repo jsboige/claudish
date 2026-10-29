@@ -60,11 +60,20 @@ export function requestNumberFor(reqLike: unknown): number {
   return (g.__capN as number) ?? 0;
 }
 
-export function resolveSourceIp(req: Request, remoteAddrMap: WeakMap<Request, string>): string {
+/**
+ * WIRE-VOCABULARY, not "the client's address": forwarded headers when a proxy
+ * set them, the literal `direct` otherwise. It is the token that lands in the
+ * capture FILENAME, and turn-autopsy's REQ_RE accepts only `direct` or the
+ * relay pair form (`a.b.c.d__e.f.g.h_n`) — so a bare socket address here makes
+ * every capture unreadable to that consumer (measured 2026-10-29, #722
+ * read-back: `req-…-127.0.0.1.json` → "no req-* members found", while main's
+ * 1 371 captures are all `-direct`). The socket address is still recorded, as
+ * the additive `remote` payload field — informative, outside the filename.
+ */
+export function resolveSourceIp(req: Request): string {
   const xff = req.headers.get("x-forwarded-for") || "";
   const xrip = req.headers.get("x-real-ip") || "";
-  const directIp = remoteAddrMap.get(req) || "";
-  return xff || xrip || directIp || "direct";
+  return xff || xrip || "direct";
 }
 
 function excerpt(s: string, maxLen = 200): string {
@@ -143,7 +152,10 @@ export function logRequest(
   req: Request,
   remoteAddrMap: WeakMap<Request, string>
 ): void {
-  const src = resolveSourceIp(req, remoteAddrMap);
+  const src = resolveSourceIp(req);
+  // The socket address, when the server could read one. Purely additive: it
+  // never reaches `src` or the filename (see resolveSourceIp).
+  const remote = remoteAddrMap.get(req) || "";
   const ua = req.headers.get("user-agent") || "";
   const model = (body.model as string) ?? "(none)";
   // Cluster attribution header (set by each Claude Code via ANTHROPIC_CUSTOM_HEADERS).
@@ -214,6 +226,10 @@ export function logRequest(
       instanceId: getInstanceId(),
       ...extractAttributionFields(body),
       hops,
+      // Server-derived, short, and seated AFTER the attribution head the
+      // leak-policy method reads (machine + model within ~400 bytes) and AFTER
+      // `hops`; it never participates in the filename contract.
+      ...(remote ? { remote } : {}),
       body,
     });
     // Never block the request path: fire-and-forget with a silent catch.
