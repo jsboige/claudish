@@ -37,8 +37,16 @@ function script:docker {
         if (-not $env:FM_PS) { return @() }
         return @($env:FM_PS -split '@@')
     }
+    if ($a -match '^image\b') {
+        # The image-created pin: distinct from the container's own Created.
+        # Falls back to FM_CREATED so every pre-existing pin keeps its date.
+        if ($env:FM_IMAGE_CREATED) { return @($env:FM_IMAGE_CREATED) }
+        if (-not $env:FM_CREATED) { return @() }
+        return @($env:FM_CREATED)
+    }
     if ($a -match '^inspect\b') {
         if ($a -match 'Config\.Env') { if (-not $env:FM_ENV) { return @() }; return @($env:FM_ENV -split '@@') }
+        if ($a -match '\.Image') { return @('sha256:9e280fb3a939a37d829c5363fa561be4fdc3d4990c063ed8581bbc4066f7c92c') }
         if ($a -match '\.Created') { if (-not $env:FM_CREATED) { return @() }; return @($env:FM_CREATED) }
         if ($a -match 'PortBindings') { if (-not $env:FM_PORTS) { return @() }; return @($env:FM_PORTS) }
         return @()
@@ -69,6 +77,7 @@ exit $LASTEXITCODE
             [string]$Ps = 'claudish-sidecar|claudish-claudish-proxy|Up 2 hours (healthy)',
             [string[]]$EnvLines = @('PATH=/usr/bin'),
             [string]$Created = '2026-10-27T17:49:52.123456789Z',
+            [string]$ImageCreated = '',
             [string]$Ports = '{"3000/tcp":[{"HostIp":"","HostPort":"3000"}]}',
             [string[]]$Logs = @('2026-10-28T23:09:14.145886697Z [Relay] NOMINAL after 3 OK heartbeats'),
             [switch]$NoSettings
@@ -77,6 +86,7 @@ exit $LASTEXITCODE
         $env:FM_PS = $Ps
         $env:FM_ENV = ($EnvLines -join '@@')
         $env:FM_CREATED = $Created
+        $env:FM_IMAGE_CREATED = $ImageCreated
         $env:FM_PORTS = $Ports
         $env:FM_LOGS = ($Logs -join '@@')
         $env:FM_DOCKER_DOWN = ''
@@ -97,8 +107,8 @@ Describe 'fleet-matrix' {
     AfterEach {
         # Pester 6 refuses ROOT-level teardowns, so the FM_* scaffold env vars
         # are cleared here, inside the Describe.
-        Remove-Item Env:FM_PS, Env:FM_ENV, Env:FM_CREATED, Env:FM_PORTS, Env:FM_LOGS,
-            Env:FM_DOCKER_DOWN, Env:FM_SETTINGS_PATH, Env:FM_TARGET -ErrorAction SilentlyContinue
+        Remove-Item Env:FM_PS, Env:FM_ENV, Env:FM_CREATED, Env:FM_IMAGE_CREATED, Env:FM_PORTS,
+            Env:FM_LOGS, Env:FM_DOCKER_DOWN, Env:FM_SETTINGS_PATH, Env:FM_TARGET -ErrorAction SilentlyContinue
     }
 
     Context 'the full row, measured from live objects' {
@@ -118,6 +128,17 @@ Describe 'fleet-matrix' {
         It 'renders a HUB seat (no upstream var) as a measured state, not an unknown' {
             $r = Invoke-Matrix -EnvLines @('PATH=/usr/bin')
             $r.Out | Should -Match '\(unset - local\)'
+            $r.Code | Should -Be 0
+        }
+
+        It 'prints the IMAGE created date, never the container one (measured 29/10 po-2023)' {
+            # Live defect this pins: a seat recreated this morning read
+            # "2026-10-29" while serving an image built 2026-10-10, because the
+            # cell took the container's {{.Created}}. Fix reads {{.Image}} then
+            # the image's own Created; the two must be observably distinct here.
+            $r = Invoke-Matrix -Created '2026-10-29T09:01:00.000000000Z' -ImageCreated '2026-10-10T15:54:25.145147155Z'
+            $r.Out | Should -Match '\| 2026-10-10 \|'
+            $r.Out | Should -Not -Match '\| 2026-10-29 \|'
             $r.Code | Should -Be 0
         }
     }
