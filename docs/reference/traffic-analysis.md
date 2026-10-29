@@ -26,6 +26,7 @@
 | `traffic-anthropic.ps1` | **Answers "where does the Anthropic traffic come from?"** — attributes every Anthropic-native (opus/fable) request by **machine + workspace** (workspace = proof, from the system prompt; not stdout). Per-request verdict: `[OK]` ai-01 · `[REVIEW]` po-2025 · `[INFO]` fable during a `-FableOverrideActive` window · `[LEAK-SUBAGENT]` rogue Opus sub-agent (`cc_is_subagent=true`, **exit 1**) · `[REVIEW-INTERACTIVE]` user-driven non-ai-01 session (exit 0). sonnet-4-6 shown separately (remapped to glm → not Anthropic). | `.\scripts\traffic-anthropic.ps1 [-Hours N] [-FableOverrideActive]` |
 | `traffic-history.ps1` | Historical analysis from 7z archives | `.\scripts\traffic-history.ps1 [-Date yyyy-MM-dd] [-Days N]` |
 | `live-session-scan.py` | **Per-session live attribution (#362)** — aggregates in-window `req-*.json` by session (user_id + session_id) with two flag classes: `OPENAI-SHAPED` (`gpt-\|codex\|-sol\|o3-\|o4-`, LEAK-grade — the OpenAI plan is last-chance, non-renewable credit) and `RETIRED-ID` (`claude-sonnet-4-6\|glm-5.2\|qwen3.6-35b-a3b`, INFO-grade — ids removed from the catalogs but still named by drifted client configs). Two-speed read: 6 KiB head + 16 KiB tail by default, `--deep` for the full JSON parse. | `python .\scripts\live-session-scan.py [--hours N] [--top N] [--models regex] [--deep] [--json]` |
+| `turn-composition.py` | **Of what is the turn surplus made (#328)** — four sub-commands: `envelope` (whole-corpus lane attribution by head-read, ~2 KB/file), `history` (bytes re-paid per turn + the per-turn system tax), `nudge` (which trailing system block rides the turn, and whether it is a passenger or a turn of its own), `routability` (which declared rungs can authenticate on this seat, `apiKeys` map first — a container-env-only probe lies). | `python .\scripts\turn-composition.py {envelope\|history\|nudge\|routability} …` — see §Turn composition |
 | `compress-captures.ps1` | Nightly 7z compaction + GDrive backup + 30d local purge (scheduled task) | Runs automatically at 04:17 |
 | `claudish-watchdog.ps1` | Proxy health: tool-call stream test + proactive restart (uptime >11h) + auto-recovery on hang. Scheduled every 15min. | Runs automatically |
 | `CaptureUtils.psm1` | Shared module (capture parsing, device mapping, 7z extraction) | Imported by the scripts above |
@@ -137,6 +138,46 @@ pairing: july 33 paired / 16 unpaired · now 50/0 — attempt-chained turns (**c
 What stands: the **lane count, 3 → 14** (July: `glm-5.2` 21, `MiniMax-M3` 10, `opus-4-8` 2; 30/09: `glm-5.3` 19, `MiniMax-M3` 15, `opus-5-5` 5, plus 9 single-turn lanes), and the **attempt-chain contrast** (8/49 vs 0/50) — July's cascade churned upstream attempts on a sixth of its turns, the now-era none. Treat both as hypotheses a larger sample must confirm, not as findings.
 
 **Not done, and deliberately**: no mass reading. The grid is arbitrated but not yet validated against a second reader — ai-01's protocol calls for ~20 turns read twice, independently, with agreement/uncertainty published. The pilot's job was to calibrate the grid and to size the next sample; it does that and stops.
+
+### Turn composition — of what is the surplus made (measured 29/10)
+
+`scripts/turn-composition.py` answers the question the counts cannot: **of what are the extra turns made**. Four sub-commands, each reading the minimum bytes that carry its answer (`envelope` head-reads the whole corpus, ~2 KB/file; `history` and `nudge` take a deterministic stride; `routability` compares declared rungs against the credentials that actually exist).
+
+```powershell
+python .\scripts\turn-composition.py envelope --dir D:\claudish-captures --label now
+python .\scripts\turn-composition.py history  --dir D:\claudish-captures --label now --limit 400
+python .\scripts\turn-composition.py nudge    --dir D:\claudish-captures --label now --limit 400
+python .\scripts\turn-composition.py routability --config <config home>\config.json --container claudish-proxy
+```
+
+**The bill decomposes as `requests × bytes-per-request`, and the first term owns it.** Same instrument (hub captures), 05/07 = 10 595 requests in one day, 29/10 = 77 023 (**×7.3**). Mean bytes per request 525.5 k → 642.8 k chars (**×1.22**) — the harness floor is not the lever, exactly as the ×3.41/×1.08 decomposition said.
+
+**The per-turn system tax doubled, and it is a PASSENGER.** Inline `role:"system"` blocks per *assistant turn* (the honest denominator — a request is not a turn):
+
+| | 05/07 | 29/10 |
+| --- | --- | --- |
+| system blocks per assistant turn | **0.20 – 0.33** | **0.83 – 0.96** |
+| `n_system_inline` p50 / p90 / max | 7 / 20 / 47 | 39 / 162 / **872** |
+| inline-system bytes p50 | 39.9 k | 73.6 k |
+| chars per system block p50 | **4 270** | **1 419** |
+
+The ratio is flat across every history bucket (0.83–0.96 from <10 turns to 120+), so the tax is **per turn and it compounds with history length** — but the block shrank 3×, which is why the byte growth (+84 % on a line item) is a *passenger* on turns that had to happen anyway, not a turn generator.
+
+**`last_role == "system"` does NOT mean "harness-driven turn" — the pilot table above must be read with this.** Since Claude Code v2.1.153+ the client appends an output-style reminder as an inline system message after the tool_result. Measured 29/10 on n=400: **83.1 %** of requests end with a system block, of which **87.7 %** are that reminder (short Proactive form 50.6 %, long form 32.5 %, Concise 4.6 %), and the message before it is `user + tool_result` in **324/332** cases. `prev=assistant` with no `tool_use` (the shape that would make it a turn of its own) appears **zero** times; repeated conversation-state requests 6/400 across 5 sessions — no retry storm. The reminder is ~109 chars on a ~640 k-char request: *shrink the text* is a hygiene fix, never the lever, and the 40 % vs 12 % "system role" line in the pilot measures client behaviour, not agent behaviour.
+
+**The productivity denominator, same windows** (merged PRs, `gh pr list --limit 2000`, 01–12/07 vs 22–29/10):
+
+| repo | july/day | oct/day |
+| --- | --- | --- |
+| CoursIA | 83.3 | 104.8 |
+| roo-extensions | 7.0 | 11.9 |
+| claudish | 0.08 | **16.4** |
+| vllm | 0 | 15.1 |
+| **fleet** | **90.4** | **148.1** |
+
+Output went **up** (×1.6/day); what degraded is **efficiency per merge**: ~117 requests per merged PR in July vs ~520 now (**×4.4**). The surplus is therefore not "wasted turns" — it is more expensive turns to reach more output, and the ×4.4 is the number to attack.
+
+**Still open, and named**: this decomposes the *cost* of the surplus, not its *nature*. The G12 nature grid (production · verification · coordination · navigation · context-repair · duplicate-restart · waiting-poll) remains unread at mass — it needs a reader, not a counter — and per-lane attribution comes from `envelope` (machine / entrypoint / model), which is the form in which a sibling lane can be handed its own slice.
 
 ## Machine attribution
 
