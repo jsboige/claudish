@@ -16,14 +16,14 @@ import {
   type NestedToolUse,
   relayNestedInput,
 } from "../../../code-mode/types.js";
-import type { RawStreamTap } from "../../../hooks/raw.js";
 // Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [ttft]/[resp]
 // stdout markers, correlated by the request number frozen at ingestion.
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
-import { createResponseCapture } from "../response-capture.js";
-import { ttftMarkerLine } from "../traffic-markers.js";
+import type { RawStreamTap } from "../../../hooks/raw.js";
 import { wrapAnthropicError } from "../anthropic-error.js";
+import { createResponseCapture } from "../response-capture.js";
 import type { UsageCacheDetail } from "../token-tracker.js";
+import { ttftMarkerLine } from "../traffic-markers.js";
 import { ClaudeSseSink } from "./responses/claude-sse-sink.js";
 import { type ResponsesRetryOptions, runResponsesTurn } from "./responses/responses-turn.js";
 import { type ParserSource, cancelEndsUpstreamWork } from "./upstream-cancel.js";

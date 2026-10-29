@@ -16,15 +16,19 @@
  * client-cancel) — provenance is annotated in each fixture header.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync, rmSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
-import { respMarkerLine, ttftMarkerLine, wallMarkerLine } from "../../handlers/shared/traffic-markers.js";
-import { logRequest, requestNumberFor } from "./request-logger.js";
+import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   __resetCaptureDirMemo,
   createResponseCapture,
 } from "../../handlers/shared/response-capture.js";
+import {
+  respMarkerLine,
+  ttftMarkerLine,
+  wallMarkerLine,
+} from "../../handlers/shared/traffic-markers.js";
+import { logRequest, requestNumberFor } from "./request-logger.js";
 
 // ── The contract, as a consumer would write it ──────────────────────────────
 // Two leading spaces are PART of the format (both templates start with "  ").
@@ -32,9 +36,9 @@ import {
 // `closed`/`stop` may be `?`. Field order is load-bearing for latency
 // histograms and (pid, reqN) joins; units are suffixed on every numeric field.
 const TTFT_RE =
-  /^  \[ttft\] (\S+) model=(\S+) reqN=(\d+) headers=(-?\d+)ms firstEvent=(\d+)ms total=(-?\d+)ms$/;
+  /^ {2}\[ttft\] (\S+) model=(\S+) reqN=(\d+) headers=(-?\d+)ms firstEvent=(\d+)ms total=(-?\d+)ms$/;
 const RESP_RE =
-  /^  \[resp\] (\S+) model=(\S+) reqN=(\d+) events~=(\d+) bytes=(\d+) closed=(\S+) stop=(\S+) (\d+)ms -> (\S+)$/;
+  /^ {2}\[resp\] (\S+) model=(\S+) reqN=(\d+) events~=(\d+) bytes=(\d+) closed=(\S+) stop=(\S+) (\d+)ms -> (\S+)$/;
 
 const FIXTURE_DIR = join(import.meta.dir, "../../../__fixtures__/traffic-format");
 
@@ -83,7 +87,17 @@ describe("ttftMarkerLine — the [ttft] producer", () => {
 describe("respMarkerLine — the [resp] producer", () => {
   test("exact shape with real fields", () => {
     expect(
-      respMarkerLine("openai", "glm-5.2", 1, 7, 1019, true, "tool_use", 11, "/captures/resp-1-r0001-x.sse")
+      respMarkerLine(
+        "openai",
+        "glm-5.2",
+        1,
+        7,
+        1019,
+        true,
+        "tool_use",
+        11,
+        "/captures/resp-1-r0001-x.sse"
+      )
     ).toBe(
       "  [resp] openai model=glm-5.2 reqN=1 events~=7 bytes=1019 closed=true stop=tool_use 11ms -> /captures/resp-1-r0001-x.sse\n"
     );
@@ -103,12 +117,30 @@ describe("respMarkerLine — the [resp] producer", () => {
     }
     // Producer-built fixture lines (3rd and 4th) round-trip exactly.
     expect(
-      respMarkerLine("openai", "glm-5.3", 0, 0, 0, "?", "?", 5,
-        "/captures/resp-1-r0000-2026-10-07T00-00-00-000Z-openai-glm-5.3.sse")
+      respMarkerLine(
+        "openai",
+        "glm-5.3",
+        0,
+        0,
+        0,
+        "?",
+        "?",
+        5,
+        "/captures/resp-1-r0000-2026-10-07T00-00-00-000Z-openai-glm-5.3.sse"
+      )
     ).toBe(lines[2] + "\n");
     expect(
-      respMarkerLine("anthropic", "kimi-k2.5", 9, 12, 4096, false, "client-cancel", 501,
-        "/captures/resp-1-r0009-2026-10-07T00-00-00-000Z-anthropic-kimi-k2.5.sse")
+      respMarkerLine(
+        "anthropic",
+        "kimi-k2.5",
+        9,
+        12,
+        4096,
+        false,
+        "client-cancel",
+        501,
+        "/captures/resp-1-r0009-2026-10-07T00-00-00-000Z-anthropic-kimi-k2.5.sse"
+      )
     ).toBe(lines[3] + "\n");
   });
 });
@@ -165,8 +197,7 @@ describe("emission sites use the shared builders (anti-re-inlining guard)", () =
   // this guard fails if a site re-inlines a template instead of calling the
   // builder, which is the one drift the exact-string pins above cannot see.
   test("the three stream parsers call ttftMarkerLine; response-capture calls respMarkerLine", () => {
-    const src = (rel: string) =>
-      readFileSync(join(import.meta.dir, rel), "utf8");
+    const src = (rel: string) => readFileSync(join(import.meta.dir, rel), "utf8");
     for (const rel of [
       "../../handlers/shared/stream-parsers/openai-sse.ts",
       "../../handlers/shared/stream-parsers/anthropic-sse.ts",
@@ -195,12 +226,7 @@ describe("wall line — the two-pass client-error instrument's exact join key (#
     expect(line).toBe("Error [GLM Coding]: HTTP 429 reqN=42. Rate limited…");
     const m = WALL_RE.exec(line);
     expect(m).not.toBeNull();
-    expect([m![1], m![2], m![3], m![4]]).toEqual([
-      "GLM Coding",
-      "429",
-      "42",
-      "Rate limited…",
-    ]);
+    expect([m![1], m![2], m![3], m![4]]).toEqual(["GLM Coding", "429", "42", "Rate limited…"]);
   });
 
   test("no `[claudish] ` prefix and no trailing newline — logStderr adds both", () => {
@@ -217,10 +243,7 @@ describe("wall line — the two-pass client-error instrument's exact join key (#
   });
 
   test("composed-handler emits it through the builder, with the request's own number", () => {
-    const src = readFileSync(
-      join(import.meta.dir, "../../handlers/composed-handler.ts"),
-      "utf8"
-    );
+    const src = readFileSync(join(import.meta.dir, "../../handlers/composed-handler.ts"), "utf8");
     expect(src).toContain("wallMarkerLine(");
     // the number comes from the raw Request, never the global counter
     expect(src).toContain("requestNumberFor(c.req)");

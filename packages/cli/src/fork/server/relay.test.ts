@@ -1843,7 +1843,9 @@ describe("#279a — deep-probe overlap guard (proberTick)", () => {
     // without the guard, every 10 s tick during recovery double-spends.
     let deepProbes = 0;
     let release!: () => void;
-    const held = new Promise<void>((r) => (release = r));
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
     fetchImpl = async (url: any) => {
       const u = String(url);
       if (u.endsWith("/health")) {
@@ -1923,7 +1925,7 @@ describe("#279b — hop-list self-detection", () => {
     const h = lastFetch!.init.headers as Record<string, string>;
     expect(h["x-claudish-hops"]).toBe(`node-a,${getInstanceId()}`); // appended, upstream ids preserved
     expect(h["x-claudish-machine"]).toBe("myia-po-203"); // attribution survives, untouched
-    expect(h["authorization"]).toBe("Bearer client-oauth"); // client OAuth untouched
+    expect(h.authorization).toBe("Bearer client-oauth"); // client OAuth untouched
     expect(h["x-proxy-key"]).toBe("cluster-key"); // cluster gate untouched
   });
 

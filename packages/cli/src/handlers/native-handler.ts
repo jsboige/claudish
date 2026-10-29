@@ -1,11 +1,11 @@
 import type { Context } from "hono";
 import { credentials } from "../auth/credentials/authority.js";
-import { recordSessionBudgetOutput } from "../fork/session-budget.js";
 // Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [resp] stdout
 // marker on the streaming branch, and a durable appendUpstreamError trace of
 // non-ok bodies — NativeHandler is the ONLY path for Anthropic-native traffic,
 // so without it a quota wall from api.anthropic.com left no durable trace.
 import { requestNumberFor } from "../fork/middleware/request-logger.js";
+import { recordSessionBudgetOutput } from "../fork/session-budget.js";
 import { requestHooksOf } from "../hooks/request-stage.js";
 import { log, maskCredential } from "../logger.js";
 import { redactForClient } from "../redact.js";
@@ -17,11 +17,8 @@ import {
   stripAdvisorBeta,
 } from "./native-handler-advisor.js";
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
-import {
-  appendUpstreamError,
-  createResponseCapture,
-} from "./shared/response-capture.js";
 import { addSigningSecrets, credentialValuesFromRequest } from "./shared/call-context.js";
+import { appendUpstreamError, createResponseCapture } from "./shared/response-capture.js";
 import {
   type UpstreamReaderSlot,
   cancelEndsUpstreamWork,

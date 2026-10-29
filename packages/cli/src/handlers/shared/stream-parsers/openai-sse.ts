@@ -8,20 +8,20 @@
  */
 
 import type { Context } from "hono";
-import type { RawStreamTap } from "../../../hooks/raw.js";
-import { log } from "../../../logger.js";
-import { redactForClient } from "../../../redact.js";
 // Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [ttft]/[resp]
 // stdout markers, correlated by the request number frozen at ingestion.
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
+import type { RawStreamTap } from "../../../hooks/raw.js";
+import { log } from "../../../logger.js";
+import { redactForClient } from "../../../redact.js";
 import { createResponseCapture } from "../response-capture.js";
-import { ttftMarkerLine } from "../traffic-markers.js";
 import {
   type ToolSchema,
   extractToolCallsFromText,
   hasExtractableFunctionTag,
   validateAndRepairToolCall,
 } from "../tool-call-recovery.js";
+import { ttftMarkerLine } from "../traffic-markers.js";
 import { isWebSearchToolCall } from "../web-search-detector.js";
 import { executeWebSearch, extractSearchQuery } from "../web-search-executor.js";
 import { type BlockRef, createBlockWriter } from "./block-writer.js";

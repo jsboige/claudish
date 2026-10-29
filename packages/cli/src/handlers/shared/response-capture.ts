@@ -14,8 +14,8 @@
  * server-side (the parser loop never reached close).
  */
 
-import { mkdirSync, appendFileSync } from "fs";
-import { writeFile } from "fs/promises";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 
 import { getInstanceId } from "../../instance-id.js";
 import { respMarkerLine } from "./traffic-markers.js";
@@ -114,10 +114,10 @@ export function createResponseCapture(
       const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
       sse += text;
       // Count SSE events (data: lines) for a quick at-a-glance summary.
-      let idx = 0;
-      while ((idx = text.indexOf("\ndata:", idx)) !== -1) {
+      let idx = text.indexOf("\ndata:");
+      while (idx !== -1) {
         events++;
-        idx += 6;
+        idx = text.indexOf("\ndata:", idx + 6);
       }
     },
     note(noteLabel: string) {
@@ -129,10 +129,12 @@ export function createResponseCapture(
       try {
         if (!ensureCaptureDir(captureDir)) return;
         const ts = new Date().toISOString().replace(/[:.]/g, "-");
-        const safeModel = String(model).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40);
+        const safeModel = String(model)
+          .replace(/[^a-zA-Z0-9._-]/g, "_")
+          .slice(0, 40);
         const file = `${captureDir}/resp-${process.pid}-r${String(reqNumber).padStart(4, "0")}-${ts}-${label}-${safeModel}.sse`;
         const header =
-          `# claudish response capture\n` +
+          "# claudish response capture\n" +
           `# parser=${label} model=${model} reqN=${reqNumber} pid=${process.pid}\n` +
           // #662 — same rationale as the request side: `pid` is 1 in every
           // container life, the instanceId discriminates lives. Its OWN header
@@ -147,7 +149,17 @@ export function createResponseCapture(
         const stopReason = extra?.stop_reason ?? "?";
         const closed = extra?.closed ?? "?";
         process.stdout.write(
-          respMarkerLine(label, model, reqNumber, events, sse.length, closed, stopReason, Date.now() - startedAt, file)
+          respMarkerLine(
+            label,
+            model,
+            reqNumber,
+            events,
+            sse.length,
+            closed,
+            stopReason,
+            Date.now() - startedAt,
+            file
+          )
         );
         // Fire-and-forget: see the note at the top of this file.
         writeFile(file, header + sse).catch((e) => {

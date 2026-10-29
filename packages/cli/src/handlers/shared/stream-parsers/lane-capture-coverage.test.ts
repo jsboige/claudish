@@ -17,12 +17,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { __resetCaptureDirMemo } from "../response-capture.js";
 import { createGeminiSseStream } from "./gemini-sse.js";
 import { createOllamaJsonlStream } from "./ollama-jsonl.js";
-import { __resetCaptureDirMemo } from "../response-capture.js";
 
 const PARSER_DIR = join(import.meta.dir);
 const CAPTURE_DIR = join(tmpdir(), `claudish-lane-capture-${process.pid}`);
@@ -152,7 +152,9 @@ describe("gemini lane — capture + [resp] marker", () => {
     );
 
     const lines = await captureStdout(async () => {
-      const reader = createGeminiSseStream(ctx, neverEnding, { modelName: "gemini-2.0-flash" }).body!.getReader();
+      const reader = createGeminiSseStream(ctx, neverEnding, {
+        modelName: "gemini-2.0-flash",
+      }).body!.getReader();
       await reader.read();
       await reader.cancel("client went away");
     });

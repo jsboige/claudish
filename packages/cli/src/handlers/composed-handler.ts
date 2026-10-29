@@ -156,6 +156,10 @@ import {
   isContextOverflowError,
   isRequestShapeError,
 } from "./shared/request-shape.js";
+// Capture pipeline (#641 blocker-2 port): the unconditional capture-dir copy
+// of a non-ok body (captureUpstreamError above is the separate, env-gated
+// opt-in — both fire, different consumers).
+import { appendUpstreamError } from "./shared/response-capture.js";
 import {
   type LegAuthBinding,
   createLegIssuer,
@@ -188,10 +192,6 @@ import {
   withConnectionRetry,
 } from "./shared/transient-retry.js";
 import { captureUpstreamError } from "./shared/upstream-error-capture.js";
-// Capture pipeline (#641 blocker-2 port): the unconditional capture-dir copy
-// of a non-ok body (captureUpstreamError above is the separate, env-gated
-// opt-in — both fire, different consumers).
-import { appendUpstreamError } from "./shared/response-capture.js";
 
 /**
  * Backoff schedule for a retryable error that arrived inside an HTTP 200 stream.

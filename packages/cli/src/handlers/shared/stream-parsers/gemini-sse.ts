@@ -8,13 +8,13 @@
 
 import type { Context } from "hono";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
-import type { RawStreamTap } from "../../../hooks/raw.js";
-import { log } from "../../../logger.js";
-import { redactForClient } from "../../../redact.js";
 // Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [resp] stdout
 // marker, correlated by the request number frozen at ingestion. Tap-only wire
 // (no [ttft] marker on this lane — same as main).
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
+import type { RawStreamTap } from "../../../hooks/raw.js";
+import { log } from "../../../logger.js";
+import { redactForClient } from "../../../redact.js";
 import { createResponseCapture } from "../response-capture.js";
 import { messageStartUsage } from "./message-start-usage.js";
 import { sseDataPayload } from "./sse-line.js";

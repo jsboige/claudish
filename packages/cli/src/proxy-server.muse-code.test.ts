@@ -220,6 +220,10 @@ process.on("unhandledRejection", error => { console.error(error); realExit(1); }
     syncBuiltinESMExports();
   `;
   const initialization = `
+    // This child's stdout is a protocol stream (one JSON line). The capture
+    // pipeline's markers are ungated stdout by design; filter exactly the
+    // pinned prefixes here, like child-proxy-run.ts does for CP-10.
+    (await import(${JSON.stringify(resolve(import.meta.dir, "./test-support/traffic-markers-silence.js"))})).silenceTrafficMarkers();
     let keychainOperations = 0;
     const forbidden = () => { keychainOperations++; throw new Error("Real Keychain process forbidden"); };
     const generic = await import(${JSON.stringify(resolve(import.meta.dir, "./providers/keychain.js"))});

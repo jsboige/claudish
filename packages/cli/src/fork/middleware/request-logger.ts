@@ -7,8 +7,8 @@
  * Leak investigation mode: dumps system prompt excerpt + first + last user message.
  */
 
-import { mkdirSync } from "fs";
-import { writeFile } from "fs/promises";
+import { mkdirSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { inboundKeyFor } from "../../handlers/shared/inbound-keys.js";
 import { getInstanceId } from "../../instance-id.js";
 import { HOPS_HEADER } from "../server/relay.js";
@@ -60,10 +60,7 @@ export function requestNumberFor(reqLike: unknown): number {
   return (g.__capN as number) ?? 0;
 }
 
-export function resolveSourceIp(
-  req: Request,
-  remoteAddrMap: WeakMap<Request, string>
-): string {
+export function resolveSourceIp(req: Request, remoteAddrMap: WeakMap<Request, string>): string {
   const xff = req.headers.get("x-forwarded-for") || "";
   const xrip = req.headers.get("x-real-ip") || "";
   const directIp = remoteAddrMap.get(req) || "";
@@ -163,7 +160,12 @@ export function logRequest(
   // are written to disk and read back by the traffic-*.ps1 analyzers.
   const hops = (req.headers.get(HOPS_HEADER) || "")
     .split(",")
-    .map((h) => h.trim().replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 64))
+    .map((h) =>
+      h
+        .trim()
+        .replace(/[^a-zA-Z0-9._-]/g, "")
+        .slice(0, 64)
+    )
     .filter(Boolean)
     .slice(0, 8);
 
@@ -234,11 +236,12 @@ export function logRequest(
   );
 
   // System prompt excerpt (first 300 chars)
-  const sysText = typeof body.system === "string"
-    ? body.system
-    : Array.isArray(body.system)
-      ? JSON.stringify(body.system)
-      : "";
+  const sysText =
+    typeof body.system === "string"
+      ? body.system
+      : Array.isArray(body.system)
+        ? JSON.stringify(body.system)
+        : "";
   if (sysText) {
     process.stdout.write(`  [system] ${excerpt(sysText, 300)}\n`);
   }

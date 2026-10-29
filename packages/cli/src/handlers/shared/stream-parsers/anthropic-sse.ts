@@ -11,11 +11,11 @@
 
 import type { Context } from "hono";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
-import { log } from "../../../logger.js";
-import { redactForClient } from "../../../redact.js";
 // Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [ttft]/[resp]
 // stdout markers, correlated by the request number frozen at ingestion.
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
+import { log } from "../../../logger.js";
+import { redactForClient } from "../../../redact.js";
 import { createResponseCapture } from "../response-capture.js";
 import { ttftMarkerLine } from "../traffic-markers.js";
 import { messageStartUsage } from "./message-start-usage.js";

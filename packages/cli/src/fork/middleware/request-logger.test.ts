@@ -9,12 +9,12 @@
  * path never blocks on the event loop.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
-import { logRequest } from "./request-logger";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { markInboundKey } from "../../handlers/shared/inbound-keys.js";
 import { getInstanceId } from "../../instance-id.js";
+import { logRequest } from "./request-logger";
 
 function mkRequest(headers: Record<string, string> = {}): Request {
   return new Request("http://localhost:3000/v1/messages", {
@@ -171,7 +171,7 @@ describe("request-logger capture (fork)", () => {
       new WeakMap()
     );
 
-    let file = await waitForCapture(capDir);
+    const file = await waitForCapture(capDir);
     expect(file).not.toBeNull();
     let json = JSON.parse(readFileSync(file!, "utf8"));
     expect(json.inbound_key).toBe("external-jamin");
@@ -231,7 +231,8 @@ describe("request-logger capture (fork)", () => {
         model: "glm-5.3",
         messages: [],
         metadata: { user_id: "not json at all" },
-        system: "x-anthropic-billing-header: cc_version=2.1.258; cc_entrypoint=agentSdk; cch=xyz;\nbody",
+        system:
+          "x-anthropic-billing-header: cc_version=2.1.258; cc_entrypoint=agentSdk; cch=xyz;\nbody",
       },
       "ComposedHandler",
       mkRequest(),
@@ -390,7 +391,12 @@ describe("request-logger stdout format (pinning — RSM consumer contract)", () 
 
   it("emits a line matching the consumer contract (stream + machine)", () => {
     const line = captureRequestLine(
-      { model: "claude-sonnet-5", stream: true, messages: [{ role: "user", content: "x" }], max_tokens: 1024 },
+      {
+        model: "claude-sonnet-5",
+        stream: true,
+        messages: [{ role: "user", content: "x" }],
+        max_tokens: 1024,
+      },
       "NativeHandler",
       { "x-claudish-machine": "myia-po-2023" }
     );

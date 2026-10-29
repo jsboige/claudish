@@ -1,13 +1,13 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import {
-  appendUpstreamError,
-  createResponseCapture,
-  __resetCaptureDirMemo,
-} from "./response-capture.js";
-import { getInstanceId } from "../../instance-id.js";
-import { rmSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getInstanceId } from "../../instance-id.js";
+import {
+  __resetCaptureDirMemo,
+  appendUpstreamError,
+  createResponseCapture,
+} from "./response-capture.js";
 
 /**
  * appendUpstreamError durably logs non-ok upstream response bodies to
