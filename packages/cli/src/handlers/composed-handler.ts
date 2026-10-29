@@ -1000,6 +1000,52 @@ export class ComposedHandler implements ModelHandler {
         // Not corroborated: fall through to the upstream. Its 400 (if doomed)
         // returns the same recoverable turn one round-trip later; its 200 (if
         // served) is a turn the old gate would have thrown away.
+        //
+        // #739 — one round-trip per oversized request is the DESIGNED cost of
+        // #674, and on a local lane it is paid 121 times a day (measured
+        // 29/10: 118 of 122 context skips are provably post-400). The exact
+        // counter exists to make that the exception, but it was wired ONLY into
+        // the derived-window branch below — and that branch is an `else if`
+        // behind this one, so the FIRST learned cap SHADOWS it and takes the
+        // tokenizer down with it. That is precisely the state in which the band
+        // is worth asking: the cap says "probably over", the window says
+        // "maybe not". Ask the engine's own tokenizer before paying the fetch.
+        // Same units as the derived branch (the clamp estimate against the
+        // window), same bound, same 404-forgets-itself behaviour.
+        let exact: ExactPromptCount | null = null;
+        // MEASURED windows only — `stated ?? derived`, never the hand-typed
+        // `contextLimit`: a stale literal that is too small would turn an
+        // `exact >= literal` into a false refusal of a prompt the engine
+        // serves (#676's boundary, unchanged by #739).
+        const measuredWindow =
+          getStatedContextLimit(this.provider.displayName, this.targetModel) ??
+          this.options.derivedContextLimit;
+        if (
+          measuredWindow !== undefined &&
+          measuredWindow > 0 &&
+          !exactCountDisabled() &&
+          this.provider.countPromptTokens &&
+          inExactCountBand(estimateClampTokens(claudeRequest), measuredWindow, readExactCountBand())
+        ) {
+          const wireMessages = (requestPayload as any)?.messages;
+          if (Array.isArray(wireMessages) && wireMessages.length > 0) {
+            exact = await this.provider.countPromptTokens(wireMessages);
+          }
+          if (exact) {
+            if (exact.exact >= measuredWindow) {
+              log(
+                `[ExactCount] refuse-locally provider=${this.provider.displayName} model=${this.targetModel} ` +
+                  `est=${est} exact=${exact.exact} window=${measuredWindow} (learned cap ${overflowCap}) — no upstream call`,
+                true
+              );
+              return this.buildOverflowRecoveryResponse(c, payload, est, undefined, measuredWindow, exact.exact);
+            }
+            log(
+              `[ExactCount] fits provider=${this.provider.displayName} model=${this.targetModel} ` +
+                `est=${est} exact=${exact.exact} window=${measuredWindow} (learned cap ${overflowCap}) — upstream decides`
+            );
+          }
+        }
       }
     } else if (this.options.derivedContextLimit !== undefined && this.options.derivedContextLimit > 0) {
       // #651 — a window MEASURED from the engine's own `/v1/models` pre-seeds
