@@ -61,12 +61,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { Hono } from "hono";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { NativeHandler } from "./native-handler.js";
+import { Hono } from "hono";
 import { installStubFetch } from "../test-support/stub-fetch.js";
+import { NativeHandler } from "./native-handler.js";
 
 /** A minimal but COMPLETE Anthropic SSE turn (message_start … message_stop). */
 const CHUNK_1 =
@@ -189,7 +189,12 @@ describe("native lane response capture (#722 read-back, grain v17-1)", () => {
   afterEach(() => {
     if (stub) stub.restore();
     stub = null;
-    if (prevEnv === undefined) delete process.env.CLAUDISH_CAPTURE_DIR;
+    // `Reflect.deleteProperty`, NOT `delete process.env.X` (biome's
+    // lint/performance/noDelete) and NOT `= undefined`: measured on bun
+    // 1.3.14, assigning undefined to a process.env key stores the STRING
+    // "undefined" — the capture would then write to a directory literally
+    // named "undefined" in the working directory.
+    if (prevEnv === undefined) Reflect.deleteProperty(process.env, "CLAUDISH_CAPTURE_DIR");
     else process.env.CLAUDISH_CAPTURE_DIR = prevEnv;
     try {
       rmSync(capDir, { recursive: true, force: true });
