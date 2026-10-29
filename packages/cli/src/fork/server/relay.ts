@@ -371,6 +371,40 @@ function logFallthrough(state: RelayState, reason: string): void {
   );
 }
 
+/**
+ * #763 — a relayed request that DIES upstream before its first client-visible
+ * event leaves no local trace at all, and the seat that emitted it therefore
+ * cannot answer "did it pass through me?" from its own logs.
+ *
+ * Why it is invisible today, by construction: `[ttft]` is written on the first
+ * USEFUL event (a 4xx has none), `[Request]` comes from `logRequest` — never
+ * called on the relay branch — and a nominal relay writes no capture on purpose
+ * (the hub captures centrally). So a burst of rejected requests reads exactly
+ * like a burst that bypassed the sidecar.
+ *
+ * One bounded line per forwarded non-OK response: status, route, and the
+ * request size as the CLIENT sent it (pre-gzip — the compressed figure would
+ * make two seats' `bytes_in` incomparable). Never a body, never a header value:
+ * the docker log is readable by the whole hub, the same discipline #761 states
+ * for the STEP-ADVANCE marker. Instrumentation only — no new retry, no capture,
+ * no behavior change on any path.
+ *
+ * Measured shape it exists for (#763): 26 `POST /v1/chat/completions` rejected
+ * 400 before inference, bodies 890 524 → 1 002 085 bytes, and zero lines in the
+ * sidecar's log naming the route.
+ */
+function logUpstreamNonOk(
+  status: number,
+  route: string,
+  bytesIn: number,
+  contentLength: string | null
+): void {
+  const out = contentLength && /^\d+$/.test(contentLength) ? contentLength : "-";
+  logStderr(
+    `[relay] upstream-nonok status=${status} route=${route} bytes_in=${bytesIn} bytes_out=${out}`
+  );
+}
+
 // ── #279: per-request hop marker ────────────────────────────────────
 // #156's heartbeat identity sees a node forwarding to ITSELF (its own /health
 // comes back). It cannot see (a) the boot window — `alive` starts optimistic,
@@ -503,6 +537,10 @@ export async function forwardToUpstream(
   // gzip for WAN externals — the uplink (system + history + tools) is the
   // constrained direction; the hub inflates via readRequestBody().
   let payload: Uint8Array | string = JSON.stringify(body);
+  // #763 — the request size as the CLIENT sent it, captured before the optional
+  // gzip: `bytes_in` must mean the same thing on a compressing WAN external and
+  // on a LAN sidecar, otherwise two seats' bursts cannot be compared.
+  const requestBytes = Buffer.byteLength(payload as string, "utf-8");
   if (state.compress) {
     try {
       payload = gzipSync(Buffer.from(payload as string, "utf-8"));
@@ -701,6 +739,20 @@ export async function forwardToUpstream(
   // reproduce, and a 529 is the provider's overload — neither is evidence about
   // the hub's health, so pass through rather than replay locally.
   state.consecutiveFail = 0;
+
+  // #763 — every non-OK response that reaches this point is passed through to
+  // the client, and that is exactly the class that used to leave no local
+  // trace. The 529 and the marked drain-freeze already logged their own line
+  // just above (a different fact: "no local replay"), so they are excluded —
+  // one event, one line. A 5xx never reaches here (it falls through above).
+  if (res.status >= 400 && res.status !== 529 && !drainFreeze503) {
+    logUpstreamNonOk(
+      res.status,
+      reqPath,
+      requestBytes,
+      res.headers.get("content-length")
+    );
+  }
 
   const contentType = res.headers.get("content-type") || "";
   if (!contentType.includes("text/event-stream")) {
