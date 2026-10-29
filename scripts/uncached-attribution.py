@@ -69,7 +69,19 @@ one seat's portable install. An absent or failing extractor raises — it never
 presents as an empty corpus (measured 2026-10-29: the hardcoded path is
 po-2028's, po-2024 has only `7zr` from winget).
 
-Exit codes: 0 = measured, 1 = no corpus found, 2 = docker/archive unreadable.
+Exit codes: 0 = measured, 1 = no corpus found, 2 = archive unreadable,
+3 = extraction refused by the pre-flight (nothing was written).
+
+EXTRACTION PRE-FLIGHT (the 29/10 disk incident)
+------------------------------------------------
+`--archive` extracts the corpus to disk, and a capture corpus expands ~84x
+(0,36 Go compressed -> 31 Go extracted on captures-2026-10-28.7z). An
+extraction launched without that knowledge drained D: at ~150 Go/h until the
+fleet wall (Maintenance, [URGENT][DISK] 29/10 20:32Z). The tool therefore
+reads the archive INDEX first (`7z l -slt`, no extraction) and refuses when
+the target volume would fall below its floor — 12 % of the volume and at
+least 20 Go, whichever is bigger. The remedy is in the message: another
+`--workdir`, or `--force-extract` to override deliberately.
 """
 
 from __future__ import annotations
@@ -103,6 +115,10 @@ NO_MACHINE = "(no machine header)"
 #: "archive unreadable" used to look like "empty corpus".
 DEFAULT_SEVENZIP = r"D:\PortableApps\PortableApps\7-ZipPortable\App\7-Zip\7z.exe"
 DEFAULT_WORKDIR = os.environ.get("CLAUDISH_UNCACHED_WORKDIR", r"D:\claudish-uncached")
+# Volume floor for an extraction (the 29/10 disk incident: an extraction with
+# no size knowledge drained D: at ~150 Go/h until Maintenance's wall).
+DEFAULT_MIN_FREE_PCT = 12.0
+DEFAULT_MIN_FREE_BYTES = 20 * 1024 ** 3
 
 
 def find_extractor() -> str | None:
@@ -125,6 +141,10 @@ def find_extractor() -> str | None:
 
 class ArchiveError(RuntimeError):
     """The archive could not be read — never allowed to look like an empty corpus."""
+
+
+class PreflightError(RuntimeError):
+    """The extraction was refused before it started (volume floor)."""
 
 
 def ts_ms(ts: str) -> int:
@@ -338,11 +358,80 @@ def attribute(reqs, meta, resps, directory: str):
     return by_machine, by_lane, counters
 
 
-def extract_archive(archive: str, workdir: str) -> str:
+def archive_uncompressed_size(extractor: str, archive: str) -> int:
+    """Total UNCOMPRESSED size of an archive, from its index (`7z l -slt`).
+
+    The compressed size is a lie for a capture corpus: `captures-2026-10-28.7z`
+    is 0,36 Go compressed and 31 Go extracted (ratio ~84:1), because a resp
+    capture is a full SSE stream. Reading the index is cheap (no extraction)
+    and is the only way to know what an extraction will cost BEFORE it costs.
+    """
+    try:
+        proc = subprocess.run(
+            [extractor, "l", "-slt", archive], capture_output=True
+        )
+    except OSError as exc:
+        raise ArchiveError(f"indexing failed to start: {exc}") from exc
+    if proc.returncode != 0:
+        tail = (
+            (proc.stderr or proc.stdout or b"")
+            .decode("utf-8", "replace")
+            .strip()
+            .splitlines()[-5:]
+        )
+        raise ArchiveError(
+            "extractor exit "
+            f"{proc.returncode} while indexing the archive: "
+            f"{' | '.join(tail) or '(no output)'}"
+        )
+    total = 0
+    for line in (proc.stdout or b"").decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("Size = "):
+            try:
+                total += int(line.split("=", 1)[1].strip())
+            except ValueError:
+                continue
+    return total
+
+
+def check_space(target_dir: str, total_bytes: int, min_free_pct: float,
+                min_free_bytes: int) -> tuple[int, int]:
+    """Refuse an extraction that would take the target volume below its floor.
+
+    The incident of 2026-10-29 (po-2024, Maintenance [URGENT][DISK]): an
+    extraction of the 28/10 corpus was launched with no size knowledge and
+    drained D: at ~150 Go/h until the wall. The floor is a VOLUME floor, not
+    an absolute one: 12 % of the volume (the fleet alert floor) and at least
+    `min_free_bytes` (20 GiB) whichever is bigger.
+
+    Returns (free_before, floor) when the extraction fits.
+    """
+    os.makedirs(target_dir, exist_ok=True)
+    usage = shutil.disk_usage(target_dir)
+    floor = max(int(usage.total * min_free_pct / 100.0), min_free_bytes)
+    if usage.free - total_bytes < floor:
+        raise PreflightError(
+            f"extraction would break the floor on the target volume: "
+            f"{total_bytes / (1024 ** 3):.1f} Go to extract, "
+            f"{usage.free / (1024 ** 3):.1f} Go free of "
+            f"{usage.total / (1024 ** 3):.1f} Go, floor "
+            f"{floor / (1024 ** 3):.1f} Go "
+            f"({min_free_pct:g} % / {min_free_bytes / (1024 ** 3):.0f} Go). "
+            f"Use --workdir on another volume, or --force-extract to override."
+        )
+    return usage.free, floor
+
+
+def extract_archive(archive: str, workdir: str, force: bool = False,
+                    min_free_pct: float = DEFAULT_MIN_FREE_PCT,
+                    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES) -> str:
     """Extract an archive into workdir (7-Zip). Returns the target dir.
 
     Raises ArchiveError when the extractor is absent or exits non-zero: an
     unreadable archive must never be reported as an empty or partial corpus.
+    Raises PreflightError when the extraction would take the target volume
+    below its floor (the 29/10 disk incident); `force` overrides it.
     """
     extractor = find_extractor()
     if not extractor:
@@ -351,6 +440,12 @@ def extract_archive(archive: str, workdir: str) -> str:
             " (tried $SEVENZIP, 7z/7zr on PATH, and " + DEFAULT_SEVENZIP + ")"
         )
     target = os.path.join(workdir, os.path.splitext(os.path.basename(archive))[0])
+    os.makedirs(workdir, exist_ok=True)
+    if not force:
+        # The volume is measured on the WORKDIR, before the corpus directory
+        # exists: a refused extraction must leave nothing behind.
+        total = archive_uncompressed_size(extractor, archive)
+        check_space(workdir, total, min_free_pct, min_free_bytes)
     os.makedirs(target, exist_ok=True)
     try:
         proc = subprocess.run(
@@ -440,6 +535,23 @@ def main(argv=None) -> int:
     ap.add_argument("--workdir", default=DEFAULT_WORKDIR)
     ap.add_argument("--json", help="also write the raw aggregates here")
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument(
+        "--force-extract",
+        action="store_true",
+        help="extract even if the target volume would fall below its floor",
+    )
+    ap.add_argument(
+        "--min-free-pct",
+        type=float,
+        default=DEFAULT_MIN_FREE_PCT,
+        help="minimum free share of the target volume after extraction (%%)",
+    )
+    ap.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MIN_FREE_BYTES / (1024 ** 3),
+        help="minimum free space on the target volume after extraction (Go)",
+    )
     args = ap.parse_args(argv)
 
     directory = args.dir
@@ -448,7 +560,16 @@ def main(argv=None) -> int:
             print(f"archive not found: {args.archive}", file=sys.stderr)
             return 2
         try:
-            directory = extract_archive(args.archive, args.workdir)
+            directory = extract_archive(
+                args.archive,
+                args.workdir,
+                force=args.force_extract,
+                min_free_pct=args.min_free_pct,
+                min_free_bytes=int(args.min_free_gb * (1024 ** 3)),
+            )
+        except PreflightError as exc:
+            print(f"extraction refused: {exc}", file=sys.stderr)
+            return 3
         except ArchiveError as exc:
             print(f"archive unreadable: {exc}", file=sys.stderr)
             return 2

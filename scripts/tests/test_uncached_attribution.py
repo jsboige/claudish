@@ -27,6 +27,12 @@ below are load-bearing and each has a pin here:
      orphan. Pins 2, 9, 10, 11.
   7. AN UNREADABLE ARCHIVE IS LOUD. A missing extractor must raise, never
      present as an empty corpus. Pin 12.
+  8. THE EXTRACTION PRE-FLIGHT. A capture corpus expands ~84x (0,36 Go
+     compressed -> 31 Go extracted); an extraction launched without that
+     knowledge drained D: at ~150 Go/h until the fleet wall (Maintenance
+     [URGENT][DISK] 29/10). The cost is read from the archive INDEX before
+     a byte is written, and an extraction that would break the volume floor
+     is REFUSED, writing nothing. Pins 14a-14e.
 
 Run standalone (no pytest needed):
   python scripts/tests/test_uncached_attribution.py
@@ -439,6 +445,81 @@ def main() -> int:
         _fresh(tmp)
         rc = ua.main(["--dir", tmp])
         _check(rc == 1, f"pin 13: an empty corpus exits 1, got {rc}")
+
+        # --- pin 14: the SIZE PRE-FLIGHT (29/10 disk incident) ---------
+        #     An extraction with no size knowledge drained D: at ~150 Go/h
+        #     until Maintenance's wall: the cost is read from the archive
+        #     INDEX before a byte is written, and refused if the target
+        #     volume would fall below its floor.
+        _fresh(tmp)
+        free_now = shutil.disk_usage(tmp).free
+        try:
+            ua.check_space(tmp, free_now * 4, ua.DEFAULT_MIN_FREE_PCT,
+                           ua.DEFAULT_MIN_FREE_BYTES)
+        except ua.PreflightError as exc:
+            _check(
+                "floor" in str(exc) and "workdir" in str(exc),
+                f"pin 14a: the refusal must name the floor and the remedy: {exc}",
+            )
+        else:
+            raise AssertionError(
+                "pin 14a: an extraction that breaks the volume floor must be refused"
+            )
+
+        # It fits -> no refusal, and the measured free space is returned.
+        free_before, floor = ua.check_space(
+            tmp, 1, ua.DEFAULT_MIN_FREE_PCT, ua.DEFAULT_MIN_FREE_BYTES
+        )
+        _check(
+            free_before > 0 and floor > 0,
+            f"pin 14b: check_space must report free={free_before} floor={floor}",
+        )
+
+        # The uncompressed size comes from the archive INDEX: the compressed
+        # size lies by ~84x on a capture corpus (0,36 Go -> 31 Go).
+        saved_run = ua.subprocess.run
+        try:
+            class _FakeProc:
+                returncode = 0
+                stdout = (
+                    b"----------\nPath = a.7z\nSize = 389618713\n"
+                    b"Path = req-1.json\nSize = 100\n"
+                    b"Path = resp-1.sse\nSize = 200\n"
+                )
+                stderr = b""
+
+            ua.subprocess.run = lambda *a, **k: _FakeProc()
+            total = ua.archive_uncompressed_size("7zr.exe", "x.7z")
+            _check(
+                total == 389618713 + 100 + 200,
+                f"pin 14c: index size = {total}, want 389619013",
+            )
+        finally:
+            ua.subprocess.run = saved_run
+
+        # The CLI refuses BEFORE extracting, and says so with its own code.
+        saved_find = ua.find_extractor
+        saved_size = ua.archive_uncompressed_size
+        try:
+            ua.find_extractor = lambda: "7zr.exe"
+            ua.archive_uncompressed_size = lambda e, a: free_now * 4
+            fake_archive = os.path.join(tmp, "captures-2026-10-28.7z")
+            with open(fake_archive, "wb") as fh:
+                fh.write(b"not a real archive")
+            rc = ua.main(
+                ["--archive", fake_archive, "--workdir", os.path.join(tmp, "wd")]
+            )
+            _check(
+                rc == 3,
+                f"pin 14d: a refused extraction exits 3 (pre-flight), got {rc}",
+            )
+            _check(
+                not os.path.isdir(os.path.join(tmp, "wd", "captures-2026-10-28")),
+                "pin 14e: a refused extraction must leave no corpus behind",
+            )
+        finally:
+            ua.find_extractor = saved_find
+            ua.archive_uncompressed_size = saved_size
 
         print("uncached-attribution: all pins green")
         return 0
