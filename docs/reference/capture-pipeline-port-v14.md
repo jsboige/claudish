@@ -1,7 +1,9 @@
 # Capture Pipeline Port to v14 — Spec (#641 blocker 2)
 
-Status: spec (chosen over a direct port this cycle). Scope: make the traffic-measurement
-apparatus survive the `replatform/v14` landing. The go/no-go evaluation (#641, comment
+Status: spec delivered as PR #722 (`port/641-capture-pipeline`, open, on `replatform/v14`)
+— the 3 verbatim files plus the wires below, executed 27/10. The port's measured
+deviations from this document are recorded in the last section; review #722 against
+both. Scope: make the traffic-measurement apparatus survive the `replatform/v14` landing. The go/no-go evaluation (#641, comment
 6434476328) lists the absent capture pipeline as hard blocker 2: on v14 (`d2afec56`) there
 are zero capture writers, so `claudish_traffic`, the `traffic-*.ps1` family, attribution
 (#98/#400/#566/#662), the leak-policy greps and `turn-autopsy.py` would all die at landing.
@@ -45,7 +47,7 @@ it a format change breaks the consumers in the other repo weeks later, the #3391
 | 1 | `src/proxy-server.ts` `/v1/messages` (after the relay branch, alongside handler resolution ≈ `:1347`) | `logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap)` — **one** wire; v14 has no `/v1/chat/completions` route, so main's second wire at `proxy-server.ts:3127` has no counterpart |
 | 2 | `stream-parsers/anthropic-sse.ts` (≈ `:110`) | `reqN = requestNumberFor(c.req)`, `createResponseCapture("anthropic", …, reqN)`, `ttftMarkerLine` at first `data:` |
 | 3 | `stream-parsers/openai-sse.ts` (≈ `:305`) | same, label `openai` |
-| 4 | `stream-parsers/openai-responses-sse.ts` (≈ `:154`) | same, label `responses` |
+| 4 | `stream-parsers/openai-responses-sse.ts` (≈ `:154`) | same, label `responses` — v14 reality: the parser is 3 sub-modules there, the tap hooks `onFirstUpstreamData` in `responses-leg.ts` |
 | 5 | `stream-parsers/gemini-sse.ts` (≈ `:42`) | capture tap only (no ttft marker on main either) |
 | 6 | `stream-parsers/ollama-jsonl.ts` (≈ `:33`) | capture tap only |
 | 7 | `handlers/native-handler.ts` (≈ `:358`) | `createResponseCapture("native", …, requestNumberFor(c.req))` + `appendUpstreamError` at the non-ok site (≈ `:336`) |
@@ -54,6 +56,38 @@ it a format change breaks the consumers in the other repo weeks later, the #3391
 
 (Exact line numbers are main's, as the anchors to copy from; v14 equivalents sit in the
 same functions — the files are 143 re-based M's, so verify each anchor on arrival.)
+
+## Deviations measured in the port (PR #722, relecture 29/10)
+
+None of these touches a reader contract — filename formats and stdout marker shapes held
+(the producer pins run verbatim); they are wiring realities of the v14 tree, recorded so
+this spec matches what the branch actually carries:
+
+- **responses parser**: v14 splits it into 3 sub-modules — the capture tap is a hook
+  (`onFirstUpstreamData`) in `responses-leg.ts`, not a single anchored site.
+- **`srv.requestIP(req)` is Bun on v14** — the attribution/remote-addr path was adapted
+  to the v14 server API.
+- **One `appendUpstreamError` site has no v14 counterpart**: main's policy-refusal site
+  (#65) does not exist on the v14 tree — absent, not wired.
+- **`appendUpstreamError` receives the already-rewritten error text** (v14's
+  signing-lease invariant), where main's site passes it at an earlier stage.
+- **`headerLatencyMs` rides a new `handleStream` parameter** — main's mechanism for the
+  wall/latency marker did not transplant as-is.
+- **`BodyInit` ×2 base casts → `SerializedBody`** (`6f5cdc88`): the v14 base's
+  `as BodyInit` casts at `relay.ts:535/:736` fail the `macos-bridge` typecheck pass;
+  replaced with the trunk's `SerializedBody` union (`providers/transport/types.ts`).
+- **11th v14 file touched: `src/recovery-contract/child-proxy-run.ts`** (CP-10): the
+  recovery child parses its own stdout as one JSON line and the ungated traffic markers
+  broke it. Fixed by ONE shared filter, `src/test-support/traffic-markers-silence.ts`,
+  installed by that child and by the 3 hermetic test children that parse their stdout
+  (the marker-pollution family, `82e580ea`). The filter is a narrow whitelist: a real
+  marker-shape leak still fails tests.
+- **Mutation audit: 7/8 invariants redden their exact pin.** INV-1 (fire-and-forget) is
+  not unit-mutable — the structural guarantee is documented inside
+  `response-capture.test.ts` itself.
+- **Acceptance**: producer pins green on the branch (50 + 171 + 87 tests). The consumer
+  read-back of a live v14 corpus (third acceptance bullet above) is still pending — it
+  needs a v14 build with `CLAUDISH_CAPTURE_DIR`, and remains the merge gate.
 
 ## Invariants that must not drift
 
