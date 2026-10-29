@@ -81,7 +81,14 @@ function Get-ContainerFacts([string]$Name) {
     # #730). A name with an empty value is NOT arming.
     $armedByValue = @($env | Where-Object { $_ -match '^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+' }).Count
     $roleCascades = @($env | Where-Object { $_ -match '^CLAUDISH_FAILOVER_(OPUS|SONNET|HAIKU|FABLE)=.+' }).Count
-    $created = (Get-DockerLines @('inspect', $Name, '--format', '{{.Created}}') | Select-Object -First 1)
+    # The column is the IMAGE's created date, not the container's: a seat that
+    # recreated this morning would otherwise read as "image built today" while
+    # serving an image from three weeks ago (measured 29/10 on po-2023 —
+    # container created 2026-10-29, image 9e280fb3a939 created 2026-10-10).
+    $imageId = (Get-DockerLines @('inspect', $Name, '--format', '{{.Image}}') | Select-Object -First 1)
+    $created = if ($imageId) {
+        Get-DockerLines @('image', 'inspect', $imageId, '--format', '{{.Created}}') | Select-Object -First 1
+    } else { $null }
     $ports = (Get-DockerLines @('inspect', $Name, '--format', '{{json .HostConfig.PortBindings}}') | Select-Object -First 1)
     # JSON form: {"3000/tcp":[{"HostIp":"","HostPort":"3000"}]} - the KEY is
     # the container port; the host port lives in HostPort. Match HostPort
