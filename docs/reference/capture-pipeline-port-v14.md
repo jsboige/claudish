@@ -59,14 +59,22 @@ same functions — the files are 143 re-based M's, so verify each anchor on arri
 
 ## Deviations measured in the port (PR #722, relecture 29/10)
 
-None of these touches a reader contract — filename formats and stdout marker shapes held
-(the producer pins run verbatim); they are wiring realities of the v14 tree, recorded so
-this spec matches what the branch actually carries:
+Most of these are wiring realities of the v14 tree, recorded so this spec matches what
+the branch actually carries. **One of them broke a reader contract, and the read-back is
+what caught it** — see the `srv.requestIP` bullet:
 
 - **responses parser**: v14 splits it into 3 sub-modules — the capture tap is a hook
   (`onFirstUpstreamData`) in `responses-leg.ts`, not a single anchored site.
-- **`srv.requestIP(req)` is Bun on v14** — the attribution/remote-addr path was adapted
-  to the v14 server API.
+- **`srv.requestIP(req)` is Bun on v14 — and it entered the FILENAME.** The port adapted
+  the remote-addr path to the v14 server API and let the result flow through
+  `resolveSourceIp`, so a locally-served capture was named
+  `req-<pid>-<n>-<ts>-127.0.0.1.json`. `turn-autopsy.py`'s `REQ_RE` accepts only
+  `direct` or the relay-pair form (`a.b.c.d__e.f.g.h_n`), so the **entire v14 corpus
+  read back as "no req-* members found"** while the same turns through main paired 2/2.
+  All **1 371** production captures on the hub are `-direct`: main's `ctx.remoteAddress`
+  never resolved on Bun, so that shape had never been emitted. Fixed in PR #757 —
+  `src` keeps the historical vocabulary (`x-forwarded-for` / `x-real-ip`, else
+  `direct`) and the address becomes the additive `remote` payload field, after `hops`.
 - **One `appendUpstreamError` site has no v14 counterpart**: main's policy-refusal site
   (#65) does not exist on the v14 tree — absent, not wired.
 - **`appendUpstreamError` receives the already-rewritten error text** (v14's
@@ -85,9 +93,19 @@ this spec matches what the branch actually carries:
 - **Mutation audit: 7/8 invariants redden their exact pin.** INV-1 (fire-and-forget) is
   not unit-mutable — the structural guarantee is documented inside
   `response-capture.test.ts` itself.
-- **Acceptance**: producer pins green on the branch (50 + 171 + 87 tests). The consumer
-  read-back of a live v14 corpus (third acceptance bullet above) is still pending — it
-  needs a v14 build with `CLAUDISH_CAPTURE_DIR`, and remains the merge gate.
+- **Acceptance**: producer pins green on the branch (50 + 171 + 87 tests). Consumer
+  read-back **measured 2026-10-29** on a live v14 build fed the same two turns
+  (openai + anthropic lane) as main, consumers run unchanged:
+  `traffic-summary.ps1` identical verdicts on both corpora;
+  `turn-autopsy.py` invisible on v14 before the fix, then **2 req / 2 resp, 2 lanes,
+  pairing 2/2 — identical to main, field for field** after it; `native-consumption.py`
+  identical ("no native capture", no native turn in either corpus — the native lane was
+  not exercised, no Anthropic credential was passed to the bench).
+  The bench ran **outside the container**, so `pid` is a host id, not `1`; the
+  comparison was made on copies whose pid token was rewritten to `1`, content
+  untouched (environment artifact, identical on both sides).
+  Merge remains the port PR's call; the fix rides PR #757 (base
+  `port/641-capture-pipeline`), and no consumer file was modified.
 
 ## Invariants that must not drift
 
