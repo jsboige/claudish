@@ -2,43 +2,40 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
-// #641 G2 — fork/server re-attachment (relay shell). The stream registry feeds
-// /health's liveness fields and bounds shutdown by consumable work; relay.ts is
-// the sidecar forward path. Both are fork extensions carried onto the branch
-// verbatim (see docs/reference/replatform-v14-layer-manifest.md).
-import { createStreamTracker, stallThresholdMs } from "./fork/server/stream-registry.js";
-import {
-  forwardToUpstream,
-  relayHealthFields,
-  requestLoopedBack,
-  HOPS_HEADER,
-  type RelayState,
-} from "./fork/server/relay.js";
-// #641 G6 — fork extensions carried onto the branch: the per-session output-token
-// ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
-// are INERT without their env knobs, so their presence changes nothing on a
-// fleet that never opts in.
-import { extractSessionKey } from "./fork/failover.js";
-import {
-  admitSessionBudget,
-  openSessionBudgetAttempt,
-  sessionBudgetRefusalAnthropic,
-} from "./fork/session-budget.js";
-import {
-  appendCapabilityQueryToMessage,
-  isCapabilityVocabEnabled,
-  liftCapabilityDeclaration,
-} from "./fork/capability-vocabulary.js";
-import { getInstanceId } from "./instance-id.js";
-import { resolveInboundKeys } from "./handlers/shared/inbound-keys.js";
-import { collectRoutedBareNames, createProxyAuthMiddleware } from "./fork/middleware/proxy-auth.js";
-import { resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
 import { isEffortLevel } from "./adapters/base-api-format.js";
 import {
   isAutoModeClassifierRequest,
   rewriteClassifierForNative,
 } from "./classifier-passthrough.js";
 import { type CodeModeSetting, parseCodeModeSetting } from "./code-mode/policy.js";
+import {
+  appendCapabilityQueryToMessage,
+  isCapabilityVocabEnabled,
+  liftCapabilityDeclaration,
+} from "./fork/capability-vocabulary.js";
+// #641 G6 — fork extensions carried onto the branch: the per-session output-token
+// ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
+// are INERT without their env knobs, so their presence changes nothing on a
+// fleet that never opts in.
+import { extractSessionKey } from "./fork/failover.js";
+import { collectRoutedBareNames, createProxyAuthMiddleware } from "./fork/middleware/proxy-auth.js";
+import {
+  HOPS_HEADER,
+  type RelayState,
+  forwardToUpstream,
+  relayHealthFields,
+  requestLoopedBack,
+} from "./fork/server/relay.js";
+// #641 G2 — fork/server re-attachment (relay shell). The stream registry feeds
+// /health's liveness fields and bounds shutdown by consumable work; relay.ts is
+// the sidecar forward path. Both are fork extensions carried onto the branch
+// verbatim (see docs/reference/replatform-v14-layer-manifest.md).
+import { createStreamTracker, stallThresholdMs } from "./fork/server/stream-registry.js";
+import {
+  admitSessionBudget,
+  openSessionBudgetAttempt,
+  sessionBudgetRefusalAnthropic,
+} from "./fork/session-budget.js";
 import {
   type AdvisorPresenceMonitor,
   createAdvisorPresenceMonitor,
@@ -62,11 +59,14 @@ import {
   releaseWhenBodyEnds,
 } from "./handlers/shared/call-context.js";
 import { UNHANDLED_ERROR_HEADER } from "./handlers/shared/hop-decision.js";
+import { resolveInboundKeys } from "./handlers/shared/inbound-keys.js";
+import { resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
 import type { ModelHandler } from "./handlers/types.js";
 import type { HookEngine } from "./hooks/engine.js";
 import { loadHooksOnce } from "./hooks/index.js";
 import type { HostMode } from "./hooks/public.js";
 import { withHooks } from "./hooks/response-seam.js";
+import { getInstanceId } from "./instance-id.js";
 import { log, logStderr } from "./logger.js";
 import { warmRecommendedModels } from "./model-loader.js";
 import { loadConfig } from "./profile-config.js";

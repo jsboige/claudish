@@ -52,10 +52,7 @@ export interface InboundKeyEntry {
  * that can never authenticate beats one that authenticates as "" — which
  * would match an empty header).
  */
-function expandSecretValue(
-  literal: string,
-  config: ClaudishProfileConfig
-): string {
+function expandSecretValue(literal: string, config: ClaudishProfileConfig): string {
   const match = literal.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/);
   if (!match) return literal;
   return config.apiKeys?.[match[1]] ?? process.env[match[1]] ?? "";
@@ -108,8 +105,7 @@ export function resolveInboundKeys(
     }
     let maxConcurrency: number | undefined;
     if (v?.maxConcurrency !== undefined) {
-      const n =
-        typeof v.maxConcurrency === "number" ? v.maxConcurrency : Number(v.maxConcurrency);
+      const n = typeof v.maxConcurrency === "number" ? v.maxConcurrency : Number(v.maxConcurrency);
       // Fail closed: an unreadable cap must never degrade to "unlimited" — a
       // malformed cap is a config error and the entry is refused loudly.
       if (!Number.isInteger(n) || n < 1) {
@@ -123,7 +119,12 @@ export function resolveInboundKeys(
       continue;
     }
     seenKeyValues.add(key);
-    entries.push({ name, key, allowModels, ...(maxConcurrency !== undefined ? { maxConcurrency } : {}) });
+    entries.push({
+      name,
+      key,
+      allowModels,
+      ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+    });
   }
   return entries;
 }

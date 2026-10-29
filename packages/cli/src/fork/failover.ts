@@ -279,7 +279,10 @@ const recovering = new Map<string, RecoveryState>();
 /** (role|bucket) → the cascade step that pair was last seen serving while its
  * bucket was walled. Replaces the old per-role pendingRecovery: recovery is now
  * knowable per (role, bucket), and the wall expiry itself no longer sees the role. */
-const servedUnderWall = new Map<string, { label: string; direction: FailoverDirection; stepIndex: number }>();
+const servedUnderWall = new Map<
+  string,
+  { label: string; direction: FailoverDirection; stepIndex: number }
+>();
 /**
  * Sessions that have already received the "moment of failover" stream notice, per
  * (role|bucket), mapped to the set of step indices they were notified at. Re-notify
@@ -384,7 +387,11 @@ type StepClass = (typeof STEP_CLASSES)[number];
  * route to a model name that does not exist and surface as a provider error far from
  * its cause. The declaration is rejected loudly, the target stays routable.
  */
-function splitStepClass(raw: string, role: FailoverRole, idx: number): { target: string; cls?: StepClass } {
+function splitStepClass(
+  raw: string,
+  role: FailoverRole,
+  idx: number
+): { target: string; cls?: StepClass } {
   const m = /^(.*?)!([A-Za-z0-9_-]+)$/.exec(raw.trim());
   if (!m) return { target: raw.trim() };
   const cls = m[2].toLowerCase();
@@ -399,7 +406,10 @@ function splitStepClass(raw: string, role: FailoverRole, idx: number): { target:
 
 /** Split a `>`-separated env value into trimmed non-empty steps. */
 function splitSteps(raw: string): string[] {
-  return raw.split(">").map((s) => s.trim()).filter(Boolean);
+  return raw
+    .split(">")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 /** #274: parse a `role:<r>` step reference. Returns the role when the raw step
@@ -439,14 +449,18 @@ function delegationAcyclic(
  * matters even for empty entries: ">2026-08-25T22:28:00Z" declares a reset for step 1
  * only — so empties must NOT be filtered out the way splitSteps does. Invalid entries
  * warn and fall back to undefined (no declared reset = probe per backoff, the safe default). */
-function parseStepResets(raw: string | undefined, count: number, role: FailoverRole): (Date | undefined)[] {
+function parseStepResets(
+  raw: string | undefined,
+  count: number,
+  role: FailoverRole
+): (Date | undefined)[] {
   const out: (Date | undefined)[] = Array.from({ length: count }, () => undefined);
   if (!raw) return out;
   const parts = raw.split(">").map((s) => s.trim());
   for (let i = 0; i < count && i < parts.length; i++) {
     if (!parts[i]) continue;
     const d = new Date(parts[i]);
-    if (isNaN(d.getTime())) {
+    if (Number.isNaN(d.getTime())) {
       logStderr(
         `[Failover] ${role}: unparseable reset date '${parts[i]}' for step ${i} — ignoring. Want ISO 8601, e.g. 2026-09-01T00:00:00Z.`
       );
@@ -537,7 +551,10 @@ let roleAliases: { pattern: string; role: FailoverRole }[] = [];
 /** Parse "pattern:role,pattern:role" — lowercase patterns, validated roles. */
 function parseRoleAliases(raw: string): { pattern: string; role: FailoverRole }[] {
   const out: { pattern: string; role: FailoverRole }[] = [];
-  for (const piece of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+  for (const piece of raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)) {
     const [patternRaw, roleRaw] = piece.split(":");
     const pattern = (patternRaw || "").trim().toLowerCase();
     const role = (roleRaw || "").trim().toLowerCase() as FailoverRole;
@@ -602,7 +619,10 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   };
   armAfterRefusals = Math.max(1, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_AFTER, 2));
   armGraceMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_GRACE_MS, 0));
-  armRetryAfterCeilingMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS, 120_000));
+  armRetryAfterCeilingMs = Math.max(
+    0,
+    parseIntEnv(env.CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS, 120_000)
+  );
   sessionDwellMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_SESSION_DWELL_MS, 600_000));
   recoveryGraceMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_RECOVERY_GRACE_MS, 120_000));
 
@@ -719,7 +739,9 @@ export function getFailoverRule(role: FailoverRole): FailoverRule | undefined {
  * skipped. Never returns the placeholder role keyword as a servable target. */
 let roleNominalResolver: ((role: FailoverRole) => string | undefined) | null = null;
 
-export function setRoleNominalResolver(fn: ((role: FailoverRole) => string | undefined) | null): void {
+export function setRoleNominalResolver(
+  fn: ((role: FailoverRole) => string | undefined) | null
+): void {
   roleNominalResolver = fn;
 }
 
@@ -780,8 +802,7 @@ function resolveRoleStep(
       if ("bucket" in nb) bucket = nb.bucket;
     }
     if (bucket !== undefined) {
-      const walledNow =
-        isBucketWalled(bucket) || isBucketWalled(LEGACY_ROLE_WIDE_BUCKET);
+      const walledNow = isBucketWalled(bucket) || isBucketWalled(LEGACY_ROLE_WIDE_BUCKET);
       if (!walledNow) {
         step.target = nominal;
         return { concrete: nominal, owner: { role: targetRole, nominal: true } };
@@ -791,7 +812,11 @@ function resolveRoleStep(
         // bucket so the wall owns a failover (a role-step resolves to the
         // nominal if healthy — a walled bucket is not healthy, and with nowhere
         // to fall the delegating role advances to its own next step).
-        armFailover(targetRole, `role-step nominal ${nominal} found its bucket ${bucket} walled with no cascade`, bucket);
+        armFailover(
+          targetRole,
+          `role-step nominal ${nominal} found its bucket ${bucket} walled with no cascade`,
+          bucket
+        );
       }
     } else {
       // Bare routing-chain nominal and no bucket resolver (unit tests): the
@@ -919,7 +944,10 @@ function walkDelegationPath(
     !exclude.has(lastStep.target) &&
     !(lastStep.resetAt && Date.now() < lastStep.resetAt.getTime())
   ) {
-    return { concrete: lastStep.target, owner: { role: targetRole, nominal: false, stepIndex: last } };
+    return {
+      concrete: lastStep.target,
+      owner: { role: targetRole, nominal: false, stepIndex: last },
+    };
   }
   return null;
 }
@@ -1060,7 +1088,8 @@ export function markStepFailed(
   // the default ladder (pin 2): a declaration never overrules the classifier.
   const own = rule.steps[idx].ownBackoff === true && nonQuota;
   const sameEpisode =
-    isStepTtlFailed(prev) && (prev.concrete === undefined || concrete === undefined || prev.concrete === concrete);
+    isStepTtlFailed(prev) &&
+    (prev.concrete === undefined || concrete === undefined || prev.concrete === concrete);
   arr[idx] = {
     count: sameEpisode ? prev.count : prev.count + 1,
     lastFailure: new Date(Date.now()),
@@ -1209,10 +1238,7 @@ export function resolveFailoverTarget(
  * isFailoverActive(role, bucket) (#552 review, B1). */
 const dwellPins = new Map<
   FailoverRole,
-  Map<
-    string,
-    { stepIndex: number; until: number; bucket: string | undefined; pinnedAt: number }
-  >
+  Map<string, { stepIndex: number; until: number; bucket: string | undefined; pinnedAt: number }>
 >();
 /** #625 review: `pinnedAt` is the ORIGINAL instant of the current pin — set when
  * the pin is created, never on the sliding renewal (a busy session renews every
@@ -1418,92 +1444,96 @@ export function resolveFailoverTargetForSession(
         `[Failover] DWELL ${role} session …${sessionKey.slice(-8)} yielded — step ${pin.stepIndex} skipped for this request (#431); re-resolving`
       );
     } else {
-    const fails = stepFailures.get(role);
-    const pinnedStep = rule.steps[pin.stepIndex];
-    const pinnedFailure = fails?.[pin.stepIndex];
-    let pinnedStillServable =
-      // The step (not just its failure record) is passed: a config-declared
-      // future resetAt closes the step outright (#261), so a pin holding on a
-      // step the operator just closed yields instead of riding out its dwell.
-      // #331: stepTtlBinds, not bare isStepTtlFailed — a pinned `role:` step
-      // whose TTL was recorded against a concrete the delegation has LEFT is
-      // still servable (it rides the target's current resolution); only a
-      // freeze on the CURRENT concrete is a genuine advancement-past-the-pin.
-      pin.stepIndex < rule.steps.length && !stepTtlBinds(role, pinnedFailure, pinnedStep);
-    if (pinnedStillServable && pinnedStep?.roleRef) {
-      if (resolveRoleStep(role, pinnedStep) === null) {
-        // The delegation can no longer serve (its own resolution went nominal,
-        // or its concrete target died) — re-resolve; never pin a placeholder.
-        // Otherwise the pin HOLDS even if the delegating role's own earlier
-        // steps became probeable: `resolveRoleStep` refreshes `step.target` in
-        // place, so the session rides the target's cascade without a provider
-        // switch inside its dwell (#91 point 4). A `wasNominal` yield here
-        // moved sessions to an earlier probeable step mid-dwell — removed in
-        // review (probe, 01/10): the flag survived delegated successes (the
-        // reset clears the OWNER's coordinate), so one nominal wall unpinned
-        // every session on that step for hours.
-        pinnedStillServable = false;
+      const fails = stepFailures.get(role);
+      const pinnedStep = rule.steps[pin.stepIndex];
+      const pinnedFailure = fails?.[pin.stepIndex];
+      let pinnedStillServable =
+        // The step (not just its failure record) is passed: a config-declared
+        // future resetAt closes the step outright (#261), so a pin holding on a
+        // step the operator just closed yields instead of riding out its dwell.
+        // #331: stepTtlBinds, not bare isStepTtlFailed — a pinned `role:` step
+        // whose TTL was recorded against a concrete the delegation has LEFT is
+        // still servable (it rides the target's current resolution); only a
+        // freeze on the CURRENT concrete is a genuine advancement-past-the-pin.
+        pin.stepIndex < rule.steps.length && !stepTtlBinds(role, pinnedFailure, pinnedStep);
+      if (pinnedStillServable && pinnedStep?.roleRef) {
+        if (resolveRoleStep(role, pinnedStep) === null) {
+          // The delegation can no longer serve (its own resolution went nominal,
+          // or its concrete target died) — re-resolve; never pin a placeholder.
+          // Otherwise the pin HOLDS even if the delegating role's own earlier
+          // steps became probeable: `resolveRoleStep` refreshes `step.target` in
+          // place, so the session rides the target's cascade without a provider
+          // switch inside its dwell (#91 point 4). A `wasNominal` yield here
+          // moved sessions to an earlier probeable step mid-dwell — removed in
+          // review (probe, 01/10): the flag survived delegated successes (the
+          // reset clears the OWNER's coordinate), so one nominal wall unpinned
+          // every session on that step for hours.
+          pinnedStillServable = false;
+        }
       }
-    }
-    const recoveredAt = nominalRecoveredAt.get(roleBucketKey(role, bucket));
-    if (pinnedStillServable && recoveredAt !== undefined && now - recoveredAt >= recoveryGraceMs) {
-      // Verified nominal recovery past the grace — return this conversation to
-      // the nominal (re-resolution lands there; nominal is never re-pinned).
-      pins?.delete(sessionKey);
-      logStderr(
-        `[Failover] DWELL ${role} session …${sessionKey.slice(-8)} yielded — nominal recovered ${Math.round(
-          (now - recoveredAt) / 1000
-        )}s ago`
-      );
-    } else if (pinnedStillServable) {
-      const backStep = recoveredStepForPin(
-        role,
-        rule,
-        pin.stepIndex,
-        pin.pinnedAt,
-        fails,
-        skipSteps,
-        now
-      );
-      if (backStep !== undefined) {
-        // #619: a servable EARLIER step holds a verified recovery older than
-        // the grace — yield and re-resolve; the walk lands on it (or an even
-        // earlier servable step) and re-pins there, back on the cheap capacity.
-        // This is NOT the `wasNominal` yield removed in the 01/10 review: that
-        // flag survived delegated successes (the reset cleared the OWNER's
-        // coordinate) so one nominal wall un-pinned every session on that step
-        // for hours — this stamp is a verified SUCCESS of the step itself,
-        // voided by its next mark, and the grace bounds an intermittent step
-        // to one switch per mark cycle.
-        const stamp = stepRecoveredAt.get(`${role}|${backStep}`) ?? now;
+      const recoveredAt = nominalRecoveredAt.get(roleBucketKey(role, bucket));
+      if (
+        pinnedStillServable &&
+        recoveredAt !== undefined &&
+        now - recoveredAt >= recoveryGraceMs
+      ) {
+        // Verified nominal recovery past the grace — return this conversation to
+        // the nominal (re-resolution lands there; nominal is never re-pinned).
         pins?.delete(sessionKey);
         logStderr(
-          `[Failover] DWELL ${role} session …${sessionKey.slice(-8)} yielded — step ${backStep} (${rule.steps[backStep]?.label}) recovered ${Math.round(
-            (now - stamp) / 1000
-          )}s ago; re-resolving`
+          `[Failover] DWELL ${role} session …${sessionKey.slice(-8)} yielded — nominal recovered ${Math.round(
+            (now - recoveredAt) / 1000
+          )}s ago`
         );
-      } else {
-        // Sliding dwell: an in-flight conversation (one that keeps resolving)
-        // renews, so the hold lasts as long as the session is active. An idle
-        // session's pin expires dwell after its last request.
-        pin.until = Math.max(pin.until, now + dwell);
-        return { step: rule.steps[pin.stepIndex], stepIndex: pin.stepIndex };
+      } else if (pinnedStillServable) {
+        const backStep = recoveredStepForPin(
+          role,
+          rule,
+          pin.stepIndex,
+          pin.pinnedAt,
+          fails,
+          skipSteps,
+          now
+        );
+        if (backStep !== undefined) {
+          // #619: a servable EARLIER step holds a verified recovery older than
+          // the grace — yield and re-resolve; the walk lands on it (or an even
+          // earlier servable step) and re-pins there, back on the cheap capacity.
+          // This is NOT the `wasNominal` yield removed in the 01/10 review: that
+          // flag survived delegated successes (the reset cleared the OWNER's
+          // coordinate) so one nominal wall un-pinned every session on that step
+          // for hours — this stamp is a verified SUCCESS of the step itself,
+          // voided by its next mark, and the grace bounds an intermittent step
+          // to one switch per mark cycle.
+          const stamp = stepRecoveredAt.get(`${role}|${backStep}`) ?? now;
+          pins?.delete(sessionKey);
+          logStderr(
+            `[Failover] DWELL ${role} session …${sessionKey.slice(-8)} yielded — step ${backStep} (${rule.steps[backStep]?.label}) recovered ${Math.round(
+              (now - stamp) / 1000
+            )}s ago; re-resolving`
+          );
+        } else {
+          // Sliding dwell: an in-flight conversation (one that keeps resolving)
+          // renews, so the hold lasts as long as the session is active. An idle
+          // session's pin expires dwell after its last request.
+          pin.until = Math.max(pin.until, now + dwell);
+          return { step: rule.steps[pin.stepIndex], stepIndex: pin.stepIndex };
+        }
       }
-    }
-    // Pinned step TTL-failed (genuine advancement) — fall through, re-pin below.
-    // #276 carve-out: a NON-QUOTA death means the step is broken, not walled —
-    // re-pinning the successor is what strands a session on the cascade tail
-    // past a recovered nominal (the pin then holds through the wall's TTL expiry,
-    // and with every active session pinned the nominal is never probed, so no
-    // #294 recovery stamp ever lands). TTL-failed must be re-checked here, not
-    // inferred from !pinnedStillServable: that flag is also cleared by a dead
-    // delegation, which keeps its own re-resolve-and-re-pin semantics.
-    pinnedDiedNonQuota =
-      !pinnedStillServable &&
-      pinnedFailure != null &&
-      pinnedFailure.nonQuota === true &&
-      isStepTtlFailed(pinnedFailure);
-    diedStepIndex = pin.stepIndex;
+      // Pinned step TTL-failed (genuine advancement) — fall through, re-pin below.
+      // #276 carve-out: a NON-QUOTA death means the step is broken, not walled —
+      // re-pinning the successor is what strands a session on the cascade tail
+      // past a recovered nominal (the pin then holds through the wall's TTL expiry,
+      // and with every active session pinned the nominal is never probed, so no
+      // #294 recovery stamp ever lands). TTL-failed must be re-checked here, not
+      // inferred from !pinnedStillServable: that flag is also cleared by a dead
+      // delegation, which keeps its own re-resolve-and-re-pin semantics.
+      pinnedDiedNonQuota =
+        !pinnedStillServable &&
+        pinnedFailure != null &&
+        pinnedFailure.nonQuota === true &&
+        isStepTtlFailed(pinnedFailure);
+      diedStepIndex = pin.stepIndex;
     } // end of the non-skipped pin branch (#431 else)
   }
 
@@ -1753,7 +1783,9 @@ export function isBucketWalled(bucket: string): boolean {
     `[Failover] DISARMED bucket ${bucket} → probing nominals (auto-arm TTL elapsed after ${Math.round(
       (Date.now() - entry.since.getTime()) / 60000
     )}min). Re-walls if the wall is still up${
-      nextTtlMs > ARM_TTL_STEPS_MS[0] ? ` (next arm TTL grows to ${Math.round(nextTtlMs / 60000)}min)` : ""
+      nextTtlMs > ARM_TTL_STEPS_MS[0]
+        ? ` (next arm TTL grows to ${Math.round(nextTtlMs / 60000)}min)`
+        : ""
     }.`
   );
   return false;
@@ -1770,7 +1802,8 @@ export function isBucketWalled(bucket: string): boolean {
  */
 export function isFailoverActive(role: FailoverRole, bucket?: string): boolean {
   if (configArmHolding(role, bucket)) return true;
-  if (bucket !== undefined) return isBucketWalled(bucket) || isBucketWalled(LEGACY_ROLE_WIDE_BUCKET);
+  if (bucket !== undefined)
+    return isBucketWalled(bucket) || isBucketWalled(LEGACY_ROLE_WIDE_BUCKET);
   if (isBucketWalled(LEGACY_ROLE_WIDE_BUCKET)) return true;
   for (const b of walled.keys()) {
     if (isBucketWalled(b)) return true;
@@ -1784,7 +1817,10 @@ export function isFailoverActive(role: FailoverRole, bucket?: string): boolean {
  * caller then computes the nominal's real bucket as usual. Computed once at the
  * route, like the #275 bucket, so the cascade and the notices agree.
  */
-export function machineArmBucket(role: FailoverRole, machine: string | null | undefined): string | undefined {
+export function machineArmBucket(
+  role: FailoverRole,
+  machine: string | null | undefined
+): string | undefined {
   const m = (machine || "").trim().toLowerCase();
   if (!m || !configArmedMachines.get(role)?.has(m)) return undefined;
   return `${MACHINE_BUCKET_PREFIX}${m}`;
@@ -1829,7 +1865,11 @@ export function getActiveFailovers(): (ResolvedFailover & { bucket: string })[] 
  * The default bucket is the legacy role-wide one, so `armFailover(role, reason)`
  * keeps its pre-#275 meaning (divert the whole role).
  */
-export function armFailover(role: FailoverRole, reason: string, bucket: string = LEGACY_ROLE_WIDE_BUCKET): boolean {
+export function armFailover(
+  role: FailoverRole,
+  reason: string,
+  bucket: string = LEGACY_ROLE_WIDE_BUCKET
+): boolean {
   if (!autoArmEnabled) return false;
   // isBucketWalled (not walled.has) so an EXPIRED wall can re-arm.
   if (isBucketWalled(bucket)) return false;
@@ -1880,12 +1920,18 @@ export function burstRetryAfterMs(headerValue: string | null, body: string): num
   if (Number.isFinite(headerSecs) && headerSecs >= 0) {
     return headerSecs * 1000 < armRetryAfterCeilingMs ? headerSecs * 1000 : null;
   }
-  const m = /(?:reset|retry|try again)[^.\n]{0,40}?\bin (\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b/i.exec(body || "");
+  const m =
+    /(?:reset|retry|try again)[^.\n]{0,40}?\bin (\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b/i.exec(
+      body || ""
+    );
   if (m) {
     const unitMs: Record<string, number> = {
-      second: 1000, sec: 1000,
-      minute: 60_000, min: 60_000,
-      hour: 3_600_000, hr: 3_600_000,
+      second: 1000,
+      sec: 1000,
+      minute: 60_000,
+      min: 60_000,
+      hour: 3_600_000,
+      hr: 3_600_000,
       day: 86_400_000,
     };
     const unit = m[2].toLowerCase().replace(/s$/, "");
@@ -2040,8 +2086,15 @@ export function parseResetAtFromBody(body: string): Date | undefined {
   const abs = /reset at (\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)? UTC/i.exec(text);
   if (abs) {
     const year = new Date().getUTCFullYear();
-    let d = new Date(
-      Date.UTC(year, Number(abs[1]) - 1, Number(abs[2]), Number(abs[3]), Number(abs[4]), Number(abs[5]))
+    const d = new Date(
+      Date.UTC(
+        year,
+        Number(abs[1]) - 1,
+        Number(abs[2]),
+        Number(abs[3]),
+        Number(abs[4]),
+        Number(abs[5])
+      )
     );
     if (d.getTime() < Date.now() - 24 * 3600_000) {
       d.setUTCFullYear(d.getUTCFullYear() + 1);
@@ -2139,7 +2192,10 @@ export function isWiringError(status: number, body: string): boolean {
  * clearing the steps' backoff under it would make every diverted request re-pay a
  * doomed probe on step 0 before advancing.
  */
-export function onNominalSuccess(role: FailoverRole, bucket: string = LEGACY_ROLE_WIDE_BUCKET): void {
+export function onNominalSuccess(
+  role: FailoverRole,
+  bucket: string = LEGACY_ROLE_WIDE_BUCKET
+): void {
   // #91: a healthy nominal means a fresh episode for this bucket — the
   // consecutive-refusal run that was building toward a wall is void, and so is the
   // TTL escalation it was feeding (point 3: prompt recovery over damping).
@@ -2262,7 +2318,10 @@ export function recordServedStepForNotices(
 }
 
 /** Notice-side read: this request's served step, when it reports `role` (else undefined). */
-export function servedStepForNotices(c: object, role?: FailoverRole | null): ServedStepRecord | undefined {
+export function servedStepForNotices(
+  c: object,
+  role?: FailoverRole | null
+): ServedStepRecord | undefined {
   const rec = servedStepRecords.get(c);
   if (!rec) return undefined;
   if (role && rec.role !== role) return undefined;
@@ -2309,13 +2368,14 @@ export function buildFailoverNotice(
   const lines: string[] = [];
   for (const a of active) {
     const { role, step, stepIndex } = a;
-    const ahead = stepIndex > 0
-      ? ` (${rules
-          .get(role)!
-          .steps.slice(0, stepIndex)
-          .map((s) => s.label)
-          .join(", ")} ahead of it ${stepIndex === 1 ? "is" : "are"} also exhausted)`
-      : "";
+    const ahead =
+      stepIndex > 0
+        ? ` (${rules
+            .get(role)!
+            .steps.slice(0, stepIndex)
+            .map((s) => s.label)
+            .join(", ")} ahead of it ${stepIndex === 1 ? "is" : "are"} also exhausted)`
+        : "";
     const bits = [
       `- \`${role}\` is being served by **${step.label}** (\`${step.target}\`) — the ${ordinal(
         stepIndex
@@ -2423,7 +2483,9 @@ function buildStreamNoticeText(
   // rest of the cascade (e.g. Kimi) was dropped from the config.
   const remaining = rules.get(role)!.steps.slice(stepIndex + 1);
   const remainder =
-    remaining.length > 0 ? `Remaining fallbacks: ${remaining.map((s) => s.label).join(", ")}. ` : "";
+    remaining.length > 0
+      ? `Remaining fallbacks: ${remaining.map((s) => s.label).join(", ")}. `
+      : "";
   if (step.direction === "degraded") {
     return (
       prefix +
@@ -2440,11 +2502,16 @@ function buildStreamNoticeText(
       note
     );
   }
-  return prefix + remainder + `Capability is roughly equivalent; continue the work as normal.` + note;
+  return (
+    prefix + remainder + "Capability is roughly equivalent; continue the work as normal." + note
+  );
 }
 
 /** The operator config-arm holding this (role, bucket) diversion, if any. */
-function configArmHolding(role: FailoverRole, bucket?: string): { machine: string | null } | undefined {
+function configArmHolding(
+  role: FailoverRole,
+  bucket?: string
+): { machine: string | null } | undefined {
   if (configArmedRoles.has(role)) return { machine: null };
   if (bucket?.startsWith(MACHINE_BUCKET_PREFIX)) {
     const machine = bucket.slice(MACHINE_BUCKET_PREFIX.length);

@@ -21,11 +21,11 @@
  */
 
 import {
+  type FailoverRole,
+  type ServedStepRecord,
   appendFailoverNoticeToMessage,
   buildFailoverNotice,
   consumeStreamNotice,
-  type FailoverRole,
-  type ServedStepRecord,
 } from "../../fork/failover.js";
 
 export function prependNoticeToAnthropicStream(
@@ -49,12 +49,13 @@ export function prependNoticeToAnthropicStream(
           // SSE events are separated by a blank line (\n\n). Process only whole
           // events; keep the trailing partial in the buffer for the next chunk.
           let out = "";
-          let boundary: number;
-          while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary >= 0) {
             const rawEvent = buffer.slice(0, boundary);
             buffer = buffer.slice(boundary + 2);
             out += transformEvent(rawEvent);
             out += "\n\n";
+            boundary = buffer.indexOf("\n\n");
           }
           if (out) controller.enqueue(encoder.encode(out));
         }

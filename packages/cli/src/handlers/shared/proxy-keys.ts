@@ -24,9 +24,6 @@ export function resolveProxyKeys(
   return [...new Set(keys)];
 }
 
-export function matchesProxyKey(
-  provided: string | undefined,
-  keys: string[]
-): boolean {
+export function matchesProxyKey(provided: string | undefined, keys: string[]): boolean {
   return !!provided && keys.includes(provided);
 }
