@@ -265,6 +265,28 @@ function Get-ContainerConfigHome([string]$Name) {
     return $fallback
 }
 
+function ConvertTo-AuditHostPath([string]$ContainerMountSource) {
+    # Docker Desktop records a Windows bind mount with the path its Linux VM
+    # sees: `/run/desktop/mnt/host/d/claudish-shadow/config`. That string is a
+    # faithful `.Source`, and it does not exist on the Windows host - so the
+    # audit read nothing and called a serving seat NO-FUEL (FOURTH false
+    # NO-FUEL of 2026-10-28, measured on po-2025: the hub's own container
+    # reports that path while the file sits at D:\claudish-shadow\config).
+    #
+    # Translation is applied ONLY when the raw path is unreadable here, and the
+    # caller NAMES it in the source string: which file was read is part of the
+    # measurement, and a silent rewrite would be the same error one layer down.
+    if ([string]::IsNullOrWhiteSpace($ContainerMountSource)) { return $null }
+    if (Test-Path -LiteralPath $ContainerMountSource) { return $null }
+    if ($ContainerMountSource -match '^(?:/run/desktop/mnt/host|/mnt)/([a-zA-Z])/(.+)$') {
+        $drive = $Matches[1].ToUpperInvariant()
+        $rest = $Matches[2]
+        $candidate = "${drive}:/" + $rest
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $null
+}
+
 function Get-ConfigHomeResolution([string]$Name, [string]$ExplicitHome, [string]$HostFallback) {
     # Precedence, each branch named in the output: an explicit -ClaudishHome
     # (the test suite pins this to stay off the real machine), else the
@@ -279,6 +301,15 @@ function Get-ConfigHomeResolution([string]$Name, [string]$ExplicitHome, [string]
     }
     $mounted = Get-ContainerConfigHome $Name
     if ($mounted) {
+        $translated = ConvertTo-AuditHostPath $mounted
+        if ($translated) {
+            return [pscustomobject]@{
+                Path = $translated
+                Source = "container mount -> ${translated} (translated from ${mounted}, unreadable on this host)"
+                IsContainerMount = $true
+                IsProofGrade = $true
+            }
+        }
         return [pscustomobject]@{
             Path = $mounted
             Source = 'container mount -> ' + $mounted
@@ -306,9 +337,20 @@ function Invoke-SeatAudit {
         nominal_bucket_source = 'assumed (override with -NominalBucket when the nominal changes)'
     }
 
+    # WHICH home this audit consults is part of the measurement, so it is
+    # resolved ONCE, before any early return, and printed on EVERY verdict path.
+    # The three false NO-FUELs of 2026-10-28 were all a home line the reader
+    # could not see; a NO-PATH or a docker-UNKNOWN without one is exactly as
+    # unfalsifiable (#730).
+    $configHome = Get-ConfigHomeResolution -Name $ContainerName -ExplicitHome $ClaudishHome -HostFallback $HostHomeFallback
+    $report['config_home'] = $configHome.Path
+    $report['config_home_source'] = $configHome.Source
+    $homeLine = "  config home      : {0} ({1})" -f $configHome.Path, $configHome.Source
+
     if (-not (Get-DockerAvailable)) {
         Write-Output "seat-readiness: UNKNOWN"
         Write-Output "  reason: docker is not reachable from this seat - nothing can be measured"
+        Write-Output $homeLine
         $script:AuditExitCode = 3
         return
     }
@@ -317,6 +359,7 @@ function Invoke-SeatAudit {
     if ($state -eq 'absent') {
         Write-Output "seat-readiness: NO-PATH"
         Write-Output "  container : $ContainerName absent - no sidecar, nothing serves without the hub (Q-65 class)"
+        Write-Output $homeLine
         $script:AuditExitCode = 2
         return
     }
@@ -325,6 +368,7 @@ function Invoke-SeatAudit {
     if ($envInfo.Names.Count -eq 0) {
         Write-Output "seat-readiness: UNKNOWN"
         Write-Output "  reason: container env unreadable (inspect returned nothing)"
+        Write-Output $homeLine
         $script:AuditExitCode = 3
         return
     }
@@ -388,13 +432,10 @@ function Invoke-SeatAudit {
     # Second fuel source, read once. Stated in the output whether it worked or
     # not: a source consulted silently is how the false NO-FUEL of 2026-10-28
     # happened in the first place.
-    $configHome = Get-ConfigHomeResolution -Name $ContainerName -ExplicitHome $ClaudishHome -HostFallback $HostHomeFallback
-    $report['config_home'] = $configHome.Path
-    $report['config_home_source'] = $configHome.Source
     # Printed BEFORE the verdict either way: WHICH file was read is part of the
     # measurement, not a detail (po-2025 read the host copy for a day and called
-    # a serving seat NO-FUEL).
-    Write-Output ("  config home      : {0} ({1})" -f $configHome.Path, $configHome.Source)
+    # a serving seat NO-FUEL). Resolved once, above, so every path carries it.
+    Write-Output $homeLine
     $configKeys = Get-ConfigApiKeyNames $configHome.Path
     if ($null -eq $configKeys) {
         Write-Output ("  fuel sources     : env only - config unreadable at {0}\apiKeys (a seat whose keys live only there reads NO-FUEL on this source's silence)" -f $configHome.Path)
