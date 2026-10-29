@@ -106,6 +106,30 @@ describe("request-logger capture (fork)", () => {
     expect(file!.split(/[/\\]/).pop()).toMatch(/^req-\d+-\d{4}-[\dT-]+-[A-Za-z0-9._-]+\.json$/);
   });
 
+  // #722 read-back (measured 2026-10-29): a bare socket address in `src` lands
+  // in the FILENAME, and turn-autopsy's REQ_RE accepts only `direct` or the
+  // relay-pair form — every local capture became invisible to that consumer
+  // ("no req-* members found"), while all 1 371 production captures are
+  // `-direct`. The address is still recorded, as the additive `remote` field.
+  it("keeps the socket address out of src and the filename (#722 read-back)", async () => {
+    mkdirSync(capDir, { recursive: true });
+    process.env.CLAUDISH_CAPTURE_DIR = capDir;
+    const req = mkRequest();
+    const addrMap = new WeakMap<Request, string>();
+    addrMap.set(req, "127.0.0.1");
+
+    logRequest({ model: "m", messages: [] }, "h", req, addrMap);
+
+    const file = await waitForCapture(capDir);
+    expect(file).not.toBeNull();
+    const json = JSON.parse(readFileSync(file!, "utf8"));
+    expect(json.src).toBe("direct");
+    expect(json.remote).toBe("127.0.0.1");
+    expect(file!.split(/[/\\]/).pop()).toMatch(
+      /^req-\d+-\d{4}-\d{4}-\d{2}-\d{2}T[\d-]+Z-direct\.json$/
+    );
+  });
+
   it("does not throw when the capture dir cannot be created", () => {
     // Point at a path under a FILE (mkdir must fail) — logRequest must not throw.
     const fakeParent = join(capDir, "blocker");

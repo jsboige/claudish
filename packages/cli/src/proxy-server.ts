@@ -1423,9 +1423,10 @@ export async function createProxyServer(
   // than patched up afterwards.
   const server = Bun.serve({
     fetch(req, srv) {
-      // Capture pipeline (fork extension): remember the direct remote address —
-      // the only source resolveSourceIp can read for a non-proxied client.
-      // Proxied requests carry x-forwarded-for / x-real-ip and skip this.
+      // Capture pipeline (fork extension): remember the direct remote address.
+      // It is recorded as the additive `remote` field ONLY — never as `src`,
+      // never in the filename, whose vocabulary turn-autopsy's REQ_RE pins to
+      // `direct` / the relay pair form (#722 read-back, measured 2026-10-29).
       // (Main's @hono/node-server wrapper read ctx.remoteAddress; Bun.serve
       // exposes the same fact as srv.requestIP — same WeakMap, native API.)
       if (!req.headers.get("x-forwarded-for") && !req.headers.get("x-real-ip")) {
