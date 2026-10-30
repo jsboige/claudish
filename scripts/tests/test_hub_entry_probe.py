@@ -66,8 +66,28 @@ def facade(status: int | None = 401, error: str | None = None) -> dict:
     return {"status": status, "error": error, "json": None, "elapsed_ms": 40}
 
 
-def seat(mode: str = "NOMINAL", since: str | None = None, last: str | None = None) -> dict:
-    return {"mode": mode, "since": since, "last_served": last}
+def seat(
+    mode: str = "NOMINAL",
+    since: str | None = None,
+    last: str | None = None,
+    role: str | None = None,
+    last_transition_mode: str | None = None,
+    log_lines: int | None = None,
+) -> dict:
+    """A seat layer result, shaped like `read_seat_mode`'s output.
+
+    `role` is the LIVE vocabulary (relay-nominal / relay-autonomous) read from
+    the seat's own /health; `last_transition_mode` is what the LOG ended on.
+    The hang verdicts (T9) only trust the live one.
+    """
+    out = {"mode": mode, "since": since, "last_served": last, "role": role}
+    if last_transition_mode is not None:
+        out["last_transition_mode"] = last_transition_mode
+    if log_lines is not None:
+        out["log_lines"] = log_lines
+        out["log_source"] = "--tail 1000"
+        out["log_readable"] = True
+    return out
 
 
 # --- the healthy baseline, and the control that proves the verdict is sensitive
@@ -201,17 +221,21 @@ timeout_entry = {"status": None, "error": "timeout", "json": None, "elapsed_ms":
 timeout_entry_py = {"status": None, "error": "TimeoutError: timed out", "json": None, "elapsed_ms": 6000}
 timeout_facade = {"status": None, "error": "TimeoutError: The read operation timed out", "elapsed_ms": 6000}
 
-hang_auto = probe.classify(timeout_entry, timeout_facade, seat("AUTONOMOUS", "2026-10-30T15:20:11Z"))
-check("a hang at both layers + AUTONOMOUS seat -> ENTRY-UNRESPONSIVE", hang_auto["verdict"] == "ENTRY-UNRESPONSIVE", hang_auto["verdict"])
+hang_auto = probe.classify(
+    timeout_entry,
+    timeout_facade,
+    seat("AUTONOMOUS", "2026-10-30T15:20:11Z", role="relay-autonomous", last_transition_mode="AUTONOMOUS"),
+)
+check("a hang at both layers + LIVE AUTONOMOUS seat -> ENTRY-UNRESPONSIVE", hang_auto["verdict"] == "ENTRY-UNRESPONSIVE", hang_auto["verdict"])
 check("ENTRY-UNRESPONSIVE is degraded, exit 1", hang_auto["degraded"] is True and hang_auto["exit_code"] == 1, str(hang_auto))
 check(
     "the other timeout spelling is recognised too",
-    probe.classify(timeout_entry_py, timeout_facade, seat("AUTONOMOUS"))["verdict"] == "ENTRY-UNRESPONSIVE",
-    probe.classify(timeout_entry_py, timeout_facade, seat("AUTONOMOUS"))["verdict"],
+    probe.classify(timeout_entry_py, timeout_facade, seat("AUTONOMOUS", role="relay-autonomous"))["verdict"] == "ENTRY-UNRESPONSIVE",
+    probe.classify(timeout_entry_py, timeout_facade, seat("AUTONOMOUS", role="relay-autonomous"))["verdict"],
 )
 
-blind_seat = probe.classify(timeout_entry, timeout_facade, seat("NOMINAL"))
-check("the same timeouts + a NOMINAL seat -> PROBE-BLIND", blind_seat["verdict"] == "PROBE-BLIND", blind_seat["verdict"])
+blind_seat = probe.classify(timeout_entry, timeout_facade, seat("NOMINAL", role="relay-nominal"))
+check("the same timeouts + a LIVE NOMINAL seat -> PROBE-BLIND", blind_seat["verdict"] == "PROBE-BLIND", blind_seat["verdict"])
 check(
     "PROBE-BLIND is inconclusive: exit 2, not degraded",
     blind_seat["exit_code"] == 2 and blind_seat["degraded"] is False,
@@ -221,6 +245,49 @@ check(
     "the same timeouts with no seat state -> UNKNOWN",
     probe.classify(timeout_entry, timeout_facade, None)["verdict"] == "UNKNOWN",
     probe.classify(timeout_entry, timeout_facade, None)["verdict"],
+)
+
+# --- T9: a mode read from the LOG alone cannot corroborate a hang ---
+# The CR's reproduced case: the seat's /health does not answer (sidecar hung
+# too), but the log ends on a NOMINAL transition — possibly hours old. The
+# pre-fix code rendered PROBE-BLIND ("do not escalate") on exactly the outage
+# the probe exists to catch.
+
+stale_nominal = seat("NOMINAL", "2026-10-30T10:32:23Z", role=None, last_transition_mode="NOMINAL", log_lines=1)
+r1_stale = probe.classify(timeout_entry, timeout_facade, stale_nominal)
+check(
+    "T9 two timeouts + a LOG-only NOMINAL -> UNKNOWN, not PROBE-BLIND",
+    r1_stale["verdict"] == "UNKNOWN",
+    r1_stale["verdict"],
+)
+check(
+    "T9 ... and it is inconclusive (exit 2): no escalation, but no suppression either",
+    r1_stale["exit_code"] == 2,
+    str(r1_stale["exit_code"]),
+)
+check(
+    "T9 the facts name the mode source as the log",
+    r1_stale["facts"].get("seat_mode_source") == "log",
+    str(r1_stale["facts"]),
+)
+
+stale_autonomous = seat("AUTONOMOUS", "2026-10-30T09:36:59Z", role=None, last_transition_mode="AUTONOMOUS", log_lines=1)
+r1_stale_escalation = probe.classify(timeout_entry, timeout_facade, stale_autonomous)
+check(
+    "T9 same root, benign direction: a LOG-only AUTONOMOUS does not conjure ENTRY-UNRESPONSIVE",
+    r1_stale_escalation["verdict"] == "UNKNOWN",
+    r1_stale_escalation["verdict"],
+)
+
+check(
+    "T9 a LIVE role is still named as the source",
+    blind_seat["facts"].get("seat_mode_source") == "live",
+    str(blind_seat["facts"]),
+)
+check(
+    "T9 a seat with neither source asserts none",
+    probe.classify(timeout_entry, timeout_facade, seat(None))["facts"].get("seat_mode_source") is None,
+    str(probe.classify(timeout_entry, timeout_facade, seat(None))["facts"]),
 )
 
 # POSITIVE CONTROLS: the new branch must not swallow the shapes it sits beside.
@@ -243,6 +310,38 @@ check(
     "hub alive + facade timeout -> FACADE-UNRESPONSIVE",
     probe.classify(entry_ok(), timeout_facade, seat("NOMINAL"))["verdict"] == "FACADE-UNRESPONSIVE",
     probe.classify(entry_ok(), timeout_facade, seat("NOMINAL"))["verdict"],
+)
+
+# --- T10: a facade that produced NO STATUS is never "fine" ---
+# Measured on the pre-fix branch (hub alive, live NOMINAL seat): a refused,
+# DNS-failed or TLS-broken facade fell through to NOMINAL — while the facade
+# is the door clients actually knock on. Invariant: no no-status shape may
+# return NOMINAL (the mirror of "a refusal is a measurement" at the entry).
+
+for no_status_error in ("refused", "gaierror: [Errno 11001] getaddrinfo failed", "SSLError: CERTIFICATE_VERIFY_FAILED"):
+    r2 = probe.classify(entry_ok(), facade(None, no_status_error), seat("NOMINAL", role="relay-nominal"))
+    short = no_status_error.split(":")[0]
+    check(
+        f"T10 a facade with no status ({short}) is never NOMINAL",
+        r2["verdict"] != "NOMINAL",
+        f'{r2["verdict"]} ({no_status_error})',
+    )
+
+r2_refused = probe.classify(entry_ok(), facade(None, "refused"), seat("NOMINAL", role="relay-nominal"))
+check(
+    "T10 a REFUSED facade -> FACADE-UNRESPONSIVE, degraded, exit 1",
+    r2_refused["verdict"] == "FACADE-UNRESPONSIVE" and r2_refused["degraded"] is True and r2_refused["exit_code"] == 1,
+    str(r2_refused),
+)
+check(
+    "T10 ... and the reason names the facade's own error",
+    "refused" in r2_refused["reason"],
+    r2_refused["reason"],
+)
+check(
+    "T10 positive control: a facade that ANSWERS 401 keeps the verdict NOMINAL",
+    probe.classify(entry_ok(), facade(401), seat("NOMINAL", role="relay-nominal"))["verdict"] == "NOMINAL",
+    probe.classify(entry_ok(), facade(401), seat("NOMINAL", role="relay-nominal"))["verdict"],
 )
 
 # --- the seat's own detachment, with a healthy hub

@@ -36,22 +36,25 @@ VERDICTS
                      entry form does not serve. ESCALATE (fleet rule: an outage
                      detected is an outage escalated in the SAME cycle).
   ENTRY-UNRESPONSIVE L1 AND L2 both fail to answer before the timeout, while
-                     this seat's own relay is AUTONOMOUS -> a hang measured at
-                     two independent layers (and corroborated by the relay) is
-                     a signal, not an absence of one. Measured live 30/10
-                     15:21Z: TCP accepted on the published port, no HTTP answer
-                     in 15 s, facade likewise.
-  PROBE-BLIND        the same two timeouts, but this seat's relay is NOMINAL ->
-                     the hub is answering the relay's heartbeats, so it is the
-                     PROBE's path that is blind, not the entry. Exit 2: do not
-                     escalate an outage you cannot see.
+                     this seat's own relay is AUTONOMOUS — read LIVE from the
+                     seat's /health (T9) — > a hang measured at two independent
+                     layers (and corroborated by a live relay) is a signal, not
+                     an absence of one. Measured live 30/10 15:21Z: TCP accepted
+                     on the published port, no HTTP answer in 15 s, facade
+                     likewise.
+  PROBE-BLIND        the same two timeouts, but this seat's relay is NOMINAL —
+                     live, same T9 requirement — > the hub is answering the
+                     relay's heartbeats, so it is the PROBE's path that is
+                     blind, not the entry. Exit 2: do not escalate an outage you
+                     cannot see.
   PATH-BROKEN        L1 unreachable but L2 answers (2xx/4xx) -> the hub answers
                      the facade but not the published port: the break is between
                      them (forwarder/port/socket/firewall), not the hub process.
   FACADE-502-ONLY    L1 alive but L2 is a gateway error -> the hub is fine, the
                      facade's forwarder is not (an ARR/port change).
-  FACADE-UNRESPONSIVE L1 alive but L2 never answered -> the hub serves its
-                     published port and the WAN in front of it is silent.
+  FACADE-UNRESPONSIVE L1 alive but L2 never produced a status — timeout,
+                     refusal, DNS or TLS error (T10) — > the hub serves its
+                     published port and the WAN in front of it is not serving.
   SEAT-DETACHED      L1 alive, L2 fine, but this seat's relay is AUTONOMOUS ->
                      the seat stopped forwarding while the hub is healthy
                      (stuck hysteresis, key mismatch): it serves locally and
@@ -94,6 +97,20 @@ TRAPS (each one produces a wrong-but-plausible answer if you skip it):
      probe is run. The tail ladder plus a bounded no-tail read fix the read;
      `log_lines`/`log_source` keep "could not read" distinct from "no
      transition in what I read".
+  T9 A mode read from the LOG alone is history, not a measurement. When the
+     seat's own /health gives no role (sidecar hung too — same code as the
+     hub, same mechanism as eventLoopBlockedMs5m), the log's last transition
+     can be hours stale: a stale NOMINAL would conjure PROBE-BLIND and
+     suppress the escalation on the very outage the probe exists to catch;
+     a stale AUTONOMOUS would conjure a false ENTRY-UNRESPONSIVE. Both hang
+     verdicts therefore require the LIVE role; a log-only mode falls to
+     UNKNOWN, and the facts name the source (`seat_mode_source: live|log`).
+  T10 A facade that produced NO STATUS (connection refused, DNS failure,
+     TLS error) is not "fine". Before this trap was pinned, those shapes fell
+     through to NOMINAL while the entry answered — yet the facade is the door
+     clients actually knock on, and a refusal there is a measurement (the
+     mirror of entry_refused at the entry layer). No no-status shape may
+     return NOMINAL.
 
 READ-ONLY: HTTP GETs, one bounded `docker logs --tail`, no writes, no
 secrets (hosts, statuses, verdicts and timestamps only).
@@ -404,10 +421,15 @@ def read_seat_mode(
             "role": role,
             "url": url,
             "last_transition_mode": None,
+            "mode_source": None,
             "log_lines": log_lines,
             "log_source": log_source,
             "log_readable": bool(log_lines),
         }
+    # T9: name WHERE the reported mode came from. A live role is a
+    # measurement; a log transition is history. The hang verdicts require the
+    # live one, so the report must say which one it used.
+    mode_source = "live" if mode is not None else ("log" if last_transition_mode is not None else None)
     return {
         "mode": mode or last_transition_mode,
         "since": since,
@@ -415,6 +437,7 @@ def read_seat_mode(
         "role": role,
         "url": url,
         "last_transition_mode": last_transition_mode,
+        "mode_source": mode_source,
         "log_lines": log_lines,
         "log_source": log_source,
         "log_readable": bool(log_lines),
@@ -462,10 +485,19 @@ def classify(entry: dict, facade: dict | None = None, seat: dict | None = None) 
         facts["facade_status"] = facade.get("status")
         if facade.get("error"):
             facts["facade_error"] = facade["error"]
+    # T9: the LIVE seat role is the only mode that can corroborate a hang.
+    live_seat_mode = None
     if seat is not None:
         facts["seat_mode"] = seat.get("mode")
         facts["seat_mode_since"] = seat.get("since")
         facts["seat_last_served"] = seat.get("last_served")
+        # T9: say WHERE the seat mode came from — a live role or a log
+        # transition. The hang verdicts below only trust the live one.
+        live_seat_mode = seat_mode_from_role(seat.get("role"))
+        if live_seat_mode is not None:
+            facts["seat_mode_source"] = "live"
+        elif seat.get("last_transition_mode"):
+            facts["seat_mode_source"] = "log"
         # T8: "the log could not be read" is not "there was no transition".
         facts["seat_log_lines"] = seat.get("log_lines")
         if seat.get("log_source"):
@@ -496,6 +528,16 @@ def classify(entry: dict, facade: dict | None = None, seat: dict | None = None) 
                 "the hub answers its published port but the WAN facade never "
                 "answered: the hub is fine, the path in front of it is silent",
             )
+        elif facade_silent:
+            # T10: a facade that produced NO status (refused, DNS, TLS) is not
+            # "fine" — it is the door clients knock on, and a refusal there is
+            # a measurement, the mirror of entry_refused below.
+            verdict, reason = (
+                "FACADE-UNRESPONSIVE",
+                "the hub answers its published port but the WAN facade produced "
+                f"no answer at all ({(facade or {}).get('error') or 'no status'}): "
+                "the hub is fine, the door in front of it is not serving",
+            )
         elif seat is not None and seat_mode == "AUTONOMOUS":
             verdict, reason = (
                 "SEAT-DETACHED",
@@ -506,25 +548,31 @@ def classify(entry: dict, facade: dict | None = None, seat: dict | None = None) 
             verdict, reason = ("NOMINAL", "the fleet entry form answers and the seat still relays")
     else:
         if entry_timeout and facade_silent:
-            # A hang at two independent layers is a measurement, not an absence.
-            if seat_mode == "AUTONOMOUS":
+            # A hang at two independent layers is a measurement, not an absence —
+            # but only a LIVE seat role corroborates it (T9): a mode read from
+            # the log alone may be hours stale (a hung sidecar neither answers
+            # /health nor writes transitions), and a stale NOMINAL would
+            # suppress the escalation this probe exists to raise.
+            if live_seat_mode == "AUTONOMOUS":
                 verdict, reason = (
                     "ENTRY-UNRESPONSIVE",
                     "neither the published port nor the WAN facade answered before "
-                    "the timeout, and this seat's relay is AUTONOMOUS: the entry is "
-                    "hung, not merely slow",
+                    "the timeout, and this seat's relay is AUTONOMOUS (live): the "
+                    "entry is hung, not merely slow",
                 )
-            elif seat_mode == "NOMINAL":
+            elif live_seat_mode == "NOMINAL":
                 verdict, reason = (
                     "PROBE-BLIND",
-                    "both layers timed out but this seat's relay is NOMINAL — the "
-                    "hub answers the relay, so the probe's own path is blind",
+                    "both layers timed out but this seat's relay is NOMINAL (live) "
+                    "— the hub answers the relay, so the probe's own path is blind",
                 )
             else:
                 verdict, reason = (
                     "UNKNOWN",
-                    "both layers timed out and the seat's relay state is unknown: "
-                    "nothing corroborates the hang",
+                    "both layers timed out and this seat's LIVE relay state is "
+                    f"unknown (source={facts.get('seat_mode_source') or 'none'}): "
+                    "a log mode is history, not corroboration — nothing proves "
+                    "the hang",
                 )
         elif facade_gw:
             verdict, reason = (
