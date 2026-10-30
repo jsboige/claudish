@@ -23,9 +23,18 @@ Companion numbers: `payg-budget-2026-10.md` (what a request costs, who burns it)
 **Instrument correction (lesson first).** The first pass used REST `pulls` paged 4×100 by
 `updated desc` — on active repos that window never reaches back to July, so July read "0
 merged PR" on repos that demonstrably merged hundreds (the user's commit-activity graphs
-caught it). The corrected instrument is the search API (`is:merged merged:A..B` → exact
-`total_count`) + `stats/commit_activity` for commits. Scratch snapshots: `.tmp/lean-pr-anatomy.json`
-(anatomy, October detail — valid), `.tmp/lean-pr-recount.json` (counts, corrected).
+caught it). The corrected instrument is the search API + `stats/commit_activity`. Both are
+reproducible by any seat with `gh` (no scratch files needed):
+
+```bash
+# exact merged-PR count per repo·month (never trust deep pagination for old months)
+gh api "search/issues?q=repo:<owner>/<repo>+type:pr+is:merged+merged:2026-07-01..2026-08-01&per_page=1" --jq .total_count
+# commits per month (same data as the commit-activity graphs)
+gh api repos/<owner>/<repo>/stats/commit_activity   # 52 weekly buckets, retry on 202
+# anatomy (comments/review_comments are complete in the list payload;
+# commits/additions/changed_files only in the detail view — sample)
+gh api "repos/<owner>/<repo>/pulls?state=closed&sort=updated&direction=desc&per_page=100"
+```
 
 Merged PRs per month (exact, big six; EPF/ECE small, search-rate-limited in pass 2 — ≤ ~40
 combined in Oct per pass 1):
@@ -71,7 +80,7 @@ Findings, corrected:
 
 | # | Question | Owner | Instrument / first probe |
 |---|---|---|---|
-| W1 | Requests+tokens+€ **per poste** (coordinateur / adjoint / secrétaire / worker / organes / étudiants), July vs Oct, *within* lane | hub seat | extend `.tmp/payg-attribution.py`: role inference from machine×workspace×profile markers (Hermes/Nanoclaw/agent) over paired captures; within-lane req/PR is the number that answers "×4" cleanly |
+| W1 | Requests+tokens+€ **per poste** (coordinateur / adjoint / secrétaire / worker / organes / étudiants), July vs Oct, *within* lane | hub seat | paired captures: pair `resp-1-rNNNN-*` ↔ `req-1-NNNN-*` by sequence number; workspace = last `Primary working directory:` match in the body; usage legs = last `"usage"` in the resp tail; then role inference from machine×workspace×profile markers (Hermes/Nanoclaw/agent); within-lane req/PR is the number that answers "×4" cleanly |
 | W2 | Conversational round-trips per merged PR | hub seat | intercom/DM census from conversation traces; count ASK/ACK/REPLY/claim-release cycles per PR; compare lanes |
 | W3 | Adjoint/secrétaire paperasse | po-2027/po-2028 seats + hub captures | classify the 235-PR 2025-Epita population: regeneration vs incremental; % of files never re-touched within 7 days (a regenerated file never read again = paperasse) |
 | W4 | Hermes/Nanoclaw zealousness | ai-01 + hub | Hermes: system = 21 k chars, 60 % skills catalog, 7.0 % of fleet requests (measured 30/10, #445-D2) — measure catalog weight vs actual skill usage; Nanoclaw: deploy gated on ai-01, appears in lane contexts — baseline its cycle cost the week it wakes. Zealousness proxy: tool-call fan-out + retry rate per turn |

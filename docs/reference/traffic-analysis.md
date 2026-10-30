@@ -2,6 +2,8 @@
 
 **Deferred from `CLAUDE.md`.** The script table and the container/sidecar traps stay in `CLAUDE.md`; this file holds the capture format, attribution, and leak-diagnosis detail.
 
+**Measured studies (dated, detail lives in each doc):** consumption July→Oct and the PAYG budget — `payg-budget-2026-10.md` · Lean audit (requests per merged PR ×2.2, per-poste split) — `lean-audit-2026-10.md`.
+
 **Use the scripts, not hand-rolled grep.** The proxy log format has traps that produce false positives when grepped naively (see `proxy-log-monitoring` memory: `bytes=NNNN` matching error codes, timestamp digits matching `429`, `[msg:N]` body previews matching keywords). The scripts encode the precise filters.
 
 ## Pick the level
