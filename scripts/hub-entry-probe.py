@@ -35,20 +35,34 @@ VERDICTS
   ENTRY-DOWN         L1 unreachable AND L2 is a gateway error -> the fleet
                      entry form does not serve. ESCALATE (fleet rule: an outage
                      detected is an outage escalated in the SAME cycle).
+  ENTRY-UNRESPONSIVE L1 AND L2 both fail to answer before the timeout, while
+                     this seat's own relay is AUTONOMOUS -> a hang measured at
+                     two independent layers (and corroborated by the relay) is
+                     a signal, not an absence of one. Measured live 30/10
+                     15:21Z: TCP accepted on the published port, no HTTP answer
+                     in 15 s, facade likewise.
+  PROBE-BLIND        the same two timeouts, but this seat's relay is NOMINAL ->
+                     the hub is answering the relay's heartbeats, so it is the
+                     PROBE's path that is blind, not the entry. Exit 2: do not
+                     escalate an outage you cannot see.
   PATH-BROKEN        L1 unreachable but L2 answers (2xx/4xx) -> the hub answers
                      the facade but not the published port: the break is between
                      them (forwarder/port/socket/firewall), not the hub process.
   FACADE-502-ONLY    L1 alive but L2 is a gateway error -> the hub is fine, the
                      facade's forwarder is not (an ARR/port change).
+  FACADE-UNRESPONSIVE L1 alive but L2 never answered -> the hub serves its
+                     published port and the WAN in front of it is silent.
   SEAT-DETACHED      L1 alive, L2 fine, but this seat's relay is AUTONOMOUS ->
                      the seat stopped forwarding while the hub is healthy
                      (stuck hysteresis, key mismatch): it serves locally and
                      looks healthy while the fleet is not.
-  UNKNOWN            a probe was inconclusive (no status, timeout) -> exit 2.
-                     Absence of signal is not a signal.
+  UNKNOWN            a probe was inconclusive and nothing corroborates it ->
+                     exit 2. Absence of signal is not a signal.
 
 EXIT CODES
-  0 NOMINAL · 1 degraded (any other verdict) · 2 UNKNOWN or usage error.
+  0 NOMINAL · 1 degraded (ENTRY-DOWN, ENTRY-UNRESPONSIVE, PATH-BROKEN,
+  FACADE-502-ONLY, FACADE-UNRESPONSIVE, SEAT-DETACHED) · 2 inconclusive
+  (UNKNOWN, PROBE-BLIND) or usage error.
 
 TRAPS (each one produces a wrong-but-plausible answer if you skip it):
   T1 A gateway error from the facade alone would be reported as "the hub is
@@ -73,6 +87,13 @@ TRAPS (each one produces a wrong-but-plausible answer if you skip it):
      AUTONOMOUS]") MENTIONS a mode without BEING a transition. Reading those
      as transitions dates the outage to a per-request failure instead of the
      mode change, and the report then claims a transition that never happened.
+  T8 A single large `docker logs --tail N` can return **0 lines** on a
+     freshly recreated container (driver `local`: 1900 returned the 1794
+     retained lines, 1999 and 20000 returned 0 — measured on ai-01). Read as
+     "the log is empty", it makes the seat layer blind at the exact moment the
+     probe is run. The tail ladder plus a bounded no-tail read fix the read;
+     `log_lines`/`log_source` keep "could not read" distinct from "no
+     transition in what I read".
 
 READ-ONLY: HTTP GETs, one bounded `docker logs --tail`, no writes, no
 secrets (hosts, statuses, verdicts and timestamps only).
@@ -100,8 +121,33 @@ DEFAULT_CONTAINER = "claudish-sidecar"
 # T2: only role=hub is the fleet-facing entry form.
 ENTRY_ROLE = "hub"
 GATEWAY_ERRORS = (502, 503, 504)
+DEGRADED_VERDICTS = frozenset(
+    {
+        "ENTRY-DOWN",
+        "ENTRY-UNRESPONSIVE",
+        "PATH-BROKEN",
+        "FACADE-502-ONLY",
+        "FACADE-UNRESPONSIVE",
+        "SEAT-DETACHED",
+    }
+)
+EXIT_CODES = {
+    "NOMINAL": 0,
+    "ENTRY-DOWN": 1,
+    "ENTRY-UNRESPONSIVE": 1,
+    "PATH-BROKEN": 1,
+    "FACADE-502-ONLY": 1,
+    "FACADE-UNRESPONSIVE": 1,
+    "SEAT-DETACHED": 1,
+    "PROBE-BLIND": 2,
+    "UNKNOWN": 2,
+}
 # T3: outside this range, uptimeSec is not a duration.
 MAX_PLAUSIBLE_UPTIME_SEC = 7 * 24 * 3600
+# T8: the tail ladder (a single large --tail can return 0 lines), and the byte
+# cap of the no-tail fallback read.
+TAIL_LADDER = (20000, 5000, 1000, 200)
+NO_TAIL_BYTE_CAP = 4 * 1024 * 1024
 
 RELAY_TRANSITION_RE = re.compile(r"(?:→|->)\s*(NOMINAL|AUTONOMOUS)\b")
 # Fallback for a log whose arrow did not survive the encoding.
@@ -177,6 +223,77 @@ def probe_http(url: str, timeout: float = 6.0) -> dict:
     }
 
 
+def _docker_log_text(container: str, tail: int | None, runner=None) -> tuple[str, int]:
+    """`docker logs` bounded. Returns (text, non-empty line count). Never raises.
+
+    T8 (measured on ai-01, driver `local`, max-file=4 / max-size=50m, on a
+    freshly recreated sidecar): `docker logs --tail N` returns **0 lines** once
+    N is too large — 1900 returned the 1794 retained lines, 1999 returned 0,
+    20000 returned 0, while the log held hundreds of `[ttft]`. A single large
+    `--tail` is therefore not a reliable read: it renders a busy container
+    EMPTY. The ladder in `read_seat_mode` walks down until a read returns
+    something.
+    """
+    cmd = ["docker", "logs", "-t", container]
+    if tail is not None:
+        cmd = ["docker", "logs", "--tail", str(tail), "-t", container]
+    try:
+        if runner is not None:
+            out = runner(cmd)
+        else:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+            out = proc.stdout or ""
+            if not out.strip():
+                out = proc.stderr or ""
+    except Exception:
+        return "", 0
+    lines = [l for l in out.splitlines() if l.strip()]
+    return out, len(lines)
+
+
+def _docker_log_last_bytes(container: str, cap: int = NO_TAIL_BYTE_CAP) -> tuple[str, int]:
+    """`docker logs` WITHOUT `--tail`, keeping only the last `cap` bytes.
+
+    The no-tail read is the one the driver bounds itself (its own retention),
+    so it is the fallback that survives the T8 trap — but the retained set can
+    be tens of megabytes, hence the bounded rolling tail instead of a full
+    capture.
+    """
+    try:
+        proc = subprocess.Popen(
+            ["docker", "logs", "-t", container],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return "", 0
+    buf = bytearray()
+    try:
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > cap:
+                del buf[: len(buf) - cap]
+        proc.wait(timeout=30)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    text = buf.decode("utf-8", "replace")
+    return text, len([l for l in text.splitlines() if l.strip()])
+
+
 def local_sidecar_url(container: str) -> str | None:
     """The seat's own sidecar URL, from the published port of its container.
 
@@ -218,7 +335,14 @@ def seat_mode_from_role(role: str | None) -> str | None:
     return None
 
 
-def read_seat_mode(container: str, tail: int = 20000, seat_url: str | None = None) -> dict | None:
+def read_seat_mode(
+    container: str,
+    tail: int = 20000,
+    seat_url: str | None = None,
+    runner=None,
+    health_probe=None,
+    no_tail_reader=None,
+) -> dict | None:
     """Current relay mode of this seat, plus the date of the last transition.
 
     Two sources, deliberately:
@@ -226,42 +350,64 @@ def read_seat_mode(container: str, tail: int = 20000, seat_url: str | None = Non
         live; the log is a history that a busy seat outruns);
       - the container log gives WHEN the last transition happened — that date
         is what turns "the fleet is down" into "the fleet has been down since
-        09:36:59Z". T4: `--tail` only, never `--since` (a rotated segment
-        would be served silently).
+        09:36:59Z".
+
+    T4: never `--since` (a rotated segment would be served silently).
+    T8: never a single large `--tail` (it can return 0 lines on a freshly
+    recreated container). The ladder walks down until a read returns
+    something; the no-tail read is the last resort, bounded in bytes.
+
+    The returned dict says what was READ: `log_lines` (0 means the log could
+    not be read at all — NOT "no transition in the log") and `log_source`
+    (which read produced it). A seat layer that read nothing asserts nothing.
     """
     url = seat_url or local_sidecar_url(container)
     role = None
     if url:
-        live = probe_http(f"{url.rstrip('/')}/health", timeout=4.0)
+        probe = health_probe or probe_http
+        live = probe(f"{url.rstrip('/')}/health", timeout=4.0)
         payload = live.get("json")
         if isinstance(payload, dict):
             role = payload.get("role")
     mode = seat_mode_from_role(role)
 
-    last_transition_mode = None
-    since = None
-    last_served = None
-    try:
-        proc = subprocess.run(
-            ["docker", "logs", "--tail", str(tail), "-t", container],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
-    except Exception:
-        proc = None
-    if proc is not None:
-        out = proc.stdout or ""
-        if not out.strip():
-            out = proc.stderr or ""
-        scanned = scan_relay_log(out)
-        last_transition_mode = scanned["last_transition_mode"]
-        since = scanned["since"]
-        last_served = scanned["last_served"]
+    text = ""
+    log_lines = 0
+    log_source = None
+    for candidate in dict.fromkeys((tail,) + TAIL_LADDER):
+        if candidate is None:
+            continue
+        text, log_lines = _docker_log_text(container, candidate, runner=runner)
+        if log_lines:
+            log_source = f"--tail {candidate}"
+            break
+    if not log_lines:
+        # The driver bounds its own retention; read it, bounded in bytes.
+        reader = no_tail_reader or _docker_log_last_bytes
+        try:
+            text, log_lines = reader(container)
+        except Exception:
+            text, log_lines = "", 0
+        if log_lines:
+            log_source = "no-tail (bounded)"
+
+    scanned = scan_relay_log(text) if log_lines else {"last_transition_mode": None, "since": None, "last_served": None}
+    last_transition_mode = scanned["last_transition_mode"]
+    since = scanned["since"]
+    last_served = scanned["last_served"]
+
     if mode is None and last_transition_mode is None and last_served is None:
-        return None
+        return {
+            "mode": None,
+            "since": None,
+            "last_served": None,
+            "role": role,
+            "url": url,
+            "last_transition_mode": None,
+            "log_lines": log_lines,
+            "log_source": log_source,
+            "log_readable": bool(log_lines),
+        }
     return {
         "mode": mode or last_transition_mode,
         "since": since,
@@ -269,7 +415,20 @@ def read_seat_mode(container: str, tail: int = 20000, seat_url: str | None = Non
         "role": role,
         "url": url,
         "last_transition_mode": last_transition_mode,
+        "log_lines": log_lines,
+        "log_source": log_source,
+        "log_readable": bool(log_lines),
     }
+
+
+def _is_timeout(probe_result: dict | None) -> bool:
+    """True when the probe gave up waiting rather than receiving an answer.
+
+    A timeout is a DIFFERENT measurement from a refusal: the port accepted the
+    connection and the peer never spoke (measured live 30/10 15:22Z — TCP open
+    on the published port, no HTTP answer in 10 s).
+    """
+    return "timeout" in str((probe_result or {}).get("error") or "").lower()
 
 
 def entry_is_the_form(entry: dict) -> bool:
@@ -307,11 +466,22 @@ def classify(entry: dict, facade: dict | None = None, seat: dict | None = None) 
         facts["seat_mode"] = seat.get("mode")
         facts["seat_mode_since"] = seat.get("since")
         facts["seat_last_served"] = seat.get("last_served")
+        # T8: "the log could not be read" is not "there was no transition".
+        facts["seat_log_lines"] = seat.get("log_lines")
+        if seat.get("log_source"):
+            facts["seat_log_source"] = seat.get("log_source")
+        if seat.get("log_readable") is False:
+            facts["seat_log_unreadable"] = True
 
     facade_gw = bool(facade is not None and facade.get("status") in GATEWAY_ERRORS)
     facade_answers = bool(
         facade is not None and facade.get("status") is not None and not facade_gw
     )
+    facade_silent = bool(facade is not None and facade.get("status") is None)
+    entry_timeout = _is_timeout(entry)
+    facade_timeout = facade is not None and _is_timeout(facade)
+    entry_refused = (entry.get("error") or "") == "refused"
+    seat_mode = (seat or {}).get("mode")
 
     if form_alive:
         if facade_gw:
@@ -320,7 +490,13 @@ def classify(entry: dict, facade: dict | None = None, seat: dict | None = None) 
                 "the hub answers its published port but the WAN facade returns a "
                 "gateway error: the forwarder in front of it is broken",
             )
-        elif seat is not None and seat.get("mode") == "AUTONOMOUS":
+        elif facade_timeout:
+            verdict, reason = (
+                "FACADE-UNRESPONSIVE",
+                "the hub answers its published port but the WAN facade never "
+                "answered: the hub is fine, the path in front of it is silent",
+            )
+        elif seat is not None and seat_mode == "AUTONOMOUS":
             verdict, reason = (
                 "SEAT-DETACHED",
                 "the hub is healthy but this seat stopped forwarding "
@@ -329,7 +505,28 @@ def classify(entry: dict, facade: dict | None = None, seat: dict | None = None) 
         else:
             verdict, reason = ("NOMINAL", "the fleet entry form answers and the seat still relays")
     else:
-        if facade_gw:
+        if entry_timeout and facade_silent:
+            # A hang at two independent layers is a measurement, not an absence.
+            if seat_mode == "AUTONOMOUS":
+                verdict, reason = (
+                    "ENTRY-UNRESPONSIVE",
+                    "neither the published port nor the WAN facade answered before "
+                    "the timeout, and this seat's relay is AUTONOMOUS: the entry is "
+                    "hung, not merely slow",
+                )
+            elif seat_mode == "NOMINAL":
+                verdict, reason = (
+                    "PROBE-BLIND",
+                    "both layers timed out but this seat's relay is NOMINAL — the "
+                    "hub answers the relay, so the probe's own path is blind",
+                )
+            else:
+                verdict, reason = (
+                    "UNKNOWN",
+                    "both layers timed out and the seat's relay state is unknown: "
+                    "nothing corroborates the hang",
+                )
+        elif facade_gw:
             verdict, reason = (
                 "ENTRY-DOWN",
                 "the published hub port does not answer and the WAN facade "
@@ -341,6 +538,12 @@ def classify(entry: dict, facade: dict | None = None, seat: dict | None = None) 
                 "the published hub port does not answer but the WAN facade does: "
                 "the break is on the path, not in the hub process",
             )
+        elif entry_refused:
+            verdict, reason = (
+                "ENTRY-DOWN",
+                "the published hub port REFUSED the connection (a measured "
+                "non-service) and no other layer answered for it",
+            )
         else:
             verdict, reason = (
                 "UNKNOWN",
@@ -348,12 +551,11 @@ def classify(entry: dict, facade: dict | None = None, seat: dict | None = None) 
                 "is not a signal",
             )
 
-    degraded = verdict != "NOMINAL"
     return {
         "verdict": verdict,
         "reason": reason,
-        "degraded": degraded,
-        "exit_code": 0 if verdict == "NOMINAL" else (1 if verdict != "UNKNOWN" else 2),
+        "degraded": verdict in DEGRADED_VERDICTS,
+        "exit_code": EXIT_CODES[verdict],
         "facts": facts,
     }
 
@@ -402,9 +604,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         if seat is not None:
             print(
-                f"[hub-entry] seat mode={facts.get('seat_mode', '-')}"
-                f" since={facts.get('seat_mode_since', '-')}"
-                f" last_served={facts.get('seat_last_served', '-')}"
+                f"[hub-entry] seat mode={facts.get('seat_mode') or '-'}"
+                f" since={facts.get('seat_mode_since') or '-'}"
+                f" last_served={facts.get('seat_last_served') or '-'}"
+                f" log_lines={facts.get('seat_log_lines')}"
+                f" log_source={facts.get('seat_log_source') or '-'}"
             )
     return result["exit_code"]
 

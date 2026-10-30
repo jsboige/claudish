@@ -256,10 +256,31 @@ dead" — that distinction decides who gets paged. Pins:
    announced. Even when the actor is the hub lane's own tooling, the
    announcement is what tells the other seats.
 
-**What this seat could not determine:** the cause of the 75-minute watchdog gap
-on po-2025 (host freeze vs Docker daemon restart vs a dead scheduler) needs
-that seat's Event Log, and the failure of the *collector* to attribute the
-ledger's `instanceId` per line. Both are the hub lane's to close.
+**The hub lane's post-mortem (30/10 15:09Z, RAPPORTÉ) answered what this seat
+could not determine:** the container **never crashed** (`started=10:32:02Z`,
+exit 0, no OOM, no drain entry that day) — the **host rebooted** at
+**10:29:08Z** (Event 1074, `Explorer.EXE`, "Autre (non planifié)", clean
+shutdown 6006/6005, no 41/6008) and the container came back three minutes
+later. So the 75-minute watchdog gap is the **host being down**, not a dead
+scheduler. Corroborated on that seat by bursts of `event streamer: error: EOF`
+and a vhdx compaction skipped twelve days running.
+
+**The mechanism is recurrent, and it is the hub's own event loop.** The hub
+publishes `eventLoopBlockedMs5m`: 5 295 ms at 13:01Z, then 38 623 → 40 641 →
+42 272 → 45 153 → **59 833 ms** at 14:52Z — **20 % of five minutes** with only
+2 active streams, so not load (po-2023, RAPPORTÉ). It ran out at **15:19:57Z**:
+the seat's forward died on a closed socket, AUTONOMOUS at **15:20:11Z**,
+`/health` **3/3 timing out at 15 s**, the façade likewise, while `.50:80`,
+`.50:135` and the WAN stayed open and the published port **accepted the TCP
+connection** — the process was hung, not the path (measured from po-2024,
+15:21–15:23Z). That live episode is why the probe grew **`ENTRY-UNRESPONSIVE`**
+and **`PROBE-BLIND`**: its first version rendered the hang `UNKNOWN`, i.e. it
+called a measurement an absence of signal. The per-minute event-loop series
+(#760, `08d25348c`) is the instrument that dates these stalls on the hub seat.
+
+**Still open on the hub lane:** the ledger's `instanceId` attribution (§3
+above) is a documented defect, not a fixed one — now **#782**, with the
+suggested route (`State.StartedAt`, a per-restart anchor).
 
 ## Compose environment surface
 

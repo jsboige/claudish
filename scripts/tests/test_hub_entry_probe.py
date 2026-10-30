@@ -195,6 +195,56 @@ unknown = probe.classify(
 check("UNKNOWN when no layer answers", unknown["verdict"] == "UNKNOWN", unknown["verdict"])
 check("UNKNOWN exit code is 2 (inconclusive, not degraded)", unknown["exit_code"] == 2, str(unknown["exit_code"]))
 
+# --- ENTRY-UNRESPONSIVE / PROBE-BLIND: a measured hang is not "no signal" ---
+
+timeout_entry = {"status": None, "error": "timeout", "json": None, "elapsed_ms": 6000}
+timeout_entry_py = {"status": None, "error": "TimeoutError: timed out", "json": None, "elapsed_ms": 6000}
+timeout_facade = {"status": None, "error": "TimeoutError: The read operation timed out", "elapsed_ms": 6000}
+
+hang_auto = probe.classify(timeout_entry, timeout_facade, seat("AUTONOMOUS", "2026-10-30T15:20:11Z"))
+check("a hang at both layers + AUTONOMOUS seat -> ENTRY-UNRESPONSIVE", hang_auto["verdict"] == "ENTRY-UNRESPONSIVE", hang_auto["verdict"])
+check("ENTRY-UNRESPONSIVE is degraded, exit 1", hang_auto["degraded"] is True and hang_auto["exit_code"] == 1, str(hang_auto))
+check(
+    "the other timeout spelling is recognised too",
+    probe.classify(timeout_entry_py, timeout_facade, seat("AUTONOMOUS"))["verdict"] == "ENTRY-UNRESPONSIVE",
+    probe.classify(timeout_entry_py, timeout_facade, seat("AUTONOMOUS"))["verdict"],
+)
+
+blind_seat = probe.classify(timeout_entry, timeout_facade, seat("NOMINAL"))
+check("the same timeouts + a NOMINAL seat -> PROBE-BLIND", blind_seat["verdict"] == "PROBE-BLIND", blind_seat["verdict"])
+check(
+    "PROBE-BLIND is inconclusive: exit 2, not degraded",
+    blind_seat["exit_code"] == 2 and blind_seat["degraded"] is False,
+    str(blind_seat),
+)
+check(
+    "the same timeouts with no seat state -> UNKNOWN",
+    probe.classify(timeout_entry, timeout_facade, None)["verdict"] == "UNKNOWN",
+    probe.classify(timeout_entry, timeout_facade, None)["verdict"],
+)
+
+# POSITIVE CONTROLS: the new branch must not swallow the shapes it sits beside.
+check(
+    "entry timeout + gateway error stays ENTRY-DOWN",
+    probe.classify(timeout_entry, facade(502), seat("NOMINAL"))["verdict"] == "ENTRY-DOWN",
+    probe.classify(timeout_entry, facade(502), seat("NOMINAL"))["verdict"],
+)
+check(
+    "entry timeout + facade answers stays PATH-BROKEN",
+    probe.classify(timeout_entry, facade(401), seat("NOMINAL"))["verdict"] == "PATH-BROKEN",
+    probe.classify(timeout_entry, facade(401), seat("NOMINAL"))["verdict"],
+)
+check(
+    "entry refused + facade silent -> ENTRY-DOWN (a refusal is a measurement)",
+    probe.classify(entry_refused(), timeout_facade, seat("NOMINAL"))["verdict"] == "ENTRY-DOWN",
+    probe.classify(entry_refused(), timeout_facade, seat("NOMINAL"))["verdict"],
+)
+check(
+    "hub alive + facade timeout -> FACADE-UNRESPONSIVE",
+    probe.classify(entry_ok(), timeout_facade, seat("NOMINAL"))["verdict"] == "FACADE-UNRESPONSIVE",
+    probe.classify(entry_ok(), timeout_facade, seat("NOMINAL"))["verdict"],
+)
+
 # --- the seat's own detachment, with a healthy hub
 
 detached = probe.classify(entry_ok(), facade(401), seat("AUTONOMOUS", "2026-10-30T09:36:59Z"))
@@ -239,6 +289,113 @@ check(
     ]
     is None,
     "a per-request line was read as a transition",
+)
+
+# --- T8: a large --tail can render a BUSY log empty (measured on ai-01) ---
+
+BUSY_LOG = (
+    "2026-10-30T09:36:59.187Z [Relay] upstream http://192.168.0.50:3000 DOWN after 2 failure(s) (heartbeat) → AUTONOMOUS\n"
+    "2026-10-30T10:32:23.853Z [Relay] upstream http://192.168.0.50:3000 healthy again → NOMINAL (relay resumed)\n"
+    "2026-10-30T10:52:47.762Z [ttft] model=glm-5.3 ttft=812ms\n"
+)
+
+
+def fake_runner(mapping):
+    """Pretend `docker logs`: the tail value selects the answer (None = no tail)."""
+
+    def _run(cmd):
+        tail = None
+        if "--tail" in cmd:
+            tail = int(cmd[cmd.index("--tail") + 1])
+        return mapping.get(tail, "")
+
+    return _run
+
+
+def fake_health(role):
+    def _probe(url, timeout=4.0):
+        if role is None:
+            return {"status": None, "error": "refused", "json": None, "elapsed_ms": 1}
+        return {"status": 200, "error": None, "json": {"role": role, "uptimeSec": 1200}, "elapsed_ms": 1}
+
+    return _probe
+
+
+def no_tail_empty(container):
+    return "", 0
+
+
+laddered = probe.read_seat_mode(
+    "claudish-sidecar",
+    tail=20000,
+    seat_url="http://127.0.0.1:3915",
+    runner=fake_runner({20000: "", 5000: "", 1000: BUSY_LOG}),
+    health_probe=fake_health("relay-nominal"),
+    no_tail_reader=no_tail_empty,
+)
+check("T8 the ladder recovers a log a large --tail renders empty", laddered["since"] == "2026-10-30T10:32:23.853Z", str(laddered))
+check("T8 the read names which tail answered", laddered["log_source"] == "--tail 1000", str(laddered.get("log_source")))
+check("T8 the log is reported readable", laddered["log_readable"] is True and laddered["log_lines"] > 0, str(laddered))
+
+direct = probe.read_seat_mode(
+    "claudish-sidecar",
+    tail=20000,
+    seat_url="http://127.0.0.1:3915",
+    runner=fake_runner({20000: BUSY_LOG}),
+    health_probe=fake_health("relay-nominal"),
+    no_tail_reader=no_tail_empty,
+)
+check("T8 positive control: a working large tail is used as-is", direct["log_source"] == "--tail 20000", str(direct.get("log_source")))
+
+blind = probe.read_seat_mode(
+    "claudish-sidecar",
+    tail=20000,
+    seat_url="http://127.0.0.1:3915",
+    runner=fake_runner({}),
+    health_probe=fake_health(None),
+    no_tail_reader=no_tail_empty,
+)
+check("T8 an unreadable log is reported as such", blind["log_readable"] is False and blind["log_lines"] == 0, str(blind))
+check("T8 an unreadable log claims no transition", blind["last_transition_mode"] is None and blind["since"] is None, str(blind))
+blind_verdict = probe.classify(entry_ok(), facade(401), blind)
+check("T8 unreadable seat log does not fabricate a detachment", blind_verdict["verdict"] == "NOMINAL", blind_verdict["verdict"])
+check(
+    "T8 ... and the facts say the log was unreadable",
+    blind_verdict["facts"].get("seat_log_unreadable") is True,
+    str(blind_verdict["facts"]),
+)
+
+detached_blind = probe.read_seat_mode(
+    "claudish-sidecar",
+    tail=20000,
+    seat_url="http://127.0.0.1:3915",
+    runner=fake_runner({}),
+    health_probe=fake_health("relay-autonomous"),
+    no_tail_reader=no_tail_empty,
+)
+check("T8 a live AUTONOMOUS role survives an unreadable log", detached_blind["mode"] == "AUTONOMOUS", str(detached_blind))
+check(
+    "T8 ... and the verdict follows the live role",
+    probe.classify(entry_ok(), facade(401), detached_blind)["verdict"] == "SEAT-DETACHED",
+    str(probe.classify(entry_ok(), facade(401), detached_blind)["verdict"]),
+)
+
+# --- RELAY_FALLBACK: a line whose arrow did not survive the encoding ---
+
+for arrowless, expected in (
+    ("2026-10-30T10:32:23.853Z [Relay] upstream http://x:3000 healthy again � NOMINAL (relay resumed)", "NOMINAL"),
+    ("2026-10-30T09:36:59.187Z [Relay] upstream http://x:3000 DOWN after 2 failure(s) (heartbeat) � AUTONOMOUS", "AUTONOMOUS"),
+):
+    got_fallback = probe.scan_relay_log(arrowless)
+    check(f"RELAY_FALLBACK: an arrowless line reads {expected}", got_fallback["last_transition_mode"] == expected, str(got_fallback))
+
+check(
+    "RELAY_FALLBACK: an arrowless per-request line still yields no transition",
+    probe.scan_relay_log(
+        "2026-10-30T09:37:01.100Z [Relay] forward failed (hub HTTP 502) � this request served LOCALLY [1/2 before AUTONOMOUS]"
+    )["last_transition_mode"]
+    is None,
+    "a per-request line was read as a transition via the fallback",
 )
 
 # --- the probe layer itself is bounded and never raises
