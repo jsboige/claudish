@@ -16,7 +16,7 @@ import { createResponseCapture } from "../response-capture.js";
 import { ttftMarkerLine } from "../traffic-markers.js";
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import { executeWebFetch } from "../web-search-executor.js";
-import { reconcileFrame } from "./frame-coherence.js";
+import { passthroughFrame, reconcileFrame } from "./frame-coherence.js";
 import {
   isPolicyRefusal,
   logPolicyRefusal,
@@ -44,6 +44,16 @@ const PRE_VISIBLE_REFORWARD_BACKOFF_MS: readonly number[] = [400, 1_200];
  * anthropic-wire lane needs a way to be taken back out without a deploy.
  * Values above the ladder length clamp to it (the ladder is the real bound).
  */
+/**
+ * Kill switch for the frame-coherence repair (review ai-01, 30/10), re-read per
+ * emission. It rewrites client-visible frames on the hottest path of every
+ * anthropic-wire lane, so it must be removable without a deploy — `=0` relays
+ * every frame exactly as the upstream sent it. Absent/empty = enabled.
+ */
+function frameCoherenceEnabled(): boolean {
+  return process.env.CLAUDISH_FRAME_COHERENCE !== "0";
+}
+
 function preVisibleReforwardMax(): number {
   const raw = process.env.CLAUDISH_PREVISIBLE_REFORWARD_MAX;
   if (raw === undefined || raw.trim() === "") return PRE_VISIBLE_REFORWARD_BACKOFF_MS.length;
@@ -140,6 +150,9 @@ export function createAnthropicPassthroughStream(
         // read, so the event line is buffered for exactly one line. Held on
         // BOTH paths: every drop site below (thinking suppression, server
         // tool suppression, orphan frames) lives on one path or the other.
+        // The repair's kill switch, resolved ONCE per stream (= per request):
+        // `CLAUDISH_FRAME_COHERENCE=0` relays every frame untouched.
+        const coherenceEnabled = frameCoherenceEnabled();
         let pendingEventLine: string | null = null;
         /** A frame was just dropped — swallow its trailing blank separator too. */
         let suppressedFrame = false;
@@ -168,7 +181,9 @@ export function createAnthropicPassthroughStream(
          * A frame that is already coherent is forwarded byte-for-byte.
          */
         const emitDataLine = (text: string) => {
-          const frame = reconcileFrame(pendingEventLine, text);
+          const frame = coherenceEnabled
+            ? reconcileFrame(pendingEventLine, text)
+            : passthroughFrame(pendingEventLine, text);
           if (frame.changed) {
             log(
               `[AnthropicSSE] Frame coherence repair (${frame.reason}): event="${frame.eventName ?? "-"}" json_type="${frame.jsonType ?? "-"}" (model=${opts.modelName})`

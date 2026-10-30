@@ -208,6 +208,44 @@ describe("frame-coherence — helper", () => {
     expect(JSON.parse(out.dataLine.slice(6)).type).toBe("content_block_start");
   });
 
+  it("never promotes a payload to a terminal kind it was not declared as", () => {
+    // `message_stop` is identified by ABSENCE — no delta, no content_block, no
+    // message, no numeric index — so `{"type":"ping"}` satisfies it. Aligning
+    // on it would mint a TERMINAL frame mid-stream: the client ends its message
+    // there and everything after it is lost, which is the failure class this
+    // module exists to prevent. Review ai-01, 30/10.
+    const data = 'data: {"type":"ping"}';
+    const out = reconcileFrame("event: message_delta", data);
+    expect(out.changed).toBe(false);
+    expect(out.eventLine).toBe("event: message_delta");
+    expect(out.dataLine).toBe(data);
+  });
+
+  it("never promotes a payload to message_start either", () => {
+    // Same absence-based weakness, other end of the message: opening a message
+    // the upstream never started is as destructive as ending one.
+    const data = 'data: {"type":"message_delta","message":{}}';
+    const out = reconcileFrame("event: content_block_delta", data);
+    expect(out.changed).toBe(false);
+    expect(out.eventLine).toBe("event: content_block_delta");
+    expect(out.dataLine).toBe(data);
+  });
+
+  it("`usage` is what separates message_delta from content_block_delta", () => {
+    // KEYSTONE (review ai-01, 30/10): the payload predicates are load-bearing
+    // precisely because they are mutually exclusive. Drop `usage` from the
+    // message_delta predicate and this body satisfies BOTH kinds — the witness
+    // goes silent and the pair gets aligned on the (wrong) event name instead
+    // of on the body.
+    const out = reconcileFrame(
+      "event: message_delta",
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}'
+    );
+    expect(out.changed).toBe(true);
+    expect(out.reason).toBe("event-name-mismatch");
+    expect(out.eventLine).toBe("event: content_block_delta");
+  });
+
   it("never drops a frame it cannot interpret", () => {
     const data = 'data: {"foo":1}';
     const out = reconcileFrame("event: something_else", data);
@@ -375,5 +413,20 @@ describe("frame-coherence — the client-visible wire", () => {
       )
     );
     expect(wire).toContain('data: {"type":"message_stop"}');
+  });
+
+  it("relays every frame untouched when CLAUDISH_FRAME_COHERENCE=0", async () => {
+    // The kill switch (review ai-01, 30/10): the repair rewrites client-visible
+    // frames on the hottest path, so it has to be removable without a deploy.
+    const mutated = frame("content_block_delta", { type: "message_delta", index: 0 });
+    const repaired = await run(streamWith(mutated)); // switch absent = repair on
+    process.env.CLAUDISH_FRAME_COHERENCE = "0";
+    try {
+      const relayed = await run(streamWith(mutated));
+      expect(repaired).not.toContain(mutated.trim()); // control: the repair is real
+      expect(relayed).toContain(mutated.trim()); // switch off: byte-for-byte
+    } finally {
+      delete process.env.CLAUDISH_FRAME_COHERENCE;
+    }
   });
 });

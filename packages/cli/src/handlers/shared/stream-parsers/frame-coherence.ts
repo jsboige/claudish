@@ -132,6 +132,19 @@ export function payloadSatisfies(kind: string, p: any): boolean {
   }
 }
 
+/**
+ * Kinds a payload may NEVER be promoted to on its own (review ai-01, 30/10).
+ *
+ * `message_stop` is identifiable by ABSENCE — no `delta`, no `content_block`,
+ * no `message`, no numeric `index` — so `{"type":"ping"}` satisfies it. Minting
+ * a terminal frame mid-stream is worse than the incoherence it repairs: the
+ * client ends its message there and everything after it is lost, which is the
+ * very failure class this module exists to prevent. The same goes for opening
+ * a message the upstream never started. These two kinds are only ever believed
+ * when one of the frame's OWN names already says so.
+ */
+const UNPROMOTABLE_KINDS = new Set(["message_start", "message_stop"]);
+
 /** The kinds a payload can identify (ping carries no body of its own). */
 const PAYLOAD_KINDS = [
   "message_start",
@@ -152,6 +165,24 @@ export function soleKindSatisfiedBy(p: any): string | null {
 }
 
 /**
+ * The frame exactly as it arrived — no repair. Also the kill switch's path
+ * (`CLAUDISH_FRAME_COHERENCE=0`), so both spell "relay untouched" once.
+ */
+export function passthroughFrame(
+  eventLine: string | null,
+  dataLine: string
+): FrameReconciliation {
+  return {
+    eventLine,
+    dataLine,
+    changed: false,
+    reason: null,
+    eventName: eventLine ? parseEventName(eventLine) : null,
+    jsonType: null,
+  };
+}
+
+/**
  * Reconcile one frame's `event:` line with its JSON `type`.
  *
  * Never throws: an unparseable payload is relayed unchanged.
@@ -162,14 +193,7 @@ export function reconcileFrame(
 ): FrameReconciliation {
   const unchanged = (
     reason: FrameReconciliation["reason"] = null
-  ): FrameReconciliation => ({
-    eventLine,
-    dataLine,
-    changed: false,
-    reason,
-    eventName: eventLine ? parseEventName(eventLine) : null,
-    jsonType: null,
-  });
+  ): FrameReconciliation => ({ ...passthroughFrame(eventLine, dataLine), reason });
 
   if (!dataLine.startsWith("data: ")) return unchanged();
 
@@ -239,6 +263,24 @@ export function reconcileFrame(
   // They disagree and both are real Anthropic kinds: the PAYLOAD decides —
   // it is the only witness of what the frame really is.
   const payloadKind = soleKindSatisfiedBy(payload);
+  if (
+    payloadKind &&
+    UNPROMOTABLE_KINDS.has(payloadKind) &&
+    payloadKind !== eventName &&
+    payloadKind !== jsonType
+  ) {
+    // A terminal/open frame identified only by ABSENCE of the other fields:
+    // too weak a witness to end (or start) the client's message. Relayed
+    // unchanged — one lost frame, never a truncated answer.
+    return {
+      eventLine,
+      dataLine,
+      changed: false,
+      reason: null,
+      eventName,
+      jsonType,
+    };
+  }
   if (payloadKind && payloadKind !== eventName && payloadKind !== jsonType) {
     // The body says a THIRD kind: both names are wrong. The payload wins,
     // and the pair is aligned on it — the client's validation then passes
