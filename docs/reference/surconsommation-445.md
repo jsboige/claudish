@@ -76,6 +76,31 @@ diff refutes that**: no block is internally duplicated in the high mode. The hig
 *which output style* the seat runs. A single "trim the harness" lever would have moved the
 2 864 tier and left the Hermes catalogue untouched.
 
+### Fleet weight of each loader
+
+Weighted by the per-machine request volume already measured (ai-01 23 167 · po-2024 13 613 ·
+po-2028 13 298 · po-2023 11 514 · po-2025 11 044 · po-2027 5 865 · web1/web2 2 721), applied to
+the loader mix observed in the 200-turn stratified sample:
+
+| loader | share of fleet requests | mean floor (chars) |
+|---|---:|---:|
+| Interactive base | **57,5 %** | 11 234 |
+| Interactive + Proactive style | **27,2 %** | 13 511 |
+| **Hermes (skills catalogue)** | **7,0 %** | **20 974** |
+| Other / mixed | 4,7 % | 6 118 |
+| Agent profile | 2,6 % | 2 871 |
+| No system block | 1,0 % | 0 |
+
+**The Hermes catalogue is 7 % of the fleet's requests and 24 % of ai-01's** — it is the only
+loader whose excess is worth a dedicated action (the catalogue, not the harness). The
+`(none)` machine bucket (3 316 requests) had no sampled turn and is excluded from the
+weighting; the totals above therefore cover 81 222 of the 84 538 measured requests.
+
+> The exhaustive fleet-wide version of this census (95 648 request files) was **started and
+> stopped**: it read ~190 GB off `D:` at ~48 ms/file and would have competed with the hub's
+> own capture writes. The stratified sample above replaces it, and says so.
+
+
 ---
 
 ## D2-1 — compaction threshold, quantified (the counterfactual)
