@@ -267,15 +267,46 @@ def index_corpus(directory: str):
     return reqs, meta, resps, files
 
 
-def attribute(reqs, meta, resps, directory: str):
-    """-> (by_machine, by_lane, counters).
+def _seat_of(machine: str, readable: bool) -> str:
+    """The seat a capture is attributed to.
+
+    ONE predicate, shared by the paired and the unpaired branch: first an
+    unreadable request file (we know it exists, we cannot read it), then a
+    capture with no `machine` header (an EXTERNAL caller — not this fleet),
+    then the seat the header names. Two branches with two copies of this
+    rule would drift, and a drifted seat rule silently re-attributes a
+    fleet's turns.
+    """
+    if not readable:
+        return UNREADABLE
+    if not machine:
+        return NO_MACHINE
+    return machine
+
+
+def attribute(reqs, meta, resps, directory: str, read_usage: bool = True):
+    """-> (by_machine, by_lane, counters, unpaired_by_machine, unpaired_by_model).
 
     Row layout: [turns, cold_input, cache_creation, cache_read, output].
     Counters reconcile with the corpus: req = paired + usage_missing +
     resp_unreadable + unpaired, resp = claimed + orphan_resp.
+
+    The UNPAIRED population — a request no response capture claims — is
+    attributed per seat AND per model. That is the population an
+    extrapolation to the fleet has to account for BEFORE it extrapolates: a
+    global counter says "1 917 turns are attributed to nobody", a per-seat
+    breakdown says whose they are and which model they asked for. Without
+    it, the per-seat table and the fleet total cannot be reconciled.
+
+    `read_usage=False` runs the pairing on the corpus INDEX only (no
+    response body is opened). The volumes are then NOT measured and the
+    caller must say so: the pairing question is answered by the file names
+    alone, while a full pass reads 47k SSE bodies to extract usage.
     """
     by_machine: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
     by_lane: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
+    unpaired_by_machine: dict[str, int] = defaultdict(int)
+    unpaired_by_model: dict[str, int] = defaultdict(int)
     counters = {
         "req": sum(len(v) for v in reqs.values()),
         "resp": sum(len(v) for v in resps.values()),
@@ -312,14 +343,22 @@ def attribute(reqs, meta, resps, directory: str):
         counters["orphan_resp"] += len(slist) - claimed_here
 
         for ri, rq in enumerate(rlist):
-            machine, _model, readable = meta.get(rq[1], ("", "?", False))
+            machine, model, readable = meta.get(rq[1], ("", "?", False))
             if not readable:
                 counters["unreadable_req"] += 1
             got = claims.get(ri)
             if not got:
                 counters["unpaired"] += 1
+                unpaired_by_machine[_seat_of(machine, readable)] += 1
+                unpaired_by_model[model or "(unknown model)"] += 1
                 continue
             sp = got[-1]  # the serving attempt is the LAST claim
+            if not read_usage:
+                # Index-only mode: the claim EXISTS (the request has a
+                # response), but the volume behind it was not measured. It
+                # counts as paired, and no volume is attributed anywhere.
+                counters["paired"] += 1
+                continue
             u, status = resp_usage(os.path.join(directory, sp[1]))
             if status == "unreadable":
                 # The file could not be READ. Measured 29/10: a concurrent
@@ -338,13 +377,9 @@ def attribute(reqs, meta, resps, directory: str):
             cread = int(u.get("cache_read_input_tokens") or 0)
             outp = int(u.get("output_tokens") or 0)
             counters["paired"] += 1
-            if not readable:
-                seat = UNREADABLE
-            elif not machine:
+            seat = _seat_of(machine, readable)
+            if seat == NO_MACHINE:
                 counters["blank_machine"] += 1
-                seat = NO_MACHINE
-            else:
-                seat = machine
             a = by_machine[seat]
             a[0] += 1
             a[1] += cold
@@ -367,7 +402,7 @@ def attribute(reqs, meta, resps, directory: str):
     for counter, slist in resps.items():
         if counter not in reqs:
             counters["orphan_resp"] += len(slist)
-    return by_machine, by_lane, counters
+    return by_machine, by_lane, counters, unpaired_by_machine, unpaired_by_model
 
 
 def archive_uncompressed_size(extractor: str, archive: str) -> int:
@@ -490,7 +525,9 @@ def _totals(counters) -> dict:
     }
 
 
-def render(by_machine, by_lane, counters, top: int = 12) -> str:
+def render(by_machine, by_lane, counters, top: int = 12,
+           unpaired_by_machine=None, unpaired_by_model=None,
+           read_usage: bool = True) -> str:
     out = []
     tot = _totals(counters)
     denom = tot["uncached"] or 1
@@ -509,35 +546,71 @@ def render(by_machine, by_lane, counters, top: int = 12) -> str:
         f"          unreadable request files {counters['unreadable_req']:,}"
         f" | blank-machine {counters['blank_machine']:,}"
     )
-    out.append(
-        f"volume: cold input_tokens = {counters['total_cold']:,}"
-        f"  cache_creation = {counters['total_cache_creation']:,}"
-        f"  cache_read = {counters['total_cache_read']:,}"
-        f"  output = {counters['total_output']:,}"
-    )
-    out.append(
-        f"        UNCACHED (cold + cache writes) = {tot['uncached']:,}"
-        f"  |  prompt (cold + writes + reads) = {tot['prompt']:,}"
-    )
-    out.append("")
-    out.append(
-        "== by machine (turns / cold / cache_creation / cache_read / output"
-        " / uncached-share) =="
-    )
-    for k in sorted(by_machine, key=lambda k: -(by_machine[k][1] + by_machine[k][2])):
-        a = by_machine[k]
+    if not read_usage:
+        out.append("")
         out.append(
-            f"{k:<24} {a[0]:>8,}  {a[1]:>15,}  {a[2]:>13,}  {a[3]:>15,}"
-            f"  {a[4]:>13,}  {100.0 * (a[1] + a[2]) / denom:5.1f}%"
+            "PAIRS-ONLY: no response body was opened — VOLUMES NOT MEASURED."
+        )
+        out.append(
+            "The pairing above is complete; the token columns are absent by"
+            " construction, not zero."
+        )
+    else:
+        out.append(
+            f"volume: cold input_tokens = {counters['total_cold']:,}"
+            f"  cache_creation = {counters['total_cache_creation']:,}"
+            f"  cache_read = {counters['total_cache_read']:,}"
+            f"  output = {counters['total_output']:,}"
+        )
+        out.append(
+            f"        UNCACHED (cold + cache writes) = {tot['uncached']:,}"
+            f"  |  prompt (cold + writes + reads) = {tot['prompt']:,}"
         )
     out.append("")
-    out.append(f"== by lane/model (top {top} by uncached) ==")
-    for k in sorted(by_lane, key=lambda k: -(by_lane[k][1] + by_lane[k][2]))[:top]:
-        a = by_lane[k]
+    if read_usage:
         out.append(
-            f"{k[0]}/{k[1]:<40} {a[0]:>8,}  {a[1]:>15,}  {a[2]:>13,}"
-            f"  {a[3]:>15,}  {a[4]:>13,}  {100.0 * (a[1] + a[2]) / denom:5.1f}%"
+            "== by machine (turns / cold / cache_creation / cache_read / output"
+            " / uncached-share) =="
         )
+        for k in sorted(by_machine, key=lambda k: -(by_machine[k][1] + by_machine[k][2])):
+            a = by_machine[k]
+            out.append(
+                f"{k:<24} {a[0]:>8,}  {a[1]:>15,}  {a[2]:>13,}  {a[3]:>15,}"
+                f"  {a[4]:>13,}  {100.0 * (a[1] + a[2]) / denom:5.1f}%"
+            )
+        out.append("")
+        out.append(f"== by lane/model (top {top} by uncached) ==")
+        for k in sorted(by_lane, key=lambda k: -(by_lane[k][1] + by_lane[k][2]))[:top]:
+            a = by_lane[k]
+            out.append(
+                f"{k[0]}/{k[1]:<40} {a[0]:>8,}  {a[1]:>15,}  {a[2]:>13,}"
+                f"  {a[3]:>15,}  {a[4]:>13,}  {100.0 * (a[1] + a[2]) / denom:5.1f}%"
+        )
+    # The unattributed population, per seat and per model. An extrapolation
+    # to the fleet must carry it: a per-seat table that silently omits the
+    # turns nobody claimed does not reconcile with the fleet total.
+    ubm = dict(unpaired_by_machine or {})
+    ubo = dict(unpaired_by_model or {})
+    total_unpaired = counters["unpaired"]
+    out.append("")
+    out.append(
+        "== unpaired requests (no response capture claims them) by seat =="
+    )
+    if ubm:
+        for k in sorted(ubm, key=lambda k: -ubm[k]):
+            share = 100.0 * ubm[k] / total_unpaired if total_unpaired else 0.0
+            out.append(f"{k:<24} {ubm[k]:>8,}  {share:5.1f}%")
+    else:
+        out.append("(none)")
+    out.append(f"{'TOTAL':<24} {total_unpaired:>8,}")
+    out.append("")
+    out.append(f"== unpaired requests by requested model (top {top}) ==")
+    if ubo:
+        for k in sorted(ubo, key=lambda k: -ubo[k])[:top]:
+            share = 100.0 * ubo[k] / total_unpaired if total_unpaired else 0.0
+            out.append(f"{k:<40} {ubo[k]:>8,}  {share:5.1f}%")
+    else:
+        out.append("(none)")
     return "\n".join(out)
 
 
@@ -548,6 +621,12 @@ def main(argv=None) -> int:
     ap.add_argument("--workdir", default=DEFAULT_WORKDIR)
     ap.add_argument("--json", help="also write the raw aggregates here")
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument(
+        "--pairs-only",
+        action="store_true",
+        help="pair on the corpus index only (no response body is read): "
+             "the volumes are then NOT measured, and the output says so",
+    )
     ap.add_argument(
         "--force-extract",
         action="store_true",
@@ -595,16 +674,46 @@ def main(argv=None) -> int:
         where = "after extraction" if args.archive else ""
         print(f"no req-* captures {' '.join(filter(None, [where]))} in {directory}", file=sys.stderr)
         return 1
-    by_machine, by_lane, counters = attribute(reqs, meta, resps, directory)
-    print(render(by_machine, by_lane, counters, args.top))
+    read_usage = not args.pairs_only
+    (
+        by_machine,
+        by_lane,
+        counters,
+        unpaired_by_machine,
+        unpaired_by_model,
+    ) = attribute(reqs, meta, resps, directory, read_usage=read_usage)
+    print(
+        render(
+            by_machine,
+            by_lane,
+            counters,
+            args.top,
+            unpaired_by_machine=unpaired_by_machine,
+            unpaired_by_model=unpaired_by_model,
+            read_usage=read_usage,
+        )
+    )
     if args.json:
-        totals = _totals(counters)
         payload = {
+            "mode": "full" if read_usage else "pairs-only",
             "counters": counters,
-            "totals": totals,
-            "by_machine": {k: v for k, v in by_machine.items()},
-            "by_lane": {f"{k[0]}/{k[1]}": v for k, v in by_lane.items()},
+            "unpaired_by_machine": dict(unpaired_by_machine),
+            "unpaired_by_model": dict(unpaired_by_model),
         }
+        if read_usage:
+            payload["totals"] = _totals(counters)
+            payload["by_machine"] = {k: v for k, v in by_machine.items()}
+            payload["by_lane"] = {
+                f"{k[0]}/{k[1]}": v for k, v in by_lane.items()
+            }
+        else:
+            # The keys are OMITTED, not nulled: a consumer that reads
+            # totals["uncached"] must fail loudly rather than read 0 as a
+            # measured volume.
+            payload["note"] = (
+                "pairs-only: response bodies were not read; the volumes are "
+                "NOT measured (no totals / by_machine / by_lane keys)"
+            )
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
     return 0

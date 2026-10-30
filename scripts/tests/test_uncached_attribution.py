@@ -129,9 +129,20 @@ def _resp(
     return name
 
 
-def _run(dirpath):
+def _index(dirpath):
     reqs, meta, resps, _files = ua.index_corpus(dirpath)
-    return ua.attribute(reqs, meta, resps, dirpath)
+    return reqs, meta, resps, dirpath
+
+
+def _run(dirpath):
+    """The three views the historical pins assert on."""
+    bm, bl, counters, _ubm, _ubo = ua.attribute(*_index(dirpath))
+    return bm, bl, counters
+
+
+def _run_full(dirpath):
+    """Everything, including the per-seat breakdown of the unpaired."""
+    return ua.attribute(*_index(dirpath))
 
 
 def _fresh(tmp):
@@ -549,6 +560,90 @@ def main() -> int:
         finally:
             ua.find_extractor = saved_find
             ua.archive_uncompressed_size = saved_size
+
+        # --- pin 15: the UNATTRIBUTED population, per seat ----------------
+        #   A global "N unpaired" counter cannot be extrapolated to the
+        #   fleet: it says whose those turns are NOT. The per-seat
+        #   breakdown is what makes the per-seat table and the fleet total
+        #   reconcilable -- and an external caller (no machine header) is a
+        #   THIRD population, not a seat.
+        _fresh(tmp)
+        _req(tmp, 1, 1, "2026-10-28T10-00-00-000Z", "seat-A", "openai/glm-5.3")
+        _resp(
+            tmp, 1, 1, "2026-10-28T10-00-05-000Z", "openai-glm-5.3", 1000, 4000, 50
+        )
+        # seat-B: a request NO response capture ever claims
+        _req(tmp, 1, 2, "2026-10-28T11-00-00-000Z", "seat-B", "openai/swift-1.5-27b")
+        # an external caller (no machine header), also never answered
+        _req(tmp, 1, 3, "2026-10-28T12-00-00-000Z", "", "openai/deepseek-flash")
+
+        _bm, _bl, counters, ubm, ubo = _run_full(tmp)
+        _check(
+            counters["unpaired"] == 2,
+            f"pin 15a: unpaired = {counters['unpaired']}, want 2",
+        )
+        _check(
+            ubm.get("seat-B") == 1,
+            f"pin 15b: seat-B unpaired = {ubm.get('seat-B')}, want 1",
+        )
+        _check(
+            ubm.get(ua.NO_MACHINE) == 1,
+            f"pin 15c: an external caller lands in {ua.NO_MACHINE}, got {dict(ubm)}",
+        )
+        _check(
+            sum(ubm.values()) == counters["unpaired"],
+            f"pin 15d: the breakdown must sum to the counter: {dict(ubm)}"
+            f" vs {counters['unpaired']}",
+        )
+        _check(
+            "seat-A" not in ubm,
+            f"pin 15e: a PAIRED request must not appear in the unpaired"
+            f" breakdown, got {dict(ubm)}",
+        )
+        _check(
+            ubo.get("openai/swift-1.5-27b") == 1,
+            f"pin 15f: the unpaired turns carry the requested model,"
+            f" got {dict(ubo)}",
+        )
+        _reconciles(counters, "pin 15g")
+        out_full = ua.render(
+            _bm, _bl, counters, 12,
+            unpaired_by_machine=ubm, unpaired_by_model=ubo,
+        )
+        _check(
+            "unpaired requests" in out_full and "seat-B" in out_full,
+            "pin 15h: the render must NAME the unattributed seats",
+        )
+
+        # --- pin 16: PAIRS-ONLY measures the pairing, not the volumes ----
+        #   The pairing is answered by the file names; the volumes need the
+        #   47k response bodies. The index-only mode must publish the
+        #   pairing and say, out loud, that it published no volume.
+        _bm2, _bl2, c2, ubm2, ubo2 = ua.attribute(*_index(tmp), read_usage=False)
+        _check(
+            dict(ubm2) == dict(ubm),
+            f"pin 16a: pairs-only must attribute the same unpaired turns:"
+            f" {dict(ubm2)} vs {dict(ubm)}",
+        )
+        _check(
+            c2["paired"] == counters["paired"],
+            f"pin 16b: pairs-only paired = {c2['paired']},"
+            f" want {counters['paired']}",
+        )
+        _check(
+            c2["total_cold"] == 0,
+            f"pin 16c: pairs-only must not publish a volume,"
+            f" got cold = {c2['total_cold']}",
+        )
+        out_pairs = ua.render(
+            _bm2, _bl2, c2, 12,
+            unpaired_by_machine=ubm2, unpaired_by_model=ubo2,
+            read_usage=False,
+        )
+        _check(
+            "VOLUMES NOT MEASURED" in out_pairs,
+            "pin 16d: the pairs-only output must say the volumes are not measured",
+        )
 
         print("uncached-attribution: all pins green")
         return 0
