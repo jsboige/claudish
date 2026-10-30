@@ -26,6 +26,17 @@ and that would silently manufacture a conclusion:
   6. CROSS-TAB PARTITION -- the per-machine x per-model slice must partition
      the corpus. A sibling lane is handed that slice; a dropped or double
      counted row would land on another lane's dashboard as an attribution.
+  7. ARCHIVE BOUNDARY -- the archive stream is the members back to back, with
+     no separator. A body may embed a JSON object carrying a `ts` key, so the
+     boundary marker is the envelope's opening (timestamp AND the key that
+     follows it); a loose marker would split a stream mid-body.
+  8. INDEX CROSS-CHECK -- the archive index says how many members are in
+     there. A marker whose head count disagrees with it yields a corpus that
+     still LOOKS like a census and is wrong: the only honest outcome is a
+     refusal.
+  9. PARTIAL DAY -- an archive is not necessarily a whole day: 27/10 holds
+     5 136 request captures against 57 849 response captures. The request
+     share is in the output, so a reader sees the coverage before quoting it.
 
 Run standalone (no pytest needed):
   python scripts/tests/test_turn_composition.py
@@ -259,6 +270,82 @@ def pin_machine_cross_tab_partitions_the_corpus():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# --- pin 7: the archive boundary marker splits members, and nothing else ----
+
+def _member_bytes(ts, machine, model="glm-5.3", body_extra=b""):
+    env = ('{"ts":"%s","src":"direct","machine":"%s","model":"%s",'
+           '"entrypoint":"cli","body":{' % (ts, machine, model)).encode()
+    return env + body_extra + b'{"messages":[]}}'
+
+
+def pin_archive_marker_splits_only_on_member_boundaries():
+    """The archive stream is the members back to back, with no separator.
+
+    A body may embed a JSON object carrying a `ts` key -- a tool result
+    quoting a log line. A loose `{"ts":` marker would split the stream there,
+    in the middle of a body, and the head that follows would be read as a
+    capture: the corpus would look complete and be WRONG. The marker is the
+    envelope's opening (timestamp AND the key that follows it), and the
+    member count is cross-checked against the archive index.
+    """
+    stream = (_member_bytes("2026-07-05T12-33-44-123Z", "myia-po-2023")
+              + _member_bytes("2026-07-05T12-34-00-000Z", "myia-po-2027",
+                              body_extra=b'"tool":"{\\"ts\\":\\"whatever\\"}",')
+              + _member_bytes("2026-07-05T12-35-00-000Z", "myia-po-2025"))
+    heads = list(tcomp.iter_heads(io.BytesIO(stream), head=2048))
+    _check(len(heads) == 3, "three members must give three heads: %d" % len(heads))
+    machines = [tcomp.parse_head(h.decode("utf-8", "replace")).get("machine")
+                for h in heads]
+    _check(machines == ["myia-po-2023", "myia-po-2027", "myia-po-2025"],
+           "a body-embedded ts must not split the stream: %r" % machines)
+
+
+# --- pin 8: the marker that does not agree with the index is a refusal ------
+
+def pin_archive_boundary_mismatch_is_refused():
+    """The archive index says how many members are in there. A marker whose
+    head count disagrees with it did NOT split that archive cleanly.
+
+    The corpus it yields would still LOOK like a census -- plausible totals,
+    plausible per-machine slices -- and every one of them would be wrong. The
+    only honest outcome is a refusal that names the mismatch.
+    """
+    strict = [{"machine": "m"} for _ in range(10)]
+    loose = [{"machine": "m"} for _ in range(12)]
+    fields, marker = tcomp.pick_fields(strict, loose, index_n=10)
+    _check(marker == "strict", "the marker that agrees wins: %r" % marker)
+    fields, marker = tcomp.pick_fields(strict, loose, index_n=12)
+    _check(marker == "loose", "the loose marker may hold on another era: %r" % marker)
+    fields, marker = tcomp.pick_fields(strict, loose, index_n=11)
+    _check(marker == "none", "no marker agrees -> refuse: %r" % marker)
+
+
+# --- pin 9: a partial day's archive must be visible in the output ----------
+
+def pin_partial_day_archive_is_flagged():
+    """The archives are not all complete days.
+
+    Measured 30/10: 28/10 holds 49 099 request captures against 47 194
+    response captures (a full day), but 27/10 holds only 5 136 requests
+    against 57 849 responses. A census of the request captures of 27/10 would
+    look complete -- it would print per-machine totals, per-day totals -- and
+    it would cover a FRACTION of that day. The share is in the output, so a
+    reader can see it before quoting a number.
+    """
+    full = tcomp.day_completeness(49099, 47194)
+    _check(full["day_looks_complete"], "a full day must look complete: %r" % full)
+    _check(full["requests_share_of_members"] > 0.5,
+           "share: %r" % full["requests_share_of_members"])
+    part = tcomp.day_completeness(5136, 57849)
+    _check(not part["day_looks_complete"],
+           "a partial day must be flagged: %r" % part)
+    _check(part["requests_share_of_members"] < 0.5,
+           "share: %r" % part["requests_share_of_members"])
+    empty = tcomp.day_completeness(0, 0)
+    _check(empty["requests_share_of_members"] == 0.0,
+           "an empty archive must not divide by zero: %r" % empty)
+
+
 PINS = [
     pin_denominator_is_assistant_turns,
     pin_passenger_vs_own_turn,
@@ -266,6 +353,9 @@ PINS = [
     pin_envelope_survives_a_body_larger_than_the_head,
     pin_nudge_normalisation_clusters,
     pin_machine_cross_tab_partitions_the_corpus,
+    pin_archive_marker_splits_only_on_member_boundaries,
+    pin_archive_boundary_mismatch_is_refused,
+    pin_partial_day_archive_is_flagged,
 ]
 
 

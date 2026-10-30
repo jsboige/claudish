@@ -27,12 +27,25 @@ corpus; each reads the minimum bytes that carry its answer.
             (lever = stop emitting the turn). The two call for opposite fixes,
             so the classification comes before any conclusion.
 
+  archive   THE SAME ENVELOPE ATTRIBUTION, OVER THE DAY ARCHIVES. The live
+            corpus only holds the last ~2 days: the nightly compaction rotates
+            everything older into per-day .7z archives, so a before/after
+            comparison cannot be read from the live directory at all. This
+            sub-command streams the archives' request members and head-reads
+            them WITHOUT extracting them to disk: `7z e -so` writes the
+            members to a pipe, the envelope is the first ~2 KB of each member,
+            and a capture's envelope timestamp is a file boundary marker.
+            The member count is cross-checked against the archive index, so a
+            boundary that did not split cleanly is a LOUD failure, never a
+            silently short corpus.
+
 Usage
 -----
   python scripts/turn-composition.py envelope --dir D:\\claudish-captures --label now
   python scripts/turn-composition.py envelope --dir D:\\claudish-autopsy\\july05 --label july
   python scripts/turn-composition.py history  --dir D:\\claudish-captures --label now --limit 400
   python scripts/turn-composition.py nudge    --dir D:\\claudish-captures --label now --limit 400
+  python scripts/turn-composition.py archive --archives "G:\\...\\captures-2026-07-*.7z" --label july
 
 Reading rules (the traps this tool was built against, all measured 29/10):
 
@@ -55,10 +68,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import fnmatch
+import glob
 import json
 import os
 import re
 import statistics
+import subprocess
 import sys
 
 TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d\d)[-:](\d\d)[-:](\d\d)")
@@ -66,6 +82,23 @@ KEYS_RE = re.compile(
     r'"(ts|src|machine|model|pid|instanceId|device_id8|entrypoint|hops)"\s*:\s*("(?:[^"\\]|\\.)*"|[^,}\]]+)'
 )
 VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# A capture file opens with its envelope, and the envelope's timestamp is the
+# hub's own capture shape: dashes between every time field (2026-10-16T01-03-
+# 36-874Z). The marker is the envelope's OPENING — timestamp AND the key that
+# follows it — not `{"ts":` alone: a body may embed a JSON object carrying a
+# `ts` key, and a loose marker would split the stream in the middle of a body
+# (silently mis-attributing the rest). The loose form is kept as a fallback
+# for an era whose envelope had another key order; the member count is
+# cross-checked against the archive index either way.
+MEMBER_RE = re.compile(rb'\{"ts":"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z","src":"')
+MEMBER_RE_LOOSE = re.compile(rb'\{"ts":"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z"')
+
+SEVENZIP_CANDIDATES = [
+    r"D:\PortableApps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe",
+    r"C:\Program Files\7-Zip\7z.exe",
+    r"C:\Program Files (x86)\7-Zip\7z.exe",
+]
 
 
 # --------------------------------------------------------------------------
@@ -137,12 +170,10 @@ def load_body(path: str):
 # --------------------------------------------------------------------------
 # envelope
 # --------------------------------------------------------------------------
-def head_fields(path: str, head: int = 2048) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            blob = fh.read(head)
-    except OSError:
-        return {}
+def parse_head(blob: str) -> dict:
+    """The envelope keys of a capture head. First occurrence wins: the envelope
+    is serialized BEFORE the body, so the first `"machine"` in a head is the
+    envelope's, not a copy quoted inside a tool result."""
     out = {}
     for m in KEYS_RE.finditer(blob):
         k = m.group(1)
@@ -157,6 +188,234 @@ def head_fields(path: str, head: int = 2048) -> dict:
         else:
             out[k] = v.strip()
     return out
+
+
+def head_fields(path: str, head: int = 2048) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            blob = fh.read(head)
+    except OSError:
+        return {}
+    return parse_head(blob)
+
+
+# --------------------------------------------------------------------------
+# archive (the envelope attribution, over the day archives)
+# --------------------------------------------------------------------------
+def find_sevenzip(explicit: str = "") -> str:
+    """Resolve the 7z binary: an explicit path first, then the pinned
+    candidates. Empty = not found (the caller says so, it does not guess)."""
+    for c in ([explicit] if explicit else []) + SEVENZIP_CANDIDATES:
+        if c and os.path.isfile(c):
+            return c
+    return ""
+
+
+def archive_index(sevenzip: str, archive: str) -> list:
+    """The archive's member names, from the INDEX read (no member data)."""
+    proc = subprocess.run([sevenzip, "l", "-slt", archive],
+                          capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"7z l failed on {archive}: "
+                           f"{proc.stderr.decode('utf-8', 'replace')[:300]}")
+    names = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith("Path = "):
+            names.append(line[len("Path = "):].strip())
+    return names
+
+
+def iter_heads(fh, head: int = 2048, chunk: int = 4 << 20, marker=None):
+    """Yield the HEAD of every capture member in a concatenated stream.
+
+    The stream is what `7z e -so` writes: the members back to back, no
+    separator. A member's head starts at its envelope marker, so the heads are
+    read by scanning for the markers. A member is only yielded once the NEXT
+    marker is seen (its end is known), so a truncated stream cannot look
+    complete; the last member is yielded at EOF.
+    """
+    marker = marker or MEMBER_RE
+    buf = b""
+    while True:
+        data = fh.read(chunk)
+        if not data:
+            break
+        buf += data
+        ms = list(marker.finditer(buf))
+        if not ms:
+            if len(buf) > head + 8192:
+                buf = buf[-(head + 8192):]
+            continue
+        keep = ms[-1].start()
+        for m in ms[:-1]:
+            # The NEXT marker is known, so this member's end is known: its
+            # head is fully buffered, even when the member is shorter than
+            # the head window (a slice shortens itself, it does not pad).
+            yield buf[m.start():m.start() + head]
+        buf = buf[keep:]
+    m = marker.search(buf)
+    if m:
+        yield buf[m.start():m.start() + head]
+
+
+def scan_archive(sevenzip: str, archive: str, pattern: str, head: int, marker):
+    """Stream one archive's members and return their parsed envelope heads."""
+    proc = subprocess.Popen(
+        [sevenzip, "e", "-so", archive, pattern, "-r"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    fields = []
+    try:
+        for raw in iter_heads(proc.stdout, head, marker=marker):
+            fields.append(parse_head(raw.decode("utf-8", "replace")))
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        proc.wait()
+    return fields
+
+
+def pick_fields(strict, loose, index_n):
+    """Choose the marker that held. The archive index is the ground truth for
+    the member count: a marker whose head count disagrees with it did NOT
+    split this archive cleanly, and the corpus it yields is not trustworthy.
+
+    Returns (fields, marker_used) with marker_used in strict|loose|none.
+    """
+    if len(strict) == index_n:
+        return strict, "strict"
+    if len(loose) == index_n:
+        return loose, "loose"
+    return (loose if len(loose) > len(strict) else strict), "none"
+
+
+def day_completeness(n_req: int, n_resp: int) -> dict:
+    """How much of a day does this archive's REQUEST census cover?
+
+    A full day's archive holds one request capture and one response capture
+    per request, so the two counts are of the same order (measured 30/10:
+    49 099 req / 47 194 resp for 28/10, 83 075 / 77 826 for 29/10). An
+    archive whose requests are a small minority is a PARTIAL day — its
+    request census looks complete and covers a fraction of the day (27/10:
+    5 136 req against 57 849 resp).
+    """
+    total = n_req + n_resp
+    share = n_req / float(total) if total else 0.0
+    return {
+        "index_req": n_req,
+        "index_resp": n_resp,
+        "requests_share_of_members": round(share, 4),
+        "day_looks_complete": share >= 0.5,
+    }
+
+
+def cmd_archive(args):
+    sevenzip = find_sevenzip(args.sevenzip)
+    if not sevenzip:
+        raise SystemExit("NO_7Z: no 7z binary found — pass --sevenzip")
+
+    archives = []
+    for pattern in args.archives:
+        archives.extend(sorted(glob.glob(pattern)))
+    if not archives:
+        raise SystemExit("NO_ARCHIVE: the --archives glob matched nothing")
+
+    c_entry, c_machine, c_model = (collections.Counter() for _ in range(3))
+    per_day = collections.Counter()
+    c_machine_model, c_machine_day = collections.Counter(), collections.Counter()
+    unreadable = 0
+    total = 0
+    per_archive = []
+
+    for archive in archives:
+        pattern = args.pattern
+        rx = re.compile(fnmatch.translate(pattern))
+        all_names = archive_index(sevenzip, archive)
+        index_members = [n for n in all_names if rx.match(os.path.basename(n))]
+        # A FULL day's archive holds one request capture and one response
+        # capture per request: the two counts must be of the same order
+        # (measured 30/10: 49 099 req / 47 194 resp for 28/10, 83 075 /
+        # 77 826 for 29/10). An archive whose requests are a small minority
+        # is a PARTIAL day (27/10: 5 136 req against 57 849 resp) -- its
+        # request census would look complete and cover a fraction of the day.
+        n_req = sum(1 for n in all_names if os.path.basename(n).startswith("req-"))
+        n_resp = sum(1 for n in all_names if os.path.basename(n).startswith("resp-"))
+        completeness = day_completeness(n_req, n_resp)
+        # The index is the ground truth for "how many members are in there".
+        # If the stream split into a different number of heads, the boundary
+        # marker did NOT hold on this archive: the corpus is then UNUSABLE,
+        # and the counts would be a silent lie. A second, looser marker is
+        # tried before giving up (an era whose envelope had another key
+        # order), and the marker that held is reported.
+        fields = scan_archive(sevenzip, archive, pattern, args.head, MEMBER_RE)
+        if len(fields) != len(index_members):
+            loose = scan_archive(sevenzip, archive, pattern, args.head, MEMBER_RE_LOOSE)
+            fields, marker_used = pick_fields(fields, loose, len(index_members))
+        else:
+            marker_used = "strict"
+        for f in fields:
+            if not f:
+                unreadable += 1
+                continue
+            ts = f.get("ts") or ""
+            m = TS_RE.search(ts)
+            day = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else "?"
+            if args.frm and day < args.frm:
+                continue
+            if args.to and day > args.to:
+                continue
+            total += 1
+            ep = f.get("entrypoint") or "(none)"
+            mach = f.get("machine") or "(none)"
+            mod = f.get("model") or "(none)"
+            c_entry[ep] += 1
+            c_machine[mach] += 1
+            c_model[mod] += 1
+            per_day[day] += 1
+            c_machine_model[(mach, mod)] += 1
+            c_machine_day[(mach, day)] += 1
+        per_archive.append({
+            "archive": archive,
+            "index_members": len(index_members),
+            "stream_members": len(fields),
+            "marker": marker_used,
+            "boundary_ok": len(index_members) == len(fields),
+            "index_total": len(all_names),
+            **completeness,
+        })
+
+    mm = collections.defaultdict(list)
+    for (mach, mod), v in sorted(c_machine_model.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1])):
+        mm[mach].append({"model": mod, "n": v})
+    md = collections.defaultdict(list)
+    for (mach, day), v in sorted(c_machine_day.items()):
+        md[mach].append({"day": day, "n": v})
+
+    out = {
+        "label": args.label,
+        "archives": [a for a in archives],
+        "requests_total": total,
+        "files_unreadable": unreadable,
+        "entrypoint": dict(c_entry.most_common()),
+        "machine": dict(c_machine.most_common()),
+        "model": dict(c_model.most_common(15)),
+        "per_day": {k: per_day[k] for k in sorted(per_day)},
+        "machine_model": {k: v[: getattr(args, "top", 8)] for k, v in sorted(mm.items())},
+        "machine_per_day": {k: v for k, v in sorted(md.items())},
+        "per_archive": per_archive,
+        "boundary_all_ok": all(a["boundary_ok"] for a in per_archive),
+        "days_look_complete": all(a["day_looks_complete"] for a in per_archive),
+    }
+    emit(out, args.out)
+    if not out["boundary_all_ok"]:
+        raise SystemExit("BOUNDARY_MISMATCH: a member count disagrees with the "
+                         "archive index — the corpus is NOT trustworthy")
+    if not out["days_look_complete"]:
+        print("PARTIAL_DAY: an archive holds far fewer request captures than "
+              "response captures — its request census covers a FRACTION of "
+              "that day. Read per_archive[].requests_share_of_members before "
+              "quoting a number.", file=sys.stderr)
 
 
 def cmd_envelope(args):
@@ -467,6 +726,21 @@ def main():
     r.add_argument("--container", default="")
     r.add_argument("--out")
     r.set_defaults(func=cmd_routability)
+
+    a = sub.add_parser("archive", help="the envelope attribution, over the day .7z archives")
+    a.add_argument("--archives", nargs="+", required=True,
+                   help="one or more .7z paths or globs")
+    a.add_argument("--label", required=True)
+    a.add_argument("--sevenzip", default="")
+    a.add_argument("--from", dest="frm", default="", help="first day, YYYY-MM-DD")
+    a.add_argument("--to", dest="to", default="", help="last day, YYYY-MM-DD")
+    a.add_argument("--head", type=int, default=2048)
+    a.add_argument("--pattern", default="req-*.json",
+                   help="member pattern, used for BOTH the stream and the index "
+                        "cross-check (a scoped run stays self-consistent)")
+    a.add_argument("--top", type=int, default=8)
+    a.add_argument("--out")
+    a.set_defaults(func=cmd_archive)
 
     args = ap.parse_args()
     args.func(args)
