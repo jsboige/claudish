@@ -466,11 +466,14 @@ Describe 'armed-cascade guard counts CASCADES, not knobs (#141 x #304)' {
 
     It 'a cascade line in the env file keeps the guard open (no false refuse)' {
         Reset-DrainFixture
-        # Mirror of the refuse above: same armed container, but the file now
-        # carries the cascade itself — nothing to lose, no refuse. With clean
-        # fixtures the run then proceeds all the way to OUTCOME success.
+        # Mirror of the refuse above: same armed container, and the file
+        # carries the SAME cascade — nothing to lose, no refuse. (#716: the
+        # guard now compares values too, so the fixture's value must match the
+        # container's; a differing value is a rewrite and IS refused — see the
+        # same-cardinality Describe below.) With clean fixtures the run then
+        # proceeds all the way to OUTCOME success.
         [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
-        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", (New-Object System.Text.ASCIIEncoding))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=example@model`n", (New-Object System.Text.ASCIIEncoding))
 
         $r = Invoke-ClaudishDrainedRestart -Reason 'cascade-present' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
         $r | Should -BeTrue
@@ -500,6 +503,98 @@ Describe 'armed-cascade guard counts CASCADES, not knobs (#141 x #304)' {
         $oldBroad = [regex]::Escape('^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+')
         $drainText | Should -Not -Match $oldBroad
         $installText | Should -Not -Match $oldBroad
+    }
+}
+
+Describe 'armed-cascade guard compares SETS, not cardinalities (#716)' {
+    # A fixture pair with the SAME count and a DIFFERENT cascade is the shape
+    # an operator hits while editing one cascade line. The pre-#716 guard
+    # compared counts (file=1 container=1) and waved it through: the recreate
+    # shipped a cascade nobody intended, and the log line read like a pass.
+    BeforeEach {
+        Reset-DrainFixture
+        $script:SavedEnv = [System.IO.File]::ReadAllText($script:EnvFile)
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), 'claudish-proxy running', (New-Object System.Text.ASCIIEncoding))
+    }
+    AfterEach {
+        [System.IO.File]::WriteAllText($script:EnvFile, $script:SavedEnv, (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    It 'REFUSES a same-cardinality SWAP (file rewrites the value the container carries)' {
+        [System.IO.File]::WriteAllText($script:EnvFile, "CLAUDISH_FAILOVER_SONNET=other@model`n", (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'swap' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeFalse
+        $log = Get-DrainLogText
+        $log | Should -Match 'RECREATE REFUSED'
+        $log | Should -Match 'rewrites CLAUDISH_FAILOVER_SONNET'
+        $log | Should -Match 'same-cardinality swap'
+        $log | Should -Match 'OUTCOME refused'
+        (Get-CallsText) | Should -Not -Match '(?m)^compose'
+    }
+
+    It 'REFUSES a REMOVAL masked by an addition (container 2, file 2, one name lost)' {
+        [System.IO.File]::WriteAllText($script:EnvFile, "CLAUDISH_FAILOVER_SONNET=gc@glm-5.3`nCLAUDISH_FAILOVER_HAIKU=vllm@swift`n", (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`nCLAUDISH_FAILOVER_OPUS=cx@sol`n", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'masked-removal' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeFalse
+        $log = Get-DrainLogText
+        $log | Should -Match 'removes CLAUDISH_FAILOVER_OPUS'
+        # The added name is not the reason to refuse — it is reported separately.
+        $log | Should -Not -Match 'rewrites'
+        (Get-CallsText) | Should -Not -Match '(?m)^compose'
+    }
+
+    It '-AllowCascadeChange lets the deliberate edit through and logs names ONLY (never a value)' {
+        [System.IO.File]::WriteAllText($script:EnvFile, "CLAUDISH_FAILOVER_SONNET=other@model`n", (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'deliberate' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile -AllowCascadeChange
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match 'AllowCascadeChange'
+        $log | Should -Match 'rewrites CLAUDISH_FAILOVER_SONNET'
+        $log | Should -Match 'OUTCOME success'
+        # #716 ⚠ VALUES MUST NEVER BE LOGGED: CLAUDISH_FAILOVER_* carries model
+        # ids today, but the same files hold CLAUDISH_PROXY_KEY. Neither side's
+        # value may appear anywhere in the drain log.
+        $log | Should -Not -Match ([regex]::Escape('gc@glm-5.3'))
+        $log | Should -Not -Match ([regex]::Escape('other@model'))
+    }
+
+    It 'a pure ADDITION passes without the switch (widening a cascade is not a gutting)' {
+        [System.IO.File]::WriteAllText($script:EnvFile, "CLAUDISH_FAILOVER_SONNET=gc@glm-5.3`nCLAUDISH_FAILOVER_HAIKU=vllm@swift`n", (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'widen' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match 'ADDS CLAUDISH_FAILOVER_HAIKU'
+        $log | Should -Not -Match 'RECREATE REFUSED'
+        $log | Should -Match 'OUTCOME success'
+    }
+
+    It 'a leading BOM on line 1 does not hide the first cascade from the guard (#762 shape)' {
+        # U+FEFF is not whitespace to .NET's Trim(); an unhandled BOM made the
+        # FIRST armed line invisible to the count — the exact fail-open #141
+        # exists to prevent (file reads "0 armed", container has 1 -> refuse a
+        # legitimate deploy, or worse on the other side of the comparison).
+        [System.IO.File]::WriteAllText($script:EnvFile, ([char]0xFEFF + "CLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n"), (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'inspect_out.txt'), "PATH=/usr/bin`nCLAUDISH_FAILOVER_SONNET=gc@glm-5.3`n", (New-Object System.Text.ASCIIEncoding))
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'bom' -Url 'http://127.0.0.1:1' -Recreate -EnvFile $script:EnvFile
+        $r | Should -BeTrue
+        (Get-DrainLogText) | Should -Not -Match 'carries no armed'
+        (Get-DrainLogText) | Should -Match 'OUTCOME success'
+    }
+
+    It 'drift pin: the parse helper and the count share ONE role-only literal' {
+        $rolePattern = [regex]::Escape('^CLAUDISH_FAILOVER_(OPUS|SONNET|HAIKU|FABLE)=.+')
+        $drainText = [System.IO.File]::ReadAllText($script:DrainScript)
+        (@([regex]::Matches($drainText, $rolePattern)).Count) | Should -Be 1
+        $drainText | Should -Match 'Get-ArmedCascadeMap'
     }
 }
 

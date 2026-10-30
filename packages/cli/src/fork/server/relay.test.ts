@@ -1964,3 +1964,124 @@ describe("#279b — hop-list self-detection", () => {
     expect(h["x-claudish-hops"]).toBe(getInstanceId());
   });
 });
+
+// ── #763 — a relayed non-OK response leaves ONE bounded local line ───
+//
+// The blind spot: a relayed 4xx writes no `[ttft]` (no useful event), no
+// `[Request]` (logRequest never runs on the relay branch) and no capture (a
+// nominal relay captures centrally, by design). The emitting seat therefore
+// could not answer "did it pass through me?" from its own logs.
+describe("forwardToUpstream — upstream-nonok marker (#763)", () => {
+  const ERROR_BODY = JSON.stringify({
+    type: "error",
+    error: { type: "invalid_request_error", message: "prompt is too long: 200001 > 200000 tokens" },
+  });
+
+  /** Capture everything logStderr writes for the duration of `fn`. */
+  async function captureStderr(fn: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as any).write = (chunk: any) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      await fn();
+    } finally {
+      (process.stderr as any).write = realWrite;
+    }
+    return lines;
+  }
+
+  const markers = (lines: string[]): string[] =>
+    lines.flatMap((l) => l.split("\n")).filter((l) => l.includes("upstream-nonok"));
+
+  it("a 400 on /v1/chat/completions writes exactly one line: status, route, request bytes", async () => {
+    fetchImpl = async () =>
+      new Response(ERROR_BODY, {
+        status: 400,
+        headers: { "content-type": "application/json", "content-length": String(ERROR_BODY.length) },
+      });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const c = mockForwardContext({});
+    c.req.path = "/v1/chat/completions";
+    const body = { model: "m", messages: [{ role: "user", content: "x".repeat(500) }] };
+
+    const out: { res: Response | null } = { res: null };
+    const lines = await captureStderr(async () => {
+      out.res = await forwardToUpstream(c, body, state);
+    });
+
+    expect(out.res!.status).toBe(400); // passed through, unchanged
+    const m = markers(lines);
+    expect(m.length).toBe(1);
+    expect(m[0]).toContain("status=400");
+    expect(m[0]).toContain("route=/v1/chat/completions");
+    expect(m[0]).toContain(`bytes_in=${Buffer.byteLength(JSON.stringify(body), "utf-8")}`);
+    expect(m[0]).toContain(`bytes_out=${ERROR_BODY.length}`);
+    expect(state.consecutiveFail).toBe(0); // a 4xx is not a liveness verdict
+    expect(state.alive).toBe(true);
+  });
+
+  it("the marker carries NO body and no header value — only the three facts", async () => {
+    fetchImpl = async () =>
+      new Response(ERROR_BODY, { status: 400, headers: { "content-type": "application/json" } });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const c = mockForwardContext({ authorization: "Bearer sk-ant-super-secret" });
+
+    const lines = await captureStderr(async () => {
+      await forwardToUpstream(c, { model: "m", api_key: "sk-ant-super-secret" }, state);
+    });
+
+    const joined = markers(lines).join(" ");
+    expect(joined).not.toContain("super-secret");
+    expect(joined).not.toContain("prompt is too long");
+    expect(joined).not.toContain("invalid_request_error");
+  });
+
+  it("bytes_in is the UNCOMPRESSED request size on a compressing relay", async () => {
+    fetchImpl = async () =>
+      new Response(ERROR_BODY, { status: 400, headers: { "content-type": "application/json" } });
+    const state = createRelayState({ upstream: "http://hub:3000", compress: true });
+    const body = { model: "m", messages: [{ role: "user", content: "y".repeat(4000) }] };
+    const plain = Buffer.byteLength(JSON.stringify(body), "utf-8");
+
+    const lines = await captureStderr(async () => {
+      await forwardToUpstream(mockForwardContext({}), body, state);
+    });
+
+    // The wire carried gzip… (the relay really compressed)
+    expect((lastFetch!.init.headers as Record<string, string>)["content-encoding"]).toBe("gzip");
+    expect(Buffer.isBuffer(lastFetch!.init.body)).toBe(true);
+    expect((lastFetch!.init.body as Buffer).length).toBeLessThan(plain);
+    // …but the pin is about the NUMBER, which stays comparable across seats.
+    expect(markers(lines)[0]).toContain(`bytes_in=${plain}`);
+  });
+
+  it("a normal 200 stream writes NO upstream-nonok line", async () => {
+    fetchImpl = async () => sseResponse('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const lines = await captureStderr(async () => {
+      const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+      await r!.text(); // drain, as the client would
+    });
+
+    expect(markers(lines).length).toBe(0);
+  });
+
+  it("a 529 keeps its own single line (no duplicate marker — one event, one line)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ type: "error", error: { type: "overloaded_error" } }), {
+        status: 529,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const lines = await captureStderr(async () => {
+      await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    });
+
+    expect(markers(lines).length).toBe(0);
+  });
+});
