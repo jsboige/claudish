@@ -124,8 +124,13 @@ for day, n in db.execute("select day, sum(n) from responses where model='deepsee
     print(day, n, f"peak={pk:.0%}")
 PY
 
-# attribution by machine+workspace (pair resp ↔ req by sequence number)
-python .tmp/payg-attribution.py deepseek-flash 600   # this repo, scratch
+# attribution by machine+workspace — no scratch script needed, the recipe is:
+#   pair resp-1-rNNNN-* <-> req-1-NNNN-* by sequence number (0 = unpaired)
+#   machine  = capture envelope field
+#   workspace = LAST "Primary working directory:" match inside the req body messages
+#               (raw text search of the body is worthless — 2026-09-08 measurement)
+#   usage legs = last "usage" object in the resp tail (the 4 kB head only carries
+#               output_tokens:1 — never read legs from a head slice)
 
 # prices: https://api-docs.deepseek.com/quick_start/pricing (read 2026-10-30)
 ```

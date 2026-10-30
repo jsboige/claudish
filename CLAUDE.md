@@ -23,7 +23,6 @@ Planned-but-unimplemented work — the SEP-1686 channel migration, optional `not
 | Sidecar deployment runbook | `docs/deployment/relay-sidecar-deployment.md` |
 | Model routing narratives (native pin #218, foreign-credential guard #296, MiniMax forced-thinking chain, input counters #179) | `docs/reference/model-routing.md` |
 | Never-hang narratives (drain design and measurements, 1017-response corpus, instrument-filter calibration) | `docs/reference/never-hang.md` |
-| PAYG budget July→Oct (DeepSeek price anchor, €/response ≈ 0.0015, falaise-day mechanism, claudish <1.3 % of burn, ranked measures) | `docs/reference/payg-budget-2026-10.md` |
 | `test:strict` full mechanics (#175 — entry keys, module-load deaths, bun double-count, classes 2/2b) | `docs/reference/test-strict.md` |
 
 ## Fleet-Rollout Verification (hard rule, mandate 2026-09-12)
