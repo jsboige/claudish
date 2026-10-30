@@ -123,6 +123,21 @@ capped at `steps.length + 1` attempts.
   `nonQuota` — which **forfeits the dwell of any session pinned there** (#276, see below)
   instead of re-pinning the session at the successor.
 
+**The marker carries the body's structured identity (#739b).** `STEP-ADVANCE` reads
+`HTTP 400 (non-quota) from step N; body=<class>; trying next step`, where `<class>` is
+`stepFailBodyClass(errBody)` (`failover.ts`): up to two structured tokens from the upstream
+error body — `error.code`, `error.type`, top-level `code`, code before type — matched against
+`[A-Za-z0-9._-]{1,64}` and dropped whole on any mismatch. **Free text never reaches the marker**
+(prose messages, hostile tokens): the docker log is readable by anyone with hub access, and a
+marker that echoed provider prose would put arbitrary upstream bytes on it. Why this exists
+(measured 29/10): two 400s from the same provider, one classified and one not 37 s apart, were
+indistinguishable after the fact — the unrecognized one left **no line in any instrument**
+(the failover journal keeps only `[Failover]` markers and an error response writes no capture),
+so "find the text difference" had no substrate. The class rides `why`, so the backoff record
+(`markStepFailed`) carries it too. Top-level `type` is deliberately not a candidate:
+Anthropic's envelope sets it to the literal `"error"` on every failure. Pins incl. the
+never-echo-prose guard: `failover.test.ts` (`stepFailBodyClass` describe).
+
 **Per-session dwell, in brief.** With a session key (`metadata.user_id`), `resolveFailoverTargetForSession`
 pins a conversation to its resolved step for `CLAUDISH_FAILOVER_SESSION_DWELL_MS` (default 10 min,
 sliding — renewed by activity, never pins the nominal): the pin HOLDS while the step is servable, even
