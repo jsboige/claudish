@@ -23,6 +23,9 @@ and that would silently manufacture a conclusion:
   5. NUDGE NORMALISATION -- dates, long hex ids and numbers are normalised, so
      two turns of the same nudge cluster together instead of forming one cluster
      per turn.
+  6. CROSS-TAB PARTITION -- the per-machine x per-model slice must partition
+     the corpus. A sibling lane is handed that slice; a dropped or double
+     counted row would land on another lane's dashboard as an attribution.
 
 Run standalone (no pytest needed):
   python scripts/tests/test_turn_composition.py
@@ -206,12 +209,63 @@ def pin_nudge_normalisation_clusters():
     _check(c == e, "long hex ids must normalise: %r vs %r" % (c, e))
 
 
+# --- pin 6: the per-machine cross-tab partitions the corpus -----------------
+
+def pin_machine_cross_tab_partitions_the_corpus():
+    """A sibling lane is handed ITS OWN slice; the slice must be a partition.
+
+    If the cross-tab dropped a row or counted a request under two machines, the
+    per-machine numbers would still LOOK plausible -- they would just be wrong,
+    and the error would land on another lane's dashboard as an attribution.
+    """
+    d = tempfile.mkdtemp()
+    try:
+        _write_capture(d, "req-1-0001-2026-10-29T10-00-00-000Z.json",
+                       "2026-10-29T10:00:00.000Z", "myia-po-2027", "cli", "glm-5.3",
+                       [{"role": "user", "content": "go"}])
+        _write_capture(d, "req-1-0002-2026-10-29T10-01-00-000Z.json",
+                       "2026-10-29T10:01:00.000Z", "myia-po-2027", "cli", "glm-5.3",
+                       [{"role": "user", "content": "go"}])
+        _write_capture(d, "req-1-0003-2026-10-29T10-02-00-000Z.json",
+                       "2026-10-29T10:02:00.000Z", "myia-po-2027", "cron", "glm-5.3",
+                       [{"role": "user", "content": "go"}])
+        _write_capture(d, "req-1-0004-2026-10-30T10-00-00-000Z.json",
+                       "2026-10-30T10:00:00.000Z", "myia-po-2025", "cron", "mmc@M3.1",
+                       [{"role": "user", "content": "go"}])
+        out = os.path.join(d, "o.json")
+        _quiet(tcomp.cmd_envelope,
+               SimpleNamespace(dir=d, label="t", head=2048, top=8, out=out))
+        r = json.load(open(out, encoding="utf-8"))
+        mm = r["machine_model"]
+        _check(r["requests_total"] == 4, "total: %r" % r["requests_total"])
+        # every request is attributed to exactly one (machine, model) cell
+        total_cells = sum(c["n"] for cells in mm.values() for c in cells)
+        _check(total_cells == r["requests_total"],
+               "cross-tab must partition the corpus: %d cells vs %d"
+               % (total_cells, r["requests_total"]))
+        # and each machine's slice sums to its own total
+        for mach, cells in mm.items():
+            s = sum(c["n"] for c in cells)
+            _check(s == r["machine"][mach],
+                   "slice of %s sums to %d, machine total is %d"
+                   % (mach, s, r["machine"][mach]))
+        _check(mm["myia-po-2027"][0]["model"] == "glm-5.3", "model: %r" % mm["myia-po-2027"])
+        _check(mm["myia-po-2027"][0]["n"] == 3, "count: %r" % mm["myia-po-2027"])
+        # the day split is per machine too
+        days = {x["day"]: x["n"] for x in r["machine_per_day"]["myia-po-2027"]}
+        _check(days.get("2026-10-29") == 3 and days.get("2026-10-30") is None,
+               "days: %r" % days)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 PINS = [
     pin_denominator_is_assistant_turns,
     pin_passenger_vs_own_turn,
     pin_apikeys_map_counts_as_present,
     pin_envelope_survives_a_body_larger_than_the_head,
     pin_nudge_normalisation_clusters,
+    pin_machine_cross_tab_partitions_the_corpus,
 ]
 
 
