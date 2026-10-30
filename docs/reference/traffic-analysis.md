@@ -24,6 +24,7 @@
 | `traffic-anthropic.ps1` | **Answers "where does the Anthropic traffic come from?"** — attributes every Anthropic-native (opus/fable) request by **machine + workspace** (workspace = proof, from the system prompt; not stdout). Per-request verdict: `[OK]` ai-01 · `[REVIEW]` po-2025 · `[INFO]` fable during a `-FableOverrideActive` window · `[LEAK-SUBAGENT]` rogue Opus sub-agent (`cc_is_subagent=true`, **exit 1**) · `[REVIEW-INTERACTIVE]` user-driven non-ai-01 session (exit 0). sonnet-4-6 shown separately (remapped to glm → not Anthropic). | `.\scripts\traffic-anthropic.ps1 [-Hours N] [-FableOverrideActive]` |
 | `traffic-history.ps1` | Historical analysis from 7z archives | `.\scripts\traffic-history.ps1 [-Date yyyy-MM-dd] [-Days N]` |
 | `live-session-scan.py` | **Per-session live attribution (#362)** — aggregates in-window `req-*.json` by session (user_id + session_id) with two flag classes: `OPENAI-SHAPED` (`gpt-\|codex\|-sol\|o3-\|o4-`, LEAK-grade — the OpenAI plan is last-chance, non-renewable credit) and `RETIRED-ID` (`claude-sonnet-4-6\|glm-5.2\|qwen3.6-35b-a3b`, INFO-grade — ids removed from the catalogs but still named by drifted client configs). Two-speed read: 6 KiB head + 16 KiB tail by default, `--deep` for the full JSON parse. | `python .\scripts\live-session-scan.py [--hours N] [--top N] [--models regex] [--deep] [--json]` |
+| `turn-composition.py` | **Of what is the turn surplus made (#328)** — five sub-commands: `envelope` (whole-corpus lane attribution by head-read, ~2 KB/file), `history` (bytes re-paid per turn + the per-turn system tax), `nudge` (which trailing system block rides the turn, and whether it is a passenger or a turn of its own), `routability` (which declared rungs can authenticate on this seat, `apiKeys` map first — a container-env-only probe lies), `archive` (the same lane attribution **over the day `.7z` archives**, streamed, never extracted to disk). | `python .\scripts\turn-composition.py {envelope\|history\|nudge\|routability\|archive} …` — see §Turn composition |
 | `compress-captures.ps1` | Nightly 7z compaction + GDrive backup + 30d local purge (scheduled task) | Runs automatically at 04:17 |
 | `claudish-watchdog.ps1` | Proxy health: tool-call stream test + proactive restart (uptime >11h) + auto-recovery on hang. Scheduled every 15min. | Runs automatically |
 | `CaptureUtils.psm1` | Shared module (capture parsing, device mapping, 7z extraction) | Imported by the scripts above |
@@ -135,6 +136,100 @@ pairing: july 33 paired / 16 unpaired · now 50/0 — attempt-chained turns (**c
 What stands: the **lane count, 3 → 14** (July: `glm-5.2` 21, `MiniMax-M3` 10, `opus-4-8` 2; 30/09: `glm-5.3` 19, `MiniMax-M3` 15, `opus-5-5` 5, plus 9 single-turn lanes), and the **attempt-chain contrast** (8/49 vs 0/50) — July's cascade churned upstream attempts on a sixth of its turns, the now-era none. Treat both as hypotheses a larger sample must confirm, not as findings.
 
 **Not done, and deliberately**: no mass reading. The grid is arbitrated but not yet validated against a second reader — ai-01's protocol calls for ~20 turns read twice, independently, with agreement/uncertainty published. The pilot's job was to calibrate the grid and to size the next sample; it does that and stops.
+
+### Turn composition — of what is the surplus made (measured 29/10)
+
+`scripts/turn-composition.py` answers the question the counts cannot: **of what are the extra turns made**. Four sub-commands, each reading the minimum bytes that carry its answer (`envelope` head-reads the whole corpus, ~2 KB/file; `history` and `nudge` take a deterministic stride; `routability` compares declared rungs against the credentials that actually exist).
+
+```powershell
+python .\scripts\turn-composition.py envelope --dir D:\claudish-captures --label now
+python .\scripts\turn-composition.py history  --dir D:\claudish-captures --label now --limit 400
+python .\scripts\turn-composition.py nudge    --dir D:\claudish-captures --label now --limit 400
+python .\scripts\turn-composition.py routability --config <config home>\config.json --container claudish-proxy
+```
+
+**The bill decomposes as `requests × bytes-per-request`, and the first term owns it.** Same instrument (hub captures), 05/07 = 10 595 requests in one day, 29/10 = 77 023 (**×7.3**). Mean bytes per request 525.5 k → 642.8 k chars (**×1.22**) — the harness floor is not the lever, exactly as the ×3.41/×1.08 decomposition said.
+
+**The per-turn system tax doubled, and it is a PASSENGER.** Inline `role:"system"` blocks per *assistant turn* (the honest denominator — a request is not a turn):
+
+| | 05/07 | 29/10 |
+| --- | --- | --- |
+| system blocks per assistant turn | **0.20 – 0.33** | **0.83 – 0.96** |
+| `n_system_inline` p50 / p90 / max | 7 / 20 / 47 | 39 / 162 / **872** |
+| inline-system bytes p50 | 39.9 k | 73.6 k |
+| chars per system block p50 | **4 270** | **1 419** |
+
+The ratio is flat across every history bucket (0.83–0.96 from <10 turns to 120+), so the tax is **per turn and it compounds with history length** — but the block shrank 3×, which is why the byte growth (+84 % on a line item) is a *passenger* on turns that had to happen anyway, not a turn generator.
+
+**`last_role == "system"` does NOT mean "harness-driven turn" — the pilot table above must be read with this.** Since Claude Code v2.1.153+ the client appends an output-style reminder as an inline system message after the tool_result. Measured 29/10 on n=400: **83.1 %** of requests end with a system block, of which **87.7 %** are that reminder (short Proactive form 50.6 %, long form 32.5 %, Concise 4.6 %), and the message before it is `user + tool_result` in **324/332** cases. `prev=assistant` with no `tool_use` (the shape that would make it a turn of its own) appears **zero** times; repeated conversation-state requests 6/400 across 5 sessions — no retry storm. The reminder is ~109 chars on a ~640 k-char request: *shrink the text* is a hygiene fix, never the lever, and the 40 % vs 12 % "system role" line in the pilot measures client behaviour, not agent behaviour.
+
+**The productivity denominator, same windows** (merged PRs, `gh pr list --limit 2000`, 01–12/07 vs 22–29/10):
+
+| repo | july/day | oct/day |
+| --- | --- | --- |
+| CoursIA | 83.3 | 104.8 |
+| roo-extensions | 7.0 | 11.9 |
+| claudish | 0.08 | **16.4** |
+| vllm | 0 | 15.1 |
+| **fleet** | **90.4** | **148.1** |
+
+Output went **up** (×1.6/day); what degraded is **efficiency per merge**: ~117 requests per merged PR in July vs ~520 now (**×4.4**). The surplus is therefore not "wasted turns" — it is more expensive turns to reach more output, and the ×4.4 is the number to attack.
+
+**Still open, and named**: this decomposes the *cost* of the surplus, not its *nature*. The G12 nature grid (production · verification · coordination · navigation · context-repair · duplicate-restart · waiting-poll) remains unread at mass — it needs a reader, not a counter — and per-lane attribution comes from `envelope` (machine / entrypoint / model), which is the form in which a sibling lane can be handed its own slice.
+
+**Per-lane attribution exists (`machine_model` / `machine_per_day` cross-tabs, 30/10) — and the first run measured the trap: the LIVE corpus is not the HISTORY.** `envelope` now emits `machine` (totals), `machine_model` (top models per machine) and `machine_per_day` (per machine × day), so a sibling lane's slice is one command. Run 30/10 ~03:43Z over the live dir:
+
+| machine | requests | top requested ids |
+| --- | --- | --- |
+| myia-ai-01 | 23 167 | claude-haiku-5-5 8 388 · claude-sonnet-4-6 5 717 · claude-sonnet-5-5 5 289 · claude-opus-5-5 3 388 |
+| myia-po-2024 | 13 657 | claude-sonnet-5-5 8 876 · claude-haiku-5-5 4 034 · claude-opus-5-5 713 |
+| myia-po-2028 | 13 383 | claude-haiku-5-5 7 234 · claude-sonnet-5-5 6 142 |
+| myia-po-2023 | 11 656 | claude-sonnet-5-5 7 767 · claude-haiku-5-5 3 773 |
+| myia-po-2025 | 11 151 | claude-sonnet-5-5 9 630 · gpt-6.1-sol 1 045 |
+| myia-po-2027 | 5 899 | claude-sonnet-5-5 4 068 · claude-haiku-5-5 1 811 |
+| myia-web2 / web1 | 1 717 / 1 044 | claude-sonnet-5-5 |
+| *(none)* | 3 337 | glm-5.3 2 366 · deepseek-v4-flash 617 |
+
+…**but `machine_per_day` shows every machine's rows start at 2026-10-29**: the nightly compaction has already rotated everything older out of the live dir, so the ×7.3 July→October comparison **cannot be answered from the live corpus** — it lives in the `captures-*.7z` archives and needs `history` (or an extraction pass under the pre-flight guard, calm window only). An `envelope` on the live dir answers *current* attribution; never cite it as a two-window trend. `model=` here is the **client's requested id** (role keywords arrive as full ids like `claude-sonnet-5-5` and are mapped by the hub), not the concrete that served — `files_unreadable: 0` on 85 011 files.
+
+### The archives carry the history — `archive` reads them without extracting them (30/10)
+
+The `envelope` answer above is **current** attribution. The two-window answer lives in the day archives `captures-YYYY-MM-DD.7z`, and the live dir cannot answer it (the nightly compaction rotates it out). `turn-composition.py archive` does what `envelope` does, **over an archive**: it streams the request members (`7z e -so`) and head-reads them **without extracting them to disk** — a day holds 7.4 GB (27/10) to 33.7 GB (28/10) uncompressed, and that volume is never written out.
+
+```powershell
+python .\scripts\turn-composition.py archive --archives "D:\claudish-captures\archive\captures-2026-10-28.7z" --label oct28
+```
+
+**First measurements (30/10, hub seat, local archives):**
+
+| day | requests | ai-01 | po-2023 | po-2025 | po-2028 | po-2024 | po-2027 | web2/web1 | (none) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 28/10 | 49 099 | 17 535 | 7 625 | 7 473 | 5 612 | 2 202 | 5 110 | 802/668 | 2 072 |
+| 29/10 | 83 075 | 23 167 | 11 020 | 10 805 | 13 053 | 13 425 | 5 773 | 1 625/964 | 3 243 |
+
+**And it CROSS-CHECKS against the live corpus.** The live-dir census of the same morning (03:43Z, covering 29+30/10) reads ai-01 **23 167** — *exactly* the archive's 29/10 figure — and every other machine is higher by precisely the 30/10 delta (po-2024 13 657 vs 13 425, po-2023 11 656 vs 11 020, …; 85 011 vs 83 075 = **1 936** = 30/10's requests). Two independent corpora, same attribution, difference exactly one day: that is the instrument's own verification, on the subject every lane's attribution claim rests on.
+
+**The July window (01–11/07, the `G:` archives) — same instrument, second corpus, and the two-window answer #445 asks for (30/10):**
+
+| window | requests | /day | po-2025 | (none) | po-2023 | po-2026 † | ai-01 | po-2024 | web1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 01–11/07 | 169 213 | ~15 383 | 37 524 | 36 451 | 35 636 | 27 225 | 25 339 | 5 091 | 1 945 |
+| 28–29/10 | 132 174 | ~66 087 | 18 278 | 5 315 | 18 645 | — | 40 702 | 15 627 | 1 632 (+web2 2 427) |
+
+July models: `glm-5.2` 68 708 (40,6 %) · `mmc@MiniMax-M3` 68 065 (40,2 %) · `claude-opus-4-8` 16 966 (10,0 %) · `claude-sonnet-4-6` 8 983 · `claude-fable-5` 5 522. October models: `claude-sonnet-5-5` 68 501 (51,8 %) · `claude-haiku-5-5` 36 222 (27,4 %) — the July corpus is 81 % GLM+MiniMax, the October one 79 % Anthropic-native ids. † po-2026 is defunct; po-2028, po-2027 and web2 did not exist in July (together 31 975 requests over 28–29/10 = **24 % of October's traffic**).
+
+**The drift is NOT uniform, and that is the answer's substance**: ai-01 ×8,8/day (2 304 → 20 351; 15 % → 31 % of fleet traffic — in July half its requests were `opus-4-8`), po-2024 ×16,9 (463 → 7 814), po-2023 ×2,9, po-2025 ×2,7, web1 ×4,6, and **(none) ×0,8 — down in absolute terms** (3 314 → 2 658/day). Global ×4,3 — and July's daily volume is flat across weekdays and weekends alike (15 402 vs 15 332/day), so the weekday-only October window does not skew the ratio.
+
+**12/07 is REFUSED and excluded from the window**: its index lists 12 265 request members, the stream parses 12 239 — **deterministically, over two independent runs** — so the archive genuinely holds 26 members that do not open with a parseable envelope, and which 26 they are is unknowable from the stream. A 0,2 % gap would print a plausible-looking census; the boundary cross-check refuses it instead. The window is the 11 clean days, and any July figure quoted elsewhere must say so.
+
+**Four traps, all measured, all pinned:**
+
+- **The boundary marker is the envelope's OPENING** (its timestamp AND the key that follows it), not `{"ts":` — a body may embed a JSON object carrying a `ts` key, and a loose marker splits the stream in the middle of a body. The head count is cross-checked against the **archive index** (`7z l -slt`): a marker that disagrees with the index did not split that archive cleanly, and the run **refuses** (`BOUNDARY_MISMATCH`) instead of printing a census that looks complete and is wrong.
+- **An archive is not necessarily a whole day.** 28/10 holds 49 099 request captures against 47 194 response captures and 29/10 holds 83 075 / 77 826 — a full day, the two counts of the same order. **27/10 holds 5 136 requests against 57 849 responses**: that day's request captures are largely **not** in that archive, and a census of them would print plausible per-machine totals covering **8 % of the day**. The output carries `requests_share_of_members` per archive and flags `PARTIAL_DAY` on stderr.
+- **The response captures carry no machine.** `resp-*.sse` opens with a comment header (parser, model, `reqN`, pid, instance, elapsed) — the fleet identity lives only in the request envelope. An archive whose request members are missing **cannot be attributed by another route**.
+- **`7z e` needs `-r`**: the members are stored under their relative path and the wildcard matches the full path; without it the extraction matches nothing and returns an empty stream — which the index cross-check turns into a loud failure rather than a zero census.
+
+**The archives are on `G:` once the local copy is purged, and `G:` is a degraded path — but the cost is front-loaded, not per-read**: a *directory listing* of `G:\Mon Drive\Backups-Cloud\claudish\` took **15 minutes** on 30/10, and the first cold single-archive read ~10 minutes; the full 11-archive July window afterwards ran at **20–40 s/archive** (DriveFS warm). Plan for the cold first touch, not the warm pass.
 
 ## Machine attribution
 
