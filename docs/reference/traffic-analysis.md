@@ -179,6 +179,21 @@ Output went **up** (×1.6/day); what degraded is **efficiency per merge**: ~117 
 
 **Still open, and named**: this decomposes the *cost* of the surplus, not its *nature*. The G12 nature grid (production · verification · coordination · navigation · context-repair · duplicate-restart · waiting-poll) remains unread at mass — it needs a reader, not a counter — and per-lane attribution comes from `envelope` (machine / entrypoint / model), which is the form in which a sibling lane can be handed its own slice.
 
+**Per-lane attribution exists (`machine_model` / `machine_per_day` cross-tabs, 30/10) — and the first run measured the trap: the LIVE corpus is not the HISTORY.** `envelope` now emits `machine` (totals), `machine_model` (top models per machine) and `machine_per_day` (per machine × day), so a sibling lane's slice is one command. Run 30/10 ~03:43Z over the live dir:
+
+| machine | requests | top requested ids |
+| --- | --- | --- |
+| myia-ai-01 | 23 167 | claude-haiku-5-5 8 388 · claude-sonnet-4-6 5 717 · claude-sonnet-5-5 5 289 · claude-opus-5-5 3 388 |
+| myia-po-2024 | 13 657 | claude-sonnet-5-5 8 876 · claude-haiku-5-5 4 034 · claude-opus-5-5 713 |
+| myia-po-2028 | 13 383 | claude-haiku-5-5 7 234 · claude-sonnet-5-5 6 142 |
+| myia-po-2023 | 11 656 | claude-sonnet-5-5 7 767 · claude-haiku-5-5 3 773 |
+| myia-po-2025 | 11 151 | claude-sonnet-5-5 9 630 · gpt-6.1-sol 1 045 |
+| myia-po-2027 | 5 899 | claude-sonnet-5-5 4 068 · claude-haiku-5-5 1 811 |
+| myia-web2 / web1 | 1 717 / 1 044 | claude-sonnet-5-5 |
+| *(none)* | 3 337 | glm-5.3 2 366 · deepseek-v4-flash 617 |
+
+…**but `machine_per_day` shows every machine's rows start at 2026-10-29**: the nightly compaction has already rotated everything older out of the live dir, so the ×7.3 July→October comparison **cannot be answered from the live corpus** — it lives in the `captures-*.7z` archives and needs `history` (or an extraction pass under the pre-flight guard, calm window only). An `envelope` on the live dir answers *current* attribution; never cite it as a two-window trend. `model=` here is the **client's requested id** (role keywords arrive as full ids like `claude-sonnet-5-5` and are mapped by the hub), not the concrete that served — `files_unreadable: 0` on 85 011 files.
+
 ## Machine attribution
 
 Machines are identified by the `X-Claudish-Machine` header (set via `ANTHROPIC_CUSTOM_HEADERS` in Claude Code settings). When missing, `CaptureUtils.psm1` falls back to device_id fingerprinting. Known device IDs are hardcoded in the module's `$DeviceMap` (currently partial — po-2023 + ai-01 only; update when new machines are seen without the header).
