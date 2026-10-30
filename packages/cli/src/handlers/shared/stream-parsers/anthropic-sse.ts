@@ -16,6 +16,7 @@ import { createResponseCapture } from "../response-capture.js";
 import { ttftMarkerLine } from "../traffic-markers.js";
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import { executeWebFetch } from "../web-search-executor.js";
+import { reconcileFrame } from "./frame-coherence.js";
 import {
   isPolicyRefusal,
   logPolicyRefusal,
@@ -156,11 +157,29 @@ export function createAnthropicPassthroughStream(
           }
           pendingEventLine = null;
         };
-        /** Emit a data line (flushing its held `event:` line first, in order). */
+        /**
+         * Emit a data line (flushing its held `event:` line first, in order).
+         *
+         * Frame coherence (frame-coherence.ts): the held `event:` line and the
+         * frame's JSON `type` are reconciled BEFORE either is forwarded. The
+         * Anthropic client SDK reads a frame as a PAIR and dies — or silently
+         * loses the answer — when the two disagree; the proxy is the last hop
+         * before the client, so an incoherent pair it relays is a dead turn.
+         * A frame that is already coherent is forwarded byte-for-byte.
+         */
         const emitDataLine = (text: string) => {
+          const frame = reconcileFrame(pendingEventLine, text);
+          if (frame.changed) {
+            log(
+              `[AnthropicSSE] Frame coherence repair (${frame.reason}): event="${frame.eventName ?? "-"}" json_type="${frame.jsonType ?? "-"}" (model=${opts.modelName})`
+            );
+          }
+          // The repaired/synthesized event line takes the held slot; the flush
+          // below emits it BEFORE the data line, in order, as before.
+          pendingEventLine = frame.eventLine;
           flushPendingEvent();
           if (!isClosed) {
-            controller.enqueue(encoder.encode(text + "\n"));
+            controller.enqueue(encoder.encode(frame.dataLine + "\n"));
             // #286 — one choke point for every data-line emission (both filter
             // branches, the remap layer, the unparseable pass-through): what was
             // FORWARDED is client-visible whatever its schema. See the flag's
