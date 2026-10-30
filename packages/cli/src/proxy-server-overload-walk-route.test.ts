@@ -638,20 +638,100 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
   }, 30_000);
 
   // The walk's `catch` is load-bearing, not defensive: a step whose provider
-  // has no credential makes getHandlerForRequest THROW a RoutingError. Without
-  // the catch that throw becomes HTTP 400 "could not be routed" — terminal for
-  // Claude Code — where the original 529 would have been retried. The kimi
-  // key vars are in SANDBOX_ENV_KEYS, so the throw is guaranteed and hermetic.
-  test("W14: the walk step THROWS (no credential) → the ORIGINAL 529, no state", async () => {
+  // has no credential makes getHandlerForRequest THROW a RoutingError, zero
+  // upstream calls paid. #769 — that is an IMPASSE, not an attempt failure:
+  // the walk advances one hop exactly like a budget refusal, so a host-local
+  // routing gap costs the request one step instead of the whole cascade.
+  // Before #769 the catch swallowed the throw as a classless failure and the
+  // ORIGINAL 529 surfaced. The kimi key vars are in SANDBOX_ENV_KEYS, so the
+  // throw is guaranteed and hermetic.
+  test("W14: the walk step UNROUTABLE (no credential) → the walk advances and serves the next step (#769)", async () => {
     await spin();
     resetWalk({ CLAUDISH_FAILOVER_SONNET: "kimi@fake-kimi>s1-ep@fake-s1" });
     const r1 = await postMessage("claude-sonnet-5");
-    expect(r1.status).toBe(529);
-    expect(calls.nm).toBe(1);
-    expect(calls.s1).toBe(0); // bounded — the throw does not walk deeper
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(1); // the overloaded nominal, paid once
+    expect(calls.s1).toBe(1); // the unroutable step 0 was skipped, step 1 served
     expect(calls.native).toBe(0);
+    // No fleet state from the skip (#769 AC d): the step is healthy, the host
+    // simply cannot route it.
     expect(isFailoverActive("sonnet")).toBe(false);
     expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("step 0"))).toBe(true);
+    expect(
+      failoverLog.some((l) => l.includes("[Failover] WALK-SKIP sonnet") && l.includes("reason=unroutable"))
+    ).toBe(true);
+  }, 30_000);
+
+  // #769 — the advance is bounded to ONE hop like everything the walk buys: a
+  // second unroutable target surfaces the ORIGINAL overload (retryable 529),
+  // never a routing 400 and never an unbounded scan of the cascade.
+  test("W14b: BOTH walk targets unroutable → the ORIGINAL 529, no 400, no state (#769)", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "kimi@fake-kimi>kimi@fake-kimi2" });
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(529); // the nominal's own overload, retryable
+    const body = await r1.text();
+    expect(body).toContain("server cluster is currently under high load"); // the ORIGINAL body
+    expect(body).not.toContain("could not be routed"); // no routing refusal smuggled in
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(0);
+    expect(calls.s1).toBe(0); // nothing callable on either target
+    expect(isFailoverActive("sonnet")).toBe(false);
+  }, 30_000);
+
+  // #769 Site A — the ARMED loop (not the walk) hitting an unroutable step.
+  // The step is skipped through the SAME request-scoped `skippedSteps` set the
+  // #431 family uses (no failure mark, no wall), and the next step serves.
+  test("U1: an ARMED cascade whose step 0 is unroutable → step 1 serves, no mark (#769)", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "kimi@fake-kimi>s1-ep@fake-s1" });
+    // Arm the NOMINAL's bucket so the loop resolves the cascade from attempt 0.
+    expect(armFailover("sonnet", "test: nominal walled, cascade engaged", bucketOfNominal())).toBe(true);
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(0); // walled nominal — never probed
+    expect(calls.s0).toBe(0); // unroutable — construction threw before any call
+    expect(calls.s1).toBe(1); // the skip landed on the next step
+    // The skip marker names the step and the reason (countable, forceConsole).
+    expect(
+      failoverLog.some(
+        (l) =>
+          l.includes("[Failover] SKIP sonnet[0]") &&
+          l.includes("reason=unroutable") &&
+          l.includes("kimi@fake-kimi")
+      )
+    ).toBe(true);
+    // No step marked failed: the marker for a marked step is STEP-ADVANCE.
+    expect(failoverLog.some((l) => l.includes("STEP-UNROUTABLE sonnet"))).toBe(false);
+  }, 30_000);
+
+  // #769 AC 6 — the LAST step unroutable cannot skip: the cascade refuses in
+  // the labelled overload form (529 + `x-claudish-step-skip: unroutable`), not
+  // with a client-shaped routing 400 — the gap is host-local, not the
+  // caller's fault.
+  test("U2: LAST step unroutable → labelled 529 refusal, never a routing 400 (#769)", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0>kimi@fake-kimi" });
+    expect(armFailover("sonnet", "test: nominal walled, cascade engaged", bucketOfNominal())).toBe(true);
+    // Step 0 benched through the plane the ARMED resolver reads (a live step
+    // failure record — a bucket wall is a walk-only skip, W12), so the
+    // resolver hands back the LAST (unroutable) one.
+    markStepFailed("sonnet", 0, "test: step 0 benched", undefined, { concrete: "s0-ep@fake-s0" });
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(529); // the labelled refusal, retryable
+    expect(r1.headers.get("x-claudish-step-skip")).toContain("unroutable");
+    const body = await r1.text();
+    const parsed = JSON.parse(body);
+    expect(parsed.error.type).toBe("overloaded_error");
+    expect(parsed.error.message).toContain("has no routable step on this host");
+    expect(parsed.error.message).toContain("kimi@fake-kimi");
+    // The env-var hint of the underlying RoutingError reaches the operator.
+    expect(parsed.error.message).toContain("KIMI_API_KEY");
+    expect(calls.nm).toBe(0);
+    expect(calls.s0).toBe(0);
+    expect(failoverLog.some((l) => l.includes("[Failover] STEP-UNROUTABLE sonnet[1]"))).toBe(true);
   }, 30_000);
 
   // Review of #331 (06/10) point 1 — the ONE-SHOT walk used bare
