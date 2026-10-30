@@ -163,6 +163,9 @@ def cmd_envelope(args):
     names = sorted(n for n in os.listdir(args.dir) if n.startswith("req-") and n.endswith(".json"))
     c_entry, c_machine, c_model, c_dev = (collections.Counter() for _ in range(4))
     per_day, per_entry_day = collections.Counter(), collections.Counter()
+    # cross-tabs: a sibling lane asked for ITS OWN slice -- the per-machine
+    # totals alone do not say WHICH model its turns were made of.
+    c_machine_model, c_machine_day = collections.Counter(), collections.Counter()
     unreadable = 0
     for n in names:
         f = head_fields(os.path.join(args.dir, n), args.head)
@@ -172,12 +175,25 @@ def cmd_envelope(args):
         m = TS_RE.search(ts)
         day = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else "?"
         ep = f.get("entrypoint") or "(none)"
+        mach = f.get("machine") or "(none)"
+        mod = f.get("model") or "(none)"
         c_entry[ep] += 1
-        c_machine[f.get("machine") or "(none)"] += 1
-        c_model[f.get("model") or "(none)"] += 1
+        c_machine[mach] += 1
+        c_model[mod] += 1
         c_dev[f.get("device_id8") or "(none)"] += 1
         per_day[day] += 1
         per_entry_day[(ep, day)] += 1
+        c_machine_model[(mach, mod)] += 1
+        c_machine_day[(mach, day)] += 1
+
+    # top-N models per machine, kept in ONE pass over the sorted counter so the
+    # order is deterministic (a Counter's iteration order is insertion order).
+    mm = collections.defaultdict(list)
+    for (mach, mod), v in sorted(c_machine_model.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1])):
+        mm[mach].append({"model": mod, "n": v})
+    md = collections.defaultdict(list)
+    for (mach, day), v in sorted(c_machine_day.items()):
+        md[mach].append({"day": day, "n": v})
 
     out = {
         "label": args.label, "dir": args.dir, "requests_total": len(names),
@@ -191,6 +207,9 @@ def cmd_envelope(args):
             {"entrypoint": k[0], "day": k[1], "n": v}
             for k, v in sorted(per_entry_day.items(), key=lambda x: (x[0][1], -x[1]))
         ],
+        # per-machine slices: what each lane's turns were made of, and when
+        "machine_model": {k: v[: getattr(args, "top", 8)] for k, v in sorted(mm.items())},
+        "machine_per_day": {k: v for k, v in sorted(md.items())},
     }
     emit(out, args.out)
 
@@ -424,6 +443,7 @@ def main():
     e.add_argument("--dir", required=True)
     e.add_argument("--label", required=True)
     e.add_argument("--head", type=int, default=2048)
+    e.add_argument("--top", type=int, default=8)
     e.add_argument("--out")
     e.set_defaults(func=cmd_envelope)
 
