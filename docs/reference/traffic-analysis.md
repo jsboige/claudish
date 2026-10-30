@@ -24,7 +24,7 @@
 | `traffic-anthropic.ps1` | **Answers "where does the Anthropic traffic come from?"** — attributes every Anthropic-native (opus/fable) request by **machine + workspace** (workspace = proof, from the system prompt; not stdout). Per-request verdict: `[OK]` ai-01 · `[REVIEW]` po-2025 · `[INFO]` fable during a `-FableOverrideActive` window · `[LEAK-SUBAGENT]` rogue Opus sub-agent (`cc_is_subagent=true`, **exit 1**) · `[REVIEW-INTERACTIVE]` user-driven non-ai-01 session (exit 0). sonnet-4-6 shown separately (remapped to glm → not Anthropic). | `.\scripts\traffic-anthropic.ps1 [-Hours N] [-FableOverrideActive]` |
 | `traffic-history.ps1` | Historical analysis from 7z archives | `.\scripts\traffic-history.ps1 [-Date yyyy-MM-dd] [-Days N]` |
 | `live-session-scan.py` | **Per-session live attribution (#362)** — aggregates in-window `req-*.json` by session (user_id + session_id) with two flag classes: `OPENAI-SHAPED` (`gpt-\|codex\|-sol\|o3-\|o4-`, LEAK-grade — the OpenAI plan is last-chance, non-renewable credit) and `RETIRED-ID` (`claude-sonnet-4-6\|glm-5.2\|qwen3.6-35b-a3b`, INFO-grade — ids removed from the catalogs but still named by drifted client configs). Two-speed read: 6 KiB head + 16 KiB tail by default, `--deep` for the full JSON parse. | `python .\scripts\live-session-scan.py [--hours N] [--top N] [--models regex] [--deep] [--json]` |
-| `turn-composition.py` | **Of what is the turn surplus made (#328)** — four sub-commands: `envelope` (whole-corpus lane attribution by head-read, ~2 KB/file), `history` (bytes re-paid per turn + the per-turn system tax), `nudge` (which trailing system block rides the turn, and whether it is a passenger or a turn of its own), `routability` (which declared rungs can authenticate on this seat, `apiKeys` map first — a container-env-only probe lies). | `python .\scripts\turn-composition.py {envelope\|history\|nudge\|routability} …` — see §Turn composition |
+| `turn-composition.py` | **Of what is the turn surplus made (#328)** — five sub-commands: `envelope` (whole-corpus lane attribution by head-read, ~2 KB/file), `history` (bytes re-paid per turn + the per-turn system tax), `nudge` (which trailing system block rides the turn, and whether it is a passenger or a turn of its own), `routability` (which declared rungs can authenticate on this seat, `apiKeys` map first — a container-env-only probe lies), `archive` (the same lane attribution **over the day `.7z` archives**, streamed, never extracted to disk). | `python .\scripts\turn-composition.py {envelope\|history\|nudge\|routability\|archive} …` — see §Turn composition |
 | `compress-captures.ps1` | Nightly 7z compaction + GDrive backup + 30d local purge (scheduled task) | Runs automatically at 04:17 |
 | `claudish-watchdog.ps1` | Proxy health: tool-call stream test + proactive restart (uptime >11h) + auto-recovery on hang. Scheduled every 15min. | Runs automatically |
 | `CaptureUtils.psm1` | Shared module (capture parsing, device mapping, 7z extraction) | Imported by the scripts above |
@@ -191,6 +191,32 @@ Output went **up** (×1.6/day); what degraded is **efficiency per merge**: ~117 
 | *(none)* | 3 337 | glm-5.3 2 366 · deepseek-v4-flash 617 |
 
 …**but `machine_per_day` shows every machine's rows start at 2026-10-29**: the nightly compaction has already rotated everything older out of the live dir, so the ×7.3 July→October comparison **cannot be answered from the live corpus** — it lives in the `captures-*.7z` archives and needs `history` (or an extraction pass under the pre-flight guard, calm window only). An `envelope` on the live dir answers *current* attribution; never cite it as a two-window trend. `model=` here is the **client's requested id** (role keywords arrive as full ids like `claude-sonnet-5-5` and are mapped by the hub), not the concrete that served — `files_unreadable: 0` on 85 011 files.
+
+### The archives carry the history — `archive` reads them without extracting them (30/10)
+
+The `envelope` answer above is **current** attribution. The two-window answer lives in the day archives `captures-YYYY-MM-DD.7z`, and the live dir cannot answer it (the nightly compaction rotates it out). `turn-composition.py archive` does what `envelope` does, **over an archive**: it streams the request members (`7z e -so`) and head-reads them **without extracting them to disk** — a day holds 7.4 GB (27/10) to 33.7 GB (28/10) uncompressed, and that volume is never written out.
+
+```powershell
+python .\scripts\turn-composition.py archive --archives "D:\claudish-captures\archive\captures-2026-10-28.7z" --label oct28
+```
+
+**First measurements (30/10, hub seat, local archives):**
+
+| day | requests | ai-01 | po-2023 | po-2025 | po-2028 | po-2024 | po-2027 | web2/web1 | (none) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 28/10 | 49 099 | 17 535 | 7 625 | 7 473 | 5 612 | 2 202 | 5 110 | 802/668 | 2 072 |
+| 29/10 | 83 075 | 23 167 | 11 020 | 10 805 | 13 053 | 13 425 | 5 773 | 1 625/964 | 3 243 |
+
+**And it CROSS-CHECKS against the live corpus.** The live-dir census of the same morning (03:43Z, covering 29+30/10) reads ai-01 **23 167** — *exactly* the archive's 29/10 figure — and every other machine is higher by precisely the 30/10 delta (po-2024 13 657 vs 13 425, po-2023 11 656 vs 11 020, …; 85 011 vs 83 075 = **1 936** = 30/10's requests). Two independent corpora, same attribution, difference exactly one day: that is the instrument's own verification, on the subject every lane's attribution claim rests on.
+
+**Four traps, all measured, all pinned:**
+
+- **The boundary marker is the envelope's OPENING** (its timestamp AND the key that follows it), not `{"ts":` — a body may embed a JSON object carrying a `ts` key, and a loose marker splits the stream in the middle of a body. The head count is cross-checked against the **archive index** (`7z l -slt`): a marker that disagrees with the index did not split that archive cleanly, and the run **refuses** (`BOUNDARY_MISMATCH`) instead of printing a census that looks complete and is wrong.
+- **An archive is not necessarily a whole day.** 28/10 holds 49 099 request captures against 47 194 response captures and 29/10 holds 83 075 / 77 826 — a full day, the two counts of the same order. **27/10 holds 5 136 requests against 57 849 responses**: that day's request captures are largely **not** in that archive, and a census of them would print plausible per-machine totals covering **8 % of the day**. The output carries `requests_share_of_members` per archive and flags `PARTIAL_DAY` on stderr.
+- **The response captures carry no machine.** `resp-*.sse` opens with a comment header (parser, model, `reqN`, pid, instance, elapsed) — the fleet identity lives only in the request envelope. An archive whose request members are missing **cannot be attributed by another route**.
+- **`7z e` needs `-r`**: the members are stored under their relative path and the wildcard matches the full path; without it the extraction matches nothing and returns an empty stream — which the index cross-check turns into a loud failure rather than a zero census.
+
+**The archives are on `G:` once the local copy is purged, and `G:` is a degraded path**: a *directory listing* of `G:\Mon Drive\Backups-Cloud\claudish\` took **15 minutes** on 30/10. A single-archive read is a different cost — measure it before planning a window.
 
 ## Machine attribution
 
