@@ -143,7 +143,7 @@ describe("frame-coherence — helper", () => {
   it("aligns a mismatched type to the event name", () => {
     const out = reconcileFrame(
       "event: content_block_delta",
-      'data: {"type":"message_delta","index":0}'
+      'data: {"type":"message_delta","index":0,"delta":{"type":"text_delta","text":"x"}}'
     );
     expect(out.changed).toBe(true);
     expect(out.reason).toBe("type-mismatch");
@@ -175,6 +175,37 @@ describe("frame-coherence — helper", () => {
     expect(out.changed).toBe(true);
     expect(out.reason).toBe("event-name-unknown");
     expect(out.eventLine).toBe("event: content_block_delta");
+  });
+
+  it("aligns the EVENT line to the JSON type when the payload matches the JSON type", () => {
+    // The client validates the payload against the JSON `type` and ROUTES by
+    // the event name. Here the payload carries `delta` + `usage` — a
+    // message_delta — while the event line says content_block_delta. The
+    // payload is the only witness: the event name is the wrong one, so it is
+    // the event line that gets aligned (a frame whose event name the SDK does
+    // not know is silently DROPPED).
+    const out = reconcileFrame(
+      "event: content_block_delta",
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}'
+    );
+    expect(out.changed).toBe(true);
+    expect(out.reason).toBe("event-name-mismatch");
+    expect(out.eventLine).toBe("event: message_delta");
+    expect(JSON.parse(out.dataLine.slice(6)).type).toBe("message_delta");
+  });
+
+  it("aligns BOTH names on the kind the payload identifies", () => {
+    // The body carries a `content_block` — a content_block_start — while the
+    // event line says content_block_delta and the JSON type says
+    // message_delta. The payload is the only witness: both names are wrong,
+    // and the client's validation passes once the pair agrees on the body.
+    const out = reconcileFrame(
+      "event: content_block_delta",
+      'data: {"type":"message_delta","index":0,"content_block":{"type":"text","text":""}}'
+    );
+    expect(out.changed).toBe(true);
+    expect(out.eventLine).toBe("event: content_block_start");
+    expect(JSON.parse(out.dataLine.slice(6)).type).toBe("content_block_start");
   });
 
   it("never drops a frame it cannot interpret", () => {
@@ -292,6 +323,27 @@ describe("frame-coherence — the client-visible wire", () => {
     const frames = parseWire(wire);
     const delta = frames.find((f) => f.data?.delta);
     expect(delta!.data.type).toBe("content_block_delta");
+  });
+
+  it("corrects a wrong event line when the JSON type is the true one", async () => {
+    // The payload carries `delta` + `usage` — a message_delta — while the
+    // event line says content_block_delta. The client validates against the
+    // JSON type and routes by the event name, so the EVENT line is the wrong
+    // one here: it has to follow the body.
+    const wire = await run(
+      streamWith(
+        frame("content_block_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { output_tokens: 7 },
+        })
+      )
+    );
+    const frames = parseWire(wire);
+    const delta = frames.find((f) => f.data?.usage);
+    expect(delta).toBeDefined();
+    expect(delta!.event).toBe("message_delta");
+    expect(delta!.data.type).toBe("message_delta");
   });
 
   it("INVARIANT — no frame leaves the proxy with a type/event disagreement", async () => {
