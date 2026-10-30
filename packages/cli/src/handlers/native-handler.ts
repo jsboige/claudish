@@ -308,11 +308,15 @@ export class NativeHandler implements ModelHandler {
     }
 
     // Execute fetch
+    // #780: the abort controller reaches the fetch so a client cancel can end
+    // the upstream turn instead of letting it run (and bill) to completion.
+    const upstreamAbort = new AbortController();
     try {
       const anthropicResponse = await fetch(`${this.baseUrl}/v1/messages`, {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
+        signal: upstreamAbort.signal,
       });
 
       const contentType = anthropicResponse.headers.get("content-type") || "";
@@ -356,54 +360,102 @@ export class NativeHandler implements ModelHandler {
       if (contentType.includes("text/event-stream")) {
         log("[Native] Streaming response detected");
         const cap = createResponseCapture("native", target, true, requestNumberFor(c.req));
-        return c.body(
-          new ReadableStream({
-            async start(controller) {
-              const reader = anthropicResponse.body?.getReader();
-              if (!reader) throw new Error("No reader");
+        // #780: a client cancel must end the upstream work. Before this, the
+        // pump kept reading after the consumer left, so the abandoned turn was
+        // billed upstream in full, and the capture was finalised `reason=error`
+        // at the first enqueue into the closed client stream.
+        // Shape taken from the v14 tree's `cancelEndsUpstreamWork`:
+        // `shared/stream-parsers/upstream-cancel.ts`.
+        // Typed structurally, not nominally: the cancel path needs exactly one
+        // capability (`cancel`), and the reader's nominal type differs between
+        // the DOM lib and bun-types (`readMany`).
+        const upstream: { reader?: { cancel(reason?: unknown): Promise<void> } } = {};
+        let pump: Promise<void> | undefined;
+        let clientCancelled = false;
 
-              const decoder = new TextDecoder();
-              let buffer = "";
-              let eventLog = "";
+        const runPump = async (controller: ReadableStreamDefaultController<Uint8Array>) => {
+          const reader = anthropicResponse.body?.getReader();
+          if (!reader) throw new Error("No reader");
+          upstream.reader = reader;
 
-              try {
-                while (true) {
-                  const { done, value } = await reader.read();
-                  if (done) break;
+          const decoder = new TextDecoder();
+          let buffer = "";
+          let eventLog = "";
 
-                  cap.tap(value);
-                  controller.enqueue(value);
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
 
-                  // Basic logging
-                  const chunkText = decoder.decode(value, { stream: true });
-                  buffer += chunkText;
-                  // Advisor tap: extract any advisor tool_use ids and record
-                  // stream events to the log (no-op when disabled).
-                  recordAdvisorEventsFromChunk(advisorCfg, chunkText);
-                  const lines = buffer.split("\n");
-                  buffer = lines.pop() || "";
-                  for (const line of lines) {
-                    if (line.trim()) eventLog += line + "\n";
-                    // #317: the terminal message_delta carries the upstream
-                    // usage — feed the per-session budget counter. Max-per-
-                    // attempt in the sink makes this idempotent and tolerant
-                    // of any earlier partial usage line. Never throws.
-                    if (line.includes('"output_tokens"')) {
-                      for (const m of line.matchAll(/"output_tokens"\s*:\s*(\d+)/g)) {
-                        recordSessionBudgetOutput(c.req.raw, Number(m[1]));
-                      }
-                    }
+              cap.tap(value);
+              controller.enqueue(value);
+
+              // Basic logging
+              const chunkText = decoder.decode(value, { stream: true });
+              buffer += chunkText;
+              // Advisor tap: extract any advisor tool_use ids and record
+              // stream events to the log (no-op when disabled).
+              recordAdvisorEventsFromChunk(advisorCfg, chunkText);
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+              for (const line of lines) {
+                if (line.trim()) eventLog += line + "\n";
+                // #317: the terminal message_delta carries the upstream
+                // usage — feed the per-session budget counter. Max-per-
+                // attempt in the sink makes this idempotent and tolerant
+                // of any earlier partial usage line. Never throws.
+                if (line.includes('"output_tokens"')) {
+                  for (const m of line.matchAll(/"output_tokens"\s*:\s*(\d+)/g)) {
+                    recordSessionBudgetOutput(c.req.raw, Number(m[1]));
                   }
                 }
-                if (eventLog) log(eventLog);
-                cap.note("reader done");
-                cap.done({ closed: true, reason: "done" });
-                controller.close();
-              } catch (e) {
-                log(`[Native] Stream Error: ${e}`);
-                cap.note(`stream error: ${String(e)}`);
-                cap.done({ closed: true, reason: "error", err: String(e) });
-                controller.close();
+              }
+            }
+            if (clientCancelled) {
+              cap.note("client cancelled");
+              cap.done({ closed: false, reason: "client-cancel" });
+              return;
+            }
+            if (eventLog) log(eventLog);
+            cap.note("reader done");
+            cap.done({ closed: true, reason: "done" });
+            controller.close();
+          } catch (e) {
+            if (clientCancelled) {
+              // The runtime closed the client stream under us; that is the
+              // cancel path, not a stream failure.
+              cap.note("client cancelled mid-pump");
+              cap.done({ closed: false, reason: "client-cancel" });
+              return;
+            }
+            log(`[Native] Stream Error: ${e}`);
+            cap.note(`stream error: ${String(e)}`);
+            cap.done({ closed: true, reason: "error", err: String(e) });
+            controller.close();
+          }
+        };
+
+        return c.body(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              pump = runPump(controller);
+              return pump;
+            },
+            async cancel(reason) {
+              clientCancelled = true;
+              // Both paths, in the v14 order: the abort drops the connection,
+              // and the reader cancel makes the pending `read()` resolve `done`
+              // so the pump settles before this cancel promise resolves.
+              upstreamAbort.abort();
+              try {
+                await upstream.reader?.cancel(reason);
+              } catch {
+                // Already released or errored: the loop has stopped either way.
+              }
+              try {
+                await pump;
+              } catch {
+                // The pump's failure is its own to report; cancel only waits.
               }
             },
           }),
