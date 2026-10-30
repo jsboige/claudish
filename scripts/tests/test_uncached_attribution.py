@@ -32,7 +32,10 @@ below are load-bearing and each has a pin here:
      knowledge drained D: at ~150 Go/h until the fleet wall (Maintenance
      [URGENT][DISK] 29/10). The cost is read from the archive INDEX before
      a byte is written, and an extraction that would break the volume floor
-     is REFUSED, writing nothing. Pins 14a-14e.
+     is REFUSED, writing nothing. Pins 14a-14h: the refusal is the FLOOR (a
+     corpus that fits and still eats it is refused too), `--force-extract`
+     skips the pre-flight, and a workdir that cannot be prepared is a named
+     refusal rather than a traceback.
 
 Run standalone (no pytest needed):
   python scripts/tests/test_uncached_attribution.py
@@ -560,6 +563,117 @@ def main() -> int:
         finally:
             ua.find_extractor = saved_find
             ua.archive_uncompressed_size = saved_size
+
+        # A corpus that FITS on the volume and still leaves it under the floor
+        # is refused too: "does it fit" is not the question, the floor is. Pin
+        # 14a's corpus does not fit at all, so neutering the floor term
+        # (`< floor` -> `< 0`) kept the suite green -- this case is the one
+        # that goes red alone.
+        saved_usage = ua.shutil.disk_usage
+        try:
+            class _FakeUsage:
+                total = 1024 ** 4          # 1 TiB -> 12 % = ~122.9 GiB floor
+                free = 200 * 1024 ** 3
+                used = total - free
+
+            ua.shutil.disk_usage = lambda _p: _FakeUsage()
+            floor = max(
+                int(1024 ** 4 * ua.DEFAULT_MIN_FREE_PCT / 100.0),
+                ua.DEFAULT_MIN_FREE_BYTES,
+            )
+            fits_and_eats_the_floor = _FakeUsage.free - floor + 1
+            _check(
+                fits_and_eats_the_floor < _FakeUsage.free,
+                f"pin 14f precondition: {fits_and_eats_the_floor} must FIT "
+                f"on {_FakeUsage.free} free",
+            )
+            try:
+                ua.check_space(
+                    tmp, fits_and_eats_the_floor, ua.DEFAULT_MIN_FREE_PCT,
+                    ua.DEFAULT_MIN_FREE_BYTES,
+                )
+            except ua.PreflightError:
+                pass
+            else:
+                raise AssertionError(
+                    "pin 14f: an extraction that fits but leaves the volume "
+                    "under its floor MUST be refused"
+                )
+            # One byte under, and the same shape passes: the boundary is the
+            # floor itself, not "fits".
+            free_before, floor_seen = ua.check_space(
+                tmp, fits_and_eats_the_floor - 2, ua.DEFAULT_MIN_FREE_PCT,
+                ua.DEFAULT_MIN_FREE_BYTES,
+            )
+            _check(
+                floor_seen == floor,
+                f"pin 14f: floor reported {floor_seen}, want {floor}",
+            )
+        finally:
+            ua.shutil.disk_usage = saved_usage
+
+        # --force-extract skips the pre-flight -- and the default does not.
+        # Both directions: a test that never passes force=True cannot see the
+        # bypass vanish, and one that only passes force=True cannot see the
+        # pre-flight stop running.
+        saved_find2 = ua.find_extractor
+        saved_run2 = ua.subprocess.run
+        saved_check2 = ua.check_space
+        preflights = []
+        try:
+            class _OkProc:
+                returncode = 0
+                stdout = b""
+                stderr = b""
+
+            ua.find_extractor = lambda: "7zr.exe"
+            ua.subprocess.run = lambda *a, **k: _OkProc()
+            ua.check_space = (
+                lambda *a, **k: preflights.append(a) or (0, 0)
+            )
+            ua.extract_archive("captures.7z", os.path.join(tmp, "wd-default"))
+            _check(
+                len(preflights) == 1,
+                f"pin 14g: the pre-flight must run by default, ran {len(preflights)}x",
+            )
+            ua.extract_archive(
+                "captures.7z", os.path.join(tmp, "wd-forced"), force=True
+            )
+            _check(
+                len(preflights) == 1,
+                "pin 14g: --force-extract must SKIP the pre-flight, but it ran "
+                f"{len(preflights)}x",
+            )
+        finally:
+            ua.find_extractor = saved_find2
+            ua.subprocess.run = saved_run2
+            ua.check_space = saved_check2
+
+        # A workdir that cannot be prepared (read-only share, no permission)
+        # is a named refusal with its own exit code -- never a traceback.
+        saved_makedirs = ua.os.makedirs
+        try:
+            def _refuse(_path, exist_ok=False):
+                raise PermissionError(13, "Access is denied", _path)
+
+            ua.os.makedirs = _refuse
+            try:
+                ua.check_space(
+                    tmp, 1, ua.DEFAULT_MIN_FREE_PCT, ua.DEFAULT_MIN_FREE_BYTES
+                )
+            except ua.PreflightError:
+                pass
+            except PermissionError as exc:
+                raise AssertionError(
+                    f"pin 14h: a read-only workdir must be a refusal (exit 3), "
+                    f"not a traceback: {exc}"
+                ) from exc
+            else:
+                raise AssertionError(
+                    "pin 14h: an unprepared workdir must be refused, not used"
+                )
+        finally:
+            ua.os.makedirs = saved_makedirs
 
         # --- pin 15: the UNATTRIBUTED population, per seat ----------------
         #   A global "N unpaired" counter cannot be extrapolated to the

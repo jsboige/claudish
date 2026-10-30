@@ -442,6 +442,24 @@ def archive_uncompressed_size(extractor: str, archive: str) -> int:
     return total
 
 
+def _ensure_dir(path: str, what: str) -> None:
+    """Create `path`, or REFUSE — a share that says no is exit 3, not a traceback.
+
+    A `--workdir` on a read-only mount (a network share, a directory the
+    caller may not create) used to escape as a raw `PermissionError` traceback:
+    the operator got a stack instead of the one line naming the volume. Any
+    failure to prepare the target directory is a pre-flight refusal, and says
+    which directory and why.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        raise PreflightError(
+            f"cannot prepare the {what} ({path}): {exc}. "
+            f"Use --workdir on a writable local volume."
+        ) from exc
+
+
 def check_space(target_dir: str, total_bytes: int, min_free_pct: float,
                 min_free_bytes: int) -> tuple[int, int]:
     """Refuse an extraction that would take the target volume below its floor.
@@ -452,10 +470,20 @@ def check_space(target_dir: str, total_bytes: int, min_free_pct: float,
     an absolute one: 12 % of the volume (the fleet alert floor) and at least
     `min_free_bytes` (20 GiB) whichever is bigger.
 
+    "It fits on the disk" is NOT the question: a corpus that fits and still
+    leaves the volume under its floor is refused exactly like one that does
+    not fit. The floor is the invariant.
+
     Returns (free_before, floor) when the extraction fits.
     """
-    os.makedirs(target_dir, exist_ok=True)
-    usage = shutil.disk_usage(target_dir)
+    _ensure_dir(target_dir, "target directory")
+    try:
+        usage = shutil.disk_usage(target_dir)
+    except OSError as exc:
+        raise PreflightError(
+            f"cannot measure the target volume ({target_dir}): {exc}. "
+            f"Use --workdir on a readable local volume."
+        ) from exc
     floor = max(int(usage.total * min_free_pct / 100.0), min_free_bytes)
     if usage.free - total_bytes < floor:
         raise PreflightError(
@@ -487,13 +515,13 @@ def extract_archive(archive: str, workdir: str, force: bool = False,
             " (tried $SEVENZIP, 7z/7zr on PATH, and " + DEFAULT_SEVENZIP + ")"
         )
     target = os.path.join(workdir, os.path.splitext(os.path.basename(archive))[0])
-    os.makedirs(workdir, exist_ok=True)
+    _ensure_dir(workdir, "workdir")
     if not force:
         # The volume is measured on the WORKDIR, before the corpus directory
         # exists: a refused extraction must leave nothing behind.
         total = archive_uncompressed_size(extractor, archive)
         check_space(workdir, total, min_free_pct, min_free_bytes)
-    os.makedirs(target, exist_ok=True)
+    _ensure_dir(target, "corpus directory")
     try:
         proc = subprocess.run(
             [extractor, "x", "-y", f"-o{target}", archive],
@@ -647,6 +675,13 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     directory = args.dir
+    if directory and args.archive:
+        # Silence here reads as "both were used": the archive is NOT read.
+        print(
+            f"--archive ignored: --dir {directory} was given, so the archive "
+            f"is not extracted",
+            file=sys.stderr,
+        )
     if not directory and args.archive:
         if not os.path.exists(args.archive):
             print(f"archive not found: {args.archive}", file=sys.stderr)
@@ -697,6 +732,7 @@ def main(argv=None) -> int:
         payload = {
             "mode": "full" if read_usage else "pairs-only",
             "counters": counters,
+            "corpus": dict(files),
             "unpaired_by_machine": dict(unpaired_by_machine),
             "unpaired_by_model": dict(unpaired_by_model),
         }
