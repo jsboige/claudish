@@ -13,6 +13,7 @@ Planned-but-unimplemented work — the SEP-1686 channel migration, optional `not
 | Web search interception paths, SearXNG/MCP fallback chains, components | `docs/reference/web-search-interception.md` |
 | Relay internals (header build, prober, compression, outage reconciliation) | `docs/reference/relay-internals.md` |
 | Budget failover: cascade walk, notice channels, per-step backoff, Qwen/GLM thinking measurements | `docs/reference/budget-failover.md` · `.env.sidecar.example` |
+| Consumption analysis (July vs late September vs now; why the MiniMax weekly plan walls early; what the 175 k cache-read floor per request costs) | `docs/reference/consumption-2026-10.md` |
 | Negotiated capability vocabulary (#83 — wired: lift at `/v1/messages` entry + query at the condensation rail, gate `CLAUDISH_CAPABILITY_VOCAB` default off, ask cap `CLAUDISH_CAPABILITY_QUERY_MAX_ASKS` default 3) | `docs/reference/capability-vocabulary.md` |
 | Signature-based role routing (#82 — proposition de design, non arbitrée, aucun code) | `docs/reference/signature-routing.md` · entry `ROADMAP.md` |
 | Haiku → swift debrayage — staged widening (Q-po2025-31 : gates R/C mesurés avant toute levée du STEP_EXCLUDE ai-01 ; po-2028 durablement exclu) | `docs/reference/haiku-swift-debrayage.md` · entry `ROADMAP.md` |
