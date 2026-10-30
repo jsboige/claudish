@@ -23,7 +23,6 @@ Planned-but-unimplemented work — the SEP-1686 channel migration, optional `not
 | Sidecar deployment runbook | `docs/deployment/relay-sidecar-deployment.md` |
 | Model routing narratives (native pin #218, foreign-credential guard #296, MiniMax forced-thinking chain, input counters #179) | `docs/reference/model-routing.md` |
 | Never-hang narratives (drain design and measurements, 1017-response corpus, instrument-filter calibration) | `docs/reference/never-hang.md` |
-| Hub outage 30/10 post-mortem (docker/WSL door wedge, refuted "8 drains", watchdog probe blind spot, two intake collapses histogram) | `docs/reference/hub-outage-2026-10-30.md` |
 | `test:strict` full mechanics (#175 — entry keys, module-load deaths, bun double-count, classes 2/2b) | `docs/reference/test-strict.md` |
 
 ## Fleet-Rollout Verification (hard rule, mandate 2026-09-12)
