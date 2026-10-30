@@ -209,6 +209,19 @@ python .\scripts\turn-composition.py archive --archives "D:\claudish-captures\ar
 
 **And it CROSS-CHECKS against the live corpus.** The live-dir census of the same morning (03:43Z, covering 29+30/10) reads ai-01 **23 167** — *exactly* the archive's 29/10 figure — and every other machine is higher by precisely the 30/10 delta (po-2024 13 657 vs 13 425, po-2023 11 656 vs 11 020, …; 85 011 vs 83 075 = **1 936** = 30/10's requests). Two independent corpora, same attribution, difference exactly one day: that is the instrument's own verification, on the subject every lane's attribution claim rests on.
 
+**The July window (01–11/07, the `G:` archives) — same instrument, second corpus, and the two-window answer #445 asks for (30/10):**
+
+| window | requests | /day | po-2025 | (none) | po-2023 | po-2026 † | ai-01 | po-2024 | web1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 01–11/07 | 169 213 | ~15 383 | 37 524 | 36 451 | 35 636 | 27 225 | 25 339 | 5 091 | 1 945 |
+| 28–29/10 | 132 174 | ~66 087 | 18 278 | 5 315 | 18 645 | — | 40 702 | 15 627 | 1 632 (+web2 2 427) |
+
+July models: `glm-5.2` 68 708 (40,6 %) · `mmc@MiniMax-M3` 68 065 (40,2 %) · `claude-opus-4-8` 16 966 (10,0 %) · `claude-sonnet-4-6` 8 983 · `claude-fable-5` 5 522. October models: `claude-sonnet-5-5` 68 501 (51,8 %) · `claude-haiku-5-5` 36 222 (27,4 %) — the July corpus is 81 % GLM+MiniMax, the October one 79 % Anthropic-native ids. † po-2026 is defunct; po-2028, po-2027 and web2 did not exist in July (together 31 975 requests over 28–29/10 = **24 % of October's traffic**).
+
+**The drift is NOT uniform, and that is the answer's substance**: ai-01 ×8,8/day (2 304 → 20 351; 15 % → 31 % of fleet traffic — in July half its requests were `opus-4-8`), po-2024 ×16,9 (463 → 7 814), po-2023 ×2,9, po-2025 ×2,7, web1 ×4,6, and **(none) ×0,8 — down in absolute terms** (3 314 → 2 658/day). Global ×4,3 — and July's daily volume is flat across weekdays and weekends alike (15 402 vs 15 332/day), so the weekday-only October window does not skew the ratio.
+
+**12/07 is REFUSED and excluded from the window**: its index lists 12 265 request members, the stream parses 12 239 — **deterministically, over two independent runs** — so the archive genuinely holds 26 members that do not open with a parseable envelope, and which 26 they are is unknowable from the stream. A 0,2 % gap would print a plausible-looking census; the boundary cross-check refuses it instead. The window is the 11 clean days, and any July figure quoted elsewhere must say so.
+
 **Four traps, all measured, all pinned:**
 
 - **The boundary marker is the envelope's OPENING** (its timestamp AND the key that follows it), not `{"ts":` — a body may embed a JSON object carrying a `ts` key, and a loose marker splits the stream in the middle of a body. The head count is cross-checked against the **archive index** (`7z l -slt`): a marker that disagrees with the index did not split that archive cleanly, and the run **refuses** (`BOUNDARY_MISMATCH`) instead of printing a census that looks complete and is wrong.
@@ -216,7 +229,7 @@ python .\scripts\turn-composition.py archive --archives "D:\claudish-captures\ar
 - **The response captures carry no machine.** `resp-*.sse` opens with a comment header (parser, model, `reqN`, pid, instance, elapsed) — the fleet identity lives only in the request envelope. An archive whose request members are missing **cannot be attributed by another route**.
 - **`7z e` needs `-r`**: the members are stored under their relative path and the wildcard matches the full path; without it the extraction matches nothing and returns an empty stream — which the index cross-check turns into a loud failure rather than a zero census.
 
-**The archives are on `G:` once the local copy is purged, and `G:` is a degraded path**: a *directory listing* of `G:\Mon Drive\Backups-Cloud\claudish\` took **15 minutes** on 30/10. A single-archive read is a different cost — measure it before planning a window.
+**The archives are on `G:` once the local copy is purged, and `G:` is a degraded path — but the cost is front-loaded, not per-read**: a *directory listing* of `G:\Mon Drive\Backups-Cloud\claudish\` took **15 minutes** on 30/10, and the first cold single-archive read ~10 minutes; the full 11-archive July window afterwards ran at **20–40 s/archive** (DriveFS warm). Plan for the cold first touch, not the warm pass.
 
 ## Machine attribution
 
