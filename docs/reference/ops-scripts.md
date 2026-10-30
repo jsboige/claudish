@@ -119,6 +119,8 @@ Six measured traps, each of which produced a wrong answer before its fix — the
 
 **Two fuel sources**: env names and `config.json → apiKeys` names. #730's first false NO-FUEL came from an audit that only read env; #740 added the config source.
 
+**A THIRD fuel source — the Codex OAuth bind (measured 2026-10-30 on the hub, po-2025).** `cx@` (openai-codex: `gpt-6-sol`, `gpt-6-astra`) authenticates with the **bind file** `codex-oauth.json` in the same claudish home, and with nothing else: there is no `OPENAI_CODEX_API_KEY`, and `GOOGLE_API_KEY` / `GEMINI_API_KEY` — the two names the `google` bucket looks for — have nothing to do with it. An audit that knows only env + `apiKeys` therefore reads that rung as **fuel-less**, and a reader who trusts it may pull `cx@` out of the canon: that rung is **barreau 0 of the OPUS and FABLE roles**, and its token expires **2026-11-02T09:21Z**. The bind is therefore consulted **per rung** (it fuels a `cx@` rung and nothing else — a `google`-bucket `gemini@` rung is still fabric-less), and only presence booleans and the expiry date leave it. Pins: bind present → READY, bind absent → NO-FUEL on the same seat, the bind must not fuel a non-`cx@` rung, and no token / account id ever reaches stdout.
+
 **Which `config.json` — the home precedence (#743, third false NO-FUEL, 2026-10-28).** The file that matters is the one the **CONTAINER** reads, not the host user's:
 
 1. explicit `-ClaudishHome <path>` — what the suite uses to stay off the running machine;
