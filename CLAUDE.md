@@ -23,6 +23,7 @@ Planned-but-unimplemented work — the SEP-1686 channel migration, optional `not
 | Sidecar deployment runbook | `docs/deployment/relay-sidecar-deployment.md` |
 | Model routing narratives (native pin #218, foreign-credential guard #296, MiniMax forced-thinking chain, input counters #179) | `docs/reference/model-routing.md` |
 | Never-hang narratives (drain design and measurements, 1017-response corpus, instrument-filter calibration) | `docs/reference/never-hang.md` |
+| Lean audit — fleet productivity chantier (mandate 30/10: per-poste split, review round-trips, Hermes/Nanoclaw, paperasse vs durability; grain 1 = the ×4 mixture shift) | `docs/reference/lean-audit-2026-10.md` |
 | `test:strict` full mechanics (#175 — entry keys, module-load deaths, bun double-count, classes 2/2b) | `docs/reference/test-strict.md` |
 
 ## Fleet-Rollout Verification (hard rule, mandate 2026-09-12)
