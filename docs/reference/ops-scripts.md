@@ -88,6 +88,21 @@ nightly 7z compaction + GDrive backup (02:47 — moved off 04:17 on 2026-08-20: 
 
 **Tests**: `scripts/tests/claudish-split-brain-scan.Tests.ps1` (both `powershell.exe` 5.1 and `pwsh` 7), fixtures injected by mocking the three OS sources (`Get-CimInstance` — which also throws on any `-Filter`, pinning the single-snapshot rule — / `Get-ScheduledTask` / `Get-ScheduledTaskInfo`); the roster section runs on REAL fixture transcripts written to temp dirs with old mtimes on purpose (the arming must be readable outside every mtime window).
 
+### Reading a `TASK-NONZERO-RESULT` flag that names somebody else's task
+
+The scan flags a non-zero `LastTaskResult` on ANY task, including tasks this repo does not own. **The flag is correct; the attribution is the reader's job.** A daily-failing task on po-2025, `\Recycle-Worktrees-Fleet` (hidden launcher `hidden-launchers\Recycle-Worktrees-Fleet.vbs` — `Run(cmd, 0, True)` ⇒ SW_HIDE, so it is invisible to `CronList` and to the session roster), returns `1` at every run (every ~15–20 min) and therefore produced **14 `TASK-NONZERO-RESULT` events in the 4 h window 2026-10-29T20:38Z→2026-10-30T00:36Z** in `~/.claudish/session-watch.log` (11 in one full day, first measured) — **one** root cause, so they must be relayed as **one aggregate WARN**, never one per event.
+
+The organ's own report (`G:\Mon Drive\Maintenance\outputs\recycle_worktrees_fleet-<MACHINE>\report-<stamp>.json`, `totals: {removable, refused, applied, scanned}`) names the two classes, and they are **refusals, not corruption**:
+
+| class | verbatim stderr | meaning |
+| --- | --- | --- |
+| stale worktree lock | `fatal: cannot remove a locked working tree, lock reason: claude agent agent-XXXX (pid 50848)` | a `git worktree` **lock file** (reason + pid). A dead pid + an old lock date ⇒ the lock is stale, not a live session. A lock blocks `git worktree remove`; it does not mean the tree is bad. |
+| submodule worktree | `fatal: working trees containing submodules cannot be moved or removed` | git refuses by design — a worktree with submodules cannot be moved or removed at all, so the attempt must never be made. |
+
+Measured 29/10 on po-2025: 6 locked worktrees (2.84 GB) in `D:\dev\2025-MSMIN5IN52-GenAI`, all at main's HEAD `5e22b96b…` with **zero unique commits** (⇒ preservation provable before any removal), locks dated 08/09/2026, pid 50848 dead; plus 16 CoursIA worktrees with submodules. Unlocking the 6 stale locks is **git metadata only** (no deletion) and leaves the decision to the organ's own policy at its next run.
+
+**Ownership is the point**: the prune logic lives in `D:\Dev\CoursIA-2\scripts\ci\prune_merged_worktrees.py`, the wrapper in `C:\ProgramData\maint-scripts\recycle_worktrees_fleet.ps1` — **neither is in this repo**. A defect there is **reported to its owner**, never patched from this lane, and the fix is not "make the exit code 0" but "a locked worktree is a REFUSAL and a submodule worktree is not attempted".
+
 ## Content-level split-brain discriminator (`split-brain-content.py`, #41)
 
 **Read-only, capture-side complement to `split-brain-scan.ps1`.** The host scan answers "is a session id duplicated on this machine?"; this one answers the question a host scan cannot, from the hub's own captures: *inside one `session_id`, are two message sequences cohabiting?* (user directive 2026-10-09 — when metadata cannot separate two sequences under one lane, descend to the content). A Claude Code conversation is append-only, so each request's user-message history extends the previous one; the instrument reconstructs those histories and flags sequences that are disjoint **and concurrently alive**.
