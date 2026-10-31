@@ -175,6 +175,32 @@ the relay-**bypassed** *local* clients are shielded from a hub outage — which 
 argument for pointing the WAN entry at a relay rather than straight at the hub
 (`models.myia.io`, IIS site id=49).
 
+## Reading the relay's verdict lines (§Verdicts)
+
+Every verdict line is a decision the relay made under its own arming rules — the line says what the
+relay concluded, never why the conclusion is true. Reading rules, each anchored to a measured
+window:
+
+- **The transition line names its TRIGGER, and the trigger is not the cause.** `DOWN after 2
+  failure(s) (heartbeat) → AUTONOMOUS` arms on the heartbeat channel; `DOWN after 2 failure(s)
+  (forward-connect: …)` arms on forwarded requests. The parenthetical says which channel tripped —
+  deciding between client-side transport and hub-end availability still takes the two-signatures
+  table above.
+- **Count episodes by lines that END with `AUTONOMOUS`** — the word mid-line is not a transition
+  (the ~6× overcount rule of `traffic-analysis.md` applies verbatim).
+- **`(aborted-on-autonomous)` lines are the trip cost, not client errors.** In-flight forwards
+  aborted when the mode armed are re-served locally (`this request served LOCALLY [n/2 before
+  AUTONOMOUS]` — the counter is the arming count this forward fed, the #80 precondition in action).
+- **Recovery is two lines, and the second is the verdict.** `deep probe OK — message_stop after
+  <n>ms` then `healthy again → NOMINAL (relay resumed)`: the deep probe (a real tool-call stream)
+  is the gate; the heartbeats only earned it a hearing. Measured 31/10 on po-2024: hub entry down
+  05:12:59Z, sidecar AUTONOMOUS 05:13:12Z (13 s later), entry back 05:36:32Z, deep probe OK
+  (8 332 ms) → NOMINAL 05:36:36Z — 23 min 24 s autonomous, 301 requests served locally, zero
+  client errors. The probe's seconds are dead time added to recovery by design: hysteresis's price.
+- **A quiet AUTONOMOUS window says nothing about the hub** — once autonomous the relay sends
+  nothing upstream, so no client request can refute the verdict (the asymmetry pinned above);
+  corroborate hub-side (watchdog probes, capture gaps) before reading a flap window as hub time.
+
 ## Tests
 
 `relay.test.ts` (16 — hysteresis, header build incl. ai-01 Opus passthrough, gzip, never-hang delegation). Budget-free resilience E2E: `bun run packages/cli/src/fork/server/relay-e2e.ts` (real prober + mock hub: NOMINAL → FAILOVER → RECOVERY over real HTTP, ~2-3 min).
