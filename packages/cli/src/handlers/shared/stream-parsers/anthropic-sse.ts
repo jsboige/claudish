@@ -16,6 +16,7 @@ import { createResponseCapture } from "../response-capture.js";
 import { ttftMarkerLine } from "../traffic-markers.js";
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import { executeWebFetch } from "../web-search-executor.js";
+import { passthroughFrame, reconcileFrame } from "./frame-coherence.js";
 import {
   isPolicyRefusal,
   logPolicyRefusal,
@@ -34,6 +35,17 @@ import {
  * more before degrading to the notice it would have got anyway.
  */
 const PRE_VISIBLE_REFORWARD_BACKOFF_MS: readonly number[] = [400, 1_200];
+
+/**
+ * Kill switch for the frame-coherence repair (review ai-01, 30/10), re-read per
+ * stream (the caller resolves it once per request). It rewrites client-visible
+ * frames on the hottest path of every anthropic-wire lane, so it must be
+ * removable without a deploy — `=0` relays every frame exactly as the upstream
+ * sent it. Absent/empty = enabled.
+ */
+function frameCoherenceEnabled(): boolean {
+  return process.env.CLAUDISH_FRAME_COHERENCE !== "0";
+}
 
 /**
  * Bound AND kill switch for the pre-visible re-forward, re-read per stream.
@@ -139,6 +151,9 @@ export function createAnthropicPassthroughStream(
         // read, so the event line is buffered for exactly one line. Held on
         // BOTH paths: every drop site below (thinking suppression, server
         // tool suppression, orphan frames) lives on one path or the other.
+        // The repair's kill switch, resolved ONCE per stream (= per request):
+        // `CLAUDISH_FRAME_COHERENCE=0` relays every frame untouched.
+        const coherenceEnabled = frameCoherenceEnabled();
         let pendingEventLine: string | null = null;
         /** A frame was just dropped — swallow its trailing blank separator too. */
         let suppressedFrame = false;
@@ -156,11 +171,31 @@ export function createAnthropicPassthroughStream(
           }
           pendingEventLine = null;
         };
-        /** Emit a data line (flushing its held `event:` line first, in order). */
+        /**
+         * Emit a data line (flushing its held `event:` line first, in order).
+         *
+         * Frame coherence (frame-coherence.ts): the held `event:` line and the
+         * frame's JSON `type` are reconciled BEFORE either is forwarded. The
+         * Anthropic client SDK reads a frame as a PAIR and dies — or silently
+         * loses the answer — when the two disagree; the proxy is the last hop
+         * before the client, so an incoherent pair it relays is a dead turn.
+         * A frame that is already coherent is forwarded byte-for-byte.
+         */
         const emitDataLine = (text: string) => {
+          const frame = coherenceEnabled
+            ? reconcileFrame(pendingEventLine, text)
+            : passthroughFrame(pendingEventLine, text);
+          if (frame.changed) {
+            log(
+              `[AnthropicSSE] Frame coherence repair (${frame.reason}): event="${frame.eventName ?? "-"}" json_type="${frame.jsonType ?? "-"}" (model=${opts.modelName})`
+            );
+          }
+          // The repaired/synthesized event line takes the held slot; the flush
+          // below emits it BEFORE the data line, in order, as before.
+          pendingEventLine = frame.eventLine;
           flushPendingEvent();
           if (!isClosed) {
-            controller.enqueue(encoder.encode(text + "\n"));
+            controller.enqueue(encoder.encode(frame.dataLine + "\n"));
             // #286 — one choke point for every data-line emission (both filter
             // branches, the remap layer, the unparseable pass-through): what was
             // FORWARDED is client-visible whatever its schema. See the flag's
