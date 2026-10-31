@@ -291,6 +291,27 @@ called a measurement an absence of signal. The per-minute event-loop series
 above) is a documented defect, not a fixed one — now **#782**, with the
 suggested route (`State.StartedAt`, a per-restart anchor).
 
+## 2026-10-31 — the WAN façade's IIS logs are UTC, not local
+
+`u_ex*.log` under `W3SVC49` (the `models.myia.io` site on po-2023) timestamps
+in **UTC**, per the W3C default. Measured on the 31/10 05:13→05:36Z outage:
+the 502 storm reads `05:13:16→05:36:47` in-log and matches the relay's UTC
+window to the second, while a naive local-time (UTC+1) filter lands one hour
+after the outage and reads it as calm — 393× 200, exactly the post-recovery
+traffic. Reading rule: before joining an IIS window to a relay/docker window,
+anchor on a shared event (a restart's 502 burst), never on an assumed
+timezone.
+
+That same window, counted at the façade (impact of the hub outage): **220×
+502** on `:443` — 49 workload POSTs (`/v1/messages`, bodies 311–707 KB, client
+retry loops) from two remote seats (`IP-A [redacted]`, `IP-B [redacted]`), 164
+canary `/health` 502s, 3 localhost probes, 4 scanner hits. The outage read
+from outside was **not binary**: 200s flowed until **05:21Z** interleaved
+with the first 502s (flapping phase), zero 200s **05:22→05:36Z** (hard-down,
+even `/health` degraded to 400), recovery **05:36:15Z+**. The separate
+04:52:55–04:53:28Z burst (18× 502) is the hub-seat watchdog's proactive
+restart, not the outage.
+
 ## Compose environment surface
 
 `docker-compose.yml` carries a default for every relay variable, so the hub runs with **no `.env` at
