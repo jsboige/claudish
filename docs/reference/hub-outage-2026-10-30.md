@@ -21,7 +21,7 @@
 2. **Chaque coupure suit le même schéma en trois temps** : (a) le CLI docker cesse de
    répondre (le watchdog et les collecteurs se taisent — leurs ticks s'arrêtent AVANT
    la coupure de trafic) ; (b) la porte fleet-facing meurt (l'entrée du hub tombe à
-   zéro alors que le process continuait de répondre sur loopback) ; (c) le user
+   zéro ; rien n'indique une mort du process, mais loopback n'est pas mesuré pendant les trous) ; (c) le user
    rebootte l'hôte, le conteneur revient en ~3 min, le trafic reprend instantanément.
 3. **Le hub a servi du trafic normal jusqu'à ~09:30Z** — la fenêtre « 08:44Z » rapportée
    par les sièges n'est pas celle de la mort de la porte. Le process n'est mort pour
