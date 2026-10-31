@@ -171,7 +171,13 @@ $script:BucketAliases = @{
     'ds' = 'deepseek'; 'deepseek' = 'deepseek'
     'kc' = 'kimi'; 'kimi' = 'kimi'; 'moon' = 'kimi'; 'moonshot' = 'kimi'
     'mm' = 'minimax'; 'mmax' = 'minimax'; 'mmc' = 'minimax'; 'minimax' = 'minimax'
-    'g' = 'google'; 'google' = 'google'; 'cx' = 'google'; 'gemini' = 'google'
+    'g' = 'google'; 'google' = 'google'; 'gemini' = 'google'
+    # 'cx' is NOT google: the proxy resolves the shortcut to openai-codex and
+    # walls that bucket separately (parseModelSpec -> classifyNominalBucket,
+    # failover.ts #275). Mapping it to google made a cascade carrying both
+    # 'g@...' and 'cx@...' count ONE bucket where the proxy walls TWO, and a
+    # google-nominal seat read its cx@ rung as same-bucket (false NO-FUEL).
+    'cx' = 'openai-codex'; 'openai-codex' = 'openai-codex'
     'oai' = 'openai'; 'openai' = 'openai'
     'litellm' = 'litellm'; 'ollama' = 'local'; 'llama' = 'local'; 'll' = 'local'
     'lmstudio' = 'local'
@@ -204,6 +210,9 @@ $script:FuelEnvByBucket = @{
     'kimi' = @('KIMI_API_KEY', 'MOONSHOT_API_KEY', 'KIMI_CODING_API_KEY')
     'minimax' = @('MINIMAX_API_KEY', 'MINIMAX_GROUP_ID', 'MINIMAX_CODING_API_KEY')
     'google' = @('GOOGLE_API_KEY', 'GEMINI_API_KEY')
+    # Empty on purpose: NO env name proves fuel for the codex bucket - the
+    # OAuth bind file is its only credential (see Get-OAuthBindFuel).
+    'openai-codex' = @()
     'openai' = @('OPENAI_API_KEY')
     'anthropic-native' = @('ANTHROPIC_API_KEY')
     'qwen-token-plan' = @('QWEN_TOKEN_PLAN_API_KEY')
@@ -246,7 +255,20 @@ function Get-OAuthBindFuel([string]$HomePath) {
     try {
         $b = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     }
-    catch { return $null }
+    catch {
+        # A file that EXISTS but does not parse (a half-written refresh leaves
+        # exactly this) is NOT the same as no bind. Returning $null here made
+        # the audit print 'absent' - the silent-source failure family this
+        # whole script exists to kill. Present, unreadable, not counted as
+        # fuel: the reader gets the third state and decides.
+        return [pscustomobject]@{
+            Present         = $true
+            Readable        = $false
+            HasAccessToken  = $false
+            HasRefreshToken = $false
+            ExpiresAtUtc    = $null
+        }
+    }
     $expires = $null
     try {
         if ($null -ne $b.expires_at) {
@@ -255,8 +277,9 @@ function Get-OAuthBindFuel([string]$HomePath) {
     }
     catch { $expires = $null }
     return [pscustomobject]@{
-        Present        = $true
-        HasAccessToken = ($null -ne $b.access_token -and ([string]$b.access_token).Trim().Length -gt 0)
+        Present         = $true
+        Readable        = $true
+        HasAccessToken  = ($null -ne $b.access_token -and ([string]$b.access_token).Trim().Length -gt 0)
         HasRefreshToken = ($null -ne $b.refresh_token -and ([string]$b.refresh_token).Trim().Length -gt 0)
         ExpiresAtUtc   = $expires
     }
@@ -502,7 +525,11 @@ function Invoke-SeatAudit {
     # STATED whether it is there or not - a source consulted silently is how the
     # false NO-FUEL of 2026-10-28 happened in the first place.
     $oauthBind = Get-OAuthBindFuel $configHome.Path
-    $bindState = if ($null -eq $oauthBind) { 'absent' } else { 'present' }
+    $bindState = 'absent'
+    if ($null -ne $oauthBind) {
+        $bindState = 'present'
+        if (-not $oauthBind.Readable) { $bindState = 'present, unreadable - not counted as fuel' }
+    }
     if ($null -eq $configKeys) {
         Write-Output ("  fuel sources     : env only - config unreadable at {0}\apiKeys (a seat whose keys live only there reads NO-FUEL on this source's silence); Codex OAuth bind: {1}" -f $configHome.Path, $bindState)
     }
@@ -510,16 +537,20 @@ function Invoke-SeatAudit {
         Write-Output ("  fuel sources     : env + config ({0} apiKey name(s) in the mounted home; values never read out); Codex OAuth bind: {1}" -f $configKeys.Count, $bindState)
     }
     foreach ($role in $cascadeRoles.Keys) {
-        # Third source, checked PER RUNG: the OAuth bind fuels the cx@ rung and
-        # nothing else. A seat whose only non-nominal rung is cx@ is READY when
-        # the bind is there - and NO-FUEL when it is not. Checked BEFORE the
-        # monobucket bail-out below: a role whose other rungs all sit in the
-        # nominal bucket can still escape the wall through a cx@ rung.
+        # Third source, as a BUCKET rule: the OAuth bind fuels the
+        # 'openai-codex' bucket and nothing else (any rung spelling that
+        # resolves there - cx@..., openai-codex@...). A seat whose only
+        # non-nominal rung is cx@ is READY when the bind is there - and
+        # NO-FUEL when it is not. Checked BEFORE the monobucket bail-out
+        # below: a role whose other rungs all sit in the nominal bucket can
+        # still escape the wall through a cx@ rung. The generic loop below
+        # finds no env name for this bucket (the table entry is empty), so
+        # the bind is its only route to fuel.
         foreach ($rung in @($rungsByRole[$role])) {
-            if ($rung -notmatch '^(cx|openai-codex)@') { continue }
             $rbucket = Get-BucketOfRung $rung
-            if ($rbucket -eq $NominalBucket -or $rbucket -eq 'delegated' -or $rbucket -eq 'unknown') { continue }
-            if ($null -ne $oauthBind -and $oauthBind.HasAccessToken) {
+            if ($rbucket -ne 'openai-codex') { continue }
+            if ($rbucket -eq $NominalBucket) { continue }
+            if ($null -ne $oauthBind -and $oauthBind.Readable -and $oauthBind.HasAccessToken) {
                 $credentialedNonNominal = $true
                 if (-not $reportedBuckets.ContainsKey('oauth-bind')) {
                     $reportedBuckets['oauth-bind'] = $true

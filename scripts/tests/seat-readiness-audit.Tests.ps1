@@ -52,7 +52,10 @@ BeforeAll {
             [hashtable]$MountedConfigApiKeys,
             # The THIRD fuel source: a Codex OAuth bind file in the same home.
             # $true writes a bind with fake tokens; $false writes none.
+            # $GarbageOAuthBind writes a present-but-unparseable file - exactly
+            # what a half-written refresh leaves behind (review item 2, #774).
             [switch]$WithOAuthBind,
+            [switch]$GarbageOAuthBind,
             [switch]$NoExplicitHome,
             # Spell the mount SOURCE the way Docker Desktop records a Windows
             # bind mount (`/run/desktop/mnt/host/c/...`), while the file really
@@ -92,6 +95,14 @@ BeforeAll {
             [System.IO.File]::WriteAllText(
                 (Join-Path $auditHome 'codex-oauth.json'),
                 $bind,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+        if ($GarbageOAuthBind) {
+            # Truncated mid-object: present, never parseable.
+            [System.IO.File]::WriteAllText(
+                (Join-Path $auditHome 'codex-oauth.json'),
+                '{"access_token":',
                 (New-Object System.Text.UTF8Encoding($false))
             )
         }
@@ -439,9 +450,11 @@ Describe 'seat-readiness-audit' {
             $r.Out | Should -Match 'Codex OAuth bind: absent'
         }
 
-        It 'the bind does NOT fuel a google-bucket rung that is not cx@ (per-rung, not per-bucket)' {
-            # gemini@ sits in the same 'google' bucket as cx@ but has nothing to
-            # do with the bind: counting the bind for it would invent fabric.
+        It 'the bind does NOT fuel a google-bucket rung (the bind is the codex bucket rule, not google)' {
+            # gemini@ sits in 'google'; the bind fuels 'openai-codex' only.
+            # Before #774 the cx@ alias mapped into 'google', so the audit
+            # printed "bucket 'google' has the Codex OAuth bind" - a reader
+            # was told an OpenAI credential held a Google bucket.
             $env = @(
                 'PATH=/usr/bin',
                 'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
@@ -451,6 +464,39 @@ Describe 'seat-readiness-audit' {
             $r = Invoke-Audit -EnvLines $env -WithOAuthBind
             $r.Code | Should -Be 1
             $r.Out | Should -Match 'seat-readiness: NO-FUEL'
+            $r.Out | Should -Not -Match "bucket 'google' has the Codex OAuth bind"
+        }
+
+        It 'THE PIN (#774 R1): g@ and cx@ rungs are DISTINCT buckets - the fabric is not under-counted' {
+            # The proxy walls these two separately (openai-codex is its own
+            # bucket, failover.ts classifyNominalBucket). Old mapping folded
+            # cx@ into 'google': one bucket where the proxy sees two, and a
+            # google-nominal seat would read its cx@ rung as same-bucket.
+            $env = @(
+                'PATH=/usr/bin',
+                'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
+                'CLAUDISH_FAILOVER_OPUS=g@gemini-2.0-flash>cx@gpt-6.1-sol',
+                'CLAUDISH_FAILOVER_ACTIVE=opus'
+            )
+            $r = Invoke-Audit -EnvLines $env -WithOAuthBind
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'seat-readiness: READY'
+            $r.Out | Should -Match 'buckets \[google, openai-codex\]'
+            $r.Out | Should -Match "bucket 'openai-codex' has the Codex OAuth bind codex-oauth\.json"
+            $r.Out | Should -Not -Match "bucket 'google' has the Codex OAuth bind"
+        }
+
+        It 'THE PIN (#774 R2): a present-but-unreadable bind reads as its own state, never as absent' {
+            # A truncated codex-oauth.json is exactly what a half-written
+            # refresh leaves behind. Reading it as "absent" is the
+            # silent-source failure family this script exists to kill.
+            $r = Invoke-Audit -EnvLines (New-CodexOnlyEnv) -GarbageOAuthBind
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'seat-readiness: NO-FUEL'
+            $r.Out | Should -Match 'Codex OAuth bind: present, unreadable - not counted as fuel'
+            $r.Out | Should -Not -Match 'Codex OAuth bind: absent'
+            # unreadable proves nothing: no fuel claim may be printed off it
+            $r.Out | Should -Not -Match 'has the Codex OAuth bind codex-oauth\.json'
         }
 
         It 'the value firewall covers the bind too: no token, no account id' {
