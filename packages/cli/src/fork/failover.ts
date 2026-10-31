@@ -2287,6 +2287,49 @@ export function isWiringError(status: number, body: string): boolean {
 }
 
 /**
+ * Machine-readable identity of an upstream error body — #739(b).
+ *
+ * The STEP-ADVANCE marker says `HTTP 400 (non-quota)` and nothing else about
+ * the body. Measured 29/10: two 400s from the same provider, one recognized
+ * and one not 37 s apart, were indistinguishable after the fact — the
+ * unrecognized one left no line in any instrument (the failover journal only
+ * keeps `[Failover]` markers, and an error response writes no capture), so
+ * "find the text difference" had no substrate. This closes that gap at the
+ * only place the body is still in hand: the marker.
+ *
+ * Extracts ONLY structured identity tokens — `error.code`, `error.type`, and
+ * a top-level `code` — never free text. A marker that echoed provider prose
+ * would put arbitrary upstream bytes on the docker log, which anyone with hub
+ * access reads. Top-level `type` is deliberately skipped: Anthropic's error
+ * envelope sets it to the literal string "error" on every failure, so it
+ * carries no information — and OpenAI's `error.type` is already covered.
+ *
+ * Bounded on purpose: `[A-Za-z0-9._-]{1,64}` per token, at most two distinct
+ * tokens joined by `/`, `""` when the body offers nothing structured. The
+ * ordering (code before type) keeps the more specific token first.
+ */
+export function stepFailBodyClass(body: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body || "");
+  } catch {
+    return "";
+  }
+  if (typeof parsed !== "object" || parsed === null) return "";
+  const err = (parsed as Record<string, unknown>).error;
+  const errObj = typeof err === "object" && err !== null ? (err as Record<string, unknown>) : null;
+  const candidates = [errObj?.code, errObj?.type, (parsed as Record<string, unknown>).code];
+  const tokens: string[] = [];
+  for (const c of candidates) {
+    if (typeof c !== "string") continue;
+    if (!/^[A-Za-z0-9._-]{1,64}$/.test(c)) continue;
+    if (!tokens.includes(c)) tokens.push(c);
+    if (tokens.length === 2) break;
+  }
+  return tokens.join("/");
+}
+
+/**
  * Called by the cascade loop when the NOMINAL model answered successfully for `role`
  * drawing on `bucket`. Clears that bucket's refusal run and TTL escalation (healthy
  * nominal = fresh episode for the METER) and, if (role|bucket) was serving under a

@@ -281,6 +281,10 @@ services:
       # and surfaces the provider's own 400 instead of a labeled local refusal).
       # Empty = census ON. Read-per-request.
       - CLAUDISH_CONTEXT_ADMISSION=${CLAUDISH_CONTEXT_ADMISSION:-}
+      # #772 — frame-coherence kill switch: "0" relays every SSE frame exactly as
+      # the upstream sent it (no event/type repair). Empty = repair ON. Read once
+      # per stream, i.e. per request.
+      - CLAUDISH_FRAME_COHERENCE=${CLAUDISH_FRAME_COHERENCE:-}
       # #310 — runtime knobs the proxy reads that were never in this list
       # (same absence class as the #304 failover knobs above: the env file only
       # interpolates, so a value set for a name this list does not carry never
