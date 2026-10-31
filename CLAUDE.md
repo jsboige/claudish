@@ -18,6 +18,7 @@ Planned-but-unimplemented work — the SEP-1686 channel migration, optional `not
 | Haiku → swift debrayage — staged widening (Q-po2025-31 : gates R/C mesurés avant toute levée du STEP_EXCLUDE ai-01 ; po-2028 durablement exclu) | `docs/reference/haiku-swift-debrayage.md` · entry `ROADMAP.md` |
 | OpenAI-compatible ingress (`/v1/chat/completions`) request/response translation | `docs/reference/openai-ingress.md` |
 | Traffic scripts, capture format, leak diagnostics | `docs/reference/traffic-analysis.md` |
+| Surconsommation #445 — D1 qualitative (what is *inside* the turns), the four-loader floor taxonomy, the compaction-threshold counterfactual | `docs/reference/surconsommation-445.md` · issue `claudish#445` |
 | Ops scripts runbook — watchdog, drained restart/recreate, docker lifecycle events, nightly compaction and the shared off-site archive namespace | `docs/reference/ops-scripts.md` |
 | Channel wire format, client gating, tracing | `docs/reference/channel-mode.md` |
 | Sidecar deployment runbook | `docs/deployment/relay-sidecar-deployment.md` |
