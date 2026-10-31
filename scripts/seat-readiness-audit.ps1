@@ -54,6 +54,20 @@
   The config read follows the same firewall as the env read: NAMES and
   presence only, values never leave the function.
 
+  A THIRD fuel source exists, and it is the one that was invisible (measured
+  2026-10-30 on the hub, po-2025): the Codex OAuth BIND FILE,
+  `codex-oauth.json`, in the same claudish home. `cx@` (openai-codex:
+  gpt-6-sol, gpt-6-astra) authenticates with that file and with NOTHING else
+  - there is no OPENAI_CODEX_API_KEY, and GOOGLE_API_KEY / GEMINI_API_KEY
+  (the two names the 'google' bucket looks for) have nothing to do with it. An
+  audit that knows only env + apiKeys map sees that rung as FUEL-LESS, and a
+  reader who trusts it may pull `cx@` out of the canon - which is exactly the
+  cliff the coordinator flagged on 2026-10-29 (barreau 0 of the OPUS and
+  FABLE roles, token expiring 2026-11-02T09:21Z). The bind is therefore
+  consulted PER RUNG (it fuels a cx@ rung and nothing else - a google-bucket
+  gemini@ rung is still fabric-less), and only presence booleans and the
+  EXPIRY DATE leave it.
+
   WHICH HOME, though - and this is where source two went wrong next
   (2026-10-28, third false NO-FUEL of the day). The audit used to read
   `$env:USERPROFILE\.claudish`, a HOST path. The path the proxy actually reads
@@ -157,7 +171,13 @@ $script:BucketAliases = @{
     'ds' = 'deepseek'; 'deepseek' = 'deepseek'
     'kc' = 'kimi'; 'kimi' = 'kimi'; 'moon' = 'kimi'; 'moonshot' = 'kimi'
     'mm' = 'minimax'; 'mmax' = 'minimax'; 'mmc' = 'minimax'; 'minimax' = 'minimax'
-    'g' = 'google'; 'google' = 'google'; 'cx' = 'google'; 'gemini' = 'google'
+    'g' = 'google'; 'google' = 'google'; 'gemini' = 'google'
+    # 'cx' is NOT google: the proxy resolves the shortcut to openai-codex and
+    # walls that bucket separately (parseModelSpec -> classifyNominalBucket,
+    # failover.ts #275). Mapping it to google made a cascade carrying both
+    # 'g@...' and 'cx@...' count ONE bucket where the proxy walls TWO, and a
+    # google-nominal seat read its cx@ rung as same-bucket (false NO-FUEL).
+    'cx' = 'openai-codex'; 'openai-codex' = 'openai-codex'
     'oai' = 'openai'; 'openai' = 'openai'
     'litellm' = 'litellm'; 'ollama' = 'local'; 'llama' = 'local'; 'll' = 'local'
     'lmstudio' = 'local'
@@ -190,6 +210,9 @@ $script:FuelEnvByBucket = @{
     'kimi' = @('KIMI_API_KEY', 'MOONSHOT_API_KEY', 'KIMI_CODING_API_KEY')
     'minimax' = @('MINIMAX_API_KEY', 'MINIMAX_GROUP_ID', 'MINIMAX_CODING_API_KEY')
     'google' = @('GOOGLE_API_KEY', 'GEMINI_API_KEY')
+    # Empty on purpose: NO env name proves fuel for the codex bucket - the
+    # OAuth bind file is its only credential (see Get-OAuthBindFuel).
+    'openai-codex' = @()
     'openai' = @('OPENAI_API_KEY')
     'anthropic-native' = @('ANTHROPIC_API_KEY')
     'qwen-token-plan' = @('QWEN_TOKEN_PLAN_API_KEY')
@@ -211,6 +234,55 @@ function Get-FuelNamesForBucket([string]$Bucket) {
         if (-not $names.Contains($derived)) { $names.Add($derived) }
     }
     return $names.ToArray()
+}
+
+function Get-OAuthBindFuel([string]$HomePath) {
+    # The THIRD fuel source (measured 2026-10-30 on the hub, po-2025).
+    #
+    # `cx@` (openai-codex: gpt-6-sol, gpt-6-astra) authenticates with a BIND
+    # FILE in the claudish home - `codex-oauth.json` - and with NOTHING else:
+    # there is no OPENAI_CODEX_API_KEY, and GOOGLE_API_KEY / GEMINI_API_KEY
+    # (the two names the 'google' bucket looks for) have nothing to do with it.
+    # An audit that knows only env + apiKeys map therefore sees that rung as
+    # FUEL-LESS, and a reader who trusts it may pull `cx@` out of the canon -
+    # which is exactly the cliff the coordinator flagged on 2026-10-29
+    # (barreau 0 of the OPUS and FABLE roles, token expiring 2026-11-02).
+    #
+    # Firewall: presence booleans and the EXPIRY DATE only. No token, no
+    # account id, no token length - nothing that can be replayed.
+    $path = Join-Path $HomePath 'codex-oauth.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $b = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        # A file that EXISTS but does not parse (a half-written refresh leaves
+        # exactly this) is NOT the same as no bind. Returning $null here made
+        # the audit print 'absent' - the silent-source failure family this
+        # whole script exists to kill. Present, unreadable, not counted as
+        # fuel: the reader gets the third state and decides.
+        return [pscustomobject]@{
+            Present         = $true
+            Readable        = $false
+            HasAccessToken  = $false
+            HasRefreshToken = $false
+            ExpiresAtUtc    = $null
+        }
+    }
+    $expires = $null
+    try {
+        if ($null -ne $b.expires_at) {
+            $expires = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$b.expires_at).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        }
+    }
+    catch { $expires = $null }
+    return [pscustomobject]@{
+        Present         = $true
+        Readable        = $true
+        HasAccessToken  = ($null -ne $b.access_token -and ([string]$b.access_token).Trim().Length -gt 0)
+        HasRefreshToken = ($null -ne $b.refresh_token -and ([string]$b.refresh_token).Trim().Length -gt 0)
+        ExpiresAtUtc   = $expires
+    }
 }
 
 function Get-ConfigApiKeyNames([string]$HomePath) {
@@ -391,6 +463,7 @@ function Invoke-SeatAudit {
     # bucket structure per armed cascade: names of buckets only
     $rungBucketsByRole = @{}
     $rungCountByRole = @{}
+    $rungsByRole = @{}
     foreach ($role in $cascadeRoles.Keys) {
         # read the actual value to classify, expose ONLY derived structure
         $raw = Get-ContainerEnvRaw $ContainerName
@@ -400,6 +473,7 @@ function Invoke-SeatAudit {
         }
         $rungs = @($value -split '>' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         $rungCountByRole[$role] = $rungs.Count
+        $rungsByRole[$role] = $rungs
         $rungBucketsByRole[$role] = @($rungs | ForEach-Object { Get-BucketOfRung $_ } | Select-Object -Unique)
     }
 
@@ -447,13 +521,43 @@ function Invoke-SeatAudit {
     # not: a source consulted silently is how the false NO-FUEL of 2026-10-28
     # happened in the first place.
     $configKeys = Get-ConfigApiKeyNames $configHome.Path
+    # THIRD fuel source: the Codex OAuth bind (codex-oauth.json). Read once, and
+    # STATED whether it is there or not - a source consulted silently is how the
+    # false NO-FUEL of 2026-10-28 happened in the first place.
+    $oauthBind = Get-OAuthBindFuel $configHome.Path
+    $bindState = 'absent'
+    if ($null -ne $oauthBind) {
+        $bindState = 'present'
+        if (-not $oauthBind.Readable) { $bindState = 'present, unreadable - not counted as fuel' }
+    }
     if ($null -eq $configKeys) {
-        Write-Output ("  fuel sources     : env only - config unreadable at {0}\apiKeys (a seat whose keys live only there reads NO-FUEL on this source's silence)" -f $configHome.Path)
+        Write-Output ("  fuel sources     : env only - config unreadable at {0}\apiKeys (a seat whose keys live only there reads NO-FUEL on this source's silence); Codex OAuth bind: {1}" -f $configHome.Path, $bindState)
     }
     else {
-        Write-Output ("  fuel sources     : env + config ({0} apiKey name(s) in the mounted home; values never read out)" -f $configKeys.Count)
+        Write-Output ("  fuel sources     : env + config ({0} apiKey name(s) in the mounted home; values never read out); Codex OAuth bind: {1}" -f $configKeys.Count, $bindState)
     }
     foreach ($role in $cascadeRoles.Keys) {
+        # Third source, as a BUCKET rule: the OAuth bind fuels the
+        # 'openai-codex' bucket and nothing else (any rung spelling that
+        # resolves there - cx@..., openai-codex@...). A seat whose only
+        # non-nominal rung is cx@ is READY when the bind is there - and
+        # NO-FUEL when it is not. Checked BEFORE the monobucket bail-out
+        # below: a role whose other rungs all sit in the nominal bucket can
+        # still escape the wall through a cx@ rung. The generic loop below
+        # finds no env name for this bucket (the table entry is empty), so
+        # the bind is its only route to fuel.
+        foreach ($rung in @($rungsByRole[$role])) {
+            $rbucket = Get-BucketOfRung $rung
+            if ($rbucket -ne 'openai-codex') { continue }
+            if ($rbucket -eq $NominalBucket) { continue }
+            if ($null -ne $oauthBind -and $oauthBind.Readable -and $oauthBind.HasAccessToken) {
+                $credentialedNonNominal = $true
+                if (-not $reportedBuckets.ContainsKey('oauth-bind')) {
+                    $reportedBuckets['oauth-bind'] = $true
+                    Write-Output ("  fuel             : bucket '{0}' has the Codex OAuth bind codex-oauth.json (access={1}, refresh={2}, expires {3}; values never printed)" -f $rbucket, $oauthBind.HasAccessToken, $oauthBind.HasRefreshToken, $oauthBind.ExpiresAtUtc)
+                }
+            }
+        }
         $buckets = $rungBucketsByRole[$role]
         $nonNominal = @($buckets | Where-Object { $_ -ne $NominalBucket -and $_ -ne 'delegated' -and $_ -ne 'unknown' })
         if ($nonNominal.Count -eq 0) {
