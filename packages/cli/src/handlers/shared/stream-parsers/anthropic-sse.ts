@@ -37,6 +37,17 @@ import {
 const PRE_VISIBLE_REFORWARD_BACKOFF_MS: readonly number[] = [400, 1_200];
 
 /**
+ * Kill switch for the frame-coherence repair (review ai-01, 30/10), re-read per
+ * stream (the caller resolves it once per request). It rewrites client-visible
+ * frames on the hottest path of every anthropic-wire lane, so it must be
+ * removable without a deploy — `=0` relays every frame exactly as the upstream
+ * sent it. Absent/empty = enabled.
+ */
+function frameCoherenceEnabled(): boolean {
+  return process.env.CLAUDISH_FRAME_COHERENCE !== "0";
+}
+
+/**
  * Bound AND kill switch for the pre-visible re-forward, re-read per stream.
  *
  * `0` disables the behavior entirely, which is the positive control that the
@@ -44,16 +55,6 @@ const PRE_VISIBLE_REFORWARD_BACKOFF_MS: readonly number[] = [400, 1_200];
  * anthropic-wire lane needs a way to be taken back out without a deploy.
  * Values above the ladder length clamp to it (the ladder is the real bound).
  */
-/**
- * Kill switch for the frame-coherence repair (review ai-01, 30/10), re-read per
- * emission. It rewrites client-visible frames on the hottest path of every
- * anthropic-wire lane, so it must be removable without a deploy — `=0` relays
- * every frame exactly as the upstream sent it. Absent/empty = enabled.
- */
-function frameCoherenceEnabled(): boolean {
-  return process.env.CLAUDISH_FRAME_COHERENCE !== "0";
-}
-
 function preVisibleReforwardMax(): number {
   const raw = process.env.CLAUDISH_PREVISIBLE_REFORWARD_MAX;
   if (raw === undefined || raw.trim() === "") return PRE_VISIBLE_REFORWARD_BACKOFF_MS.length;
