@@ -35,7 +35,7 @@ de #445 ; tout levier nomme le contrôle qu'il touche (en principe aucun : on vi
 | | |
 |---|---|
 | Machine | `myia-ai-01`, coordinateur |
-| Workers | `po-2023` (= `po-203`), `po-2024`, `po-2025`, `po-2027` (hub-direct via le WAN) · `po-2026` **HS matériel** depuis le 10/10 (Maintenance#91) |
+| Workers | `po-2023` (= `po-203`), `po-2024`, `po-2025`, `po-2027` (hub-direct via le WAN), `po-2028` · `po-2026` **HS matériel** depuis le 10/10 (Maintenance#91) |
 | WAN | `models.myia.io` : IIS po-2023 → `.50:3000` ; porte po-2027 + crons hors site |
 | Périmètre | workspace `claudish` seul (`/coordinate` de roo-extensions est un autre mandat) |
 | Hub | `http://192.168.0.50:3000` — **po-2025** depuis le 05/09 |
@@ -145,10 +145,8 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 - Comparer avec `origin/main` fetché, jamais avec une ref locale du passé.
 - **Collisions** : tous poussent sous `jsboige`, donc comparer les `files`, pas les titres.
 - **Avant review ou merge** :
-  - lire le body, tous les commentaires, toutes les reviews avec leur `state`, et le diff ;
   - vérifier `Closes #NN` dans le body **et** dans les commits de branche (`git log origin/main..<branche>`) ;
-  - rejouer en local ; le job CI `test` exécute la suite complète (mesuré 23/10 : 2529 tests sur
-    155 fichiers), lire ses compteurs plutôt que sa couleur ;
+  - rejouer en local ; le job CI `test` peut sortir « success » avec des échecs : lire ses compteurs ;
   - faire tourner une mutation sur chaque garde ajoutée.
   - Pas de merge sur un CR non adressé. Mes CR sont des **commentaires** : écrire « attend TON push » dans
     la file du worker.
@@ -184,8 +182,7 @@ Détail et pièges (ctx.pages, réauthentification, périodes) : reference.md §
 
 Registre `memory/open-questions-ledger.md`. Toute question non bloquante y vit, au format : ce qui se
 passe · ce qui est demandé · ce qui arrive sans réponse · la reco · l'échéance. Elle n'en sort **que sur
-réponse du user** et se représente en Phase 6. On n'attend jamais une réponse pour exécuter. Le plan-mode et
-`AskUserQuestion` sont deny : ne pas les contourner.
+réponse du user** et se représente en Phase 6. On n'attend jamais une réponse pour exécuter.
 
 ### Phase 5b — Contrôle des gestes (mandat user 07/09)
 
@@ -206,8 +203,8 @@ réponse du user** et se représente en Phase 6. On n'attend jamais une réponse
 
 ### Phase 6 — Publication
 
-Commit + PR **avant** le rapport, avec `roosync_dashboard(action:"append", type:"workspace",
-content:"[DONE] …")`. Jamais de rapport dans un fichier du dépôt. Le bilan contient :
+`roosync_dashboard(action:"append", type:"workspace", content:"[DONE] …")`, après commit + PR. Le
+bilan contient :
 - le **registre des questions ouvertes**, tant qu'il n'est pas vide ;
 - le **tableau d'avancement mesuré** (user, 04/10) : PRs mergées/fermées/ouvertes depuis le cycle
   précédent ; chaque PR ouverte — qui la tient et son âge (toute PR > 24 h nommée) ; issues actionnables
