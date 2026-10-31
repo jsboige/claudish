@@ -15,8 +15,8 @@ traffic pass (central captures + GitHub). The executing siblings are the lanes o
 machines, which did not exist in July; **their first mandate stays the sidecar relay +
 aligned cascades** — Lean grains are P1 behind that, never in front of it.
 
-Companion numbers: `payg-budget-2026-10.md` (what a request costs, who burns it),
-`consumption-2026-10.md` (volume vs requests decomposition).
+Companion numbers: `payg-budget-2026-10.md` (#786, pending — what a request costs, who
+burns it), `consumption-2026-10.md` (#784, pending — volume vs requests decomposition).
 
 ## Grain 1 (30/10, measured — **corrected same evening after user challenge**)
 
@@ -45,9 +45,13 @@ combined in Oct per pass 1):
 | jsboige/roo-extensions | 206 | 235 | 489 | 344 | 1.7 (med 1) | +132/−4 | 2 |
 | jsboige/jsboige-mcp-servers | 265 | 116 | 204 | 298 | — | — | — |
 | ArgumentumGames/Argumentum | 284 | 159 | 366 | 368 | — | — | — |
-| jsboigeEpita/2025-Epita-Intelligence-Symbolique | 189 | 237 | 543 | 235 | 1.6 (med 1) | +4387/−4272 | **202** |
+| jsboigeEpita/2025-Epita-Intelligence-Symbolique | 189 | 237 | 543 | 235 | 1.6 (med 1) | +4387/−4272 | **202** ᵃ |
 | jsboigeEpita/2026-Epita-Intelligence-Symbolique | 22 | 0 | 0 | 0 | Jul: 5.5 | Jul: +3182/−40 | Jul: 20 |
 | **Total** | **967** | 791 | 1 751 | **1 606** | | | |
+
+ᵃ Sample mean of the ≤12-PR **detail** sample. The complete October population (W3,
+below) is **median 4, p90 10, mean 37.8, max 911** — the 202 describes 9 test-tree
+re-emissions, not the lane's per-PR work.
 
 (`jsboigeEpita/CoursIA` merged 0 PRs ever but shows **2 295 commits in July** — a
 direct-push workflow; commits ≈ merged PRs on every agent repo — squash — so "per commit"
@@ -71,10 +75,14 @@ Findings, corrected:
   (→ W2); (b) the "CI comments paid in reading" cost is near-zero *as text* today — CI's
   real cost is the **agent cycles each check-run notification triggers** (every cycle
   re-pays the ~100–144 k-token harness floor, → W6).
-- **Flag for the secrétaire lane**: 2025-Epita (CoursIA-3) merged 235 PRs in Oct at
-  **202 files/PR** (+4.4k/−4.2k lines each) — regeneration-shaped; solidification vs
-  paperwork is exactly W3's question. Note it also did 543 PRs in September — this lane's
-  volume doubled long before October.
+- **Flag for the secrétaire lane — corrected by W3 (31/10, complete population)**: the
+  202 files/PR figure was a sample mean. 2025-Epita (CoursIA-3) merged 235 PRs in Oct at
+  **median 4, p90 10, mean 37.8 files/PR** (max 911), with **93.1 % of October
+  file-events under `tests/`** and the 3 largest PRs ~98 % tests — content-addressed LLM
+  cassettes (`tests/fixtures/llm_cassettes/<sha256>.json`, added∩removed = 0). The flag
+  describes **9 test-tree re-emissions**, not the lane's review work; on file **volume**
+  only 7.1 % is regeneration (59.4 % of PRs are, by count). It also did 543 PRs in
+  September — this lane's volume doubled long before October.
 
 ## Grain W1 (31/10, measured — per-poste requests + token legs, one day)
 
@@ -143,6 +151,55 @@ robocopy <capture-dir> .tmp/w1-resps "resp-1-*<DAY>*" /NJH /NJS /NP /NDL /NFL
 #    (raw text search of the body is worthless — 2026-09-08 measurement); the body is
 #    JSON-escaped, so the line ends at a literal \n two-byte sequence, not a real newline
 ```
+
+## Grain W3 (31/10, harvested from po-2027 — 2025-Epita file anatomy, complete October population)
+
+Population: **234 October merges with files** (clone blob-less; every squashed PR = one
+`(#N)` commit; the API says 231 merged — a delta of 3 squashes whose `(#N)` suffix did not
+survive, stated as measurement margin). Two instruments were run (git-log clone here, REST
+API commit-by-commit on roo-extensions' seat); they agree on the core and one number is
+reconciled below.
+
+- **The "202 files/PR" flag is a queue artefact.** Distribution measured: **median 4,
+  p90 10, mean 37.8, max 911** — an overwhelming population of small PRs, the mean pulled
+  by 9 monsters at ≥500 files.
+- **The volume is test-tree re-emission.** **93.1 % of October file-events (8 226/8 836)
+  are under `tests/`**; 89/234 PRs (38 %) are test-dominant (>50 % of their files under
+  `tests/`). The 3 largest PRs (#3265 911 files, #3186 904, #2874 873) are **~98 % tests**
+  — 3–17 production files each. The mechanism, named by the second instrument:
+  **content-addressed LLM cassettes** (`tests/fixtures/llm_cassettes/<sha256>.json`,
+  added∩removed overlap = 0) — each monster is a test tree re-emitted wholesale, not
+  reviewed content.
+- **Regeneration vs incremental: two answers, two denominators.** By **PR count**: 59.4 %
+  regenerating (≥50 % of files already touched by an earlier merge). By file **volume**:
+  **7.1 %** — monsters inject NEW test files while small PRs iterate the same shared
+  modules (`orchestration/invoke_callables.py` touched **47×**,
+  `reporting/.../act3_conclusion_plugin.py` **33×**, `orchestration/state_writers.py`
+  **28×**).
+- **Never re-touched at 7 days: 56.3 %** — the API instrument restricted to complete
+  windows (2 371/2 949 files, 578 excluded). The git-log instrument's 70.8 % counted all
+  distinct October files including those too recent to have a closed 7-day window — a
+  mechanically inflated **biased upper bound**; **56.3 % is the headline number**.
+
+Reading (measured, no action recommendation): the waste candidates on that lane are
+(a) the 9 mass re-emissions and (b) the shared module touched 47× — not a generalised
+regeneration of the repo.
+
+Reproduction (git-log instrument, no scratchpad dependency):
+
+```bash
+git clone --filter=blob:none --no-checkout https://github.com/jsboigeEpita/2025-Epita-Intelligence-Symbolique
+git -C <repo> log --no-merges \
+  --since=2026-10-01T00:00:00Z --until=2026-11-01T00:00:00Z \
+  --format=%x00%H|%cI|%s --name-only
+# each NUL-separated block = 1 PR iff the subject ends in (#N)
+# regenerating = >=50% of the PR's files already touched by an earlier merge (merge order asc)
+# never-re-touched-at-7d = no later touch within 7 days of first appearance (complete windows only)
+# tests share = file-events under tests/ / total
+```
+
+Thresholds and definitions are the only parameters; everything replays from these commands
+alone. Raw JSON available from po-2027's session on request.
 
 ## Workstreams
 
