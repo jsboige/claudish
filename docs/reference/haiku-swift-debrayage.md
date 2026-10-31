@@ -78,6 +78,45 @@ Drift observed the same day (measured, no gesture): live `…_ACTIVE` = `haiku@m
 
 Day-level cost of the same window (13:05→14:40Z, after the 13:30:44Z MiniMax wall): swift 166 responses, and the haiku overflow that could not wait rode `role:sonnet` to `ds@deepseek-flash` — 2 784 PAYG responses in 95 minutes.
 
+### The third hop: hub and engine share a LAN, and the path leaves it (proposal, 31/10 — no gesture)
+
+Measured: `customEndpoints.vllm-myia.url` is
+`https://api.medium.text-generation-webui.myia.io/v1`; that name resolves to
+`90.65.170.144`, **po-2023's WAN IP** (IIS site 49). The hub (po-2025) and the
+engine (ai-01) are on the **same LAN**. So every hub→swift call leaves the LAN
+through the public façade and comes back — and dies when po-2023's host does,
+which is exactly what happened on 31/10 (3 h 02, §Incident above).
+
+The engine's lane (DM 17:12Z, on the user's 31/10 routing mandate) proposes
+routing the **internal hub→swift flow over the LAN** — `http://<ai-01-LAN>:5002/v1`
+with the MEDIUM key — while **external seats keep the public name and the
+`external-vllm` key** (po-2023/2027/2024/2028 sidecars, Jamin and Candy's inbound
+keys). Blast radius of such a step, stated exhaustively: the `url` field of one
+custom endpoint in `config.json` (bound into the container, read at startup →
+one drained recreate), and the credential the engine accepts from a LAN source.
+`maxConcurrency`, `contextLimit`/`deriveContextLimit`, `STEP_EXCLUDE`, the
+cascade list and the ladder are untouched.
+
+Preconditions — each must be measured, none assumed:
+
+1. **The engine's LAN address, and a successful `GET /v1/models` on it with the
+   MEDIUM key.** Never guess the address.
+2. **Reachability from inside the container**, not from the Windows host: the
+   hub runs under Docker Desktop's NAT. `frognano` at `host.docker.internal:5003`
+   proves the container reaches *its own host*, which says nothing about another
+   LAN host.
+3. **The engine's own view of a LAN client** — allow-list, rate, and whether it
+   considers that traffic internal. That is the engine owner's answer, not ours.
+4. **A `global` announce before the recreate**, per the entry-form rule: a change
+   to how the fleet reaches the engine is announced before it is applied.
+
+What it would and would not fix: the hub's own traffic stops crossing the edge
+(the 31/10 failure mode disappears for it); the **engine stays a single point**,
+and the four external seats still cross the WAN, so Q65 stands for them. Rollback
+is the same size as the change — put the public name back, recreate, announce.
+
+Proposal only; pending the engine's answers and the coordinator's ACK.
+
 ## 3. Design — three gates, then one ladder
 
 ### Gate R — engine reliability (precondition; **running green since 05:20Z 27/10** — closes 28/10 05:20Z if it holds)
