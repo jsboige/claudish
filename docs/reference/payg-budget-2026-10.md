@@ -128,9 +128,13 @@ for day, n in db.execute("select day, sum(n) from responses where model='deepsee
     print(day, n, f"peak={pk:.0%}")
 PY
 
-# attribution by machine+workspace — no scratch script needed, the recipe is:
-#   pair resp-1-rNNNN-* <-> req-1-NNNN-* by sequence number (0 = unpaired)
-#   machine  = capture envelope field
+# attribution by machine+workspace — do NOT re-derive pairing by hand: the
+# request counter restarts at 0001 at every hub process start (30/10 alone has
+# four container epochs), so pairing on the counter alone can cross lives and
+# attribute a response to the wrong machine. `scripts/uncached-attribution.py`
+# (#765) implements restart-aware pairing — same counter, nearest preceding
+# `req` within a 20-min window — and is the reference instrument. The fields:
+#   machine   = capture envelope field
 #   workspace = LAST "Primary working directory:" match inside the req body messages
 #               (raw text search of the body is worthless — 2026-09-08 measurement)
 #   usage legs = last "usage" object in the resp tail (the 4 kB head only carries
