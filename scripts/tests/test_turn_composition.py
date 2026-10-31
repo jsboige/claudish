@@ -34,6 +34,10 @@ and that would silently manufacture a conclusion:
      there. A marker whose head count disagrees with it yields a corpus that
      still LOOKS like a census and is wrong: the only honest outcome is a
      refusal.
+  10. SAMPLE COVERAGE -- the sampled files must span the window and include the
+     newest capture, and the coverage must be printed. `names[::n//limit]`
+     followed by `[:limit]` kept a prefix and dropped the tail silently
+     (measured at 93202525: n=799 / limit=400 lost the last 399 files).
   9. PARTIAL DAY -- an archive is not necessarily a whole day: 27/10 holds
      5 136 request captures against 57 849 response captures. The request
      share is in the output, so a reader sees the coverage before quoting it.
@@ -346,6 +350,42 @@ def pin_partial_day_archive_is_flagged():
            "an empty archive must not divide by zero: %r" % empty)
 
 
+
+# --- pin 10: the sample covers the window and prints its coverage -----------
+
+def pin_sample_covers_the_window_and_reports_coverage():
+    """A prefix of a name-sorted list is not a chronological prefix.
+
+    At 93202525, n=799 / limit=400 kept the 400 first names and dropped the
+    last 399 with nothing in the output saying so. The sample must cover the
+    newest capture and report what it skipped.
+    """
+    d = tempfile.mkdtemp(prefix="tcomp-sample-")
+    try:
+        for i in range(10):
+            day = "2026-07-%02d" % (i + 1)
+            open(os.path.join(d, "req-1-%d-%sT00-00-00-000Z-x.json" % (i, day)), "w").close()
+        # the NEWEST capture, which sorts FIRST by name (pid 2 < pid ordering )
+        newest = os.path.join(d, "req-2-0-2026-07-11T00-00-00-000Z-x.json")
+        open(newest, "w").close()
+        names, picked, cov = tcomp.sample_files(d, 4)
+        _check(isinstance(cov, dict),
+               "sampling coverage must be REPORTED as a record, got %s (a bare stride "
+               "is the pre-review shape that hid the dropped tail)" % type(cov).__name__)
+        _check(cov["available"] == 11, "population must be 11: %r" % cov)
+        _check(cov["covers_newest"], "the newest capture must be sampled: %r" % cov)
+        _check(os.path.basename(newest) in picked,
+               "newest file absent from the sample: %r" % (picked,))
+        _check(cov["skipped"] == cov["available"] - cov["sampled"],
+               "skipped must be reported, not implied: %r" % cov)
+        _check(len(picked) <= 4, "limit must be honoured: %r" % (picked,))
+        _, picked2, cov2 = tcomp.sample_files(d, 99)
+        _check(cov2["sampled"] == 11 and cov2["skipped"] == 0,
+               "a limit above the population samples everything: %r" % cov2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 PINS = [
     pin_denominator_is_assistant_turns,
     pin_passenger_vs_own_turn,
@@ -356,6 +396,7 @@ PINS = [
     pin_archive_marker_splits_only_on_member_boundaries,
     pin_archive_boundary_mismatch_is_refused,
     pin_partial_day_archive_is_flagged,
+    pin_sample_covers_the_window_and_reports_coverage,
 ]
 
 

@@ -49,17 +49,25 @@ Usage
 
 Reading rules (the traps this tool was built against, all measured 29/10):
 
-  * The process environment of the container is NOT the credential list. A
-    custom endpoint's `${VAR}` template resolves against the config home's
-    `apiKeys` map; an env-only probe reports "MISSING" for a rung that serves
-    traffic fine. Never conclude "not routable" from a container env read.
+  * Credential precedence is ENV-FIRST, then the config home's `apiKeys` map.
+    Measured 31/10 (po-2025, `docker exec claudish-proxy env`): the key that
+    authenticated `vllm-myia` was the container's `VLLM_API_KEY`, while
+    `config.json` still carried a stale 15-character literal for the same
+    variable -- a config-only probe reads the wrong key, and an env-only probe
+    reports MISSING for a rung that serves traffic fine. Read BOTH; let
+    `routability` name the winner. Never conclude "not routable" from one
+    source alone.
   * `last_role == "system"` does NOT mean "harness-driven turn" (see `nudge`):
     since Claude Code v2.1.153+ the client appends an output-style reminder as
     an inline system message after the tool_result. Measured 29/10: 83.1 % of
     requests end that way, and 324/332 of them ride a user/tool_result turn.
-  * Sampling is a deterministic stride over name-sorted files, so it follows
-    time without being biased by file-system order. Every sub-command also
-    prints the EXACT population it sampled from, so a ratio can be re-weighted.
+  * Sampling is a deterministic spread over the files sorted by the timestamp
+    carried IN THE NAME (sorting by name groups by pid first, so it is not
+    chronological), and the picks always cover the newest capture. The coverage
+    is printed (`sampling`: available / sampled / skipped / covers_newest), not
+    implied: an earlier version kept the first `limit` names and dropped the
+    tail silently -- n=799 at limit=400 lost the last 399 files with nothing in
+    the output saying so.
   * An era comparison must state its incomparabilities: pre-#98 captures carry
     no `entrypoint` / `workload` / `device_id8`, and part of July carries no
     `session_id`. The tool returns None rather than inventing a value.
@@ -156,10 +164,29 @@ def pctile(vals, q):
     return s[min(len(s) - 1, int(q * (len(s) - 1)))]
 
 
+def _name_ts(name):
+    # the capture timestamp carried by the file name (chronological key)
+    m = re.search(r"-(\d{4}-\d{2}-\d{2}T[\d-]+Z)-", name)
+    return m.group(1) if m else name
+
+
 def sample_files(directory: str, limit: int):
-    names = sorted(n for n in os.listdir(directory) if n.startswith("req-") and n.endswith(".json"))
-    stride = max(1, len(names) // limit) if limit else 1
-    return names, names[::stride][:limit] if limit else names, stride
+    """Deterministic sample that covers the window and reports its coverage."""
+    names = sorted((n for n in os.listdir(directory)
+                    if n.startswith("req-") and n.endswith(".json")),
+                   key=_name_ts)
+    total = len(names)
+    if not limit or limit >= total:
+        picked = list(names)
+    elif limit == 1:
+        picked = [names[-1]]
+    else:
+        step = (total - 1) / float(limit - 1)
+        picked = [names[i] for i in sorted(set(round(k * step) for k in range(limit)))]
+    coverage = {"available": total, "sampled": len(picked),
+                "skipped": total - len(picked),
+                "covers_newest": bool(picked) and picked[-1] == names[-1]}
+    return names, picked, coverage
 
 
 def load_body(path: str):
@@ -477,7 +504,7 @@ def cmd_envelope(args):
 # history (per-trace budget + the per-turn system tax)
 # --------------------------------------------------------------------------
 def cmd_history(args):
-    names, picked, stride = sample_files(args.dir, args.limit)
+    names, picked, coverage = sample_files(args.dir, args.limit)
     rows = []
     for n in picked:
         try:
@@ -520,7 +547,7 @@ def cmd_history(args):
 
     out = {
         "label": args.label, "dir": args.dir,
-        "requests_total": len(names), "sampled": len(rows), "stride": stride,
+        "requests_total": len(names), "sampled": len(rows), "sampling": coverage,
         "mean_per_request_chars": {k.replace("chars_", ""): mean(k) for k in
                                   ("chars_user", "chars_assistant", "chars_system_inline",
                                    "chars_system_top", "chars_tools")},
@@ -572,7 +599,7 @@ def norm(s: str, n: int = 90) -> str:
 
 
 def cmd_nudge(args):
-    names, picked, stride = sample_files(args.dir, args.limit)
+    names, picked, coverage = sample_files(args.dir, args.limit)
     clusters, chars, examples = collections.Counter(), collections.Counter(), {}
     classes = collections.Counter()
     sessions = collections.defaultdict(list)
@@ -623,7 +650,7 @@ def cmd_nudge(args):
     n_trailing = sum(classes.values())
     out = {
         "label": args.label, "dir": args.dir,
-        "requests_total": len(names), "sampled": n_ok, "stride": stride,
+        "requests_total": len(names), "sampled": n_ok, "sampling": coverage,
         "ended_with_system": n_trailing,
         "pct_ended_with_system": round(100.0 * n_trailing / max(1, n_ok), 1),
         "classification": dict(classes.most_common()),
@@ -671,17 +698,24 @@ def cmd_routability(args):
         rows.append({
             "endpoint": name, "baseUrl": ep.get("baseUrl") or ep.get("url"),
             "apiPath": ep.get("apiPath"), "authScheme": ep.get("authScheme"),
-            "credential_source": ("apiKeys:" + ",".join(v for v in vars_ if api_keys.get(v))
-                                  if any(api_keys.get(v) for v in vars_)
-                                  else ("env:" + ",".join(vars_) if vars_ else "literal/none")),
+            # precedence is env-FIRST (measured 31/10): name the source that WINS
+            "credential_source": (
+                ("env:" + ",".join(v for v in vars_ if env_present.get(v)))
+                if any(env_present.get(v) for v in vars_)
+                else (("apiKeys:" + ",".join(v for v in vars_ if api_keys.get(v)))
+                      if any(api_keys.get(v) for v in vars_)
+                      else "literal/none")),
             "status": "OK" if not missing else "MISSING:" + ",".join(missing),
         })
     out = {
         "config": args.config, "container": args.container,
         "apiKeys_map_names": sorted(api_keys),
         "endpoints": rows,
-        "note": "a ${VAR} template resolves against the config home's apiKeys map FIRST; "
-                "a container-env-only probe reports a false MISSING",
+        "note": "credential resolution is ENV-FIRST, then the config home's apiKeys map "
+                "(measured 31/10: VLLM_API_KEY in the container authenticated vllm-myia "
+                "while config.json carried a stale literal). `credential_source` names the "
+                "winner. Authenticatable is NOT routable: this reads credentials and "
+                "endpoint declarations only -- no cascade order, no wall, no routing.",
     }
     emit(out, args.out)
 
@@ -721,7 +755,11 @@ def main():
     n.add_argument("--out")
     n.set_defaults(func=cmd_nudge)
 
-    r = sub.add_parser("routability", help="which declared rungs can authenticate on this seat")
+    r = sub.add_parser(
+        "routability",
+        help="credential resolvability ONLY -- which declared rungs hold a resolvable "
+             "credential in this config home (env first, then apiKeys). Says nothing "
+             "about cascade order, walls, or whether a request would be routed here")
     r.add_argument("--config", required=True)
     r.add_argument("--container", default="")
     r.add_argument("--out")
