@@ -304,7 +304,7 @@ timezone.
 
 That same window, counted at the façade (impact of the hub outage): **220×
 502** on `:443` — 49 workload POSTs (`/v1/messages`, bodies 311–707 KB, client
-retry loops) from two remote seats (`82.66.89.184`, `51.75.200.22`), 164
+retry loops) from two remote seats (`IP-A [redacted]`, `IP-B [redacted]`), 164
 canary `/health` 502s, 3 localhost probes, 4 scanner hits. The outage read
 from outside was **not binary**: 200s flowed until **05:21Z** interleaved
 with the first 502s (flapping phase), zero 200s **05:22→05:36Z** (hard-down,
