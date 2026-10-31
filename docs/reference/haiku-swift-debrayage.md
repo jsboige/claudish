@@ -97,25 +97,45 @@ one drained recreate), and the credential the engine accepts from a LAN source.
 `maxConcurrency`, `contextLimit`/`deriveContextLimit`, `STEP_EXCLUDE`, the
 cascade list and the ladder are untouched.
 
-Preconditions — each must be measured, none assumed:
+Preconditions — each must be measured, none assumed. **Three of the four are
+measured true (31/10 ~23:5xZ); the fourth is a user arbitration, not a
+measurement:**
 
 1. **The engine's LAN address, and a successful `GET /v1/models` on it with the
-   MEDIUM key.** Never guess the address.
-2. **Reachability from inside the container**, not from the Windows host: the
-   hub runs under Docker Desktop's NAT. `frognano` at `host.docker.internal:5003`
-   proves the container reaches *its own host*, which says nothing about another
-   LAN host.
-3. **The engine's own view of a LAN client** — allow-list, rate, and whether it
-   considers that traffic internal. That is the engine owner's answer, not ours.
+   MEDIUM key.** Measured by the engine's lane: **`192.168.0.47:5002`** (interface
+   `MyIA-AI-Gigabit`), listening on `0.0.0.0`, `200` in 8 ms from ai-01's host,
+   `401` without a key. Never guess the address — this one is on record now.
+2. **Reachability from inside the hub's container** (Docker Desktop NAT), not
+   from the Windows host. Measured from `claudish-proxy` on po-2025: **`200` in
+   15 ms**; the same call through the public name answers **`200` in 86 ms**. The
+   LAN route is ~5.7× faster on the handshake alone and never leaves the switch.
+   `frognano` at `host.docker.internal` was never evidence for this — the
+   measurement is.
+3. **The engine's own view of a LAN client — key and header shape.** Decided by
+   the engine's lane: **MEDIUM**, on the argument that the hub→engine flow already
+   carries that key today through the edge, so a LAN route distributes no new
+   secret and leaves the revocation surface unchanged (`external-vllm` stays
+   reserved for the public path, cap 2, for Jamin and Candy). Two operational
+   facts that will bite anyone testing it: the engine accepts
+   **`Authorization: Bearer` only** (`x-api-key` on the same LAN URL answers
+   `401`), and the credential that actually works is the container's
+   **`VLLM_API_KEY`** (sha256 `db2738ab1328…`), **not** the 15-character `apiKey`
+   literal still present in `config.json` — a probe that reads the config file
+   tests the wrong secret and reports a false 401.
 4. **A `global` announce before the recreate**, per the entry-form rule: a change
-   to how the fleet reaches the engine is announced before it is applied.
+   to how the fleet reaches the engine is announced before it is applied. **Still
+   open — this is the user arbitration (Q65).**
 
 What it would and would not fix: the hub's own traffic stops crossing the edge
 (the 31/10 failure mode disappears for it); the **engine stays a single point**,
 and the four external seats still cross the WAN, so Q65 stands for them. Rollback
-is the same size as the change — put the public name back, recreate, announce.
+is the same size as the change — put the public name back, recreate, announce —
+and the public name stays documented as the fallback that carried the whole
+afternoon of 31/10. Side effect on the engine's census, stated by its owner: hub
+calls then appear without `x_forwarded_for` (the `?` bucket, like local calls) and
+never under `90.65.170.144` again, so before/after is distinguishable.
 
-Proposal only; pending the engine's answers and the coordinator's ACK.
+Proposal only; the three measurements are in and the arbitration is what remains.
 
 ## 3. Design — three gates, then one ladder
 
