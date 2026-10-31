@@ -1581,18 +1581,13 @@ export async function createProxyServer(
       // control-flow narrowing cannot see (it would narrow this to `null`).
       const override = delegationOverride as DelegationOverride | null;
       delegationOverride = null;
-      const handler = override
-        ? await getHandlerForRequest(override.concrete, 0, sessionKey, bucket, override.concrete)
-        : await getHandlerForRequest(
-            requestedModel,
-            0,
-            sessionKey,
-            bucket,
-            undefined,
-            keylessNative,
-            skippedSteps,
-            machineHeader
-          );
+      // #769: resolve BEFORE building the handler. A RoutingError thrown at
+      // handler construction (an explicit provider@model the host cannot route
+      // — no credential, no custom endpoint) must be attributable to the step
+      // it belongs to, and the catch below needs `resolved` and `delegation`
+      // to skip forward instead of surfacing a terminal 400. Same source of
+      // truth as the swap inside getHandlerForRequest (the walk's contract
+      // above): nothing mutates between these synchronous reads.
       const resolved = override && rule
         ? { step: rule.steps[override.stepIndex], stepIndex: override.stepIndex }
         : role && !keylessNative
@@ -1634,6 +1629,88 @@ export async function createProxyServer(
         );
         return true;
       };
+      // #769 — an unroutable cascade step skips forward, like the #431 family:
+      // the step is HEALTHY (no upstream answered — construction threw before
+      // any call), the host just cannot route it, so no markStepFailed, no
+      // bucket wall, no arm, no pin — the walk continues on the next step. The
+      // discriminator is WHO named the target: stepIndex >= 0 (the cascade
+      // named it) → skip; -1 (the CLIENT named it) → the throw stands
+      // (terminal 400 + env-var hint, unchanged).
+      let handler: Awaited<ReturnType<typeof getHandlerForRequest>>;
+      try {
+        handler = override
+          ? await getHandlerForRequest(override.concrete, 0, sessionKey, bucket, override.concrete)
+          : await getHandlerForRequest(
+              requestedModel,
+              0,
+              sessionKey,
+              bucket,
+              undefined,
+              keylessNative,
+              skippedSteps,
+              machineHeader
+            );
+      } catch (err) {
+        if (!(err instanceof RoutingError) || !role || stepIndex < 0 || !rule) throw err;
+        const concrete = delegation?.concrete ?? resolved.step?.target ?? requestedModel;
+        // The dead concrete was never PAID (construction threw before any
+        // call), and `triedConcretes` is written only after a construction
+        // succeeded — so without this entry the #609 walk's exclusion set
+        // does not know it, `resolveDelegationExcluding` re-offers the same
+        // unroutable concrete (with `attempt--`) until the candidate bound
+        // is hit, and only then skips the step: the delegation's own
+        // routable steps are never tried (R1, measured 31/10). Harmless to
+        // the #331 revisit guard below: a concrete that cannot be built
+        // never reaches the serve path that guard conditions on.
+        let excluded = triedConcretes.get(stepIndex);
+        if (!excluded) {
+          excluded = new Set<string>();
+          triedConcretes.set(stepIndex, excluded);
+        }
+        excluded.add(concrete);
+        // A delegation path may hold another routable concrete — try it first
+        // (#609 semantics; the next iteration re-enters this try on the
+        // override and skips again if that one is unroutable too).
+        if (walkDelegatedTarget()) {
+          attempt--;
+          continue;
+        }
+        const canSkipStep =
+          stepIndex < rule.steps.length - 1 && attempt + 1 < maxAttempts && !stepSkipDisabled();
+        if (canSkipStep) {
+          log(
+            `[Failover] SKIP ${role}[${stepIndex}] reason=unroutable ${concrete} — advancing to next step, no failure mark (#769)`,
+            true // forceConsole — operational event, countable marker (#431/#769)
+          );
+          skippedSteps.add(stepIndex);
+          continue;
+        }
+        // Last step (or no routable successor): refuse in the labelled
+        // overload form — the cascade has no routable step on THIS host, and
+        // a bare routing 400 would read as a client error for a host-local
+        // routing gap. Same wire shape as the budget-synth 529 above.
+        log(
+          `[Failover] STEP-UNROUTABLE ${role}[${stepIndex}] ${concrete} — last step, no routable successor (#769)`,
+          true // forceConsole — operational event, countable marker
+        );
+        return new Response(
+          JSON.stringify(
+            wrapAnthropicError(
+              529,
+              `Cascade ${role} has no routable step on this host — ${concrete}: ${err.message}`,
+              "overloaded_error"
+            )
+          ),
+          {
+            status: 529,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "2",
+              "x-claudish-step-skip": encodeStepSkipHeader("unroutable", concrete),
+            },
+          }
+        );
+      }
       // #331: the #263 revisit guard is keyed by the CONCRETE this request
       // already paid on that step, not by the step index alone. A role-step
       // whose delegation has ADVANCED resolves a different concrete — serving
@@ -2105,6 +2182,7 @@ export async function createProxyServer(
               | { served: Response }
               | { served: null; status: number; errBody: string }
               | { served: null; budgetRefused: true }
+              | { served: null; unroutable: true }
             > => {
               const modelBeforeAttempt = body.model;
               // #654 r1 — the walk serves through the SAME endpoint budget as
@@ -2198,10 +2276,22 @@ export async function createProxyServer(
                 const targetErrBody = await targetResp.text().catch(() => "");
                 walkRelease?.();
                 return { served: null, status: targetResp.status, errBody: targetErrBody };
-              } catch {
+              } catch (err) {
                 // The attempt itself threw — no class, so no advance: the
                 // original overload stands. The lease (if committed) ends here.
                 walkRelease?.();
+                // #769 — a RoutingError is NOT an attempt failure: the target
+                // was unroutable at construction (no credential for its
+                // provider on this host), zero upstream calls were paid.
+                // Returned labelled so the caller advances like a budget
+                // refusal instead of pinning the walk on a dead step.
+                if (err instanceof RoutingError) {
+                  log(
+                    `[Failover] WALK-SKIP ${role} → ${target.concrete} reason=unroutable — ${err.message} (#769)`,
+                    true // forceConsole — operational event, countable marker
+                  );
+                  return { served: null, unroutable: true };
+                }
                 return { served: null, status: 0, errBody: "" };
               } finally {
                 body.model = modelBeforeAttempt;
@@ -2229,6 +2319,24 @@ export async function createProxyServer(
               }
               return response;
             }
+            // #769 — an unroutable walk target was never called: construction
+            // threw before the engine, so the walk advances to the next
+            // servable step with the SAME shape as the budget refusal above —
+            // no call, no mark, no wall. Bounded to ONE hop; a second
+            // unroutable target surfaces the original overload.
+            if ("unroutable" in firstAttempt && firstAttempt.unroutable) {
+              const unroutableSkip = await resolveTransientStep(role, {
+                bucketOf: concreteStepBucketOf,
+                nominalBucket: bucket ?? undefined,
+                afterStepIndex: walk.stepIndex,
+                machine: machineHeader,
+              }).catch(() => null);
+              if (unroutableSkip) {
+                const skipped = await attemptWalkStep(unroutableSkip);
+                if (skipped.served) return skipped.served;
+              }
+              return response;
+            }
             // #598 — a step that died CONNECTION-class has told us the HOST was
             // unreachable, not that its plan is walled. Measured 2026-10-22:
             // the nominal's egress and walk step 0's were the same dead host,
@@ -2247,9 +2355,14 @@ export async function createProxyServer(
             // absorbed; a budget that admitted the first attempt and not the
             // second is the intended shape (worst case: nominal + 1 walk +
             // the advance's own connect timeout, all inside the budget).
+            // #769 widened the failure union with `unroutable` (handled and
+            // returned above), so the connection-class reading below narrows
+            // explicitly: what is left with a status is the classless throw.
+            const firstFailure =
+              "status" in firstAttempt ? firstAttempt : { status: 0, errBody: "" };
             const advanceElapsedMs = Date.now() - cascadeStartedAtMs;
             if (
-              isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody) &&
+              isConnectionWalkClass(firstFailure.status, firstFailure.errBody) &&
               walkBudgetMs > 0 &&
               advanceElapsedMs > walkBudgetMs
             ) {
@@ -2257,7 +2370,7 @@ export async function createProxyServer(
                 `[Failover] WALK-ADVANCE ${role} skipped — budget ${advanceElapsedMs}ms > ${walkBudgetMs}ms`,
                 true
               );
-            } else if (isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody)) {
+            } else if (isConnectionWalkClass(firstFailure.status, firstFailure.errBody)) {
               const nextWalk = await resolveTransientStep(role, {
                 bucketOf: concreteStepBucketOf,
                 nominalBucket: bucket ?? undefined,
@@ -3023,17 +3136,32 @@ export async function createProxyServer(
       // not a dry run (it writes the per-session dwell pin and decides the
       // billing-header strip), so letting it swap behind a keyless native
       // request would both mislabel the log and write fleet state.
-      const handler = await getHandlerForRequest(
-        body.model,
-        0,
-        sessionKey,
-        requestBucket,
-        undefined,
-        keylessNativeRequest(c, body.model),
-        undefined,
-        c.req.header("x-claudish-machine") ?? null
-      );
-      logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
+      // #769 — the entry resolution swaps to the armed cascade's CURRENT step;
+      // when that step cannot be routed on THIS host the throw must not end the
+      // request: handleWithCascade re-resolves per attempt and skips forward.
+      // The handler read here only feeds the request log and the billing-header
+      // strip, neither of which a routable step would change — a null is
+      // tolerated, and a client-named spec keeps its terminal 400 (role null).
+      let handler: Awaited<ReturnType<typeof getHandlerForRequest>> | null = null;
+      try {
+        handler = await getHandlerForRequest(
+          body.model,
+          0,
+          sessionKey,
+          requestBucket,
+          undefined,
+          keylessNativeRequest(c, body.model),
+          undefined,
+          c.req.header("x-claudish-machine") ?? null
+        );
+      } catch (e) {
+        if (!(e instanceof RoutingError) || requestRole == null) throw e;
+        log(
+          `[Failover] entry-resolution UNROUTABLE ${requestRole} (${body.model}): ${e.message} — the cascade walk skips forward (#769)`,
+          true // forceConsole — operational event, countable marker
+        );
+      }
+      logRequest(body, handler?.constructor.name ?? "cascade", c.req.raw, hostnameConfig.remoteAddrMap);
       stripBillingHeaderFromBody(body, handler instanceof NativeHandler);
 
       // Route through the budget-failover cascade (nominal → step0 → step1 …),
@@ -3163,17 +3291,29 @@ export async function createProxyServer(
       // #412 — the OpenAI-compatible ingress resolves the handler for the same
       // two reasons as /v1/messages (log label + billing strip, plus the dwell
       // pin it writes as a side effect), so it carries the same suppression.
-      const handler = await getHandlerForRequest(
-        anthropicBody.model,
-        0,
-        extractSessionKey(anthropicBody),
-        requestBucket,
-        undefined,
-        keylessNativeRequest(c, anthropicBody.model),
-        undefined,
-        c.req.header("x-claudish-machine") ?? null
-      );
-      logRequest(anthropicBody, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
+      // #769 — same entry tolerance as /v1/messages: this ingress feeds the
+      // same cascade walk, so an unroutable CURRENT step must reach it instead
+      // of ending the request on a routing 400.
+      let handler: Awaited<ReturnType<typeof getHandlerForRequest>> | null = null;
+      try {
+        handler = await getHandlerForRequest(
+          anthropicBody.model,
+          0,
+          extractSessionKey(anthropicBody),
+          requestBucket,
+          undefined,
+          keylessNativeRequest(c, anthropicBody.model),
+          undefined,
+          c.req.header("x-claudish-machine") ?? null
+        );
+      } catch (e) {
+        if (!(e instanceof RoutingError) || requestRole == null) throw e;
+        log(
+          `[Failover] entry-resolution UNROUTABLE ${requestRole} (${anthropicBody.model}): ${e.message} — the cascade walk skips forward (#769)`,
+          true // forceConsole — operational event, countable marker
+        );
+      }
+      logRequest(anthropicBody, handler?.constructor.name ?? "cascade", c.req.raw, hostnameConfig.remoteAddrMap);
       stripBillingHeaderFromBody(anthropicBody, handler instanceof NativeHandler);
 
       // Route through the cascade, then inject onset/recovery notices on the

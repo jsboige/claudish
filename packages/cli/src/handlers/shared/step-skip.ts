@@ -34,11 +34,13 @@ import { readBodyWithDeadline } from "../../providers/transport/quota-wall.js";
 
 export const STEP_SKIP_HEADER = "x-claudish-step-skip";
 
-export type StepSkipReason = "context" | "busy" | "media";
+export type StepSkipReason = "context" | "busy" | "media" | "unroutable";
 
 /** Every reason the loop will act on. A producer adding one must extend this
- *  AND `readStepSkip` together — a header the reader drops is a silent no-op. */
-const STEP_SKIP_REASONS: readonly StepSkipReason[] = ["context", "busy", "media"];
+ *  AND `readStepSkip` together — a header the reader drops is a silent no-op.
+ *  `unroutable` (#769) is produced on the loop's OWN last-step 529 refusal
+ *  only — no upstream ever carries it, so no response-shape skip fires on it. */
+const STEP_SKIP_REASONS: readonly StepSkipReason[] = ["context", "busy", "media", "unroutable"];
 
 export interface StepSkipInfo {
   reason: StepSkipReason;
