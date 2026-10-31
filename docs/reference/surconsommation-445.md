@@ -11,7 +11,8 @@ attribution), capture-name and `X-Claudish-Machine` header parsing.
 
 DoD of the user mandate (29/10): **D1** qualitative diagnostic → **D2** remediation posed →
 **D3** applied and verified by its effect → **D4** consumption back under the envelope
-(~1 k$/month DeepSeek on top of ~1 k$ of subscriptions, at July's merge rate).
+(envelope stated in the internal `cost-ledger-405`, at July's merge rate - spend figures
+stay on the internal dashboard, never in a repo file).
 
 ---
 
@@ -113,10 +114,10 @@ bytes/message was wrong in sign and was discarded).
 
 | compaction threshold | fleet re-read (200-turn sample) | reduction |
 |---|---:|---:|
-| 200 msgs | −15.9 % | **−2.28 G tokens/day** (extrapolated on ~95 000 turns/day) |
-| **300 msgs** | **−8.2 %** | **−1.18 G tokens/day** |
-| 400 msgs | −5.4 % | −0.78 G tokens/day |
-| 600 msgs | −3.2 % | −0.46 G tokens/day |
+| 200 msgs | −15.9 % | **−2.28 G tokens** (per 95 648-request corpus) |
+| **300 msgs** | **−8.2 %** | **−1.18 G tokens** (per corpus) |
+| 400 msgs | −5.4 % | −0.78 G tokens (per corpus) |
+| 600 msgs | −3.2 % | −0.46 G tokens (per corpus) |
 
 Distribution: median `n_messages` 125 (p75 236, p90 392, max 1 982); **16 % of turns exceed
 300 messages and carry 22 % of the re-read**; their `cache_read` median is 201 088 against
@@ -124,7 +125,9 @@ Distribution: median `n_messages` 125 (p75 236, p90 392, max 1 982); **16 % of t
 
 **The saving is concentrated, not diffuse** — which is what makes a threshold worth setting:
 a 300-message threshold touches 16 % of turns for 8.2 % of the re-read, a 200-message
-threshold touches fewer turns for twice the effect.
+threshold **doubles** the effect (−15.9 %) **and widens** the population it touches:
+every turn above 300 messages is also above 200, and p75 = 236 puts the >200 set above a
+quarter of turns (>25 % against 16 %).
 
 ### Where the re-read lands (and why it is not an OpenAI problem)
 
@@ -143,9 +146,9 @@ Re-read share by **served** lane (the model that actually answered):
 Opus→Sol absorption measured on the request side (2 080 fallback responses + 1 045 direct on
 29/10). The re-read lands on **MiniMax (27.9 %)**, DeepSeek PAYG (34.1 %) and GLM (20.1 %).
 
-**Link to the plan wall (Q-39)**: MiniMax's console reads 51.61 B tokens/day on the Coding
-plan, and the MiniMax plan bills on tokens. A 300-message compaction threshold therefore cuts
-the MiniMax plan's daily consumption by ≈ 6 % (≈ 27.3 % of the re-read is MiniMax's, and the
+**Link to the plan wall (Q-39)**: The MiniMax plan bills on tokens (its absolute consumption
+reading stays on the internal dashboard). A 300-message compaction threshold therefore cuts
+the MiniMax plan's daily consumption by ≈ 6 % (≈ 27.9 % of the re-read is MiniMax's, and the
 threshold removes 8.2 % of the re-read), pushing the weekly wall out by roughly an hour; at
 200 messages, ≈ 12 % and ≈ 2.4 hours. Modest — but it is the **only** lever measured here that
 touches the wall's driver rather than its symptom.
@@ -189,7 +192,9 @@ gates. Any cascade-side remedy remains behind the 28/10 arbitration rule.
   tokens to € is the cost ledger's job (`cost-ledger-405`), not this file's.
 - The counterfactual is **linear in message count** and assumes the history would otherwise be
   replayed unchanged; a real compaction also replaces tool-result bulk with a summary, so the
-  saving is a **lower bound**.
+  saving is an **estimate whose residual sign is unmeasured**: the counterfactual omits the
+  compaction call itself, which re-reads the full history once and emits a summary that is
+  then re-read - those terms push the other way.
 - The **live corpus no longer contains July** (compaction pushed it into the `captures-*.7z`
   archives) ⇒ **no before/after ratio is computable here**. It requires a `history` pass over
   the archives, announced beforehand (17/10 pre-flight guard).
