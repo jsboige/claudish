@@ -1653,6 +1653,21 @@ export async function createProxyServer(
       } catch (err) {
         if (!(err instanceof RoutingError) || !role || stepIndex < 0 || !rule) throw err;
         const concrete = delegation?.concrete ?? resolved.step?.target ?? requestedModel;
+        // The dead concrete was never PAID (construction threw before any
+        // call), and `triedConcretes` is written only after a construction
+        // succeeded — so without this entry the #609 walk's exclusion set
+        // does not know it, `resolveDelegationExcluding` re-offers the same
+        // unroutable concrete (with `attempt--`) until the candidate bound
+        // is hit, and only then skips the step: the delegation's own
+        // routable steps are never tried (R1, measured 31/10). Harmless to
+        // the #331 revisit guard below: a concrete that cannot be built
+        // never reaches the serve path that guard conditions on.
+        let excluded = triedConcretes.get(stepIndex);
+        if (!excluded) {
+          excluded = new Set<string>();
+          triedConcretes.set(stepIndex, excluded);
+        }
+        excluded.add(concrete);
         // A delegation path may hold another routable concrete — try it first
         // (#609 semantics; the next iteration re-enters this try on the
         // override and skips again if that one is unroutable too).

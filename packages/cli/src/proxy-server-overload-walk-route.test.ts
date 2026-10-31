@@ -734,6 +734,46 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
     expect(failoverLog.some((l) => l.includes("[Failover] STEP-UNROUTABLE sonnet[1]"))).toBe(true);
   }, 30_000);
 
+  // #769 review R1 (31/10) — an unroutable concrete is never PAID, and the
+  // #609 walk's exclusion set was built only from what a request paid, so the
+  // walk re-offered the SAME dead delegation concrete (with `attempt--`) until
+  // the candidate bound was hit, and only then skipped the step — the
+  // delegation's own routable steps were never tried (measured: two
+  // `trying kimi@fake-kimi` lines, then SKIP, t2 never called). The catch now
+  // records the dead concrete in `triedConcretes` BEFORE walking, so the very
+  // first DELEGATION-WALK lands on the target's own step. RED when the
+  // `excluded.add(concrete)` is dropped.
+  test("U3: an unroutable DELEGATION nominal does not loop the walk — the target's own step serves (R1, #769)", async () => {
+    // opus's failover-side nominal is UNROUTABLE (no kimi credential in the
+    // sandbox — the resolver, not the modelMap, is what the delegation reads,
+    // see resolveDelegationExcluding); opus's cascade step (t2) is healthy.
+    await spin();
+    resetWalk({
+      CLAUDISH_FAILOVER_SONNET: "role:opus>s1-ep@fake-s1",
+      CLAUDISH_FAILOVER_OPUS: "t2-ep@fake-t2",
+    });
+    setRoleNominalResolver((r) =>
+      r === "sonnet" ? SONNET_NOMINAL
+      : r === "opus" ? "kimi@fake-kimi"
+      : undefined
+    );
+    // Wall the SONNET nominal's bucket so the cascade serves from attempt 0.
+    expect(armFailover("sonnet", "test: nominal walled, cascade engaged", bucketOfNominal())).toBe(true);
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.t2).toBe(1); // the delegation advanced to the TARGET's step
+    expect(calls.s1).toBe(0); // sonnet's step 1 never paid — t2 served first
+    // The dead nominal is offered to the walk ZERO times (the pre-fix loop
+    // logged `trying kimi@fake-kimi (opus nominal)` twice before skipping).
+    expect(failoverLog.some((l) => l.includes("trying kimi@fake-kimi"))).toBe(false);
+    expect(
+      failoverLog.some(
+        (l) => l.includes("[Failover] DELEGATION-WALK sonnet[0]") && l.includes("trying t2-ep@fake-t2 (opus step 0)")
+      )
+    ).toBe(true);
+  }, 30_000);
+
   // Review of #331 (06/10) point 1 — the ONE-SHOT walk used bare
   // isStepTtlFailed at resolveTransientStep, the exact order resolveSkipping-
   // Failed was just fixed for. Setup: sonnet[0] = role:opus marked against
