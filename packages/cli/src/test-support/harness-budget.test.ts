@@ -20,6 +20,12 @@
 import { describe, test, expect } from "bun:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import {
+  CLAUDE_MD_BUDGET_BYTES,
+  claudeMdBudgetMessage,
+  measureBudgetedBytes,
+  withinClaudeMdBudget,
+} from "./claude-md-budget";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..", "..");
 
@@ -51,7 +57,7 @@ const BUDGETS: Budget[] = [
     // layer itself. 94 365 B before #445 (A1); each moved narrative now lives in
     // a docs/reference/<theme>.md file named by the pointer table at its top.
     path: "CLAUDE.md",
-    maxBytes: 40 * 1024 + 960,
+    maxBytes: CLAUDE_MD_BUDGET_BYTES,
     detail: "docs/reference/<theme>.md (see the pointer table at the top of CLAUDE.md)",
   },
 ];
@@ -75,9 +81,11 @@ describe("harness byte budgets (#445)", () => {
       const size = Buffer.byteLength(raw.replace(/\r\n/g, "\n"), "utf-8");
       expect(
         size,
-        `${b.path} is ${size} B, over its ${b.maxBytes} B budget (+${size - b.maxBytes}). ` +
-          `It is loaded on every turn: move the measurements / incident narrative / history into ` +
-          `${b.detail} and leave a one-line pointer. Raising the budget is a #445 decision, not a fix.`,
+        b.path === "CLAUDE.md"
+          ? claudeMdBudgetMessage(size, b.maxBytes)
+          : `${b.path} is ${size} B, over its ${b.maxBytes} B budget (+${size - b.maxBytes}). ` +
+            `It is loaded on every turn: move the measurements / incident narrative / history into ` +
+            `${b.detail} and leave a one-line pointer. Raising the budget is a #445 decision, not a fix.`,
       ).toBeLessThanOrEqual(b.maxBytes);
     });
 
@@ -102,4 +110,34 @@ describe("harness byte budgets (#445)", () => {
       }
     });
   }
+});
+
+describe("CLAUDE.md budget boundary (#445 A2)", () => {
+  // A budget nobody checks is a wish; a budget nobody can trip is decoration.
+  // These pins make the gate falsifiable: raise CLAUDE_MD_BUDGET_BYTES by one
+  // byte and the first test below goes red.
+
+  test("the budget is 40 960 B", () => {
+    expect(CLAUDE_MD_BUDGET_BYTES).toBe(40 * 1024);
+  });
+
+  test("one byte over the budget is refused, exactly at the budget is accepted", () => {
+    expect(withinClaudeMdBudget(CLAUDE_MD_BUDGET_BYTES)).toBe(true);
+    expect(withinClaudeMdBudget(CLAUDE_MD_BUDGET_BYTES + 1)).toBe(false);
+  });
+
+  test("the size measured is line-ending independent", () => {
+    // core.autocrlf=true would otherwise make the verdict depend on the seat.
+    const LF = String.fromCharCode(10);
+    const CR = String.fromCharCode(13);
+    const lf = `a${LF}b${LF}`;
+    const crlf = `a${CR}${LF}b${CR}${LF}`;
+    expect(measureBudgetedBytes(crlf)).toBe(measureBudgetedBytes(lf));
+  });
+
+  test("the failure message says where the detail goes", () => {
+    const msg = claudeMdBudgetMessage(CLAUDE_MD_BUDGET_BYTES + 1);
+    expect(msg).toContain("docs/reference/<theme>.md");
+    expect(msg).toContain("one-line pointer");
+  });
 });

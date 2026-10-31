@@ -197,6 +197,100 @@ the po-203 local cascade, 4 days undetected) and the 30/09 orphan `:3000` socket
 ~80 min, fleet cut mid-afternoon). Both were shape changes nobody announced; the convention
 exists so the next one is at least visible before it bites.
 
+## 2026-10-30 — the entry form was down ~55 min, and no lane said so
+
+Measured from a seat (po-2024), not from the hub: **the fleet-facing entry form
+(`192.168.0.50:3000`) did not answer between 09:36:59Z and 10:32:23Z**, the WAN
+façade `models.myia.io` answered **502** throughout, and the hub container that
+serves now (instance `ca6c14b5…`) started at **10:32:01Z**. The outage was
+visible only in the seat's own relay log — no dashboard, no incident, no
+announcement, while the convention above was in force.
+
+**The evidence, by source (each line carries its provenance):**
+
+| Fact | Value | Source |
+|---|---|---|
+| Relay leaves NOMINAL → AUTONOMOUS | 09:26:48Z (`DOWN after 2 failure(s) (heartbeat)`), brief NOMINAL blip 09:36:42Z (deep probe OK after 28 304 ms), AUTONOMOUS again **09:36:59Z**, NOMINAL again **10:32:23Z** | this seat's sidecar container log, `[Relay]` lines |
+| Published port unreachable | TCP refused at 10:26Z and 10:31Z (3 probes × 10 s) | measured from po-2024 |
+| WAN façade | HTTP **502** on `https://models.myia.io` at ~10:26–10:29Z | measured from po-2024 |
+| Hub process start | **10:32:01Z** — `uptimeSec` 76 / 728 / 1019 at 10:33:18Z / 10:44:10Z / 10:49:00Z (three samples, exact 1× rate) | hub `/health`, read from po-2024 |
+| Hub upstream degrading before the entry died | `[Failover] STEP-ADVANCE haiku — HTTP 502 (non-quota) from step 0` at 09:19Z, 09:24Z, 09:43Z, 09:57Z, 09:58Z; `step haiku[0] (Swift 1.5 local) failed (non-quota) — count=38` | `~/.claudish/failover-events.log` on po-2025 |
+| Silence on the hub side | **no** failover event between **09:58:07Z** and **10:32:23Z** | same ledger |
+| The hub seat's own surveillance was blind | `watchdog.log`: last tick before the gap 09:17:09Z, first after **10:32:18Z** — **75 min / 5 ticks missing**, the entry after the gap reading `DEGRADED (uptime=0h)` | `~/.claudish/watchdog.log` on po-2025 (timestamps are host-local, UTC+1) |
+
+The hub container's own lifecycle that morning is **not** told here: a
+seat-side reading of `docker-events.log` once saw a "restart storm" in it,
+and the hub lane's post-mortem refuted that reading with the same journal
+(zero lifecycle events on `claudish-proxy` that window, an empty `drain.log`,
+119 requests served inside the alleged "stopped" window). The hub-side
+chronology lives in **`docs/reference/hub-outage-2026-10-30.md`** (#785);
+this section keeps only what a seat measured.
+
+**The hub's durable ledger cannot certify its own outage window.** In
+`failover-events.log` the `ts` is the *line's* docker timestamp but the
+`instanceId` is the one the proxy reported **when the collection tick ran**
+(`scripts/failover-events-collect.ps1`). After a restart, lines written before
+it but collected after it carry the **new** instance id: the ledger shows lines
+stamped 09:18–09:58Z attributed to `ca6c14b5…`, the instance that only started
+at 10:32:01Z. The instance id is a `randomUUID()` at module load
+(`packages/cli/src/instance-id.ts`), so it cannot survive a restart — the
+attribution is the collector's, and it is misleading. Read the ledger's
+`ts`, not its `instanceId`, to date an event.
+
+**What was missing is the PATH, not the traffic.** No instrument asked "is the
+entry form up?": the traffic instruments count requests (and the MCP
+`claudish_traffic` renders a **false GAP** on a healthy relay sidecar — memory
+`traffic-mcp-false-gap`), `fleet-matrix.ps1` describes the local seat,
+`seat-readiness-audit.ps1` answers "would this seat survive the hub dying",
+`claudish-mode-watch.ps1` persists the local role. `scripts/hub-entry-probe.py`
+(new) probes the entry form in layers and says **which** layer is down:
+`NOMINAL` · `ENTRY-DOWN` · `PATH-BROKEN` · `FACADE-502-ONLY` · `SEAT-DETACHED`
+· `UNKNOWN` (exit 0 / 1 / 2). One probe cannot tell "hub dead" from "path
+dead" — that distinction decides who gets paged. Pins:
+`scripts/tests/test_hub_entry_probe.py`.
+
+**Two rules, restated because both were broken on the day:**
+
+1. **An outage detected is an outage escalated — in the SAME cycle** (the
+   repo-level rule). This one was detected at 09:26:48Z and was still
+   unannounced at 11:00Z, four cycles later. A seat that observes the fleet
+   entry form down escalates it: `global` dashboard + DM to the coordinator,
+   with the measured window, the sources, and what the seat could not
+   determine.
+2. **A change to the fleet-facing entry point is announced BEFORE it is
+   applied** (roo-extensions#3963, above). The rule needs no restart storm to
+   stand: the door was dead from ~09:30Z and nobody announced it, whatever
+   the mechanism turned out to be (a host reboot — below). The announcement
+   is what tells the other seats; the mechanism arrives later, in the
+   post-mortem.
+
+**The hub lane's post-mortem answered what this seat could not determine**
+(full hub-side chronology: **`docs/reference/hub-outage-2026-10-30.md`**,
+#785): the container **never crashed** (`started=10:32:02Z`,
+exit 0, no OOM, no drain entry that day) — the **host rebooted** at
+**10:29:08Z** (Event 1074, `Explorer.EXE`, "Autre (non planifié)", clean
+shutdown 6006/6005, no 41/6008) and the container came back three minutes
+later. So the 75-minute watchdog gap is the **host being down**, not a dead
+scheduler. Corroborated on that seat by bursts of `event streamer: error: EOF`
+and a vhdx compaction skipped twelve days running.
+
+**The mechanism is recurrent, and it is the hub's own event loop.** The hub
+publishes `eventLoopBlockedMs5m`: 5 295 ms at 13:01Z, then 38 623 → 40 641 →
+42 272 → 45 153 → **59 833 ms** at 14:52Z — **20 % of five minutes** with only
+2 active streams, so not load (po-2023, RAPPORTÉ). It ran out at **15:19:57Z**:
+the seat's forward died on a closed socket, AUTONOMOUS at **15:20:11Z**,
+`/health` **3/3 timing out at 15 s**, the façade likewise, while `.50:80`,
+`.50:135` and the WAN stayed open and the published port **accepted the TCP
+connection** — the process was hung, not the path (measured from po-2024,
+15:21–15:23Z). That live episode is why the probe grew **`ENTRY-UNRESPONSIVE`**
+and **`PROBE-BLIND`**: its first version rendered the hang `UNKNOWN`, i.e. it
+called a measurement an absence of signal. The per-minute event-loop series
+(#760, `08d25348c`) is the instrument that dates these stalls on the hub seat.
+
+**Still open on the hub lane:** the ledger's `instanceId` attribution (§3
+above) is a documented defect, not a fixed one — now **#782**, with the
+suggested route (`State.StartedAt`, a per-restart anchor).
+
 ## Compose environment surface
 
 `docker-compose.yml` carries a default for every relay variable, so the hub runs with **no `.env` at
