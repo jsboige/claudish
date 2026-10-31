@@ -217,7 +217,14 @@ announcement, while the convention above was in force.
 | Hub upstream degrading before the entry died | `[Failover] STEP-ADVANCE haiku — HTTP 502 (non-quota) from step 0` at 09:19Z, 09:24Z, 09:43Z, 09:57Z, 09:58Z; `step haiku[0] (Swift 1.5 local) failed (non-quota) — count=38` | `~/.claudish/failover-events.log` on po-2025 |
 | Silence on the hub side | **no** failover event between **09:58:07Z** and **10:32:23Z** | same ledger |
 | The hub seat's own surveillance was blind | `watchdog.log`: last tick before the gap 09:17:09Z, first after **10:32:18Z** — **75 min / 5 ticks missing**, the entry after the gap reading `DEGRADED (uptime=0h)` | `~/.claudish/watchdog.log` on po-2025 (timestamps are host-local, UTC+1) |
-| Restart storm on the hub container | 8 drain/recreate cycles between 08:44Z and 10:44Z; one (09:35:55Z) left the container **stopped and dead from 09:37:55Z to 09:53:53Z** | `~/.claudish/docker-events.log` on po-2025 |
+
+The hub container's own lifecycle that morning is **not** told here: a
+seat-side reading of `docker-events.log` once saw a "restart storm" in it,
+and the hub lane's post-mortem refuted that reading with the same journal
+(zero lifecycle events on `claudish-proxy` that window, an empty `drain.log`,
+119 requests served inside the alleged "stopped" window). The hub-side
+chronology lives in **`docs/reference/hub-outage-2026-10-30.md`** (#785);
+this section keeps only what a seat measured.
 
 **The hub's durable ledger cannot certify its own outage window.** In
 `failover-events.log` the `ts` is the *line's* docker timestamp but the
@@ -251,13 +258,15 @@ dead" — that distinction decides who gets paged. Pins:
    with the measured window, the sources, and what the seat could not
    determine.
 2. **A change to the fleet-facing entry point is announced BEFORE it is
-   applied** (roo-extensions#3963, above). The restart storm of 08:44–10:44Z
-   is a sequence of changes to the hub container, and none of them was
-   announced. Even when the actor is the hub lane's own tooling, the
-   announcement is what tells the other seats.
+   applied** (roo-extensions#3963, above). The rule needs no restart storm to
+   stand: the door was dead from ~09:30Z and nobody announced it, whatever
+   the mechanism turned out to be (a host reboot — below). The announcement
+   is what tells the other seats; the mechanism arrives later, in the
+   post-mortem.
 
-**The hub lane's post-mortem (30/10 15:09Z, RAPPORTÉ) answered what this seat
-could not determine:** the container **never crashed** (`started=10:32:02Z`,
+**The hub lane's post-mortem answered what this seat could not determine**
+(full hub-side chronology: **`docs/reference/hub-outage-2026-10-30.md`**,
+#785): the container **never crashed** (`started=10:32:02Z`,
 exit 0, no OOM, no drain entry that day) — the **host rebooted** at
 **10:29:08Z** (Event 1074, `Explorer.EXE`, "Autre (non planifié)", clean
 shutdown 6006/6005, no 41/6008) and the container came back three minutes
