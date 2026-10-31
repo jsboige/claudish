@@ -1,0 +1,18 @@
+# [resp] marker contract — MUST match respMarkerLine (handlers/shared/traffic-markers.ts),
+# emitted by createResponseCapture.done() BEFORE the capture write is dispatched
+# (real-time hang signal: a [Request] with no [resp] = the parser never reached close).
+# Consumers: traffic-live.ps1 response counts, the req↔resp hang heuristic, capture
+# pairing scripts (join by (pid, reqN), never by parsing this filename).
+# Grammar (two leading spaces; label = PARSER; no machine= on this line family):
+#   [resp] <label> model=<model> reqN=<n> events~=<e> bytes=<b> closed=<bool|?> stop=<reason|?> <ms>ms -> <file>
+# `?` is a meaning ("the stream ended without one"), never a bug; stop=client-cancel
+# with closed=false is how a client abort closes out (#220).
+# Guard: change the builder -> traffic-format-producer.test.ts fails HERE.
+# Provenance: lines 1-2 are WILD (relay .46 myia-po-2023 docker logs 2026-10-07,
+# docker-timestamp prefix stripped); lines 3-4 are PRODUCER-BUILT to pin the `?`
+# fallback shape and the client-cancel shape (no wild sample on that corpus).
+
+  [resp] openai model=glm-5.2 reqN=1 events~=7 bytes=1019 closed=true stop=tool_use 11ms -> /captures/resp-1-r0001-2026-10-07T05-31-07-285Z-openai-glm-5.2.sse
+  [resp] openai model=glm-5.2 reqN=2 events~=7 bytes=1017 closed=true stop=tool_use 8ms -> /captures/resp-1-r0002-2026-10-07T06-46-15-525Z-openai-glm-5.2.sse
+  [resp] openai model=glm-5.3 reqN=0 events~=0 bytes=0 closed=? stop=? 5ms -> /captures/resp-1-r0000-2026-10-07T00-00-00-000Z-openai-glm-5.3.sse
+  [resp] anthropic model=kimi-k2.5 reqN=9 events~=12 bytes=4096 closed=false stop=client-cancel 501ms -> /captures/resp-1-r0009-2026-10-07T00-00-00-000Z-anthropic-kimi-k2.5.sse

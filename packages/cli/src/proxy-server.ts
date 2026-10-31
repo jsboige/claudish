@@ -19,6 +19,13 @@ import {
 // fleet that never opts in.
 import { extractSessionKey } from "./fork/failover.js";
 import { collectRoutedBareNames, createProxyAuthMiddleware } from "./fork/middleware/proxy-auth.js";
+// #641 blocker-2 port — capture pipeline (fork extension). request-logger owns
+// the req-*.json capture, the pinned [Request] stdout line and the per-request
+// number (requestNumberFor) the stream parsers correlate their [ttft]/[resp]
+// markers and resp-* captures by. hostname-binding supplies the direct-address
+// WeakMap, fed in Bun.serve's fetch wrapper below.
+import { logRequest } from "./fork/middleware/request-logger.js";
+import { createHostnameConfig } from "./fork/server/hostname-binding.js";
 import {
   HOPS_HEADER,
   type RelayState,
@@ -1015,6 +1022,10 @@ export async function createProxyServer(
   // fork/server/stream-registry.ts.
   const streamTracker = createStreamTracker();
   app.use("*", streamTracker.middleware);
+  // Capture pipeline (fork extension): bind config + direct-address map. The
+  // map is populated in Bun.serve's fetch wrapper (below) and read at capture
+  // time by logRequest — x-forwarded-for / x-real-ip take precedence there.
+  const hostnameConfig = createHostnameConfig(options.hostname);
   const startedAt = Date.now();
 
   // Terminal-safety backstop. Hono's DEFAULT error handler is literally
@@ -1348,6 +1359,14 @@ export async function createProxyServer(
         advisorPresence
       );
 
+      // Capture pipeline (fork extension): req-* capture + [Request] line +
+      // request-number assignment (requestNumberFor). Sits AFTER the relay
+      // branch (nominal forwards never capture locally — the hub captures
+      // centrally) and AFTER handler resolution (the handler name is part of
+      // the [Request] contract). Attribution fields (machine, hops,
+      // inbound_key, device_id8, entrypoint/workload) ride the envelope.
+      logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
+
       // #317: the attempt token is attached right before the paid attempt — the
       // usage sink keys its max-ledger on it. No-op when both bars are off.
       openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
@@ -1403,7 +1422,24 @@ export async function createProxyServer(
   // Bun.serve touches no globals, so the whole class of problem is gone rather
   // than patched up afterwards.
   const server = Bun.serve({
-    fetch: app.fetch,
+    fetch(req, srv) {
+      // Capture pipeline (fork extension): remember the direct remote address.
+      // It is recorded as the additive `remote` field ONLY — never as `src`,
+      // never in the filename, whose vocabulary turn-autopsy's REQ_RE pins to
+      // `direct` / the relay pair form (#722 read-back, measured 2026-10-29).
+      // (Main's @hono/node-server wrapper read ctx.remoteAddress; Bun.serve
+      // exposes the same fact as srv.requestIP — same WeakMap, native API.)
+      if (!req.headers.get("x-forwarded-for") && !req.headers.get("x-real-ip")) {
+        try {
+          const ip = srv.requestIP(req);
+          if (ip) hostnameConfig.remoteAddrMap.set(req, ip.address);
+        } catch {
+          // Address unavailable (unix socket, detached) — capture falls back
+          // to "direct", which is what an unattributable source means.
+        }
+      }
+      return app.fetch(req, srv);
+    },
     port,
     // Fork extension (#641 G2): configurable bind — the hub and sidecar
     // containers must reach sibling machines ("0.0.0.0"), everything else

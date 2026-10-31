@@ -331,6 +331,10 @@ async function responseScenario(
   const moduleUrl = (path: string) => JSON.stringify(`${root}/${path}.js`);
   const script = `
     const exit = process.exit.bind(process);
+    // This child's stdout is a protocol stream (one JSON line). The capture
+    // pipeline's markers are ungated stdout by design; filter exactly the
+    // pinned prefixes here, like child-proxy-run.ts does for CP-10.
+    (await import(${moduleUrl("test-support/traffic-markers-silence")})).silenceTrafficMarkers();
     globalThis.fetch = Object.assign(async () => {
       throw new Error("unexpected network request");
     }, { preconnect: () => {} });

@@ -254,6 +254,10 @@ describe("G4 — tool-less full-conversation panel payload", () => {
       // request is built by the production payload builder and Responses adapter.
       const script = `
       import { readFileSync } from "node:fs";
+      // This child's stdout is a protocol stream (one JSON line). The capture
+      // pipeline's markers are ungated stdout by design; filter exactly the
+      // pinned prefixes here, like child-proxy-run.ts does for CP-10.
+      (await import(${JSON.stringify(moduleUrl("../test-support/traffic-markers-silence.ts"))})).silenceTrafficMarkers();
       const { ComposedHandler } = await import(${JSON.stringify(moduleUrl("composed-handler.ts"))});
       const { CodexAPIFormat } = await import(${JSON.stringify(moduleUrl("../adapters/codex-api-format.ts"))});
       const { _setCatalogEntriesForTest } = await import(${JSON.stringify(moduleUrl("../providers/catalog-client.ts"))});

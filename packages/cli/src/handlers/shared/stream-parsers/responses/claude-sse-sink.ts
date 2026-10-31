@@ -43,6 +43,8 @@ export class ClaudeSseSink {
   private readonly toolBlocks = new Map<number, ToolBlockState>();
   private readonly abort = new AbortController();
   private firstToolId: string | undefined;
+  /** Stop reason of the last `message_delta`, for the [resp] capture marker. */
+  private lastStopReason: string | undefined;
   /** Text blocks of the message by index, in order (code mode anchors a text-only turn by them). */
   private readonly texts = new Map<number, string>();
 
@@ -185,6 +187,7 @@ export class ClaudeSseSink {
 
   /** `message_delta` + `message_stop`. */
   endMessage(stopReason: string, usage: { input_tokens: number; output_tokens: number }): void {
+    this.lastStopReason = stopReason;
     this.send("message_delta", {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
@@ -192,6 +195,15 @@ export class ClaudeSseSink {
     });
     this.send("message_stop", { type: "message_stop" });
     this.finish();
+  }
+
+  /**
+   * The stop_reason of the terminal message_delta this sink emitted, if any
+   * (capture pipeline, #641 blocker-2 port — feeds the [resp] marker's
+   * `stop=` field; undefined → `?`, "the stream ended without one").
+   */
+  get finalStopReason(): string | undefined {
+    return this.lastStopReason;
   }
 
   /**

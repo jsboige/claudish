@@ -8,9 +8,14 @@
 
 import type { Context } from "hono";
 import type { BaseAPIFormat } from "../../../adapters/base-api-format.js";
+// Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [resp] stdout
+// marker, correlated by the request number frozen at ingestion. Tap-only wire
+// (no [ttft] marker on this lane — same as main).
+import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import type { RawStreamTap } from "../../../hooks/raw.js";
 import { log } from "../../../logger.js";
 import { redactForClient } from "../../../redact.js";
+import { createResponseCapture } from "../response-capture.js";
 import { messageStartUsage } from "./message-start-usage.js";
 import { sseDataPayload } from "./sse-line.js";
 import {
@@ -41,7 +46,7 @@ export interface GeminiSseOptions {
 }
 
 export function createGeminiSseStream(
-  _c: Context,
+  c: Context,
   response: Response,
   opts: GeminiSseOptions
 ): Response {
@@ -52,9 +57,21 @@ export function createGeminiSseStream(
   let cancelled = false;
   let pingInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Capture pipeline (#641 blocker-2 port) — reqN resolved from the request
+  // object (assigned at ingestion by logRequest), never from the global
+  // counter, so the resp-* file pairs with its req-* under concurrency.
+  const reqN = requestNumberFor(c.req);
+  const cap = createResponseCapture("gemini", opts.modelName, true, reqN);
+
   const upstream: UpstreamReaderSlot = {};
   const source: ParserSource<Uint8Array> = {
     async start(controller) {
+      // Mirror every outgoing byte into the response capture.
+      const _origEnqueue = controller.enqueue.bind(controller);
+      controller.enqueue = ((chunk: any) => {
+        cap.tap(chunk);
+        return _origEnqueue(chunk);
+      }) as typeof controller.enqueue;
       const send = (event: string, data: any) => {
         if (!isClosed) {
           controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
@@ -74,6 +91,9 @@ export function createGeminiSseStream(
       let lastActivity = Date.now();
       /** Upstream finishReason was MAX_TOKENS — the turn was cut off, not completed. */
       let truncated = false;
+      // Capture pipeline: stop_reason of the terminal message_delta, for the
+      // [resp] marker. Stays undefined when none went out → `?`.
+      let sentStopReason: string | undefined;
 
       send("message_start", {
         type: "message_start",
@@ -137,6 +157,8 @@ export function createGeminiSseStream(
           } finally {
             teardown();
           }
+          // Capture pipeline: client abort — `closed=false` in the [resp] marker.
+          cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
           return;
         }
 
@@ -180,6 +202,7 @@ export function createGeminiSseStream(
             // thinking model spent the whole budget reasoning — as the model's
             // complete final word.
             const stopReason = truncated ? "max_tokens" : hasToolCalls ? "tool_use" : "end_turn";
+            sentStopReason = stopReason;
             if (truncated) {
               log("[GeminiSSE] finishReason=MAX_TOKENS → stop_reason=max_tokens");
             }
@@ -198,6 +221,17 @@ export function createGeminiSseStream(
           }
         } finally {
           teardown();
+          // Capture pipeline (#641 blocker-2 port): `closed: true` on every
+          // path that reached finalize (the controller always closes here),
+          // with the stop reason of the terminal event the client got. done()
+          // is idempotent and swallows its own errors — it can never break the
+          // stream.
+          cap.done({
+            closed: true,
+            stop_reason: reason === "error" ? "exception" : sentStopReason,
+            reason,
+            path: "finalize",
+          });
         }
       };
 
@@ -392,6 +426,8 @@ export function createGeminiSseStream(
         clearInterval(pingInterval);
         pingInterval = null;
       }
+      // Capture pipeline: client abort — `closed=false` in the [resp] marker.
+      cap.done({ closed: false, stop_reason: "client-cancel", path: "cancel" });
     },
   };
   const stream = new ReadableStream(cancelEndsUpstreamWork(upstream, source));

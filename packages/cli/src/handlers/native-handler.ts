@@ -1,5 +1,10 @@
 import type { Context } from "hono";
 import { credentials } from "../auth/credentials/authority.js";
+// Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [resp] stdout
+// marker on the streaming branch, and a durable appendUpstreamError trace of
+// non-ok bodies — NativeHandler is the ONLY path for Anthropic-native traffic,
+// so without it a quota wall from api.anthropic.com left no durable trace.
+import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
 import { requestHooksOf } from "../hooks/request-stage.js";
 import { log, maskCredential } from "../logger.js";
@@ -13,6 +18,7 @@ import {
 } from "./native-handler-advisor.js";
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
 import { addSigningSecrets, credentialValuesFromRequest } from "./shared/call-context.js";
+import { appendUpstreamError, createResponseCapture } from "./shared/response-capture.js";
 import {
   type UpstreamReaderSlot,
   cancelEndsUpstreamWork,
@@ -208,6 +214,13 @@ export class NativeHandler implements ModelHandler {
       // Handle streaming
       if (contentType.includes("text/event-stream")) {
         log("[Native] Streaming response detected");
+        // Capture pipeline (#641 blocker-2 port) — reqN frozen at ingestion so
+        // the resp-* file pairs with its req-* under concurrency. The tap sits
+        // on the controller override: v14's passthrough re-encodes and redacts
+        // events before forwarding, so the capture holds exactly the bytes the
+        // client received (main taps the raw upstream, which IS what its client
+        // receives — same invariant, adapted to this wire).
+        const cap = createResponseCapture("native", target, true, requestNumberFor(c.req));
         // A downstream cancel cancels this reader and waits for the loop below
         // (which logs the whole stream at its end) before it resolves.
         const upstream: UpstreamReaderSlot = {};
@@ -216,6 +229,12 @@ export class NativeHandler implements ModelHandler {
           new ReadableStream(
             cancelEndsUpstreamWork<Uint8Array>(upstream, {
               async start(controller) {
+                // Mirror every outgoing byte into the response capture.
+                const _origEnqueue = controller.enqueue.bind(controller);
+                controller.enqueue = ((chunk: any) => {
+                  cap.tap(chunk);
+                  return _origEnqueue(chunk);
+                }) as typeof controller.enqueue;
                 const reader = anthropicResponse.body?.getReader();
                 if (!reader) throw new Error("No reader");
                 upstream.reader = reader;
@@ -285,6 +304,12 @@ export class NativeHandler implements ModelHandler {
                   }
                   flushHeld(pending + decoder.decode());
                   if (eventLog) log(eventLog);
+                  cap.note("reader done");
+                  cap.done(
+                    cancelled
+                      ? { closed: false, reason: "client-cancel" }
+                      : { closed: true, reason: "done" }
+                  );
                   if (!cancelled) controller.close();
                 } catch (e) {
                   // The lines already read are forwarded, as they were before
@@ -294,6 +319,8 @@ export class NativeHandler implements ModelHandler {
                   } catch {}
                   if (eventLog) log(eventLog);
                   log(`[Native] Stream Error: ${redactForClient(String(e))}`);
+                  cap.note(`stream error: ${String(e)}`);
+                  cap.done({ closed: !cancelled, reason: "error", err: String(e) });
                   if (!cancelled) {
                     try {
                       controller.close();
@@ -306,6 +333,9 @@ export class NativeHandler implements ModelHandler {
               // resolves the cancel.
               cancel() {
                 cancelled = true;
+                // Capture pipeline: client abort — `closed=false` in the [resp]
+                // marker (idempotent with the loop-end call above).
+                cap.done({ closed: false, reason: "client-cancel" });
               },
             })
           ),
@@ -324,6 +354,18 @@ export class NativeHandler implements ModelHandler {
       // request's credential, so it is redacted before it is logged or returned;
       // a success body is parsed exactly as it arrived.
       const raw = await anthropicResponse.text();
+      if (!anthropicResponse.ok) {
+        // Capture pipeline: durable trace of the refusal body. The redacted
+        // echo below is for the client; the capture dir is the local, trusted
+        // side — same split as main's appendUpstreamError site (without this,
+        // a native quota wall left no durable trace).
+        appendUpstreamError({
+          model: target,
+          provider: "Anthropic (native)",
+          status: anthropicResponse.status,
+          body: raw,
+        });
+      }
       const data = JSON.parse(anthropicResponse.ok ? raw : redactForClient(raw));
       // #317: non-streaming native usage feeds the session budget too.
       {

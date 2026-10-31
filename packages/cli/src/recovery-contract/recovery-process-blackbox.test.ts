@@ -13,7 +13,12 @@
 import { describe, expect, test } from "bun:test";
 import { reservePorts, sleep, startRawFixture } from "./fixtures.js";
 
-const CHILD = new URL("./child-proxy-run.ts", import.meta.url).pathname;
+import { fileURLToPath } from "node:url";
+
+// Windows: URL.pathname yields "/D:/Dev/…" — bun cannot resolve the leading
+// slash ("Module not found"), so the child dies at module load. fileURLToPath
+// is the portable form (proved 29/10 alongside the process.execPath spawn fix).
+const CHILD = fileURLToPath(new URL("./child-proxy-run.ts", import.meta.url));
 const SECRET_KEY = "sk-blackbox-SECRET-VALUE-9f3c1d"; // the key the child configures
 
 interface ChildRun {
@@ -33,7 +38,10 @@ async function runChild(
   const started = Date.now();
   const child = Bun.spawn(
     [
-      "bun",
+      // Windows: the literal "bun" is not resolvable by uv_spawn (no .exe /
+      // PATHEXT walk) — spawn the running binary itself (proved 27/10: the
+      // CP-10/CP-7 local reds were this ENOENT, not a product defect).
+      process.execPath,
       "run",
       CHILD,
       mode,
@@ -149,7 +157,7 @@ describe("CP-7 — the process itself lets go", () => {
     const [port] = reservePorts(1);
     const fixture = startRawFixture(port);
     const child = Bun.spawn(
-      ["bun", "run", CHILD, "exhaust", `http://127.0.0.1:${port}/v1`, "120000"],
+      [process.execPath, "run", CHILD, "exhaust", `http://127.0.0.1:${port}/v1`, "120000"],
       { env: { ...process.env }, stdout: "pipe", stderr: "pipe", stdin: "ignore" }
     );
     try {

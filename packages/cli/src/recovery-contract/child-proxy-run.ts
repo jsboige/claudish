@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setConfigFileOverride } from "../config-override.js";
 import { createProxyServer } from "../proxy-server.js";
+import { silenceTrafficMarkers } from "../test-support/traffic-markers-silence.js";
 
 const [mode, endpointUrl, apiTimeoutMs, abortAfterMs] = process.argv.slice(2);
 
@@ -30,6 +31,22 @@ const SECRET_KEY = "sk-blackbox-SECRET-VALUE-9f3c1d";
 
 process.env.API_TIMEOUT_MS = apiTimeoutMs ?? "40000";
 delete process.env.CLAUDISH_RECOVERY;
+
+// The capture-pipeline port (PR #722) wires the traffic markers into the v14
+// proxy. The whole [Request] block is UNGATED stdout on a server deployment —
+// `[claudish] [Request] …` + the `  [system] ` / `  [msg:N] ` excerpts
+// (request-logger), `  [ttft] ` (parsers), `  [resp] ` (response-capture) —
+// the channel `docker logs` exposes and every traffic-*.ps1 reader consumes.
+// THIS child is not a deployment: per the header contract above, its stdout is
+// the protocol stream and carries exactly one JSON line. Rather than forking
+// the marker channel (which would fork the pinned consumer contract the port
+// exists to preserve), the child filters EXACTLY the pinned marker prefixes —
+// one shared definition, also installed by every OTHER hermetic child that
+// parses a JSON stdout line (test-support/traffic-markers-silence.ts). The
+// whitelist is deliberately narrow: any OTHER stdout byte — a stray [Recovery]
+// line, a banner, a future ungated marker — still reaches the consumer and
+// fails the test that owns the contract.
+silenceTrafficMarkers();
 
 const dir = mkdtempSync(join(tmpdir(), "recovery-child-"));
 const configPath = join(dir, "config.json");
