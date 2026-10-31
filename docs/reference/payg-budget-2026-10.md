@@ -22,7 +22,7 @@ everything else off-peak, weekends included.
 
 Measured legs per PAYG response (30/10, n=600 resp tails):
 
-| Leg | Tokens/resp | Share of billed input |
+| Leg | Tokens/resp | Share of priced input |
 | --- | ---: | ---: |
 | cache read (hit) | 174 086 | 99.1 % |
 | fresh input (miss) | 1 610 | 0.9 % |
@@ -39,7 +39,11 @@ the MiniMax plan, where every re-read token burns quota 1:1). Per response, € 
 `lane-series.sqlite` (142 days, `resp-*` counts), priced per day at each day's own
 peak/off-peak split:
 
-| Window | PAYG resp/day | €/month run-rate | Actual billed |
+Every € figure in this doc is **computed, not invoiced** — lane response counts ×
+the public price table × the measured legs above. No figure is read from a billing
+console (console readings stay on the internal dashboard; only ratios live here).
+
+| Window | PAYG resp/day | €/month run-rate | Estimated (resp × price) |
 | --- | ---: | ---: | ---: |
 | **July 01–31** | **0** (no DeepSeek model served at all; first deepseek-flash day = 09-10) | €0 | €0 |
 | Late Sept 20–30 | 3 824 | ~€170 | ~€62 (11 days) |
@@ -47,7 +51,7 @@ peak/off-peak split:
 | **Oct 20–30** | **11 511** | **~€518** | ~€177 (11 days) |
 | Worst single days (08-09/10, 23-24/10, 29/10) | 21 000–27 700 | **~€1 170** | €32–41 each |
 
-**October's actual total ≈ €330–360** (27–28/10 missing from the store — ingestion gap,
+**October's estimated total ≈ €330–360** (27–28/10 missing from the store — ingestion gap,
 not zero traffic). So:
 
 - The monthly average is **already inside the "few hundred €" ceiling**.
@@ -101,7 +105,7 @@ stack outages, not fleet size.
 
 - **Closes the PAYG half of #405**: the cache-hit leg now has an official price anchor,
   and the per-response € is measured, not estimated.
-- **Reframes the user's 1 k€ envelope**: October billed ~€350; the 1 k€ figure is the
+- **Reframes the user's 1 k€ envelope**: October estimated ~€350; the 1 k€ figure is the
   worst-day run-rate. The controllable variable is falaise-day frequency, not price.
 - **Still open on #405**: the *subscription* legs (MiniMax plan, GLM Coding plan) are
   priced per month, not per token — their "€ per response" depends on quota mechanics
