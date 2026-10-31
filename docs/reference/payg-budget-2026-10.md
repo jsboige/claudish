@@ -60,20 +60,36 @@ not zero traffic). So:
 
 ## 3. Attribution — the burn is CoursIA-class work, not the claudish workspace
 
-Paired census on 30/10 (600 deepseek-flash responses ↔ `req-*` envelopes by sequence
-number; workspace = last `Primary working directory:` in the request body, per
-`Get-WorkspaceFromBody`):
+Paired census on 30/10, **full population, restart-aware** (3 709 of 3 718 deepseek-flash
+responses paired to their `req-*` envelope; window **00:00:03Z → 22:18:30Z**). The day
+spans **three process lifetimes** (resp `instanceId` counts 1 746 / 1 104 / 859), so
+pairing is not single-counter: same sequence number + nearest-preceding request
+timestamp within a 20-min window — `scripts/uncached-attribution.py` semantics (#765).
+Epochs being hours apart, a cross-restart bind is arithmetically excluded (0 pairs
+capped by the window; 9 responses unpaired). Workspace = last
+`Primary working directory:` in the request head:
 
-- **~95 % of PAYG responses come from CoursIA-class workspaces** (CoursIA, CoursIA-2,
-  CoursIA-3, Epita), spread across all six machines. Top single row: ai-01:CoursIA 9.8 %.
-- **The claudish workspace does not appear in the top 18** (< 1.3 % of the PAYG burn —
-  **under €5/month** at October's rate). On ALL traffic (1 500-request sample) claudish
-  is **4.3 %** of fleet requests; CoursIA-class is 64.7 %.
-- Requested-role split of PAYG: 57 % sonnet, 36 % haiku (the overflow path), 4 % opus.
+- **36.1 % of PAYG responses come from CoursIA-class workspaces** (1 338; CoursIA,
+  CoursIA-2, CoursIA-3, Epita), spread across all six machines — the largest
+  *attributable* class (top rows: po-2023 313, po-2024 273, po-2028 245).
+- **41.2 % (1 527) carry no harness marker at all** — no `Primary working directory:`
+  anywhere in the request. Verified **not** a truncation artifact (30/30 head-negative
+  files are also negative in their last 64 KiB): these are non-Claude-Code callers —
+  OpenAI-ingress script traffic and inbound-key consumers — heaviest on po-2028 (437)
+  and ai-01 (274).
+- **The claudish workspace is 2.4 %** (89 responses — ≈ **€8–9/month** at October's
+  rate, assuming even per-response cost). An earlier 600-response sample had put it
+  under 1.3 % / €5 — the sample was not representative; the numbers above are the
+  full-day population.
+- Requested-role split: **sonnet 69.9 %, haiku 26.5 %, glm-5.3 3.4 % + glm-5.2 0.3 %,
+  opus 0** — glm-named requests land on deepseek-flash through the cascade walk (the
+  GLM step has been 402-dead since 28/10).
 
 The user's hypothesis ("votre workspace qui n'existait pas en juillet" as a cost driver)
-is measured and **quantified**: claudish is real volume (4.3 % of requests, mostly on
-subscription lanes) but is **not** what the PAYG bill buys. The bill buys course sessions.
+is measured and **quantified**: claudish is real volume (4.3 % of fleet requests, mostly
+on subscription lanes; 2.4 % of PAYG responses) but is **not** what the PAYG bill buys.
+The bill buys course sessions — the largest attributable class — plus the unmarked
+script traffic riding the same lanes.
 
 ## 4. The mechanism — PAYG is a *buffer-stack* meter, not a volume meter
 
