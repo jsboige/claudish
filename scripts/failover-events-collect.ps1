@@ -42,7 +42,13 @@
 #
 # Outputs, both under <ClaudishHome>:
 #   failover-events.log         append-only NDJSON, one kept line per record:
-#                               {ts, line, container, instanceId}
+#                               {ts, line, container, instanceId, instanceIdSource}
+#                               (instanceIdSource #782: 'started-at' = attributed
+#                               via the container's StartedAt across a restart,
+#                               'collect-instant' = instance stable for the whole
+#                               window, 'unattributed' = change tick whose
+#                               StartedAt could not be read — id '' rather than a
+#                               guess)
 #   failover-events-state.json  last tick + bounded history + dedup ring
 #
 # The state file is what makes a DEAD collector distinguishable from a QUIET
@@ -230,20 +236,39 @@ $prevInstance = ''
 if ($null -ne $state) { try { $prevInstance = [string]$state.InstanceId } catch { $prevInstance = '' } }
 $instanceChanged = ($null -ne $instanceId -and $prevInstance -ne '' -and $instanceId -ne $prevInstance)
 
+# #782: on the tick that discovers a NEW instanceId, read the container's
+# StartedAt (host clock — one bounded docker inspect) and attribute each kept
+# line to the instance that was LIVE when the LINE was written; a stable tick
+# needs no split (the collect-time id is then each line's id). A read failure
+# (docker unreachable, inspect refused) degrades the attribution to
+# ''/'unattributed' — never a guess — and costs nothing to collection itself.
+$startedAtUtc = ''
+if ($instanceChanged) {
+    $ins = Invoke-DockerEventsBounded -DockerArgs @('inspect', '--format', '{{.State.StartedAt}}', $Container) -TimeoutSec $DockerTimeoutSec
+    if ($ins.Ok) {
+        $first = @($ins.Lines | Where-Object { $_ })[0]
+        if ($null -ne $first) { $startedAtUtc = ([string]$first).Trim() }
+    }
+}
+
 # NDJSON, one record per kept line: the LINE's own docker timestamp (not the
-# collect instant), the line verbatim, the container name, the instanceId the
-# proxy reported when the tick ran.
+# collect instant), the line verbatim, the container name, and the
+# instance-attribution pair (#782).
 $written = 0
 if ($measured -and $new.Kept.Count -gt 0) {
+    $attr = @(Get-FailoverInstanceAttribution -Events $new.Kept -CurrentInstanceId "$instanceId" -PreviousInstanceId $prevInstance -InstanceChanged $instanceChanged -StartedAtUtc $startedAtUtc)
     $sb = New-Object System.Text.StringBuilder
+    $i = 0
     foreach ($e in @($new.Kept)) {
         $rec = @{
-            ts         = $e.Ts
-            line       = $e.Rest
-            container  = $Container
-            instanceId = "$instanceId"
+            ts               = $e.Ts
+            line             = $e.Rest
+            container        = $Container
+            instanceId       = [string]$attr[$i].Id
+            instanceIdSource = [string]$attr[$i].Source
         }
         [void]$sb.AppendLine(($rec | ConvertTo-Json -Compress))
+        $i++
     }
     try {
         # UTF8 no BOM — a BOM corrupts exactly the first record, and the first
@@ -278,6 +303,10 @@ $record = [PSCustomObject]@{
     Skipped          = @($new.Skipped).Count
     InstanceId       = "$instanceId"
     InstanceChanged  = $instanceChanged
+    # The StartedAt a change tick split its attribution on ('' when unreadable
+    # or no change) — days later this is what separates a real boundary from a
+    # degraded 'unattributed' tick.
+    StartedAtUtc     = $startedAtUtc
 }
 
 $newState = Add-DockerEventsTickRecord -State $state -Record $record -HistoryCap $HistoryCap

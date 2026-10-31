@@ -33,6 +33,7 @@ import {
   DWELL_TOMBSTONES_MAX,
   markStepFailed,
   parseResetAtFromBody,
+  stepFailBodyClass,
   resetStepSuccess,
   onNominalSuccess,
   onNominalRefusal,
@@ -1054,6 +1055,53 @@ describe("reset-time awareness", () => {
       expect(parseResetAtFromBody('{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}')).toBeUndefined();
       expect(parseResetAtFromBody('{"error":{"message":"Rate limit exceeded, retry in 3s"}}')).toBeUndefined();
       expect(parseResetAtFromBody("")).toBeUndefined();
+    });
+  });
+
+  // #739(b): the STEP-ADVANCE marker must carry the body's structured identity,
+  // or two 400s from the same provider are indistinguishable after the container
+  // dies (measured 29/10 — the unrecognized one left no trace in any instrument).
+  describe("stepFailBodyClass", () => {
+    it("reads code and type from an OpenAI-shaped error envelope, code first", () => {
+      expect(
+        stepFailBodyClass(
+          '{"error":{"message":"maximum context length is 8192 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}'
+        )
+      ).toBe("context_length_exceeded/invalid_request_error");
+    });
+
+    it("reads the GLM numeric code alone", () => {
+      expect(stepFailBodyClass('{"error":{"code":"1308","message":"Usage limit reached for 5 hour."}}')).toBe("1308");
+    });
+
+    it("reads a top-level code (Qwen Throttling shape) with error.type alongside", () => {
+      expect(
+        stepFailBodyClass('{"code":"Throttling.AllocationQuota","error":{"type":"quota_exceeded"},"message":"The quota is exhausted."}')
+      ).toBe("quota_exceeded/Throttling.AllocationQuota");
+    });
+
+    // The load-bearing pins: free text NEVER reaches the marker. A marker that
+    // echoed provider prose would put arbitrary upstream bytes on the docker log.
+    it("echoes NO free text — prose messages never appear in the class", () => {
+      expect(stepFailBodyClass('{"error":{"message":"Rate limit exceeded, retry in 3s"}}')).toBe("");
+      expect(stepFailBodyClass("maximum context length is 8192 tokens")).toBe("");
+      expect(stepFailBodyClass("")).toBe("");
+    });
+
+    it("skips Anthropic's top-level type (always the literal 'error') and a hostile token", () => {
+      // Top-level type is deliberately not a candidate; the hostile token fails
+      // the charset bound and is dropped whole, never truncated into the marker.
+      expect(stepFailBodyClass('{"type":"error","error":{"type":"invalid_request_error","code":"x<y>z"}}')).toBe(
+        "invalid_request_error"
+      );
+    });
+
+    it("bounds each token at 64 chars and the list at two distinct tokens", () => {
+      const long = "a".repeat(65);
+      expect(stepFailBodyClass(`{"error":{"code":"${long}","type":"1308"}}`)).toBe("1308");
+      expect(
+        stepFailBodyClass('{"code":"a","error":{"code":"a","type":"b","param":"c"}}')
+      ).toBe("a/b");
     });
   });
 

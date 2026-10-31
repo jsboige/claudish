@@ -50,6 +50,12 @@ BeforeAll {
             # Mount table the mocked docker inspect returns. A config only
             # reachable through the mount is the point of the 2026-10-28 pin.
             [hashtable]$MountedConfigApiKeys,
+            # The THIRD fuel source: a Codex OAuth bind file in the same home.
+            # $true writes a bind with fake tokens; $false writes none.
+            # $GarbageOAuthBind writes a present-but-unparseable file - exactly
+            # what a half-written refresh leaves behind (review item 2, #774).
+            [switch]$WithOAuthBind,
+            [switch]$GarbageOAuthBind,
             [switch]$NoExplicitHome,
             # Spell the mount SOURCE the way Docker Desktop records a Windows
             # bind mount (`/run/desktop/mnt/host/c/...`), while the file really
@@ -73,6 +79,30 @@ BeforeAll {
             [System.IO.File]::WriteAllText(
                 (Join-Path $auditHome 'config.json'),
                 $json,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+        if ($WithOAuthBind) {
+            # Fake tokens on purpose (see header): the suite asserts they never
+            # reach stdout. expires_at is a fixed instant so the printed expiry
+            # is deterministic.
+            $bind = @{
+                access_token  = 'FAKE-CODEX-ACCESS-TOKEN-zz1'
+                refresh_token = 'FAKE-CODEX-REFRESH-TOKEN-zz2'
+                expires_at    = 1793611286427
+                account_id    = 'FAKE-ACCOUNT-ID-zz3'
+            } | ConvertTo-Json -Depth 3
+            [System.IO.File]::WriteAllText(
+                (Join-Path $auditHome 'codex-oauth.json'),
+                $bind,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+        if ($GarbageOAuthBind) {
+            # Truncated mid-object: present, never parseable.
+            [System.IO.File]::WriteAllText(
+                (Join-Path $auditHome 'codex-oauth.json'),
+                '{"access_token":',
                 (New-Object System.Text.UTF8Encoding($false))
             )
         }
@@ -170,6 +200,18 @@ BeforeAll {
             'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
             'CLAUDISH_FAILOVER_SONNET=ds@deepseek-flash',
             'CLAUDISH_FAILOVER_ACTIVE=sonnet'
+        )
+    }
+    # The cx@ fixture (third fuel source): ONE non-nominal rung, cx@, and no
+    # provider env name. Declared in BeforeAll on purpose - a function declared
+    # in a Context is not reliably visible inside It bodies (same trap the
+    # header documents for variables).
+    function New-CodexOnlyEnv {
+        @(
+            'PATH=/usr/bin',
+            'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
+            'CLAUDISH_FAILOVER_OPUS=cx@gpt-6.1-sol>role:sonnet',
+            'CLAUDISH_FAILOVER_ACTIVE=opus'
         )
     }
 }
@@ -378,6 +420,90 @@ Describe 'seat-readiness-audit' {
         It 'the value firewall covers the config source too' {
             $r = Invoke-Audit -EnvLines (New-SeatEnv 'kc@k3') -ConfigApiKeys @{ KIMI_CODING_API_KEY = 'sk-FAKE-KIMI-11' }
             $r.Out | Should -Not -Match 'sk-FAKE-KIMI-11'
+            $r.Out | Should -Not -Match 'FAKE-CLUSTER-KEY-9f2'
+        }
+    }
+
+    Context 'the THIRD fuel source: the Codex OAuth bind (measured 2026-10-30 on the hub)' {
+        # `cx@` (openai-codex) authenticates with the bind FILE and nothing
+        # else: no OPENAI_CODEX_API_KEY, and the GOOGLE_API_KEY /
+        # GEMINI_API_KEY names the 'google' bucket looks for are irrelevant to
+        # it. An audit that knows only env + apiKeys map reads that rung as
+        # fabric-less, and a reader who trusts it may pull `cx@` out of the
+        # canon - the 2026-11-02 cliff (barreau 0 of OPUS and FABLE).
+        # The fixture seat: ONE non-nominal rung, cx@, and no provider env name
+        # (New-CodexOnlyEnv lives in BeforeAll).
+        It 'a cx@ rung with the bind present reads READY and NAMES the bind' {
+            $r = Invoke-Audit -EnvLines (New-CodexOnlyEnv) -WithOAuthBind
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'seat-readiness: READY'
+            $r.Out | Should -Match 'Codex OAuth bind: present'
+            $r.Out | Should -Match 'has the Codex OAuth bind codex-oauth\.json'
+            # the expiry DATE is a measurement, not a secret
+            $r.Out | Should -Match 'expires 2026-11-02T09:21:26Z'
+        }
+
+        It 'THE PIN: the same seat WITHOUT the bind reads NO-FUEL - only the bind differs' {
+            $r = Invoke-Audit -EnvLines (New-CodexOnlyEnv)
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'seat-readiness: NO-FUEL'
+            $r.Out | Should -Match 'Codex OAuth bind: absent'
+        }
+
+        It 'the bind does NOT fuel a google-bucket rung (the bind is the codex bucket rule, not google)' {
+            # gemini@ sits in 'google'; the bind fuels 'openai-codex' only.
+            # Before #774 the cx@ alias mapped into 'google', so the audit
+            # printed "bucket 'google' has the Codex OAuth bind" - a reader
+            # was told an OpenAI credential held a Google bucket.
+            $env = @(
+                'PATH=/usr/bin',
+                'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
+                'CLAUDISH_FAILOVER_SONNET=gemini@gemini-2.0-flash',
+                'CLAUDISH_FAILOVER_ACTIVE=sonnet'
+            )
+            $r = Invoke-Audit -EnvLines $env -WithOAuthBind
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'seat-readiness: NO-FUEL'
+            $r.Out | Should -Not -Match "bucket 'google' has the Codex OAuth bind"
+        }
+
+        It 'THE PIN (#774 R1): g@ and cx@ rungs are DISTINCT buckets - the fabric is not under-counted' {
+            # The proxy walls these two separately (openai-codex is its own
+            # bucket, failover.ts classifyNominalBucket). Old mapping folded
+            # cx@ into 'google': one bucket where the proxy sees two, and a
+            # google-nominal seat would read its cx@ rung as same-bucket.
+            $env = @(
+                'PATH=/usr/bin',
+                'CLAUDISH_PROXY_KEY=FAKE-CLUSTER-KEY-9f2',
+                'CLAUDISH_FAILOVER_OPUS=g@gemini-2.0-flash>cx@gpt-6.1-sol',
+                'CLAUDISH_FAILOVER_ACTIVE=opus'
+            )
+            $r = Invoke-Audit -EnvLines $env -WithOAuthBind
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'seat-readiness: READY'
+            $r.Out | Should -Match 'buckets \[google, openai-codex\]'
+            $r.Out | Should -Match "bucket 'openai-codex' has the Codex OAuth bind codex-oauth\.json"
+            $r.Out | Should -Not -Match "bucket 'google' has the Codex OAuth bind"
+        }
+
+        It 'THE PIN (#774 R2): a present-but-unreadable bind reads as its own state, never as absent' {
+            # A truncated codex-oauth.json is exactly what a half-written
+            # refresh leaves behind. Reading it as "absent" is the
+            # silent-source failure family this script exists to kill.
+            $r = Invoke-Audit -EnvLines (New-CodexOnlyEnv) -GarbageOAuthBind
+            $r.Code | Should -Be 1
+            $r.Out | Should -Match 'seat-readiness: NO-FUEL'
+            $r.Out | Should -Match 'Codex OAuth bind: present, unreadable - not counted as fuel'
+            $r.Out | Should -Not -Match 'Codex OAuth bind: absent'
+            # unreadable proves nothing: no fuel claim may be printed off it
+            $r.Out | Should -Not -Match 'has the Codex OAuth bind codex-oauth\.json'
+        }
+
+        It 'the value firewall covers the bind too: no token, no account id' {
+            $r = Invoke-Audit -EnvLines (New-CodexOnlyEnv) -WithOAuthBind
+            $r.Out | Should -Not -Match 'FAKE-CODEX-ACCESS-TOKEN-zz1'
+            $r.Out | Should -Not -Match 'FAKE-CODEX-REFRESH-TOKEN-zz2'
+            $r.Out | Should -Not -Match 'FAKE-ACCOUNT-ID-zz3'
             $r.Out | Should -Not -Match 'FAKE-CLUSTER-KEY-9f2'
         }
     }

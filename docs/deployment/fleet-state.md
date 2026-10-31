@@ -18,7 +18,7 @@ Rules:
   `[Failover] configured=N auto=on`, `/health`, `test -f` on every file bind,
   relay NOMINAL as seen by po-203.
 
-## Current canonical form — hub po-2025 (read IN the container, 29/10 10:2xZ)
+## Current canonical form — hub po-2025 (read IN the container, 29/10 13:2xZ)
 
 **This block outranks any cascade/role row further down.** Those rows are dated snapshots of
 23/09 and earlier; they are kept for the audit trail, not as the current shape. "La règle" is
@@ -27,8 +27,9 @@ never a coordinator's summary.
 
 ```
 CLAUDISH_FAILOVER_ACTIVE   = haiku@myia-po-2027,haiku@myia-po-2023,haiku@myia-po-2024,haiku@myia-po-2028
-CLAUDISH_FAILOVER_SONNET   = mistral@zai-glm-5-3 > kc@k3 > qwen-token-plan@deepseek-v4.1-flash-1017 > ds@deepseek-flash
-                             LABEL Mistral GLM>Kimi K3>Qwen prepaid>DeepSeek Flash PAYG · DIRECTION degraded>lateral>lateral>lateral
+CLAUDISH_FAILOVER_SONNET   = mistral@zai-glm-5-3 > kc@k3 > mmc@MiniMax-M3.1-Flash > qwen-token-plan@deepseek-v4.1-flash-1017 > ds@deepseek-flash
+                             LABEL Mistral GLM>Kimi K3>MiniMax M3.1>Qwen prepaid>DeepSeek Flash PAYG
+                             DIRECTION degraded>lateral>lateral>lateral>lateral
 CLAUDISH_FAILOVER_HAIKU    = vllm-myia@swift-1.5-27b!own > role:sonnet     (LABEL Swift 1.5 local (vllm-myia)>Sonnet role)
 CLAUDISH_FAILOVER_OPUS     = cx@gpt-6.1-sol > role:sonnet
 CLAUDISH_FAILOVER_FABLE    = cx@gpt-6-astra > role:opus
@@ -38,7 +39,7 @@ CLAUDISH_FAILOVER_ROLE_MODELS  = glm-5.1/5.2/5.3:sonnet, glm-4.7:sonnet, minimax
                                  gpt-6-sol/6.1-sol/5.6-sol:opus, gpt-6-astra:fable
 ```
 
-Two readings that cost a diagnosis when missed:
+Three readings that cost a diagnosis when missed:
 
 - **`kc@k3`, never `kc@k3.1-pro`.** Two distinct ids on the same endpoint and key; the swap landed
   29/10 (drained recreate `success`, verified by value). `k3.1-pro` stays the id named in the Kimi
@@ -48,7 +49,14 @@ Two readings that cost a diagnosis when missed:
   `role:sonnet` instead of straining the local GPU. `myia-ai-01` is excluded for the same reason
   (the step would saturate, never max).
 
-VERIFIED 29/10 10:2xZ by `docker exec claudish-proxy env | grep '^CLAUDISH_FAILOVER_'` on the hub.
+VERIFIED 29/10 13:2xZ by `docker exec claudish-proxy env | grep '^CLAUDISH_FAILOVER_'` on the hub,
+after the drained recreate `success` of 13:20:07Z (new `instanceId` 877f42cb).
+
+- **MiniMax is rung 3 of the sonnet ladder** (user order 29/10 ~13:2xZ: spend the remaining
+  MiniMax stock instead of the DeepSeek PAYG tail). `_NOTE` and `_RESET` are **positional** — one
+  field per step — so adding a rung means recounting both, or a note lands on the wrong step.
+  Measured the same day: GLM walled on 402, Kimi on 429, then sessions pinned to
+  `step 2 (MiniMax M3.1)` — the DeepSeek rung was not reached.
 
 ## po-2025 — HUB (canonical since 05/09 cutover)
 

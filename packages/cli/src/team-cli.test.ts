@@ -11,17 +11,22 @@
  * Non-vacuity: written before the fix; red on main (captured.mode undefined,
  * the `interactive` key dead). team-grid is mocked at the module registry
  * because team-cli imports it DYNAMICALLY (await import) inside the grid
- * branch — mock.module covers the dynamic resolve. The bare factory exports
- * only runWithGrid: no other test file imports team-grid.js (the e2e file
- * goes through e2e-helpers), so the process-global mock (#272) is contained.
+ * branch — mock.module covers the dynamic resolve. The factory spreads the
+ * real module and overrides only runWithGrid: mock.module is process-global
+ * with no unregister (#272), and under bun 1.4.0 it binds every LATER static
+ * import in the same process — a bare factory stranded team-grid-failure-
+ * details.test.ts's `buildTeamStatus` import at link time (#794), so the
+ * mock must keep the sibling exports live.
  */
 import { describe, expect, mock, test } from "bun:test";
 import { teamCommand } from "./team-cli.js";
+import * as realTeamGrid from "./team-grid.js";
 
 const captured: Array<Record<string, unknown>> = [];
 const STATUS = { startedAt: "2026-10-19T00:00:00.000Z", models: {} };
 
 mock.module("./team-grid.js", () => ({
+  ...realTeamGrid,
   runWithGrid: async (
     _sessionPath: string,
     _models: string[],

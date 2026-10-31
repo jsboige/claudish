@@ -52,6 +52,32 @@ Failure accounting (hub side, corrected 2026-10-27 ~09:30Z: this paragraph's 04:
 
 Standing consequence while the Qwen closure holds (until 11/11): **any GLM wall sends the entire sonnet role — including haiku's overflow tail — straight to PAYG.** GLM walls daily; the exposure is structural, not exceptional (this is the Q-po2025-30 march, already arbitrated-open at user level). A widening step that adds haiku volume to step 0 adds overflow tail to exactly this exposure; Gate C's sizing must quote PAYG landings per wall-hour as a first-class number.
 
+### Incident 2026-10-31 — 3 h 02 without swift: it was the WAN edge, not the engine
+
+Measured hub-side (`docker logs -t claudish-proxy`), same day. Last swift response **10:01:43Z** (reqN 12700, 27 s, `stop=tool_use`); the two long streams in flight then ended `stop=max_tokens` at **10:04:15Z** (229 s and 483 s, one 1.46 MB / 21 296 chars — runaway generations, not failures). From **10:04** to **10:14:22Z** the step took repeated non-quota marks, each preceded by the same line:
+
+```text
+Error: Cannot reach api.medium.text-generation-webui.myia.io for Vllm-myia. This is a network
+problem on your machine — check your internet connection, VPN, or DNS resolver …
+[Failover] STEP-ADVANCE haiku — HTTP 400 (non-quota) from step 0; trying next step
+[Failover] step haiku[0] (Swift 1.5 local (vllm-myia)) failed (non-quota) — count=1 ttl=30s own
+```
+
+escalating `count=1 ttl=30s` (10:07:00Z) → `count=2 ttl=2min` (10:08:58Z), then fresh episodes every 60–90 s until 10:14:22Z. No further mark after that; what is measured is the effect: **zero swift responses between 10:04:15Z and 13:03:37Z** (3 h 02 m), while the engine itself was healthy throughout (ai-01's view: health 200, 0 restart, zero refusals).
+
+**The mute is the WAN edge.** `api.medium.text-generation-webui.myia.io` resolves to **90.65.170.144**, po-2023's own WAN IP (`fleet-state.md`, VERIFIED 27/10): the swift path enters the fleet through **po-2023's IIS edge**, not through ai-01 directly. po-2023's host **froze at ~10:00Z** (Event 41 + 6008, no BugCheck; memory asphyxia — 6.08 → 3.26 GB free in 30 min) and **booted back at 12:59Z** (container Up 13:00:10Z). First swift response after the mute: **13:03:37Z**, 4 minutes after the edge returned. The silence is bracketed by the edge's death and rebirth.
+
+Refuted by measurement: key rotation (a 401 would have *reached* the engine — ai-01 saw none), arms down (`docker inspect`: `Created=2026-10-30T16:57:48Z`, and `…_ACTIVE` holds four arms by value, below), configuration change (nothing changed between 10:01 and 13:03 except the edge's availability).
+
+Two consequences worth keeping:
+
+1. **A connect failure wears an "HTTP 400" label.** The classifier reports `HTTP 400 (non-quota) from step 0` for a request that never received an HTTP answer. Read `failover-events.log` alone and you diagnose an engine refusing work it never got. Instrument fix is a candidate issue (not opened unilaterally).
+2. **Gate R measures the engine; the availability of step 0 is the *edge's* health.** Same single-homing as Q65's WAN edge (po-2023). A green Gate R clock says nothing while the edge depends on one host that freezes under memory pressure.
+
+Drift observed the same day (measured, no gesture): live `…_ACTIVE` = `haiku@myia-po-2027,haiku@myia-po-2023,haiku@myia-po-2024,haiku@myia-po-2028` — **four arms**, versus the three recorded at the 27/10 00:52Z arm. `po-2028` is armed although ladder step 4 parks it forever — benign while `STEP_EXCLUDE` holds (its walk skips step 0 and lands on its nominal MiniMax), material at a MiniMax wall (it then walks `role:sonnet` → PAYG). Restoring the three-arm form is a cascade change and therefore waits on explicit user accord.
+
+Day-level cost of the same window (13:05→14:40Z, after the 13:30:44Z MiniMax wall): swift 166 responses, and the haiku overflow that could not wait rode `role:sonnet` to `ds@deepseek-flash` — 2 784 PAYG responses in 95 minutes.
+
 ## 3. Design — three gates, then one ladder
 
 ### Gate R — engine reliability (precondition; **running green since 05:20Z 27/10** — closes 28/10 05:20Z if it holds)

@@ -136,6 +136,40 @@ def presence(marker):
     return "empty" if marker == "<empty>" else "set"
 
 
+# A credential that is DECLARED but VALUELESS (an empty string) is a third shape,
+# distinct from #296's shape B (a real credential the client would send). Measured
+# on myia-po-2023, 30/10: ANTHROPIC_AUTH_TOKEN = "" in the seat's settings.json --
+# the matrix printed it as "empty" and flagged nothing. It never reaches the proxy
+# (the cluster key `x-proxy-key` authenticates the request: the hub answered 200
+# with an empty bearer AND with no authorization header at all), but every
+# SDK-based probe inherits the seat's env and dies on it -- httpx refuses to send
+# an invalid header value ("Illegal header value b'Bearer '"). The Claude Code
+# client itself is unaffected. Flag it: it is invisible, and it breaks tooling.
+CREDENTIAL_SHAPES = {
+    "set": "is set (client sends its own credential, #296 shape B)",
+    "empty": (
+        "is declared but valueless (empty string) -- an SDK client inherits it and "
+        "dies on the invalid `Bearer ` header it builds; the proxy never sees it "
+        "(the cluster key authenticates), measured 30/10 po-2023"
+    ),
+}
+
+
+def credential_flags(machine, masked):
+    """Flags for the credential shapes, by masked presence marker.
+
+    `masked` is the snapshot's `maskedEnvKeys` map (name -> "<set>" / "<empty>" /
+    "<unset>"): the value is never read, only its presence class."""
+    flags = []
+    for key, marker in sorted((masked or {}).items()):
+        if key not in CREDENTIAL_KEYS:
+            continue
+        shape = CREDENTIAL_SHAPES.get(presence(marker))
+        if shape:
+            flags.append("%s: env.%s %s" % (machine, key, shape))
+    return flags
+
+
 def age_hours(iso, now):
     try:
         then = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
@@ -267,10 +301,8 @@ def main():
         )
         masked = snap.get("maskedEnvKeys", {})
         for key, marker in sorted(masked.items()):
-            state = presence(marker)
-            print(f"  env.{key}: {state} (sensitive, value never shown)")
-            if key in CREDENTIAL_KEYS and state == "set":
-                flags.append(f"{machine}: env.{key} is set (client sends its own credential, #296 shape B)")
+            print(f"  env.{key}: {presence(marker)} (sensitive, value never shown)")
+        flags.extend(credential_flags(machine, masked))
         print(f"  otherTopLevelKeys = {snap.get('otherTopLevelKeys')}")
 
     for key, values in seen.items():

@@ -332,6 +332,115 @@ Describe 'Test-DockerLogsSinceCoherence (stale-segment probe)' {
     }
 }
 
+Describe 'Get-FailoverInstanceAttribution (#782 — the journal survives its own restarts)' {
+    # Measured in the 30/10 hub incident (#779 §3): lines time-stamped
+    # 09:18-09:58Z were attributed to ca6c14b5…, an instance that only
+    # STARTED at 10:32:01Z. The collect-time id is the wrong id exactly across
+    # a restart — the one place the journal exists to date. These pins hold
+    # the StartedAt split and the never-guess degradation.
+
+    BeforeAll {
+        $script:PrevInstance    = 'f4e2d1c0-9b8a-4c7d-8e6f-1a2b3c4d5e6f'
+        $script:CurrentInstance = 'c0ba8264-1111-4222-8333-444455556666'
+    }
+
+    It 'AC1 fake restart: strictly before StartedAt keeps the PREVIOUS id, at-or-after takes the new one' {
+        $events = @(
+            (ConvertFrom-DockerLogLine -Line '2026-10-05T09:18:04.000000000Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=10min')
+            (ConvertFrom-DockerLogLine -Line '2026-10-05T10:32:01.500000000Z [Failover] step-skip busy: mmc@MiniMax-M3.1-Flash — plan concurrency, not a failure')
+            (ConvertFrom-DockerLogLine -Line '2026-10-05T10:45:12.000000000Z [Failover] DISARMED bucket glm-coding -> probing nominals')
+        )
+        # StartedAt rendered at tenth-of-a-second width, the boundary line at
+        # nano width: same instant, two renderings — AT the boundary => new id.
+        $a = @(Get-FailoverInstanceAttribution -Events $events -CurrentInstanceId $script:CurrentInstance -PreviousInstanceId $script:PrevInstance -InstanceChanged $true -StartedAtUtc '2026-10-05T10:32:01.5Z')
+        $a.Count | Should -Be 3
+        $a[0].Id | Should -Be $script:PrevInstance
+        $a[0].Source | Should -Be 'started-at'
+        $a[1].Id | Should -Be $script:CurrentInstance
+        $a[1].Source | Should -Be 'started-at'
+        $a[2].Id | Should -Be $script:CurrentInstance
+    }
+
+    It 'REPLAY 31/10: hub restart StartedAt 05:35:57Z — outage-window markers keep the dead instance, post-boot markers take the new one' {
+        # The dispatch asked this exact departure replayed: the hub's WSL came
+        # back at 05:35:57Z on 31/10 and the container with it, so the tick
+        # that discovered the new instanceId ingested BOTH sides of the boot.
+        $events = @(
+            (ConvertFrom-DockerLogLine -Line '2026-10-31T05:13:27.100000000Z [Failover] ARMED bucket minimax-plan (haiku nominal) ttl=10min')
+            (ConvertFrom-DockerLogLine -Line '2026-10-31T05:35:57.361538999Z [Failover] step-skip busy: mmc@MiniMax-M3.1-Flash — plan concurrency, not a failure')
+            (ConvertFrom-DockerLogLine -Line '2026-10-31T05:36:41.000000000Z [Failover] CLOSED bucket glm-coding — nominal healthy again')
+        )
+        # inspect renders StartedAt at microsecond width here, the log lines
+        # are nanosecond width — the split must compare chronologically.
+        $a = @(Get-FailoverInstanceAttribution -Events $events -CurrentInstanceId $script:CurrentInstance -PreviousInstanceId $script:PrevInstance -InstanceChanged $true -StartedAtUtc '2026-10-31T05:35:57.361538Z')
+        $a[0].Id | Should -Be $script:PrevInstance
+        $a[1].Id | Should -Be $script:CurrentInstance   # .361538999 is AFTER .361538000
+        $a[2].Id | Should -Be $script:CurrentInstance
+    }
+
+    It 'mixed fraction widths compare CHRONOLOGICALLY, not lexicographically (.1Z vs .11Z — plain -lt on strings gets this wrong)' {
+        $events = @(
+            (ConvertFrom-DockerLogLine -Line '2026-10-05T10:32:01.09Z [Failover] DISARMED bucket glm-coding -> probing nominals')
+            (ConvertFrom-DockerLogLine -Line '2026-10-05T10:32:01.11Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=10min')
+        )
+        $a = @(Get-FailoverInstanceAttribution -Events $events -CurrentInstanceId $script:CurrentInstance -PreviousInstanceId $script:PrevInstance -InstanceChanged $true -StartedAtUtc '2026-10-05T10:32:01.1Z')
+        $a[0].Id | Should -Be $script:PrevInstance      # 0.09s < 0.10s
+        $a[1].Id | Should -Be $script:CurrentInstance    # 0.11s > 0.10s
+    }
+
+    It 'AC2a StartedAt UNREADABLE (docker refused — empty string): NO id is fabricated' {
+        $events = @((ConvertFrom-DockerLogLine -Line '2026-10-05T09:18:04.000000000Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=10min'))
+        $a = @(Get-FailoverInstanceAttribution -Events $events -CurrentInstanceId $script:CurrentInstance -PreviousInstanceId $script:PrevInstance -InstanceChanged $true -StartedAtUtc '')
+        $a[0].Id | Should -Be ''
+        $a[0].Source | Should -Be 'unattributed'
+    }
+
+    It 'AC2b StartedAt MALFORMED (not an RFC3339 instant): same refusal, no guess' {
+        $events = @((ConvertFrom-DockerLogLine -Line '2026-10-05T09:18:04.000000000Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=10min'))
+        $a = @(Get-FailoverInstanceAttribution -Events $events -CurrentInstanceId $script:CurrentInstance -PreviousInstanceId $script:PrevInstance -InstanceChanged $true -StartedAtUtc 'not-a-date')
+        $a[0].Id | Should -Be ''
+        $a[0].Source | Should -Be 'unattributed'
+    }
+
+    It 'a line whose own ts cannot be normalized is unattributed too (defensive — the split never fabricates)' {
+        $events = @(@{ Ts = 'garbage'; Rest = '[Failover] ARMED bucket glm-coding (sonnet nominal) ttl=10min' })
+        $a = @(Get-FailoverInstanceAttribution -Events $events -CurrentInstanceId $script:CurrentInstance -PreviousInstanceId $script:PrevInstance -InstanceChanged $true -StartedAtUtc '2026-10-05T10:32:01.5Z')
+        $a[0].Id | Should -Be ''
+        $a[0].Source | Should -Be 'unattributed'
+    }
+
+    It 'a STABLE tick attributes every line to the current instance, source collect-instant (the trivially-true case)' {
+        $events = @(
+            (ConvertFrom-DockerLogLine -Line '2026-10-05T19:20:31.123456789Z [Failover] ARMED bucket glm-coding (sonnet nominal) ttl=10min')
+            (ConvertFrom-DockerLogLine -Line '2026-10-05T19:21:02.987654321Z [Failover] DWELL sonnet session 8f2c…9a yielded — nominal recovered 74s ago')
+        )
+        $a = @(Get-FailoverInstanceAttribution -Events $events -CurrentInstanceId $script:CurrentInstance -PreviousInstanceId $script:PrevInstance -InstanceChanged $false -StartedAtUtc '')
+        $a.Count | Should -Be 2
+        foreach ($x in $a) {
+            $x.Id | Should -Be $script:CurrentInstance
+            $x.Source | Should -Be 'collect-instant'
+        }
+    }
+
+    It 'ConvertTo-Rfc3339NanoKey: pads, truncates and refuses — $null for anything not an RFC3339 UTC instant' {
+        ConvertTo-Rfc3339NanoKey -Value '2026-10-05T10:32:01.5Z' | Should -Be '2026-10-05T10:32:01.500000000Z'
+        ConvertTo-Rfc3339NanoKey -Value '2026-10-05T10:32:01Z' | Should -Be '2026-10-05T10:32:01.000000000Z'
+        ConvertTo-Rfc3339NanoKey -Value '2026-10-05T10:32:01.123456789123Z' | Should -Be '2026-10-05T10:32:01.123456789Z'
+        ConvertTo-Rfc3339NanoKey -Value 'not-a-date' | Should -BeNullOrEmpty
+        ConvertTo-Rfc3339NanoKey -Value '' | Should -BeNullOrEmpty
+        ConvertTo-Rfc3339NanoKey -Value '2026-10-05T10:32:01.5+01:00' | Should -BeNullOrEmpty
+    }
+
+    It 'the GLUE consults the attribution on every write, stamps instanceIdSource, and pays for inspect ONLY on a change tick (red if the wiring is deleted)' {
+        $path = Join-Path $script:ScriptsRoot 'failover-events-collect.ps1'
+        $text = [System.IO.File]::ReadAllText($path)
+        ($text -match 'Get-FailoverInstanceAttribution') | Should -Be $true
+        ($text -match 'instanceIdSource') | Should -Be $true
+        ($text -match [regex]::Escape('{{.State.StartedAt}}')) | Should -Be $true
+        ($text -match 'if \(\$instanceChanged\)\s*\{\s*\r?\n\s*\$ins = Invoke-DockerEventsBounded') | Should -Be $true
+    }
+}
+
 Describe 'the collector contains no actuator' {
     # Same shape and reasoning as the docker-events guard (#192): collecting
     # is not acting (#173). Note: Remove-Item is deliberately NOT in the
