@@ -2643,6 +2643,89 @@ function Select-NewFailoverLines {
     return @{ Kept = $kept; Skipped = $skipped; Seen = $ring }
 }
 
+function ConvertTo-Rfc3339NanoKey {
+    <#
+    .SYNOPSIS
+        Normalize an RFC3339 UTC instant to a fixed-width string whose
+        LEXICOGRAPHIC order is the CHRONOLOGIC order. PURE.
+    .DESCRIPTION
+        Docker renders the same instant at different fraction widths on
+        different surfaces — `logs --timestamps` pads to 9 digits, `inspect
+        .State.StartedAt` is typically 6, second-resolution exists on both —
+        and comparing those forms as plain strings is WRONG across widths
+        ('.1Z' sorts AFTER '.11Z' lexicographically while 0.1s < 0.11s).
+        Padding the fraction to exactly 9 digits makes the two strings
+        comparable as strings, ORDINALLY: no date parsing, no culture, PS
+        5.1-safe. Truncation beyond 9 digits is sub-nanosecond — docker never
+        emits it. Returns $null when the value is not an RFC3339 UTC instant:
+        the caller treats that as "unknown", never as a date.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    if ($Value -match '^(?<head>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(?<frac>\d+))?Z$') {
+        $frac = $Matches['frac']
+        if ([string]::IsNullOrEmpty($frac)) { $frac = '000000000' }
+        if ($frac.Length -gt 9) { $frac = $frac.Substring(0, 9) }
+        return ('{0}.{1}Z' -f $Matches['head'], $frac.PadRight(9, '0'))
+    }
+    return $null
+}
+
+function Get-FailoverInstanceAttribution {
+    <#
+    .SYNOPSIS
+        Per-line instanceId attribution that survives a restart (#782). PURE.
+    .DESCRIPTION
+        The collector reads the proxy's instanceId ONCE per tick, at collect
+        time — so on the tick that follows a restart, every ingested
+        pre-restart line would be stamped with the NEW process's id. Measured
+        in the 30/10 hub incident (#779 §3): lines time-stamped 09:18-09:58Z
+        were attributed to ca6c14b5…, an instance that only STARTED at
+        10:32:01Z — the journal's per-line attribution is wrong exactly across
+        the restarts it exists to date, and #779 could only mitigate it in
+        documentation ("read the ts, not the instanceId").
+
+        This function splits a change-tick's kept lines at the container's
+        StartedAt (host clock, read via docker inspect on change ticks only):
+        strictly before → the PREVIOUS instance id, at-or-after → the current
+        one, both with instanceIdSource 'started-at'. On a stable tick no
+        restart happened in the window, so the collect-time id IS each line's
+        id — source 'collect-instant'. When StartedAt cannot be normalized
+        (docker unreachable, inspect refused, malformed) NO id is fabricated:
+        records carry instanceId '' with source 'unattributed'. Never guess.
+
+        Returns a parallel array of @{ Id; Source }, same order and count as
+        Events, for the glue to zip into the NDJSON records.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Events,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$CurrentInstanceId,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$PreviousInstanceId,
+        [bool]$InstanceChanged = $false,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$StartedAtUtc
+    )
+    $out = @()
+    if (-not $InstanceChanged) {
+        foreach ($e in @($Events)) {
+            $out += @{ Id = $CurrentInstanceId; Source = 'collect-instant' }
+        }
+        return $out
+    }
+    $startedKey = ConvertTo-Rfc3339NanoKey -Value $StartedAtUtc
+    foreach ($e in @($Events)) {
+        if ($null -eq $startedKey) { $out += @{ Id = ''; Source = 'unattributed' }; continue }
+        $tsKey = ConvertTo-Rfc3339NanoKey -Value ([string]$e.Ts)
+        if ($null -eq $tsKey) { $out += @{ Id = ''; Source = 'unattributed' }; continue }
+        # ORDINAL, never -lt on strings: the culture-aware operator is not
+        # guaranteed to order ASCII digits and 'Z' the way time does.
+        if ([string]::CompareOrdinal($tsKey, $startedKey) -lt 0) {
+            $out += @{ Id = $PreviousInstanceId; Source = 'started-at' }
+        } else {
+            $out += @{ Id = $CurrentInstanceId; Source = 'started-at' }
+        }
+    }
+    return $out
+}
+
 function Get-FailoverNextSince {
     <#
     .SYNOPSIS
@@ -3023,6 +3106,8 @@ Export-ModuleMember -Function @(
     'Get-FailoverLineFingerprint'
     'Select-NewFailoverLines'
     'Get-FailoverNextSince'
+    'ConvertTo-Rfc3339NanoKey'
+    'Get-FailoverInstanceAttribution'
     'Test-DockerLogsSinceCoherence'
     'Get-ClaudishServingBase'
     'Resolve-ClaudishProbeUrl'
