@@ -17,7 +17,7 @@ import {
 // ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
 // are INERT without their env knobs, so their presence changes nothing on a
 // fleet that never opts in.
-import { extractSessionKey } from "./fork/failover.js";
+import { extractSessionKey, roleFromModelName } from "./fork/failover.js";
 import { collectRoutedBareNames, createProxyAuthMiddleware } from "./fork/middleware/proxy-auth.js";
 // #641 blocker-2 port — capture pipeline (fork extension). request-logger owns
 // the req-*.json capture, the pinned [Request] stdout line and the per-request
@@ -30,6 +30,7 @@ import {
   HOPS_HEADER,
   type RelayState,
   forwardToUpstream,
+  readRequestBody,
   relayHealthFields,
   requestLoopedBack,
 } from "./fork/server/relay.js";
@@ -60,11 +61,25 @@ import { createHandlerSet } from "./handlers/handler-set.js";
 import { loadAdvisorSwapConfig } from "./handlers/native-handler-advisor.js";
 import { NativeHandler } from "./handlers/native-handler.js";
 import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
+// #641 G7 — OpenAI-compatible ingress (/v1/chat/completions): the two
+// translation directions are fork files carried verbatim from main (they are
+// fully self-contained), and the notice policy rides the same
+// failover-stream-notice module G5 brought over.
+import {
+  anthropicMessageToChatCompletion,
+  createOpenAIChatStreamFromAnthropic,
+} from "./handlers/shared/anthropic-to-openai.js";
 import {
   SIGNING_SECRETS_KEY,
   createSigningSecrets,
   releaseWhenBodyEnds,
 } from "./handlers/shared/call-context.js";
+import {
+  applyFailoverNotices,
+  carryNoticeHeader,
+  noticePolicyForIngress,
+} from "./handlers/shared/failover-stream-notice.js";
+import { convertOpenAIRequestToAnthropic } from "./handlers/shared/format/openai-request-to-anthropic.js";
 import { UNHANDLED_ERROR_HEADER } from "./handlers/shared/hop-decision.js";
 import { resolveInboundKeys } from "./handlers/shared/inbound-keys.js";
 import { resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
@@ -1403,6 +1418,212 @@ export async function createProxyServer(
         wrapAnthropicError(500, redactForClient(String(e))),
         500,
         handlerThrew ? { [UNHANDLED_ERROR_HEADER]: "1" } : undefined
+      );
+    }
+  });
+
+  // OpenAI-compatible ingress (#641 G7, fork extension). An OpenAI client
+  // (sk-agent, any AsyncOpenAI consumer) POSTs here; we translate the body to
+  // Anthropic shape, run the SAME pipeline as /v1/messages, and translate the
+  // response back to OpenAI wire shape. Anthropic remains the native ingress;
+  // this is a translated ingress into the same pipeline. Carried from main's
+  // proxy-server.ts route, adapted to the seams that exist on this branch —
+  // the deltas are marked #641-G7-GAP inline:
+  //   - no drain-freeze gate (the freeze infra is not ported yet);
+  //   - handler resolution is the v14 single-arg getHandlerForRequest and the
+  //     route serves through handler.handle — the budget-failover cascade
+  //     (handleWithCascade) is ported as a module (fork/failover.ts) but not
+  //     yet wired into any route, so the applyFailoverNotices call below is
+  //     inert by construction until that grain lands;
+  //   - no stripBillingHeaderFromBody / keylessNativeRequest / requestBucketOf
+  //     (the billing-strip and bucket families are not ported).
+  app.post("/v1/chat/completions", async (c) => {
+    try {
+      // Same client-error terminal 400 as /v1/messages (#548 on main), in this
+      // route's OpenAI error envelope: readRequestBody() throws a SyntaxError
+      // on empty / non-JSON input that the catch below would otherwise map to
+      // a retryable 500 (which relays count toward hub hysteresis). It also
+      // inflates a gzipped relay body — a sidecar forward arrives with
+      // content-encoding: gzip, which c.req.json() would not decode.
+      let openaiBody: any;
+      try {
+        openaiBody = await readRequestBody(c);
+      } catch (parseErr) {
+        return c.json(
+          {
+            error: {
+              message: `Invalid request body: ${(parseErr as Error)?.message ?? parseErr}`,
+              type: "invalid_request_error",
+              param: null,
+              code: null,
+            },
+          },
+          400
+        );
+      }
+      if (openaiBody === null || typeof openaiBody !== "object" || Array.isArray(openaiBody)) {
+        return c.json(
+          {
+            error: {
+              message: "Invalid request body: expected a JSON object",
+              type: "invalid_request_error",
+              param: null,
+              code: null,
+            },
+          },
+          400
+        );
+      }
+
+      // Relay (sidecar NOMINAL): forward the RAW OpenAI body to the hub's
+      // /v1/chat/completions — the hub translates. forwardToUpstream is
+      // path-aware, so the forward reaches the route the client hit, not
+      // /v1/messages. #279: same hop-list gate as /v1/messages — a loop can
+      // enter on either ingress.
+      // #641-G7-GAP: no admission-freeze gate here — main places
+      // drainFreezeGate() before the relay branch; the drain/freeze infra is
+      // not ported yet.
+      const relay = options.relay;
+      if (relay?.upstream && requestLoopedBack(c)) {
+        log(
+          `[Relay] request returned via ${HOPS_HEADER} — own id in hop list (boot window or relay cycle) — serving LOCALLY`,
+          true
+        );
+      } else if (relay?.upstream && relay.alive) {
+        const forwarded = await forwardToUpstream(c, openaiBody, relay);
+        if (forwarded) return forwarded;
+      }
+
+      if (typeof openaiBody?.model !== "string" || openaiBody.model.length === 0) {
+        return c.json(
+          {
+            error: {
+              message: "missing required field: model",
+              type: "invalid_request_error",
+              param: "model",
+              code: null,
+            },
+          },
+          400
+        );
+      }
+
+      const anthropicBody = convertOpenAIRequestToAnthropic(openaiBody);
+      const wantsStream = openaiBody.stream === true;
+
+      // #317 option B — same admission as /v1/messages, on the OpenAI wire
+      // shape this ingress speaks (sk-agent / AsyncOpenAI consumers get a
+      // programmatic consumer's error envelope, with the same retry-after).
+      // Inert without CLAUDISH_SESSION_BUDGET_*.
+      const openaiSessionKey = extractSessionKey(anthropicBody);
+      const machineHeader = c.req.header("x-claudish-machine") ?? null;
+      {
+        const admission = admitSessionBudget(machineHeader, openaiSessionKey, process.env);
+        if (admission?.refused) {
+          return c.json(
+            {
+              error: {
+                message: admission.message,
+                type: "rate_limit_error",
+                code: null,
+              },
+            },
+            429,
+            { "retry-after": String(admission.retryAfterSec) }
+          );
+        }
+      }
+
+      // Resolve and serve through the v14 pipeline (advisor + hooks, same
+      // wrapping as /v1/messages). #641-G7-GAP: main routes through
+      // handleWithCascade and carries requestBucketOf /
+      // stripBillingHeaderFromBody / keylessNativeRequest around resolution —
+      // none of those seams exist on this branch yet.
+      const handler = withAdvisor(
+        withRequestHooks(await getHandlerForRequest(anthropicBody.model)),
+        advisorPresence
+      );
+      logRequest(anthropicBody, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
+
+      // #317: attach the attempt token right before the paid attempt, same as
+      // /v1/messages — the usage sink keys its max-ledger on it.
+      openSessionBudgetAttempt(c.req.raw, machineHeader, openaiSessionKey, process.env);
+
+      // Inject onset/recovery notices on the Anthropic-shape response BEFORE
+      // translation to OpenAI wire shape. #229: this ingress's consumers are
+      // programmatic (sk-agent, any AsyncOpenAI client) — the notice rides the
+      // response header, NOT the content, so an empty model output stays
+      // visibly empty instead of being masked by the notice-as-answer. Inert
+      // while the cascade is unwired (no role ever substitutes), correct the
+      // day it lands.
+      let response = await handler.handle(c, anthropicBody);
+      response = await applyFailoverNotices(
+        response,
+        roleFromModelName(anthropicBody.model),
+        openaiSessionKey,
+        wantsStream,
+        noticePolicyForIngress(c.req.path)
+      );
+
+      // Translate the final Anthropic response to OpenAI shape.
+      if (!response.ok) {
+        // Error: convert the Anthropic error envelope to OpenAI's error shape
+        // so an OpenAI SDK can surface it instead of choking on the foreign
+        // body.
+        let errJson: any;
+        try {
+          errJson = await response.json();
+        } catch {
+          errJson = { error: { type: "api_error", message: `upstream HTTP ${response.status}` } };
+        }
+        const anthropicErr = errJson?.error ?? errJson;
+        const oaiErr = {
+          error: {
+            message: anthropicErr.message ?? `upstream HTTP ${response.status}`,
+            type: anthropicErr.type ?? "api_error",
+            code: anthropicErr.code ?? null,
+          },
+        };
+        return c.json(oaiErr, response.status as any);
+      }
+
+      if (wantsStream) {
+        // #229 review: both translations below rebuild their headers from
+        // scratch, which is where the notice header set above used to die —
+        // consumed (dedup + recovery-budget side effects) then never
+        // delivered.
+        return carryNoticeHeader(
+          response,
+          createOpenAIChatStreamFromAnthropic(response, anthropicBody.model)
+        );
+      }
+      const message = await response.json();
+      return carryNoticeHeader(
+        response,
+        c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
+          headers: { "Content-Type": "application/json" },
+        })
+      );
+    } catch (e) {
+      log(`[Proxy] /v1/chat/completions error: ${e}`);
+      // Same routing-failure doctrine as /v1/messages, on the OpenAI wire
+      // shape this ingress speaks — this route resolves through the same
+      // getHandlerForRequest, so the missing-credential throw reaches it too.
+      if (isTerminalRoutingFailure(e)) {
+        return c.json(
+          {
+            error: {
+              message: redactForClient(e.message),
+              type: "invalid_request_error",
+              code: null,
+            },
+          },
+          400
+        );
+      }
+      return c.json(
+        { error: { message: redactForClient(String(e)), type: "api_error", code: null } },
+        500
       );
     }
   });
