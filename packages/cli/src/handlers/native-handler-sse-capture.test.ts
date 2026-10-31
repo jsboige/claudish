@@ -27,24 +27,20 @@
  *   2. DONE    — at upstream close the capture is finalized: a
  *      `resp-<pid>-r<NNNN>-<ts>-native-<model>.sse` file exists, carrying the
  *      `parser=native` header the .sse readers anchor on.
- *   3. CANCEL  — a CLIENT cancel mid-stream does NOT reach the upstream: the
- *      native lane keeps the upstream turn running to its end (measured: the
- *      upstream body stream was never cancelled), and the capture is finalized
- *      as an ERROR at the first enqueue into the closed client stream
- *      ("Controller is already closed"), holding the upstream bytes up to that
- *      point and NOT the tail that arrived after the cancel.
+ *   3. CANCEL  — a CLIENT cancel mid-stream DOES reach the upstream: the
+ *      native lane cancels the upstream reader (measured: the upstream body
+ *      stream is cancelled), the pump settles before the cancel promise
+ *      resolves, and the capture is finalized `closed:false` /
+ *      `reason:"client-cancel"` — a clean end, not an error.
  *
- * Points 1 and 2 close the read-back hole the gate named. Point 3 is NOT an
- * endorsement: it records what the lane does today, because the answer
- * ("the upstream keeps burning after the client left") is a fact ai-01 asked
- * for and could not measure without a paid probe. Two consequences are visible
- * in the pinned facts, and are reported, not fixed here:
- *   - a cancelled native turn is still billed upstream (no cancel propagation);
- *   - the capture of a cancelled turn ends in `reason=error`, so a reader sees
- *     a truncated capture rather than a clean end.
- * Fixing them means changing the native lane's production behaviour — ai-01's
- * call, not this PR's (QUEUE v17: "AC répond au trou sans changer production
- * pour le banc").
+ * Points 1 and 2 close the read-back hole the gate named. Point 3 was originally
+ * pinned as what the lane did on 2026-10-29 (po-2024): the cancel did NOT reach
+ * the upstream, the abandoned turn was billed in full, and the capture ended
+ * `reason=error` ("Controller is already closed"). That measurement became
+ * issue #780, and this bench is now the regression pin of the FIX: the
+ * `reason=error` / "Controller is already closed" pair must never come back.
+ * Mutation discipline: removing the `cancel()` callback in `native-handler.ts`
+ * turns the cancel case of this file red.
  *
  * ⚠ SCOPE — this file lands on MAIN, and it describes MAIN's native lane.
  * The v14 port is a DIFFERENT tree with a different passthrough: #722's own
@@ -109,6 +105,10 @@ function stubNativeSSE(opts: { hold?: boolean } = {}): Stub {
         const enc = new TextEncoder();
         controller.enqueue(enc.encode(CHUNK_1));
         if (opts.hold) await gate;
+        // #780: a real upstream whose connection the proxy dropped stops
+        // producing — it does not write into a cancelled stream. The guard
+        // keeps the stub faithful once `cancel()` is propagated.
+        if (cancelled) return;
         controller.enqueue(enc.encode(CHUNK_2));
         controller.enqueue(enc.encode(CHUNK_3));
         controller.close();
@@ -235,7 +235,7 @@ describe("native lane response capture (#722 read-back, grain v17-1)", () => {
     expect(captured.slice(captured.indexOf("# ====="))).toContain(clientText.trim());
   });
 
-  it("cancel: a client cancel does not reach the upstream, and the capture ends in error", async () => {
+  it("cancel: a client cancel ends the upstream work, and the capture ends clean", async () => {
     stub = stubNativeSSE({ hold: true });
 
     const res = await post(buildApp());
@@ -247,26 +247,29 @@ describe("native lane response capture (#722 read-back, grain v17-1)", () => {
     expect(new TextDecoder().decode(first.value)).toContain('"type":"message_start"');
 
     await reader.cancel("client went away");
-    // Let the pump notice what it notices, then release the held upstream.
+    // Let the pump notice what it notices, then release the held upstream
+    // (which must now find its stream already cancelled and produce nothing).
     await new Promise((r) => setTimeout(r, 150));
     stub.release();
 
-    // MEASURED: the client cancel is NOT propagated upstream. The native lane
-    // keeps the upstream turn running — it never cancels the upstream reader.
-    expect(stub.upstreamCancelled()).toBe(false);
+    // #780: the client cancel IS propagated upstream — the provider connection
+    // is dropped instead of billing the abandoned turn to completion.
+    expect(stub.upstreamCancelled()).toBe(true);
 
     const file = await waitForCapture(capDir);
     expect(file).not.toBeNull();
     const captured = readFileSync(file!, "utf-8");
 
-    // MEASURED: the capture is finalized as an ERROR at the first enqueue into
-    // the closed client stream — not as a clean end.
-    expect(captured).toContain('"reason":"error"');
-    expect(captured).toContain("Controller is already closed");
+    // #780: the capture is finalized as a CLEAN client-cancel — not as an
+    // error at the first enqueue into the closed client stream.
+    expect(captured).toContain('"reason":"client-cancel"');
+    expect(captured).toContain('"closed":false');
+    expect(captured).not.toContain("Controller is already closed");
 
-    // MEASURED: it holds the upstream bytes up to the cancel, and NOT the tail
-    // that arrived after it — a cancelled turn's capture is TRUNCATED.
-    expect(captured).toContain('"type":"content_block_stop"');
+    // The capture holds the bytes that reached the client before the cancel,
+    // and NOT the upstream tail that was never read.
+    expect(captured).toContain('"type":"content_block_delta"');
+    expect(captured).not.toContain('"type":"content_block_stop"');
     expect(captured).not.toContain('"type":"message_stop"');
   });
 });
