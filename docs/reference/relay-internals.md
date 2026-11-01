@@ -414,6 +414,34 @@ thesis — event-loop blocking under load driving NOMINAL→AUTONOMOUS
 transitions — is **refuted for these two transitions** (loop sub-second, hub
 serving) while the midday upstream pressure itself is real and measured.
 
+**v27 closes the gap, in code — with the reading rule that goes with it.** Two
+markers now ship together. The hub logs one
+`[Health] hit peer=<addr> machine=<id> status=<ok|stalled>` line per
+**arrival** (`proxy-server.ts`, kill switch `CLAUDISH_HEALTH_ARRIVAL_LOG=0`,
+read per call), emitted *before* the gauges are read so even a stalled instance
+proves it was reached. The prober logs the **failure shape** of an episode
+(`relay.ts`): `[Relay] heartbeat FAILED after <ms> — <shape>` on the first
+failure, `[Relay] heartbeat RECOVERED after N failure(s) over <s> — first:
+<shape>` on the first success — episode-latched on purpose, so a multi-hour
+outage is two lines and not a flood. The probe also carries
+`X-Claudish-Machine`, so an arrival is attributed to a machine instead of
+staying an anonymous peer.
+
+Read the pair, never one alone:
+
+| Hub-side arrivals for the observer | Sidecar-side shape | Reading |
+| --- | --- | --- |
+| **No `[Health] hit` line at all** across the gap | `timeout after <budget>ms` | **Never arrived** — container path, NAT, or the observer's own host down. The hub never saw the packet: look at the tube and at the observer's host, not at the loop. |
+| Arrivals present, roughly one per tick | `timeout after <budget>ms` | **Arrived, answered slowly** — the hub received the probe and its reply did not come back inside the budget (loop pressure, or the socket starving behind a large response). |
+| Arrivals present with `status=stalled` | `HTTP 503` | The hub **answered with its own stall verdict** — a hub-side condition by construction, no inference needed. |
+| A burst of arrivals at one instant after a silent gap | `timeout`, then OK | **Backlog drained** — replies queued behind a block; the two timestamps bracket it. |
+
+⚠ **Deployment honesty (Fleet-Rollout Verification).** Both markers ship in
+code; neither is live on any seat until **that seat's container is recreated**
+(compose injects `CLAUDISH_HEALTH_ARRIVAL_LOG` at create time only, #310, and a
+sidecar needs the new image). Until then, a `[Health]` grep returning nothing is
+**not** evidence that no heartbeat arrived.
+
 ## Compose environment surface
 
 `docker-compose.yml` carries a default for every relay variable, so the hub runs with **no `.env` at
