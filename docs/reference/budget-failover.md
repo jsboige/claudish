@@ -594,6 +594,60 @@ landed 13:30:44Z — 321 responses served in h13Z, then **zero** through h19Z
 while haiku traffic kept flowing; GLM re-walled 19:13Z and the sonnet role was
 served by DeepSeek Flash PAYG (1 734 responses h18Z, 1 141 h19Z).
 
+### The counter-read: when the first rung after a deploy IS a regression
+
+The rule above — the first rung after a deploy is the ladder booting — needs
+its negative, or it will swallow real failures. Three shapes measured on this
+fleet are **not** a boot:
+
+1. **Non-quota marks are a path failure, not a rung.** A boot re-arms *walls*:
+   markers that name a quota/plan wall, `step … walled … (HTTP 429)`. A
+   **non-quota** mark (`step … failed (non-quota) … body=api_error`) says the
+   step could not be reached or served. Measured 01/11: swift's 502 burst
+   02:01:26→02:50:43 — five marks, ttl climbing 30 s → 2 min → 5 min, **zero
+   responses for 49 minutes** — was the announced engine backup, a real
+   outage, not a ladder boot.
+2. **The concrete never serves.** A boot *ends* in service: GLM recovered at
+   01:12:18 and served 1 060 `[resp]` in the same hour. If the hour after a
+   deploy shows the role's nominal concrete at **zero** `[resp]` while its
+   cascade steps serve, the deploy broke the nominal path — read the landing,
+   not the intent.
+3. **The armed list differs by value.** `configured=N armed=[…]` is the boot
+   line; diff it against the pre-deploy line **by value** (never by name).
+   Four arms in, four arms out, identical targets. Anything else is a config
+   regression wearing a boot's clothing.
+
+And a timing bound: a boot is over in ~40 minutes (arm cycles at 10 min then
+20 min). Marks still escalating two hours later with no `RECOVERED` and no
+`[resp]` are either a standing wall (expected — MiniMax until its reset) or an
+outage; "boot" stops being an explanation after the second disarm.
+
+### MiniMax re-entry: what the ladder does when the weekly reset lands (2026-11-02)
+
+The weekly reset is expected **~2026-11-02T00:00Z**. Console liveness was
+proven first (two passes 4 h 58 min apart on 01/11, countdown advanced
+4 h 59 min: "resets in 19 h 20 min" → "14 h 21 min", weekly 100 % used
+throughout — an identical countdown at two passes is the frozen signature).
+Procedure, hub-side, no console required:
+
+1. **The disarm.** The wall TTL ladder had climbed to 240 min (count=4 at
+   02:50:44Z on 01/11); after the reset the next probe returns non-429, so
+   expect `DISARMED bucket minimax-coding → probing nominals` **without** a
+   re-ARM in the following TTL window.
+2. **The recovery line.** Expect `RECOVERED … (minimax-coding) → nominal` —
+   the shape of the 01:12:18Z sonnet recovery — plus dwell pins yielding
+   (`DWELL haiku session … yielded`).
+3. **The proof.** The first `[resp] … model=MiniMax-M3.1` line after 00:00Z.
+   The number to quote, by the zero rule above, is served responses per hour,
+   cross-checked against the wall-marker count, which should fall back to the
+   probe rate (1–3/h).
+4. **The sidecar corollary.** Sidecar cascades carrying
+   `mmc@MiniMax-M3.1-Flash` as a sonnet step un-wall on their own probes;
+   their reading lives in their own journals, not the hub's.
+
+If the wall re-arms past 00:00Z + one TTL with the console still reading
+weekly 100 %, the reset has not landed — the live countdown is the arbiter.
+
 ## The estimator: bytes / 3.5
 
 `JSON.stringify(body).length / 3.5` — deliberately NOT the `/4`
