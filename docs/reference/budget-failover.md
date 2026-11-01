@@ -594,6 +594,51 @@ landed 13:30:44Z — 321 responses served in h13Z, then **zero** through h19Z
 while haiku traffic kept flowing; GLM re-walled 19:13Z and the sonnet role was
 served by DeepSeek Flash PAYG (1 734 responses h18Z, 1 141 h19Z).
 
+## What a recreate costs the ladder, and the steps that fall together (measured 2026-11-01)
+
+The 00:41:30Z deploy of `main` gave the first full-window reading of the ladder
+*before and after* a wipe. Two findings, both decision-grade, neither a defect.
+
+**The ladder rebuilds from rung 1, so the first ~40 minutes are not a state.**
+GLM `ARMED` 00:41:37 (ttl 10 min) → `DISARMED` 00:51:37 → re-`ARMED` 00:51:56
+(ttl 20 min) → `DISARMED` 01:12:00 → **`RECOVERED` 01:12:18**, after which the
+nominal served 3 h 15 min (`glm-5.3`: 1 060 / 1 103 / 1 191 `[resp]` in h01–h03)
+before re-walling at 04:27:10 and re-arming at rung 2 (04:37:15, ttl 20 min).
+A wall that was already up before the recreate therefore re-establishes itself
+within 2 minutes and then **re-escalates from 10 min, not from where it stood**.
+Read the first rung after a deploy as the ladder booting, never as a regression.
+
+**The sonnet ladder's prepaid steps refuse together — a walled GLM lands on
+PAYG, not on Kimi or Qwen.** One request, one walk, four seconds:
+
+```text
+04:27:10 [Failover] step sonnet[0] (Mistral GLM)  walled — count=1 ttl=10min (HTTP 402)
+04:27:11 [Failover] step sonnet[1] (Kimi K3)      walled — count=1 ttl=10min (HTTP 429)
+04:27:14 [Failover] step sonnet[2] (Qwen prepaid) walled — count=1 ttl=until 2026-11-11T16:00:00Z (HTTP 429)
+```
+
+Same shape at 01:05:12/13/15 and again at 04:37:16/17. Qwen's refusal is by
+construction (the dated closure), but **Kimi's 429 is a measured second wall,
+not a configured one** — so behind GLM there is no prepaid capacity left, and
+any reasoning of the form "GLM walls, the next two steps absorb" is wrong on
+this fleet. The PAYG landings follow precisely: `deepseek-flash` 544 responses
+since the recreate, in h01 (247, before GLM recovered at 01:12) and h04 (297,
+after it re-walled at 04:27) — **zero** in h02–h03 while GLM served.
+
+Two corroborations worth keeping:
+
+- **A scheduled upstream outage is visible as a 502 burst, not a connect
+  error.** ai-01's backup window took swift down 02:00→02:50:54Z; the hub
+  logged `step haiku[0] … failed (non-quota) … (HTTP 502 … body=api_error)`
+  from 02:01:26 to 02:50:43, five marks, ttl escalating 30 s → 2 min → 5 min,
+  and the engine's boot line lands 11 s after the last mark. An announced
+  window and the log agree to the minute.
+- **MiniMax never served since the recreate.** Across 6 306 `[resp]` lines,
+  `MiniMax-M3.1` appears **zero** times, while the console (live this time)
+  read weekly **100 % used, resets in 19 h 20 min** ≈ 2026-11-02T00:00Z. The
+  hub-side zero and the console agree — which is the point of quoting the
+  zero rather than a marker count.
+
 ## The estimator: bytes / 3.5
 
 `JSON.stringify(body).length / 3.5` — deliberately NOT the `/4`
