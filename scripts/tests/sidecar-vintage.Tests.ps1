@@ -69,6 +69,12 @@ exit $LASTEXITCODE
     git -C $script:VRepo add .
     $env:GIT_AUTHOR_DATE = '2026-10-28T12:00:00'; $env:GIT_COMMITTER_DATE = '2026-10-28T12:00:00'
     git -C $script:VRepo -c user.email=vintage@test -c user.name=vintage commit -qm 'after the image, cli path'
+    # Test-only commit after the image: counted in the total distance, never
+    # in the critical column - that split IS the file v26 addition.
+    Set-Content (Join-Path $script:VRepo 'packages\cli\src\zz.test.ts') -Value 'test-only'
+    git -C $script:VRepo add .
+    $env:GIT_AUTHOR_DATE = '2026-10-29T12:00:00'; $env:GIT_COMMITTER_DATE = '2026-10-29T12:00:00'
+    git -C $script:VRepo -c user.email=vintage@test -c user.name=vintage commit -qm 'after the image, test file only'
     Add-Content (Join-Path $script:VRepo 'README.md') -Value 'now'
     git -C $script:VRepo add .
     Remove-Item Env:GIT_AUTHOR_DATE, Env:GIT_COMMITTER_DATE -ErrorAction SilentlyContinue
@@ -131,49 +137,50 @@ Describe 'sidecar-vintage' {
     It 'renders a fully measured row and exits 0' {
         $r = Invoke-Vintage
         $r.Code | Should -Be 0
-        $r.Out | Should -Match '\| 2026-10-27T17:49:13\.123456789Z \| 14 \| yes \(3\) \| 1 \|'
+        $r.Out | Should -Match '\| 2026-10-27T17:49:13\.123456789Z \| 14 \| yes \(3\) \| 2 \| 1 \|'
     }
 
-    It 'counts only packages/cli/src commits newer than the IMAGE, never everything' {
-        # Fixture holds 3 commits total; the row must say 1 (the after-image
-        # cli commit). A bare count would read 3, a container-date keying
-        # would read 2.
+    It 'counts only packages/cli/src commits newer than the IMAGE, never everything; tests never count as critical' {
+        # Fixture holds 4 commits total; the row must say 2 behind / 1
+        # critical (the after-image cli commit - the after-image TEST-only
+        # commit counts in the total, never in the critical column). A bare
+        # count would read 4, and folding tests into critical would read 2.
         $r = Invoke-Vintage
         # \r?$ : Out-String keeps the CRLF, and a bare $ does not match
         # before the \r (the row itself is correct - an anchor artifact).
-        $r.Out | Should -Match '\| 14 \| yes \(3\) \| 1 \|\r?$'
+        $r.Out | Should -Match '\| 14 \| yes \(3\) \| 2 \| 1 \|\r?$'
     }
 
     It 'a zero distance is a measured zero, never ?' {
         $r = Invoke-Vintage -ImageCreated '2030-01-01T00:00:00Z'
         $r.Code | Should -Be 0
-        $r.Out | Should -Match '\| 14 \| yes \(3\) \| 0 \|\r?$'
+        $r.Out | Should -Match '\| 14 \| yes \(3\) \| 0 \| 0 \|\r?$'
     }
 
     It 'a pre-#615 /health shape renders no gauges and says so' {
         $r = Invoke-Vintage -HealthJson $script:Health11
         $r.Code | Should -Be 0
-        $r.Out | Should -Match '\| 11 \| no \| 1 \|'
+        $r.Out | Should -Match '\| 11 \| no \| 2 \| 1 \|'
         $r.Out | Should -Match 'predates #615'
     }
 
     It 'dead docker renders ? everywhere and exits 2, never absent' {
         $r = Invoke-Vintage -DockerDown
         $r.Code | Should -Be 2
-        $r.Out | Should -Match '\| \? \| \? \| \? \| \? \|'
+        $r.Out | Should -Match '\| \? \| \? \| \? \| \? \| \? \|'
         $r.Out | Should -Not -Match 'absent'
     }
 
     It 'an absent container is a measured state, not an instrument failure' {
         $r = Invoke-Vintage -Absent
         $r.Code | Should -Be 0
-        $r.Out | Should -Match '\| absent \| - \| - \| - \|'
+        $r.Out | Should -Match '\| absent \| - \| - \| - \| - \|'
     }
 
     It 'unreachable /health is ? (unknown), exit 1 - never a blank that reads ok' {
         $r = Invoke-Vintage -HealthJson ''
         $r.Code | Should -Be 1
-        $r.Out | Should -Match '\| \? \| \? \| 1 \|'
+        $r.Out | Should -Match '\| \? \| \? \| 2 \| 1 \|'
     }
 
     It 'probes the HOST port from HostPort, not the container port key' {

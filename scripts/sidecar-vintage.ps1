@@ -82,14 +82,24 @@ function Get-HealthShape([int]$Port) {
     } catch { return $null }
 }
 
-function Get-CommitDistance([string]$SinceIso, [string]$Repo) {
-    # Commits touching packages/cli/src since the IMAGE was created. A zero
-    # is a measured zero; $null (git gave no signal) renders '?'.
+function Get-CommitCounts([string]$SinceIso, [string]$Repo) {
+    # Two distances since the IMAGE was created: every commit under
+    # packages/cli/src, and the CRITICAL subset - non-test sources. The
+    # total says "stale", the critical count says "serves wrong behavior":
+    # a sidecar behind on handlers/failover/relay code is the one that
+    # mishandles a turn in AUTONOMOUS, and that is the number that decides
+    # a recreate (file v26: commit distance alone does not say which ones
+    # count). A zero is a measured zero; $null (git gave no signal) is
+    # unknown at the caller.
     if (-not $SinceIso) { return $null }
-    $out = & git -C $Repo log ("--since={0}" -f $SinceIso) --format=%H -- packages/cli/src 2>$null
+    $total = & git -C $Repo log ("--since={0}" -f $SinceIso) --format=%H -- packages/cli/src 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
-    if ($null -eq $out) { return 0 }
-    return @($out).Count
+    $critical = & git -C $Repo log ("--since={0}" -f $SinceIso) --format=%H -- packages/cli/src ":(exclude)*.test.ts" ":(exclude)packages/cli/src/test-support" ":(exclude)packages/cli/src/test-fixtures" 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return @{
+        Total    = if ($null -eq $total) { 0 } else { @($total).Count }
+        Critical = if ($null -eq $critical) { 0 } else { @($critical).Count }
+    }
 }
 
 # --- docker signal -----------------------------------------------------------
@@ -121,9 +131,9 @@ Write-Output ("  repo       : {0}" -f $RepoPath)
 if ($null -eq $dockerAlive) {
     # Docker gave NO signal: every docker-read cell is UNKNOWN.
     Write-Output ''
-    Write-Output '| machine | container | image created (UTC) | /health keys | eventLoop gauges | commits behind (packages/cli/src) |'
-    Write-Output '|---|---|---|---|---|---|'
-    Write-Output "| $machine | $Container | ? | ? | ? | ? |"
+    Write-Output '| machine | container | image created (UTC) | /health keys | eventLoop gauges | commits behind (packages/cli/src) | critical behind (non-test) |'
+    Write-Output '|---|---|---|---|---|---|---|'
+    Write-Output "| $machine | $Container | ? | ? | ? | ? | ? |"
     exit 2
 }
 
@@ -131,9 +141,9 @@ if (-not $imageId) {
     # inspect gave nothing for this name: a measured absence, not an unknown.
     Write-Output '  inspect    : container absent'
     Write-Output ''
-    Write-Output '| machine | container | image created (UTC) | /health keys | eventLoop gauges | commits behind (packages/cli/src) |'
-    Write-Output '|---|---|---|---|---|---|'
-    Write-Output "| $machine | $Container | absent | - | - | - |"
+    Write-Output '| machine | container | image created (UTC) | /health keys | eventLoop gauges | commits behind (packages/cli/src) | critical behind (non-test) |'
+    Write-Output '|---|---|---|---|---|---|---|'
+    Write-Output "| $machine | $Container | absent | - | - | - | - |"
     exit 0
 }
 
@@ -151,9 +161,12 @@ if ($null -ne $shape) {
     if ($shape.Gauges -gt 0) { $gaugesCell = "yes ({0})" -f $shape.Gauges } else { $gaugesCell = 'no' }
 } else { $unknown = $true }
 
-$distance = Get-CommitDistance $imageCreated $RepoPath
-$distanceCell = '?'
-if ($null -ne $distance) { $distanceCell = "{0}" -f $distance } else { $unknown = $true }
+$distance = Get-CommitCounts $imageCreated $RepoPath
+$distanceCell = '?'; $criticalCell = '?'
+if ($null -ne $distance) {
+    $distanceCell = "{0}" -f $distance.Total
+    $criticalCell = "{0}" -f $distance.Critical
+} else { $unknown = $true }
 
 Write-Output ("  image      : {0}" -f $imageId)
 Write-Output ("  created    : {0}" -f $createdCell)
@@ -163,8 +176,8 @@ if ($shape -and $shape.Gauges -eq 0) {
 }
 Write-Output ''
 
-Write-Output '| machine | container | image created (UTC) | /health keys | eventLoop gauges | commits behind (packages/cli/src) |'
-Write-Output '|---|---|---|---|---|---|'
-Write-Output ("| {0} | {1} | {2} | {3} | {4} | {5} |" -f $machine, $Container, $createdCell, $keysCell, $gaugesCell, $distanceCell)
+Write-Output '| machine | container | image created (UTC) | /health keys | eventLoop gauges | commits behind (packages/cli/src) | critical behind (non-test) |'
+Write-Output '|---|---|---|---|---|---|---|'
+Write-Output ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} |" -f $machine, $Container, $createdCell, $keysCell, $gaugesCell, $distanceCell, $criticalCell)
 if ($unknown) { $script:VintageExitCode = 1 }
 exit $script:VintageExitCode
