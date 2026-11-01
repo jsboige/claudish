@@ -66,6 +66,8 @@ let calls: Record<string, number> = {};
 let wallEndpoints = new Set<string>();
 /** Endpoints answering a plain 500 (the non-quota pin W3). */
 let errorEndpoints = new Set<string>();
+/** Endpoints refusing the prompt as too large (#431's `context` skip). */
+let overflowEndpoints = new Set<string>();
 
 const SANDBOX_ENV_KEYS = [
   "ZAI_API_KEY",
@@ -100,6 +102,7 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_FAILOVER_AUTO",
   "CLAUDISH_FAILOVER_ARM_AFTER",
   "CLAUDISH_FAILOVER_ARM_GRACE_MS",
+  "CLAUDISH_FAILOVER_STEP_SKIP",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -135,6 +138,20 @@ function quotaWall(): Response {
   return new Response(
     JSON.stringify({ detail: "Check your subscription on https://example.invalid/subscription" }),
     { status: 402, headers: { "content-type": "application/json" } }
+  );
+}
+
+/** The size refusal `isContextOverflowError` classifies: structured code first. */
+function contextOverflow(): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: "This model's maximum context length is 8192 tokens.",
+        type: "invalid_request_error",
+        code: "context_length_exceeded",
+      },
+    }),
+    { status: 400, headers: { "content-type": "application/json" } }
   );
 }
 
@@ -204,6 +221,7 @@ beforeEach(() => {
   calls = { nm: 0, s0: 0, s1: 0 };
   wallEndpoints = new Set(["nm"]);
   errorEndpoints = new Set();
+  overflowEndpoints = new Set();
   registerFakeEndpoints();
   for (const k of SANDBOX_ENV_KEYS) {
     savedEnv[k] = process.env[k];
@@ -219,6 +237,7 @@ beforeEach(() => {
     calls[which] = (calls[which] ?? 0) + 1;
     if (errorEndpoints.has(which)) return new Response("upstream exploded", { status: 500 });
     if (wallEndpoints.has(which)) return quotaWall();
+    if (overflowEndpoints.has(which)) return contextOverflow();
     return healthySSE();
   }) as typeof fetch;
 });
@@ -410,5 +429,67 @@ describe("G8 — the first cascade wiring, through the real /v1/messages route",
     // No fleet state written on this path: a non-quota failure of a last step
     // marks nothing (nothing beneath it to protect).
     expect(isBucketWalled(bucketOfNominal())).toBe(false);
+  }, 30_000);
+});
+
+describe("#431 — a step that cannot TAKE this request is skipped, not failed", () => {
+  // The measured shape, on both producers: the step is HEALTHY (it would serve
+  // the next request), so nothing is marked, walled or armed — only THIS
+  // request routes around it. The discriminator against an ordinary
+  // non-quota failure is request 2: a marked step is TTL-benched for 10 min
+  // and would never be re-paid, so `calls.s0 === 2` is what proves the absence
+  // of a mark (the client outcome is 200 in both cases — the loop fail-forwards
+  // an intermediate step either way, which is exactly why the mark is the thing
+  // worth pinning).
+
+  test("S1: a `context` refusal on an intermediate step (classified from the error body) advances WITHOUT writing failure state", async () => {
+    await spin();
+    armCascade();
+    overflowEndpoints = new Set(["s0"]);
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200); // s1 served
+    expect(calls.nm).toBe(1); // the walled nominal, paid once
+    expect(calls.s0).toBe(1); // the step that could not take the request
+    expect(calls.s1).toBe(1); // the successor served
+    expect(JSON.stringify(await r1.json())).toContain("s1-ep@fake-s1");
+
+    // THE PIN: no mark. The step is re-paid — a benched step would not be.
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s0).toBe(2);
+    expect(calls.s1).toBe(2);
+  }, 30_000);
+
+  test("S2: the kill switch — `CLAUDISH_FAILOVER_STEP_SKIP=0` restores the pre-#431 behaviour and the step IS marked", async () => {
+    await spin();
+    armCascade();
+    // Read per request from `process.env` (the house kill-switch convention),
+    // so the switch is flipped the way an operator flips it.
+    process.env.CLAUDISH_FAILOVER_STEP_SKIP = "0";
+    overflowEndpoints = new Set(["s0"]);
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200); // an intermediate failure still fail-forwards
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(1);
+
+    // The mark is the difference from S1: the benched step is never re-paid.
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(2);
+  }, 30_000);
+
+  test("S3: a LAST step is never skipped — its refusal is what the client must see", async () => {
+    await spin();
+    // One step: it is the last step of the sonnet cascade.
+    armCascade({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0" });
+    overflowEndpoints = new Set(["s0"]);
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(400); // surfaced, not swallowed into a phantom advance
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(0);
   }, 30_000);
 });
