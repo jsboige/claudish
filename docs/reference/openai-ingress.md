@@ -58,6 +58,49 @@ o1/o3 remaps budget → `reasoning_effort`. `#435` also fixed the Qwen openai-wi
 which mapped *any* `originalRequest.thinking` to `enable_thinking: true` — inverting an explicit
 disabled ask.
 
+### The outbound writer: which client controls actually reach the endpoint (#783)
+
+The ingress half above is necessary but not sufficient — a `{type:"disabled"}` block still has to
+reach the endpoint *in the form that endpoint reads*. Until #783 no code wrote vLLM's form
+(`chat_template_kwargs.enable_thinking`): a model served by an endpoint with **no dialect** —
+`swift-1.5-27b` on `vllm-myia`, whose id matches no model family — had the block silently dropped,
+and the engine's template default (**thinking ON**) applied. Measured symptom: a client asking for
+no reasoning received 135 chars of it, blocking 6 sk-agent agents on web2.
+
+`composed-handler.ts` step 5a-bis now writes the off-switch, **last**, on the OpenAI wire:
+
+- The predicate is **"the ask would otherwise be LOST"**, never "the client asked". If the payload
+  already carries a form its endpoint reads — top-level `enable_thinking` (Qwen/DashScope), the
+  binary `thinking` object (GLM, MiniMax), or an operator-supplied `chat_template_kwargs.
+  enable_thinking` from the endpoint's extra payload fields — the adapter keeps **full ownership**
+  and nothing is added. Two spellings of one intent on the same wire is how a contradiction is
+  born (the 2026-08-19 `reasoning_effort` + `thinking_budget` 400).
+- Sibling `chat_template_kwargs` keys are preserved, so `effortTarget`'s
+  `reasoning_effort` (#667) survives alongside it.
+- **Strict-schema backends are skipped** (`omitReasoningContent`, the Mistral `422
+  extra_forbidden` family): they reject unknown top-level fields, and a reasoning preference is
+  never worth failing a turn over.
+- The Anthropic wire is untouched — there the block *is* the native form.
+
+Pins: `composed-handler-thinking-off.test.ts` (8 cases: the mapping, sibling preservation, the
+three ownership owners — top-level switch, binary `thinking`, operator-pinned
+`chat_template_kwargs` — no-ask/enabled no-op, strict-schema skip, anthropic wire). Each
+ownership disjunct has its own pin **and its own red under mutation**: removing
+`payload.thinking !== undefined` turns AC3b red — and that disjunct is what excludes the two
+reachable non-vLLM OpenAI-wire targets, **DeepSeek** (its dialect writes
+`request.thinking={type:"disabled"}` for a client off-switch, `deepseek-model-dialect.ts`) and
+**OpenRouter** (its format passes `claudeRequest.thinking` through verbatim), including every
+DeepSeek PAYG substitution the cascade's last step makes. An operator-pinned
+`chat_template_kwargs.enable_thinking` wins over a contradicting client ask — the #667 "what the
+operator armed is not clobbered downstream" doctrine; note a `false`-valued fixture cannot pin
+this (the rewrite is idempotent) — the pin carries `true` on purpose. `#667`'s AC4 pin was
+narrowed to what it actually asks — no `reasoning_effort` on a disabled block — since the object
+itself may now legitimately carry `enable_thinking`.
+
+**Still open on this path**: `swift-1.5-27b-no-thinking` answering **403 "not served on this
+proxy"** (symptom 2 of #783) is a *routing/catalog* question, not a translation one — that id must
+be checked against the catalog and the inbound-key allowlist (§7.6) on the seat that serves it.
+
 **Measured on the real lane (2026-10-11)**, probe proxy → hub `/v1/messages` → sonnet nominal
 `gc@glm-5.3`, prompt `"Reponds exactement: ok"`, `max_tokens: 200`: no controls → **36 completion
 tokens, 131 chars of `reasoning_content`**; `enable_thinking: false` → **3 completion tokens,
