@@ -17,7 +17,32 @@ import {
 // ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
 // are INERT without their env knobs, so their presence changes nothing on a
 // fleet that never opts in.
-import { extractSessionKey, roleFromModelName } from "./fork/failover.js";
+import {
+  ARM_TTL_MAX_MS,
+  type FailoverStep,
+  NATIVE_BUCKET,
+  classifyNominalBucket,
+  earliestWalledReprobeAt,
+  extractSessionKey,
+  getArmGraceMs,
+  getFailoverRule,
+  initFailover,
+  isQuotaExhaustion,
+  isWiringError,
+  markStepFailed,
+  onNominalRefusal,
+  onNominalSuccess,
+  parseResetAtFromBody,
+  providerBucketOf,
+  recordServedStepForNotices,
+  resetStepSuccess,
+  resolveDelegationOwner,
+  resolveFailoverTargetForSession,
+  roleFromModelName,
+  servedStepForNotices,
+  setRoleNominalBucketResolver,
+  setRoleNominalResolver,
+} from "./fork/failover.js";
 import { collectRoutedBareNames, createProxyAuthMiddleware } from "./fork/middleware/proxy-auth.js";
 // #641 blocker-2 port — capture pipeline (fork extension). request-logger owns
 // the req-*.json capture, the pinned [Request] stdout line and the per-request
@@ -1043,6 +1068,343 @@ export async function createProxyServer(
   const hostnameConfig = createHostnameConfig(options.hostname);
   const startedAt = Date.now();
 
+  // ── Budget-failover cascade wiring (#641 G8, first wiring) ────────────────────
+  //
+  // The module (fork/failover.ts, G5) held the whole state machine — rules, arm,
+  // walls, per-step backoff, dwell pins, notices — but nothing called it: both
+  // ingress routes resolved through `getHandlerForRequest(model)` alone, so no
+  // role could ever substitute and the `applyFailoverNotices` calls were inert
+  // by construction. This block is the FIRST wiring: the startup registration,
+  // the bucket helpers, and the serve loop (nominal → steps, bounded), adapted
+  // to the seams that exist on this base. Deliberately narrower than main's
+  // loop — the gap list is enumerated in the PR and each entry lands as its own
+  // grain: no #747 serving-note strip (the module snapshot predates it), no
+  // #412 keyless suppression, no #565 context-admission census, no #654
+  // endpoint token budget, no #431 busy/context skip wire (the Context marker
+  // family is not ported), no #299-B overload walk, no #609 in-request
+  // delegation walk (owner-side MARKS are kept — the S1/S2 defect class), no
+  // #218 native-lane version pin, no #693 machine-scoped resolution arm (the
+  // ported resolveFailoverTargetForSession takes no machine argument).
+  //
+  // Inert with no CLAUDISH_FAILOVER_* env: no rule ⇒ one attempt ⇒ the nominal
+  // through the same resolution as before, byte-identical serve.
+  initFailover();
+  // The v14 modelMap carries no `fable` slot (its role set is opus/sonnet/
+  // haiku/subagent) — index by string, not by FailoverRole, so the resolver
+  // stays valid the day a slot is added.
+  setRoleNominalResolver((r) => (modelMap as Record<string, string | undefined> | undefined)?.[r]);
+
+  /** The request-side nominal target, mirroring resolveHandlerForRequest's own
+   * mapping steps (slot map → role keywords → --model default) so the bucketer
+   * and the serving resolution can never drift — a nominal bucketed as X while
+   * it serves from Y walls a meter nobody draws on (#275). */
+  const resolveNominalTarget = (requestedModel: string): { target: string; mapped: boolean } => {
+    const slot = options.slotMap?.get(requestedModel);
+    if (slot) {
+      return {
+        target:
+          slot.provider != null && slot.provider !== ""
+            ? `${slot.provider}@${slot.model}`
+            : slot.model,
+        mapped: true,
+      };
+    }
+    let target = requestedModel;
+    let mapped = false;
+    const req = requestedModel.toLowerCase();
+    if (modelMap) {
+      if (req.includes("opus") && modelMap.opus) {
+        target = modelMap.opus;
+        mapped = true;
+      } else if (req.includes("sonnet") && modelMap.sonnet) {
+        target = modelMap.sonnet;
+        mapped = true;
+      } else if (req.includes("haiku") && modelMap.haiku) {
+        target = modelMap.haiku;
+        mapped = true;
+      } else if (model) target = model;
+    } else if (model) {
+      target = model;
+    }
+    return { target, mapped };
+  };
+
+  /** Bucket for an ALREADY-CONCRETE cascade step target (#348): classify, never
+   * re-map. Narrowed vs main on this base: no user-routing-rule override
+   * consultation and no `route()` primary fallback — a bare routing-chain
+   * nominal (`glm-5.3`) buckets canonically (`glm`) instead of on the route()
+   * primary. Delegations whose nominal is a bare chain name are the one shape
+   * that mis-buckets; the armed cascades this base serves today carry concrete
+   * `provider@model` steps only. */
+  const concreteStepBucketOfSync = (stepTarget: string): string => {
+    const decision = classifyNominalBucket(stepTarget, () => false);
+    if ("bucket" in decision) return decision.bucket;
+    return providerBucketOf(stepTarget);
+  };
+  setRoleNominalBucketResolver(concreteStepBucketOfSync);
+
+  /** The provider bucket a requested model's NOMINAL draws on (#275) — the meter
+   * a quota refusal walls. Same classification chain as the concrete twin. */
+  const nominalBucketOfModel = async (requestedModel: string): Promise<string> => {
+    const { target } = resolveNominalTarget(requestedModel);
+    const decision = classifyNominalBucket(target, () => false);
+    if ("bucket" in decision) return decision.bucket;
+    return providerBucketOf(target);
+  };
+
+  /** The ONE bucket an ingress request keys every failover decision on: undefined
+   * when its role has no cascade (today's behaviour for every unconfigured
+   * role). No Context is taken — the machine-arm bucket (#693) is not
+   * consulted, the ported resolution takes no machine argument. */
+  const requestBucketOf = async (requestedModel: string): Promise<string | undefined> => {
+    const role = roleFromModelName(requestedModel);
+    if (!role || !getFailoverRule(role)) return undefined;
+    return await nominalBucketOfModel(requestedModel);
+  };
+
+  /**
+   * Serve through the budget-failover cascade: nominal attempt first, then each
+   * configured step, bounded (`steps.length + 1`). Each attempt resolves the
+   * CURRENT failover state, so a role already armed serves its step on attempt
+   * 0. Qualifying quota refusals (isQuotaExhaustion — deliberately narrow, 401
+   * and 404 never arm) advance the walk and write fleet state; non-quota
+   * failures surface on the nominal and the last step, and fail forward with a
+   * marked step in between. #274: a role-step's marks reach the OWNING side.
+   * #409: a walled LAST step surfaces as a 429 rate_limit_error the client
+   * already retries, never the provider's own 403/402. Called by both ingress
+   * routes; applyFailoverNotices wraps the result at the route (content on
+   * /v1/messages, response header on /v1/chat/completions — #229).
+   */
+  const handleWithCascade = async (
+    c: Context,
+    body: any,
+    requestedModel: string,
+    nominalBucket?: string
+  ): Promise<Response> => {
+    const role = roleFromModelName(requestedModel);
+    const rule = role ? getFailoverRule(role) : undefined;
+    const bucket = nominalBucket ?? (rule ? await nominalBucketOfModel(requestedModel) : undefined);
+    const maxAttempts = rule ? rule.steps.length + 1 : 1; // nominal + each step
+    const armGraceMs = getArmGraceMs();
+    const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
+    const machineHeader = c.req.header("x-claudish-machine") ?? null;
+    let graceRetried = false; // #91: one wait-and-retry on the nominal per request
+    let response: Response | undefined;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const resolved = role
+        ? resolveFailoverTargetForSession(role, sessionKey, bucket)
+        : { step: null as FailoverStep | null, stepIndex: -1 };
+      const { stepIndex } = resolved;
+      // #274: when this attempt serves a role-step's DELEGATION, the bookkeeping
+      // must reach the OWNING side (target's bucket for its nominal, target's
+      // step otherwise) — derived from the RESOLUTION itself.
+      const delegation =
+        role && resolved.step?.roleRef ? resolveDelegationOwner(role, resolved.step) : null;
+      // The step's target is already concrete — serve it verbatim (the v14
+      // getHandlerForRequest is single-arg; the swap happens HERE, at the loop,
+      // not inside resolution). The nominal goes through the request-side
+      // mapping exactly as before the wiring.
+      const serveModel =
+        stepIndex >= 0 && resolved.step?.target ? resolved.step.target : requestedModel;
+      const handler = withAdvisor(
+        withRequestHooks(await getHandlerForRequest(serveModel)),
+        advisorPresence
+      );
+      // Capture pipeline contract (fork extension): one [Request] line per
+      // request, AFTER handler resolution — the handler that actually serves
+      // attempt 0, so an armed role logs the step's lane, not the nominal's.
+      if (attempt === 0) {
+        logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
+      }
+      // #317: FRESH attempt token per paid upstream attempt — the usage sink
+      // keys its max-ledger on it (two paid attempts of one request must land
+      // in two slots). No-op when both bars are off.
+      openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+      response = await handler.handle(c, body);
+      if (response.ok) {
+        if (role) {
+          // #431 CR B1: name the step that actually served, for the notices.
+          recordServedStepForNotices(c, role, resolved.step ?? undefined, stepIndex);
+          if (stepIndex === -1)
+            onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
+          else resetStepSuccess(role, stepIndex);
+          // #274: the concrete model succeeded — clear the OWNING side too, in
+          // the owner's vocabulary, never the delegating role's own bucket.
+          if (delegation) {
+            if (delegation.owner.nominal) {
+              onNominalSuccess(
+                delegation.owner.role,
+                concreteStepBucketOfSync(delegation.concrete)
+              );
+            } else {
+              resetStepSuccess(delegation.owner.role, delegation.owner.stepIndex);
+            }
+          }
+        }
+        return response;
+      }
+      if (!role) return response; // no role → no cascade possible
+      let errBody = "";
+      try {
+        errBody = await response.clone().text();
+      } catch {
+        // unreadable body — status alone still decides for 402
+      }
+      const reason = `HTTP ${response.status} from ${requestedModel}`;
+      if (!isQuotaExhaustion(response.status, errBody)) {
+        // Wiring faults never advance: a mistyped model id in a step would
+        // become permanently invisible, every request stepping over it.
+        if (isWiringError(response.status, errBody)) {
+          log(
+            `[Failover] STEP-WIRING ${role} step=${stepIndex} — HTTP ${response.status} looks like a misconfigured step; surfacing instead of advancing`,
+            true // forceConsole — operational event, countable marker
+          );
+          return response;
+        }
+        // Fail-forward: a non-quota failure on an INTERMEDIATE step still has a
+        // working successor beneath it. The nominal and the last step surface —
+        // the user's own model failing must reach the user. Marked, not merely
+        // skipped (first backoff rung is 10 min; unmarked, every subsequent
+        // request re-pays the round-trip to a step that may be down for hours).
+        // The nonQuota flag (#276) forfeits a dwell pin instead of re-pinning
+        // deeper. #331: the mark carries the CONCRETE this attempt served.
+        const isIntermediateStep =
+          stepIndex >= 0 && rule != null && stepIndex < rule.steps.length - 1;
+        if (!isIntermediateStep) return response;
+        const why = `HTTP ${response.status} (non-quota) from step ${stepIndex}`;
+        log(`[Failover] STEP-ADVANCE ${role} — ${why}; trying next step`, true);
+        const attemptConcrete = delegation?.concrete ?? resolved.step?.target;
+        markStepFailed(role, stepIndex, why, parseResetAtFromBody(errBody), {
+          nonQuota: true,
+          concrete: attemptConcrete,
+        });
+        if (delegation && !delegation.owner.nominal) {
+          markStepFailed(
+            delegation.owner.role,
+            delegation.owner.stepIndex,
+            why,
+            parseResetAtFromBody(errBody),
+            {
+              nonQuota: true,
+              concrete: delegation.concrete,
+            }
+          );
+        }
+        continue;
+      }
+      if (stepIndex === -1) {
+        // Nominal walled (#91 gate: burst discrimination + grace before arming).
+        // "armed" also covers the concurrent-request race where another request
+        // armed the role between this one's resolution and its refusal: the
+        // retry below re-resolves and serves from the cascade.
+        const verdict = onNominalRefusal(
+          role,
+          reason,
+          response.headers.get("retry-after"),
+          errBody,
+          bucket
+        );
+        if (verdict.outcome === "burst") {
+          // A short retry-after names a burst: surface it, the client ladder
+          // absorbs it, the role never exiles for a 10-min TTL off a blip.
+          return response;
+        }
+        if (verdict.outcome === "grace") {
+          if (armGraceMs > 0 && !graceRetried) {
+            graceRetried = true;
+            await new Promise((r) => setTimeout(r, armGraceMs));
+            attempt--; // replay the nominal attempt, not a cascade step
+            continue;
+          }
+          return response;
+        }
+        // "armed" — fall through: the next iteration resolves the cascade.
+      } else {
+        // #274 delegated bookkeeping: exactly one increment per failure on each
+        // side, and the owning side records the wall in ITS OWN vocabulary.
+        markStepFailed(role, stepIndex, reason, parseResetAtFromBody(errBody), {
+          concrete: delegation?.concrete ?? resolved.step?.target,
+        });
+        if (delegation) {
+          if (delegation.owner.nominal) {
+            onNominalRefusal(
+              delegation.owner.role,
+              reason,
+              response.headers.get("retry-after"),
+              errBody,
+              concreteStepBucketOfSync(delegation.concrete)
+            );
+          } else {
+            markStepFailed(
+              delegation.owner.role,
+              delegation.owner.stepIndex,
+              reason,
+              parseResetAtFromBody(errBody),
+              {
+                concrete: delegation.concrete,
+              }
+            );
+          }
+        }
+        if (rule && stepIndex === rule.steps.length - 1) {
+          // #409: a walled LAST step never surfaces the provider's own 403/402
+          // (Claude Code renders a 403 as an auth failure and offers a login
+          // prompt; a 402 "Insufficient Balance" reads as a wiring error). Both
+          // ARE budget walls — say so in the vocabulary the client already
+          // retries: 429 rate_limit_error, retry-after bounded by the proxy's
+          // next re-probe. Native lane excluded: its meter is the client's own
+          // credential, which already speaks 429.
+          if (!(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`)) {
+            const lastConcrete = delegation?.concrete ?? resolved.step?.target ?? requestedModel;
+            let upstreamMsg = errBody.slice(0, 200);
+            try {
+              const parsed = JSON.parse(errBody);
+              const m = parsed?.error?.message ?? parsed?.message;
+              if (typeof m === "string" && m.length > 0) upstreamMsg = m.slice(0, 200);
+            } catch {
+              // not JSON — the raw slice above already is the message
+            }
+            const headers = new Headers({ "Content-Type": "application/json" });
+            const horizon = earliestWalledReprobeAt(role, bucket);
+            let capped = false;
+            if (horizon) {
+              const seconds = Math.max(1, Math.ceil((horizon.getTime() - Date.now()) / 1000));
+              capped = seconds > ARM_TTL_MAX_MS / 1000;
+              headers.set(
+                "retry-after",
+                String(Math.min(Math.ceil(ARM_TTL_MAX_MS / 1000), seconds))
+              );
+            }
+            log(
+              `[Failover] WALL-SURFACE ${role} — HTTP ${response.status} from ${lastConcrete} rewritten to 429 rate_limit_error` +
+                (horizon
+                  ? ` (retry-after ${headers.get("retry-after")}s${capped ? ", capped at wall-TTL max" : ""})`
+                  : " (no re-probe horizon — retry-after omitted)"),
+              true // forceConsole — operational event, countable marker
+            );
+            try {
+              await response.body?.cancel();
+            } catch {
+              // already gone — nothing to drain
+            }
+            return new Response(
+              JSON.stringify({
+                type: "error",
+                error: {
+                  type: "rate_limit_error",
+                  message: `[Failover] ${role}: every step walled — last: ${lastConcrete} ${response.status}: ${upstreamMsg}`,
+                },
+              }),
+              { status: 429, headers }
+            );
+          }
+          return response; // last step also walled (native lane: surface as-is)
+        }
+      }
+    }
+    return response as Response;
+  };
+
   // Terminal-safety backstop. Hono's DEFAULT error handler is literally
   // `console.error(err)` + a text/plain "Internal Server Error" (see
   // hono/dist/hono-base.js). During an interactive session claudish's stderr IS
@@ -1366,36 +1728,34 @@ export async function createProxyServer(
         }
       }
 
-      // The advisor wrapper goes on the RESOLVED handler (FallbackHandler
-      // included), once per request, around the hooks. See `withAdvisor` and
-      // `withRequestHooks` above.
-      const handler = withAdvisor(
-        withRequestHooks(await getHandlerForRequest(body.model)),
-        advisorPresence
-      );
-
-      // Capture pipeline (fork extension): req-* capture + [Request] line +
-      // request-number assignment (requestNumberFor). Sits AFTER the relay
-      // branch (nominal forwards never capture locally — the hub captures
-      // centrally) and AFTER handler resolution (the handler name is part of
-      // the [Request] contract). Attribution fields (machine, hops,
-      // inbound_key, device_id8, entrypoint/workload) ride the envelope.
-      logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
-
-      // #317: the attempt token is attached right before the paid attempt — the
-      // usage sink keys its max-ledger on it. No-op when both bars are off.
-      openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
-
-      // Route. The `await` is load-bearing: `return handler.handle(...)` hands
-      // the promise back BEFORE it settles, so a rejection escapes this
-      // try/catch entirely and lands in Hono's error handler instead. That is
-      // how connect failures bypassed every message we build here.
+      // Budget-failover cascade (#641 G8, first wiring): the nominal attempt
+      // through the SAME resolution as before, then each configured step. The
+      // [Request] log line and the per-attempt budget token moved INSIDE the
+      // loop — one log per request naming attempt 0's lane (an armed role logs
+      // the step's lane, not the nominal's), and a FRESH token per paid
+      // attempt (#317). Inert with no CLAUDISH_FAILOVER_* env.
+      const requestRole = roleFromModelName(body.model);
+      const requestBucket = await requestBucketOf(body.model);
+      // Route. The `await`s are load-bearing: handing a promise back BEFORE it
+      // settles lets a rejection escape this try/catch entirely and land in
+      // Hono's error handler instead. That is how connect failures bypassed
+      // every message we build here.
       try {
-        return await applyCapabilityQueryAtCondensation(
-          await handler.handle(c, body),
+        const response = await handleWithCascade(c, body, body.model, requestBucket);
+        // Inject onset/recovery notices: in-content on this ingress (the
+        // Claude Code agent loop), response header on /v1/chat/completions
+        // (#229). The wrap never throws — a thrown error would turn a working
+        // condensation into a failed one.
+        const noticed = await applyFailoverNotices(
+          response,
+          requestRole,
           sessionKey,
-          body.stream === true
+          body.stream === true,
+          noticePolicyForIngress(c.req.path),
+          requestBucket,
+          servedStepForNotices(c, requestRole) // #431 CR B1: name the step that served
         );
+        return await applyCapabilityQueryAtCondensation(noticed, sessionKey, body.stream === true);
       } catch (handlerError) {
         handlerThrew = true;
         throw handlerError;
@@ -1430,13 +1790,12 @@ export async function createProxyServer(
   // proxy-server.ts route, adapted to the seams that exist on this branch —
   // the deltas are marked #641-G7-GAP inline:
   //   - no drain-freeze gate (the freeze infra is not ported yet);
-  //   - handler resolution is the v14 single-arg getHandlerForRequest and the
-  //     route serves through handler.handle — the budget-failover cascade
-  //     (handleWithCascade) is ported as a module (fork/failover.ts) but not
-  //     yet wired into any route, so the applyFailoverNotices call below is
-  //     inert by construction until that grain lands;
-  //   - no stripBillingHeaderFromBody / keylessNativeRequest / requestBucketOf
-  //     (the billing-strip and bucket families are not ported).
+  //   - since G8 the route serves through handleWithCascade like /v1/messages,
+  //     so this ingress inherits the budget-failover substitution and the
+  //     applyFailoverNotices call below is live (the narrower-than-main gap
+  //     list lives with the cascade wiring block);
+  //   - no stripBillingHeaderFromBody / keylessNativeRequest
+  //     (the billing-strip family is not ported).
   app.post("/v1/chat/completions", async (c) => {
     try {
       // Same client-error terminal 400 as /v1/messages (#548 on main), in this
@@ -1534,35 +1893,27 @@ export async function createProxyServer(
         }
       }
 
-      // Resolve and serve through the v14 pipeline (advisor + hooks, same
-      // wrapping as /v1/messages). #641-G7-GAP: main routes through
-      // handleWithCascade and carries requestBucketOf /
-      // stripBillingHeaderFromBody / keylessNativeRequest around resolution —
-      // none of those seams exist on this branch yet.
-      const handler = withAdvisor(
-        withRequestHooks(await getHandlerForRequest(anthropicBody.model)),
-        advisorPresence
-      );
-      logRequest(anthropicBody, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
-
-      // #317: attach the attempt token right before the paid attempt, same as
-      // /v1/messages — the usage sink keys its max-ledger on it.
-      openSessionBudgetAttempt(c.req.raw, machineHeader, openaiSessionKey, process.env);
+      // Serve through the v14 pipeline + the budget-failover cascade (same
+      // loop as /v1/messages since G8; the [Request] log line and the attempt
+      // token live inside the loop). Inert with no CLAUDISH_FAILOVER_* env.
+      const openaiRole = roleFromModelName(anthropicBody.model);
+      const openaiBucket = await requestBucketOf(anthropicBody.model);
 
       // Inject onset/recovery notices on the Anthropic-shape response BEFORE
       // translation to OpenAI wire shape. #229: this ingress's consumers are
       // programmatic (sk-agent, any AsyncOpenAI client) — the notice rides the
       // response header, NOT the content, so an empty model output stays
-      // visibly empty instead of being masked by the notice-as-answer. Inert
-      // while the cascade is unwired (no role ever substitutes), correct the
-      // day it lands.
-      let response = await handler.handle(c, anthropicBody);
+      // visibly empty instead of being masked by the notice-as-answer. The
+      // wrap never throws.
+      let response = await handleWithCascade(c, anthropicBody, anthropicBody.model, openaiBucket);
       response = await applyFailoverNotices(
         response,
-        roleFromModelName(anthropicBody.model),
+        openaiRole,
         openaiSessionKey,
         wantsStream,
-        noticePolicyForIngress(c.req.path)
+        noticePolicyForIngress(c.req.path),
+        openaiBucket,
+        servedStepForNotices(c, openaiRole) // #431 CR B1: name the step that served
       );
 
       // Translate the final Anthropic response to OpenAI shape.
