@@ -594,6 +594,42 @@ landed 13:30:44Z — 321 responses served in h13Z, then **zero** through h19Z
 while haiku traffic kept flowing; GLM re-walled 19:13Z and the sonnet role was
 served by DeepSeek Flash PAYG (1 734 responses h18Z, 1 141 h19Z).
 
+## A 429 salve that is neither quota nor hub load: GLM plan concurrency, `code=1302` (measured 2026-11-01)
+
+The WAN façade counted 77 client-visible 429s in five minutes (08:53→08:58Z,
+one remote seat's cron workload ramped to ~30 req/min, the 429s **interleaved
+with 200s**) and asked the hub to corroborate. Hub journal, same window:
+
+- **204 `[ConcurrencyRefusal] provider=GLM Coding model=gc@glm-5.3 HTTP 429
+  code=1302 — plan concurrency busy, not a step failure`** (38/32/24/64/44/2
+  per minute), **137 GLM streams completed** in the same window, and **zero
+  `code=1308` the whole day** (918 `[ConcurrencyRefusal]` lines total since
+  the 00:41Z recreate — 917 on `gc@glm-5.3`, 1 on `gc@glm-5.2`, all 1302).
+- Context: GLM had **RECOVERED at 06:18:00Z** (serving sonnet nominally after
+  the 04:27 wall fell), so the salve is a *healthy* nominal meeting its plan's
+  **concurrency** ceiling under a burst — chronic background pressure all day,
+  with the salve as its peak.
+- The pair that settles the classification: **204 concurrency 429s at
+  08:53–08:58 armed nothing** (no `glm-coding` transition until 10:31), then
+  **one qualifying refusal at 10:31:59 re-armed the wall** (ARM-GRACE 1/2 →
+  `ARMED bucket glm-coding`). Same bucket, two refusal classes, two
+  behaviors, same day.
+
+Reading rules that fall out:
+
+- **`1302` is concurrency; `1308` is the quota wall** — different answers, no
+  console needed to tell them apart. 1308 (`Usage limit reached … will reset
+  at …`, the po-2028 29/10 corpus) names a time-boxed wall and qualifies to
+  arm; 1302 names busy slots, never arms (the marker says so: *not a step
+  failure*), and the client sees 429s **interleaved with 200s as slots free**
+  — the interlacing is the signature. A dated pure-1302 corpus (01/11
+  08:53–08:58Z) now exists for whatever classifier work wants the pair
+  separated (#781).
+- **Counting client-side 429s alone misattributes the wall.** 77 surfaced at
+  one WAN client; 204 were refused hub-side across all callers. The salve is
+  the GLM plan's concurrency ceiling — not a hub rate limit, not a proxy
+  throughput wall.
+
 ## What a recreate costs the ladder, and the steps that fall together (measured 2026-11-01)
 
 The 00:41:30Z deploy of `main` gave the first full-window reading of the ladder
