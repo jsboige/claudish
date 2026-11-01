@@ -19,9 +19,11 @@ import {
 // fleet that never opts in.
 import {
   ARM_TTL_MAX_MS,
+  type DelegationOwner,
   type FailoverStep,
   NATIVE_BUCKET,
   classifyNominalBucket,
+  delegationCandidateBound,
   earliestWalledReprobeAt,
   extractSessionKey,
   getArmGraceMs,
@@ -36,6 +38,7 @@ import {
   providerBucketOf,
   recordServedStepForNotices,
   resetStepSuccess,
+  resolveDelegationExcluding,
   resolveDelegationOwner,
   resolveFailoverTargetForSession,
   roleFromModelName,
@@ -1081,10 +1084,14 @@ export async function createProxyServer(
   // grain: no #747 serving-note strip (the module snapshot predates it), no
   // #412 keyless suppression, no #565 context-admission census, no #654
   // endpoint token budget, no #431 busy/context skip wire (the Context marker
-  // family is not ported), no #299-B overload walk, no #609 in-request
-  // delegation walk (owner-side MARKS are kept — the S1/S2 defect class), no
-  // #218 native-lane version pin, no #693 machine-scoped resolution arm (the
-  // ported resolveFailoverTargetForSession takes no machine argument).
+  // family is not ported), no #299-B overload walk, no #218 native-lane version
+  // pin, no #693 machine-scoped resolution arm (the ported
+  // resolveFailoverTargetForSession takes no machine argument), no #769
+  // unroutable-step skip (a RoutingError at construction surfaces).
+  // #609 IS wired below (walkDelegatedTarget): a delegated concrete that fails
+  // in-request is followed by the next concrete of the TARGET's path on the same
+  // delegating step, before the caller's next step — outside the attempt budget,
+  // bounded by the target path's candidate count.
   //
   // Inert with no CLAUDISH_FAILOVER_* env: no rule ⇒ one attempt ⇒ the nominal
   // through the same resolution as before, byte-identical serve.
@@ -1189,23 +1196,68 @@ export async function createProxyServer(
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
     const machineHeader = c.req.header("x-claudish-machine") ?? null;
     let graceRetried = false; // #91: one wait-and-retry on the nominal per request
+    // #609: a delegated concrete that failed in THIS request is followed by the
+    // NEXT concrete of the target's path, on the SAME delegating step, before
+    // the walk moves on or surfaces — a `role:` step stands for the target's
+    // whole chain, not for the single concrete the resolution happened to pick.
+    // One-shot override, consumed by the next iteration; it rides OUTSIDE the
+    // caller's attempt budget (`attempt--`) and is bounded by the target path's
+    // candidate count, excluding every concrete this request already paid.
+    type DelegationOverride = { stepIndex: number; concrete: string; owner: DelegationOwner };
+    let delegationOverride: DelegationOverride | null = null;
+    let delegationWalks = 0;
+    // Concretes this request already paid, across steps (the #609 exclusion
+    // set). The index-keyed, #331-aware twin on main also feeds a revisit
+    // guard this base does not have — here the set has exactly one reader.
+    const paidConcretes = new Set<string>();
     let response: Response | undefined;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const resolved = role
-        ? resolveFailoverTargetForSession(role, sessionKey, bucket)
-        : { step: null as FailoverStep | null, stepIndex: -1 };
+      // #609: an override attempt serves the walk's concrete verbatim and reads
+      // no failover state — the walk chose the concrete, a re-resolution would
+      // hand the dead one back. Typed read: the only writer is the closure
+      // below, which control-flow narrowing cannot see.
+      const override = delegationOverride as DelegationOverride | null;
+      delegationOverride = null;
+      const resolved =
+        override && rule
+          ? { step: rule.steps[override.stepIndex], stepIndex: override.stepIndex }
+          : role
+            ? resolveFailoverTargetForSession(role, sessionKey, bucket)
+            : { step: null as FailoverStep | null, stepIndex: -1 };
       const { stepIndex } = resolved;
       // #274: when this attempt serves a role-step's DELEGATION, the bookkeeping
       // must reach the OWNING side (target's bucket for its nominal, target's
       // step otherwise) — derived from the RESOLUTION itself.
-      const delegation =
-        role && resolved.step?.roleRef ? resolveDelegationOwner(role, resolved.step) : null;
+      const delegation = override
+        ? { concrete: override.concrete, owner: override.owner }
+        : role && resolved.step?.roleRef
+          ? resolveDelegationOwner(role, resolved.step)
+          : null;
+      // #609: arm the next delegated concrete for THIS step, when the target's
+      // path still has one this request has not paid. True = the caller drains
+      // and `continue`s; false = today's advance / surface.
+      const walkDelegatedTarget = (): boolean => {
+        if (!role || !delegation || !resolved.step?.roleRef || stepIndex < 0) return false;
+        if (delegationWalks >= delegationCandidateBound(resolved.step)) return false;
+        paidConcretes.add(delegation.concrete);
+        const next = resolveDelegationExcluding(resolved.step, paidConcretes);
+        if (!next) return false;
+        delegationWalks++;
+        delegationOverride = { stepIndex, concrete: next.concrete, owner: next.owner };
+        log(
+          `[Failover] DELEGATION-WALK ${role}[${stepIndex}] — ${delegation.concrete} failed in this request; ` +
+            `trying ${next.concrete} (${next.owner.role} ${next.owner.nominal ? "nominal" : `step ${next.owner.stepIndex}`})`,
+          true // forceConsole — operational event, countable marker
+        );
+        return true;
+      };
       // The step's target is already concrete — serve it verbatim (the v14
       // getHandlerForRequest is single-arg; the swap happens HERE, at the loop,
       // not inside resolution). The nominal goes through the request-side
       // mapping exactly as before the wiring.
       const serveModel =
-        stepIndex >= 0 && resolved.step?.target ? resolved.step.target : requestedModel;
+        override?.concrete ??
+        (stepIndex >= 0 && resolved.step?.target ? resolved.step.target : requestedModel);
       const handler = withAdvisor(
         withRequestHooks(await getHandlerForRequest(serveModel)),
         advisorPresence
@@ -1270,7 +1322,23 @@ export async function createProxyServer(
         // deeper. #331: the mark carries the CONCRETE this attempt served.
         const isIntermediateStep =
           stepIndex >= 0 && rule != null && stepIndex < rule.steps.length - 1;
-        if (!isIntermediateStep) return response;
+        if (!isIntermediateStep) {
+          // #609: a delegating LAST step whose concrete failed non-quota walks
+          // the target's remaining path before surfacing. No mark is written —
+          // that is the last step's contract (nothing beneath it to protect);
+          // the exclusion set is the request's only memory of the failure. A
+          // wiring fault already surfaced above, so a mistyped id stays visible.
+          if (walkDelegatedTarget()) {
+            try {
+              await response.body?.cancel();
+            } catch {
+              // already gone — nothing to drain
+            }
+            attempt--; // outside the caller's budget, bounded by the candidate count
+            continue;
+          }
+          return response;
+        }
         const why = `HTTP ${response.status} (non-quota) from step ${stepIndex}`;
         log(`[Failover] STEP-ADVANCE ${role} — ${why}; trying next step`, true);
         const attemptConcrete = delegation?.concrete ?? resolved.step?.target;
@@ -1345,6 +1413,18 @@ export async function createProxyServer(
               }
             );
           }
+        }
+        // #609: a delegated wall walks the target's remaining path in-request —
+        // the marks above are written exactly as before; the walk only decides
+        // what THIS request tries next. Exhausted → today's advance / surface.
+        if (walkDelegatedTarget()) {
+          try {
+            await response.body?.cancel();
+          } catch {
+            // already gone — nothing to drain
+          }
+          attempt--; // outside the caller's budget, bounded by the candidate count
+          continue;
         }
         if (rule && stepIndex === rule.steps.length - 1) {
           // #409: a walled LAST step never surfaces the provider's own 403/402

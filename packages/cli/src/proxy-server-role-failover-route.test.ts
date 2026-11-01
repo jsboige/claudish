@@ -4,11 +4,11 @@
  * so a role substitution is real and `applyFailoverNotices` is live.
  *
  * Why this file is not a copy of the fork's `proxy-server-role-failover-route`:
- * the fork's version pins #609 in-request delegation walks, #331 concrete-keyed
- * revisit guards and #554 sync-twin decisions — sites that DO NOT EXIST in this
- * first wiring (the deliberately-narrower-than-main gap list lives with the
- * wiring block in proxy-server.ts). What exists here is pinned; the deferred
- * semantics are named so nothing looks covered when it is not.
+ * the fork's version pins #331 concrete-keyed revisit guards, #554 sync-twin
+ * decisions and #431's skip wire — sites that DO NOT EXIST on this base (the
+ * gap list lives with the wiring block in proxy-server.ts). #609's in-request
+ * delegation walk DOES exist here and is pinned by W5/W7. What exists is pinned;
+ * what is deferred is named so nothing looks covered when it is not.
  *
  * Harness: the G6 session-budget pattern — the REAL proxy on an ephemeral port,
  * custom endpoints registered through the proxy's own entry point (no config
@@ -17,10 +17,13 @@
  * Mutation table — every row was RUN against this file (throwaway copy), not
  * reasoned about:
  *  - serve the nominal on every attempt (drop the `serveModel` swap) ⇒ W1, W4,
- *    W5 and W6 red (the substitute never serves: 402 surfaces, s0 uncalled);
- *  - drop the `isQuotaExhaustion` gate (treat every !ok as a wall) ⇒ W3 red
- *    (a 500 arms the role and serves s0);
- *  - drop the #409 last-step relabel ⇒ W4 and W5 red (the raw 402 surfaces);
+ *    W5, W6 and W7 red (the substitute never serves: 402/500 surface);
+ *  - drop the `isQuotaExhaustion` gate (treat every !ok as a wall) ⇒ W3 and W7
+ *    red (a delegated 500 arms instead of walking the target's path);
+ *  - drop the #409 last-step relabel ⇒ W4 red (the raw 402 surfaces; W5 no
+ *    longer depends on it — its delegated wall walks to s0 before that block);
+ *  - drop the #609 walk on the QUOTA path ⇒ **W5 red**, others green;
+ *  - drop the #609 walk on the NON-quota path ⇒ **W7 red**, others green;
  *  - drop the whole `/v1/messages` cascade call (serve handler.handle
  *    directly) ⇒ W1/W2 stay green for the wrong reason only if the env is also
  *    dropped — W1 is the discriminator (402 vs 200);
@@ -31,11 +34,14 @@
  *  - skip the owner-side `onNominalRefusal` in the delegated quota path ⇒ W5
  *    red (the direct sonnet request re-pays the walled nominal: calls.nm=2).
  *
- * MEASURED SHAPE (two pins state what the module DOES, not what main does):
- * W4's second request re-probes the last step on purpose (`resolveSkippingFailed`
- * last-step fallback) and W5's delegated wall surfaces in-request because the
- * #609 walk is not ported. Both were read off a failing run before being pinned
- * — an assertion written from main's test file would have been red forever.
+ * MEASURED SHAPE (W4 states what the module DOES, not what main does):
+ * W4's second request re-probes the last step on purpose — `resolveSkippingFailed`
+ * ends with a documented last-step fallback ("a PAYG target should not wall, and
+ * its real error beats a synthetic one"). Read off a failing run before being
+ * pinned: an assertion copied from main's test file would have been red forever.
+ * W5/W7 used to state the OPPOSITE (a delegated failure surfaced); #609 replaced
+ * that shape and the expectations were flipped in the same commit, so the file
+ * never carries a claim its wiring does not implement.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -356,17 +362,20 @@ describe("G8 — the first cascade wiring, through the real /v1/messages route",
     });
 
     // Request 1: opus is config-armed, so attempt 0 IS the delegation, and it
-    // resolves sonnet's healthy nominal (nm) — which walls. The owner-side
-    // bookkeeping (onNominalRefusal on the TARGET's bucket) is what this pin
-    // exists for. The in-request advance to s0 afterwards is #609's walk, named
-    // in the wiring gap list and NOT ported: here the delegated step is marked
-    // and the wall surfaces (the opus step is its own last step, and a native
-    // nominal is exempt from the #409 relabel by design). Measured, so the pin
-    // states the wall rather than a substitute main would have served.
+    // resolves sonnet's healthy nominal (nm) — which walls. Two things are
+    // pinned here: the owner-side bookkeeping (onNominalRefusal on the TARGET's
+    // bucket) and #609's in-request walk — the delegated wall is followed by the
+    // TARGET's next concrete (s0) inside the same request, because a `role:`
+    // step stands for the target's whole chain.
+    //
+    // This pin USED TO assert the opposite (402, s0 uncalled): before #609 was
+    // wired, the delegated step was marked and the wall surfaced. The expectation
+    // was flipped with the wiring, in the same commit, because the old shape is
+    // exactly the defect #609 exists to remove.
     const r1 = await postMessage("claude-opus-5");
-    expect(r1.status).toBe(402);
+    expect(r1.status).toBe(200); // the target's next concrete served in-request
     expect(calls.nm).toBe(1); // the delegated target paid exactly once
-    expect(calls.s0).toBe(0); // no in-request walk past the delegated step (#609)
+    expect(calls.s0).toBe(1); // #609: the walk followed the target's path
 
     // THE PIN: the DELEGATED refusal armed the target's bucket. Without the
     // owner-side call, sonnet's nominal bucket is never walled by delegated
@@ -374,10 +383,32 @@ describe("G8 — the first cascade wiring, through the real /v1/messages route",
     expect(isBucketWalled(bucketOfNominal())).toBe(true);
 
     // Request 2 (DIRECT sonnet): diverts under the wall the delegation armed —
-    // lands on s0, never re-pays nm.
+    // lands on s0 again, never re-pays nm.
     const r2 = await postMessage("claude-sonnet-5");
     expect(r2.status).toBe(200);
     expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(2);
+  }, 30_000);
+
+  test("W7: #609 on the NON-quota path — a delegating LAST step whose concrete fails still walks the target's path before surfacing", async () => {
+    await spin();
+    armCascade({
+      CLAUDISH_FAILOVER_OPUS: "role:sonnet",
+      CLAUDISH_FAILOVER_ACTIVE: "opus",
+    });
+    // The delegated concrete answers a plain 500 — NOT a wall, so nothing is
+    // marked or armed; the only memory of the failure is this request's
+    // exclusion set. opus's step 0 is its own LAST step, so the old behaviour
+    // surfaced the 500 (no intermediate step to advance to).
+    wallEndpoints = new Set();
+    errorEndpoints = new Set(["nm"]);
+
+    const r1 = await postMessage("claude-opus-5");
+    expect(r1.status).toBe(200); // the target's remaining path served instead
+    expect(calls.nm).toBe(1);
     expect(calls.s0).toBe(1);
+    // No fleet state written on this path: a non-quota failure of a last step
+    // marks nothing (nothing beneath it to protect).
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
   }, 30_000);
 });
