@@ -82,8 +82,18 @@ no reasoning received 135 chars of it, blocking 6 sk-agent agents on web2.
   never worth failing a turn over.
 - The Anthropic wire is untouched — there the block *is* the native form.
 
-Pins: `composed-handler-thinking-off.test.ts` (6 cases: the mapping, sibling preservation,
-adapter-ownership, no-ask/enabled no-op, strict-schema skip, anthropic wire). `#667`'s AC4 pin was
+Pins: `composed-handler-thinking-off.test.ts` (8 cases: the mapping, sibling preservation, the
+three ownership owners — top-level switch, binary `thinking`, operator-pinned
+`chat_template_kwargs` — no-ask/enabled no-op, strict-schema skip, anthropic wire). Each
+ownership disjunct has its own pin **and its own red under mutation**: removing
+`payload.thinking !== undefined` turns AC3b red — and that disjunct is what excludes the two
+reachable non-vLLM OpenAI-wire targets, **DeepSeek** (its dialect writes
+`request.thinking={type:"disabled"}` for a client off-switch, `deepseek-model-dialect.ts`) and
+**OpenRouter** (its format passes `claudeRequest.thinking` through verbatim), including every
+DeepSeek PAYG substitution the cascade's last step makes. An operator-pinned
+`chat_template_kwargs.enable_thinking` wins over a contradicting client ask — the #667 "what the
+operator armed is not clobbered downstream" doctrine; note a `false`-valued fixture cannot pin
+this (the rewrite is idempotent) — the pin carries `true` on purpose. `#667`'s AC4 pin was
 narrowed to what it actually asks — no `reasoning_effort` on a disabled block — since the object
 itself may now legitimately carry `enable_thinking`.
 

@@ -55,6 +55,52 @@ class EncodesItsOwnSwitch extends BaseAPIFormat {
   }
 }
 
+/**
+ * The binary-`thinking` owner. NOT hypothetical: DeepSeek's dialect writes
+ * `request.thinking = {type:"disabled"}` for a client off-switch
+ * (deepseek-model-dialect.ts — the 2026-10-22 hub condensation incident) and
+ * OpenRouter's format passes `claudeRequest.thinking` through verbatim. The
+ * `payload.thinking !== undefined` disjunct is what keeps THIS seam off both —
+ * delete it and every DeepSeek PAYG substitution (the cascade's last step)
+ * grows a `chat_template_kwargs` it never read about.
+ */
+class EncodesBinaryThinking extends BaseAPIFormat {
+  override prepareRequest(request: any): any {
+    request.thinking = { type: "disabled" };
+    return request;
+  }
+  processTextContent(textContent: string): any {
+    return { cleanedText: textContent, extractedToolCalls: [], wasTransformed: false };
+  }
+  shouldHandle(): boolean {
+    return true;
+  }
+  getName(): string {
+    return "EncodesBinaryThinking";
+  }
+}
+
+/** The operator-extra-payload owner: `chat_template_kwargs` set outside the code. */
+class EncodesTemplateKwargs extends BaseAPIFormat {
+  override prepareRequest(request: any): any {
+    // `true` ON PURPOSE: the disjunct's job is to keep an operator-pinned
+    // switch even when it CONTRADICTS the client. A `false` fixture makes the
+    // pin idempotent — `{...prior, enable_thinking:false}` rewrites the same
+    // content and the mutation survives its own deletion (measured).
+    request.chat_template_kwargs = { enable_thinking: true };
+    return request;
+  }
+  processTextContent(textContent: string): any {
+    return { cleanedText: textContent, extractedToolCalls: [], wasTransformed: false };
+  }
+  shouldHandle(): boolean {
+    return true;
+  }
+  getName(): string {
+    return "EncodesTemplateKwargs";
+  }
+}
+
 function openaiUpstream(): Response {
   const chunk = (delta: unknown, finish: string | null) =>
     `data: ${JSON.stringify({
@@ -143,6 +189,25 @@ describe("ComposedHandler — #783 client thinking OFF on the openai wire", () =
     const wire = await run(req({ type: "disabled" }), { adapter: new EncodesItsOwnSwitch(MODEL) });
     expect(wire.enable_thinking).toBe(false);
     expect(wire.chat_template_kwargs).toBeUndefined();
+  });
+
+  test("AC3b: the binary-`thinking` owner (DeepSeek dialect, OpenRouter passthrough) is excluded", async () => {
+    const wire = await run(req({ type: "disabled" }), {
+      adapter: new EncodesBinaryThinking(MODEL),
+    });
+    expect(wire.thinking).toEqual({ type: "disabled" });
+    expect(wire.chat_template_kwargs).toBeUndefined();
+    expect(wire.enable_thinking).toBeUndefined();
+  });
+
+  test("AC3c: an operator-pinned chat_template_kwargs wins over the client's ask", async () => {
+    const wire = await run(req({ type: "disabled" }), {
+      adapter: new EncodesTemplateKwargs(MODEL),
+    });
+    // The operator armed `true` (the #667 "last writer" doctrine: what the
+    // operator armed is not clobbered downstream); the client asked off. The
+    // seam leaves the wire alone — no second spelling, no overwrite.
+    expect(wire.chat_template_kwargs).toEqual({ enable_thinking: true });
   });
 
   test("AC4: no ask, or an enabled ask, writes nothing", async () => {
