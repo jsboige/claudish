@@ -364,6 +364,56 @@ even `/health` degraded to 400), recovery **05:36:15Z+**. The separate
 04:52:55–04:53:28Z burst (18× 502) is the hub-seat watchdog's proactive
 restart, not the outage.
 
+## 2026-11-01 — two missed heartbeats, neither corroborated hub-side
+
+ai-01's sidecar went AUTONOMOUS twice outside any announced window —
+02:53:21→02:54:41Z (80 s) and 10:57:21→10:58:28Z (67 s, one request served
+locally) — with no hub restart (uptime continuous, `ffc2b819`). The hub
+journal read over both instants **discards a hub-side stall for both**, and
+with it the first reading of "the hub missed heartbeats":
+
+- **Episode 1 (02:53Z) is observer-side.** Hub log density shows no dip
+  (156→231 lines/min through the window), GLM ttfts sit at 1.2–6.0 s, and
+  requests from po-2023/24/27/28 were accepted continuously — but **not one
+  `machine=myia-ai-01` request** lands from 02:52:30 until 02:54:37.78, three
+  seconds before the sidecar recovered. The hub served everyone else while the
+  observing machine's own traffic was absent; the window overlaps the tail of
+  ai-01's `Backup-Ubuntu-WSL`.
+- **Episode 2 (10:57Z) has the hub demonstrably serving.** `[Request]` lines
+  land at 10:57:40/48/52/56 — four of them from ai-01's own host (three
+  Hermes + one sdk-cli), in the middle of the window in which its sidecar's
+  heartbeats were failing. Host→hub worked while container→hub did not. The
+  hub was under real pressure (9 active streams, deepseek-flash headers
+  4.7–51.9 s, swift streams closing at 120 s and 369 s) — but the highest
+  `eventLoopBlockedMs5m` anyone read is **859.6 ms** (12:07Z), and a 60+ s
+  loop block leaves fingerprints (a log-density gap, a ttft explosion) that
+  neither window shows. The sidecar's relayed `[ttft]` of 4.6–10.2 s at midday
+  are real upstream waits passed through — hub-side avg 8.1 s headers over
+  n=392 (12:00–12:15Z), the sonnet role on DeepSeek PAYG after GLM re-walled
+  at 10:31:59 — not queueing at the hub. And the hub's own `[EventLoop]
+  lag=` threshold marker fired **exactly once all day — 267 ms at 06:13:24Z,
+  between the two episodes** — and not once inside either window: the loop
+  never crossed the marker's floor while a heartbeat was being missed.
+
+Reading rule: **a missed heartbeat is an observer event until the hub journal
+corroborates it.** Before calling a heartbeat miss a hub outage, read (1)
+per-minute log density over the window, (2) whether `[Request]` lines —
+including from the observing machine's host — kept landing, (3) upstream
+ttfts and the loop gauges. Two consecutive `/health` failures → AUTONOMOUS is
+the designed hysteresis doing its job; episode 2's total cost was one request
+served locally.
+
+The instrument gap that keeps the residual question open: **`/health`
+arrivals are not logged hub-side** — a case-insensitive grep for "health"
+over 214 640 log lines returns 24 hits, all prompt text. "Heartbeat never
+arrived" (container NAT, path) therefore cannot be distinguished from
+"answered slowly" (loop pressure) from the hub journal alone; the
+discriminator is a heartbeat-arrival marker hub-side, or the sidecar's own
+failure shape (connect timeout vs slow response). Until one exists, #587's
+thesis — event-loop blocking under load driving NOMINAL→AUTONOMOUS
+transitions — is **refuted for these two transitions** (loop sub-second, hub
+serving) while the midday upstream pressure itself is real and measured.
+
 ## Compose environment surface
 
 `docker-compose.yml` carries a default for every relay variable, so the hub runs with **no `.env` at
