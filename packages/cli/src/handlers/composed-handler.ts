@@ -875,6 +875,49 @@ export class ComposedHandler implements ModelHandler {
         // (medium) keeps applying.
       }
     }
+
+    // 5a-bis. #783 — the client's thinking OFF reaches the endpoint's own
+    // switch. The OpenAI ingress already maps a vLLM-style ask
+    // (`chat_template_kwargs.enable_thinking` or top-level `enable_thinking`)
+    // onto the house `thinking:{type:"disabled"}` block (#435), but the
+    // outbound side had no writer for vLLM's form: a model served by an
+    // endpoint with NO dialect (`swift-1.5-27b` on vllm-myia — its id matches
+    // no family) drops the block silently, the engine falls back to its
+    // template default (thinking ON), and a client that asked for no
+    // reasoning gets its reasoning anyway (web2: 135 chars, 6 sk-agent agents
+    // blocked).
+    //
+    // Written LAST on purpose, like the effort seam above, so nothing
+    // downstream can clobber it. The predicate is "the ask would otherwise be
+    // LOST", not "the client asked": a dialect that already encoded the
+    // off-switch in the form ITS endpoint reads — top-level
+    // `enable_thinking` (Qwen/DashScope, qwen-model-dialect), the binary
+    // `thinking` object (GLM, MiniMax), or an operator-supplied
+    // `chat_template_kwargs.enable_thinking` via the endpoint's extra payload
+    // fields — keeps full ownership and is left untouched. Adding a second
+    // spelling next to a working one is how a wire acquires contradictions
+    // (the 2026-08-19 `reasoning_effort` + `thinking_budget` 400).
+    //
+    // Strict-schema backends (`omitReasoningContent`, the Mistral 422
+    // `extra_forbidden` family) are skipped: they reject unknown top-level
+    // fields, and a client's reasoning preference is never worth failing a
+    // turn over.
+    if (this.resolveStreamFormat() === "openai-sse" && !this.options.omitReasoningContent) {
+      if ((claudeRequest as any)?.thinking?.type === "disabled") {
+        const payload = requestPayload as any;
+        const alreadyEncoded =
+          typeof payload.enable_thinking === "boolean" ||
+          payload.thinking !== undefined ||
+          typeof payload.chat_template_kwargs?.enable_thinking === "boolean";
+        if (!alreadyEncoded) {
+          const prior = payload.chat_template_kwargs ?? {};
+          payload.chat_template_kwargs = { ...prior, enable_thinking: false };
+          log(
+            `[Thinking] client asked thinking off -> chat_template_kwargs.enable_thinking=false (${this.provider.displayName})`
+          );
+        }
+      }
+    }
     const toolNameMap = adapter.getToolNameMap();
 
     // 5b. Refresh auth / health check (must happen before transformPayload, which may use auth state)

@@ -162,7 +162,13 @@ describe("ComposedHandler — #667 effort mapping onto chat_template_kwargs.reas
     const { wireBody } = await run(baseRequest(undefined, { type: "disabled" }), {
       effortTarget: "chat_template_kwargs.reasoning_effort",
     });
-    expect(wireBody.chat_template_kwargs).toBeUndefined();
+    // #667's ask is that the EFFORT mapping does not fire on a disabled block.
+    // Since #783 the disabled block is itself carried to vLLM as
+    // `chat_template_kwargs.enable_thinking=false` (the off-switch had no
+    // outbound writer — see composed-handler-thinking-off.test.ts), so the
+    // object may now exist: what must stay absent is the depth knob.
+    expect(wireBody.chat_template_kwargs?.reasoning_effort).toBeUndefined();
+    expect(wireBody.chat_template_kwargs?.enable_thinking).toBe(false);
   });
 
   test("AC5: an unrecognized effort value is dropped and the request is still served", async () => {
