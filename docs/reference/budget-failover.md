@@ -549,6 +549,51 @@ Marker shape (grep-family of the #431 SKIP line):
 and `[EndpointBudget] <ep> resubmit=k in flight (…) — estimate replaces its
 predecessor (#654 AC5)` for echoes.
 
+## Reading a wall from the hub when the provider console is frozen (2026-10-31)
+
+A provider's usage console can be **freshly written and stale at once**: on
+31/10 the reader ran at 18:06:38Z and 18:10:39Z, four minutes apart, and both
+printed *"Resets in 4 hr 21 min"*, with the DeepSeek balance identical to the
+cent. The file's mtime was current; its content was not. **A fresh mtime is not
+a live reading**, and no quota figure derives from it.
+
+When the console is out, the hub's own log is the measurement — three greps,
+one per question:
+
+```powershell
+# 1. refusals that NAME the wall, per provider per hour (a 429 alone is not a wall)
+docker logs claudish-proxy -t --since <iso> 2>&1 |
+  Select-String 'names a quota/plan wall'
+
+# 2. service actually rendered, per hour per concrete
+docker logs claudish-proxy -t --since <iso> 2>&1 |
+  Select-String '\[resp\] .* model=([A-Za-z0-9.\-]+) '
+
+# 3. arm/disarm transitions — a DISARM followed by a re-ARM minutes later
+#    is the wall still up, seen from the probe
+docker logs claudish-proxy -t --since <iso> 2>&1 |
+  Select-String 'ARMED bucket|DISARMED bucket|RECOVERED'
+```
+
+Reading rules that change the verdict:
+
+- **A wall marker count of 1–3/h is the probe rate, not traffic.** After a wall
+  lands the cascade re-probes its nominal on the TTL; those lines are the probe
+  speaking, and they never enter a demand estimate.
+- **The number to quote is zero**: zero `[resp]` lines for the walled concrete
+  between two of its arms. That is the wall's floor, measured, with no console.
+- **`[resp] model=` is the resolved concrete on the hub** (the client's
+  requested id on a NOMINAL sidecar — see `traffic-analysis.md`), so the two
+  ends of a wall are read on one machine without touching a provider.
+- A recreate **wipes the in-process wall, bench and dwell state**: after one,
+  expect a re-probe burst and fresh re-walls within minutes. That is not a
+  regression, and it is not a recovery either until a nominal actually serves.
+
+Measured shape on 31/10 (illustration, never a benchmark): the MiniMax wall
+landed 13:30:44Z — 321 responses served in h13Z, then **zero** through h19Z
+while haiku traffic kept flowing; GLM re-walled 19:13Z and the sonnet role was
+served by DeepSeek Flash PAYG (1 734 responses h18Z, 1 141 h19Z).
+
 ## The estimator: bytes / 3.5
 
 `JSON.stringify(body).length / 3.5` — deliberately NOT the `/4`
