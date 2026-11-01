@@ -201,6 +201,32 @@ window:
   nothing upstream, so no client request can refute the verdict (the asymmetry pinned above);
   corroborate hub-side (watchdog probes, capture gaps) before reading a flap window as hub time.
 
+### The entry probe's mode-dependent verdicts (§Verdicts, `hub-entry-probe.py`)
+
+Three of the probe's verdicts turn on this seat's relay mode, and **only a live `/health` may
+supply it** (`role=relay-nominal|relay-autonomous`, trap T9). The last `→ NOMINAL` / `→ AUTONOMOUS`
+line in the container log is a fallback that can be hours stale: a stale `NOMINAL` would render
+`PROBE-BLIND` — exit 2, *do not escalate* — on exactly the hang the probe exists to catch (a
+sidecar can freeze on the same event-loop mechanism as the hub, stop writing transitions, and leave
+the log's last word `NOMINAL`); a stale `AUTONOMOUS` conjures a false `ENTRY-UNRESPONSIVE`. With no
+live role those shapes degrade to `UNKNOWN` — absence of a signal is not a signal. Pinned: two
+timeouts + log-only `NOMINAL` → `UNKNOWN`, not `PROBE-BLIND`.
+
+- **`ENTRY-UNRESPONSIVE`** — both layers fail to answer **before the timeout** *and* the seat's
+  relay is live-AUTONOMOUS: a hang measured at two independent layers, corroborated by a live
+  relay. Measured live 30/10 15:21Z: TCP accepted on the published port, no HTTP answer in 15 s.
+- **`PROBE-BLIND`** — the same two timeouts but a live-NOMINAL seat: the hub answers the relay's
+  heartbeats, so the probe's own path is blind, not the entry. Exit 2.
+- **`FACADE-UNRESPONSIVE`** — L1 alive while the façade produced **no status at all**: timeout,
+  refusal, DNS or TLS error (trap T10). A REFUSED façade *did* answer (RST) — that is why the
+  verdict reads "no status", not "no answer": the pre-#779 reason string ("never answered before
+  the timeout") was wrong for a refusal, and the same branch returned `NOMINAL` for refused / DNS /
+  TLS — a façade serving nothing read as healthy.
+
+Exit codes: `0` NOMINAL · `1` degraded (ENTRY-DOWN, ENTRY-UNRESPONSIVE, PATH-BROKEN,
+FACADE-502-ONLY, FACADE-UNRESPONSIVE, SEAT-DETACHED) · `2` inconclusive (`UNKNOWN`,
+`PROBE-BLIND`) or usage error.
+
 ## Tests
 
 `relay.test.ts` (16 — hysteresis, header build incl. ai-01 Opus passthrough, gzip, never-hang delegation). Budget-free resilience E2E: `bun run packages/cli/src/fork/server/relay-e2e.ts` (real prober + mock hub: NOMINAL → FAILOVER → RECOVERY over real HTTP, ~2-3 min).
