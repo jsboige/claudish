@@ -414,6 +414,76 @@ thesis — event-loop blocking under load driving NOMINAL→AUTONOMOUS
 transitions — is **refuted for these two transitions** (loop sub-second, hub
 serving) while the midday upstream pressure itself is real and measured.
 
+### A third transition, and it sits exactly at the recovery floor
+
+po-2023's relay (same hub, different machine and path) tripped a third time
+at **16:35:12.54Z → 16:36:21.90Z** — **69 s**, against **69 s** for its own
+10:57:13.90Z → 10:58:23.09Z episode. Two different transitions, same duration
+to the tenth of a second is not a coincidence of outages: **the number
+measures the recovery protocol, not the outage.** Recovery needs 3 OK
+heartbeats + a 60 s cooldown + a deep tool-call probe, so any condition that
+clears inside that window reports the floor — reading "69 s" as "69 s of
+downtime" over-states every episode.
+
+The reading rule above holds on this seat too, and it has one datum the
+ai-01 episodes lack: the **same pipe carried real traffic healthy 10 minutes
+before and 4 minutes after** (canari `[ttft]` 283 ms at 16:25:06, 272 ms at
+16:40:09). The heartbeat failed inside a window whose path was demonstrably
+working on either side. Combined with the hub journal finding — `[Request]`
+lines from the observing host landing DURING the 10:57 window, `/health`
+arrivals not logged at all — the shape that survives every measurement is:
+**the heartbeat probe is its own client, and it can fail while the data path
+is fine.** That is a probe-design property (#587's mechanism remains
+unrefuted as a *cause class*, but it is not demonstrated by these
+transitions), and it does not call for a hub restart, a config-arm, or an
+investigation thread of its own.
+
+## The `:18182` pipe's launcher — logon-only, and the guard that replaces it (Q65)
+
+The façade's forwarder (`D:\Production\claudish-relay-po2025\relay.js`, a raw TCP
+pipe `:18182 → hub .50:3000`, born of the docker-bridge ARP limitation) was started
+**only by an `HKCU\…\Run` value** — at LOGON, in an interactive session, with no
+service, no scheduled task, no watchdog. Measured consequence (27/10): a reboot
+without an opened session leaves the fleet-facing entry **dead with no automatic
+recovery**, and po-2027/web1/web2 have no other path to the hub.
+
+User arbitration 2026-11-01 (Q65, option b): convert it to a **startup task with a
+guard**. The organ is `scripts/install-relay-autostart.ps1` (registers) +
+`scripts/relay-guard.ps1` (what the task runs), pinned by
+`scripts/tests/relay-autostart.Tests.ps1`.
+
+- **Trigger 1 at startup** — fires before any logon, which is the hole being closed.
+- **Trigger 2, once + repetition every 10 min** — the guard. It probes the port and
+  starts the pipe ONLY when nothing listens: **it never kills or restarts a live
+  pipe** (hub liveness behind the pipe is the relay container's hysteresis, not the
+  guard's), so it coexists with the legacy `HKCU` launcher — whichever starts first
+  wins, the other is a no-op.
+- **It does not delete the `HKCU` value.** That removal is a separate, reversible
+  step to be taken only after the guard has proven it restarts a dead pipe.
+- The guard logs one UTC line per **action** (not per tick, or a 10-minute cadence
+  would bury the signal), never on the happy path.
+
+**Three Windows PowerShell 5.1 findings, each measured while building it** (the
+interpreter scheduled tasks actually use — not pwsh 7):
+
+| Finding | Shape |
+|---|---|
+| `$PSScriptRoot` is **empty inside a `param()` default** under `-File` | `Join-Path $PSScriptRoot …` threw `ParameterArgumentValidationError` before any side effect; resolve it at body scope |
+| `-RepetitionDuration ([TimeSpan]::MaxValue)` is **rejected** | serialises to `Duration P99999999DT23H59M59S` → `0x80041318`, "incorrectly formatted or out of bounds". An **empty** Duration is the "repeat indefinitely" shape |
+| A `-Daily` trigger cannot take `-RepetitionInterval` + `-RepetitionDuration` | parameter set does not resolve; use `-Once -At <now+1m> -RepetitionInterval <n>` |
+
+**The discovery worth keeping: XML validation happens BEFORE the privilege check.**
+A non-elevated `Register-ScheduledTask` therefore validates the task XML — which is
+what makes the UAC discipline's "run the whole chain non-elevated first" a real
+validator rather than a formality. The `TimeSpan.MaxValue` defect above was caught
+by exactly that run (an object-graph dry-run had passed it), and the final
+non-elevated shape failed on `Accès refusé` / `0x80070005` **and nothing else** —
+the only acceptable failure.
+
+State at 2026-11-01 21:0xZ: installer committed and dry-run/non-elevated-verified;
+**registration awaits its single elevation window**. Until it is registered the
+`HKCU` value remains the only launcher and the reboot hole stays open.
+
 ## Compose environment surface
 
 `docker-compose.yml` carries a default for every relay variable, so the hub runs with **no `.env` at
