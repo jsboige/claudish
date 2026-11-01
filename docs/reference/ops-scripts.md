@@ -226,3 +226,30 @@ GitHub-side instrument (REST only — GraphQL is chronically exhausted on jsboig
 **What the columns count**: `merged` = PRs with `merged_at` in the month; `formal rev/PR` = any formal-state review per PR (author's own excluded everywhere); `CR rounds/PR` = CHANGES_REQUESTED events per PR — a CHANGES_REQUESTED dismissed then re-requested by the same reviewer counts twice (that IS a second round on the wire); `PRs >= 1 CR` = share of merges that went through at least one CR; `no review` = merged with zero formal reviews; `1st-rev->merge h` = latency from first formal review to merge (a first review submitted AFTER the merge counts as a review but is excluded from the age — post-merge tidy-up); `trunc` > 0 means a PR returned exactly 100 reviews (review storm) or the listing pager clipped — raise the caps before quoting the month.
 
 **Reading rules**: month buckets key on `merged_at` (UTC) — a PR reviewed in September but merged 01/10 00:30Z is an October PR. The "non-discriminating pin" share of axis B stays MANUAL labeling (pins live in review bodies, which this script does not read) — do not automate it by keyword, that was B3's original sin. Baseline on this repo (run 2026-10-18): Sep 142 merged / 0.00 CR/PR / 141 no-review; Oct 176 merged / 0.13 CR/PR / 20 PRs >= 1 CR / 115 no-review — the review process switched on mid-Oct; two-thirds of merges still land unreviewed.
+
+## The PowerShell suite on both interpreters (`test:scripts` · `test:scripts:win51`, #809)
+
+**Two suites, one test tree** (`scripts/tests/`): `bun run test:scripts` runs Pester under **pwsh 7**, `bun run test:scripts:win51` under **Windows PowerShell 5.1** — the interpreter the fleet's scheduled tasks actually invoke, so a green pwsh run says nothing about what ships. Run both; they do not agree, and where they disagree 5.1 is the one that matters.
+
+**`test:scripts:win51` carries `-ExecutionPolicy Bypass`, and that flag is the fix — not a version pin.** On a host where `Get-ExecutionPolicy -List` shows **every scope `Undefined`** (the effective policy is `Restricted`), `Import-Module Pester` refuses the module's format data and fails with `Échec de la vérification d'AuthorizationManager` on `Pester.Format.ps1xml`; `Invoke-Pester` is then `CommandNotFoundException` and the suite exits 1. `Bypass` on the invocation is **process-scoped**: nothing is written to the registry, no machine-wide security posture moves, no elevation is needed, and the flag is visible in the npm script for the next reader.
+
+**A version pin was tried first and is wrong** (measured on po-2027, 2026-11-01). Pinning `Import-Module Pester -RequiredVersion 5.7.1` did not clear the failure — the same AuthorizationManager refusal came back — because the version was never the variable. Under `-ExecutionPolicy Bypass`, **both** 6.2.0 and 5.7.1 load on **PS 5.1.26100.9711** (`LOADED 6.2.0`, `LOADED 5.7.1`). The earlier fleet claim that "Pester 6.2.0 is pwsh-only" is **withdrawn**: it was a misattribution of a policy failure, and pinning would have buried the real cause behind a version that appeared to work by accident of installation order. Do not pin a Pester version in `package.json`; if a pin ever becomes necessary, it belongs here with its own measurement.
+
+**Installing a Pester into the 5.1 tree by hand**, when a host genuinely lacks one: `Install-Module` is not usable there — under 5.1 the PowerShellGet `ShouldContinue` path throws `La référence d'objet n'est pas définie` in a non-interactive session. The working route is the nupkg:
+
+```powershell
+Invoke-WebRequest https://www.powershellgallery.com/api/v2/package/Pester/5.7.1 -OutFile "$env:TEMP\Pester.5.7.1.zip"
+Expand-Archive "$env:TEMP\Pester.5.7.1.zip" "$env:TEMP\pester571" -Force
+New-Item -ItemType Directory -Force "$env:USERPROFILE\Documents\WindowsPowerShell\Modules\Pester\5.7.1" | Out-Null
+Copy-Item "$env:TEMP\pester571\*" "$env:USERPROFILE\Documents\WindowsPowerShell\Modules\Pester\5.7.1" -Recurse -Force
+```
+
+⚠ **The destination is load-bearing**: 5.1 reads `Documents\WindowsPowerShell\Modules`, pwsh reads `Documents\PowerShell\Modules`. A module installed from a pwsh prompt lands in the second tree and stays invisible to 5.1 — the symptom is `Get-Module -ListAvailable Pester` not listing it at all.
+
+**Diagnosing a red `test:scripts:win51` in this order** — the first two steps separate the three causes that look identical from the outside (policy, missing module, broken test):
+
+1. `powershell -NoProfile -Command "Get-ExecutionPolicy -List"` — all `Undefined` means the invocation needs `-ExecutionPolicy Bypass`.
+2. `powershell -NoProfile -Command "Get-Module -ListAvailable Pester | Select Version"` — empty means an install problem, not a test problem.
+3. Only then read the Pester failure output: `CommandNotFoundException` on `Invoke-Pester` is a load failure (1 or 2); assertion failures are the tests.
+
+A `2>&1 > file` redirect is not a capture — it sends stderr to the console and leaves the file holding stdout only. Write `> file 2>&1`.
