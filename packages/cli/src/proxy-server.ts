@@ -19,8 +19,8 @@ import {
 // fleet that never opts in.
 import {
   ARM_TTL_MAX_MS,
-  NATIVE_BUCKET,
   type FailoverStep,
+  NATIVE_BUCKET,
   classifyNominalBucket,
   earliestWalledReprobeAt,
   extractSessionKey,
@@ -1102,7 +1102,10 @@ export async function createProxyServer(
     const slot = options.slotMap?.get(requestedModel);
     if (slot) {
       return {
-        target: slot.provider != null && slot.provider !== "" ? `${slot.provider}@${slot.model}` : slot.model,
+        target:
+          slot.provider != null && slot.provider !== ""
+            ? `${slot.provider}@${slot.model}`
+            : slot.model,
         mapped: true,
       };
     }
@@ -1195,12 +1198,14 @@ export async function createProxyServer(
       // #274: when this attempt serves a role-step's DELEGATION, the bookkeeping
       // must reach the OWNING side (target's bucket for its nominal, target's
       // step otherwise) — derived from the RESOLUTION itself.
-      const delegation = role && resolved.step?.roleRef ? resolveDelegationOwner(role, resolved.step) : null;
+      const delegation =
+        role && resolved.step?.roleRef ? resolveDelegationOwner(role, resolved.step) : null;
       // The step's target is already concrete — serve it verbatim (the v14
       // getHandlerForRequest is single-arg; the swap happens HERE, at the loop,
       // not inside resolution). The nominal goes through the request-side
       // mapping exactly as before the wiring.
-      const serveModel = stepIndex >= 0 && resolved.step?.target ? resolved.step.target : requestedModel;
+      const serveModel =
+        stepIndex >= 0 && resolved.step?.target ? resolved.step.target : requestedModel;
       const handler = withAdvisor(
         withRequestHooks(await getHandlerForRequest(serveModel)),
         advisorPresence
@@ -1220,13 +1225,17 @@ export async function createProxyServer(
         if (role) {
           // #431 CR B1: name the step that actually served, for the notices.
           recordServedStepForNotices(c, role, resolved.step ?? undefined, stepIndex);
-          if (stepIndex === -1) onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
+          if (stepIndex === -1)
+            onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
           else resetStepSuccess(role, stepIndex);
           // #274: the concrete model succeeded — clear the OWNING side too, in
           // the owner's vocabulary, never the delegating role's own bucket.
           if (delegation) {
             if (delegation.owner.nominal) {
-              onNominalSuccess(delegation.owner.role, concreteStepBucketOfSync(delegation.concrete));
+              onNominalSuccess(
+                delegation.owner.role,
+                concreteStepBucketOfSync(delegation.concrete)
+              );
             } else {
               resetStepSuccess(delegation.owner.role, delegation.owner.stepIndex);
             }
@@ -1259,7 +1268,8 @@ export async function createProxyServer(
         // request re-pays the round-trip to a step that may be down for hours).
         // The nonQuota flag (#276) forfeits a dwell pin instead of re-pinning
         // deeper. #331: the mark carries the CONCRETE this attempt served.
-        const isIntermediateStep = stepIndex >= 0 && rule != null && stepIndex < rule.steps.length - 1;
+        const isIntermediateStep =
+          stepIndex >= 0 && rule != null && stepIndex < rule.steps.length - 1;
         if (!isIntermediateStep) return response;
         const why = `HTTP ${response.status} (non-quota) from step ${stepIndex}`;
         log(`[Failover] STEP-ADVANCE ${role} — ${why}; trying next step`, true);
@@ -1269,10 +1279,16 @@ export async function createProxyServer(
           concrete: attemptConcrete,
         });
         if (delegation && !delegation.owner.nominal) {
-          markStepFailed(delegation.owner.role, delegation.owner.stepIndex, why, parseResetAtFromBody(errBody), {
-            nonQuota: true,
-            concrete: delegation.concrete,
-          });
+          markStepFailed(
+            delegation.owner.role,
+            delegation.owner.stepIndex,
+            why,
+            parseResetAtFromBody(errBody),
+            {
+              nonQuota: true,
+              concrete: delegation.concrete,
+            }
+          );
         }
         continue;
       }
@@ -1281,7 +1297,13 @@ export async function createProxyServer(
         // "armed" also covers the concurrent-request race where another request
         // armed the role between this one's resolution and its refusal: the
         // retry below re-resolves and serves from the cascade.
-        const verdict = onNominalRefusal(role, reason, response.headers.get("retry-after"), errBody, bucket);
+        const verdict = onNominalRefusal(
+          role,
+          reason,
+          response.headers.get("retry-after"),
+          errBody,
+          bucket
+        );
         if (verdict.outcome === "burst") {
           // A short retry-after names a burst: surface it, the client ladder
           // absorbs it, the role never exiles for a 10-min TTL off a blip.
@@ -1313,9 +1335,15 @@ export async function createProxyServer(
               concreteStepBucketOfSync(delegation.concrete)
             );
           } else {
-            markStepFailed(delegation.owner.role, delegation.owner.stepIndex, reason, parseResetAtFromBody(errBody), {
-              concrete: delegation.concrete,
-            });
+            markStepFailed(
+              delegation.owner.role,
+              delegation.owner.stepIndex,
+              reason,
+              parseResetAtFromBody(errBody),
+              {
+                concrete: delegation.concrete,
+              }
+            );
           }
         }
         if (rule && stepIndex === rule.steps.length - 1) {
@@ -1342,7 +1370,10 @@ export async function createProxyServer(
             if (horizon) {
               const seconds = Math.max(1, Math.ceil((horizon.getTime() - Date.now()) / 1000));
               capped = seconds > ARM_TTL_MAX_MS / 1000;
-              headers.set("retry-after", String(Math.min(Math.ceil(ARM_TTL_MAX_MS / 1000), seconds)));
+              headers.set(
+                "retry-after",
+                String(Math.min(Math.ceil(ARM_TTL_MAX_MS / 1000), seconds))
+              );
             }
             log(
               `[Failover] WALL-SURFACE ${role} — HTTP ${response.status} from ${lastConcrete} rewritten to 429 rate_limit_error` +

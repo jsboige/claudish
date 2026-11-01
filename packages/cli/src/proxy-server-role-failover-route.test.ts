@@ -16,14 +16,18 @@
  *
  * Mutation table — every row was RUN against this file (throwaway copy), not
  * reasoned about:
- *  - serve the nominal on every attempt (drop the `serveModel` swap) ⇒ W1 red
- *    (402 surfaces, s0 never called) and W5 red;
+ *  - serve the nominal on every attempt (drop the `serveModel` swap) ⇒ W1, W4,
+ *    W5 and W6 red (the substitute never serves: 402 surfaces, s0 uncalled);
  *  - drop the `isQuotaExhaustion` gate (treat every !ok as a wall) ⇒ W3 red
  *    (a 500 arms the role and serves s0);
+ *  - drop the #409 last-step relabel ⇒ W4 and W5 red (the raw 402 surfaces);
  *  - drop the whole `/v1/messages` cascade call (serve handler.handle
  *    directly) ⇒ W1/W2 stay green for the wrong reason only if the env is also
  *    dropped — W1 is the discriminator (402 vs 200);
- *  - remove `initFailover()` ⇒ every armed pin red (no rule ever loads);
+ *  - remove `initFailover()` ⇒ **W6 only** — and that is a measured correction,
+ *    not a typo: the first run of this table left ALL GREEN, because
+ *    `armCascade()` goes through `resetFailoverForTests(env)`, which calls
+ *    `initFailover(env)` itself. The startup init is covered by W6 alone;
  *  - skip the owner-side `onNominalRefusal` in the delegated quota path ⇒ W5
  *    red (the direct sonnet request re-pays the walled nominal: calls.nm=2).
  *
@@ -131,7 +135,8 @@ function quotaWall(): Response {
 const SONNET_NOMINAL = "nom-ep@fake-nom";
 const bucketOfNominal = () => {
   const nb = classifyNominalBucket(SONNET_NOMINAL, () => false);
-  if (!("bucket" in nb)) throw new Error("route test: custom-endpoint nominal must classify to a bucket");
+  if (!("bucket" in nb))
+    throw new Error("route test: custom-endpoint nominal must classify to a bucket");
   return nb.bucket;
 };
 
@@ -198,7 +203,7 @@ beforeEach(() => {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
-  globalThis.fetch = (async (input: any, init: any) => {
+  globalThis.fetch = (async (input: any, _init: any) => {
     const url = typeof input === "string" ? input : String(input?.url ?? "");
     if (!url.startsWith("http://fake.invalid/")) {
       // Background warmers (pricing / catalog / recommended) and anything else.
@@ -324,6 +329,23 @@ describe("G8 — the first cascade wiring, through the real /v1/messages route",
     expect(calls.s0).toBe(1); // a benched intermediate step is never re-paid
     expect(calls.s1).toBe(2); // the PAYG tail is re-probed once per request
     expect((await r2.json())?.error?.type).toBe("rate_limit_error");
+  }, 30_000);
+
+  test("W6: the cascade is armed by the PROXY's own startup init — no test-side re-init", async () => {
+    // Kills a mutation that survived the first run of the table: dropping
+    // `initFailover()` from the proxy's startup left every other pin green,
+    // because `armCascade()` goes through `resetFailoverForTests(env)`, which
+    // calls `initFailover(env)` itself. The PRODUCTION path — env present at
+    // boot, module initialised once, nobody re-arming it — was pinned by
+    // nothing. Here the env is set BEFORE `spin()` and no test-side init runs.
+    Object.assign(process.env, CASCADE_ENV);
+    await spin();
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(1); // startup init loaded the rule and the arm happened
+    expect(isBucketWalled(bucketOfNominal())).toBe(true);
   }, 30_000);
 
   test("W5: a delegated wall (opus → role:sonnet → sonnet's nominal) arms the TARGET's bucket — a later DIRECT sonnet request never re-pays it (#274 owner side)", async () => {
