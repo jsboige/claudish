@@ -106,7 +106,7 @@ CONSOLES = [
         "id": "anthropic-payg",
         "name": "Anthropic Console — Billing / Usage",
         "url": "https://console.anthropic.com/settings/billing",
-        "role": "PAYG Anthropic (différent du forfait claude.ai : c'est le compteur de l'API native).",
+        "role": "PAYG Anthropic (différent du forfait claude.ai : c'est le compteur de l'API native). Le compte bénéficie de **200 $/mois de crédit PAYG** (user, 02/11) — le réservoir le moins utilisé de la flotte, et le candidat naturel pour y déplacer la condensation (Haiku).",
         "auth": "session console.anthropic.com (à authentifier)",
         "fields": ["credit balance", "usage 30d"],
         "todo": True,

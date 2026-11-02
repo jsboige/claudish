@@ -61,7 +61,7 @@ into a document.
 | `claude` | claude.ai/new#settings/usage | Anthropic plan weekly limit + reset | the interactive seats' own ceiling |
 | `chatgpt` | chatgpt.com/settings/usage?tab=overview | weekly limit shared by Codex/Work/agents | Codex capacity |
 | `copilot` | github.com/settings/copilot/features | monthly AI credits | rarely bound — a large idle reservoir |
-| `anthropic-payg` | console.anthropic.com/settings/billing | **PAYG API**, distinct from the claude.ai plan | *to authenticate* |
+| `anthropic-payg` | console.anthropic.com/settings/billing | **PAYG API**, distinct from the claude.ai plan; the account carries **200 $/month of credit** (user, 2026-11-02) | *to authenticate* — the least-used reservoir in the fleet, and the natural home for the dashboard condensation (Haiku) if vllm no longer wants it on swift |
 | `openai-payg` | platform.openai.com/usage | **PAYG API**, distinct from the chatgpt weekly plan | *to authenticate* |
 
 ⚠ Two pairs are easy to conflate: **claude.ai plan ≠ Anthropic PAYG**, and
