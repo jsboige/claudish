@@ -73,6 +73,14 @@ export interface RelayState {
    * matching. Published on /health as `selfLoop`.
    */
   selfLoop: boolean;
+  /**
+   * v27 — heartbeat FAILURE-EPISODE bookkeeping, log-only. `consecutiveFail`
+   * feeds the hysteresis (and is shared with in-band forward failures); this
+   * latch answers the other question, which the 2026-11-01 episodes left open:
+   * *what* failed and *how long* it took. Open while heartbeats are failing,
+   * null once one succeeds. Never read by a decision path.
+   */
+  hbEpisode?: { startedAt: number; failures: number; firstShape: string } | null;
 }
 
 // ── Hysteresis tuning ──────────────────────────────────────────────
@@ -865,21 +873,30 @@ export async function forwardToUpstream(
  * Exported for the regression test only.
  */
 export async function heartbeat(state: RelayState): Promise<boolean> {
+  const startedAt = Date.now();
+  const budgetMs = resolveHeartbeatTimeoutMs();
+  // v27 — the prober identifies itself (#587 instrument gap). The hub logs one
+  // `[Health] hit peer=… machine=…` line per arrival; without this header every
+  // sidecar's heartbeat is an anonymous peer, and a gap can be attributed to
+  // the wrong machine. Empty id ⇒ no header (the hub never probes itself).
+  const machine = machineName();
+  const headers: Record<string, string> = machine ? { "X-Claudish-Machine": machine } : {};
   try {
     const res = await fetch(`${state.upstream}/health`, {
       method: "GET",
+      headers,
       // Per-tick resolve: a WAN edge needs a larger budget than the 4s LAN
       // default, and the operator flips it mid-incident (#711/WAN, 2026-10-27).
-      signal: AbortSignal.timeout(resolveHeartbeatTimeoutMs()),
+      signal: AbortSignal.timeout(budgetMs),
     });
-    if (!res.ok) return false;
+    if (!res.ok) return noteHeartbeatFailure(state, startedAt, `HTTP ${res.status}`);
     // Body-read failure is a fetch failure (false), NOT "not detected" — an
     // aborted read must not be laundered into a healthy verdict.
     let text: string;
     try {
       text = await res.text();
     } catch {
-      return false;
+      return noteHeartbeatFailure(state, startedAt, "body read aborted");
     }
     // JSON.parse failure IS "not detected": a non-JSON 200 keeps the pre-#156
     // verdict (true) rather than reaching the outer catch as a failure.
@@ -904,12 +921,64 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
           );
         }
       }
-      if (isSelf) return false;
+      if (isSelf) return noteHeartbeatFailure(state, startedAt, "self-loop (the upstream IS this process)");
     }
+    noteHeartbeatRecovered(state);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    return noteHeartbeatFailure(state, startedAt, shapeOfHeartbeatError(err, budgetMs));
   }
+}
+
+/**
+ * v27 — the failure SHAPE, which is what splits the two incidents the hub-side
+ * journal alone could not tell apart: a `timeout` took the full budget (the
+ * peer answered slowly or not at all), while a fast `ECONNREFUSED` never had a
+ * listener, and `HTTP 503` proves the hub ANSWERED (its own stall verdict).
+ * Never throws — a logging instrument that can fail the prober is worse than
+ * none.
+ */
+function shapeOfHeartbeatError(err: unknown, budgetMs: number): string {
+  try {
+    const e = err as { name?: unknown; message?: unknown; code?: unknown; cause?: { code?: unknown } };
+    const name = typeof e?.name === "string" ? e.name : "Error";
+    if (name === "TimeoutError" || name === "AbortError") return `timeout after ${budgetMs}ms`;
+    const code = e?.cause?.code ?? e?.code;
+    if (typeof code === "string") return `${code} (${name})`;
+    const msg = typeof e?.message === "string" ? e.message : "";
+    return msg ? `${name}: ${msg}` : name;
+  } catch {
+    return "unknown";
+  }
+}
+
+/** First failure of an episode is logged WITH its shape and elapsed time; the
+ * rest are counted silently (a multi-hour outage must not become a log flood),
+ * then one recovery line closes the episode with the totals. */
+function noteHeartbeatFailure(state: RelayState, startedAt: number, shape: string): false {
+  const elapsed = Date.now() - startedAt;
+  const ep = state.hbEpisode;
+  if (!ep) {
+    state.hbEpisode = { startedAt, failures: 1, firstShape: shape };
+    log(
+      `[Relay] heartbeat FAILED after ${elapsed}ms — ${shape} (${redactUpstreamForLog(state.upstream)})`,
+      true
+    );
+  } else {
+    ep.failures++;
+  }
+  return false;
+}
+
+function noteHeartbeatRecovered(state: RelayState): void {
+  const ep = state.hbEpisode;
+  if (!ep) return; // steady state: silence is the healthy signal
+  state.hbEpisode = null;
+  const over = Date.now() - ep.startedAt;
+  log(
+    `[Relay] heartbeat RECOVERED after ${ep.failures} failure(s) over ${(over / 1000).toFixed(1)}s — first: ${ep.firstShape}`,
+    true
+  );
 }
 
 /**
