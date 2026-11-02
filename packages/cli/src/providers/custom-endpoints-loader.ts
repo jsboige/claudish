@@ -196,6 +196,8 @@ function buildSimpleHandler(
     prefixes: ctx.provider.prefixes ?? [],
     headers: ctx.provider.headers,
     authScheme: ctx.provider.authScheme ?? "x-api-key",
+    // #686/#718 — internal-endpoint opt-in rides both wires
+    clientAttribution: ep.clientAttribution === true,
   };
   const transport = new AnthropicProviderTransport(remoteProvider, apiKey, ep.maxConcurrency);
   const adapter = new AnthropicAPIFormat(finalModel, ctx.provider.name);
@@ -266,6 +268,8 @@ function buildComplexHandler(
         headers: ep.headers,
         authScheme: ep.authScheme ?? "x-api-key",
         streamFormatOverride: ep.streamFormat,
+        // #686/#718 — internal-endpoint opt-in rides both wires
+        clientAttribution: ep.clientAttribution === true,
       };
       const transport = new AnthropicProviderTransport(remoteProvider, apiKey, ep.maxConcurrency);
       const adapter = new AnthropicAPIFormat(finalModel, ctx.provider.name);

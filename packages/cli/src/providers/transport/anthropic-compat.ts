@@ -22,6 +22,8 @@ export class AnthropicProviderTransport implements ProviderTransport {
   readonly name: string;
   readonly displayName: string;
   readonly streamFormat: StreamFormat = "anthropic-sse";
+  /** #686/#718 — endpoint opted into client attribution (see remote-provider-types). */
+  readonly clientAttribution: boolean;
 
   private provider: RemoteProvider;
   private apiKey: string;
@@ -34,6 +36,7 @@ export class AnthropicProviderTransport implements ProviderTransport {
     this.name = provider.name;
     this.maxConcurrency = maxConcurrency;
     this.displayName = AnthropicProviderTransport.formatDisplayName(provider.name);
+    this.clientAttribution = provider.clientAttribution === true;
 
     if (this.maxConcurrency !== undefined) {
       log(

@@ -390,4 +390,114 @@ describe("custom-endpoints-loader", () => {
       expect((handler as any).options.omitReasoningContent).toBeUndefined();
     });
   });
+
+  describe("clientAttribution plumbing (#686/#718 — both wires)", () => {
+    // #718: an internal endpoint is internal because it is DECLARED so, on
+    // either wire. #686 shipped the opt-in on the OpenAI wire only; these pins
+    // hold the anthropic-wire paths to the same contract, and pin the default
+    // (no flag = external = never attributed) that keeps third parties
+    // (mistral, qwen-token-plan) opaque to our topology.
+    function attributionOf(handler: any): boolean {
+      return handler.provider.clientAttribution === true;
+    }
+
+    // Local twin of the omitReasoningContent ctx — the loader overrides
+    // baseUrl/apiPath from the endpoint entry, so one shape serves both wires.
+    function ctx(modelName: string): ProfileContext {
+      return {
+        provider: {
+          name: "engine",
+          baseUrl: "https://engine.internal.example.com",
+          apiPath: "/v1/chat/completions",
+          apiKeyEnvVar: "CUSTOM_ENGINE_KEY",
+          prefixes: ["engine"],
+          authScheme: "bearer",
+        },
+        modelName,
+        targetModel: modelName,
+        port: 3000,
+        apiKey: "sk-test",
+        sharedOpts: {},
+      };
+    }
+
+    test("complex anthropic endpoint opted in: the transport carries clientAttribution", () => {
+      loadCustomEndpoints(
+        makeConfig({
+          "internal-anthropic": {
+            kind: "complex",
+            displayName: "Internal Anthropic Front",
+            transport: "anthropic",
+            baseUrl: "https://engine.internal.example.com",
+            apiPath: "/v1/messages",
+            apiKey: "k",
+            clientAttribution: true,
+          },
+        })
+      );
+
+      const handler = getRuntimeProfiles()
+        .get("internal-anthropic")!
+        .createHandler(ctx("some-model"))!;
+      expect(attributionOf(handler)).toBe(true);
+    });
+
+    test("simple anthropic endpoint opted in: the transport carries clientAttribution", () => {
+      loadCustomEndpoints(
+        makeConfig({
+          "internal-simple": {
+            kind: "simple",
+            url: "https://engine2.internal.example.com",
+            format: "anthropic",
+            apiKey: "k",
+            clientAttribution: true,
+          },
+        })
+      );
+
+      const handler = getRuntimeProfiles()
+        .get("internal-simple")!
+        .createHandler(ctx("some-model"))!;
+      expect(attributionOf(handler)).toBe(true);
+    });
+
+    test("anthropic endpoint without the flag stays external — never attributed (#718 AC2/AC3)", () => {
+      loadCustomEndpoints(
+        makeConfig({
+          "third-party": {
+            kind: "complex",
+            displayName: "Third Party",
+            transport: "anthropic",
+            baseUrl: "https://api.thirdparty.example.com",
+            apiKey: "k",
+          },
+        })
+      );
+
+      const handler = getRuntimeProfiles()
+        .get("third-party")!
+        .createHandler(ctx("some-model"))!;
+      expect(attributionOf(handler)).toBe(false);
+    });
+
+    test("openai endpoint opted in: unchanged, the pre-existing wire keeps its contract", () => {
+      loadCustomEndpoints(
+        makeConfig({
+          "internal-openai": {
+            kind: "complex",
+            displayName: "Internal OpenAI Front",
+            transport: "openai",
+            baseUrl: "https://engine3.internal.example.com",
+            apiKey: "k",
+            clientAttribution: true,
+          },
+        })
+      );
+
+      const handler = getRuntimeProfiles()
+        .get("internal-openai")!
+        .createHandler(ctx("some-model"))!;
+      expect(attributionOf(handler)).toBe(true);
+    });
+  });
 });
