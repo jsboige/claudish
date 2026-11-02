@@ -646,11 +646,14 @@ actually served again (captures, per-minute; the bucket re-probes at each
 |---|---|---|---|---|---|
 | A | 02:38:58 | 03:19:06 | (02:38:58, 03:18:58] | **02:56:47** ✓ | 7 h 38 → 8 h 18 |
 | B | 08:16:12 | 08:56:50 | (08:16:12, 08:56:14] | **08:19:06** ✓ | 7 h 23 → 8 h 03 |
-| C | 13:27:06 | (probe due 14:07) | (13:27:06, 14:07:06] | **13:56:50** | 7 h 50 → 8 h 30 |
+| C | 13:27:06 | 14:08 (probe at 14:07:06) | (13:27:06, 14:07:06] | **13:56:50** | 7 h 50 → 8 h 30 |
 
-The intersection of the three brackets is **≈ 8 h 00**: UTC+8 fits every episode,
-while UTC and UTC+1 are refuted outright (under those readings GLM would have
-stayed walled until 10:56 / 16:19, yet it served from 03:19 / 08:56).
+The intersection of the three brackets is **[7 h 50, 8 h 03] ≈ 8 h 00**: UTC+8 fits
+every episode, while UTC and UTC+1 are refuted outright (under those readings GLM
+would have stayed walled until 10:56 / 16:19, yet it served from 03:19 / 08:56).
+Episode C is the clean one: the wall lifted at 13:27:06 + 40 min = **14:07:06**,
+seven minutes *after* the announced−8h instant, so the lift was the TTL and the
+true opening sits in the bracket above.
 
 What it costs, bounded: the UTC-read value is declined, so the step falls to the
 bucket TTL and is blind between the true opening and the next probe — **22.3 min**
