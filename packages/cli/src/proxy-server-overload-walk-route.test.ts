@@ -213,7 +213,7 @@ beforeEach(() => {
     savedFailoverEnv[k] = process.env[k];
     delete process.env[k];
   }
-  globalThis.fetch = (async (input: any, init: any) => {
+  globalThis.fetch = (async (input: any) => {
     // Request / URL instances reach here too (the native lane builds a
     // Request); reading only `input.url` would silently fall through to the
     // catch-all 200 and make a native 529 look like a healthy answer.
