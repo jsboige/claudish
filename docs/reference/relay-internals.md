@@ -75,6 +75,27 @@ failing heartbeats = slow upstream; fast headers + failing heartbeats = local tu
 `/health` heartbeat timeout is never, on its own, evidence the hub is down — it shares the tube and
 the host with everything else.
 
+**Attribution at fleet scale — the #730 grid (po-2027, 27/10→01/11, 42 episodes / 424.2 min).**
+The same doctrine applied to five days of AUTONOMOUS episodes on one seat, every class carrying its
+proof, two recomputes assumed (grid + provenance:
+[#730 comment](https://github.com/jsboige/claudish/issues/730#issuecomment-6574563173)):
+
+| class | episodes | min | share | proof |
+|---|---:|---:|---:|---|
+| HUB — named 5xx | 7 | 12.4 | 2.9 % | 502/503 named by the hub |
+| HUB — by construction | 6 | 73.0 | 17.2 % | 30/10 drain cluster (5 episodes) + 01/11 00:41 hub recreate |
+| not hub-side — the probe itself | 4 | 5.3 | 1.2 % | hub journal 0×5xx AND 36-92 capture files per window |
+| seat — Netwtw14 | 8 | 46.3 | 10.9 % | seat `System` journal join |
+| undetermined | 17 | 287.2 | 67.7 % | `/v1/messages` plane alive in every window (captures); no hub event, no seat signal |
+
+The undetermined class is the largest by time and is **bounded, not opaque**: in every one of its
+windows the hub was serving the seat's message traffic, so the residual points at the heartbeat
+path itself — which no current instrument sees. Three limits bound any re-measure: container logs
+die with the container (the 21 windows ≤ 31/10 have no hub-side journal, ever), `/health` is never
+captured (captures cover `/v1/messages` only), and `failover-events.log` only starts 01/11 05:16Z.
+**The single measure that closes the undetermined class is the `[Health]` marker (#812)** —
+heartbeat lines logged hub-side — which lands at the next natural hub recreate.
+
 **What the hub-side journal holds (po-2025, `~/.claudish/docker-events.log` — the durable collector
 of issue #169).** At 08:50:56Z a `container start claudish-proxy` **carrying the same container id**
 (`32c3f1378a91`) — and between 06:34:11Z and that event **no `create`, `stop`, `die`, `kill` or
