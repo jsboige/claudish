@@ -1554,10 +1554,11 @@ describe("redactUpstreamForLog", () => {
 
     // Positive control: the matcher must find the log calls at all, and must
     // find the redacted form — otherwise "0 verbatim" would mean "0 matched".
-    // 5 = boot + 2 hysteresis transitions (#160) + both #156 self-loop
-    // transition lines; grows with every new redacted call site.
+    // 6 = boot + 2 hysteresis transitions (#160) + both #156 self-loop
+    // transition lines + the v27 heartbeat FAILED shape line; grows with every
+    // new redacted call site.
     expect(logCalls.length).toBeGreaterThan(3);
-    expect(logCalls.filter((l) => l.includes("redactUpstreamForLog(state.upstream)")).length).toBe(5);
+    expect(logCalls.filter((l) => l.includes("redactUpstreamForLog(state.upstream)")).length).toBe(6);
 
     const verbatim = logCalls.filter((l) => /\$\{state\.upstream\}/.test(l));
     expect(verbatim).toEqual([]);
@@ -2083,5 +2084,115 @@ describe("forwardToUpstream — upstream-nonok marker (#763)", () => {
     });
 
     expect(markers(lines).length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v27 — heartbeat failure SHAPE and episode log (#587 instrument gap).
+//
+// The hub logs one `[Health] hit peer=… machine=…` line per arrival
+// (proxy-server.ts); this is the other half, sidecar-side. Together they split
+// the two incidents the 2026-11-01 journal could not tell apart: a `timeout`
+// took the whole budget (the peer answered slowly or not at all), a fast
+// ECONNREFUSED never had a listener, `HTTP 503` proves the hub ANSWERED with
+// its own stall verdict. Episode-latched: a multi-hour outage is two lines,
+// not a flood.
+describe("v27 — heartbeat failure shape and episode log", () => {
+  const realConsoleLog = console.log;
+  let lines: string[];
+  const savedMachine = process.env.CLAUDISH_MACHINE;
+
+  beforeEach(() => {
+    lines = [];
+    console.log = ((m: unknown) => {
+      lines.push(String(m));
+    }) as typeof console.log;
+  });
+  afterEach(() => {
+    console.log = realConsoleLog;
+    if (savedMachine === undefined) delete process.env.CLAUDISH_MACHINE;
+    else process.env.CLAUDISH_MACHINE = savedMachine;
+  });
+
+  const failed = () => lines.filter((l) => l.includes("[Relay] heartbeat FAILED"));
+  const recovered = () => lines.filter((l) => l.includes("[Relay] heartbeat RECOVERED"));
+
+  it("B1: a timeout names its budget, the rest of the episode stays silent, recovery closes it with the totals", async () => {
+    fetchImpl = async () => {
+      const e = new Error("The operation was aborted due to timeout");
+      e.name = "TimeoutError";
+      throw e;
+    };
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(false);
+    expect(failed()).toHaveLength(1);
+    expect(failed()[0]).toContain("timeout after");
+    // The SECOND failure of the same episode: counted, never re-logged.
+    expect(await heartbeat(state)).toBe(false);
+    expect(failed()).toHaveLength(1);
+    expect(recovered()).toHaveLength(0);
+    // One success closes the episode — with the count, so a reader gets the
+    // episode's size without a per-tick line.
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    expect(await heartbeat(state)).toBe(true);
+    expect(recovered()).toHaveLength(1);
+    expect(recovered()[0]).toContain("after 2 failure(s)");
+  });
+
+  it("B2: a refused connection names the code — fast, a different incident from a timeout", async () => {
+    fetchImpl = async () => {
+      const e: any = new TypeError("fetch failed");
+      e.cause = { code: "ECONNREFUSED" };
+      throw e;
+    };
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(false);
+    expect(failed()).toHaveLength(1);
+    expect(failed()[0]).toContain("ECONNREFUSED");
+    expect(failed()[0]).not.toContain("timeout");
+  });
+
+  it("B3: a non-ok reply names the HTTP status — the hub answered, with its own verdict", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "stalled" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(false);
+    expect(failed()).toHaveLength(1);
+    expect(failed()[0]).toContain("HTTP 503");
+  });
+
+  it("B4: the probe carries X-Claudish-Machine so the hub can attribute the arrival — and none when unset", async () => {
+    process.env.CLAUDISH_MACHINE = "myia-ai-01";
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    expect(lastFetch!.url).toContain("/health");
+    expect((lastFetch!.init.headers as Record<string, string>)["X-Claudish-Machine"]).toBe("myia-ai-01");
+    delete process.env.CLAUDISH_MACHINE;
+    expect(await heartbeat(state)).toBe(true);
+    expect(lastFetch!.init.headers).toEqual({});
+  });
+
+  it("B5: a healthy steady state emits nothing — silence is the signal", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ status: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    await heartbeat(state);
+    await heartbeat(state);
+    expect(lines.filter((l) => l.includes("[Relay] heartbeat"))).toHaveLength(0);
   });
 });

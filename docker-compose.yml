@@ -175,6 +175,11 @@ services:
       # carries (never values). Off when empty. Read per request, but like every
       # name here it enters the container only at a recreate.
       - CLAUDISH_NATIVE_HEADER_NAMES_LOG=${CLAUDISH_NATIVE_HEADER_NAMES_LOG:-}
+      # v27 (#587 instrument gap) — one `[Health] hit peer=… machine=…` line per
+      # /health arrival, so a missed sidecar heartbeat can be split into "never
+      # arrived" vs "arrived, answered slowly". Only an explicit "0" silences
+      # it; empty = marker on (~6 lines/min at a 10 s probe cadence).
+      - CLAUDISH_HEALTH_ARRIVAL_LOG=${CLAUDISH_HEALTH_ARRIVAL_LOG:-}
       # Budget failover (fork extension). All empty → inert: no routing change,
       # no notice, zero added bytes. Belongs on the machine that actually CALLS
       # the models. That is the hub most of the time, but a sidecar calls them
