@@ -2,9 +2,8 @@
 
 The cascade is driven by other people's quota walls. A wall is only legible from
 the provider's own console: the proxy sees the *refusal*, never the remaining
-budget or the reset anchor. This file is the inventory of those consoles, the
-instrument to read them, and the first reading that makes the fleet's real
-headroom visible.
+budget or the reset anchor. This file is the inventory of those consoles and the
+instrument to read them.
 
 Catalogue (single source): `python scripts/console-tabs.py list` ·
 `scripts/console-tabs.py urls` prints the reopen list, one URL per line.
@@ -61,29 +60,34 @@ into a document.
 | `claude` | claude.ai/new#settings/usage | Anthropic plan weekly limit + reset | the interactive seats' own ceiling |
 | `chatgpt` | chatgpt.com/settings/usage?tab=overview | weekly limit shared by Codex/Work/agents | Codex capacity |
 | `copilot` | github.com/settings/copilot/features | monthly AI credits | rarely bound — a large idle reservoir |
-| `anthropic-payg` | console.anthropic.com/settings/billing | **PAYG API**, distinct from the claude.ai plan; the account carries **200 $/month of credit** (user, 2026-11-02) | *to authenticate* — the least-used reservoir in the fleet, and the natural home for the dashboard condensation (Haiku) if vllm no longer wants it on swift |
-| `openai-payg` | platform.openai.com/usage | **PAYG API**, distinct from the chatgpt weekly plan | *to authenticate* |
+| `openrouter` | openrouter.ai/workspaces/default/activity | **PAYG aggregator** — what the fleet pays when a direct step is walled and the route lands on `or@` | an aggregator wall moves the bill, not the cap |
+| `anthropic-payg` | console.anthropic.com/settings/billing | **PAYG API**, distinct from the claude.ai plan; carries a monthly credit | *to authenticate* — the natural home for the dashboard condensation (Haiku) if vllm no longer wants it on swift |
+| `openai-payg` | platform.openai.com/settings/organization/usage | **PAYG API**, distinct from the chatgpt weekly plan | *to authenticate* |
 
 ⚠ Two pairs are easy to conflate: **claude.ai plan ≠ Anthropic PAYG**, and
 **chatgpt weekly plan ≠ OpenAI PAYG**. They are separate counters with separate
 wallets; a read of one says nothing about the other.
 
-## First readings — 2026-11-02 ~14:35 local
+### Provenance — the tab set moves
 
-Baseline recorded the day the consoles were opened. Keep corrections in the
-readings log, not here.
+The catalogue is the single source of *what each console answers*, not of *what
+was open at some past instant*. The user opens and closes tabs; a URL recorded
+once and printed later can land the next session on a page with no session, which
+reads as a dead plan. Every entry therefore carries a `provenance` (`vu` in
+`list`): `verbatim tab-NN, <instant>` = read off that live tab at that instant,
+`jamais observé` = a standard console path still to confirm. **Re-verify an entry
+whose provenance is old before reopening it**, and correct it here rather than
+inheriting a stale link.
 
-| console | reading | consequence |
-|---|---|---|
-| z.ai Coding Plan | **5 h quota 100 % used**, MCP 0 %, **3 resets available, unused** | the sonnet nominal is dry *right now* — matches 0 `glm-5.3` served since 11h UTC |
-| z.ai usage | 7 days: 17.87 B tokens, GLM-5.3 = 17.84 B, cache hit 97.1 %, off-peak 93.8 % | the plan is used as long-context bulk, not as chat |
-| Kimi | **7 days 100 %**, 5 h 0 %, 7 d resets **02/11 21:08** | the free step returns tonight; total plan use 47.09 % |
-| Qwen Token Plan | **monthly remaining 0.0 %**, reset **11/11 17:00 local**, plan quota 180 000 | dead until 11/11 — no lever here |
-| Mistral | Pro, **25,5 €/month of API included**, reset in 28 days (monthly, 1st) | explains the `402 API budget exhausted` on `mistral@zai-glm-5-3` |
-| DeepSeek PAYG | balance **$181.07**, **$600.33 last 30 days**, 340 646 requests, 58.06 B tokens | the invoice to defend — ≈ $20/day |
-| claude.ai | warning: **limit reached Thursday evening, before the Friday 02:00 reset** | the interactive seats are on course to stall ~1 day early |
-| Codex | **4 % left**, resets in 2 d 4 h | Codex capacity is effectively gone until then |
-| Copilot | **19 / 1 500 credits**, resets 2026-12-01 | 1 481 credits idle — the one unused reservoir |
+## Readings live elsewhere
+
+Levels — balances, percentages, reset anchors — **never go in this file**: they
+expire the moment they are written and eight-day-old numbers get read as current.
+They accumulate in `~/.claudish/console-readings.jsonl` (machine-local) and are
+reported on the fleet dashboard. What belongs here are the **structural** facts
+that do not move: Mistral's API allowance is monthly and included in the Pro plan;
+Qwen's Token Plan is a monthly window; Kimi carries two windows (5 h and 7 d); the
+Anthropic account carries a monthly PAYG credit distinct from the claude.ai plan.
 
 ## Why this matters to the cascade
 
@@ -109,5 +113,6 @@ anchor with the percentage.
 ## Adding a console
 
 Append one entry to `CONSOLES` in `scripts/console-tabs.py` (`id`, `name`, `url`,
-`role`, `auth`, `fields`, and `todo: True` while unauthenticated). No other file
-needs to change; `list` and `urls` pick it up.
+`role`, `auth`, `fields`, `provenance`, and `todo: True` while unauthenticated).
+`provenance` is mandatory in practice: say which tab you read it off and when, or
+write `jamais observé`. No other file needs to change; `list` and `urls` pick it up.

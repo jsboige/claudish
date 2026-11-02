@@ -14,6 +14,12 @@ playwright MCP owns the profile, and a second process would fight it for the loc
 
 Readings go to `~/.claudish/console-readings.jsonl` (machine-local, never in git):
 one object per observation, so a series accumulates instead of being overwritten.
+
+Every entry carries a `provenance` string, because the tab set MOVES: the user
+opens and closes consoles, and a catalogue that presents an unobserved URL as
+canonical sends the next session to a page with no session (2026-11-02 review).
+`verbatim tab-NN, <instant>` means the URL was read off that open tab at that
+instant; `jamais observé` means it is a standard console path still to confirm.
 """
 from __future__ import annotations
 
@@ -28,6 +34,8 @@ READINGS = Path.home() / ".claudish" / "console-readings.jsonl"
 # `role` says WHAT the console answers, which is the part every session lost.
 # `auth` documents how the session is held, so a lost cookie is diagnosed rather
 # than guessed (see docs/reference/subscription-consoles.md).
+# `provenance` says WHEN the URL was last seen on a real tab — a catalogue that
+# claims to be the single source must say what it observed and when.
 CONSOLES = [
     {
         "id": "minimax",
@@ -36,6 +44,7 @@ CONSOLES = [
         "role": "Fenêtre 5 h + quota hebdo (le mur qui arme haiku→sonnet). Source du relevé mono-observateur et de ~/.claudish/minimax-plan-watch.log.",
         "auth": "profil playwright persistant (session console longue durée)",
         "fields": ["5-hour %", "weekly %", "resets-in"],
+        "provenance": "verbatim tab-00, 2026-11-02 20:35 local",
     },
     {
         "id": "zai",
@@ -44,6 +53,7 @@ CONSOLES = [
         "role": "Quota 5 h du Coding Plan (nominal de la lane sonnet), quota MCP, réinitialisations disponibles, tokens cumulés par modèle.",
         "auth": "OAuth chat.z.ai (Google) — le cookie se perd sans prévenir, la page renvoie alors un mur de connexion",
         "fields": ["5h quota %", "mcp quota %", "resets available", "tokens 7d/30d"],
+        "provenance": "verbatim tab-01, 2026-11-02 20:35 local",
     },
     {
         "id": "kimi",
@@ -52,6 +62,7 @@ CONSOLES = [
         "role": "Fenêtre 5 h ET fenêtre 7 jours du plan Code — c'est le 7 j qui a maxé depuis avant le week-end.",
         "auth": "session navigateur",
         "fields": ["5h %", "7d %", "resets-in", "total %"],
+        "provenance": "verbatim tab-02, 2026-11-02 20:35 local (absente des 11 onglets relevés par ai-01 à 09:46Z — la session a été rouverte depuis)",
     },
     {
         "id": "deepseek",
@@ -60,6 +71,7 @@ CONSOLES = [
         "role": "Le PAYG réel : solde rechargé, coût 30 jours, requêtes et tokens. C'est le compteur de la facture.",
         "auth": "session navigateur",
         "fields": ["balance", "cost 30d", "requests 30d", "tokens 30d"],
+        "provenance": "verbatim tab-03, 2026-11-02 20:35 local",
     },
     {
         "id": "qwen",
@@ -68,14 +80,16 @@ CONSOLES = [
         "role": "Quota MENSUEL du Token Plan (remise à zéro horodatée) — la lane restée murée jusqu'au 11/11.",
         "auth": "session navigateur (l'URL reçoit des paramètres de traçage, non nécessaires)",
         "fields": ["monthly remaining %", "reset time", "plan quota"],
+        "provenance": "verbatim tab-06, 2026-11-02 20:35 local ; ai-01 a relevé le même jour à 09:46Z un second point d'entrée, modelstudio.console.alibabacloud.com/ap-southeast-1/subscription/token-plan/personal (tab-04) — les deux mènent au Token Plan, la session décide lequel répond",
     },
     {
         "id": "mistral",
         "name": "Mistral Admin — Abonnement",
         "url": "https://admin.mistral.ai/subscription",
-        "role": "Forfait API inclus dans l'abonnement Pro (25,5 €/mois, remis à zéro le 1er du mois) — c'est ce budget qui rend le 402 'API budget exhausted'.",
+        "role": "Forfait API inclus dans l'abonnement Pro (remis à zéro le 1er du mois) — c'est ce budget qui rend le 402 'API budget exhausted'.",
         "auth": "session navigateur",
         "fields": ["included API allowance", "reset date", "used"],
+        "provenance": "verbatim tab-07, 2026-11-02 20:35 local",
     },
     {
         "id": "claude",
@@ -84,6 +98,7 @@ CONSOLES = [
         "role": "Limite hebdomadaire du forfait Anthropic, réinitialisation, et crédits d'utilisation au-delà.",
         "auth": "session claude.ai",
         "fields": ["weekly warning", "reset day", "spend limit"],
+        "provenance": "verbatim tab-05, 2026-11-02 20:35 local",
     },
     {
         "id": "chatgpt",
@@ -92,6 +107,7 @@ CONSOLES = [
         "role": "Limite hebdomadaire partagée Codex / Work / agents d'espace.",
         "auth": "session chatgpt.com",
         "fields": ["weekly remaining %", "resets-in"],
+        "provenance": "verbatim tab-04, 2026-11-02 20:35 local",
     },
     {
         "id": "copilot",
@@ -100,24 +116,36 @@ CONSOLES = [
         "role": "Crédits AI mensuels du plan Pro (réservoir très peu entamé).",
         "auth": "session github.com",
         "fields": ["credits used / total", "reset date"],
+        "provenance": "verbatim tab-08, 2026-11-02 20:35 local",
+    },
+    {
+        "id": "openrouter",
+        "name": "OpenRouter — Activity / Billing",
+        "url": "https://openrouter.ai/workspaces/default/activity",
+        "role": "PAYG agrégateur — ce que la flotte paie quand un étage direct est muré et que la route retombe sur `or@`/`openrouter@`.",
+        "auth": "session openrouter.ai",
+        "fields": ["credits remaining", "usage 30d", "per-model spend"],
+        "provenance": "verbatim tab-10, 2026-11-02 09:46Z (relevé ai-01) — fermée au 20:35 local",
     },
     # --- not yet opened by the user (02/11) ---
     {
         "id": "anthropic-payg",
         "name": "Anthropic Console — Billing / Usage",
         "url": "https://console.anthropic.com/settings/billing",
-        "role": "PAYG Anthropic (différent du forfait claude.ai : c'est le compteur de l'API native). Le compte bénéficie de **200 $/mois de crédit PAYG** (user, 02/11) — le réservoir le moins utilisé de la flotte, et le candidat naturel pour y déplacer la condensation (Haiku).",
+        "role": "PAYG Anthropic (différent du forfait claude.ai : c'est le compteur de l'API native), alimenté par un crédit mensuel dont le niveau vit dans le relevé, pas ici.",
         "auth": "session console.anthropic.com (à authentifier)",
         "fields": ["credit balance", "usage 30d"],
+        "provenance": "jamais observé — chemin standard du Console, à confirmer à la première ouverture",
         "todo": True,
     },
     {
         "id": "openai-payg",
         "name": "OpenAI Platform — Usage / Billing",
-        "url": "https://platform.openai.com/usage",
+        "url": "https://platform.openai.com/settings/organization/usage",
         "role": "PAYG OpenAI (le plan hebdo de l'onglet chatgpt est un autre compteur).",
         "auth": "session platform.openai.com (à authentifier)",
         "fields": ["usage 30d", "cost", "credit balance"],
+        "provenance": "verbatim tab-09, 2026-11-02 09:46Z (relevé ai-01) — chemin /settings/organization/usage, pas /usage",
         "todo": True,
     },
 ]
@@ -131,10 +159,13 @@ def cmd_list(as_json: bool = False) -> int:
         flag = "  [À AUTHENTIFIER]" if c.get("todo") else ""
         print(f"\n{c['id']} — {c['name']}{flag}")
         print(f"  url    : {c['url']}")
+        print(f"  vu     : {c.get('provenance', 'provenance absente — à vérifier avant usage')}")
         print(f"  répond : {c['role']}")
         print(f"  auth   : {c['auth']}")
         print(f"  champs : {', '.join(c['fields'])}")
     print(f"\n{len(CONSOLES)} consoles ({sum(1 for c in CONSOLES if c.get('todo'))} restantes à ouvrir).")
+    print("La liste d'onglets BOUGE : `vu` date la dernière observation réelle — une entrée")
+    print("dont la provenance est ancienne se re-vérifie avant de rouvrir quoi que ce soit.")
     print(f"Relevés      : {READINGS}")
     print("Relevé d'une console : roosync playwright, onglet N, puis le probe JS de")
     print("docs/reference/subscription-consoles.md, puis `console-tabs.py log`.")
