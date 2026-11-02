@@ -777,3 +777,12 @@ Mutations: `/3.5` → `/4` kills 8 unit pins; replacement
 disabled kills both AC5 pins; refusals-never-divert kills B1/B3/B4/B6/B7 and
 leaves B2 (inert) + B5 (replace) green; `controller.error` restored in
 `withBudgetRelease`'s catch kills the never-hang pin.
+
+## Where a wall actually comes from
+
+A status code never names the window that produced it: the same `429` is a
+5-hour quota, a 7-day window, a monthly budget or a per-second rate limit — and
+each has a different remedy and a different reset anchor. The providers' own
+consoles, the reading recipe and the baseline ledger live in
+[`subscription-consoles.md`](subscription-consoles.md)
+(`python scripts/console-tabs.py list`).
