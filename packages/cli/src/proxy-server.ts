@@ -8,6 +8,22 @@ import type { ProxyServer } from "./types.js";
 // shorten them (a 60 s window cannot expire inside a test); /health reads
 // these at CALL TIME, never a cached value.
 export const lagProbeWindows = { maxMs: 60_000, blockedMs: 300_000 };
+/**
+ * v27 (#810 instrument gap) — one log line per `/health` ARRIVAL, on by default.
+ *
+ * Measured 2026-11-01, hub journal: a case-insensitive "health" grep over a full
+ * day (214 640 lines, since the 00:41Z recreate) returned 24 hits, ALL of them
+ * prompt text. Nothing recorded that a heartbeat had been received, so a
+ * sidecar's missed heartbeat could not be split into "never arrived" (container
+ * path / NAT / the peer's own host) vs "arrived and was answered slowly" (event
+ * loop pressure) — the exact question the two ai-01 episodes left open. The
+ * prober ticks every ~10 s per sidecar, so this is a handful of lines per
+ * minute, never per-request volume. Kill switch, read per call; `0` silences
+ * the marker without touching the reply.
+ */
+export function healthArrivalLogEnabled(): boolean {
+  return process.env.CLAUDISH_HEALTH_ARRIVAL_LOG !== "0";
+}
 import { NativeHandler, stripProxyOwnHeaders } from "./handlers/native-handler.js";
 import {
   nativeAuthHeaderNames,
@@ -2789,6 +2805,23 @@ export async function createProxyServer(
     const thresholdMs = stallThresholdMs();
     const stalled = streamTracker.isStalled(thresholdMs);
     const { role, upstream } = relayHealthFields(options.relay);
+    // v27 arrival marker — emitted BEFORE the gauges are read, so a stalled
+    // instance still proves it was REACHED (a hub that answers slowly and one
+    // that is never contacted are different incidents, and until now the
+    // journal could not tell them apart). `status` here is the verdict this
+    // very reply carries; `peer` is the socket address (the LAN's best
+    // attribution — `[Request]` lines read `src=direct` there) and `machine`
+    // is the prober's own id, sent since v27 in relay.ts heartbeat().
+    if (healthArrivalLogEnabled()) {
+      let peer = "-";
+      try {
+        peer = (c.env as any)?.incoming?.socket?.remoteAddress ?? "-";
+      } catch {
+        // No socket on a non-http transport: attribution degrades, never throws.
+      }
+      const machine = c.req.header("x-claudish-machine")?.trim() || "-";
+      log(`[Health] hit peer=${peer} machine=${machine} status=${stalled ? "stalled" : "ok"}`, true);
+    }
     return c.json(
       {
         status: stalled ? "stalled" : "ok",

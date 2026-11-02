@@ -97,11 +97,22 @@ export function nativeCredentialRefusalShape(
  * against the real predicate, not a copied keyword list.
  */
 export function nativeCredentialRefusalResponse(model: string): Response {
+  // #410 companion (measured 2026-11-01 on the hub, #783): a family-unknown
+  // bare name ("swift-1.5-27b-no-thinking") defaults to the native lane in
+  // parseModelSpec, so on a proxy without an Anthropic credential it dies
+  // HERE — and the old wording told the client it had asked for a "native
+  // model", which is not what it sent (the reporter read an allowlist
+  // refusal into it; the allowlist never fired). A claude-* name really is a
+  // native request; anything else on this lane is far more likely a name
+  // that resolved nowhere. The wording names the actual cause per shape.
+  const message = model.startsWith("claude-")
+    ? `claudish: native model ${model} is not served on this proxy (no Anthropic credential to send) — use a role alias or a non-native model`
+    : `claudish: unknown model ${model} — not found in any provider catalog or routing map (it was defaulted to the native lane, which this proxy cannot serve: no Anthropic credential) — use provider@model or a configured alias`;
   return new Response(
     JSON.stringify(
       wrapAnthropicError(
         403,
-        `claudish: native model ${model} is not served on this proxy (no Anthropic credential to send) — use a role alias or a non-native model`,
+        message,
         "permission_error"
       )
     ),

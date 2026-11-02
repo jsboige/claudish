@@ -234,6 +234,63 @@ describe("#296 — refusal wording vs isQuotaExhaustion", () => {
   }, 30_000);
 });
 
+// ---- #410 companion: the wording names the actual cause --------------------------
+
+describe("#410 — unknown bare name: the refusal says unknown, not native", () => {
+  // Founding measurement (2026-11-01, #783): `swift-1.5-27b-no-thinking` on the
+  // hub — a family-unknown bare name defaults to the native lane
+  // (parseModelSpec), the hub holds no Anthropic credential, and the refusal
+  // told the client it had asked for a "native model". The reporter read an
+  // allowlist refusal into it; the allowlist never fired. Two pins: the
+  // wording per shape, and the new body still never arms the cascade.
+  const UNKNOWN_BODY = {
+    model: "swift-1.5-27b-no-thinking",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "ok" }],
+  };
+
+  test("family-unknown bare name → 403 'unknown model', 0 upstream calls, no 'native model'", async () => {
+    await spin();
+    const res = await post(
+      "/v1/messages",
+      headers({ "x-api-key": PROXY_KEY }),
+      UNKNOWN_BODY
+    );
+    expect(res.status).toBe(403);
+    expect(anthropicCalls.length).toBe(0);
+    const raw: any = await res.json();
+    expect(raw.error.type).toBe("permission_error");
+    expect(raw.error.message).toContain("unknown model swift-1.5-27b-no-thinking");
+    expect(raw.error.message).toContain("not found in any provider catalog or routing map");
+    expect(raw.error.message).not.toContain("native model");
+  }, 30_000);
+
+  test("claude-shaped name keeps the native wording (the client really did ask native)", async () => {
+    await spin();
+    const res = await post(
+      "/v1/messages",
+      headers({ "x-api-key": PROXY_KEY }),
+      NATIVE_BODY
+    );
+    const raw: any = await res.json();
+    expect(raw.error.message).toContain("native model claude-opus-5-5");
+    expect(raw.error.message).not.toContain("unknown model");
+  }, 30_000);
+
+  test("the unknown-model 403 body does not match any quota-wall keyword", async () => {
+    await spin();
+    const res = await post(
+      "/v1/messages",
+      headers({ authorization: "Bearer some-foreign-token", "x-proxy-key": PROXY_KEY }),
+      UNKNOWN_BODY
+    );
+    const raw: any = await res.json();
+    // The real predicate, not a copied keyword list — same contract as the
+    // native wording above.
+    expect(isQuotaExhaustion(res.status, JSON.stringify(raw))).toBe(false);
+  }, 30_000);
+});
+
 // ---- route-level: /v1/messages ---------------------------------------------------
 
 describe("#296 — /v1/messages native lane", () => {

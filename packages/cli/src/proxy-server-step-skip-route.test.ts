@@ -86,6 +86,7 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_CAPTURE_DIR",
   "CLAUDISH_FAILOVER_STEP_SKIP", "CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS",
   "CLAUDISH_CONTEXT_ADMISSION",
+  "CLAUDISH_HEALTH_ARRIVAL_LOG",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -379,14 +380,14 @@ beforeEach(() => {
         line.includes("[MediaCap]") || // #575
         line.includes("[EndpointBudget]") || // #654
         line.includes("[ConcurrencyRefusal]") || // #679
-        line.includes("[ExactCount]") // #674
+        line.includes("[ExactCount]") || // #674
+        line.includes("[Health]") // v27 arrival marker
       ) {
         markerLog.push(line);
       }
     }
     return realStderrWrite(chunk, ...rest);
-  }) as any;
-  console.log = ((...args: any[]) => {
+  }) as any;  console.log = ((...args: any[]) => {
     const text = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
     for (const line of text.split("\n")) {
       if (
@@ -398,7 +399,8 @@ beforeEach(() => {
         line.includes("[MediaCap]") || // #575
         line.includes("[EndpointBudget]") || // #654
         line.includes("[ConcurrencyRefusal]") || // #679
-        line.includes("[ExactCount]") // #674
+        line.includes("[ExactCount]") || // #674
+        line.includes("[Health]") // v27 arrival marker
       ) {
         markerLog.push(line);
       }
@@ -1302,6 +1304,60 @@ describe("#587 — /health publishes time-localized event-loop lag (gate instrum
     });
     expect(Math.max(...lags)).toBeGreaterThanOrEqual(250);
     expect(Math.min(...lags)).toBeGreaterThanOrEqual(250);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// v27 — the /health ARRIVAL marker (#587 instrument gap).
+//
+// Measured 2026-11-01 on the hub: a case-insensitive "health" grep over a full
+// day's journal (214 640 lines) returned 24 hits, ALL prompt text — nothing
+// recorded that a heartbeat had been received. So a sidecar's missed heartbeat
+// could not be split into "never arrived" (path/NAT/the observer's host) vs
+// "arrived and was answered slowly" (loop pressure), which is exactly the
+// question the two ai-01 episodes left open. One line per ARRIVAL, emitted
+// before the gauges are read, so even a stalled instance proves it was reached.
+describe("v27 — /health arrival marker", () => {
+  const hits = () => markerLog.filter((l) => l.includes("[Health] hit"));
+
+  test("A1: one line per arrival, carrying peer + machine + the reply's own verdict", async () => {
+    await spin();
+    resetCascade();
+    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, {
+      headers: { "x-claudish-machine": "myia-ai-01" },
+    });
+    expect(r.status).toBe(200);
+    const lines = hits();
+    expect(lines).toHaveLength(1); // one arrival, one line — never per-request volume
+    expect(lines[0]).toContain("machine=myia-ai-01");
+    expect(lines[0]).toContain("status=ok");
+    // The peer address is the LAN's best attribution ([Request] reads
+    // src=direct there) — a real socket must yield one, not the fallback.
+    expect(lines[0]).toMatch(/peer=(?!-)\S+/);
+  }, 30_000);
+
+  test("A2: kill switch CLAUDISH_HEALTH_ARRIVAL_LOG=0 silences the line, never the reply", async () => {
+    process.env.CLAUDISH_HEALTH_ARRIVAL_LOG = "0";
+    await spin();
+    resetCascade();
+    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, {
+      headers: { "x-claudish-machine": "myia-ai-01" },
+    });
+    expect(r.status).toBe(200);
+    const body: any = await r.json();
+    expect(typeof body.instanceId).toBe("string"); // the surface is untouched
+    expect(hits()).toHaveLength(0);
+  }, 30_000);
+
+  test("A3: a probe that identifies nothing still logs — attribution degrades, it never throws", async () => {
+    await spin();
+    resetCascade();
+    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    expect(r.status).toBe(200);
+    const lines = hits();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("machine=-");
+    expect(lines[0]).toMatch(/peer=(?!-)\S+/);
   }, 30_000);
 });
 
