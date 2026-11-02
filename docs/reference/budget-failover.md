@@ -663,20 +663,25 @@ responses; at GLM's measured peak (≈ 21/min) the share GLM would have absorbed
 That is ~7 % of the current run rate: real, and not a path to the 300 €/month
 target.
 
-Two things this measurement does **not** justify:
+Two verdicts from this measurement:
 
-- **Raising `CLAUDISH_FAILOVER_ARM_AFTER` (Q-76 study, verdict: leave it).** The
+- **Raising `CLAUDISH_FAILOVER_ARM_AFTER` (Q-76 study) stays rejected.** The
   `1302` throttle never arms — `isQuotaExhaustion` matches neither "rate limit" nor
   "per minute" — so the day's 34 arms came from 39 genuine `1308` walls and are
   legitimate. The cost is the *lift time*, not the refusal count.
-- **Trusting the timestamp outright.** A per-provider offset (`+08:00` for Z.AI)
-  must be applied **before** the same guard, never instead of it: applied to a body
-  that really were UTC, the shifted value lands in the past, fails the guard, and
-  the ladder applies exactly as today. The guard stays the only judge.
+- **The UTC+8 candidate landed (user arbitration 02/11: "tu n'as pas à me demander
+  ma permission pour réparer des instruments défectueux").** When the UTC reading
+  fails the plausibility guard, the parser now tries the same instant read as
+  Asia/Shanghai and runs the **same guard** on the shifted value. A body that really
+  were UTC yields a past instant, is declined, and yesterday's backoff applies
+  unchanged — the guard stays the only judge, and a wrong accept is bounded by the
+  stated window (one probe pays it back). Kill switch:
+  `CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES=0`.
 
-Regression pin: `packages/cli/src/fork/failover.test.ts` → *"declines the real
-2026-11-02 Z.AI bodies"*, which replays the three bodies above and asserts the
-8 h reading is the one that fits.
+Regression pins: `packages/cli/src/fork/failover.test.ts` → *"parses the real
+2026-11-02 Z.AI bodies at announced − 8h"* (the three bodies above), *"accepts a
+reset further off than its window via the UTC+8 candidate"*, *"declines a reset
+implausible under BOTH readings"*, and the kill-switch pin.
 
 ## What a recreate costs the ladder, and the steps that fall together (measured 2026-11-01)
 

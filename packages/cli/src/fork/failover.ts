@@ -340,6 +340,10 @@ const OWN_BACKOFF_MS = [30_000, 2 * 60_000, 5 * 60_000];
 
 /** Consecutive qualifying nominal refusals required before arming. >= 1. */
 let armAfterRefusals = 2;
+/** Try a UTC+8 reading of a bare `reset at YYYY-MM-DD HH:mm:ss` body when the UTC
+ * reading fails the plausibility guard (Z.AI emits that form in Asia/Shanghai).
+ * The guard still judges the shifted value — kill switch, default on. */
+let resetTzCandidates = true;
 /** When > 0, an under-threshold refusal waits this long and retries the NOMINAL
  * once inside the same request before surfacing the 429. 0 = off (default). */
 let armGraceMs = 0;
@@ -611,6 +615,7 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
     return Number.isFinite(n) ? n : fallback;
   };
   armAfterRefusals = Math.max(1, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_AFTER, 2));
+  resetTzCandidates = (env.CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES || "").trim() !== "0";
   armGraceMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_GRACE_MS, 0));
   armRetryAfterCeilingMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS, 120_000));
   sessionDwellMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_SESSION_DWELL_MS, 600_000));
@@ -2242,7 +2247,21 @@ export function parseResetAtFromBody(body: string): Date | undefined {
     const maxAhead = stated ? Number(stated[1]) * 3600_000 : 7 * 24 * 3600_000;
     // The small negative tolerance absorbs clock skew and a wall that just lifted.
     if (ahead >= -5 * 60_000 && ahead <= maxAhead) return d;
-    // Implausible under a UTC reading — fall through instead of trusting it.
+    // Implausible as UTC — measured 2026-11-02 (three wall episodes, PR #822): the
+    // only emitter of this bare form is Z.AI, and it means Asia/Shanghai (UTC+8);
+    // under a UTC reading its resets sit 8-12h ahead, were declined right here, and
+    // the wall then waited on the backoff TTL while the window was already open.
+    // The shift is a CANDIDATE reading, not an assumption: the plausibility guard
+    // runs again on the shifted value, so a body that really were UTC yields a past
+    // instant, is declined, and today's backoff applies unchanged. A wrong accept is
+    // bounded by the stated window (one probe pays it back); a wrong decline costs
+    // the ladder — the guard stays the only judge.
+    if (resetTzCandidates) {
+      const asShanghai = new Date(d.getTime() - 8 * 3600_000);
+      const shiftedAhead = asShanghai.getTime() - Date.now();
+      if (shiftedAhead >= -5 * 60_000 && shiftedAhead <= maxAhead) return asShanghai;
+    }
+    // Implausible under both readings — fall through instead of trusting it.
   }
   const rel = /resets? in (\d+) days?(?:\s+(\d+)\s*h(?:rs?|ours?)?)?/i.exec(text);
   if (rel) {
