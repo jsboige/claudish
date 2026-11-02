@@ -1026,12 +1026,19 @@ describe("reset-time awareness", () => {
     // this change — they pin the plausibility guard so a later, more permissive parse
     // cannot quietly start trusting a timestamp whose offset it cannot justify. The
     // two tests above are the ones that fail without the branch.
-    it("declines a GLM reset further off than the window it declares (a non-UTC reading)", () => {
-      // 12h ahead while the body says the window is 5h: unreachable under UTC, so the
-      // timestamp means some other offset. Declining costs one wasted probe; trusting
-      // it would skip a working lane for hours.
+    it("accepts a reset further off than its window via the UTC+8 candidate — Z.AI means Shanghai", () => {
+      // 12h ahead while the body says the window is 5h: impossible under UTC, exact
+      // shape of the production 1308 corpus (8-12h ahead, PR #822). The shifted
+      // reading lands 4h ahead — inside the window the body itself states.
       const got = parseResetAtFromBody(
         '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 1970-01-01 12:16:40"}}'
+      );
+      expect(got?.getTime()).toBe(clock + 4 * 3600_000);
+    });
+
+    it("declines a reset implausible under BOTH readings (3 days ahead of a 5h window)", () => {
+      const got = parseResetAtFromBody(
+        '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 1970-01-04 03:16:40"}}'
       );
       expect(got).toBeUndefined();
     });
@@ -1041,6 +1048,36 @@ describe("reset-time awareness", () => {
         '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 1969-12-31 23:46:40"}}'
       );
       expect(got).toBeUndefined();
+    });
+
+    // MEASURED 2026-11-02 (hub, three wall episodes, PR #822): Z.AI announces its
+    // reset in Asia/Shanghai (UTC+8), so under the UTC reading every real 1308 body
+    // sits 8-12h ahead. Since the UTC+8 candidate landed, these parse to announced
+    // −8h — each landing just after the refusal, inside the window the body states.
+    // Before it, they were declined and the wall waited on the bucket TTL: 22.3,
+    // 37.7 and ~10 min of an open window spent on the ladder (~74 $/month).
+    it("parses the real 2026-11-02 Z.AI bodies at announced − 8h", () => {
+      const pad = (n: number) => String(n).padStart(2, "0");
+      // [refusal h:m:s, announced reset h:m:s] — all three agree on exactly 8h.
+      const cases: Array<[[number, number, number], [number, number, number]]> = [
+        [[2, 38, 58], [10, 56, 47]],
+        [[8, 16, 12], [16, 19, 6]],
+        [[13, 27, 6], [21, 56, 50]],
+      ];
+      for (const [[rh, rm, rs], [xh, xm, xs]] of cases) {
+        clock = Date.UTC(2026, 10, 2, rh, rm, rs);
+        const body = `{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-02 ${pad(xh)}:${pad(xm)}:${pad(xs)}"}}`;
+        expect(parseResetAtFromBody(body)?.getTime()).toBe(Date.UTC(2026, 10, 2, xh - 8, xm, xs));
+      }
+    });
+
+    it("kill switch CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES=0 restores the UTC-only reading", () => {
+      initFailover({ CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES: "0" } as NodeJS.ProcessEnv);
+      clock = Date.UTC(2026, 10, 2, 2, 38, 58);
+      const body =
+        '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-02 10:56:47"}}';
+      expect(parseResetAtFromBody(body)).toBeUndefined();
+      initFailover({} as NodeJS.ProcessEnv);
     });
 
     it("bounds an unstated window at 7 days rather than trusting it outright", () => {

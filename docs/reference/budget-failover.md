@@ -630,6 +630,59 @@ Reading rules that fall out:
   the GLM plan's concurrency ceiling — not a hub rate limit, not a proxy
   throughput wall.
 
+## Z.AI announces its reset in UTC+8, so the wall lifts on the ladder, not on the clock (measured 2026-11-02)
+
+`parseResetAtFromBody` reads the `1308` form (`Usage limit reached for 5 hour.
+Your limit will reset at YYYY-MM-DD HH:mm:ss`, no timezone marker) as **UTC** and
+then refuses any value the message's own stated window cannot justify. That guard
+is right, and the reason it fires on every real Z.AI body is measured below — the
+provider means **Asia/Shanghai**, 8 h ahead.
+
+Three wall episodes on the hub, each with its announced reset and the moment GLM
+actually served again (captures, per-minute; the bucket re-probes at each
+`DISARMED … probing nominals`, TTL 10 → 20 → 40 min):
+
+| episode | last `1308` | next successful probe | opening bracket | announced − 8 h | bracket offset |
+|---|---|---|---|---|---|
+| A | 02:38:58 | 03:19:06 | (02:38:58, 03:18:58] | **02:56:47** ✓ | 7 h 38 → 8 h 18 |
+| B | 08:16:12 | 08:56:50 | (08:16:12, 08:56:14] | **08:19:06** ✓ | 7 h 23 → 8 h 03 |
+| C | 13:27:06 | 14:08 (probe at 14:07:06) | (13:27:06, 14:07:06] | **13:56:50** | 7 h 50 → 8 h 30 |
+
+The intersection of the three brackets is **[7 h 50, 8 h 03] ≈ 8 h 00**: UTC+8 fits
+every episode, while UTC and UTC+1 are refuted outright (under those readings GLM
+would have stayed walled until 10:56 / 16:19, yet it served from 03:19 / 08:56).
+Episode C is the clean one: the wall lifted at 13:27:06 + 40 min = **14:07:06**,
+seven minutes *after* the announced−8h instant, so the lift was the TTL and the
+true opening sits in the bracket above.
+
+What it costs, bounded: the UTC-read value is declined, so the step falls to the
+bucket TTL and is blind between the true opening and the next probe — **22.3 min**
+(A), **37.7 min** (B), ~10 min (C). Those windows carried 721 + 1 409 + 281
+responses; at GLM's measured peak (≈ 21/min) the share GLM would have absorbed is
+≈ **1 400 responses/day ≈ 2.5 $/day ≈ 74 $/month** at the observed PAYG unit cost.
+That is ~7 % of the current run rate: real, and not a path to the 300 €/month
+target.
+
+Two verdicts from this measurement:
+
+- **Raising `CLAUDISH_FAILOVER_ARM_AFTER` (Q-76 study) stays rejected.** The
+  `1302` throttle never arms — `isQuotaExhaustion` matches neither "rate limit" nor
+  "per minute" — so the day's 34 arms came from 39 genuine `1308` walls and are
+  legitimate. The cost is the *lift time*, not the refusal count.
+- **The UTC+8 candidate landed (user arbitration 02/11: "tu n'as pas à me demander
+  ma permission pour réparer des instruments défectueux").** When the UTC reading
+  fails the plausibility guard, the parser now tries the same instant read as
+  Asia/Shanghai and runs the **same guard** on the shifted value. A body that really
+  were UTC yields a past instant, is declined, and yesterday's backoff applies
+  unchanged — the guard stays the only judge, and a wrong accept is bounded by the
+  stated window (one probe pays it back). Kill switch:
+  `CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES=0`.
+
+Regression pins: `packages/cli/src/fork/failover.test.ts` → *"parses the real
+2026-11-02 Z.AI bodies at announced − 8h"* (the three bodies above), *"accepts a
+reset further off than its window via the UTC+8 candidate"*, *"declines a reset
+implausible under BOTH readings"*, and the kill-switch pin.
+
 ## What a recreate costs the ladder, and the steps that fall together (measured 2026-11-01)
 
 The 00:41:30Z deploy of `main` gave the first full-window reading of the ladder
