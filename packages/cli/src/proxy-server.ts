@@ -111,6 +111,8 @@ import { convertOpenAIRequestToAnthropic } from "./handlers/shared/format/openai
 import { UNHANDLED_ERROR_HEADER } from "./handlers/shared/hop-decision.js";
 import { resolveInboundKeys } from "./handlers/shared/inbound-keys.js";
 import { resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
+import { isContextOverflowError } from "./handlers/shared/request-shape.js";
+import { readStepSkip, stepSkipDisabled } from "./handlers/shared/step-skip.js";
 import type { ModelHandler } from "./handlers/types.js";
 import type { HookEngine } from "./hooks/engine.js";
 import { loadHooksOnce } from "./hooks/index.js";
@@ -1083,8 +1085,7 @@ export async function createProxyServer(
   // loop — the gap list is enumerated in the PR and each entry lands as its own
   // grain: no #747 serving-note strip (the module snapshot predates it), no
   // #412 keyless suppression, no #565 context-admission census, no #654
-  // endpoint token budget, no #431 busy/context skip wire (the Context marker
-  // family is not ported), no #299-B overload walk, no #218 native-lane version
+  // endpoint token budget, no #299-B overload walk, no #218 native-lane version
   // pin, no #693 machine-scoped resolution arm (the ported
   // resolveFailoverTargetForSession takes no machine argument), no #769
   // unroutable-step skip (a RoutingError at construction surfaces).
@@ -1092,6 +1093,12 @@ export async function createProxyServer(
   // in-request is followed by the next concrete of the TARGET's path on the same
   // delegating step, before the caller's next step — outside the attempt budget,
   // bounded by the target path's candidate count.
+  // #431 IS wired below too (the STEP-SKIP block in the non-quota branch): a
+  // non-last step that cannot TAKE this request advances without a failure mark.
+  // Its `context` producer is the loop's own reading of the step's error body
+  // (`isContextOverflowError`); the header contract is ported and read, but no
+  // handler-side emitter exists on this base yet (media cap / concurrency
+  // refusal / #565 recovery turn are the three producers main has).
   //
   // Inert with no CLAUDISH_FAILOVER_* env: no rule ⇒ one attempt ⇒ the nominal
   // through the same resolution as before, byte-identical serve.
@@ -1210,6 +1217,11 @@ export async function createProxyServer(
     // set). The index-keyed, #331-aware twin on main also feeds a revisit
     // guard this base does not have — here the set has exactly one reader.
     const paidConcretes = new Set<string>();
+    // #431: steps THIS request skipped because they cannot take it. A size
+    // refusal says nothing about the step's health, so it writes no failure
+    // state — this set is the request's ONLY memory of the skip, and it is
+    // request-scoped by construction (the next request may fit).
+    const skippedSteps = new Set<number>();
     let response: Response | undefined;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // #609: an override attempt serves the walk's concrete verbatim and reads
@@ -1222,7 +1234,7 @@ export async function createProxyServer(
         override && rule
           ? { step: rule.steps[override.stepIndex], stepIndex: override.stepIndex }
           : role
-            ? resolveFailoverTargetForSession(role, sessionKey, bucket)
+            ? resolveFailoverTargetForSession(role, sessionKey, bucket, skippedSteps)
             : { step: null as FailoverStep | null, stepIndex: -1 };
       const { stepIndex } = resolved;
       // #274: when this attempt serves a role-step's DELEGATION, the bookkeeping
@@ -1304,6 +1316,42 @@ export async function createProxyServer(
       }
       const reason = `HTTP ${response.status} from ${requestedModel}`;
       if (!isQuotaExhaustion(response.status, errBody)) {
+        // #317/#276 bookkeeping below reads this; the #431 skip above needs it
+        // BEFORE any mark is written, so it is computed once, here.
+        const isIntermediateStep =
+          stepIndex >= 0 && rule != null && stepIndex < rule.steps.length - 1;
+        // #431 — a step that cannot TAKE this request is skipped, not failed.
+        // Two producers feed one decision: the wire (`x-claudish-step-skip`,
+        // what a handler-side emitter sets on main and what this loop will read
+        // unchanged when v14 gains one) and, today, the loop's own reading of
+        // the step's error body. Only a NON-LAST step with a successor is
+        // eligible (the last step has nothing to advance to, and its own refusal
+        // is what the client must see); `continue` WITHOUT `attempt--` pays the
+        // attempt exactly as a step attempt does, and `skippedSteps` keeps the
+        // rest of this request off the same step. No mark, no wall, no arm, no
+        // dwell pin — that is the whole point of the signal.
+        if (isIntermediateStep && !stepSkipDisabled()) {
+          const wireSkip = readStepSkip(response);
+          const skip =
+            wireSkip ??
+            (isContextOverflowError(response.status, errBody)
+              ? { reason: "context" as const, detail: `status=${response.status}` }
+              : null);
+          if (skip) {
+            skippedSteps.add(stepIndex);
+            log(
+              `[Failover] STEP-SKIP ${role}[${stepIndex}] — ${skip.reason}${skip.detail ? ` (${skip.detail})` : ""}; ` +
+                "step stays healthy, trying next step",
+              true // forceConsole — operational event, countable marker
+            );
+            try {
+              await response.body?.cancel();
+            } catch {
+              // already gone — nothing to drain
+            }
+            continue;
+          }
+        }
         // Wiring faults never advance: a mistyped model id in a step would
         // become permanently invisible, every request stepping over it.
         if (isWiringError(response.status, errBody)) {
@@ -1320,8 +1368,6 @@ export async function createProxyServer(
         // request re-pays the round-trip to a step that may be down for hours).
         // The nonQuota flag (#276) forfeits a dwell pin instead of re-pinning
         // deeper. #331: the mark carries the CONCRETE this attempt served.
-        const isIntermediateStep =
-          stepIndex >= 0 && rule != null && stepIndex < rule.steps.length - 1;
         if (!isIntermediateStep) {
           // #609: a delegating LAST step whose concrete failed non-quota walks
           // the target's remaining path before surfacing. No mark is written —
