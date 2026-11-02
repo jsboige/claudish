@@ -630,6 +630,51 @@ Reading rules that fall out:
   the GLM plan's concurrency ceiling — not a hub rate limit, not a proxy
   throughput wall.
 
+## Z.AI announces its reset in UTC+8, so the wall lifts on the ladder, not on the clock (measured 2026-11-02)
+
+`parseResetAtFromBody` reads the `1308` form (`Usage limit reached for 5 hour.
+Your limit will reset at YYYY-MM-DD HH:mm:ss`, no timezone marker) as **UTC** and
+then refuses any value the message's own stated window cannot justify. That guard
+is right, and the reason it fires on every real Z.AI body is measured below — the
+provider means **Asia/Shanghai**, 8 h ahead.
+
+Three wall episodes on the hub, each with its announced reset and the moment GLM
+actually served again (captures, per-minute; the bucket re-probes at each
+`DISARMED … probing nominals`, TTL 10 → 20 → 40 min):
+
+| episode | last `1308` | next successful probe | opening bracket | announced − 8 h | bracket offset |
+|---|---|---|---|---|---|
+| A | 02:38:58 | 03:19:06 | (02:38:58, 03:18:58] | **02:56:47** ✓ | 7 h 38 → 8 h 18 |
+| B | 08:16:12 | 08:56:50 | (08:16:12, 08:56:14] | **08:19:06** ✓ | 7 h 23 → 8 h 03 |
+| C | 13:27:06 | (probe due 14:07) | (13:27:06, 14:07:06] | **13:56:50** | 7 h 50 → 8 h 30 |
+
+The intersection of the three brackets is **≈ 8 h 00**: UTC+8 fits every episode,
+while UTC and UTC+1 are refuted outright (under those readings GLM would have
+stayed walled until 10:56 / 16:19, yet it served from 03:19 / 08:56).
+
+What it costs, bounded: the UTC-read value is declined, so the step falls to the
+bucket TTL and is blind between the true opening and the next probe — **22.3 min**
+(A), **37.7 min** (B), ~10 min (C). Those windows carried 721 + 1 409 + 281
+responses; at GLM's measured peak (≈ 21/min) the share GLM would have absorbed is
+≈ **1 400 responses/day ≈ 2.5 $/day ≈ 74 $/month** at the observed PAYG unit cost.
+That is ~7 % of the current run rate: real, and not a path to the 300 €/month
+target.
+
+Two things this measurement does **not** justify:
+
+- **Raising `CLAUDISH_FAILOVER_ARM_AFTER` (Q-76 study, verdict: leave it).** The
+  `1302` throttle never arms — `isQuotaExhaustion` matches neither "rate limit" nor
+  "per minute" — so the day's 34 arms came from 39 genuine `1308` walls and are
+  legitimate. The cost is the *lift time*, not the refusal count.
+- **Trusting the timestamp outright.** A per-provider offset (`+08:00` for Z.AI)
+  must be applied **before** the same guard, never instead of it: applied to a body
+  that really were UTC, the shifted value lands in the past, fails the guard, and
+  the ladder applies exactly as today. The guard stays the only judge.
+
+Regression pin: `packages/cli/src/fork/failover.test.ts` → *"declines the real
+2026-11-02 Z.AI bodies"*, which replays the three bodies above and asserts the
+8 h reading is the one that fits.
+
 ## What a recreate costs the ladder, and the steps that fall together (measured 2026-11-01)
 
 The 00:41:30Z deploy of `main` gave the first full-window reading of the ladder

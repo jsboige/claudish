@@ -1043,6 +1043,32 @@ describe("reset-time awareness", () => {
       expect(got).toBeUndefined();
     });
 
+    // MEASURED 2026-11-02 (hub, three wall episodes): Z.AI announces its reset in
+    // Asia/Shanghai (UTC+8), so under the UTC reading every real 1308 body sits 8-12h
+    // ahead and is declined — the step then waits on the bucket TTL, not the clock.
+    // The bodies below are verbatim from that day; the residual cost is ~74 $/month
+    // (docs/reference/budget-failover.md §Z.AI announces its reset in UTC+8). If an
+    // offset fix ever lands, these flip to values and this is the test that says so.
+    it("declines the real 2026-11-02 Z.AI bodies — Z.AI announces in UTC+8, not UTC", () => {
+      const pad = (n: number) => String(n).padStart(2, "0");
+      // [refusal h:m:s, announced reset h:m:s] — all three agree on exactly 8h.
+      const cases: Array<[[number, number, number], [number, number, number]]> = [
+        [[2, 38, 58], [10, 56, 47]],
+        [[8, 16, 12], [16, 19, 6]],
+        [[13, 27, 6], [21, 56, 50]],
+      ];
+      for (const [[rh, rm, rs], [xh, xm, xs]] of cases) {
+        clock = Date.UTC(2026, 10, 2, rh, rm, rs);
+        const body = `{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-02 ${pad(xh)}:${pad(xm)}:${pad(xs)}"}}`;
+        expect(parseResetAtFromBody(body)).toBeUndefined();
+        // The only reading that fits the bracket: minus 8h lands just after the
+        // refusal, inside the 5h window the body itself states.
+        const asShanghai = Date.UTC(2026, 10, 2, xh - 8, xm, xs);
+        expect(asShanghai).toBeGreaterThan(clock);
+        expect(asShanghai - clock).toBeLessThanOrEqual(5 * 3600_000);
+      }
+    });
+
     it("bounds an unstated window at 7 days rather than trusting it outright", () => {
       expect(parseResetAtFromBody("Your limit will reset at 1970-01-02 00:16:40")?.getTime()).toBe(
         clock + 24 * 3600_000
