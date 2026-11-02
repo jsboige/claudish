@@ -22,6 +22,7 @@ import {
   type DelegationOwner,
   type FailoverStep,
   NATIVE_BUCKET,
+  buildServingNoteForRequest,
   classifyNominalBucket,
   delegationCandidateBound,
   earliestWalledReprobeAt,
@@ -45,6 +46,7 @@ import {
   servedStepForNotices,
   setRoleNominalBucketResolver,
   setRoleNominalResolver,
+  stripServingNoticesFromRequestBody,
 } from "./fork/failover.js";
 import { collectRoutedBareNames, createProxyAuthMiddleware } from "./fork/middleware/proxy-auth.js";
 // #641 blocker-2 port — capture pipeline (fork extension). request-logger owns
@@ -1083,10 +1085,9 @@ export async function createProxyServer(
   // the bucket helpers, and the serve loop (nominal → steps, bounded), adapted
   // to the seams that exist on this base. Deliberately narrower than main's
   // loop — the gap list is enumerated in the PR and each entry lands as its own
-  // grain: no #747 serving-note strip (the module snapshot predates it), no
-  // #412 keyless suppression, no #565 context-admission census, no #654
-  // endpoint token budget, no #299-B overload walk, no #218 native-lane version
-  // pin, no #693 machine-scoped resolution arm (the ported
+  // grain: no #412 keyless suppression, no #565 context-admission census, no
+  // #654 endpoint token budget, no #299-B overload walk, no #218 native-lane
+  // version pin, no #693 machine-scoped resolution arm (the ported
   // resolveFailoverTargetForSession takes no machine argument), no #769
   // unroutable-step skip (a RoutingError at construction surfaces).
   // #609 IS wired below (walkDelegatedTarget): a delegated concrete that fails
@@ -1099,6 +1100,13 @@ export async function createProxyServer(
   // (`isContextOverflowError`); the header contract is ported and read, but no
   // handler-side emitter exists on this base yet (media cap / concurrency
   // refusal / #565 recovery turn are the three producers main has).
+  // #747 IS wired below as well (both halves of the (b) arbitration): the
+  // serving banners are stripped from assistant history right after the
+  // attempt-0 capture (v14's logRequest lives inside the loop, so the strip
+  // sits after it — the capture keeps the client's verbatim history), and a
+  // substitute serving a request carries its capability note in the top-level
+  // `system`, mutate-before / restore-on-failure around the handler call.
+  // Kill switches: CLAUDISH_FAILOVER_NOTICE_STRIP / CLAUDISH_FAILOVER_REQUEST_NOTE.
   //
   // Inert with no CLAUDISH_FAILOVER_* env: no rule ⇒ one attempt ⇒ the nominal
   // through the same resolution as before, byte-identical serve.
@@ -1189,6 +1197,20 @@ export async function createProxyServer(
    * routes; applyFailoverNotices wraps the result at the route (content on
    * /v1/messages, response header on /v1/chat/completions — #229).
    */
+  /** #747 (b): append a note to an Anthropic payload's top-level `system`
+   * (absent, string, or block array) without mutating the original value —
+   * the loop's restore is a reference swap. Never throws. */
+  const appendSystemNote = (body: any, note: string): void => {
+    try {
+      if (body.system == null) body.system = note;
+      else if (typeof body.system === "string") body.system = `${body.system}\n\n${note}`;
+      else if (Array.isArray(body.system))
+        body.system = [...body.system, { type: "text", text: note }];
+    } catch {
+      // The note is advisory — never let it fail the request.
+    }
+  };
+
   const handleWithCascade = async (
     c: Context,
     body: any,
@@ -1279,12 +1301,44 @@ export async function createProxyServer(
       // attempt 0, so an armed role logs the step's lane, not the nominal's.
       if (attempt === 0) {
         logRequest(body, handler.constructor.name, c.req.raw, hostnameConfig.remoteAddrMap);
+        // #747 (b): serving banners never travel upstream. On main the strip
+        // sits at the top of handleWithCascade because logRequest runs at the
+        // ROUTE, before the cascade; on this base logRequest lives INSIDE the
+        // loop, so the equivalent contract — capture keeps the client's
+        // verbatim history (the banner-count instruments read it), every
+        // handler of every attempt forwards clean history — puts the strip
+        // right HERE, after the capture line and before the first
+        // handler.handle below. Attempt 0 is the only capture; later attempts
+        // inherit the already-stripped body. Kill switch:
+        // CLAUDISH_FAILOVER_NOTICE_STRIP=0.
+        if ((process.env.CLAUDISH_FAILOVER_NOTICE_STRIP || "").trim() !== "0") {
+          stripServingNoticesFromRequestBody(body);
+        }
       }
       // #317: FRESH attempt token per paid upstream attempt — the usage sink
       // keys its max-ledger on it (two paid attempts of one request must land
       // in two slots). No-op when both bars are off.
       openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+      // #747 (b): while a SUBSTITUTE serves, it learns its capability delta
+      // from the request side — appended to the top-level `system` of every
+      // such request (the banners are stripped from history above, and the
+      // in-content banner fires once per depth for the HUMAN). Applied around
+      // the upstream call only, mutate-before / restore-on-failure: the
+      // mutation never outlives the attempt that earned it (a failed attempt
+      // walks to the next candidate, which earns its own note fresh). Nominal
+      // attempts (stepIndex -1) carry no note. Kill switch:
+      // CLAUDISH_FAILOVER_REQUEST_NOTE=0.
+      const servingNote =
+        role &&
+        stepIndex >= 0 &&
+        resolved.step &&
+        (process.env.CLAUDISH_FAILOVER_REQUEST_NOTE || "").trim() !== "0"
+          ? buildServingNoteForRequest(role, resolved.step, stepIndex, bucket)
+          : null;
+      const systemBeforeNote = body.system;
+      if (servingNote) appendSystemNote(body, servingNote);
       response = await handler.handle(c, body);
+      if (servingNote && !response.ok) body.system = systemBeforeNote;
       if (response.ok) {
         if (role) {
           // #431 CR B1: name the step that actually served, for the notices.
