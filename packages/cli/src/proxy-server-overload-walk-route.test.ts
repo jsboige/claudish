@@ -47,6 +47,12 @@ import { createProxyServer } from "./proxy-server.js";
 import type { ProxyServer } from "./types.js";
 
 const realFetch = globalThis.fetch.bind(globalThis);
+const realConsoleLog = console.log.bind(console);
+const realStderrWrite = (process.stderr as any).write.bind(process.stderr);
+
+/** #769 pins read the marker lines; the call counts alone cannot tell a SKIP
+ *  from a step that was never resolved. */
+let failoverLog: string[] = [];
 
 let calls: Record<string, number> = {};
 /** Per-endpoint HTTP status override. Absent ⇒ 200 healthy SSE. */
@@ -152,6 +158,13 @@ function armCascade(): void {
   setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
 }
 
+/** #769: re-init with an ARBITRARY cascade env (the unroutable pins need the
+ *  steps to name a provider with no credential in the sandbox). */
+function resetWalk(env: Record<string, string>): void {
+  resetFailoverForTests({ CLAUDISH_FAILOVER_AUTO: "1", CLAUDISH_FAILOVER_ARM_AFTER: "1", ...env });
+  setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
+}
+
 async function postMessage(
   opts: { model?: string; headers?: Record<string, string> } = {}
 ): Promise<Response> {
@@ -200,6 +213,22 @@ beforeEach(() => {
   calls = { nm: 0, s0: 0, s1: 0, native: 0 };
   endpointStatus = { nm: 529, native: 529 };
   endpointDelayMs = {};
+  failoverLog = [];
+  (process.stderr as any).write = ((chunk: any, ...rest: any[]) => {
+    const text = typeof chunk === "string" ? chunk : String(chunk);
+    for (const line of text.split("\n")) {
+      if (line.includes("[Failover]")) failoverLog.push(line);
+    }
+    return realStderrWrite(chunk, ...rest);
+  }) as any;
+  console.log = ((...args: any[]) => {
+    const text = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
+    for (const line of text.split("\n")) {
+      if (line.includes("[Failover]")) failoverLog.push(line);
+    }
+    // Re-emit so a failing run still shows the proxy's operator markers.
+    realConsoleLog(...args);
+  }) as any;
   registerFakeEndpoints();
   for (const k of SANDBOX_ENV_KEYS) {
     savedEnv[k] = process.env[k];
@@ -246,6 +275,8 @@ beforeEach(() => {
 
 afterEach(async () => {
   globalThis.fetch = realFetch;
+  (process.stderr as any).write = realStderrWrite;
+  console.log = realConsoleLog;
   if (activeProxy) {
     await activeProxy.shutdown();
     activeProxy = null;
@@ -472,6 +503,114 @@ describe("#299-B — a nominal overload walks the cascade ONCE, writing zero fai
     const r1 = await postMessage();
     expect(r1.status).not.toBe(200);
     expect(calls.s0).toBe(0);
+    expect(isFailoverActive("sonnet")).toBe(false);
+  }, 30_000);
+});
+
+// ─── #769 — an unroutable step skips FORWARD, never a terminal routing 400 ────
+//
+// A step naming `provider@model` whose provider has no credential on THIS host
+// throws a RoutingError at handler CONSTRUCTION — before any upstream call.
+// That is an IMPASSE, not an attempt failure: the step is healthy, the host
+// just cannot route it. `kimi` is the vehicle because KIMI_API_KEY is in
+// SANDBOX_ENV_KEYS, so the throw is guaranteed and hermetic.
+describe("#769 — an unroutable cascade step advances instead of failing the turn", () => {
+  // Site A — the ARMED loop (not the walk) hitting an unroutable step. The
+  // skip rides the SAME request-scoped `skippedSteps` set the #431 family
+  // uses: no failure mark, no wall, no arm, no pin.
+  test("U1: an ARMED cascade whose step 0 is unroutable → step 1 serves, no mark", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "kimi@fake-kimi>s1-ep@fake-s1" });
+    // Arm the NOMINAL's bucket so the loop resolves the cascade from attempt 0.
+    expect(
+      armFailover(
+        "sonnet",
+        "test: nominal walled, cascade engaged",
+        providerBucketOf(SONNET_NOMINAL)
+      )
+    ).toBe(true);
+
+    const r1 = await postMessage({ model: "claude-sonnet-5" });
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(0); // walled nominal — never probed
+    expect(calls.s0 ?? 0).toBe(0); // unroutable — construction threw before any call
+    expect(calls.s1).toBe(1); // the skip landed on the next step
+    // The skip marker names the step, the reason and the concrete (countable).
+    expect(
+      failoverLog.some(
+        (l) =>
+          l.includes("[Failover] SKIP sonnet[0]") &&
+          l.includes("reason=unroutable") &&
+          l.includes("kimi@fake-kimi")
+      )
+    ).toBe(true);
+    // No step marked failed: the last-step marker must NOT appear.
+    expect(failoverLog.some((l) => l.includes("STEP-UNROUTABLE sonnet"))).toBe(false);
+  }, 30_000);
+
+  // AC 6 — the LAST step unroutable cannot skip: the cascade refuses in the
+  // labelled overload form (529 + `x-claudish-step-skip: unroutable`), NOT with
+  // a client-shaped routing 400. The gap is host-local, not the caller's fault.
+  test("U2: LAST step unroutable → labelled 529 refusal, never a routing 400", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0>kimi@fake-kimi" });
+    expect(
+      armFailover(
+        "sonnet",
+        "test: nominal walled, cascade engaged",
+        providerBucketOf(SONNET_NOMINAL)
+      )
+    ).toBe(true);
+    // Step 0 benched through the plane the ARMED resolver reads, so the
+    // resolver hands back the LAST (unroutable) one.
+    markStepFailed("sonnet", 0, "test: step 0 benched", undefined, { concrete: "s0-ep@fake-s0" });
+
+    const r1 = await postMessage({ model: "claude-sonnet-5" });
+    expect(r1.status).toBe(529); // the labelled refusal, retryable
+    expect(r1.headers.get("x-claudish-step-skip")).toContain("unroutable");
+    const parsed = JSON.parse(await r1.text());
+    expect(parsed.error.type).toBe("overloaded_error");
+    expect(parsed.error.message).toContain("has no routable step on this host");
+    expect(parsed.error.message).toContain("kimi@fake-kimi");
+    // The env-var hint of the underlying RoutingError reaches the operator.
+    expect(parsed.error.message).toContain("KIMI_API_KEY");
+    expect(calls.s0).toBe(0);
+    expect(failoverLog.some((l) => l.includes("[Failover] STEP-UNROUTABLE sonnet[1]"))).toBe(true);
+  }, 30_000);
+
+  // Site B — the WALK's own construction. Before #769 the catch swallowed this
+  // throw as a classless failure and the ORIGINAL 529 surfaced: a host-local
+  // routing gap cost the request the whole cascade.
+  test("W14: the walk target UNROUTABLE (no credential) → the walk advances and serves", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "kimi@fake-kimi>s1-ep@fake-s1" });
+    // NOT armed: the walk is the path that serves a substitute without arming.
+    const r1 = await postMessage({ model: "claude-sonnet-5" });
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(1); // the overloaded nominal, paid once
+    expect(calls.s1).toBe(1); // the unroutable step 0 was skipped, step 1 served
+    expect(
+      failoverLog.some(
+        (l) => l.includes("[Failover] WALK-SKIP sonnet") && l.includes("reason=unroutable")
+      )
+    ).toBe(true);
+  }, 30_000);
+
+  // The advance is bounded to ONE hop: a second unroutable target surfaces the
+  // ORIGINAL overload (retryable 529), never a routing 400 and never an
+  // unbounded scan of the cascade.
+  test("W14b: BOTH walk targets unroutable → the ORIGINAL 529, no 400, no state", async () => {
+    await spin();
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "kimi@fake-kimi>kimi@fake-kimi2" });
+    const r1 = await postMessage({ model: "claude-sonnet-5" });
+    expect(r1.status).toBe(529); // the nominal's own overload, retryable
+    const body = await r1.text();
+    expect(body).toContain("overloaded");
+    expect(body).not.toContain("could not be routed"); // no routing refusal smuggled in
+    expect(calls.nm).toBe(1);
+    expect(calls.s1).toBe(0); // nothing callable on either target
     expect(isFailoverActive("sonnet")).toBe(false);
   }, 30_000);
 });
