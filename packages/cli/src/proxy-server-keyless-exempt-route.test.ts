@@ -326,10 +326,26 @@ describe("#416 T2 — keyless + a server-held credential is refused before any f
 
   test("the refusal wording never arms the fleet's own failover (#296 doctrine)", () => {
     const msg = keylessRefusalMessage(SONNET, "bud-ep@fake-bud");
-    // The real predicate, not a paraphrase of it.
-    expect(isQuotaExhaustion(401, msg)).toBe(false);
-    expect(isQuotaExhaustion(403, msg)).toBe(false);
-    for (const word of ["quota", "credit", "balance", "weekly", "plan limit", "usage limit"]) {
+    // The real predicate, not a paraphrase of it. 402 is absent on purpose: it
+    // arms by STATUS ALONE, body unread — which is exactly why this refusal is
+    // served as 401 (asserted above) and must never be re-served as 402.
+    for (const status of [400, 403, 429, 500]) {
+      expect(isQuotaExhaustion(status, msg)).toBe(false);
+    }
+    // The predicate's FULL trigger vocabulary, so a new wording branch cannot
+    // slip past a list that stopped at the words known when it was written.
+    for (const word of [
+      "quota",
+      "credit",
+      "balance",
+      "weekly",
+      "plan limit",
+      "usage limit",
+      "insufficient",
+      "exhaust",
+      "upgrade your plan",
+      "exceed your account",
+    ]) {
       expect(msg.toLowerCase()).not.toContain(word);
     }
   });
