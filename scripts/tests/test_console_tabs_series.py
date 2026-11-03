@@ -86,11 +86,20 @@ def test_extract_invents_nothing_when_nothing_matches():
     assert got == {}, got
 
 
-def test_extract_prefers_leftover_percent_over_a_bare_percent():
-    # The usage page prints both the remaining figure and a decorative 4 %; the
-    # "restants" form must win, otherwise the series silently changes meaning.
+def test_extract_ignores_a_bare_percent_and_reads_the_leftover_form():
+    # The usage page prints both the remaining figure and a decorative 12 %; only the
+    # "restants" form is trusted (review #834, CR (iii)). A bare `N %` is a usage
+    # figure as often as a remaining one — interpreting it would silently change what
+    # the `pct` column means mid-series, so it must stay ABSENT.
     got = tabs.extract(["Utilisation récente du forfait", "12 %", "4 % restants"])
     assert got["pct"] == "4", got
+
+
+def test_extract_leaves_pct_absent_when_only_a_bare_percent_prints():
+    # Positive control for the removal: a page whose ONLY percentage is bare falls to
+    # NON INTERPRÉTÉ downstream — the honest default, not a mislabelled figure.
+    got = tabs.extract(["Utilisation récente du forfait", "12 %"])
+    assert "pct" not in got, got
 
 
 # --- log(): ts is the instant of OBSERVATION --------------------------------

@@ -29,11 +29,13 @@ Two writers feed it, and they are deliberately different:
 `FIELD_PATTERNS` to `lines`, and reports the consoles it could not read rather than
 filling them with a default.
 
-Every entry carries a `provenance` string, because the tab set MOVES: the user
+Every READER entry carries a `provenance` string, because the tab set MOVES: the user
 opens and closes consoles, and a catalogue that presents an unobserved URL as
 canonical sends the next session to a page with no session (2026-11-02 review).
 `verbatim tab-NN, <instant>` means the URL was read off that open tab at that
 instant; `jamais observé` means it is a standard console path still to confirm.
+A `log` entry carries `provenance` only when `--provenance` is passed — a manual
+reading has no tab to cite, and the field is deliberately absent rather than empty.
 """
 from __future__ import annotations
 
@@ -227,9 +229,11 @@ def cmd_log(args) -> int:
 # explicit on purpose: an extractor that guesses produces a number nobody measured, and
 # a series of those is worse than no series. Anything a pattern cannot read stays ABSENT
 # and is reported as such — never filled with a default.
+# No bare `N %` pattern, deliberately (review #834): a page that prints only a USAGE
+# percentage would land its figure in the same `pct` column the "restants" form fills —
+# a silently mislabelled number. Such a page falls to NON INTERPRÉTÉ instead.
 FIELD_PATTERNS = [
     ("pct", re.compile(r"(\d+(?:[.,]\d+)?)\s*%\s*(?:restants?|remaining)", re.I)),
-    ("pct", re.compile(r"(\d+(?:[.,]\d+)?)\s*%")),
     ("reset", re.compile(
         r"(?:r[ée]initialisation|reset)[^\n]{0,40}?(?:dans|in)\s+([0-9]+\s*[jhd]\s*(?:et\s*)?[0-9]*\s*h?)", re.I)),
     ("credits", re.compile(r"([0-9][0-9\s.,]{2,}?)\s*cr[ée]dits?", re.I)),
