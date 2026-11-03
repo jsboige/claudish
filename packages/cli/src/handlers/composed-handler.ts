@@ -3840,3 +3840,74 @@ export function getRecoveryHint(
   }
   return `Unexpected HTTP ${status} from ${providerName}.`;
 }
+
+/**
+ * Detect whether an HTTP error represents a TRANSIENT provider overload
+ * (concurrency/burst limit, server-side) rather than a quota/usage wall.
+ *
+ * Used to surface the error as HTTP 529 (overloaded_error) instead of 429
+ * (rate_limit_error): clients read 429 as "quota reached" and stop the turn,
+ * whereas 529 means "temporarily overloaded, not your usage limit" and the
+ * client retries with its own backoff. GLM Coding (gc@) frequently delivers
+ * concurrency limits as a direct HTTP 429 whose body contains "overloaded" —
+ * this is NOT a quota wall, and in no-fallback mode there is no other provider
+ * to switch to, so the only useful outcome is a patient client retry. See the
+ * 2026-06-25 patient-backoff revision.
+ *
+ * #299-B port note (v14): on main this predicate has a second reader, the
+ * patient backoff (#302). That caller does not exist on this base yet, so the
+ * walk is its only consumer — ported verbatim so the future backoff lands on
+ * the same reading rather than inventing a second one.
+ */
+export function isTransientOverload(status: number, errorText: string): boolean {
+  const lower = errorText.toLowerCase();
+  if (status === 503) return true;
+  if (status === 429) {
+    return (
+      lower.includes("overloaded") ||
+      lower.includes("concurrency") ||
+      lower.includes("concurrent") ||
+      lower.includes("temporarily") ||
+      lower.includes("service may be") ||
+      lower.includes("try again later")
+    );
+  }
+  return false;
+}
+
+/**
+ * #299-B — the class the cascade's one-shot overload walk answers to: a
+ * provider overload in either of its wire shapes. A bare 529 is the shape the
+ * proxy itself surfaces once the patient backoff is exhausted (the 429/503
+ * overload forms convert to 529 on main); `isTransientOverload` covers the
+ * 429-with-overloaded-body and 503 forms that reach the cascade directly.
+ * #298 A adds the third shape: HTTP 400 + `"connection_error"` — the proxy's
+ * own synthesis of a transport failure to the nominal (#302, credit po-2025).
+ *
+ * Deliberately NOT folded into isTransientOverload: that predicate also gates
+ * the ~5-minute patient backoff, and a 529 entering it would delay every
+ * overloaded turn by minutes before the walk could run — the 2026-10-02 hub
+ * measurement shows sustained 529s, where a fast walk to a healthy step beats
+ * a patient wait on a provider already refusing ~30 % of attempts.
+ */
+export function isOverloadWalkClass(status: number, errorText: string): boolean {
+  // #298 A (clause carried over from #302, credit po-2025): a connection
+  // failure TO the nominal provider is synthesized as HTTP 400 with a
+  // `"connection_error"` code in the body (`connection-error.ts`) — same
+  // "unreachable, not walled" class as an overload, and the client cannot
+  // retry its way out of it any better than a 529.
+  if (isConnectionWalkClass(status, errorText)) return true;
+  return status === 529 || isTransientOverload(status, errorText);
+}
+
+/**
+ * #598 — the CONNECTION class ALONE: HTTP 400 carrying the proxy's own
+ * `"connection_error"` synthesis (#298 A). Strictly narrower than
+ * {@link isOverloadWalkClass}: a step that dies here has said nothing about
+ * its PLAN — the host was unreachable. #598's step ADVANCE is not ported to
+ * this base (it is a follow-up grain); the predicate travels with
+ * isOverloadWalkClass so the walk class stays one definition.
+ */
+export function isConnectionWalkClass(status: number, errorText: string): boolean {
+  return status === 400 && errorText.includes('"connection_error"');
+}

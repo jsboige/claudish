@@ -42,6 +42,7 @@ import {
   resolveDelegationExcluding,
   resolveDelegationOwner,
   resolveFailoverTargetForSession,
+  resolveTransientStep,
   roleFromModelName,
   servedStepForNotices,
   setRoleNominalBucketResolver,
@@ -84,6 +85,7 @@ import {
   createAdvisorPanelGateway,
 } from "./handlers/advisor-panel-gateway.js";
 import { shutdownAdvisorChains } from "./handlers/advisor-route-plan.js";
+import { isOverloadWalkClass } from "./handlers/composed-handler.js";
 import type { ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
@@ -182,6 +184,17 @@ class RoutingError extends Error {
 
 function isTerminalRoutingFailure(e: unknown): e is Error {
   return e instanceof RoutingError;
+}
+
+/** #299-B: the overload walk's remaining-patience budget, in ms. Default
+ * 300 s — by the time a 429/503 overload reaches the walk it has already
+ * climbed the transport ladder (~60 s) and a patient wait (~305 s on main),
+ * leaving little of the client's own timeout. `0` disables the bound.
+ * Read per request (`CLAUDISH_FAILOVER_WALK_BUDGET_MS`). */
+const WALK_BUDGET_DEFAULT_MS = 300_000;
+function readWalkBudgetMs(): number {
+  const raw = Number.parseInt((process.env.CLAUDISH_FAILOVER_WALK_BUDGET_MS || "").trim(), 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : WALK_BUDGET_DEFAULT_MS;
 }
 
 /**
@@ -1086,10 +1099,10 @@ export async function createProxyServer(
   // to the seams that exist on this base. Deliberately narrower than main's
   // loop — the gap list is enumerated in the PR and each entry lands as its own
   // grain: no #412 keyless suppression, no #565 context-admission census, no
-  // #654 endpoint token budget, no #299-B overload walk, no #218 native-lane
-  // version pin, no #693 machine-scoped resolution arm (the ported
-  // resolveFailoverTargetForSession takes no machine argument), no #769
-  // unroutable-step skip (a RoutingError at construction surfaces).
+  // #654 endpoint token budget, no #218 native-lane version pin, no #693
+  // machine-scoped resolution arm (the ported resolveFailoverTargetForSession
+  // takes no machine argument), no #769 unroutable-step skip (a RoutingError at
+  // construction surfaces).
   // #609 IS wired below (walkDelegatedTarget): a delegated concrete that fails
   // in-request is followed by the next concrete of the TARGET's path on the same
   // delegating step, before the caller's next step — outside the attempt budget,
@@ -1107,6 +1120,16 @@ export async function createProxyServer(
   // substitute serving a request carries its capability note in the top-level
   // `system`, mutate-before / restore-on-failure around the handler call.
   // Kill switches: CLAUDISH_FAILOVER_NOTICE_STRIP / CLAUDISH_FAILOVER_REQUEST_NOTE.
+  // #299-B IS wired below as well (the one-shot OVERLOAD walk, in the non-quota
+  // branch): a transient overload on the NOMINAL — 529, an overloading 429/503,
+  // or the proxy's own 400 `connection_error` synthesis — walks ONCE to the
+  // first servable cascade step and writes no failure state; the native lane is
+  // excluded. Its own follow-ups are NOT ported and stay on the gap list:
+  // #598's connection-class ADVANCE past a dead walk step (the walk is one
+  // attempt here), #654's endpoint budget around the walk, and #769's unroutable
+  // skip (a construction throw surfaces, as everywhere else on this base).
+  // Kill switch: CLAUDISH_FAILOVER_OVERLOAD_WALK=0; patience bound:
+  // CLAUDISH_FAILOVER_WALK_BUDGET_MS (default 300 s, 0 = off).
   //
   // Inert with no CLAUDISH_FAILOVER_* env: no rule ⇒ one attempt ⇒ the nominal
   // through the same resolution as before, byte-identical serve.
@@ -1245,6 +1268,12 @@ export async function createProxyServer(
     // request-scoped by construction (the next request may fit).
     const skippedSteps = new Set<number>();
     let response: Response | undefined;
+    // #299-B: one-shot bounded — a nominal transient overload walks to the
+    // first servable cascade step at most ONCE per request, whatever the loop
+    // does afterwards. The walk's patience is measured from HERE, so it
+    // accounts for everything the nominal attempt already spent.
+    let overloadWalked = false;
+    const cascadeStartedAtMs = Date.now();
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // #609: an override attempt serves the walk's concrete verbatim and reads
       // no failover state — the walk chose the concrete, a re-resolution would
@@ -1374,6 +1403,119 @@ export async function createProxyServer(
         // BEFORE any mark is written, so it is computed once, here.
         const isIntermediateStep =
           stepIndex >= 0 && rule != null && stepIndex < rule.steps.length - 1;
+        // #299-B — one-shot overload walk. A 529 (or a 429/503 whose body names
+        // an overload, or the proxy's own 400 `connection_error` synthesis) on
+        // the NOMINAL is a PROVIDER saying "unreachable / overloaded", not the
+        // role's plan being walled (#299 measured 30 % of MiniMax attempts
+        // failing so, 2026-10-02): the client retried a dozen times against the
+        // same overloaded provider and then dropped the turn. Try the FIRST
+        // SERVABLE cascade step ONCE, for this request only, and write no
+        // FAILURE state — no arm, no stepFailures mark, no bucket wall, no
+        // dwell pin (a SERVED attempt still mirrors the loop's success
+        // bookkeeping, which a wall never feeds). The separation is the #170
+        // re-forward's (`no markFail`): the moment the overload lifts, the very
+        // next request re-probes the nominal instead of riding a cascade the
+        // role was never exiled to.
+        //
+        // The NATIVE lane is excluded on purpose (review of #326, point 1): its
+        // bucket is `anthropic-native/<model>` and its meter is the CLIENT's
+        // own Anthropic credential — a native 529 says nothing about a plan
+        // being walled, and Claude Code already retries its 529s on its own.
+        //
+        // v14 shape: no `forceTarget` seam is needed. This base's
+        // getHandlerForRequest is single-arg and the loop swaps the step in
+        // itself (`serveModel` above), so the walk serves `walk.concrete`
+        // through the SAME construction path a step attempt uses.
+        const walkDisabled = (process.env.CLAUDISH_FAILOVER_OVERLOAD_WALK || "").trim() === "0";
+        if (
+          stepIndex === -1 &&
+          !overloadWalked &&
+          !walkDisabled &&
+          rule != null &&
+          rule.steps.length > 0 &&
+          !(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`) &&
+          isOverloadWalkClass(response.status, errBody)
+        ) {
+          overloadWalked = true;
+          // #348: the walk is a recovery attempt paid out of the client's
+          // REMAINING patience — CLAUDISH_FAILOVER_WALK_BUDGET_MS (default
+          // 300 s, 0 = off, read per request) keeps the nominal attempt plus
+          // one walk inside the client's own timeout.
+          const walkBudgetMs = readWalkBudgetMs();
+          const walkElapsedMs = Date.now() - cascadeStartedAtMs;
+          if (walkBudgetMs > 0 && walkElapsedMs > walkBudgetMs) {
+            log(
+              `[Failover] WALK ${role} skipped — budget ${walkElapsedMs}ms > ${walkBudgetMs}ms (HTTP ${response.status} on nominal ${requestedModel})`,
+              true
+            );
+            return response;
+          }
+          // First SERVABLE step, read-only: a step in per-step backoff, a
+          // walled bucket (canonical bucket injected below — this base's
+          // resolver), or a role-step whose delegation cannot resolve a
+          // concrete is skipped — walking there is a round-trip at a target we
+          // already know is dead. The NOMINAL's own bucket is skipped too (a
+          // 529 is that bucket's capacity saying no). Null ⇒ no servable step:
+          // surface the original overload rather than substitute blind.
+          // A rejection must NOT escape the try contract of the walk: the
+          // resolution is async on this base, and a throw here would turn a
+          // retryable 529 into a terminal error — `.catch(() => null)` keeps a
+          // resolver failure on the "no servable step" path.
+          const walk = await resolveTransientStep(role, {
+            bucketOf: async (t) => concreteStepBucketOfSync(t),
+            nominalBucket: bucket ?? undefined,
+          }).catch(() => null);
+          if (walk) {
+            log(
+              `[Failover] WALK ${role} one-shot (HTTP ${response.status} on nominal ${requestedModel}) → ${walk.concrete} (step ${walk.stepIndex})`,
+              true
+            );
+            // ONE paid walk attempt. A served attempt mirrors the loop's
+            // success bookkeeping (a success resets a step's failure count; it
+            // never arms); a failed one writes NO state, ever — the step's own
+            // incident must not become the client's answer, so the ORIGINAL
+            // overload stands. (#598's connection-class advance and #654's
+            // endpoint budget are not on this base; the walk is one attempt by
+            // construction.)
+            const targetDelegation = walk.step.roleRef
+              ? resolveDelegationOwner(role, walk.step)
+              : null;
+            try {
+              const targetHandler = withAdvisor(
+                withRequestHooks(await getHandlerForRequest(walk.concrete)),
+                advisorPresence
+              );
+              // #317: the walk is a paid upstream attempt too — fresh token.
+              openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+              const targetResp = await targetHandler.handle(c, body);
+              if (targetResp.ok) {
+                if (!walk.step.roleRef) resetStepSuccess(role, walk.stepIndex);
+                // Only credit the owner that actually served: a delegation
+                // resolved to a different concrete during the round-trip must
+                // not lift a wall or reset a step on a success it did not
+                // produce.
+                if (targetDelegation && targetDelegation.concrete === walk.concrete) {
+                  if (targetDelegation.owner.nominal) {
+                    onNominalSuccess(
+                      targetDelegation.owner.role,
+                      concreteStepBucketOfSync(targetDelegation.concrete)
+                    );
+                  } else {
+                    resetStepSuccess(targetDelegation.owner.role, targetDelegation.owner.stepIndex);
+                  }
+                }
+                return targetResp;
+              }
+              // Not ok: READ the body — it is the drain (an unread body is a
+              // connection held open for nothing), and nothing is written.
+              await targetResp.text().catch(() => "");
+            } catch {
+              // The attempt itself threw — no class, no advance: the original
+              // overload stands.
+            }
+          }
+          return response;
+        }
         // #431 — a step that cannot TAKE this request is skipped, not failed.
         // Two producers feed one decision: the wire (`x-claudish-step-skip`,
         // what a handler-side emitter sets on main and what this loop will read
