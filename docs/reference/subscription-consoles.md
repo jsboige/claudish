@@ -47,6 +47,38 @@ One browser, several tabs, one session cookie per provider. Consequences:
 (QwenCloud does), so record the clean form and never paste the session-laden one
 into a document.
 
+### A tab is not a live view — reload before you read
+
+An open tab renders when it was last loaded, not when it is read. Measured
+2026-11-03 on a plan-usage console: the DOM was **byte-identical at 14:45Z to the
+reading taken 4 h 45 earlier — same share, same countdowns** — and only a
+`browser_navigate` to the same URL moved both the consumed share (by ~13 %
+relative) and the remaining window (from hours to minutes). Nothing in the text
+announces the staleness: the countdown still reads like a countdown.
+
+So step 2 carries a step 0 — **`browser_navigate` to the console URL before
+extracting**, and record the instant of the *reading*, not of the tab. Two
+consecutive readings that agree to the minute on every countdown are the same
+render, not a flat curve: re-read before concluding either.
+
+### From a reading to a projection
+
+`scripts/minimax-projection.py` (pins: `scripts/tests/test_minimax_projection.py`)
+computes the weekly wall from a single reading and **refuses a caller-chosen pace
+window**: the window is `reset_anchor − 7 d`, so the pace is elapsed time since the
+window opened, never the gap between two samples. The distinction is not academic —
+on a decelerating curve the two windows disagree by more than ×2 on the same reading,
+enough to flip "the wall lands before the reset" into "no wall", and on 2026-11-03
+three successive hand computations of one journal came out ×1.7 apart (cumulative
+pace, a 5.3 h gap, and a reset anchor slipped by a day applied to remaining time).
+`--recompute-log` re-derives a whole journal with the canonical column and flags the
+rows that disagree; `--assume-anchor` repairs a row whose stored anchor slipped a
+day (the same reading projects **×3 higher** on that anchor).
+
+⚠ Measured console levels never enter this repository (public fork): the readings
+live in the machine-local watch logs. What travels here is the ratio, the duration
+and the arithmetic.
+
 ## The inventory
 
 | id | console | answers | wall shape it produces |
