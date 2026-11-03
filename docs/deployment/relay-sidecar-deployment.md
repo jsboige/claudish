@@ -156,6 +156,21 @@ CLAUDISH_FAILOVER_ROLE_MODELS=glm-5.2:sonnet,glm-5.3:sonnet,minimax-m3:haiku
 
 Once written it survives every installer rewrite (#141 carries `CLAUDISH_FAILOVER_*` verbatim); the gap is that nothing provisions it by default — `.env.sidecar.example` documents the var empty, and this runbook's arming checklist never mentioned it until now.
 
+### Refreshing the image — tag the OLD `latest` BEFORE the build (measured 2026-11-03)
+
+An image refresh is `build` + a drained `-Recreate`, and those two steps have an order: reversed, the rollback tag protects the wrong image. Measured on po-2027 (WAN client seat, image 85 commits behind, refresh built from `main` `b2927f16`):
+
+- **Tag the image the container is RUNNING before `docker compose build`.** The build retags `claudish-claudish-proxy:latest`, which leaves the previous image untagged, and the builder reclaims untagged images: after that build, `docker inspect <container> --format '{{.Image}}'` still answered (a running container holds its layers) while `docker tag <id> …:pre-deploy-<UTC>` answered **`No such image`** — the rollback target no longer existed in the store. A `docker tag latest …:pre-deploy-<UTC>` placed *after* `build` is worse than none: it captures the NEW image under a rollback name and attests to a return path that would redeploy the change.
+- **Recovering a lost rollback tag: rebuild from the commit the running image was built from.** The deployment clone's reflog names it (on that seat `264b916`, the state of the 27/10 install); `git checkout --detach <sha> && docker compose build` reproduced the image with the **same `CreatedAt` to the second** (`2026-10-27 17:49:13`), which is what made the rebuilt tag a credible rollback rather than an unverified guess. Then tag it, restore the clone to `main`, rebuild, and **assert the two ids differ before draining**:
+
+```powershell
+docker images --format "{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}" | grep claudish-proxy
+# latest                      <new id>  built today
+# pre-deploy-<UTC>            <old id>  the build date of the OLD image
+```
+
+- **Read the drain's OUTCOME, not its duration.** On that seat: `START pid … 18:59:09` → `OUTCOME success (docker compose up -d returned; /health answering)` at `19:03:04`; on the hub the same script found no true zero in 300 s and cut 4 streams. Same code, different outcomes — both correct. The line to poll is the first `OUTCOME` **after your own `START pid …`** (older `OUTCOME` lines belong to previous runs), and a cut reported there is the script working, not an incident.
+
 ### WAN upstream (`models.myia.io`) — measured traps, 2026-10-27
 
 A client-only seat (po-2027) had to sidecar over the **WAN edge** because its Wi-Fi subnet cannot reach the LAN hub at all (ARP `Unreachable` on `.46/.47/.49/.50/.54`, measured by ai-01 from that seat). Five facts from that install, each measured:
