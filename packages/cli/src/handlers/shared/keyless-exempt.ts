@@ -52,8 +52,9 @@ export function isKeylessExempt(req: Request): boolean {
  * The labeled refusal. `lane` names the credential holder the request resolved
  * to — a NAME, never a key value.
  *
- * ⚠ Wording is load-bearing: `isQuotaExhaustion` arms on 401/403 bodies naming
- * a quota/credit/balance wall, so this message must never contain those words
+ * ⚠ Wording is load-bearing: `isQuotaExhaustion` arms on 400/403/500 bodies
+ * naming a quota/credit/balance wall — never on 401, which is the status this
+ * refusal carries — so this message must never contain those words
  * (same doctrine as #296 and the #400 per-key cap). Pinned by test against the
  * real predicate — an external caller must not be able to divert the fleet's
  * budget failover with a message we wrote ourselves.
