@@ -120,7 +120,11 @@ import { resolveInboundKeys } from "./handlers/shared/inbound-keys.js";
 import { isKeylessExempt, keylessRefusalMessage } from "./handlers/shared/keyless-exempt.js";
 import { resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
 import { isContextOverflowError } from "./handlers/shared/request-shape.js";
-import { readStepSkip, stepSkipDisabled } from "./handlers/shared/step-skip.js";
+import {
+  encodeStepSkipHeader,
+  readStepSkip,
+  stepSkipDisabled,
+} from "./handlers/shared/step-skip.js";
 import type { ModelHandler } from "./handlers/types.js";
 import type { HookEngine } from "./hooks/engine.js";
 import { loadHooksOnce } from "./hooks/index.js";
@@ -1379,7 +1383,74 @@ export async function createProxyServer(
       // withRequestHooks/withAdvisor sit outside getHandlerForRequest exactly
       // because `instanceof NativeHandler` must stay visible here (same
       // doctrine as count_tokens' own check, see withAdvisorSwap's note).
-      const resolvedHandler = await getHandlerForRequest(serveModel);
+      // #769 — an unroutable cascade step skips forward, like the #431 family:
+      // the step is HEALTHY (no upstream answered — construction threw before
+      // any call), the host just cannot route it, so no markStepFailed, no
+      // bucket wall, no arm, no pin. The discriminator is WHO named the target:
+      // stepIndex >= 0 (the CASCADE named it) → skip; -1 (the CLIENT named it)
+      // → the throw stands, terminal 400 + env-var hint, unchanged.
+      //
+      // On main the catch wraps main's multi-arg construction; here the
+      // construction is the loop's own single-arg call on `serveModel`, so the
+      // catch sits at the same seam the swap does.
+      let resolvedHandler: ModelHandler;
+      try {
+        resolvedHandler = await getHandlerForRequest(serveModel);
+      } catch (err) {
+        if (!(err instanceof RoutingError) || !role || stepIndex < 0 || !rule) throw err;
+        const concrete = delegation?.concrete ?? resolved.step?.target ?? serveModel;
+        // The dead concrete was never PAID (construction threw before any
+        // call), and the #609 walk's exclusion set is built only from what a
+        // request paid — so without this entry `resolveDelegationExcluding`
+        // re-offers the same unroutable concrete (with `attempt--`) until the
+        // candidate bound is hit, and the delegation's own routable steps are
+        // never tried (R1, measured on main 31/10). NOTE: this base's set is
+        // flat across steps (main's `triedConcretes` is index-keyed), so the
+        // entry excludes the dead concrete everywhere in this request — a
+        // strictly safer reading for a concrete that cannot be built at all.
+        paidConcretes.add(concrete);
+        // A delegation path may hold another routable concrete — try it first
+        // (#609 semantics: the next iteration re-enters this try on the
+        // override and skips again if that one is unroutable too).
+        if (walkDelegatedTarget()) {
+          attempt--; // outside the caller's budget, bounded by the candidate count
+          continue;
+        }
+        const canSkipStep =
+          stepIndex < rule.steps.length - 1 && attempt + 1 < maxAttempts && !stepSkipDisabled();
+        if (canSkipStep) {
+          log(
+            `[Failover] SKIP ${role}[${stepIndex}] reason=unroutable ${concrete} — advancing to next step, no failure mark (#769)`,
+            true // forceConsole — operational event, countable marker
+          );
+          skippedSteps.add(stepIndex);
+          continue;
+        }
+        // Last step (or no routable successor): refuse in the labelled overload
+        // form — the cascade has no routable step on THIS host, and a bare
+        // routing 400 would read as a client error for a host-local gap.
+        log(
+          `[Failover] STEP-UNROUTABLE ${role}[${stepIndex}] ${concrete} — last step, no routable successor (#769)`,
+          true // forceConsole — operational event, countable marker
+        );
+        return new Response(
+          JSON.stringify(
+            wrapAnthropicError(
+              529,
+              `Cascade ${role} has no routable step on this host — ${concrete}: ${err.message}`,
+              "overloaded_error"
+            )
+          ),
+          {
+            status: 529,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "2",
+              "x-claudish-step-skip": encodeStepSkipHeader("unroutable", concrete),
+            },
+          }
+        );
+      }
       const handler = withAdvisor(withRequestHooks(resolvedHandler), advisorPresence);
       // Capture pipeline contract (fork extension): one [Request] line per
       // request, AFTER handler resolution — the handler that actually serves
@@ -1614,9 +1685,45 @@ export async function createProxyServer(
               // Not ok: READ the body — it is the drain (an unread body is a
               // connection held open for nothing), and nothing is written.
               await targetResp.text().catch(() => "");
-            } catch {
-              // The attempt itself threw — no class, no advance: the original
-              // overload stands.
+            } catch (err) {
+              // #769 — a RoutingError here is NOT an attempt failure: the walk
+              // target was unroutable at construction (no credential for its
+              // provider on this host), so zero upstream calls were paid. The
+              // walk advances ONE hop instead of pinning on a dead step; a
+              // second unroutable target surfaces the ORIGINAL overload, never
+              // a routing 400.
+              if (err instanceof RoutingError) {
+                log(
+                  `[Failover] WALK-SKIP ${role} → ${walk.concrete} reason=unroutable — ${err.message} (#769)`,
+                  true // forceConsole — operational event, countable marker
+                );
+                const unroutableSkip = await resolveTransientStep(role, {
+                  bucketOf: async (t) => concreteStepBucketOfSync(t),
+                  nominalBucket: bucket ?? undefined,
+                  afterStepIndex: walk.stepIndex,
+                }).catch(() => null);
+                if (unroutableSkip) {
+                  try {
+                    const retryHandler = withAdvisor(
+                      withRequestHooks(await getHandlerForRequest(unroutableSkip.concrete)),
+                      advisorPresence
+                    );
+                    openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+                    const retryResp = await retryHandler.handle(c, body);
+                    if (retryResp.ok) {
+                      if (!unroutableSkip.step.roleRef) {
+                        resetStepSuccess(role, unroutableSkip.stepIndex);
+                      }
+                      return retryResp;
+                    }
+                    await retryResp.text().catch(() => "");
+                  } catch {
+                    // Second target unusable too — the ORIGINAL overload stands.
+                  }
+                }
+              }
+              // Any other throw (or an unroutable chain that ran out): no
+              // class, no advance — the original overload stands.
             }
           }
           return response;
