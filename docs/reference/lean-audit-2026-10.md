@@ -57,6 +57,18 @@ re-emissions, not the lane's per-PR work.
 direct-push workflow; commits ≈ merged PRs on every agent repo — squash — so "per commit"
 and "per merged PR" are the same denominator here.)
 
+> **Correction 2026-11-03 (drift plan validated, #445 D4)** — this table omitted
+> `jsboige/CoursIA` (the PR-workflow repo under the personal account; a different
+> repo from the direct-push one above). It is the fleet's **largest PR source**:
+> ~1 000 merged PRs/week in July (measured via GraphQL search `issueCount`, which is
+> not capped at 1 000). Including it, the fleet-level series is **rep/PR ≈ 90
+> (early July) → ≈ 234 (late Sept) → ≈ 243 (late Oct)** — the drift is a **four-week
+> August step (10→31/08) then a plateau**, not a slope. The ×2.2 trend of this table
+> survives in direction; its **LEVEL (~463 → ~1 021 rep/PR) is wrong by ~4×** because
+> the denominator omitted the biggest source, and the memory claim "no drift per PR"
+> built on 3 repos is retracted same-day. Canonical series: `scripts/weekly-drift.py`
+> (hub captures × all-owner merged PRs; biases stated in its docstring).
+
 Findings, corrected:
 
 - **The mixture-shift claim is RETRACTED.** July was not a quiet month: ~967 merged PRs
