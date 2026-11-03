@@ -59,10 +59,11 @@ import { createProxyServer } from "../../proxy-server.js";
 import { createRelayState } from "./relay.js";
 import type { ProxyServer } from "../../types.js";
 
-// Distinct range from the other in-process route tests (19700+, 19851/19951,
-// 19863, 19871, 19883/19983, 19891/19991, 19921, 19961).
-const SIDECAR_PORT = 19971;
-const HUB_PORT = 19972;
+// One allocation per file; the scan in test-support/port-allocation.test.ts is
+// the authority on what is already claimed (19971/19972 belong to
+// proxy-key-rotation-route.test.ts).
+const SIDECAR_PORT = 19973;
+const HUB_PORT = 19974;
 const HUB_BASE = `http://127.0.0.1:${HUB_PORT}`;
 
 const CONFIG_DIR = join(homedir(), ".claudish");

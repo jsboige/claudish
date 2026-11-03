@@ -31,8 +31,10 @@ import type { ProxyServer } from "./types.js";
 
 // ---- harness -------------------------------------------------------------------
 
-// Distinct range from native-passthrough-strip.test.ts (19871).
-const PROXY_PORT = 19921;
+// One allocation per file; the scan in test-support/port-allocation.test.ts is
+// the authority on what is already claimed (19921 belongs to
+// native-credential-guard.test.ts).
+const PROXY_PORT = 19923;
 const HOME = join(homedir(), ".claudish");
 const CONSENT_PATH = join(HOME, "drain-freeze.enabled");
 const FLAG_PATH = join(HOME, "drain-freeze");

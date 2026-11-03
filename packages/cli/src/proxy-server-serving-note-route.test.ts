@@ -37,10 +37,10 @@ import { createProxyServer } from "./proxy-server.js";
 import { resetFailoverForTests, setRoleNominalResolver } from "./fork/failover.js";
 import type { ProxyServer } from "./types.js";
 
-// Distinct range from the other in-process route tests (19883/19983, 19871,
-// 19863, 19851/19951, 19700+).
-const PROXY_PORT = 19891;
-const UPSTREAM_PORT = 19991;
+// One allocation per file; the scan in test-support/port-allocation.test.ts is
+// the authority on what is already claimed.
+const PROXY_PORT = 19892;
+const UPSTREAM_PORT = 19992;
 const UPSTREAM_BASE = `http://127.0.0.1:${UPSTREAM_PORT}`;
 
 const CONFIG_DIR = join(homedir(), ".claudish");
