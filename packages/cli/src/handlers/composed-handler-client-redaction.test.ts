@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it, jest } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const childKey = "T1_COMPOSED_REDACTION_CHILD";
+const childTimeoutMs = 18_000;
+// Outside the temp home, so the child's log outlives the `finally` cleanup and
+// can be read after the run (#825).
+const childLogPath = join(tmpdir(), "claudish-t1-client-child.log");
 
 if (process.env[childKey] !== "1") {
   it("runs client-body redaction checks with an isolated HOME", () => {
@@ -18,15 +22,35 @@ if (process.env[childKey] !== "1") {
       for (const key of Object.keys(env)) {
         if (/KEY|TOKEN|SECRET|PASSWORD|COOKIE/.test(key) && key !== childKey) delete env[key];
       }
+      const startedAt = Date.now();
       const result = Bun.spawnSync([process.execPath, "test", import.meta.path], {
         env,
-        timeout: 18_000,
+        timeout: childTimeoutMs,
         stdout: "pipe",
         stderr: "pipe",
       });
+      const elapsedMs = Date.now() - startedAt;
       const output = result.stdout.toString() + result.stderr.toString();
       console.log(output);
-      expect(result.exitCode, output).toBe(0);
+      // #825 — the child's verdict has to survive the kill. `timeout` returns a
+      // null exitCode with whatever the pipe still held, so a child that died
+      // silently and a child that failed a real assertion used to produce the
+      // same, empty-looking report. Every outcome now names the measured cause
+      // (killed vs exited), the elapsed time and where the child's own output
+      // was written — the log is flushed to disk BEFORE the assertion so a kill
+      // cannot take it with it.
+      writeFileSync(childLogPath, output);
+      const signal =
+        (result as unknown as { signalCode?: string | null }).signalCode ?? null;
+      if (result.exitCode === null || (signal !== null && result.exitCode !== 0)) {
+        throw new Error(
+          `child killed after ${elapsedMs} ms (timeout ${childTimeoutMs} ms, signal ${signal ?? "unknown"}) — no verdict was produced; ${output.length} chars of child output at ${childLogPath}\n${output}`
+        );
+      }
+      expect(
+        result.exitCode,
+        `child exited ${result.exitCode} after ${elapsedMs} ms — output at ${childLogPath}\n${output}`
+      ).toBe(0);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
