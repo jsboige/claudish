@@ -203,6 +203,7 @@ function registerFakeEndpoints(): void {
         "nm-ep": ep("nm"),
         "s0-ep": ep("s0"),
         "s1-ep": ep("s1"),
+        "t2-ep": ep("t2"),
       },
     } as unknown as ClaudishProfileConfig,
     force: true,
@@ -210,7 +211,7 @@ function registerFakeEndpoints(): void {
 }
 
 beforeEach(() => {
-  calls = { nm: 0, s0: 0, s1: 0, native: 0 };
+  calls = { nm: 0, s0: 0, s1: 0, t2: 0, native: 0 };
   endpointStatus = { nm: 529, native: 529 };
   endpointDelayMs = {};
   failoverLog = [];
@@ -612,5 +613,52 @@ describe("#769 — an unroutable cascade step advances instead of failing the tu
     expect(calls.nm).toBe(1);
     expect(calls.s1).toBe(0); // nothing callable on either target
     expect(isFailoverActive("sonnet")).toBe(false);
+  }, 30_000);
+
+  // Review R1, ported from main's #789 (pin U3 there): an unroutable concrete
+  // is never PAID, and the walk's exclusion set is built only from what a
+  // request paid — so without recording the dead concrete BEFORE walking, the
+  // walk re-offers the SAME dead delegation concrete (with `attempt--`) until
+  // the candidate bound is hit, and the delegation's own routable steps are
+  // never tried. RED when the `paidConcretes.add(concrete)` is dropped
+  // (verified by mutation on this port 03/11 — the guard survived with U3 absent).
+  test("U3: an unroutable DELEGATION nominal does not loop the walk — the target's own step serves (R1, #769)", async () => {
+    // opus's failover-side nominal is UNROUTABLE (no kimi credential in the
+    // sandbox — the resolver, not the modelMap, is what the delegation reads);
+    // opus's cascade step (t2) is healthy.
+    await spin();
+    resetWalk({
+      CLAUDISH_FAILOVER_SONNET: "role:opus>s1-ep@fake-s1",
+      CLAUDISH_FAILOVER_OPUS: "t2-ep@fake-t2",
+    });
+    setRoleNominalResolver((r) =>
+      r === "sonnet" ? SONNET_NOMINAL
+      : r === "opus" ? "kimi@fake-kimi"
+      : undefined
+    );
+    // Wall the SONNET nominal's bucket so the cascade serves from attempt 0.
+    expect(
+      armFailover(
+        "sonnet",
+        "test: nominal walled, cascade engaged",
+        providerBucketOf(SONNET_NOMINAL)
+      )
+    ).toBe(true);
+
+    const r1 = await postMessage({ model: "claude-sonnet-5" });
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.t2 ?? 0).toBe(1); // the delegation advanced to the TARGET's step
+    expect(calls.s1 ?? 0).toBe(0); // sonnet's step 1 never paid — t2 served first
+    // The dead nominal is offered to the walk ZERO times (the pre-fix loop
+    // logged `trying kimi@fake-kimi (opus nominal)` twice before skipping).
+    expect(failoverLog.some((l) => l.includes("trying kimi@fake-kimi"))).toBe(false);
+    expect(
+      failoverLog.some(
+        (l) =>
+          l.includes("[Failover] DELEGATION-WALK sonnet[0]") &&
+          l.includes("trying t2-ep@fake-t2 (opus step 0)")
+      )
+    ).toBe(true);
   }, 30_000);
 });
