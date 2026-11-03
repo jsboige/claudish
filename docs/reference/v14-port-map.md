@@ -28,14 +28,17 @@ Base measured: `replatform/v14` = `d06f3659` (#829 merged), `main` = `47ea6245`.
 | 2 | `#654` endpoint token budget | PR **#663** (`7784f65e`) | +1656/−251, 9 | `endpoint-token-budget` = **0 occurrence**; full module + 2 sites + `.env.sidecar.example` + `docker-compose.yml` + compose-coverage test + docs. The #431 busy wire it rides **already exists** (#815) | L |
 | 3 | `#218` native-lane version pin | PR **#218** (`43bb3f32`) + PR **#259** (`be19bed0`, closes #219) | +125/−1, 3 · +546/−1, 4 | `resolveNativeModelPin` = **0 occurrence**; `providers/native-pin-auto.ts` absent. The resolution site is v14's own seam (`serveModel`), not main's | S/M |
 | 4 | `#693` machine-scoped resolution arm | PR **#694** (`a5bd319c`) | +605/−19, 9 | `resolveFailoverTargetForSession` takes **no machine argument** — the signature and every caller change; plus parse, load-time refusal, docs | M |
-| 5 | `#769` unroutable-step skip | PR **#789** (`7b9c9d11`) | +319/−48, 4 | `handlers/shared/step-skip.ts` **exists already**; missing are the two `proxy-server.ts` sites (catch around step construction, entry resolution) | S/M |
+| 5 | `#769` unroutable-step skip | PR **#789** (`7b9c9d11`) | +319/−48, 4 | `handlers/shared/step-skip.ts` **exists already**, `unroutable` included in its reason vocabulary; missing are the two `proxy-server.ts` **construction** sites — the loop's (`getHandlerForRequest(serveModel)`) and the walk's (`catch {}` that swallowed the throw). There is no route-level entry resolution to guard here: `logRequest` lives inside the loop | S/M |
 | 6 | `#598` connection-class advance past a dead walk step | PR **#628** (`3c0e3a0a`) | +290/−44, 4 | `resolveTransientStep`/`resolveSkippingFailed` exist (11 hits in `fork/failover.ts`); `isConnectionWalkClass` ported with #820. Missing: the advance inside the walk block | S |
-| 7 | `#431` handler-side emitters | PR **#581** (`b3a5a7b2`, #575) · PR **#684** (`d78fea09`, #679) · PR **#573** (#565) | +468/−20, 10 · +434/−24, 8 | The skip protocol is ported (#815) and the **loop is its only producer** (`isContextOverflowError`). No handler-side emitter exists, and the `x-claudish-step-skip` header contract is read with nothing writing it (measured in #815: a handler re-wraps non-ok and carries no headers) | M **per emitter** |
+| 7a | `#431` handler-side emitter — image cap | PR **#581** (`b3a5a7b2`, closes #575) | +468/−20, 10 | The skip protocol is ported (#815) and the **loop is its only producer** (`isContextOverflowError`). No handler-side emitter exists, and the `x-claudish-step-skip` contract is read with nothing writing it (measured in #815: a handler re-wraps non-ok and carries no headers) | M |
+| 7b | `#431` handler-side emitter — concurrency refusal | PR **#684** (`d78fea09`, closes #679) | +434/−24, 8 | Same protocol gap, its own emitter: a z.ai 1302 concurrency refusal becomes a busy skip instead of a bench | M |
+| 7c | `#431` handler-side emitter — admission refusal | PR **#573**, already **row 1** | see row 1 | **Not a separate grain.** Verified by file list: #581 and #684 touch `handlers/shared/step-skip.ts`; #573 touches `handlers/shared/context-admission.ts` and touches the step-skip route test only as a route. The gap list counts the #565 admission work a second time here | — |
 | 8 | drain-freeze gate | PR **#314** (`5e3e4269`, issue #306) | +735/−2, 8 | `drainFreezeGate()` = **0 real occurrence** (only the comment naming its absence); main has 3 call sites in `proxy-server.ts` + its own test file | M |
 | 9 | billing-strip family | **no PR** — `fork/middleware/billing-header-strip.ts` (27 lines), moved by `985643d0` | — | file absent from v14's fork layer. The real work is not the 27 lines but the call sites before each serve | S |
 
-Row 7 is three grains, not one. It is written as one row because the gap list names it
-as one family; a scheduler must split it.
+The gap list writes the `#431` emitters as one family. It is **two** grains, not three:
+7a and 7b are separate emitters, and the third number it cites (`#573`, #565) is row 1
+restated. A scheduler that budgeted three emitter grains would buy one of them twice.
 
 ## Supporting measurement — the fork layer
 
