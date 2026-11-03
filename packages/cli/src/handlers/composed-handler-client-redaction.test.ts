@@ -40,8 +40,7 @@ if (process.env[childKey] !== "1") {
       // was written — the log is flushed to disk BEFORE the assertion so a kill
       // cannot take it with it.
       writeFileSync(childLogPath, output);
-      const signal =
-        (result as unknown as { signalCode?: string | null }).signalCode ?? null;
+      const signal = (result as unknown as { signalCode?: string | null }).signalCode ?? null;
       if (result.exitCode === null || (signal !== null && result.exitCode !== 0)) {
         throw new Error(
           `child killed after ${elapsedMs} ms (timeout ${childTimeoutMs} ms, signal ${signal ?? "unknown"}) — no verdict was produced; ${output.length} chars of child output at ${childLogPath}\n${output}`
