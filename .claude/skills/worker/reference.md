@@ -102,7 +102,13 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      `https://platform.minimax.io/console/usage` via MCP
      playwright (profil persistant : l'auth survit aux sessions ; si page =
      login/« no active subscription » **avec données vides**, c'est un rendu
-     transitoire — attendre 3-5 s et re-snapshotter avant de conclure). Extraire
+     transitoire — attendre 3-5 s et re-snapshotter avant de conclure).
+     ⚠ **Recharger l'onglet (`browser_navigate` sur l'URL) AVANT d'extraire** : un
+     onglet laissé ouvert rend son dernier chargement et ne le dit pas — mesuré
+     03/11, DOM identique à 10:00Z et à 14:45Z (même part consommée, mêmes
+     countdowns), déplacé seulement après reload (~13 % de part relative en plus,
+     fenêtre 5 h passée d'heures à minutes). Deux relevés qui s'accordent à la
+     minute sur tous les countdowns = le même rendu, pas une courbe plate. Extraire
      `5h %`, `weekly % + resets in`, credits. **Appender** (jamais tronquer) une
      entrée NDJSON dans `~/.claudish/minimax-plan-watch.log` :
      `{ts, type:"reading", h5_pct, h5_reset_min, week_pct, week_reset_h, credits}` ;
@@ -113,6 +119,14 @@ voir le skill **`worker-issues`** — cycle complémentaire à celui-ci, même m
      Projection (formule, pas lib) : fenêtre hebdo = reset_anchor − 7 j ;
      `elapsed_h = now − window_start` ; `pace = week_pct / elapsed_h` ;
      `eta_h = (100 − week_pct) / pace` ; `projected_pct_at_reset = pace × 168`.
+     → **Calcul : `python scripts/minimax-projection.py --ts … --weekly-pct … --reset-anchor …`**
+     (pins `scripts/tests/test_minimax_projection.py`). Il **refuse toute fenêtre de
+     pace fournie par l'appelant** : le 03/11 la même doctrine a rendu deux
+     projections ×1,7 d'écart à 1 h 40 d'intervalle en ne changeant QUE la fenêtre
+     (5,3 h entre deux relevés au lieu du cumul depuis l'ouverture).
+     `--recompute-log` re-dérive un journal entier et marque les lignes en
+     désaccord ; `--assume-anchor` répare une ancre glissée d'un jour (une ancre
+     décalée d'un jour multiplie la projection par ~3).
      Seuils : WARN dashboard si `eta_h < week_reset_h` ET marge
      `week_reset_h − eta_h > 24` (mur avant reset certain, marge > 1 j) ;
      **ASK registre** (jamais de geste auto) si `eta_h < 48`. Leviers — nommés
