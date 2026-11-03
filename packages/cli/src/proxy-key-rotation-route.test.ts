@@ -53,8 +53,8 @@ import {
 } from "./handlers/shared/proxy-key-rotation.js";
 import type { ProxyServer } from "./types.js";
 
-// Distinct range from the other in-process route tests (19700+, 19851/19951,
-// 19863, 19871, 19883/19983, 19891/19991, 19921, 19961).
+// One allocation per file; the scan in test-support/port-allocation.test.ts is
+// the authority on what is already claimed.
 const PROXY_PORT = 19971;
 const UPSTREAM_PORT = 19972;
 const UPSTREAM_BASE = `http://127.0.0.1:${UPSTREAM_PORT}`;
