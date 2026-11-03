@@ -253,7 +253,13 @@ if (process.env[childKey] !== "1") {
       expect(JSON.parse(text).error).toBeDefined();
     }, 10_000);
 
-    it("redacts the parser's SSE error frame using the transport's body-only signing secret", async () => {
+    // #827 — the contract here is closeWithTerminalTail's, not a raw `event: error`:
+    // an HTTP-200 in-stream error is turned into a labeled assistant turn PLUS the
+    // terminal pair, because Claude Code reads a bare `error` frame with no
+    // `message_stop` as an empty/malformed response. A rate-limit-shaped message
+    // takes the generic label, so the provider's words never reach the client —
+    // asserted as an absence, which is the only observable that exists on this path.
+    it("turns a rate-limited in-stream error into a labeled terminal turn, with no provider text", async () => {
       mockFetch(
         () => new Response(anthropicError, { headers: { "content-type": "text/event-stream" } })
       );
@@ -266,8 +272,38 @@ if (process.env[childKey] !== "1") {
       )();
       const text = await response.text();
       expect(response.status).toBe(200);
-      expect(text).toContain("event: error");
-      expect(text).toContain("[redacted]");
+      expect(text).toContain("[The model provider is rate limited right now.");
+      expect(text).toContain("event: message_stop");
+      expect(text).toContain('"stop_reason":"end_turn"');
+      expect(text).not.toContain("event: error");
+      expect(text).not.toContain(secret);
+    }, 10_000);
+
+    // The redaction object survives where it is actually observable: a NON-rate-limit
+    // in-stream error is surfaced as `[Upstream provider error: <redacted message>]`.
+    // Remove the redaction and this test goes red — the secret would reach the client
+    // inside that label.
+    it("redacts the provider's message when the in-stream error is not a rate limit", async () => {
+      const nonRateLimit = {
+        type: errorType,
+        error: { message: `${secret} at the upstream edge`, code: "500" },
+      };
+      const stream =
+        source.slice(0, source.indexOf(errorLine)) +
+        `event: ${errorType}\n` +
+        `data: ${JSON.stringify(nonRateLimit)}\n\n`;
+      mockFetch(() => new Response(stream, { headers: { "content-type": "text/event-stream" } }));
+      const response = await appFor(
+        transport("anthropic-sse", {
+          getHeaders: async () => ({}),
+          redactionSecrets: () => [secret],
+        }),
+        true
+      )();
+      const text = await response.text();
+      expect(response.status).toBe(200);
+      expect(text).toContain("[Upstream provider error: [redacted] at the upstream edge]");
+      expect(text).toContain("event: message_stop");
       expect(text).not.toContain(secret);
     }, 10_000);
   });
