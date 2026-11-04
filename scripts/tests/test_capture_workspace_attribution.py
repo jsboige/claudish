@@ -37,6 +37,21 @@ would silently manufacture a conclusion about WHERE the fleet's responses go:
   10. TOURS COUNT DISTINCT SESSIONS PER DAY -- two requests of one session are
      one tour; a session without an id stays out of the tour count but keeps
      its workspace row.
+  11. HISTORY REPLAY (#328 C4) -- a tool_use block rides EVERY later request
+     of its session (~151k occurrences over 2 077 sampled requests, 29/10);
+     a write class per tour is decided over DISTINCT tool_use ids, never over
+     occurrences.
+  12. QUOTED TRANSCRIPTS -- a pasted conversation inside a USER message
+     carries tool_use-shaped JSON; only assistant messages are walked.
+  13. THE REHEARSAL -- `gh pr merge --dry-run` and `git push --dry-run` are
+     measured corpus shapes, and a compound can hold rehearsal and real merge
+     back to back; the veto is per command segment (`;` `&&` `||` newline),
+     never per whole command.
+  14. TOOLSEARCH IS NOT A WRITE -- a ToolSearch input selecting
+     `roosync_dashboard` mentions the tool by name; only the dashboard tool
+     itself with a write action writes.
+  15. COMPACTION HIDES EARLY WRITES -- a tour whose history starts past a
+     compaction fold is flagged, never folded silently into zero-write.
 """
 
 import importlib.util
@@ -223,6 +238,106 @@ def pin_tours_count_distinct_sessions():
     _check(w["coursia"]["paired"] == 2, "paired counts rows with a usage-bearing response")
 
 
+def _tub(prefix, use_id, tool, inp):
+    """One assistant tool_use block inside a request body."""
+    return (b'{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"' + prefix
+            + use_id + b'","name":"' + tool + b'","input":' + inp + b'}]}]}')
+
+
+def pin_history_replay_dedupes_by_id():
+    # ONE `gh pr create` seen on 3 requests (later requests replay the block)
+    rows = [
+        {"day": "2026-10-29", "ws": "coursia", "session": "s1", "compacted": False,
+         "uses": [(b"toolu_1", "Bash") + wsattr.classify_tool_use(
+             "Bash", {"command": "gh pr create --title x --body-file b.md"}),
+             (b"toolu_read", "Read") + (None, False)]},
+        {"day": "2026-10-30", "ws": "coursia", "session": "s1", "compacted": False,
+         "uses": [(b"toolu_1", "Bash") + wsattr.classify_tool_use(
+             "Bash", {"command": "gh pr create --title x --body-file b.md"})]},
+        {"day": "2026-10-31", "ws": "coursia", "session": "s1", "compacted": False,
+         "uses": [(b"toolu_1", "Bash") + wsattr.classify_tool_use(
+             "Bash", {"command": "gh pr create --title x --body-file b.md"})]},
+    ]
+    agg = wsattr.aggregate_writes(rows, {"2026-10-29": 3, "2026-10-30": 3, "2026-10-31": 3})
+    w = agg["workspaces"]["coursia"]
+    _check(w["tours"] == 3, "a session on 3 days is 3 per-day tours (as --tours), got %r" % w["tours"])
+    _check(w["classes"].get("pr") == 3, "each day's tour carries the write (history), got %r" % w["classes"])
+    _check(w["pr_create_counted"] == 1, "one creation counted despite 3 occurrences, got %r"
+           % w["pr_create_counted"])
+    _check(w["pr_create_scaled"] == 3, "the SCALED creation also dedupes: 1 id at first-seen day,"
+           " fraction 1/3 -> 3.0 — occurrence-counting reads 9.0, got %r" % w["pr_create_scaled"])
+
+
+def pin_quoted_transcript_is_not_a_write():
+    body = (b'{"messages":[{"role":"user","content":[{"type":"tool_use","id":"toolu_x",'
+            b'"name":"Bash","input":{"command":"gh pr create --title forged"}}]}]}')
+    _check(wsattr.assistant_tool_uses({"messages": [
+        {"role": "user", "content": [{"type": "tool_use", "id": "t", "name": "Bash",
+                                      "input": {"command": "gh pr merge 1"}}]}]}) == [],
+           "a tool_use shape inside a USER message is never a write")
+
+
+def pin_dry_run_is_not_a_write():
+    cls, _ = wsattr.classify_tool_use("Bash", {"command": "gh pr merge 108 --squash --dry-run"})
+    _check(cls is None, "a --dry-run merge is a rehearsal, got %r" % cls)
+    cls2, _ = wsattr.classify_tool_use("Bash", {"command": "git push --dry-run origin main"})
+    _check(cls2 is None, "a --dry-run push is a rehearsal, got %r" % cls2)
+    # the corpus holds rehearsal and real merge in ONE compound
+    cls3, _ = wsattr.classify_tool_use("Bash", {
+        "command": "gh pr merge 108 --squash --dry-run | head -20; gh pr merge 108 --squash"})
+    _check(cls3 == "pr", "the real merge in the SAME compound still writes, got %r" % cls3)
+
+
+def pin_toolsearch_is_not_a_dashboard_write():
+    cls, _ = wsattr.classify_tool_use("ToolSearch", {
+        "query": "select:mcp__roo-state-manager__roosync_dashboard"})
+    _check(cls is None, "naming a tool in a ToolSearch query is not a write, got %r" % cls)
+    cls2, _ = wsattr.classify_tool_use("mcp__roo-state-manager__roosync_dashboard",
+                                       {"action": "read", "type": "workspace"})
+    _check(cls2 is None, "a dashboard READ is not a write, got %r" % cls2)
+    cls3, _ = wsattr.classify_tool_use("mcp__roo-state-manager__roosync_dashboard",
+                                       {"action": "append", "content": "[DONE]"})
+    _check(cls3 == "dash", "a dashboard append IS the dash class, got %r" % cls3)
+
+
+def pin_compaction_flags_the_tour():
+    body = (b'{"messages":[{"role":"user","content":"This session is being continued from a '
+            b'previous conversation that ran out of context. The summary below covers the '
+            b'earlier portion of the conversation."},{"role":"assistant","content":[]}]}')
+    _check(wsattr.compaction_flagged({
+        "messages": [{"role": "user", "content": "This session is being continued from a "
+                     "previous conversation that ran out of context. The summary below "
+                     "covers the earlier portion of the conversation."}]}) is True,
+           "the continuation marker flags the tour compacted")
+    _check(wsattr.compaction_flagged({
+        "messages": [{"role": "user", "content": "fix the build"}]}) is False,
+           "an ordinary first message is not compacted")
+
+
+def pin_gh_write_class_and_precedence():
+    cls, pc = wsattr.classify_tool_use("Bash", {"command": "git push origin feature/x"})
+    _check(cls == "pr", "git push is the pr class, got %r" % cls)
+    _check(pc is False, "a push is not a pr CREATION, got %r" % pc)
+    cls2, _ = wsattr.classify_tool_use("PowerShell", {
+        "command": "GH_TOKEN=$(gh auth token) gh issue comment 18770 --body \"[CLAIMED]\""})
+    _check(cls2 == "gh-write", "gh issue comment (the [CLAIMED] convention) is gh-write, got %r" % cls2)
+    cls3, _ = wsattr.classify_tool_use("Bash", {"command": "gh pr review 42 --approve"})
+    _check(cls3 == "gh-write", "gh pr review is gh-write, got %r" % cls3)
+    # a Bash tool that carries no command input (read-only tool) writes nothing
+    cls4, _ = wsattr.classify_tool_use("Read", {"file_path": "x.md"})
+    _check(cls4 is None, "a file read is zero-write, got %r" % cls4)
+    # strongest class wins a tour: dash + pr in one tour -> pr
+    rows = [{"day": "2026-10-29", "ws": "claudish", "session": "s7", "compacted": False,
+             "uses": [(b"d1", "mcp__roo-state-manager__roosync_dashboard")
+                      + wsattr.classify_tool_use("mcp__roo-state-manager__roosync_dashboard",
+                                                 {"action": "append", "content": "[DONE]"}),
+                      (b"p1", "Bash") + wsattr.classify_tool_use(
+                          "Bash", {"command": "gh pr create --title x"})]}]
+    agg = wsattr.aggregate_writes(rows, {"2026-10-29": 1})
+    _check(agg["workspaces"]["claudish"]["classes"] == {"pr": 1},
+           "pr outranks dash within one tour, got %r" % agg["workspaces"]["claudish"]["classes"])
+
+
 PINS = [
     pin_plain_path,
     pin_previous_directory_suffix,
@@ -239,6 +354,12 @@ PINS = [
     pin_usage_is_max_never_summed,
     pin_usage_nested_input_tokens_details,
     pin_tours_count_distinct_sessions,
+    pin_history_replay_dedupes_by_id,
+    pin_quoted_transcript_is_not_a_write,
+    pin_dry_run_is_not_a_write,
+    pin_toolsearch_is_not_a_dashboard_write,
+    pin_compaction_flags_the_tour,
+    pin_gh_write_class_and_precedence,
 ]
 
 
