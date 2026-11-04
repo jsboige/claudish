@@ -4,12 +4,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, sep } from "node:path";
 
 import {
@@ -20,6 +22,7 @@ import {
   makePaneTestEnv,
   waitNoOrphans,
 } from "../pane/test-helpers/hermetic-env.js";
+import { waitForJson } from "../test-support/wait-for-json.js";
 import { SessionManager } from "./session-manager.js";
 
 const T_PANE = 30_000;
@@ -27,16 +30,20 @@ const T_PANE = 30_000;
 type ChildProbe = { argv: string[]; env: Record<string, string>; cwd: string };
 type InheritedSettings = { enabledPlugins: Record<string, boolean>; model?: string };
 
-function waitUntil(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + timeoutMs;
-    const check = () => {
-      if (predicate()) return resolve();
-      if (Date.now() >= deadline) return reject(new Error("waitUntil timed out"));
-      setTimeout(check, 20);
-    };
-    check();
-  });
+/**
+ * #831 — the probe's read side, hoisted so its settle guard can be pinned
+ * without a pane. `existsSync` proved the directory entry existed, not that the
+ * child had finished writing: a loaded macOS CI leg read a half-written probe
+ * and `JSON.parse` died on EOF. Reading AND parsing until it settles makes
+ * existence and completeness the same condition.
+ */
+async function childProbeAt(
+  probePath: string,
+  manager: SessionManager,
+  sessionId: string
+): Promise<ChildProbe> {
+  const path = probePath.replace("{session}", manager.getSession(sessionId).claudeSessionId);
+  return waitForJson<ChildProbe>(path);
 }
 
 describe.skipIf(!MAGMUX)(
@@ -74,9 +81,7 @@ describe.skipIf(!MAGMUX)(
     }
 
     async function childProbe(manager: SessionManager, sessionId: string): Promise<ChildProbe> {
-      const path = probe.replace("{session}", manager.getSession(sessionId).claudeSessionId);
-      await waitUntil(() => existsSync(path));
-      return JSON.parse(readFileSync(path, "utf-8")) as ChildProbe;
+      return childProbeAt(probe, manager, sessionId);
     }
 
     async function expectInheritedSession(claudishFlags: string[]): Promise<InheritedSettings> {
@@ -176,3 +181,20 @@ describe.skipIf(!MAGMUX)(
     );
   }
 );
+
+describe("#831 settle guards (no pane needed)", () => {
+  const stubManager = {
+    getSession: () => ({ claudeSessionId: "pin" }),
+  } as unknown as SessionManager;
+
+  test("childProbeAt refuses a half-written probe, then settles when the writer finishes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-831-probe-"));
+    const path = join(dir, "probe-pin.json");
+    writeFileSync(path, '{"argv": ["par'); // exists, unparseable — the old read died here
+    const pending = childProbeAt(join(dir, "probe-{session}.json"), stubManager, "s");
+    await new Promise((resolve) => setTimeout(resolve, 100)); // polls must see the partial
+    writeFileSync(path, '{"argv":["claude","--x"],"env":{},"cwd":"/w"}');
+    const child = await pending;
+    expect(child.argv[0]).toBe("claude");
+  });
+});
