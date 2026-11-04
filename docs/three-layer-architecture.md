@@ -79,6 +79,11 @@ wire format. Every provider family speaks a different schema: OpenAI uses
 `messages[]` with `role`/`content`, Gemini uses `contents[]` with `parts`,
 Anthropic uses its own Messages API. `APIFormat` owns that translation.
 
+The message/tool conversion helpers behind the OpenAI-shaped formats live in
+`handlers/shared/format/openai-messages.ts` and `handlers/shared/format/openai-tools.ts`
+(the second file is where tool-schema translation happens — the `CLAUDE.md`
+pointer names only the first, since the directory is the unit that matters).
+
 **Interface** (`adapters/api-format.ts`):
 
 ```typescript
