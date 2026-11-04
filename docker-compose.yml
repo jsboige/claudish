@@ -240,6 +240,10 @@ services:
       - CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS=${CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS:-}
       - CLAUDISH_FAILOVER_SESSION_DWELL_MS=${CLAUDISH_FAILOVER_SESSION_DWELL_MS:-}
       - CLAUDISH_FAILOVER_RECOVERY_GRACE_MS=${CLAUDISH_FAILOVER_RECOVERY_GRACE_MS:-}
+      # #822 — reset-TZ candidate discovery (Z.AI announces its reset in UTC+8);
+      # compose line missing at merge, compose-env-coverage red on main. Same
+      # initFailover startup read as the knobs above — a flip needs a recreate.
+      - CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES=${CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES:-}
       # #299-B — one-shot overload walk kill switch. Unlike the knobs above this
       # is a read-per-request switch (the fleet flips it mid-flight; no recreate),
       # but a container still needs the NAME here to ever see any value at all.
