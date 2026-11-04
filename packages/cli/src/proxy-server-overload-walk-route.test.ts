@@ -83,6 +83,25 @@ let endpointText: Record<string, string> = {};
  * arm never fires. The plain shape surfaces as a raw 402, which
  * `isQuotaExhaustion` takes on STATUS alone. */
 let plainWall402 = false;
+/** #575 (row 7a): when set to an endpoint name, that endpoint answers the
+ *  engine's verbatim per-prompt image-cap 400 (fixture body) instead of
+ *  `errorBodyFor` — the handler-side `media` skip emitter classifies it. */
+let mediaCapOn: string | null = null;
+/** #575 — the engine's per-prompt image cap, verbatim from
+ * `test-fixtures/upstream-errors/vllm-image-cap-400.json` (10 hits, 12–20/10). */
+function vllmImageCap400(): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: "At most 4 image(s) may be provided in one prompt. (parameter=image)",
+        type: "BadRequestError",
+        param: "image",
+        code: 400,
+      },
+    }),
+    { status: 400, headers: { "content-type": "application/json" } }
+  );
+}
 
 const SANDBOX_ENV_KEYS = [
   "ZAI_API_KEY",
@@ -201,6 +220,8 @@ async function postMessage(
     /** #654: rides `metadata.user_id` — the budget signature keys on it. */
     session?: string;
     content?: string;
+    /** #575: an explicit content-blocks array (image blocks for the cap pins). */
+    contentBlocks?: unknown[];
   } = {}
 ): Promise<Response> {
   return realFetch(`${activeProxy!.url}/v1/messages`, {
@@ -215,7 +236,12 @@ async function postMessage(
       max_tokens: 64,
       stream: false,
       ...(opts.session ? { metadata: { user_id: opts.session } } : {}),
-      messages: [{ role: "user", content: opts.content ?? "say hi" }],
+      messages: [
+        {
+          role: "user",
+          content: opts.contentBlocks ?? opts.content ?? "say hi",
+        },
+      ],
     }),
   });
 }
@@ -256,6 +282,7 @@ beforeEach(() => {
   heldResolve = null;
   endpointText = {};
   plainWall402 = false;
+  mediaCapOn = null;
   // #654: the endpoint-budget family is per-endpoint-named, so it cannot sit
   // in SANDBOX_ENV_KEYS — sweep the whole family AND the module's global lease
   // registry; a leaked holder lease would phantom-Σ every later pin.
@@ -267,14 +294,16 @@ beforeEach(() => {
   (process.stderr as any).write = ((chunk: any, ...rest: any[]) => {
     const text = typeof chunk === "string" ? chunk : String(chunk);
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]") || line.includes("[EndpointBudget]")) failoverLog.push(line);
+      if (line.includes("[Failover]") || line.includes("[EndpointBudget]") || line.includes("[MediaCap]"))
+        failoverLog.push(line);
     }
     return realStderrWrite(chunk, ...rest);
   }) as any;
   console.log = ((...args: any[]) => {
     const text = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]") || line.includes("[EndpointBudget]")) failoverLog.push(line);
+      if (line.includes("[Failover]") || line.includes("[EndpointBudget]") || line.includes("[MediaCap]"))
+        failoverLog.push(line);
     }
     // Re-emit so a failing run still shows the proxy's operator markers.
     realConsoleLog(...args);
@@ -334,6 +363,9 @@ beforeEach(() => {
       });
     }
     const status = endpointStatus[which] ?? 200;
+    // #575: the image-cap body beats the status map — the emitter classifies
+    // THIS body, and errorBodyFor(400) is a different 400 entirely.
+    if (mediaCapOn === which) return vllmImageCap400();
     if (status === 402 && plainWall402) {
       return new Response(
         JSON.stringify({
@@ -1170,5 +1202,97 @@ describe("#654 — in-flight token budget per endpoint (busy-class skip)", () =>
     } finally {
       clearBudget();
     }
+  }, 30_000);
+});
+
+// ─── #575 (#431 row 7a) — the engine's per-prompt image cap is a skip, not a ───
+// failure. The handler-side `media` emitter (composed-handler.ts) classifies the
+// engine's verbatim 400, re-labels it exactly, and sets the skip header; the
+// loop's wire path (proxy-server.ts readStepSkip) consumes it. Relocated from
+// main's step-skip-route suite — this branch has no such suite, and the walk
+// suite is where the cascade loop is pinned.
+describe("#575 — the vLLM image cap skips forward (#431 row 7a)", () => {
+  async function responseText(r: Response): Promise<string> {
+    const body = (await r.json()) as { content?: Array<{ type?: string; text?: string }> };
+    return (body?.content ?? [])
+      .filter((b) => b?.type === "text")
+      .map((b) => b.text)
+      .join("");
+  }
+  /** Five screenshots: the cap counts BLOCKS, so the marker must report 5
+   *  against the engine's stated 4 — the number the client can act on. */
+  const fiveImages = () =>
+    Array.from({ length: 5 }, () => ({
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "A".repeat(1024) },
+    }));
+
+  test("K25: a non-last step refused on the image cap skips forward — no mark, no bench", async () => {
+    await spin();
+    armCascade();
+    endpointStatus.nm = 402; // arm -> step 0 dispatch
+    plainWall402 = true; // plain shape: the arm fires on the status alone
+    mediaCapOn = "s0"; // step 0 answers the engine's image-cap 400
+    endpointText.s1 = "ok-from-s1";
+
+    const r1 = await postMessage({
+      session: "k25",
+      contentBlocks: [...fiveImages(), { type: "text", text: "what do these show?" }],
+    });
+    // The successor's answer, never the engine's 400 — a 400 here would end the
+    // agent turn on a shape the next step serves perfectly.
+    expect(r1.status).toBe(200);
+    expect(await responseText(r1)).toContain("ok-from-s1");
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(1);
+    // The loop's skip marker (v14 wording: STEP-SKIP): reason and the exact
+    // countable detail the emitter put on the wire.
+    const skipLine = failoverLog.find((l) => l.includes("[Failover] STEP-SKIP sonnet[0]"));
+    expect(skipLine).toBeDefined();
+    expect(skipLine).toContain("media");
+    expect(skipLine).toContain("images=5");
+    expect(skipLine).toContain("cap=4");
+    expect(skipLine).toContain("param=image");
+    expect(failoverLog.some((l) => l.includes("[MediaCap]"))).toBe(true);
+
+    // No failure mark (#553's bench is exactly what this class must not arm):
+    // a FRESH session's next request resolves step 0 again.
+    mediaCapOn = null;
+    endpointText.s0 = "ok-from-s0-again";
+    const r2 = await postMessage({ session: "k25b" });
+    expect(await responseText(r2)).toContain("ok-from-s0-again");
+    expect(calls.s0).toBe(2);
+  }, 30_000);
+
+  test("K26: on the LAST step the 400 surfaces with the exact label and the skip header", async () => {
+    await spin();
+    // Single-step cascade — nothing to advance to.
+    resetWalk({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0" });
+    endpointStatus.nm = 402; // arm -> step 0 dispatch
+    plainWall402 = true;
+    mediaCapOn = "s0";
+
+    const r1 = await postMessage({
+      session: "k26",
+      contentBlocks: [
+        ...fiveImages(),
+        { type: "text", text: "what do these show?" },
+      ],
+    });
+    expect(r1.status).toBe(400);
+    // The marker rides the surface path too (harmless to a client that ignores
+    // it, greppable for one that looks — same doctrine as the failover notice).
+    expect(r1.headers.get("x-claudish-step-skip")).toContain("media");
+    const body = (await r1.json()) as { error?: { message?: string } };
+    const message = String(body?.error?.message ?? "");
+    // The exact label replaced BOTH the engine's jargon and the generic
+    // "Request format may be incompatible with provider" that sent the 20/10
+    // diagnosis thread hunting a translation bug.
+    expect(message).toContain("at most 4 image(s)");
+    expect(message).toContain("carries 5");
+    expect(message).not.toContain("Request format may be incompatible");
+    // Single round-trip, no skip: there is no successor to advance to.
+    expect(calls.s0).toBe(1);
+    expect(failoverLog.some((l) => l.includes("[Failover] STEP-SKIP"))).toBe(false);
   }, 30_000);
 });
