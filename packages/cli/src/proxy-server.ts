@@ -107,6 +107,12 @@ import {
   releaseWhenBodyEnds,
 } from "./handlers/shared/call-context.js";
 import {
+  endpointPrefixOf,
+  evaluateEndpointTokenBudget,
+  formatBudgetFacts,
+  withBudgetRelease,
+} from "./handlers/shared/endpoint-token-budget.js";
+import {
   applyFailoverNotices,
   carryNoticeHeader,
   noticePolicyForIngress,
@@ -1512,10 +1518,113 @@ export async function createProxyServer(
           401
         );
       }
-      // #317: FRESH attempt token per paid upstream attempt — the usage sink
-      // keys its max-ledger on it (two paid attempts of one request must land
-      // in two slots). No-op when both bars are off.
-      openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+      // #654 — in-flight token budget per endpoint, evaluated BEFORE the
+      // upstream call: a local engine saturates on CONTEXT, not request count
+      // (six ~200K-token bodies ≈ 1.2M KV against 750,747 available — measured
+      // 2026-10-24, engine-side). The budget rides the #431 `busy` skip wire,
+      // never the failure path. Inert unless the endpoint carries its knobs
+      // (AC1); estimator bytes/3.5 (AC3); an identical resubmission REPLACES
+      // its predecessor's estimate instead of adding one (AC5, arbitrated
+      // 24/10 — a budget counting the measured 56% client echo as fresh
+      // demand would trip on its own echo and divert a lane that has room).
+      // A refusal only ever DIVERTS: a non-last step advances (skip semantics
+      // — no mark, no wall, no arm, engine never sees the request); the
+      // nominal synthesizes the same 529 the bounded busy wait produces and
+      // lets the #299-B walk machinery own the diversion; a lane with no
+      // diversion (last step, unconfigured role, walk off) serves anyway —
+      // the budget bounds admission, it never refuses a servable request.
+      // v14: the attempt's concrete is `serveModel` for a step (the loop's
+      // own swap seam) and the mapped nominal for stepIndex -1, exactly the
+      // two forms main's `attemptConcreteNow` collapsed.
+      const budgetPrefix = endpointPrefixOf(
+        stepIndex >= 0 ? serveModel : resolveNominalTarget(requestedModel).target
+      );
+      const budgetDecision = budgetPrefix
+        ? evaluateEndpointTokenBudget(
+            budgetPrefix,
+            body,
+            // v14: these two are `string | null` here (main holds
+            // `string | undefined`) — normalized at the call site so the
+            // module stays byte-identical to the trunk.
+            { machine: machineHeader ?? undefined, session: sessionKey ?? undefined },
+            process.env,
+            Date.now(),
+            (info) => logStderr(info)
+          )
+        : null;
+      let releaseBudget: (() => void) | undefined;
+      let budgetSynthResponse: Response | undefined;
+      if (budgetDecision) {
+        const budgetDetail = formatBudgetFacts(
+          budgetDecision.facts,
+          budgetDecision.refused,
+          budgetDecision.reason
+        );
+        if (budgetDecision.facts.resubmit >= 2) {
+          log(
+            `[EndpointBudget] ${budgetPrefix} resubmit=${budgetDecision.facts.resubmit} in flight (${budgetDetail}) — estimate replaces its predecessor (#654 AC5)`,
+            true // forceConsole — operational event, countable marker (AC5b)
+          );
+        }
+        if (budgetDecision.refused) {
+          const canSkipStep =
+            role != null &&
+            rule != null &&
+            stepIndex >= 0 &&
+            stepIndex < rule.steps.length - 1 &&
+            attempt + 1 < maxAttempts &&
+            !stepSkipDisabled();
+          if (canSkipStep) {
+            log(
+              `[Failover] SKIP ${role}[${stepIndex}] reason=busy ${budgetDetail} ` +
+                `(${serveModel}) — advancing to next step, no failure mark (endpoint token budget #654)`,
+              true // forceConsole — operational event (#431/#654)
+            );
+            skippedSteps.add(stepIndex);
+            continue;
+          }
+          const canWalkNominal =
+            role != null &&
+            stepIndex === -1 &&
+            rule != null &&
+            rule.steps.length > 0 &&
+            !keylessNative &&
+            !(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`) &&
+            (process.env.CLAUDISH_FAILOVER_OVERLOAD_WALK || "").trim() !== "0";
+          if (canWalkNominal) {
+            // Same wire shape as ComposedHandler's bounded busy 529: the
+            // #299-B walk block below picks it up (`isOverloadWalkClass` on
+            // the 529), diverts one-shot to the first servable step, writes
+            // no state — and when nothing is servable it surfaces this 529,
+            // which the client retries on its own.
+            log(
+              `[Failover] budget-skip nominal ${requestedModel} (${budgetDetail}) — overload-class diversion (#654)`,
+              true // forceConsole — operational event
+            );
+            budgetSynthResponse = new Response(
+              JSON.stringify(
+                wrapAnthropicError(
+                  529,
+                  `${budgetPrefix} busy — in-flight token budget exceeded (${budgetDetail})`,
+                  "overloaded_error"
+                )
+              ),
+              {
+                status: 529,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Retry-After": "2",
+                  "x-claudish-step-skip": encodeStepSkipHeader("busy", budgetDetail),
+                },
+              }
+            );
+          } else {
+            logStderr(
+              `[EndpointBudget] ${budgetPrefix} over budget with no diversion — serving anyway (${budgetDetail})`
+            );
+          }
+        }
+      }
       // #747 (b): while a SUBSTITUTE serves, it learns its capability delta
       // from the request side — appended to the top-level `system` of every
       // such request (the banners are stripped from history above, and the
@@ -1533,9 +1642,31 @@ export async function createProxyServer(
           ? buildServingNoteForRequest(role, resolved.step, stepIndex, bucket)
           : null;
       const systemBeforeNote = body.system;
-      if (servingNote) appendSystemNote(body, servingNote);
-      response = await handler.handle(c, body);
-      if (servingNote && !response.ok) body.system = systemBeforeNote;
+      // The budget synth path (nominal → 529 for the walk block) must NOT
+      // reach the handler — the engine never sees a refused attempt (AC2).
+      // NB: `response` outlives the iteration (declared above the loop), so
+      // the gate here is the LOCAL flag, never `response` truthiness — a
+      // previous iteration's cancelled skip response is stale state.
+      if (budgetSynthResponse) {
+        response = budgetSynthResponse;
+      } else {
+        if (servingNote) appendSystemNote(body, servingNote);
+        if (budgetDecision) releaseBudget = budgetDecision.commit();
+        // #317: FRESH attempt token per paid upstream attempt — the usage sink
+        // keys its max-ledger on it (two paid attempts of one request must
+        // land in two slots). No-op when both bars are off.
+        openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+        response = await handler.handle(c, body);
+        if (servingNote && !response.ok) body.system = systemBeforeNote;
+      }
+      if (releaseBudget && response) {
+        // The lease lives exactly as long as the attempt's bytes: the wrapper
+        // releases on stream end, consumer cancel, or error (a skipped/
+        // cancelled body releases through its cancel hook; a bodyless
+        // response immediately). Below this point every path — skip advance,
+        // walk, notice wrap, return — carries the tracked body or drains it.
+        response = withBudgetRelease(response, releaseBudget);
+      }
       if (response.ok) {
         if (role) {
           // #431 CR B1: name the step that actually served, for the notices.
@@ -1654,7 +1785,8 @@ export async function createProxyServer(
             // overload stands. The failure is returned CLASSIFIED: only the
             // step's own wire shape can say whether the walk may advance, and
             // its body is also the drain (an unread body is a connection held
-            // open for nothing). (#654's endpoint budget is not on this base.)
+            // open for nothing). #654's endpoint budget gates the attempt
+            // BEFORE the call, like the loop's own gate.
             //
             // The delegation owner is STATE-DEPENDENT — resolveRoleStep reads
             // the target nominal's bucket wall and can arm it — so it is
@@ -1668,15 +1800,49 @@ export async function createProxyServer(
             ): Promise<
               | { served: Response }
               | { served: null; status: number; errBody: string; unroutable?: string }
+              | { served: null; budgetRefused: true }
             > => {
               const targetDelegation = target.step.roleRef
                 ? resolveDelegationOwner(role, target.step)
                 : null;
+              // #654 r1 — the walk serves through the SAME endpoint budget as
+              // the loop. A walk target carrying knobs is evaluated BEFORE the
+              // call (on the hub, the budgeted vLLM endpoint is the haiku
+              // cascade's step 0 — the first servable target of a haiku
+              // overload walk, the exact traffic the budget exists to bound),
+              // a refusal is a SKIP (zero calls, no state, advance to the next
+              // servable step), and a served attempt commits its lease and
+              // wraps its response — a walk-served request holding no lease
+              // is the module's own "Σ lies low" failure.
+              const walkBudgetPrefix = endpointPrefixOf(target.concrete);
+              const walkBudget = walkBudgetPrefix
+                ? evaluateEndpointTokenBudget(
+                    walkBudgetPrefix,
+                    body,
+                    { machine: machineHeader ?? undefined, session: sessionKey ?? undefined },
+                    process.env,
+                    Date.now(),
+                    (info) => logStderr(info)
+                  )
+                : null;
+              if (walkBudget?.refused) {
+                log(
+                  `[Failover] WALK-SKIP ${role} → ${target.concrete} reason=busy ${formatBudgetFacts(
+                    walkBudget.facts,
+                    true,
+                    walkBudget.reason
+                  )} — endpoint token budget (#654)`,
+                  true
+                );
+                return { served: null, budgetRefused: true };
+              }
+              let walkRelease: (() => void) | undefined;
               try {
                 const targetHandler = withAdvisor(
                   withRequestHooks(await getHandlerForRequest(target.concrete)),
                   advisorPresence
                 );
+                if (walkBudget) walkRelease = walkBudget.commit();
                 // #317: the walk is a paid upstream attempt too — fresh token.
                 openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
                 const targetResp = await targetHandler.handle(c, body);
@@ -1699,13 +1865,20 @@ export async function createProxyServer(
                       );
                     }
                   }
-                  return { served: targetResp };
+                  return {
+                    served: walkRelease ? withBudgetRelease(targetResp, walkRelease) : targetResp,
+                  };
                 }
                 // Not ok: READ the body — it is both the classifier's input
-                // (#598) and the drain. Nothing is written.
+                // (#598) and the drain; the drained bytes end the lease.
+                // Nothing is written.
                 const targetErrBody = await targetResp.text().catch(() => "");
+                walkRelease?.();
                 return { served: null, status: targetResp.status, errBody: targetErrBody };
               } catch (err) {
+                // The attempt itself threw — the lease (if committed) ends
+                // here, then the throw is classified as below.
+                walkRelease?.();
                 // #769 — a RoutingError here is NOT an attempt failure: the
                 // target was unroutable at CONSTRUCTION (no credential for its
                 // provider on this host), so zero upstream calls were paid. It
@@ -1719,6 +1892,25 @@ export async function createProxyServer(
             };
             const firstAttempt = await attemptWalkStep(walk);
             if (firstAttempt.served) return firstAttempt.served;
+            // #654 r1 — a budget-refused target was never called: the
+            // admission gate fired before the engine, so the walk advances to
+            // the next servable step with the loop's skip semantics — no call,
+            // no mark, no wall, no arm. Bounded to ONE hop, like everything
+            // the walk buys; a second refusal surfaces the ORIGINAL overload
+            // (the budget bounds admission, it never refuses a servable
+            // request outright — the next request re-probes the nominal).
+            if ("budgetRefused" in firstAttempt && firstAttempt.budgetRefused) {
+              const budgetSkip = await resolveTransientStep(role, {
+                bucketOf: async (t) => concreteStepBucketOfSync(t),
+                nominalBucket: bucket ?? undefined,
+                afterStepIndex: walk.stepIndex,
+              }).catch(() => null);
+              if (budgetSkip) {
+                const skipped = await attemptWalkStep(budgetSkip);
+                if (skipped.served) return skipped.served;
+              }
+              return response;
+            }
             // Two failures may advance ONE hop, and neither writes plan state:
             //
             // #769 — the target died UNROUTABLE at construction. Zero upstream
@@ -1734,13 +1926,19 @@ export async function createProxyServer(
             // resolver owns, and stepping over it would re-buy exactly what
             // #299 B rejected.
             let advanceReason: "unroutable" | "connection" | null = null;
-            if (firstAttempt.unroutable) {
+            // #654 widened the failure union with `budgetRefused` (handled and
+            // returned above), so both member reads below narrow explicitly —
+            // the trunk's own shape, not fall-through narrowing.
+            if ("unroutable" in firstAttempt && firstAttempt.unroutable) {
               log(
                 `[Failover] WALK-SKIP ${role} → ${walk.concrete} reason=unroutable — ${firstAttempt.unroutable} (#769)`,
                 true // forceConsole — operational event, countable marker
               );
               advanceReason = "unroutable";
-            } else if (isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody)) {
+            } else if (
+              "status" in firstAttempt &&
+              isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody)
+            ) {
               // The advance is a paid attempt too, so re-check the walk budget
               // before buying it: reaching here already means one more
               // connection failure was absorbed, and a budget that admitted the

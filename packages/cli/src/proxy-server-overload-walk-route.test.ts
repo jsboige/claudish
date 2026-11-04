@@ -43,6 +43,10 @@ import {
   isOverloadWalkClass,
   isTransientOverload,
 } from "./handlers/composed-handler.js";
+import {
+  clearEndpointTokenBudgets,
+  estimateBudgetTokens,
+} from "./handlers/shared/endpoint-token-budget.js";
 import type { ClaudishProfileConfig } from "./profile-config.js";
 import { ensureEndpointsRegistered } from "./providers/endpoint-registration.js";
 import { createProxyServer } from "./proxy-server.js";
@@ -64,6 +68,21 @@ let endpointDelayMs: Record<string, number> = {};
 /** W33 (#628): when set to a bucket, the next `tr` hit walls it BEFORE
  *  answering — a concurrent request changing the delegation owner mid-attempt. */
 let wallOnTrHit: string | null = null;
+/** #654 B3/B4/B5: the FIRST call to this endpoint is HELD until the test
+ *  resolves it — the holder's lease stays in flight while another request is
+ *  evaluated against the same Σ. */
+let holdFirstHit: string | null = null;
+let heldResolve: ((r: Response) => void) | null = null;
+/** #654 B pins: per-endpoint SSE text — the client-visible proof of WHO
+ *  served (absent ⇒ the shared greeting). */
+let endpointText: Record<string, string> = {};
+/** #654 B1-B5: answer 402s in the PLAIN `{detail}` shape (role-failover's
+ * `quotaWall`) instead of `errorBodyFor(402)`. The OpenAI-shaped body makes
+ * the handler re-envelope the wall as a 400 `invalid_request_error` — the
+ * structured `insufficient_quota` type never survives to the loop, and the
+ * arm never fires. The plain shape surfaces as a raw 402, which
+ * `isQuotaExhaustion` takes on STATUS alone. */
+let plainWall402 = false;
 
 const SANDBOX_ENV_KEYS = [
   "ZAI_API_KEY",
@@ -101,7 +120,7 @@ const savedEnv: Record<string, string | undefined> = {};
 
 let activeProxy: ProxyServer | null = null;
 
-function healthySSE(): Response {
+function healthySSE(text = "Hello from the cascade."): Response {
   const chunk = (delta: any, finish_reason: string | null = null) =>
     `data: ${JSON.stringify({
       id: "chatcmpl-fake",
@@ -112,7 +131,7 @@ function healthySSE(): Response {
     })}\n\n`;
   const sse =
     chunk({ role: "assistant", content: "" }) +
-    chunk({ content: "Hello from the cascade." }) +
+    chunk({ content: text }) +
     chunk({}, "stop") +
     "data: [DONE]\n\n";
   return new Response(
@@ -176,7 +195,13 @@ function resetWalk(env: Record<string, string>): void {
 }
 
 async function postMessage(
-  opts: { model?: string; headers?: Record<string, string> } = {}
+  opts: {
+    model?: string;
+    headers?: Record<string, string>;
+    /** #654: rides `metadata.user_id` — the budget signature keys on it. */
+    session?: string;
+    content?: string;
+  } = {}
 ): Promise<Response> {
   return realFetch(`${activeProxy!.url}/v1/messages`, {
     method: "POST",
@@ -189,7 +214,8 @@ async function postMessage(
       model: opts.model ?? "claude-sonnet-5",
       max_tokens: 64,
       stream: false,
-      messages: [{ role: "user", content: "say hi" }],
+      ...(opts.session ? { metadata: { user_id: opts.session } } : {}),
+      messages: [{ role: "user", content: opts.content ?? "say hi" }],
     }),
   });
 }
@@ -226,18 +252,29 @@ beforeEach(() => {
   endpointStatus = { nm: 529, native: 529 };
   endpointDelayMs = {};
   wallOnTrHit = null;
+  holdFirstHit = null;
+  heldResolve = null;
+  endpointText = {};
+  plainWall402 = false;
+  // #654: the endpoint-budget family is per-endpoint-named, so it cannot sit
+  // in SANDBOX_ENV_KEYS — sweep the whole family AND the module's global lease
+  // registry; a leaked holder lease would phantom-Σ every later pin.
+  for (const k of Object.keys(process.env)) {
+    if (k.startsWith("CLAUDISH_ENDPOINT_")) delete process.env[k];
+  }
+  clearEndpointTokenBudgets();
   failoverLog = [];
   (process.stderr as any).write = ((chunk: any, ...rest: any[]) => {
     const text = typeof chunk === "string" ? chunk : String(chunk);
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]")) failoverLog.push(line);
+      if (line.includes("[Failover]") || line.includes("[EndpointBudget]")) failoverLog.push(line);
     }
     return realStderrWrite(chunk, ...rest);
   }) as any;
   console.log = ((...args: any[]) => {
     const text = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]")) failoverLog.push(line);
+      if (line.includes("[Failover]") || line.includes("[EndpointBudget]")) failoverLog.push(line);
     }
     // Re-emit so a failing run still shows the proxy's operator markers.
     realConsoleLog(...args);
@@ -288,8 +325,24 @@ beforeEach(() => {
     }
     const delay = endpointDelayMs[which] ?? 0;
     if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    // #654 B3/B4/B5: hold the FIRST call to `holdFirstHit` — the holder's
+    // lease must stay in flight while a second request is evaluated.
+    if (holdFirstHit && which === holdFirstHit) {
+      holdFirstHit = null;
+      return new Promise<Response>((resolve) => {
+        heldResolve = resolve;
+      });
+    }
     const status = endpointStatus[which] ?? 200;
-    if (status === 200) return healthySSE();
+    if (status === 402 && plainWall402) {
+      return new Response(
+        JSON.stringify({
+          detail: "Check your subscription on https://example.invalid/subscription",
+        }),
+        { status: 402, headers: { "content-type": "application/json" } }
+      );
+    }
+    if (status === 200) return healthySSE(endpointText[which]);
     return new Response(errorBodyFor(status), {
       status,
       headers: { "content-type": "application/json" },
@@ -314,6 +367,12 @@ afterEach(async () => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+  // #654: same family sweep as beforeEach — a pin that crashed mid-flight
+  // must not leave its knobs (or leases) to the file's later tests.
+  for (const k of Object.keys(process.env)) {
+    if (k.startsWith("CLAUDISH_ENDPOINT_")) delete process.env[k];
+  }
+  clearEndpointTokenBudgets();
   resetFailoverForTests();
 });
 
@@ -829,5 +888,287 @@ describe("#598 — a walk step that dies connection-class advances once", () => 
     expect(earliestWalledReprobeAt("opus")).toBeDefined();
     // And a success credits the owner, it never disarms a bucket (TTL owns that).
     expect(isBucketWalled(bucketOfTr)).toBe(true);
+  }, 30_000);
+});
+
+// ─── #654 — the in-flight token budget per endpoint ─────────────────────────
+//
+// v14 home: this file (the loop AND the walk integration live in the same
+// harness here; the fork carries them in its step-skip route suite, which has
+// no v14 counterpart). The budget rides the #431 skip wire (reason=busy): an
+// over-budget step is never CALLED, never marked, never armed — the successor
+// serves. The nominal refusal is an overload-class diversion feeding the
+// #299-B one-shot walk. Unit pins (numbers, estimator, AC5 registry) live in
+// endpoint-token-budget.test.ts; these route pins carry the integration:
+// zero upstream calls on the budgeted endpoint, no bench after a budget skip,
+// real in-flight Σ, the big-cap short-pass, the echo replacement and the
+// nominal walk (B7 = the r1 walk-side gate).
+
+describe("#654 — in-flight token budget per endpoint (busy-class skip)", () => {
+  /** The knobs are per-endpoint-named (not in SANDBOX_ENV_KEYS): each pin
+   * clears the family and the lease registry before AND after itself. */
+  const clearBudget = () => {
+    for (const k of Object.keys(process.env)) {
+      if (k.startsWith("CLAUDISH_ENDPOINT_")) delete process.env[k];
+    }
+    clearEndpointTokenBudgets();
+  };
+  /** The client-visible text of a served step, per endpoint name. */
+  const sayFrom = (which: "s0" | "s1"): string => `ok-from-${which}`;
+  const setHealthy = (which: "nm" | "s0" | "s1"): void => {
+    delete endpointStatus[which];
+  };
+  const releaseHeld = (): void => {
+    heldResolve?.(healthySSE("ok-from-s0"));
+    heldResolve = null;
+  };
+  async function responseText(r: Response): Promise<string> {
+    const body: any = await r.json();
+    return (body?.content ?? [])
+      .filter((b: any) => b?.type === "text")
+      .map((b: any) => b.text)
+      .join("");
+  }
+
+  test("B1 (AC2): a step over Σ is NEVER called — the successor serves, no failure mark", async () => {
+    clearBudget();
+    try {
+      await spin();
+      armCascade();
+      endpointStatus.nm = 402; // arm -> step 0 dispatch
+      plainWall402 = true; // plain shape: the OpenAI-shaped wall re-envelopes to 400 and never arms // arm → step 0 dispatch
+      // 10 tokens: any real body (~50 est) is over Σ on the FIRST attempt —
+      // the refusal happens before any s0 socket exists.
+      process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_S0_EP = "10";
+      endpointText.s0 = sayFrom("s0");
+      endpointText.s1 = sayFrom("s1");
+
+      const r = await postMessage({ session: "b1" });
+      expect(r.status).toBe(200);
+      expect(await responseText(r)).toContain(sayFrom("s1"));
+      expect(calls.s0 ?? 0).toBe(0); // THE PIN: the engine never saw the request
+      expect(calls.s1).toBe(1);
+      expect(
+        failoverLog.some(
+          (l) =>
+            l.includes("[Failover] SKIP sonnet[0] reason=busy") &&
+            l.includes("sum=0/10") &&
+            l.includes("endpoint token budget")
+        )
+      ).toBe(true);
+
+      // No failure mark: with the budget removed (read per request), a fresh
+      // session resolves step 0 again — a bench would TTL-freeze s0 for 10 min.
+      delete process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_S0_EP;
+      const r2 = await postMessage({ session: "b1b" });
+      expect(await responseText(r2)).toContain(sayFrom("s0"));
+      expect(calls.s0).toBe(1);
+    } finally {
+      clearBudget();
+    }
+  }, 30_000);
+
+  test("B2 (AC1): no budget env ⇒ zero drift — step 0 serves, no budget marker", async () => {
+    clearBudget();
+    try {
+      await spin();
+      armCascade();
+      endpointStatus.nm = 402; // arm -> step 0 dispatch
+      plainWall402 = true; // plain shape: the OpenAI-shaped wall re-envelopes to 400 and never arms
+
+      const r = await postMessage({ session: "b2" });
+      expect(r.status).toBe(200);
+      expect((await r.json())?.content?.[0]?.text).toContain("Hello from the cascade.");
+      expect(calls.s0).toBe(1);
+      expect(calls.s1 ?? 0).toBe(0);
+      expect(failoverLog.filter((l) => l.includes("[EndpointBudget]")).length).toBe(0);
+      expect(failoverLog.filter((l) => l.includes("endpoint token budget")).length).toBe(0);
+    } finally {
+      clearBudget();
+    }
+  }, 30_000);
+
+  test("B3 (AC2): Σ counts REAL in-flight leases — the holder trips the second request", async () => {
+    clearBudget();
+    try {
+      await spin();
+      armCascade();
+      endpointStatus.nm = 402; // arm -> step 0 dispatch
+      plainWall402 = true; // plain shape: the OpenAI-shaped wall re-envelopes to 400 and never arms
+      // Budget = one estimate + slack: one request fits, two do not.
+      const est = estimateBudgetTokens({
+        model: "claude-sonnet-5",
+        max_tokens: 64,
+        stream: false,
+        metadata: { user_id: "b3a" },
+        messages: [{ role: "user", content: "hold the budget lease" }],
+      });
+      process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_S0_EP = String(est + 10);
+      endpointText.s1 = sayFrom("s1");
+      holdFirstHit = "s0";
+
+      const r1p = postMessage({ session: "b3a", content: "hold the budget lease" });
+      await new Promise((r) => setTimeout(r, 400)); // r1 reaches s0, lease committed
+      expect(calls.s0).toBe(1);
+
+      // Different session ⇒ different signature ⇒ its own estimate: est+est >
+      // est+10 ⇒ refused at step 0, s1 serves — while r1 still holds its lease.
+      const r2 = await postMessage({ session: "b3b", content: "hold the budget lease" });
+      expect(await responseText(r2)).toContain(sayFrom("s1"));
+      expect(calls.s1).toBe(1);
+      expect(calls.s0).toBe(1); // still only the holder
+
+      releaseHeld();
+      const r1 = await r1p;
+      expect(r1.status).toBe(200);
+      expect(await responseText(r1)).toContain(sayFrom("s0"));
+    } finally {
+      clearBudget();
+    }
+  }, 30_000);
+
+  test("B4 (AC4): the big-concurrency cap refuses the SECOND big body, a short one still passes", async () => {
+    clearBudget();
+    try {
+      await spin();
+      armCascade();
+      endpointStatus.nm = 402; // arm -> step 0 dispatch
+      plainWall402 = true; // plain shape: the OpenAI-shaped wall re-envelopes to 400 and never arms
+      process.env.CLAUDISH_ENDPOINT_BIG_LIMIT_S0_EP = "1";
+      endpointText.s1 = sayFrom("s1");
+      holdFirstHit = "s0";
+
+      // Big #1 (est > 100K): admitted (bigInFlight 0 < 1), holds the lease.
+      const big1 = "y".repeat(400_000);
+      const r1p = postMessage({ session: "b4a", content: `read: ${big1}` });
+      await new Promise((r) => setTimeout(r, 500));
+      expect(calls.s0).toBe(1);
+
+      // Big #2, different body: bigInFlight 1 ≥ 1 ⇒ refused reason=big ⇒ s1.
+      const big2 = "z".repeat(400_100);
+      const r2 = await postMessage({ session: "b4b", content: `read: ${big2}` });
+      expect(await responseText(r2)).toContain(sayFrom("s1"));
+      expect(
+        failoverLog.some(
+          (l) => l.includes("[Failover] SKIP sonnet[0] reason=busy") && l.includes("reason=big")
+        )
+      ).toBe(true);
+
+      // THE AC4 PIN: a short request passes under the saturated big cap.
+      const r3 = await postMessage({ session: "b4c", content: "short one please" });
+      expect(await responseText(r3)).toContain("Hello from the cascade.");
+      expect(calls.s0).toBe(2); // big#1 (holder) + short — big#2 never reached s0
+
+      releaseHeld();
+      await r1p;
+    } finally {
+      clearBudget();
+    }
+  }, 30_000);
+
+  test("B5 (AC5): an identical resubmission REPLACES its predecessor — s0 takes it again", async () => {
+    clearBudget();
+    try {
+      await spin();
+      armCascade();
+      endpointStatus.nm = 402; // arm -> step 0 dispatch
+      plainWall402 = true; // plain shape: the OpenAI-shaped wall re-envelopes to 400 and never arms
+      const est = estimateBudgetTokens({
+        model: "claude-sonnet-5",
+        max_tokens: 64,
+        stream: false,
+        metadata: { user_id: "b5" },
+        messages: [{ role: "user", content: "echo me once" }],
+      });
+      process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_S0_EP = String(est + 10);
+      endpointText.s0 = sayFrom("s0");
+      holdFirstHit = "s0";
+
+      // Same session, same body: the second copy replaces the first's estimate
+      // (Σ stays one est ≤ est+10) instead of refusing it to s1.
+      const r1p = postMessage({ session: "b5", content: "echo me once" });
+      await new Promise((r) => setTimeout(r, 400));
+      expect(calls.s0).toBe(1);
+      const r2 = await postMessage({ session: "b5", content: "echo me once" });
+      expect(await responseText(r2)).toContain(sayFrom("s0"));
+      expect(calls.s0).toBe(2); // THE PIN: s0 again — add-semantics would say s1
+      expect(calls.s1 ?? 0).toBe(0);
+      expect(
+        failoverLog.some((l) => l.includes("[EndpointBudget]") && l.includes("resubmit=2"))
+      ).toBe(true);
+
+      releaseHeld();
+      const r1 = await r1p;
+      expect(r1.status).toBe(200);
+    } finally {
+      clearBudget();
+    }
+  }, 30_000);
+
+  test("B6: the nominal's budget refusal is a walk — s0 serves, the client never sees the 529", async () => {
+    clearBudget();
+    try {
+      await spin();
+      // NO auto-arm: attempt 0 is the healthy nominal — until its budget says no.
+      resetFailoverForTests({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0>s1-ep@fake-s1" });
+      setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
+      setHealthy("nm");
+      process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_NM_EP = "10";
+      endpointText.s0 = sayFrom("s0");
+
+      const r = await postMessage({ session: "b6" });
+      expect(r.status).toBe(200); // the synthesized 529 never reaches the client
+      expect(await responseText(r)).toContain(sayFrom("s0"));
+      expect(calls.nm ?? 0).toBe(0); // the budgeted nominal is never called
+      expect(calls.s0).toBe(1);
+      expect(failoverLog.some((l) => l.includes("budget-skip nominal"))).toBe(true);
+    } finally {
+      clearBudget();
+    }
+  }, 30_000);
+
+  test("B7 (#663 r1): a walk target at full Σ gets ZERO calls — the walk advances one hop, the successor serves", async () => {
+    clearBudget();
+    try {
+      await spin();
+      // B6 shape (the NOMINAL's own budget refusal triggers the #299-B walk)
+      // with the walk's FIRST step budgeted too: s0-ep at Σ=10 refuses any
+      // real body (~50 est) BEFORE its call. Before r1 the walk bypassed the
+      // gate entirely — s0 was called with the very load the budget exists
+      // to bound. The pin is the zero: admission refused, one hop forward.
+      resetFailoverForTests({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0>s1-ep@fake-s1" });
+      setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
+      setHealthy("nm");
+      process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_NM_EP = "10";
+      process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_S0_EP = "10";
+      endpointText.s0 = sayFrom("s0");
+      endpointText.s1 = sayFrom("s1");
+
+      const r = await postMessage({ session: "b7" });
+      expect(r.status).toBe(200);
+      expect(await responseText(r)).toContain(sayFrom("s1"));
+      expect(calls.nm ?? 0).toBe(0); // the budgeted nominal never pays a round-trip
+      expect(calls.s0 ?? 0).toBe(0); // THE PIN: the walk target was refused before its call
+      expect(calls.s1).toBe(1);
+      expect(
+        failoverLog.some(
+          (l) =>
+            l.includes("[Failover] WALK-SKIP sonnet → s0-ep@fake-s0") &&
+            l.includes("sum=0/10") &&
+            l.includes("endpoint token budget")
+        )
+      ).toBe(true);
+
+      // No state written by the refusal: the nominal's budget stays armed (it
+      // is what triggers the walk), s0's lifts (read per request) — a fresh
+      // session walks again and s0 serves. A bench or wall from the walk-skip
+      // would TTL-freeze s0 for 10 min and the walk would land on s1.
+      delete process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_S0_EP;
+      const r2 = await postMessage({ session: "b7b" });
+      expect(await responseText(r2)).toContain(sayFrom("s0"));
+      expect(calls.s0).toBe(1);
+    } finally {
+      clearBudget();
+    }
   }, 30_000);
 });
