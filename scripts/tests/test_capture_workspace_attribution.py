@@ -23,6 +23,20 @@ would silently manufacture a conclusion about WHERE the fleet's responses go:
      so the fix cannot degenerate into "strip any trailing punctuation".
   6. WEEK GROUPING -- `--week` is Monday-based, so a Wednesday argument measures
      the Monday..Sunday week that contains it rather than a rolling 7 days.
+  7. SESSION, THREE SHAPES -- the capture is an ENVELOPE (`{"body": {…}}`) but
+     pre-envelope captures are bare bodies; `user_id` is JSON (CC >= 2.1) or the
+     flat `user_<h>_account_<uuid>_session_<uuid>`. All three must yield the
+     session id; a body with no metadata must yield None, not a fake bucket.
+  8. PAIRING BY REQUEST NUMBER AS WRITTEN -- `req-1-0001-…` pairs with
+     `resp-1-r0001-…` and `req-1-10000-…` with `resp-1-r10000-…`: the number
+     keeps its rendering (zero-padded on older builds), and the response
+     timestamp is NOT part of the pairing.
+  9. USAGE IS MAX, NEVER SUMMED -- `message_start` carries the real input and
+     the terminal delta the output; summing frames would multiply input by
+     frame count (#179). A mid-stream smaller input must not win either.
+  10. TOURS COUNT DISTINCT SESSIONS PER DAY -- two requests of one session are
+     one tour; a session without an id stays out of the tour count but keeps
+     its workspace row.
 """
 
 import importlib.util
@@ -123,6 +137,92 @@ def pin_week_grouping_is_monday_based():
            "the week runs Monday..Sunday: %r" % (weeks[0],))
 
 
+def pin_session_three_shapes():
+    env = (b'{"body":{"metadata":{"user_id":"{\\"device_id\\":\\"d\\",\\"session_id\\":\\"'
+           b'65230986-1c2d-4e3f-aabb-ccddeeff0011\\"}"}}}')
+    _check(wsattr.session_key(env) == "65230986-1c2d-4e3f-aabb-ccddeeff0011",
+           "envelope + JSON user_id -> session_id, got %r" % wsattr.session_key(env))
+    flat = (b'{"body":{"metadata":{"user_id":'
+            b'"user_ab12_account_c2608888-1234-4abc-9def-001122334455_session_99887766-aaaa-bbbb-cccc-111122223333"}}}')
+    _check(wsattr.session_key(flat) == "99887766-aaaa-bbbb-cccc-111122223333",
+           "envelope + flat user_id -> the uuid after `_session_`, got %r" % wsattr.session_key(flat))
+    bare = (b'{"metadata":{"user_id":"{\\"session_id\\":\\"fedcba98-7654-3210-9876-543210fedcba\\"}"},'
+            b'"model":"claude-sonnet-5-5"}')
+    _check(wsattr.session_key(bare) == "fedcba98-7654-3210-9876-543210fedcba",
+           "a pre-envelope bare body reads its top-level metadata, got %r" % wsattr.session_key(bare))
+
+
+def pin_session_absent_is_none():
+    _check(wsattr.session_key(b'{"body":{"messages":[]}}') is None,
+           "no metadata -> None, never a fake session bucket")
+    _check(wsattr.session_key(b'{"body":{"metadata":{"user_id":"opaque-not-a-session"}}}') is None,
+           "a user_id carrying no session fragment -> None")
+
+
+def pin_pairing_keeps_the_number_as_written():
+    _check(wsattr.resp_prefix_for("req-1-0001-2026-11-03T00-32-58-676Z-direct.json") == "resp-1-r0001-",
+           "zero-padded request number must keep its rendering in the resp prefix")
+    _check(wsattr.resp_prefix_for("req-1-10000-2026-11-04T00-05-26-123Z-direct.json") == "resp-1-r10000-",
+           "natural (unpadded) request number pairs with the natural resp prefix")
+    _check(wsattr.resp_prefix_for("resp-1-r0001-2026-11-03T00-33-00-176Z-native-claude-opus-5-5") is None,
+           "a resp name is not a request and must not pair with anything")
+
+
+def pin_usage_is_max_never_summed():
+    sse = (b'data: {"type":"message_start","message":{"usage":{"input_tokens":41200,"output_tokens":1}}}\n'
+           b'data: {"type":"content_block_delta","usage":{"input_tokens":12,"output_tokens":40}}\n'
+           b'data: {"type":"message_delta","usage":{"input_tokens":41200,"output_tokens":631}}\n')
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".sse", delete=False) as f:
+        f.write(sse)
+        p = f.name
+    try:
+        got = wsattr.usage_from_resp(p)
+        _check(got == (41200, 631),
+               "max of each axis across frames (41200, 631), got %r — a sum would read ~82k input" % (got,))
+    finally:
+        os.remove(p)
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+        f.write('{"usage":{"input_tokens":900,"output_tokens":45},"type":"message"}')
+        q = f.name
+    try:
+        _check(wsattr.usage_from_resp(q) == (900, 45), "a stream:false JSON response reads its top-level usage")
+    finally:
+        os.remove(q)
+
+
+def pin_usage_nested_input_tokens_details():
+    sse = b'data: {"usage":{"input_tokens_details":{"input_tokens":777},"output_tokens":12}}\n'
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".sse", delete=False) as f:
+        f.write(sse)
+        p = f.name
+    try:
+        _check(wsattr.usage_from_resp(p) == (777, 12),
+               "input_tokens_details.input_tokens is the input when the flat field is absent")
+    finally:
+        os.remove(p)
+
+
+def pin_tours_count_distinct_sessions():
+    rows = [
+        {"ws": "coursia", "session": "s1", "in": 100, "out": 10, "paired": True},
+        {"ws": "coursia", "session": "s1", "in": 50, "out": 5, "paired": True},
+        {"ws": "coursia", "session": "s2", "in": 25, "out": 2, "paired": False},
+        {"ws": "claudish", "session": "s9", "in": 1, "out": 1, "paired": True},
+        {"ws": "claudish", "session": None, "in": 2, "out": 0, "paired": True},
+    ]
+    agg = wsattr.aggregate_tours(rows, 0.5)
+    w = agg["workspaces"]
+    _check(w["coursia"]["tours"] == 2, "two distinct sessions -> 2 tours, got %r" % w["coursia"]["tours"])
+    _check(w["coursia"]["reqs"] == 3 and w["coursia"]["in_tok"] == 175, "reqs and tokens aggregate linearly")
+    _check(w["claudish"]["tours"] == 1, "a session-less request never mints a tour")
+    _check(agg["no_session"] == 1, "the session-less request is counted as no_session, not dropped")
+    _check(w["coursia"]["tours_hi"] == 4 and w["coursia"]["est_in_tok"] == 350,
+           "tours_hi and est tokens divide by the sample fraction (0.5 here) — a BOUND, not an estimate")
+    _check(w["coursia"]["paired"] == 2, "paired counts rows with a usage-bearing response")
+
+
 PINS = [
     pin_plain_path,
     pin_previous_directory_suffix,
@@ -133,6 +233,12 @@ PINS = [
     pin_parenthesised_workspace_survives,
     pin_trailing_separator_and_case,
     pin_week_grouping_is_monday_based,
+    pin_session_three_shapes,
+    pin_session_absent_is_none,
+    pin_pairing_keeps_the_number_as_written,
+    pin_usage_is_max_never_summed,
+    pin_usage_nested_input_tokens_details,
+    pin_tours_count_distinct_sessions,
 ]
 
 
