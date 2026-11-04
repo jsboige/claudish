@@ -424,16 +424,36 @@ ttfts and the loop gauges. Two consecutive `/health` failures → AUTONOMOUS is
 the designed hysteresis doing its job; episode 2's total cost was one request
 served locally.
 
-The instrument gap that keeps the residual question open: **`/health`
-arrivals are not logged hub-side** — a case-insensitive grep for "health"
-over 214 640 log lines returns 24 hits, all prompt text. "Heartbeat never
-arrived" (container NAT, path) therefore cannot be distinguished from
+The instrument gap that kept the residual question open on 01/11: **`/health`
+arrivals were not logged hub-side** — a case-insensitive grep for "health"
+over 214 640 log lines returned 24 hits, all prompt text. "Heartbeat never
+arrived" (container NAT, path) therefore could not be distinguished from
 "answered slowly" (loop pressure) from the hub journal alone; the
-discriminator is a heartbeat-arrival marker hub-side, or the sidecar's own
-failure shape (connect timeout vs slow response). Until one exists, #587's
-thesis — event-loop blocking under load driving NOMINAL→AUTONOMOUS
-transitions — is **refuted for these two transitions** (loop sub-second, hub
-serving) while the midday upstream pressure itself is real and measured.
+discriminator called for was a heartbeat-arrival marker hub-side, or the
+sidecar's own failure shape (connect timeout vs slow response). **That marker
+shipped in #812** (`[Health] hit peer=… machine=… status=…`), so the gap is
+closed — but read it for what it is:
+
+- **It is an arrival marker, emitted by the machine that RECEIVES the probe**
+  (`proxy-server.ts`, the `/health` route, before the gauges are read: a
+  stalled instance still proves it was reached). It measures "this instance
+  was reached, by that peer" — never the caller's own continuity, and never
+  the hub's ability to serve (`status=ok` is that one reply's verdict).
+- **`machine=-` means the prober is not a relay heartbeat.** A v27 relay
+  heartbeat always sends `X-Claudish-Machine`; `machine=-` lines are local
+  watchdogs (typically 30 s via the Docker port-forward, appearing as
+  `127.0.0.1`), routers or browsers. Their cadence says nothing about the
+  prober's 10 s interval (`HEARTBEAT_INTERVAL_MS`, `relay.ts`).
+- **A relay's outbound heartbeat is silent when it succeeds** — `relay.ts`
+  logs failure episodes only. A seat's continuity toward the hub therefore
+  reads in the HUB's journal (`[Health] hit … machine=<that seat>`), never in
+  its own local `[Health]` lines. Reading 740 local lines as "my heartbeat
+  works" was exactly the trap, caught and corrected on 03/11.
+
+With the marker in place, #587's thesis — event-loop blocking under load
+driving NOMINAL→AUTONOMOUS transitions — stays **refuted for these two
+transitions** (loop sub-second, hub serving) while the midday upstream
+pressure itself was real and measured.
 
 ### A third transition, and it sits exactly at the recovery floor
 
