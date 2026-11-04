@@ -46,7 +46,7 @@ import {
   logPolicyRefusal,
 } from "./shared/stream-parsers/policy-refusal.js";
 import { collectAnthropicSseToMessage } from "./shared/collect-sse-message.js";
-import { appendUpstreamError } from "./shared/response-capture.js";
+import { appendConnectionError, appendUpstreamError } from "./shared/response-capture.js";
 import {
   classifyContextOverflow,
   estimatePayloadTokens,
@@ -1249,6 +1249,17 @@ export class ComposedHandler implements ModelHandler {
       if (conn) {
         const msg = buildConnectionErrorMessage(conn.kind, this.provider.displayName, endpoint);
         log(`[${this.provider.displayName}] ${msg} (code=${conn.code})`);
+        // #844: this failure class has no HTTP response, so upstream-errors.log
+        // never sees it — one durable line with the classification stdout
+        // would otherwise lose to the next container recreate.
+        appendConnectionError({
+          model: this.targetModel,
+          provider: this.provider.displayName,
+          kind: conn.kind,
+          code: conn.code,
+          endpoint,
+          elapsed_ms: performance.now() - startTime,
+        });
         logStderr(`Error: ${msg}`);
         reportError({
           error,
