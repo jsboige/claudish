@@ -442,11 +442,15 @@ closed — but read it for what it is:
 - **`machine=-` means the prober is not a relay heartbeat *from a current
   build*.** A v27 relay heartbeat always sends `X-Claudish-Machine` — but only
   when `machineName()` is non-empty (`CLAUDISH_MACHINE`), and an image that
-  predates #587 sends no header at all: an OLD sidecar is a relay heartbeat
-  that arrives anonymous. The rest of the `machine=-` lines are local watchdogs
-  (typically 30 s via the Docker port-forward, appearing as `127.0.0.1`),
-  routers or browsers. Their cadence says nothing about the prober's 10 s
-  interval (`HEARTBEAT_INTERVAL_MS`, `relay.ts`).
+  predates #812 (`210de4bc`, 02/11 — the commit that gave the heartbeat its
+  header, as a #587 instrument) sends no header at all: an OLD sidecar is a
+  relay heartbeat that arrives anonymous. Its deep recovery probe, by contrast,
+  has named itself since 06/10 (`fb16ef2d`), so named probes next to anonymous
+  heartbeats from one seat point at its image date, not at its network. The
+  rest of the `machine=-` lines are local watchdogs (typically 30 s via the
+  Docker port-forward, appearing as `127.0.0.1`), routers or browsers. Their
+  cadence says nothing about the prober's 10 s interval
+  (`HEARTBEAT_INTERVAL_MS`, `relay.ts`).
 - **A relay's outbound heartbeat is silent when it succeeds** — `relay.ts`
   logs failure episodes only. A seat's continuity toward the hub therefore
   reads in the HUB's journal (`[Health] hit … machine=<that seat>`), never in
