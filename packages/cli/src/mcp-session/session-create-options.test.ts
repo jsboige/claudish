@@ -9,7 +9,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ENV } from "../config.js";
@@ -22,20 +23,23 @@ import {
   makePaneTestEnv,
   waitNoOrphans,
 } from "../pane/test-helpers/hermetic-env.js";
+import { waitForJson } from "../test-support/wait-for-json.js";
 import { SessionManager } from "./session-manager.js";
 
 const T_PANE = 30_000;
 
-function waitUntil(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const deadline = Date.now() + timeoutMs;
-    const check = () => {
-      if (predicate()) return resolve();
-      if (Date.now() >= deadline) return reject(new Error("waitUntil timed out"));
-      setTimeout(check, 20);
-    };
-    check();
-  });
+/**
+ * #831 — the env probe's read side, hoisted so its settle guard can be pinned
+ * without a pane: `existsSync` proved the directory entry existed, not that the
+ * child had finished writing, and `JSON.parse` died on the half-written prefix.
+ */
+async function childEnvAt(
+  probePath: string,
+  manager: SessionManager,
+  sessionId: string
+): Promise<Record<string, string>> {
+  const path = probePath.replace("{session}", manager.getSession(sessionId).claudeSessionId);
+  return (await waitForJson<{ env: Record<string, string> }>(path)).env;
 }
 
 describe.skipIf(!MAGMUX)(
@@ -77,9 +81,7 @@ describe.skipIf(!MAGMUX)(
       manager: SessionManager,
       sessionId: string
     ): Promise<Record<string, string>> {
-      const path = probe.replace("{session}", manager.getSession(sessionId).claudeSessionId);
-      await waitUntil(() => existsSync(path));
-      return (JSON.parse(readFileSync(path, "utf-8")) as { env: Record<string, string> }).env;
+      return childEnvAt(probe, manager, sessionId);
     }
 
     test(
@@ -180,3 +182,20 @@ describe.skipIf(!MAGMUX)(
     );
   }
 );
+
+describe("#831 settle guards (no pane needed)", () => {
+  const stubManager = {
+    getSession: () => ({ claudeSessionId: "pin" }),
+  } as unknown as SessionManager;
+
+  test("childEnvAt refuses a half-written env probe, then settles when the writer finishes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-831-env-"));
+    const path = join(dir, "probe-pin.json");
+    writeFileSync(path, '{"env": {"par'); // exists, unparseable — the old read died here
+    const pending = childEnvAt(join(dir, "probe-{session}.json"), stubManager, "s");
+    await new Promise((resolve) => setTimeout(resolve, 100)); // polls must see the partial
+    writeFileSync(path, '{"env":{"FAKE_PROBE_FILE":"/w/probe.json"}}');
+    const env = await pending;
+    expect(env.FAKE_PROBE_FILE).toBe("/w/probe.json");
+  });
+});

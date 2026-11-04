@@ -38,6 +38,7 @@ import {
 import { transcriptRecords } from "../pane/test-helpers/transcript-fixtures.js";
 import { projectsDir, transcriptPathFor } from "../session/session-discovery.js";
 import { readWaitLines } from "../test-helpers/contract-records.js";
+import { waitForJson, waitForTextContaining } from "../test-support/wait-for-json.js";
 import {
   SessionManager,
   normaliseTimeoutSeconds,
@@ -62,6 +63,30 @@ function waitUntil(predicate: () => boolean, timeoutMs = 10_000, intervalMs = 25
     };
     check();
   });
+}
+
+/**
+ * #831 — read sides hoisted so their settle guards can be pinned without a
+ * pane. Each old shape proved the directory entry existed, not that the writer
+ * had finished: `JSON.parse` died on the half-written prefix, and a log read
+ * before its flush could miss the very region an absence assertion targets.
+ */
+function waitForMetaAt(sessionsDir: string, id: string, timeoutMs = 15_000) {
+  return waitForJson<Record<string, unknown>>(join(sessionsDir, id, "meta.json"), timeoutMs);
+}
+
+function argvOfAt(probePath: string, manager: SessionManager, id: string): Promise<string[]> {
+  const path = probePath.replace("{session}", manager.getSession(id).claudeSessionId);
+  return waitForJson<{ argv: string[] }>(path).then((probe) => probe.argv);
+}
+
+function waitForOutputLogAt(
+  sessionsDir: string,
+  id: string,
+  substrings: readonly string[],
+  timeoutMs = 15_000
+): Promise<string> {
+  return waitForTextContaining(join(sessionsDir, id, "output.log"), substrings, timeoutMs);
 }
 
 function captureError(fn: () => unknown): unknown {
@@ -626,9 +651,7 @@ describe.skipIf(!MAGMUX)(
     }
 
     const waitForMeta = (id: string, timeoutMs = 15_000) =>
-      waitUntil(() => existsSync(join(sessionsDir, id, "meta.json")), timeoutMs).then(() =>
-        JSON.parse(readFileSync(join(sessionsDir, id, "meta.json"), "utf-8"))
-      );
+      waitForMetaAt(sessionsDir, id, timeoutMs);
 
     const stateTargets = (id: string): SlotState[] => {
       const path = join(sessionsDir, id, "events.jsonl");
@@ -703,12 +726,7 @@ describe.skipIf(!MAGMUX)(
         const manager = makeManager({ parentEnv: { ...t.env, FAKE_PROBE_FILE: probe } });
         const pinned = await create(manager, { model: "glm-5", spawnModel: "fake-env_probe" });
         const bare = await create(manager, { model: "fake-env_probe" });
-        const argvOf = (id: string) => {
-          const path = probe.replace("{session}", manager.getSession(id).claudeSessionId);
-          return waitUntil(() => existsSync(path)).then(
-            () => (JSON.parse(readFileSync(path, "utf-8")) as { argv: string[] }).argv
-          );
-        };
+        const argvOf = (id: string) => argvOfAt(probe, manager, id);
         const a = await argvOf(pinned);
         expect(a[a.indexOf("--model") + 1]).toBe("fake-env_probe");
         expect(a[0]).toBe("-i");
@@ -861,8 +879,10 @@ describe.skipIf(!MAGMUX)(
         const meta = await waitForMeta(id);
         expect(meta.terminalReason).toBe("child_exited");
         expect(String(meta.detail)).toContain("MY_SERVICE_TOKEN=***REDACTED***");
-        await waitUntil(() => existsSync(join(sessionsDir, id, "output.log")));
-        const outputLog = readFileSync(join(sessionsDir, id, "output.log"), "utf-8");
+        // #831 — settle past the region under assertion: the redaction line is
+        // among the last screen content written, so a read before its flush
+        // could miss a leak this absence check exists to catch.
+        const outputLog = await waitForOutputLogAt(sessionsDir, id, ["MY_SERVICE_TOKEN="]);
         for (const text of [
           JSON.stringify(meta),
           outputLog,
@@ -1110,4 +1130,40 @@ describe("claudish signal exit codes", () => {
       stderr: "",
     });
   }, 10_000);
+});
+
+describe("#831 settle guards (no pane needed)", () => {
+  const stubManager = {
+    getSession: () => ({ claudeSessionId: "pin" }),
+  } as unknown as SessionManager;
+
+  test("waitForMetaAt refuses a half-written meta.json, then settles", async () => {
+    const sessions = mkdtempSync(join(tmpdir(), "claudish-831-meta-"));
+    mkdirSync(join(sessions, "pin"));
+    writeFileSync(join(sessions, "pin", "meta.json"), '{"sessionId": "pi'); // unparseable prefix
+    const pending = waitForMetaAt(sessions, "pin", 5_000);
+    await new Promise((resolve) => setTimeout(resolve, 100)); // polls see the partial
+    writeFileSync(join(sessions, "pin", "meta.json"), '{"sessionId":"pin"}');
+    const meta = await pending;
+    expect(meta.sessionId).toBe("pin");
+  });
+
+  test("argvOfAt refuses a half-written probe, then settles", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-831-argv-"));
+    writeFileSync(join(dir, "probe-pin.json"), '{"argv": ["par'); // unparseable prefix
+    const pending = argvOfAt(join(dir, "probe-{session}.json"), stubManager, "s");
+    await new Promise((resolve) => setTimeout(resolve, 100)); // polls see the partial
+    writeFileSync(join(dir, "probe-pin.json"), '{"argv":["-i","--model","m"]}');
+    expect(await pending).toEqual(["-i", "--model", "m"]);
+  });
+
+  test("waitForOutputLogAt settles on the substring, refusing the partial file", async () => {
+    const sessions = mkdtempSync(join(tmpdir(), "claudish-831-out-"));
+    mkdirSync(join(sessions, "pin"));
+    writeFileSync(join(sessions, "pin", "output.log"), "before "); // marker not yet written
+    const pending = waitForOutputLogAt(sessions, "pin", ["MY_SERVICE_TOKEN="], 5_000);
+    await new Promise((resolve) => setTimeout(resolve, 100)); // polls see the partial
+    writeFileSync(join(sessions, "pin", "output.log"), "before MY_SERVICE_TOKEN=***");
+    expect(await pending).toContain("***");
+  });
 });
