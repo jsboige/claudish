@@ -2692,7 +2692,7 @@ export class ComposedHandler implements ModelHandler {
           logStderr(
             `[MediaCap] provider=${this.provider.displayName} model=${this.targetModel} ` +
               `cap=${mediaCap.max ?? "?"} images=${carried} param=${mediaCap.param ?? "?"} — ` +
-              `request-shape incapacity, not a step failure`
+              "request-shape incapacity, not a step failure"
           );
           const out = c.json(
             wrapAnthropicError(400, mediaCapRefusalText(mediaCap.max, carried), "invalid_request_error"),
@@ -3880,7 +3880,7 @@ export function getRecoveryHint(
     if (mediaCap.matched) {
       return (
         `This step accepts ${mediaCap.max !== undefined ? `at most ${mediaCap.max} image(s)` : "a limited number of images"} ` +
-        `per prompt and refused on the media count — a step-skip, not a failure.`
+        "per prompt and refused on the media count — a step-skip, not a failure."
       );
     }
     if (lower.includes("context") || lower.includes("too long") || lower.includes("token")) {
