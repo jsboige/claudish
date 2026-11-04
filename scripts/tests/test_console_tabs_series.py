@@ -102,6 +102,25 @@ def test_extract_leaves_pct_absent_when_only_a_bare_percent_prints():
     assert "pct" not in got, got
 
 
+def test_extract_reads_the_claude_weekly_used_share_in_its_own_column():
+    # claude.ai prints a USED share; it must land in `used`, never in `pct` (remaining).
+    got = tabs.extract(["Réinitialisation le vendredi 02:00", "73 % utilisés", "100 %"])
+    assert got.get("used") == "73", got
+    assert "pct" not in got, got
+    assert got.get("reset_at") == "vendredi 02:00", got
+
+
+def test_extract_reads_the_zai_five_hour_share_split_over_three_lines():
+    got = tabs.extract(["Utilisation", "Quota de 5 heures", "8", "%", "Quota MCP", "0", "%"])
+    assert got.get("used") == "8", got
+
+
+def test_extract_does_not_take_the_zai_mcp_quota_for_the_five_hour_one():
+    # Positive control: without the 5-hour header, the MCP quota must stay unread.
+    got = tabs.extract(["Quota MCP", "0", "%"])
+    assert "used" not in got, got
+
+
 # --- log(): ts is the instant of OBSERVATION --------------------------------
 
 
@@ -183,6 +202,68 @@ def test_series_days_filter_drops_older_rows():
     rc, out = _run(tabs.cmd_series, provider=None, days=7, json=False)
     assert rc == 0
     assert "90" in out and "2026-01-01" not in out, out
+
+
+# --- publish / shared copy: the series must be readable from another seat -----
+
+
+def _tmpdir():
+    return Path(tempfile.mkdtemp(prefix="console-tabs-"))
+
+
+def test_publish_copies_the_ledger_and_writes_its_manifest():
+    src = _with_ledger([
+        {"ts": "2026-11-03T11:25:54Z", "provider": "deepseek-payg", "status": "ok",
+         "lines": ["$155.67"], "provenance": "verbatim tab-03"},
+        {"ts": "2026-11-04T09:14:16Z", "provider": "kimi", "status": "ok",
+         "lines": ["10 % restants"], "provenance": "verbatim tab-02"},
+    ])
+    dest = _tmpdir() / "shared" / "console-readings.jsonl"
+    rc, out = _run(tabs.cmd_publish, to=str(dest))
+    assert rc == 0, out
+    assert dest.read_bytes() == Path(src).read_bytes()
+    meta = json.loads((dest.parent / "_meta.json").read_text(encoding="utf-8"))
+    assert meta["rows"] == 2 and meta["last_ts"] == "2026-11-04T09:14:16Z", meta
+    assert not (dest.parent / "console-readings.jsonl.tmp").exists()
+
+
+def test_publish_refuses_to_shrink_the_shared_copy():
+    # A reset local ledger must never erase the history every other seat reads.
+    dest = _tmpdir() / "console-readings.jsonl"
+    dest.write_text("\n".join(json.dumps({"ts": f"2026-10-0{i}T00:00:00Z", "provider": "kimi"})
+                              for i in range(1, 4)) + "\n", encoding="utf-8")
+    before = dest.read_bytes()
+    _with_ledger([{"ts": "2026-11-04T00:00:00Z", "provider": "kimi"}])
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc, _ = _run(tabs.cmd_publish, to=str(dest))
+    assert rc == 3, err.getvalue()
+    assert "REFUS" in err.getvalue()
+    assert dest.read_bytes() == before
+
+
+def test_series_reads_an_explicit_ledger():
+    _with_ledger([])          # local ledger empty: the figure can only come from --ledger
+    other = _tmpdir() / "copy.jsonl"
+    other.write_text(json.dumps({"ts": "2026-11-04T09:14:16Z", "provider": "chatgpt-pro-codex",
+                                 "status": "ok", "lines": ["49 521 crédits restants"]}) + "\n",
+                     encoding="utf-8")
+    rc, out = _run(tabs.cmd_series, provider=None, days=None, json=False, ledger=str(other))
+    assert rc == 0 and "49 521" in out and str(other) in out, out
+
+
+def test_series_falls_back_to_the_shared_copy_on_a_seat_without_a_ledger():
+    shared = _tmpdir() / "console-readings.jsonl"
+    shared.write_text(json.dumps({"ts": "2026-11-04T09:14:16Z", "provider": "deepseek-payg",
+                                  "status": "ok", "lines": ["$155.67"]}) + "\n", encoding="utf-8")
+    tabs.READINGS = _tmpdir() / "absent.jsonl"
+    saved = tabs.SHARED_LEDGER
+    tabs.SHARED_LEDGER = shared
+    try:
+        rc, out = _run(tabs.cmd_series, provider=None, days=None, json=False)
+    finally:
+        tabs.SHARED_LEDGER = saved
+    assert rc == 0 and "155.67" in out and str(shared) in out, out
 
 
 if __name__ == "__main__":

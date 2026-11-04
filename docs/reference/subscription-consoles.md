@@ -11,6 +11,19 @@ Readings accumulate in `~/.claudish/console-readings.jsonl` (machine-local, neve
 committed — one JSON object per observation, so a series exists instead of a
 snapshot).
 
+**Reading the series from any seat** (user, 04/11): ai-01 alone holds the browser
+profile, so ai-01 alone writes the ledger; `console-tabs.py publish` mirrors it to
+`G:\Mon Drive\Backups-Cloud\claudish\console-readings\console-readings.jsonl` (the
+private Drive, next to the capture archives — never git, console figures stay
+internal), with a `_meta.json` beside it (`published_at`, `rows`, `last_ts`,
+`sha256_16`). On any machine: `python scripts/console-tabs.py series --days 14` falls
+back to that shared copy when no local ledger exists, and prints the file it read;
+`--ledger <path>` reads any other copy. The copy is atomic and **never shrinks**: a
+publish whose local ledger has fewer rows than the shared copy is refused (exit 3).
+Freshness: the console reader publishes after each 15-min snapshot once restarted on
+the patched version; until then each coordinator cycle publishes (≤ 8 h). Check
+`_meta.json` `last_ts` before quoting a figure as current.
+
 ## The console profile
 
 All consoles are read through the **playwright MCP's persistent browser profile**.
