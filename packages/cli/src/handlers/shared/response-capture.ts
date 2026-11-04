@@ -200,3 +200,50 @@ export function appendUpstreamError(entry: {
     // capture must never crash claudish
   }
 }
+
+/**
+ * Durable one-line record of a connection-CLASS upstream failure (#844).
+ *
+ * `appendUpstreamError` above records HTTP non-ok responses — a body the
+ * upstream wrote. A connection failure (dns/refused/unreachable/closed,
+ * classified by connection-error.ts) never gets an HTTP response, so it
+ * produced NO durable line: the `{kind, code}` the classifier computes went
+ * to stdout only, and a container recreate erased it. Measured 03/11
+ * (po-2027): the 16:37:23Z "Cannot reach Z.AI" left zero entries while the
+ * 14:56:34Z 1308 of the same afternoon sits in the log with its exact
+ * request_id — after the fact, the transport failure was undiagnosable
+ * (was it ETIMEDOUT? ENETUNREACH? the classifier's catch-all? the message
+ * cannot say, `unreachable` is also the default for unknown codes).
+ *
+ * Same contract as `appendUpstreamError`: synchronous append, only on the
+ * failure path (never the hot loop), payload capped, never throws, no-op
+ * without CLAUDISH_CAPTURE_DIR. Sibling file — `upstream-errors.log`'s
+ * NDJSON shape (status/body) is read by traffic tooling and must not grow
+ * a second variant.
+ */
+export function appendConnectionError(entry: {
+  model: string;
+  provider: string;
+  kind: string;
+  code: string;
+  endpoint: string;
+  elapsed_ms: number;
+}): void {
+  const captureDir = process.env.CLAUDISH_CAPTURE_DIR;
+  if (!captureDir) return;
+  try {
+    if (!ensureCaptureDir(captureDir)) return;
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      model: entry.model,
+      provider: entry.provider,
+      kind: entry.kind,
+      code: entry.code,
+      endpoint: String(entry.endpoint).slice(0, 512),
+      elapsed_ms: Math.round(entry.elapsed_ms),
+    });
+    appendFileSync(`${captureDir}/connection-errors.log`, line + "\n");
+  } catch {
+    // capture must never crash claudish
+  }
+}
