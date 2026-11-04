@@ -218,6 +218,22 @@ window:
   05:12:59Z, sidecar AUTONOMOUS 05:13:12Z (13 s later), entry back 05:36:32Z, deep probe OK
   (8 332 ms) → NOMINAL 05:36:36Z — 23 min 24 s autonomous, 301 requests served locally, zero
   client errors. The probe's seconds are dead time added to recovery by design: hysteresis's price.
+- **The protocol has a floor, and `window − probe` is how you subtract it: the constant is ~66 s,
+  so any excess above it is real hub downtime, not recovery latency.** One container, one process
+  lifetime, four windows on 2026-11-04 (po-2028): 69,70 s − 3 672 ms = **66,03 s** · 68,70 s −
+  2 606 ms = **66,10 s** · 87,11 s − 21 101 ms = **66,01 s**. That constant is the 60 s cooldown
+  plus ~6 s (3 OK heartbeats at a 10 s cadence). The fourth window reads 147,24 s − 1 218 ms =
+  **146,0 s** on the same arithmetic — the day po-2025's *host* rebooted at 13:44:56Z, so the
+  cooldown expired while the hub was still down and the probe waited for its hearing. **A reader
+  quoting raw `DOWN → NOMINAL` durations over-states every episode by the protocol's own floor**;
+  the subtraction is what tells a 70 s heartbeat blip from a 150 s outage.
+- **The probe's first attempt is intermittent within one seat, so a fixed order is not the fix.**
+  Same container and process lifetime: **3 of 4** windows on 2026-11-03 fell back to `glm-5.3`
+  after a haiku `TimeoutError` (second attempt 1 586 / 1 169 / 1 242 ms), while **0 of 4** did on
+  2026-11-04 (first attempt succeeded in 3 672 / 2 606 / 21 101 / 1 218 ms). A seat-constant
+  reading of "haiku-first is chronically slow" (27 of 39 probe timeouts on po-2027, #387, 134
+  client-visible `Cannot reach api.z.ai` that day) is one same-seat flip away from being wrong.
+  What this supports is a **short budget on the first attempt**, not a reordering.
 - **A quiet AUTONOMOUS window says nothing about the hub** — once autonomous the relay sends
   nothing upstream, so no client request can refute the verdict (the asymmetry pinned above);
   corroborate hub-side (watchdog probes, capture gaps) before reading a flap window as hub time.
