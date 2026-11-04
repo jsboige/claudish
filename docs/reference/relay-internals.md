@@ -439,16 +439,33 @@ closed — but read it for what it is:
   stalled instance still proves it was reached). It measures "this instance
   was reached, by that peer" — never the caller's own continuity, and never
   the hub's ability to serve (`status=ok` is that one reply's verdict).
-- **`machine=-` means the prober is not a relay heartbeat.** A v27 relay
-  heartbeat always sends `X-Claudish-Machine`; `machine=-` lines are local
-  watchdogs (typically 30 s via the Docker port-forward, appearing as
-  `127.0.0.1`), routers or browsers. Their cadence says nothing about the
-  prober's 10 s interval (`HEARTBEAT_INTERVAL_MS`, `relay.ts`).
+- **`machine=-` means the prober is not a relay heartbeat *from a current
+  build*.** A v27 relay heartbeat always sends `X-Claudish-Machine` — but only
+  when `machineName()` is non-empty (`CLAUDISH_MACHINE`), and an image that
+  predates #812 (`210de4bc`, 02/11 — the commit that gave the heartbeat its
+  header, as a #587 instrument) sends no header at all: an OLD sidecar is a
+  relay heartbeat that arrives anonymous. Its deep recovery probe, by contrast,
+  has named itself since 06/10 (`fb16ef2d`), so named probes next to anonymous
+  heartbeats from one seat point at its image date, not at its network. The
+  rest of the `machine=-` lines are local watchdogs (typically 30 s via the
+  Docker port-forward, appearing as `127.0.0.1`), routers or browsers. Their
+  cadence says nothing about the prober's 10 s interval
+  (`HEARTBEAT_INTERVAL_MS`, `relay.ts`).
 - **A relay's outbound heartbeat is silent when it succeeds** — `relay.ts`
   logs failure episodes only. A seat's continuity toward the hub therefore
   reads in the HUB's journal (`[Health] hit … machine=<that seat>`), never in
   its own local `[Health]` lines. Reading 740 local lines as "my heartbeat
   works" was exactly the trap, caught and corrected on 03/11.
+- **A named-arrival gap is an image question before it is a network question**
+  (measured 04/11 on po-2025's 26 h hub corpus, 50 301 arrivals): po-2027
+  shows the full 10 s cadence — 4 127 named arrivals, no gap — but ONLY from
+  its 03/11 18:02Z rebuild on; the same seat, same network, same WAN edge
+  produced ZERO named arrivals in the 10 h before it. The "~×130 undercount"
+  first read as WAN edge stripping, then as ARR answering before the hub, was
+  the seat's own pre-rebuild image (both hypotheses dead: 3 named probes
+  transited the WAN edge named). Before reading a named gap as a network
+  hole, check the seat's image date — in the same corpus po-2024 and po-2028
+  are absent from the named arrivals altogether.
 
 With the marker in place, #587's thesis — event-loop blocking under load
 driving NOMINAL→AUTONOMOUS transitions — stays **refuted for these two
