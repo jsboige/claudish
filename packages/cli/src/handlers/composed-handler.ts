@@ -142,7 +142,6 @@ import {
   classifyConnectionError,
 } from "./shared/connection-error.js";
 import { sniffDevinStreamHead } from "./shared/devin-stream-head-sniffer.js";
-import { hasActionableLink, hasModelUnsupportedWording } from "./shared/model-unsupported.js";
 // #575 (#431 row 7a): the engine's per-prompt image cap — a request-SHAPE
 // incapacity classified from the 400 body and answered as a `media` step-skip.
 // v14 port note: `countMediaBlocks` rides THIS import on v14 (no
@@ -153,6 +152,7 @@ import {
   mediaCapRefusalText,
   mediaCapSkipDetail,
 } from "./shared/media-cap.js";
+import { hasActionableLink, hasModelUnsupportedWording } from "./shared/model-unsupported.js";
 import { filterIdentity } from "./shared/openai-compat.js";
 import { hasPlanLimitWording, isQuotaExhaustionError } from "./shared/quota-exhaustion.js";
 import { connectionFaultHeaders, recoveryHoldHeaders } from "./shared/recovery-marker.js";
@@ -175,10 +175,10 @@ import {
   createLegIssuer,
   isSameCredentialSilo,
 } from "./shared/responses-leg-issuer.js";
-import { sniffResponsesStreamHead } from "./shared/stream-head-sniffer.js";
 // #431: the skip-wire header — read by exactly one consumer (the cascade loop)
 // and set here on the `media` refusal below. Wire contract: shared/step-skip.ts.
 import { STEP_SKIP_HEADER, encodeStepSkipHeader } from "./shared/step-skip.js";
+import { sniffResponsesStreamHead } from "./shared/stream-head-sniffer.js";
 import { createAnthropicPassthroughStream } from "./shared/stream-parsers/anthropic-sse.js";
 import { createDevinConnectStream } from "./shared/stream-parsers/devin-connect.js";
 import { createGeminiSseStream } from "./shared/stream-parsers/gemini-sse.js";
@@ -2695,7 +2695,11 @@ export class ComposedHandler implements ModelHandler {
               "request-shape incapacity, not a step failure"
           );
           const out = c.json(
-            wrapAnthropicError(400, mediaCapRefusalText(mediaCap.max, carried), "invalid_request_error"),
+            wrapAnthropicError(
+              400,
+              mediaCapRefusalText(mediaCap.max, carried),
+              "invalid_request_error"
+            ),
             400 as any
           );
           out.headers.set(

@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "ignore": ["node_modules", "dist", ".git"]
+    "ignore": ["node_modules", "dist", ".git", "**/test-fixtures/upstream-errors/*.json"]
   },
   "formatter": {
     "enabled": true,

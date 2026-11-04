@@ -294,7 +294,11 @@ beforeEach(() => {
   (process.stderr as any).write = ((chunk: any, ...rest: any[]) => {
     const text = typeof chunk === "string" ? chunk : String(chunk);
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]") || line.includes("[EndpointBudget]") || line.includes("[MediaCap]"))
+      if (
+        line.includes("[Failover]") ||
+        line.includes("[EndpointBudget]") ||
+        line.includes("[MediaCap]")
+      )
         failoverLog.push(line);
     }
     return realStderrWrite(chunk, ...rest);
@@ -302,7 +306,11 @@ beforeEach(() => {
   console.log = ((...args: any[]) => {
     const text = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]") || line.includes("[EndpointBudget]") || line.includes("[MediaCap]"))
+      if (
+        line.includes("[Failover]") ||
+        line.includes("[EndpointBudget]") ||
+        line.includes("[MediaCap]")
+      )
         failoverLog.push(line);
     }
     // Re-emit so a failing run still shows the proxy's operator markers.
@@ -1274,10 +1282,7 @@ describe("#575 — the vLLM image cap skips forward (#431 row 7a)", () => {
 
     const r1 = await postMessage({
       session: "k26",
-      contentBlocks: [
-        ...fiveImages(),
-        { type: "text", text: "what do these show?" },
-      ],
+      contentBlocks: [...fiveImages(), { type: "text", text: "what do these show?" }],
     });
     expect(r1.status).toBe(400);
     // The marker rides the surface path too (harmless to a client that ignores
