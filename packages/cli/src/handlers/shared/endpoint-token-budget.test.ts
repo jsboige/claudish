@@ -106,7 +106,7 @@ describe("endpoint-token-budget #654", () => {
     const d1 = evaluateEndpointTokenBudget("ep", p, scope, env)!;
     expect(d1.refused).toBe(false);
     const r1 = d1.commit();
-    expect(endpointBudgetSnapshot()["ep"]).toEqual({ count: 1, sum: 1000, big: 0 });
+    expect(endpointBudgetSnapshot().ep).toEqual({ count: 1, sum: 1000, big: 0 });
     const d2 = evaluateEndpointTokenBudget("ep", p, { machine: "m1", session: "s2" }, env)!;
     expect(d2.refused).toBe(true);
     expect(d2.reason).toBe("sum");
@@ -158,11 +158,11 @@ describe("endpoint-token-budget #654", () => {
     expect(d2.facts.resubmit).toBe(2);
     expect(d2.refused).toBe(false); // NOT double-counted: 1000 ≤ 1500
     const r2 = d2.commit();
-    expect(endpointBudgetSnapshot()["ep"]).toEqual({ count: 1, sum: 1000, big: 0 });
+    expect(endpointBudgetSnapshot().ep).toEqual({ count: 1, sum: 1000, big: 0 });
     r1(); // the predecessor's late release is a no-op — its lease was replaced
-    expect(endpointBudgetSnapshot()["ep"]).toEqual({ count: 1, sum: 1000, big: 0 });
+    expect(endpointBudgetSnapshot().ep).toEqual({ count: 1, sum: 1000, big: 0 });
     r2();
-    expect(endpointBudgetSnapshot()["ep"]).toBeUndefined();
+    expect(endpointBudgetSnapshot().ep).toBeUndefined();
   });
 
   test("AC5 — a DIFFERENT body still adds its own estimate", () => {
@@ -196,7 +196,7 @@ describe("endpoint-token-budget #654", () => {
       const prevRelease = release;
       release = d.commit();
       prevRelease(); // no-op (replaced)
-      expect(endpointBudgetSnapshot()["ep"].count).toBe(1);
+      expect(endpointBudgetSnapshot().ep.count).toBe(1);
       last = d;
     }
     expect(last.facts.resubmit).toBe(10);
