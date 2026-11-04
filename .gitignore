@@ -89,6 +89,9 @@ test-results/
 # Smoke test results
 packages/cli/results/*.json
 .worktrees
+# Session worktrees (flat copies without .git — e.g. worktrees/v14-cascade):
+# machine-local only, never committed (clean-cycle-exit names them otherwise).
+worktrees/
 
 # Pester NUnit output written by a manual/CI `Invoke-Pester -OutputFile testResults.xml`
 # at the repo root. Same rationale as __pycache__ below: an untracked artifact made
