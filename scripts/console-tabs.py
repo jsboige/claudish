@@ -14,8 +14,22 @@ playwright MCP owns the profile, and a second process would fight it for the loc
     python scripts/console-tabs.py series --days 30
                                                    # consolidate the log into a table
 
+    python scripts/console-tabs.py publish         # mirror the ledger to the shared Drive
+    python scripts/console-tabs.py series --ledger <path>
+                                                   # read another copy (a sibling's seat)
+
 Readings go to `~/.claudish/console-readings.jsonl` (machine-local, never in git):
 one object per observation, so a series accumulates instead of being overwritten.
+
+Only ai-01 holds the browser profile, so only ai-01 writes the ledger — and a series
+nobody else can open is not a consolidated reading (user, 04/11: « accessible à tes
+siblings et tous ceux qui cherchent à approfondir l'analyse de notre conso »).
+`publish` mirrors it to `SHARED_LEDGER` on the private Drive every machine mounts —
+the Drive, never git: console usage figures are internal and never reach GitHub. The
+copy is atomic (temp + replace, so a reader mid-sync never sees half a file) and it
+REFUSES to shrink the shared copy: a reset local ledger must not erase the history
+everyone else reads. `series` on a seat without a local ledger falls back to that
+shared copy and says which file it read.
 
 Two writers feed it, and they are deliberately different:
 - `provider-consoles-reader.py` (outside this repo, on ai-01) appends the console text
@@ -40,13 +54,21 @@ reading has no tab to cite, and the field is deliberately absent rather than emp
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
+import socket
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 READINGS = Path.home() / ".claudish" / "console-readings.jsonl"
+# The private Drive every fleet machine mounts, in claudish's own folder (the one that
+# already holds the capture archives). Overridable for a seat that mounts it elsewhere.
+SHARED_LEDGER = Path(os.environ.get(
+    "CLAUDISH_CONSOLE_LEDGER_SHARED",
+    r"G:\Mon Drive\Backups-Cloud\claudish\console-readings\console-readings.jsonl"))
 
 # `role` says WHAT the console answers, which is the part every session lost.
 # `auth` documents how the session is held, so a lost cookie is diagnosed rather
@@ -238,6 +260,19 @@ FIELD_PATTERNS = [
         r"(?:r[ée]initialisation|reset)[^\n]{0,40}?(?:dans|in)\s+([0-9]+\s*[jhd]\s*(?:et\s*)?[0-9]*\s*h?)", re.I)),
     ("credits", re.compile(r"([0-9][0-9\s.,]{2,}?)\s*cr[ée]dits?", re.I)),
     ("usd", re.compile(r"\$\s?([0-9][0-9.,]*)")),
+    # USED, not remaining — its own column, never folded into `pct` (review #834's
+    # objection applies in reverse: the two must not share a column). claude.ai prints
+    # "73 % utilisés" for the weekly plan (measured 04/11, 88 rows unread until then).
+    ("used", re.compile(r"(\d+(?:[.,]\d+)?)\s*%\s*(?:utilis[ée]e?s?|used)\b", re.I)),
+    # An absolute reset ("Réinitialisation le vendredi 02:00") next to the relative one.
+    ("reset_at", re.compile(r"r[ée]initialisation\s+le\s+([^\s\d]+\.?\s+\d{1,2}[:h]\s?\d{2})", re.I)),
+]
+
+# Patterns that span lines, applied to the dump joined by "\n". Z.AI splits its 5-hour
+# figure over three lines ("Quota de 5 heures" / "8" / "%"), which no per-line pattern
+# can see; it is a USED share (the page's own wording: quota consumed).
+JOINED_PATTERNS = [
+    ("used", re.compile(r"Quota de 5 heures\s*\n\s*(\d+(?:[.,]\d+)?)\s*\n\s*%", re.I)),
 ]
 
 
@@ -252,16 +287,89 @@ def extract(lines) -> dict:
             if m:
                 out[key] = m.group(1).strip()
                 break
+    joined = "\n".join(lines)
+    for key, pat in JOINED_PATTERNS:
+        if key in out:
+            continue
+        m = pat.search(joined)
+        if m:
+            out[key] = m.group(1).strip()
     return out
+
+
+def _count_rows(path: Path) -> int:
+    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
+def cmd_publish(args) -> int:
+    """Mirror the local ledger to the shared copy, atomically, never shrinking it."""
+    src = READINGS
+    dest = Path(args.to) if getattr(args, "to", None) else SHARED_LEDGER
+    if not src.exists():
+        print(f"aucun registre local à publier : {src}", file=sys.stderr)
+        return 1
+    data = src.read_bytes()
+    rows = sum(1 for line in data.decode("utf-8").splitlines() if line.strip())
+    # A shared copy longer than the local one means the local ledger was reset or
+    # truncated. Overwriting would erase history every other seat reads — refuse.
+    if dest.exists():
+        have = _count_rows(dest)
+        if have > rows:
+            print(f"REFUS : la copie partagée a {have} relevés, le registre local {rows} — "
+                  f"publier effacerait {have - rows} relevés. Rien n'est écrit ({dest}).",
+                  file=sys.stderr)
+            return 3
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, dest)
+    last_ts = None
+    for line in reversed(data.decode("utf-8").splitlines()):
+        if line.strip():
+            try:
+                last_ts = json.loads(line).get("ts")
+            except json.JSONDecodeError:
+                pass
+            break
+    meta = {
+        "published_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_machine": socket.gethostname(),
+        "source_path": str(src),
+        "rows": rows,
+        "bytes": len(data),
+        "last_ts": last_ts,
+        "sha256_16": hashlib.sha256(data).hexdigest()[:16],
+    }
+    meta_path = dest.with_name("_meta.json")
+    meta_tmp = meta_path.with_name(meta_path.name + ".tmp")
+    meta_tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(meta_tmp, meta_path)
+    print(json.dumps(meta, ensure_ascii=False))
+    return 0
+
+
+def resolve_ledger(explicit: str | None) -> Path:
+    """The file `series` reads: explicit > local ledger > shared copy."""
+    if explicit:
+        return Path(explicit)
+    if READINGS.exists():
+        return READINGS
+    if SHARED_LEDGER.exists():
+        return SHARED_LEDGER
+    return READINGS
 
 
 def cmd_series(args) -> int:
     """Consolidate the ledger into one table over time."""
-    if not READINGS.exists():
-        print(f"aucun relevé : {READINGS}", file=sys.stderr)
+    ledger = resolve_ledger(getattr(args, "ledger", None))
+    if not ledger.exists():
+        print(f"aucun relevé : {ledger} (ni copie partagée : {SHARED_LEDGER})", file=sys.stderr)
         return 1
     rows = []
-    for line in READINGS.read_text(encoding="utf-8").splitlines():
+    for line in ledger.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -299,15 +407,16 @@ def cmd_series(args) -> int:
             if not got:
                 unresolved[r.get("provider", "?")] = unresolved.get(r.get("provider", "?"), 0) + 1
         table.append((r.get("ts", "?"), r.get("provider", "?"),
-                      fields.get("pct", "—"), fields.get("reset", "—"),
+                      fields.get("pct", "—"), fields.get("used", "—"),
+                      fields.get("reset", fields.get("reset_at", "—")),
                       fields.get("credits", "—"), fields.get("usd", "—"),
                       r.get("status", "")))
     table.sort(key=lambda t: t[0])
     w = max([len(t[1]) for t in table] + [8])
-    print(f"{'ts':20}  {'provider':{w}}  {'%':>6}  {'reset':>12}  {'crédits':>9}  {'$':>8}  état")
+    print(f"{'ts':20}  {'provider':{w}}  {'reste%':>6}  {'util%':>5}  {'reset':>15}  {'crédits':>9}  {'$':>8}  état")
     for t in table:
-        print(f"{t[0]:20}  {t[1]:{w}}  {t[2]:>6}  {t[3]:>12}  {t[4]:>9}  {t[5]:>8}  {t[6]}")
-    print(f"\n{len(table)} relevé(s) — source : {READINGS}")
+        print(f"{t[0]:20}  {t[1]:{w}}  {t[2]:>6}  {t[3]:>5}  {t[4]:>15}  {t[5]:>9}  {t[6]:>8}  {t[7]}")
+    print(f"\n{len(table)} relevé(s) — source : {ledger}")
     if unresolved:
         print("NON INTERPRÉTÉ (relevés présents, aucun champ reconnu) : "
               + ", ".join(f"{k} ×{v}" for k, v in sorted(unresolved.items())))
@@ -334,6 +443,9 @@ def main(argv=None) -> int:
     sr.add_argument("--provider")
     sr.add_argument("--days", type=int, help="ne garde que les N derniers jours")
     sr.add_argument("--json", action="store_true")
+    sr.add_argument("--ledger", help="lire ce fichier (par défaut : registre local, sinon copie partagée)")
+    pb = sub.add_parser("publish", help="copie le registre vers le Drive partagé (atomique, jamais raccourci)")
+    pb.add_argument("--to", help=f"destination (défaut : {SHARED_LEDGER})")
     a = p.parse_args(argv)
     if a.cmd == "list":
         return cmd_list(a.json)
@@ -341,6 +453,8 @@ def main(argv=None) -> int:
         return cmd_urls()
     if a.cmd == "series":
         return cmd_series(a)
+    if a.cmd == "publish":
+        return cmd_publish(a)
     return cmd_log(a)
 
 

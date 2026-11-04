@@ -172,7 +172,8 @@ contexte et mesures : reference.md § Phase 4c, enquête #328.
 Onglets ouverts par le user dans le Playwright Edge d'ai-01 ; URLs verbatim dans
 `C:\Users\MYIA\.claudish-browser\provider-consoles-urls.json` (ne jamais les deviner ni les modifier).
 - Lancer `C:\Users\MYIA\.claudish-browser\provider-consoles-reader.py` **détaché** (hors dépôt, propre à
-  ai-01). Relevé valide seulement si `read` = 11 dans `readings\_pass.txt`.
+  ai-01). Relevé valide seulement si `read` = 11 dans `readings\_pass.txt`. Puis
+  `python scripts/console-tabs.py publish` (copie Drive lue par les autres sièges, user 04/11).
 - Chiffres d'usage seulement, **dashboard interne seulement** (jamais GitHub — seuls des ratios dérivés
   vont en #405) ; aucun clic dans les fenêtres du user ; lire la période de chaque console avant toute
   addition.
