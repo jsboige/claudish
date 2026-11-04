@@ -269,8 +269,6 @@ def pin_history_replay_dedupes_by_id():
 
 
 def pin_quoted_transcript_is_not_a_write():
-    body = (b'{"messages":[{"role":"user","content":[{"type":"tool_use","id":"toolu_x",'
-            b'"name":"Bash","input":{"command":"gh pr create --title forged"}}]}]}')
     _check(wsattr.assistant_tool_uses({"messages": [
         {"role": "user", "content": [{"type": "tool_use", "id": "t", "name": "Bash",
                                       "input": {"command": "gh pr merge 1"}}]}]}) == [],
@@ -301,9 +299,6 @@ def pin_toolsearch_is_not_a_dashboard_write():
 
 
 def pin_compaction_flags_the_tour():
-    body = (b'{"messages":[{"role":"user","content":"This session is being continued from a '
-            b'previous conversation that ran out of context. The summary below covers the '
-            b'earlier portion of the conversation."},{"role":"assistant","content":[]}]}')
     _check(wsattr.compaction_flagged({
         "messages": [{"role": "user", "content": "This session is being continued from a "
                      "previous conversation that ran out of context. The summary below "
@@ -312,6 +307,52 @@ def pin_compaction_flags_the_tour():
     _check(wsattr.compaction_flagged({
         "messages": [{"role": "user", "content": "fix the build"}]}) is False,
            "an ordinary first message is not compacted")
+
+
+def pin_fleet_push_forms_and_quoted_words():
+    # The forms the fleet rules MANDATE since #4243 — a `\bgit\s+push\b` regex
+    # reads None on all three (measured by the #857 review on this corpus).
+    cls, pc = wsattr.classify_tool_use("Bash", {
+        "command": 'git -C D:/claudish/.tmp/wt-854 push origin HEAD'})
+    _check(cls == "pr", "`git -C <path> push` is the mandated push form, got %r" % cls)
+    _check(pc is False, "a push is not a pr CREATION, got %r" % pc)
+    cls2, _ = wsattr.classify_tool_use("Bash", {
+        "command": 'git -c credential.helper= -c "credential.helper=!gh auth git-credential"'
+                   ' push -q origin HEAD'})
+    _check(cls2 == "pr", "the ai-01 push form (two -c globals) writes, got %r" % cls2)
+    cls3, pc3 = wsattr.classify_tool_use("Bash", {
+        "command": "gh -R jsboige/claudish pr create --title x"})
+    _check(cls3 == "pr" and pc3 is True, "a global -R before `pr create` still counts"
+           " (and is a CREATION), got %r/%r" % (cls3, pc3))
+    # the same walk refuses the words when they are not the act (TRAP W7):
+    # quoted argument, grepped text, and git's OTHER subcommands.
+    for cmd in ('git commit -m "then git push"',
+                'grep "gh pr create" scripts/lib/log.txt',
+                "git log --oneline -5",
+                "gh auth token -u jsboige",
+                "gh pr list --limit 5"):
+        got, _ = wsattr.classify_tool_use("Bash", {"command": cmd})
+        _check(got is None, "%r carries the words, not the act — None, got %r" % (cmd, got))
+
+
+def pin_dm_send_is_a_write():
+    m = wsattr.MSGS_TOOL
+    cls, _ = wsattr.classify_tool_use(m, {"action": "send", "to": "myia-ai-01:claudish",
+                                          "subject": "[TASK] file v41"})
+    _check(cls == "dm", "a dispatch DM is the tour's output for a coordinator, got %r" % cls)
+    cls2, _ = wsattr.classify_tool_use(m, {"action": "reply", "message_id": "x", "body": "ACK"})
+    _check(cls2 == "dm", "a reply writes, got %r" % cls2)
+    for ro in ("inbox", "message", "mark_read", "archive", "stats"):
+        got, _ = wsattr.classify_tool_use(m, {"action": ro})
+        _check(got is None, "%s is bookkeeping, not a write, got %r" % (ro, got))
+    # a tour whose only external output is the dispatch DM is NOT zero-write
+    rows = [{"day": "2026-10-29", "ws": "claudish", "session": "s2", "compacted": False,
+             "uses": [(b"m1", m) + wsattr.classify_tool_use(
+                 m, {"action": "send", "subject": "file v41"})]}]
+    agg = wsattr.aggregate_writes(rows, {"2026-10-29": 1})
+    _check(agg["workspaces"]["claudish"]["classes"].get("dm") == 1,
+           "the dm class keeps a dispatch-only tour out of zero-write, got %r"
+           % agg["workspaces"]["claudish"]["classes"])
 
 
 def pin_gh_write_class_and_precedence():
@@ -360,6 +401,8 @@ PINS = [
     pin_toolsearch_is_not_a_dashboard_write,
     pin_compaction_flags_the_tour,
     pin_gh_write_class_and_precedence,
+    pin_fleet_push_forms_and_quoted_words,
+    pin_dm_send_is_a_write,
 ]
 
 

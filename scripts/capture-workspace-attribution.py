@@ -75,7 +75,9 @@ draft's error — it inflated a 7-session day to ~978.
 `--writes` classifies each tour by what its assistant history WROTE outside the
 repo (enquiry #328 C4 / #445 D3): `pr` (gh pr create/merge, git push),
 `gh-write` (gh comment/close/review), `dash` (a roosync_dashboard append/write/
-update), else `zero`. Ground rules, each measured on the 2026-10-29 corpus:
+update), `dm` (a roosync_messages send/reply/amend — for a coordinator the
+dispatch DM IS the tour's output; inbox reads, mark_read and archiving are not
+writes), else `zero`. Ground rules, each measured on the 2026-10-29 corpus:
 
 ⚠ TRAP W1 — HISTORY REPLAY. The same tool_use block rides EVERY later request
 of its session (measured: ~151k tool_use occurrences over 2 077 sampled
@@ -112,6 +114,14 @@ that is honest for request volume is NOT an estimator here (measured on the
 1 576 true creations). `pr_create_counted` is the floor; the scaled figure is
 only an upper reading, and the recall gap to the truth is compaction (W5) plus
 the sessions the stride missed entirely.
+
+⚠ TRAP W7 — THE SUBCOMMAND POSITION, NOT THE WORDS. `git push` is matched at
+the subcommand position with global flags walked over (`git -C <path> push`,
+`git -c credential.helper= -c "..." push`, `gh -R <repo> pr create` — the
+fleet's mandated forms since #4243), where a `\bgit\s+push\b` regex reads
+None. The same walk REFUSES matches inside quoted arguments: `git commit -m
+"then git push"` and `grep "gh pr create" log` carry the words, not the act.
+Pin: `pin_fleet_push_forms_and_quoted_words`.
 """
 
 import argparse
@@ -446,30 +456,68 @@ def aggregate_tours(rows: list[dict], fraction: float | None) -> dict:
 # ---------------------------------------------------------------------------
 
 SEGMENT_SPLIT = re.compile(r";|&&|\|\||\n")
-PR_RX = re.compile(r"\bgh\s+pr\s+(?:create|merge)\b|\bgit\s+push\b")
-PR_CREATE_RX = re.compile(r"\bgh\s+pr\s+create\b")
-GH_WRITE_RX = re.compile(r"\bgh\s+(?:pr|issue)\s+(?:comment|close|review)\b")
+SHELL_TOKEN_RX = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
 DASH_TOOL = "mcp__roo-state-manager__roosync_dashboard"
 DASH_ACTIONS = {"append", "write", "update"}
 MSGS_TOOL = "mcp__roo-state-manager__roosync_messages"
+# send/reply/amend CREATE or mutate a message — a coordinator's dispatch DM is
+# the tour's deliverable. inbox/mark_read/archive/cleanup are bookkeeping.
+MSGS_WRITE_ACTIONS = {"send", "reply", "amend"}
 COMPACT_RX = re.compile(r"continued from a previous conversation", re.IGNORECASE)
-CLASS_RANK = {"pr": 3, "gh-write": 2, "dash": 1}
+CLASS_RANK = {"pr": 3, "gh-write": 2, "dash": 1, "dm": 1}
+
+# Global flags (before the subcommand) that take their argument as the NEXT
+# token; every other flag-shaped token is skipped as a single token.
+GIT_FLAG_WITH_ARG = {"-C", "-c", "-S", "--git-dir", "--work-tree", "--namespace"}
+GH_FLAG_WITH_ARG = {"-R", "--repo", "--hostname"}
+GH_WRITE_SUBS = {("pr", "comment"), ("pr", "close"), ("pr", "review"),
+                 ("issue", "comment"), ("issue", "close"), ("issue", "review")}
+
+
+def shell_tokens(seg: str) -> list[str]:
+    """Space-split with quote grouping, quotes KEPT on the tokens — nothing is
+    ever unquoted or executed, and a quoted argument stays one token
+    (`-c "credential.helper=!gh auth git-credential"` never leaks the words
+    `gh` or `git` as standalone tokens)."""
+    return SHELL_TOKEN_RX.findall(seg)
+
+
+def _subcommand(tokens: list[str], prog: str, flags_with_arg: set[str]):
+    """(subcommand, index-after-it) for `prog`, walking OVER global flags —
+    or (None, -1). This is TRAP W7's instrument: the subcommand position is
+    what the fleet's mandated forms exercise (`git -C <path> push`, `gh -R
+    <repo> pr create`) and what quoted arguments cannot fake."""
+    try:
+        i = tokens.index(prog)
+    except ValueError:
+        return None, -1
+    i += 1
+    while i < len(tokens):
+        t = tokens[i]
+        if t.startswith("-"):
+            i += 2 if t in flags_with_arg else 1
+            continue
+        return t, i + 1
+    return None, -1
 
 
 def classify_tool_use(name, inp) -> tuple[str | None, bool]:
     """(write class, is_pr_create) of one tool_use — or (None, False).
 
-    Classes per the enquiry: `pr` = gh pr create/merge or git push;
-    `gh-write` = gh (pr|issue) comment/close/review; `dash` = the dashboard
-    MCP tool with a write action. A ToolSearch that merely NAMES a tool has a
-    `query` input, not a `command` one, and a read action on the dashboard
-    tool is not a write — both fall to None by shape, not by denylist.
-    The `--dry-run` veto is per SEGMENT: the corpus holds a rehearsal and the
-    real merge in ONE compound command (TRAP W3).
+    Classes per the enquiry: `pr` = gh pr create/merge or git push; `gh-write`
+    = gh (pr|issue) comment/close/review; `dash` = the dashboard MCP tool with
+    a write action; `dm` = a RooSync message send/reply/amend. A ToolSearch
+    that merely NAMES a tool has a `query` input, not a `command` one, and a
+    read action on the dashboard tool is not a write — both fall to None by
+    shape, not by denylist. The `--dry-run` veto is per SEGMENT: the corpus
+    holds a rehearsal and the real merge in ONE compound command (TRAP W3).
     """
     if name == DASH_TOOL and isinstance(inp, dict) \
             and str(inp.get("action") or "").lower() in DASH_ACTIONS:
         return "dash", False
+    if name == MSGS_TOOL and isinstance(inp, dict) \
+            and str(inp.get("action") or "").lower() in MSGS_WRITE_ACTIONS:
+        return "dm", False
     cmd = inp.get("command") if isinstance(inp, dict) else None
     if not isinstance(cmd, str):
         return None, False
@@ -477,11 +525,17 @@ def classify_tool_use(name, inp) -> tuple[str | None, bool]:
     for seg in SEGMENT_SPLIT.split(cmd):
         if "--dry-run" in seg:
             continue
-        if PR_RX.search(seg):
+        toks = shell_tokens(seg)
+        if _subcommand(toks, "git", GIT_FLAG_WITH_ARG)[0] == "push":
             hit_pr = True
-            pr_create = pr_create or bool(PR_CREATE_RX.search(seg))
-        elif GH_WRITE_RX.search(seg):
-            hit_gh = True
+        gh_sub, after = _subcommand(toks, "gh", GH_FLAG_WITH_ARG)
+        if gh_sub in ("pr", "issue"):
+            act = toks[after] if 0 <= after < len(toks) else None
+            if gh_sub == "pr" and act in ("create", "merge"):
+                hit_pr = True
+                pr_create = pr_create or act == "create"
+            elif (gh_sub, act) in GH_WRITE_SUBS:
+                hit_gh = True
     if hit_pr:
         return "pr", pr_create
     if hit_gh:
@@ -579,7 +633,7 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
 
     A TOUR is a distinct session id seen on a day (same unit as --tours); its
     class is the strongest class among its DISTINCT tool_use ids (pr >
-    gh-write > dash > zero). Tours whose session id is None never enter the
+    gh-write > dash ≈ dm > zero). Tours whose session id is None never enter the
     class table but keep a `no_session` count. PR creations are counted as
     DISTINCT ids carrying a `gh pr create` segment, scaled by the fraction of
     their FIRST-SEEN day (history replay shows the same id on later days —
@@ -599,7 +653,7 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
         t["compacted"] = t["compacted"] or r["compacted"]
         for uid, _nm, cls, pr_create in r["uses"]:
             cur = t["ids"].get(uid)
-            if cur is None or (cls or "") > (cur or ""):
+            if cur is None or (cls is not None and CLASS_RANK[cls] > CLASS_RANK[cur]):
                 t["ids"][uid] = cls
             if pr_create:
                 t.setdefault("creates", set()).add(uid)
@@ -630,20 +684,21 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
             d, _s = first_seen[(ws, uid)]
             w["create_first_day"][uid] = d
     out_ws = {}
+    rows_per_day = collections.Counter(r["day"] for r in rows)
     for ws, w in per_ws.items():
         # scaled requests: each sampled request stands for 1/fraction of its day
         est_reqs = est_zero = 0.0
         for (day, _ws2, sess), t in tours.items():
             if _ws2 != ws:
                 continue
-            frac = len([r for r in rows if r["day"] == day]) / max(totals_by_day.get(day, 1), 1)
+            frac = rows_per_day[day] / max(totals_by_day.get(day, 1), 1)
             scale = 1 / frac if frac > 0 else 0.0
             est_reqs += t["reqs"] * scale
             if not any(c for c in t["ids"].values()):
                 est_zero += t["reqs"] * scale
         pr_scaled = 0.0
         for uid, day in w["create_first_day"].items():
-            frac = len([r for r in rows if r["day"] == day]) / max(totals_by_day.get(day, 1), 1)
+            frac = rows_per_day[day] / max(totals_by_day.get(day, 1), 1)
             pr_scaled += (1 / frac) if frac > 0 else 0.0
         out_ws[ws] = {
             "tours": w["tours"], "tours_per_day": round(w["tours"] / ndays, 1),
