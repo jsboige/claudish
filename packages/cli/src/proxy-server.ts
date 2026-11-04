@@ -85,7 +85,7 @@ import {
   createAdvisorPanelGateway,
 } from "./handlers/advisor-panel-gateway.js";
 import { shutdownAdvisorChains } from "./handlers/advisor-route-plan.js";
-import { isOverloadWalkClass } from "./handlers/composed-handler.js";
+import { isConnectionWalkClass, isOverloadWalkClass } from "./handlers/composed-handler.js";
 import type { ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
@@ -1646,84 +1646,132 @@ export async function createProxyServer(
               `[Failover] WALK ${role} one-shot (HTTP ${response.status} on nominal ${requestedModel}) → ${walk.concrete} (step ${walk.stepIndex})`,
               true
             );
-            // ONE paid walk attempt. A served attempt mirrors the loop's
-            // success bookkeeping (a success resets a step's failure count; it
-            // never arms); a failed one writes NO state, ever — the step's own
+            // ONE paid walk attempt, factored so the advances below reuse the
+            // exact bookkeeping. A served attempt mirrors the loop's success
+            // bookkeeping (a success resets a step's failure count; it never
+            // arms); a failed one writes NO state, ever — the step's own
             // incident must not become the client's answer, so the ORIGINAL
-            // overload stands. (#598's connection-class advance and #654's
-            // endpoint budget are not on this base; the walk is one attempt by
-            // construction.)
-            const targetDelegation = walk.step.roleRef
-              ? resolveDelegationOwner(role, walk.step)
-              : null;
-            try {
-              const targetHandler = withAdvisor(
-                withRequestHooks(await getHandlerForRequest(walk.concrete)),
-                advisorPresence
-              );
-              // #317: the walk is a paid upstream attempt too — fresh token.
-              openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
-              const targetResp = await targetHandler.handle(c, body);
-              if (targetResp.ok) {
-                if (!walk.step.roleRef) resetStepSuccess(role, walk.stepIndex);
-                // Only credit the owner that actually served: a delegation
-                // resolved to a different concrete during the round-trip must
-                // not lift a wall or reset a step on a success it did not
-                // produce.
-                if (targetDelegation && targetDelegation.concrete === walk.concrete) {
-                  if (targetDelegation.owner.nominal) {
-                    onNominalSuccess(
-                      targetDelegation.owner.role,
-                      concreteStepBucketOfSync(targetDelegation.concrete)
-                    );
-                  } else {
-                    resetStepSuccess(targetDelegation.owner.role, targetDelegation.owner.stepIndex);
-                  }
-                }
-                return targetResp;
-              }
-              // Not ok: READ the body — it is the drain (an unread body is a
-              // connection held open for nothing), and nothing is written.
-              await targetResp.text().catch(() => "");
-            } catch (err) {
-              // #769 — a RoutingError here is NOT an attempt failure: the walk
-              // target was unroutable at construction (no credential for its
-              // provider on this host), so zero upstream calls were paid. The
-              // walk advances ONE hop instead of pinning on a dead step; a
-              // second unroutable target surfaces the ORIGINAL overload, never
-              // a routing 400.
-              if (err instanceof RoutingError) {
-                log(
-                  `[Failover] WALK-SKIP ${role} → ${walk.concrete} reason=unroutable — ${err.message} (#769)`,
-                  true // forceConsole — operational event, countable marker
+            // overload stands. The failure is returned CLASSIFIED: only the
+            // step's own wire shape can say whether the walk may advance, and
+            // its body is also the drain (an unread body is a connection held
+            // open for nothing). (#654's endpoint budget is not on this base.)
+            //
+            // The delegation owner is STATE-DEPENDENT — resolveRoleStep reads
+            // the target nominal's bucket wall and can arm it — so it is
+            // resolved BEFORE the round-trip, and credited only when it still
+            // names the concrete actually attempted. Resolved after the call, a
+            // wall moved by another request during the attempt would credit a
+            // step that never served (a false recovery that brings a benched
+            // step back).
+            const attemptWalkStep = async (
+              target: NonNullable<typeof walk>
+            ): Promise<
+              | { served: Response }
+              | { served: null; status: number; errBody: string; unroutable?: string }
+            > => {
+              const targetDelegation = target.step.roleRef
+                ? resolveDelegationOwner(role, target.step)
+                : null;
+              try {
+                const targetHandler = withAdvisor(
+                  withRequestHooks(await getHandlerForRequest(target.concrete)),
+                  advisorPresence
                 );
-                const unroutableSkip = await resolveTransientStep(role, {
-                  bucketOf: async (t) => concreteStepBucketOfSync(t),
-                  nominalBucket: bucket ?? undefined,
-                  afterStepIndex: walk.stepIndex,
-                }).catch(() => null);
-                if (unroutableSkip) {
-                  try {
-                    const retryHandler = withAdvisor(
-                      withRequestHooks(await getHandlerForRequest(unroutableSkip.concrete)),
-                      advisorPresence
-                    );
-                    openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
-                    const retryResp = await retryHandler.handle(c, body);
-                    if (retryResp.ok) {
-                      if (!unroutableSkip.step.roleRef) {
-                        resetStepSuccess(role, unroutableSkip.stepIndex);
-                      }
-                      return retryResp;
+                // #317: the walk is a paid upstream attempt too — fresh token.
+                openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+                const targetResp = await targetHandler.handle(c, body);
+                if (targetResp.ok) {
+                  if (!target.step.roleRef) resetStepSuccess(role, target.stepIndex);
+                  // Only credit the owner that actually served: a delegation
+                  // resolved to a different concrete (or to null ⇒ cannot
+                  // serve) during the round-trip must not lift a wall or reset
+                  // a step on a success it did not produce.
+                  if (targetDelegation && targetDelegation.concrete === target.concrete) {
+                    if (targetDelegation.owner.nominal) {
+                      onNominalSuccess(
+                        targetDelegation.owner.role,
+                        concreteStepBucketOfSync(targetDelegation.concrete)
+                      );
+                    } else {
+                      resetStepSuccess(
+                        targetDelegation.owner.role,
+                        targetDelegation.owner.stepIndex
+                      );
                     }
-                    await retryResp.text().catch(() => "");
-                  } catch {
-                    // Second target unusable too — the ORIGINAL overload stands.
                   }
+                  return { served: targetResp };
                 }
+                // Not ok: READ the body — it is both the classifier's input
+                // (#598) and the drain. Nothing is written.
+                const targetErrBody = await targetResp.text().catch(() => "");
+                return { served: null, status: targetResp.status, errBody: targetErrBody };
+              } catch (err) {
+                // #769 — a RoutingError here is NOT an attempt failure: the
+                // target was unroutable at CONSTRUCTION (no credential for its
+                // provider on this host), so zero upstream calls were paid. It
+                // is classified apart; every other throw has no class and
+                // therefore never advances.
+                if (err instanceof RoutingError) {
+                  return { served: null, status: 0, errBody: "", unroutable: err.message };
+                }
+                return { served: null, status: 0, errBody: "" };
               }
-              // Any other throw (or an unroutable chain that ran out): no
-              // class, no advance — the original overload stands.
+            };
+            const firstAttempt = await attemptWalkStep(walk);
+            if (firstAttempt.served) return firstAttempt.served;
+            // Two failures may advance ONE hop, and neither writes plan state:
+            //
+            // #769 — the target died UNROUTABLE at construction. Zero upstream
+            // calls were paid, so no budget is spent and none is re-checked.
+            //
+            // #598 — the target died CONNECTION-class, which says the HOST was
+            // unreachable, not that its plan is walled. Measured 2026-10-22: the
+            // nominal's egress and walk step 0's were the same dead host, so
+            // 194/194 sonnet walks re-picked step 0 and step 1 was never tried —
+            // a transport failure writes no state by design (#299 B), so
+            // `firstServable` keeps finding that same dead step servable.
+            // Deliberately NOT on a 402/429/503/529: that is capacity the
+            // resolver owns, and stepping over it would re-buy exactly what
+            // #299 B rejected.
+            let advanceReason: "unroutable" | "connection" | null = null;
+            if (firstAttempt.unroutable) {
+              log(
+                `[Failover] WALK-SKIP ${role} → ${walk.concrete} reason=unroutable — ${firstAttempt.unroutable} (#769)`,
+                true // forceConsole — operational event, countable marker
+              );
+              advanceReason = "unroutable";
+            } else if (isConnectionWalkClass(firstAttempt.status, firstAttempt.errBody)) {
+              // The advance is a paid attempt too, so re-check the walk budget
+              // before buying it: reaching here already means one more
+              // connection failure was absorbed, and a budget that admitted the
+              // first attempt but not the second is the intended shape.
+              const advanceElapsedMs = Date.now() - cascadeStartedAtMs;
+              if (walkBudgetMs > 0 && advanceElapsedMs > walkBudgetMs) {
+                log(
+                  `[Failover] WALK-ADVANCE ${role} skipped — budget ${advanceElapsedMs}ms > ${walkBudgetMs}ms`,
+                  true
+                );
+              } else {
+                advanceReason = "connection";
+              }
+            }
+            // The bound is structural: this block runs once per request
+            // (`overloadWalked`) and the advanced attempt never advances in
+            // turn — a second dead target surfaces the ORIGINAL overload.
+            if (advanceReason) {
+              const nextWalk = await resolveTransientStep(role, {
+                bucketOf: async (t) => concreteStepBucketOfSync(t),
+                nominalBucket: bucket ?? undefined,
+                afterStepIndex: walk.stepIndex,
+              }).catch(() => null);
+              if (nextWalk) {
+                log(
+                  `[Failover] WALK-ADVANCE ${role} — step ${walk.stepIndex} (${walk.concrete}) died ${advanceReason}-class; one extra attempt at ${nextWalk.concrete} (step ${nextWalk.stepIndex})`,
+                  true
+                );
+                const advanced = await attemptWalkStep(nextWalk);
+                if (advanced.served) return advanced.served;
+              }
             }
           }
           return response;
