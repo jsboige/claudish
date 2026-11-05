@@ -218,6 +218,39 @@ window:
   05:12:59Z, sidecar AUTONOMOUS 05:13:12Z (13 s later), entry back 05:36:32Z, deep probe OK
   (8 332 ms) → NOMINAL 05:36:36Z — 23 min 24 s autonomous, 301 requests served locally, zero
   client errors. The probe's seconds are dead time added to recovery by design: hysteresis's price.
+- **The protocol has a floor, and `window − probe` is how you subtract it: only the 60 s cooldown
+  is hard — the rest is at most one heartbeat interval of tick alignment, so the floor lives in
+  [60, 70] s, and any excess above it is real hub downtime, not recovery latency.** The gate at
+  `relay.ts:1243` fires on the first tick where 3 consecutive OK heartbeats (`OK_THRESHOLD = 3`)
+  AND `RECOVERY_COOLDOWN_MS = 60_000` since the flip both hold, and ticks run every
+  `HEARTBEAT_INTERVAL_MS = 10_000` (`:1285`) — the probe launches on that tick, inline. One
+  container, one process lifetime, three windows on 2026-11-04 (po-2028): 69,70 s − 3 672 ms =
+  **66,03 s** · 68,70 s − 2 606 ms = **66,10 s** · 87,11 s − 21 101 ms = **66,01 s** — a 60 s
+  cooldown plus 6 s of tick alignment. **For a heartbeat-timeout flip that alignment is not a
+  draw, it is `10 − t`**: `markFail` stamps `lastFlipAt` when the second heartbeat gives up, `t`
+  after its tick (`t` = `CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS`, default `HEARTBEAT_TIMEOUT_MS =
+  4_000`), so the first tick past the cooldown is the seventh and `window − probe = 70 − t` —
+  66 s on the 4 s default, **61,9 s on po-2023's first 2026-11-04 flip** at 9 s (po-2027
+  measured the same 61 s at 9 s, #867). Only a flip stamped off-tick (`forward-connect`,
+  `forward-http-*`) draws its alignment anywhere in [60, 70] s. Quoting one seat's 66 s as *the*
+  floor mis-states a seat on another heartbeat timeout by the difference. **It is a floor
+  measured from `markFail`, not an expected duration**: the seventh tick only opens the door if
+  the OK streak is complete, and each tick that misses it adds 10 s. The other four po-2023
+  windows that evening read 73,1 s (one tick late) and 559,0 / 601,1 / 663,9 s, where the door
+  opened, the probe failed at it, and recovery waited on retries (the #867 class). The fourth po-2028 window reads
+  147,24 s − 1 218 ms = **146,0 s** on the same arithmetic — the day po-2025's *host* rebooted
+  at 13:44:56Z, the cooldown expired while the hub was still down and the probe waited for its
+  hearing. On a first-attempt probe timeout, add the full first budget (30 s default; 10 s under
+  `CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS`, #868) plus the fallback attempt. **A reader quoting
+  raw `DOWN → NOMINAL` durations over-states every episode by the protocol's own floor**; the
+  subtraction is what tells a 70 s heartbeat blip from a 150 s outage.
+- **The probe's first attempt is intermittent within one seat, so a fixed order is not the fix.**
+  Same container and process lifetime: **3 of 4** windows on 2026-11-03 fell back to `glm-5.3`
+  after a haiku `TimeoutError` (second attempt 1 586 / 1 169 / 1 242 ms), while **0 of 4** did on
+  2026-11-04 (first attempt succeeded in 3 672 / 2 606 / 21 101 / 1 218 ms). A seat-constant
+  reading of "haiku-first is chronically slow" (27 of 39 probe timeouts on po-2027, #867, 134
+  client-visible `Cannot reach api.z.ai` that day) is one same-seat flip away from being wrong.
+  What this supports is a **short budget on the first attempt**, not a reordering.
 - **A quiet AUTONOMOUS window says nothing about the hub** — once autonomous the relay sends
   nothing upstream, so no client request can refute the verdict (the asymmetry pinned above);
   corroborate hub-side (watchdog probes, capture gaps) before reading a flap window as hub time.
