@@ -50,13 +50,29 @@ const FLAG_PATH = join(HOME, "drain-freeze");
 // Same hermeticism contract as native-passthrough-strip.test.ts: keys would
 // change resolution and CLAUDISH_PROXY_KEY would 401 before the route runs.
 const SANDBOX_ENV_KEYS = [
-  "ZAI_API_KEY", "ZAI_CODING_API_KEY", "GLM_API_KEY", "ZHIPU_API_KEY",
-  "GLM_CODING_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_CODING_API_KEY",
-  "OPENAI_API_KEY", "OPENAI_CODEX_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
-  "MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY", "LITELLM_API_KEY", "POE_API_KEY",
-  "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
-  "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
-  "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
+  "ZAI_API_KEY",
+  "ZAI_CODING_API_KEY",
+  "GLM_API_KEY",
+  "ZHIPU_API_KEY",
+  "GLM_CODING_API_KEY",
+  "MOONSHOT_API_KEY",
+  "KIMI_API_KEY",
+  "KIMI_CODING_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_CODEX_API_KEY",
+  "GEMINI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "MINIMAX_API_KEY",
+  "MINIMAX_CODING_API_KEY",
+  "LITELLM_API_KEY",
+  "POE_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "CLAUDE_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "CLAUDISH_NO_ANTHROPIC",
+  "CLAUDISH_FAILOVER_ACTIVE",
+  "CLAUDISH_PROXY_KEY",
+  "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
 ];
 const savedEnv: Record<string, string | undefined> = {};
@@ -250,7 +266,10 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages/count_tokens`, {
       method: "POST",
       headers: INBOUND_HEADERS,
-      body: JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: "ok" }] }),
+      body: JSON.stringify({
+        model: "claude-sonnet-5",
+        messages: [{ role: "user", content: "ok" }],
+      }),
     });
     expect(res.status).toBe(503);
     expect(res.headers.get("retry-after")).toBe("15");
