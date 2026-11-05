@@ -59,8 +59,15 @@ export interface ProviderTransport {
   /** Get the full API endpoint URL for a request */
   getEndpoint(model?: string): string;
 
-  /** Get HTTP headers (may be async for OAuth token refresh) */
-  getHeaders(): Promise<Record<string, string>>;
+  /**
+   * Get HTTP headers (may be async for OAuth token refresh).
+   *
+   * `claudeRequest` is the ORIGINAL inbound Anthropic-format body, passed so a
+   * transport can derive per-conversation headers (OpenAI Codex: the
+   * `session-id` cache-affinity header). Optional — the implementers that
+   * ignore it are untouched, and internal callers without a request omit it.
+   */
+  getHeaders(claudeRequest?: any): Promise<Record<string, string>>;
 
   /**
    * Override the adapter's stream format selection.
@@ -120,8 +127,14 @@ export interface ProviderTransport {
    * Optional payload transformation before sending.
    * Used by providers that wrap the payload in an envelope (e.g., CodeAssist).
    * Called after adapter.buildPayload() + adapter.prepareRequest().
+   *
+   * `claudeRequest` is the ORIGINAL inbound Anthropic-format body: buildPayload
+   * is lossy in exactly the direction a transport sometimes needs (the
+   * Responses adapter lifts `system` into `instructions` and drops `metadata`,
+   * so conversation identity is unreachable from `payload` alone). Optional and
+   * second, as upstream MadAppGang #113 shaped it.
    */
-  transformPayload?(payload: any): any;
+  transformPayload?(payload: any, claudeRequest?: any): any;
 
   /**
    * Extra options to merge into the fetch RequestInit.
