@@ -25,9 +25,11 @@
  * "frozen" and "chat ingress" tests go red while "default OFF" stays green;
  * age the flag past DRAIN_FREEZE_MAX_AGE_MS and the freeze is ignored without
  * any code change (the expiry IS the crashed-drain backstop, AC3); drop the
- * #318 marker from the gate ⇒ the frozen assertion and the unfrozen control
- * go red together (the hub half of the wire contract, this base's relay
- * consumes the marker at relay.ts's drainFreeze503 check).
+ * #318 marker from the gate ⇒ the frozen assertion goes red (the hub half of
+ * the wire contract, this base's relay consumes the marker at relay.ts's
+ * drainFreeze503 check). The unfrozen control stays green under that
+ * mutation by construction: it pins the other direction, a marker leaking
+ * onto ordinary traffic.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
