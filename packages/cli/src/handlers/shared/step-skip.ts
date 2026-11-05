@@ -21,21 +21,30 @@
  * On `main` the header is EMITTED by `ComposedHandler` from three sites
  * (`context` overflow recovery turn, `busy` bounded concurrency 529, `media`
  * per-prompt image cap #575) and the transports carry `classifyConcurrencyRefusal`
- * / `isConcurrencyRefusalResponse` (#679). `replatform/v14` carries ONE of the
- * three handler sites — the `media` emitter (#575, `media-cap.ts`, set in
- * `composed-handler.ts` on the classified 400) — plus the loop-internal
- * producers below; the concurrency refusal marker and
- * `providers/transport/quota-wall.ts` remain main-only (row 7b of the port
- * map). The vocabulary is kept identical to main on purpose: the same header
- * read by the same loop on both branches, so a later port of an emission site
- * needs no second spelling.
+ * / `isConcurrencyRefusalResponse` (#679). `replatform/v14` now carries TWO of
+ * the handler sites — the `media` emitter (#575, `media-cap.ts`, row 7a) and
+ * the `busy` concurrency-refusal emitter (#679/#684, row 7b, this port):
+ * z.ai's GLM Coding plan answers request-concurrency overuse with HTTP 429 +
+ * `error.code 1302` — a busy slot the plan frees on its own, not a step
+ * failure; the classifier below is byte-faithful to main's. Deliberately NOT
+ * ported: main's `isConcurrencyRefusalResponse` (a Response-shaped helper that
+ * reads a body through a bounded `readBodyWithDeadline` in
+ * `providers/transport/quota-wall.ts` — both of THIS base's consumers, the
+ * transport 429 ladders and the handler emitter, classify text they have
+ * already read, so the helper and the module would arrive dead), and the
+ * eligibility WeakSet (`markStepSkipEligible`), which exists on main ONLY to
+ * exempt non-last steps from the patient overload backoff — this base has no
+ * patient backoff to exempt anyone from. The vocabulary is kept identical to
+ * main on purpose: the same header read by the same loop on both branches, so
+ * a later port of an emission site needs no second spelling.
  *
  * v14's producers today: the loop itself (`handleWithCascade` classifies a
  * step's own error body with `isContextOverflowError` (`request-shape.ts`) and
  * writes a `context` skip directly — it would be its own reader otherwise),
- * the loop-construction sites (`unroutable` #769, `busy` #654), and the
- * handler-side `media` emitter above — which reaches the loop through the
- * header path below, the seam this wire contract was pinned for.
+ * the loop-construction sites (`unroutable` #769, `busy` #654), and the two
+ * handler-side emitters — `media` (#575, row 7a) and `busy` (#684, this port)
+ * — which reach the loop through the header path below, the seam this wire
+ * contract was pinned for.
  */
 
 export const STEP_SKIP_HEADER = "x-claudish-step-skip";
@@ -81,6 +90,29 @@ export function readStepSkip(response: Response): StepSkipInfo | null {
   if (!STEP_SKIP_REASONS.includes(reason as StepSkipReason)) return null;
   const detail = semi === -1 ? undefined : raw.slice(semi + 1).trim() || undefined;
   return { reason: reason as StepSkipReason, detail };
+}
+
+// ── Concurrency refusal, `busy` (#679/#684, port-map row 7b) ──────────────────
+
+/** z.ai's GLM Coding plan refuses REQUEST-concurrency overuse with HTTP 429 and
+ *  `error.code 1302` — two measured wordings, one stable code. The code is the
+ *  contract; the status gate keeps every other 429 on its ordinary route. The
+ *  USAGE wall is `1308` (isQuotaExhaustion's) and must NEVER match here: that
+ *  one is a real quota signal, not a slot that frees itself. */
+export const CONCURRENCY_REFUSAL_SKIP_DETAIL = "code=1302";
+
+/** Byte-faithful to main's #684 classifier. `bodyText` is text the caller has
+ *  ALREADY read (the transport 429 ladders clone-read the body; the handler
+ *  reads `errorText`) — this base has no unread-Response consumer, which is
+ *  why the bounded-read helper was not ported (see the module header). */
+export function classifyConcurrencyRefusal(status: number, bodyText: string): boolean {
+  if (status !== 429) return false;
+  try {
+    const code = JSON.parse(bodyText)?.error?.code;
+    return code === "1302" || code === 1302;
+  } catch {
+    return false;
+  }
 }
 
 // ── Kill switch (re-read per request) ─────────────────────────────────────────

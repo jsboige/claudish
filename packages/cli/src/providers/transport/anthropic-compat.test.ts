@@ -94,6 +94,52 @@ describe("AnthropicProviderTransport.getHeaders()", () => {
   });
 });
 
+// #679/#684 (port-map row 7b): this ladder carries the same 1302 exit as the
+// openai one. No route in `proxy-server-role-failover-route.test.ts` reaches
+// this transport (its fake endpoints declare `format: "openai"`), so the exit
+// is pinned here or nowhere.
+describe("AnthropicProviderTransport 429 ladder — plan-concurrency refusal", () => {
+  const provider: RemoteProvider = {
+    name: "zai",
+    baseUrl: "https://api.z.ai",
+    apiPath: "/anthropic/v1/messages",
+    apiKeyEnvVar: "ZAI_API_KEY",
+    prefixes: ["gc@", "zai@"],
+    authScheme: "x-api-key",
+  };
+
+  it("does not retry a 1302 refusal, and still retries an ordinary 429", async () => {
+    const transport = new AnthropicProviderTransport(provider, TEST_API_KEY);
+    const busy = JSON.stringify({
+      error: { code: "1302", message: "Request concurrency limit exceeded" },
+    });
+
+    let busyCalls = 0;
+    const busyResponse = await transport.enqueueRequest(() => {
+      busyCalls++;
+      return Promise.resolve(new Response(busy, { status: 429 }));
+    });
+    expect(busyResponse.status).toBe(429);
+    expect(busyCalls).toBe(1);
+
+    let throttleCalls = 0;
+    const recovered = await transport.enqueueRequest(() => {
+      throttleCalls++;
+      if (throttleCalls === 1) {
+        return Promise.resolve(
+          new Response('{"error":"rate limited"}', {
+            status: 429,
+            headers: { "Retry-After": "0" },
+          })
+        );
+      }
+      return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
+    });
+    expect(recovered.status).toBe(200);
+    expect(throttleCalls).toBe(2); // the ladder itself is untouched
+  }, 15_000);
+});
+
 describe("AnthropicAPIFormat — tool_reference stripping", () => {
   const adapter = new AnthropicAPIFormat("kimi-k2.5", "kimi");
 

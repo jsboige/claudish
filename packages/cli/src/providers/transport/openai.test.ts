@@ -142,6 +142,28 @@ describe("OpenAIProviderTransport 429 retry (#66)", () => {
     expect(callCount).toBe(1); // No retry
     expect(elapsed).toBeLessThan(500); // No backoff sleep
   });
+
+  // #679/#684 (port-map row 7b): the plan's REQUEST-concurrency slot frees on
+  // its own, so no wait inside this ladder can outlast it. The code is the
+  // contract — the wording has two measured spellings.
+  test("does not retry a 1302 plan-concurrency refusal — the cascade's skip is the only action", async () => {
+    const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key");
+    let callCount = 0;
+    const body = JSON.stringify({
+      error: {
+        code: "1302",
+        message: "Request concurrency limit exceeded",
+        type: "rate_limit_error",
+      },
+    });
+    const response = await transport.enqueueRequest(() => {
+      callCount++;
+      return Promise.resolve(new Response(body, { status: 429 }));
+    });
+
+    expect(response.status).toBe(429);
+    expect(callCount).toBe(1); // No retry
+  });
 });
 
 describe("isTerminal429", () => {
