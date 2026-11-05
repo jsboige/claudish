@@ -7,7 +7,9 @@ and deliberately silent about *whether main already solved it*. That silence is 
 a triage that reads the list alone concludes "to design" and mis-prices the grain. All
 nine entries below were delivered on `main`; eight have a reference PR, one does not.
 
-Base measured: `replatform/v14` = `d06f3659` (#829 merged), `main` = `47ea6245`.
+Base measured: `replatform/v14` = `09f8e03b` (#865 merged), `main` = `ef841d18` (#871 merged).
+Done rows: 7 of 9 (2, 5, 6, 7a, 7b, 8, 9 — row 9 via open PR #885); open: 1 (#565), 3 (#218), 4 (#693).
+Row 7c is not a grain (verified: row 1 restated).
 
 ## Two traps this map exists to kill
 
@@ -74,6 +76,15 @@ git grep -n "drainFreezeGate("                           origin/main     -- pack
 Each row's reference is verifiable by SHA (`git show --shortstat <sha>`) and, for the
 issue-numbered rows, by `gh api repos/jsboige/claudish/issues/<n>` (a PR returns
 `pull_request`; an issue does not — that is how row 3 was settled).
+
+## Known CI flake — do not chase it in a port PR
+
+`hermetic · macOS` intermittently fails `team-liveness-exited-slot.test.ts:91`
+(`idle_seconds >= 1`, received 0). The test sleeps a fixed 1.1 s and floors idle
+to whole seconds, so one late heartbeat frame on a loaded runner drops the value
+to 0. First seen on #869 (`65465b4e`), rerun-green same commit, analysis at
+`issuecomment-6651130218`; seen again on later PRs. The fix, if ever wanted,
+belongs in THAT TEST, never in a port diff — rerun the failed jobs and move on.
 
 ## Why this file exists
 
