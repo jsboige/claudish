@@ -45,8 +45,13 @@ CREDENTIAL_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 # 263000, sat 856 tokens above it, so compaction could never fire before a
 # vllm-routed session left the window (user 23/10, Q58: "erreur grossiere, oui
 # tu redescends"). ai-01 alone runs higher on purpose (user 20/10).
+# Lowered on 05/11 to 230000 / 300000 (user ~08:41Z, verbatim relayed by
+# myia-po-2025:claudish on `global` at 08:54Z: "l'inflation des seuils a
+# accompagné celle des coûts"). The value is `<<preserve-local>>` in the global
+# canon, so Deploy does not carry it: each seat edits its own file, and this
+# flag is how a seat still on 250000 / 330000 gets seen.
 CANON = {
-    "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW": {"*": "250000", "myia-ai-01": "330000"},
+    "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW": {"*": "230000", "myia-ai-01": "300000"},
 }
 # Values compared across the fleet; any divergence is listed.
 COMPARED = (
