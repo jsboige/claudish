@@ -979,7 +979,7 @@ export class ComposedHandler implements ModelHandler {
 
     // 5c. Provider payload transformation (e.g., CodeAssist envelope wrapping)
     if (this.provider.transformPayload) {
-      requestPayload = this.provider.transformPayload(requestPayload);
+      requestPayload = this.provider.transformPayload(requestPayload, claudeRequest);
     }
 
     // 6. Middleware before request.
@@ -1176,7 +1176,7 @@ export class ComposedHandler implements ModelHandler {
     }
 
     const endpoint = this.provider.getEndpoint(this.targetModel);
-    const headers = await this.provider.getHeaders();
+    const headers = await this.provider.getHeaders(claudeRequest);
     this.applyClientAttribution(c, headers);
     headers["Content-Type"] = "application/json";
 
@@ -1407,7 +1407,7 @@ export class ComposedHandler implements ModelHandler {
         log(`[${this.provider.displayName}] Got 401, forcing auth refresh and retrying`);
         try {
           await this.provider.forceRefreshAuth();
-          const retryHeaders = await this.provider.getHeaders();
+          const retryHeaders = await this.provider.getHeaders(claudeRequest);
           this.applyClientAttribution(c, retryHeaders);
           retryHeaders["Content-Type"] = "application/json";
           const retryInit = this.provider.getRequestInit?.() || {};
