@@ -14,7 +14,7 @@ Planned-but-unimplemented work lives in `ROADMAP.md`, each item with an explicit
 | Budget failover: cascade walk, notices, backoff, Qwen/GLM thinking measurements | `docs/reference/budget-failover.md` · `.env.sidecar.example` |
 | Capability vocabulary (#83 — wired, gate `CLAUDISH_CAPABILITY_VOCAB` default off) | `docs/reference/capability-vocabulary.md` |
 | Signature-based role routing (#82 — design only, unarbitrated, no code) | `docs/reference/signature-routing.md` · `ROADMAP.md` |
-| Haiku → swift debrayage — staged widening (02/11 : po-2028 in swift trial on user directive, revert written if net PAYG rises; po-2024 excluded) | `docs/reference/haiku-swift-debrayage.md` · `ROADMAP.md` |
+| Haiku → swift debrayage — staged widening (02/11 : po-2028 in swift trial on user directive, revert if net PAYG rises; ai-01 + po-2024 excluded) | `docs/reference/haiku-swift-debrayage.md` · `ROADMAP.md` |
 | OpenAI-compatible ingress (`/v1/chat/completions`) translation | `docs/reference/openai-ingress.md` |
 | Ops runbook — watchdog, drain/recreate, events, compaction, archive | `docs/reference/ops-scripts.md` |
 
