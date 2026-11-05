@@ -104,7 +104,10 @@ describe("request-logger capture (fork)", () => {
     try {
       const settled = waitForCapture(pinDir, 5000);
       writer = setTimeout(() => {
-        writeFileSync(partial, '{"ts":"2026-11-04T00:00:00.000Z","src":"test","machine":"myia-test"}');
+        writeFileSync(
+          partial,
+          '{"ts":"2026-11-04T00:00:00.000Z","src":"test","machine":"myia-test"}'
+        );
       }, 100);
       const file = await settled;
       expect(file).toBe(partial);
