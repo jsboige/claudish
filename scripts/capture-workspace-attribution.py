@@ -253,6 +253,45 @@ def resp_prefix_for(req_name: str) -> str | None:
     return f"resp-{m.group(1)}-r{m.group(2)}-"
 
 
+RESP_MODEL = re.compile(r"^resp-\d+-r\d+-\d{4}-\d{2}-\d{2}T[\d-]+Z-(.+)\.(?:sse|json)$")
+NO_RESP = "(no-resp)"
+# Ordered: the first family whose needle the served id contains wins. Kimi is
+# also served under a bare `k3` / `k3.1-pro` id (`kc@k3`), hence the `-k3` needle.
+FAMILIES = (
+    ("swift", ("swift",)),
+    ("glm", ("glm",)),
+    ("minimax", ("minimax",)),
+    ("deepseek", ("deepseek",)),
+    ("qwen", ("qwen",)),
+    ("kimi", ("kimi", "-k2", "-k3")),
+    ("claude", ("claude", "opus", "sonnet", "haiku")),
+    ("openai", ("gpt", "codex", "luna")),
+    ("mistral", ("mistral", "devstral", "codestral", "magistral")),
+    ("gemini", ("gemini",)),
+)
+
+
+def served_model(resp_base: str) -> str | None:
+    """`resp-1-r0003-<ts>Z-openai-qwen3.6-35b-a3b.sse` -> `openai-qwen3.6-35b-a3b`.
+
+    The response capture names the WIRE and the model that actually answered —
+    after routing, cascade and failover — which is what separates "this
+    workspace changed" from "the model serving it changed" (#445 grain C3).
+    """
+    m = RESP_MODEL.match(resp_base)
+    return m.group(1) if m else None
+
+
+def model_family(served: str | None) -> str:
+    if not served:
+        return NO_RESP
+    low = served.lower()
+    for fam, needles in FAMILIES:
+        if any(n in low for n in needles):
+            return fam
+    return "other"
+
+
 def usage_max(usage: dict) -> tuple[int, int]:
     """(input, output) of a usage object, nesting-aware. Max, never summed:
     `message_start` carries the real input, the terminal delta the output —
@@ -418,11 +457,12 @@ def read_tour_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict]
         if raw is None:
             continue
         key, _cc = workspace_key(raw)
-        row = {"ws": key, "session": session_key(raw), "in": 0, "out": 0, "paired": False}
+        row = {"ws": key, "session": session_key(raw), "in": 0, "out": 0, "paired": False, "model": None}
         pref = resp_prefix_for(base)
         if pref:
             for cand_base in list(on_disk):
                 if cand_base.startswith(pref):
+                    row["model"] = served_model(cand_base)
                     usage = usage_from_resp(on_disk[cand_base])
                     if usage is not None:
                         row["in"], row["out"] = usage
@@ -453,8 +493,12 @@ def aggregate_tours(rows: list[dict], fraction: float | None) -> dict:
     per: dict[str, dict] = {}
     no_session = 0
     for r in rows:
-        w = per.setdefault(r["ws"], {"reqs": 0, "sessions": set(), "in": 0, "out": 0, "paired": 0})
+        w = per.setdefault(r["ws"], {"reqs": 0, "sessions": set(), "in": 0, "out": 0, "paired": 0,
+                                     "families": collections.Counter(), "models": collections.Counter()})
         w["reqs"] += 1
+        served = r.get("model")
+        w["families"][model_family(served)] += 1
+        w["models"][served or NO_RESP] += 1
         if r["session"]:
             w["sessions"].add(r["session"])
         else:
@@ -465,7 +509,9 @@ def aggregate_tours(rows: list[dict], fraction: float | None) -> dict:
     out: dict[str, dict] = {}
     for k, v in per.items():
         entry = {"reqs": v["reqs"], "tours": len(v["sessions"]),
-                 "in_tok": v["in"], "out_tok": v["out"], "paired": v["paired"]}
+                 "in_tok": v["in"], "out_tok": v["out"], "paired": v["paired"],
+                 "families": dict(v["families"].most_common()),
+                 "models": dict(v["models"].most_common())}
         if fraction and fraction > 0:
             entry["tours_hi"] = round(len(v["sessions"]) / fraction)
             entry["est_in_tok"] = round(v["in"] / fraction)
@@ -1003,8 +1049,9 @@ def main(argv=None) -> int:
             for k, v in sorted(agg["workspaces"].items(), key=lambda kv: -kv[1]["reqs"])[:12]:
                 est = (f"  tours bound {v['tours']}..{v['tours_hi']}  ~in {v['est_in_tok']}  ~out {v['est_out_tok']}"
                        if "tours_hi" in v else "")
+                fams = " ".join(f"{f}:{c}" for f, c in list(v["families"].items())[:4])
                 print(f"    {k:<32} reqs={v['reqs']:>4}  tours={v['tours']:>3}"
-                      f"  in={v['in_tok']}  out={v['out_tok']}  paired={v['paired']}{est}", flush=True)
+                      f"  in={v['in_tok']}  out={v['out_tok']}  paired={v['paired']}{est}  [{fams}]", flush=True)
             continue
         counts: collections.Counter = collections.Counter()
         n = 0
