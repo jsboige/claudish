@@ -117,8 +117,8 @@ describe("CLAUDE.md budget boundary (#445 A2)", () => {
   // These pins make the gate falsifiable: raise CLAUDE_MD_BUDGET_BYTES by one
   // byte and the first test below goes red.
 
-  test("the budget is 40 960 B", () => {
-    expect(CLAUDE_MD_BUDGET_BYTES).toBe(40 * 1024);
+  test("the budget is 36 864 B", () => {
+    expect(CLAUDE_MD_BUDGET_BYTES).toBe(36 * 1024);
   });
 
   test("one byte over the budget is refused, exactly at the budget is accepted", () => {

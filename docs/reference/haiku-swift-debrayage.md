@@ -171,6 +171,20 @@ What this design deliberately does **not** change: no config-arm at a quota wall
 - ai-01 lift: user arbitration on Q-po2025-31 (already open) → one drained recreate, announce first on `global`.
 - Parked forever unless the user reopens: po-2028.
 
-## 5. Provenance
+## 5. Update — 2026-11-02: po-2028 enters a swift trial (supersedes §3 ladder item 4 and §4's "parked forever")
+
+The user lifted po-2028's `STEP_EXCLUDE` on 02/11 — **a trial, not a durable widening**. Live value at the flip:
+
+| Piece | Value |
+|---|---|
+| #693 exclusion (`CLAUDISH_FAILOVER_STEP_EXCLUDE`) | `vllm-myia@swift-1.5-27b:myia-ai-01 myia-po-2024` |
+| Meaning | ai-01 and po-2024 still skip step 0; **po-2028 no longer does** |
+| po-2024 | remains excluded |
+
+The 20/10 rationale (CoursIA-3 secretary kept on MiniMax) is superseded for po-2028 by this arbitration, not by a measurement: the trial's condition is **the revert, written in advance** — if the net PAYG spend rises once po-2028's haiku flows through swift (the #299-B/cascade accounting, not the raw swift share), the exclusion goes back for po-2028 and the measurement is recorded here. ai-01 stays the design's payload (§3, ladder 3) and is untouched by this flip.
+
+Read the armed state **by VALUE** (the `STEP_EXCLUDE` list above), never by name: a startup read, so a change needs a recreate.
+
+## 6. Provenance
 
 Mandate thread: user evening 26/10 (swift proposition → Q-po2025-31), ai-01 coordination 00:12Z 27/10 (option b), user night 27/10 ~04:45Z (mandate restated). Measurements: `minimax-plan-watch.log` lines 39–45, census files `.tmp/cons-evening.json` / `cons-1530.json` (2026-10-26), swift capture scans 26–27/10, DM `po2025-swift-econnreset-wedge-20261027T0412Z`. Engine incidents: 20/10 16:17Z wedge (deploy-2 incident, repli lesson), 27/10 01:47Z restart window + wedge. 27/10 ~09:30Z correction pass: `failover-events.log` 27/10 (83 STEP-ADVANCE, GLM wall 06:14Z → `RECOVERED` 08:35:58Z, Qwen closure until 11/11), PAYG tail-sum over 27/10 captures (8 706 resp / 8.73 M OUT / 28.9 M IN), sonnet demand p50 **159.2k** tok (n=2 436, 1 h window 27/10 07:00Z+, `prompt-size-dist.py` @ PR #708) — July sonnet p50 was 43.8k, so the 120–190k session shape is now the sonnet lane's too, not only haiku's. Related: `docs/reference/budget-failover.md` (#431, #693), `docs/reference/model-routing.md` (context limits), issue #700 (sobriety program — the demand side of this ledger).

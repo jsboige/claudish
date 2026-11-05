@@ -16,16 +16,21 @@
  */
 
 /**
- * 40 960 B — the #445 A1/A2 budget, i.e. exactly 40 KiB.
+ * 36 864 B — exactly 36 KiB, lowered from 40 KiB by the #445 thinning pass
+ * (2026-11-05), which took the file from 40 921 B to 32 763 B by moving
+ * narratives, measurements and lists into `docs/reference/<theme>.md` behind
+ * one-line pointers. The gate sits ABOVE the delivered size on purpose: it is
+ * the ceiling that stops the regrowth, not a pin on today's number.
  *
- * The gate used to read `40 * 1024 + 960` = 41 920 B, i.e. 960 B LOOSER than the
- * epic's criterion ("≤ 40 960 octets", and A2's "test rouge à 40 961 octets").
- * The 960 B headroom was never a decision, it was an off-by-960 in the constant:
- * with it, `main` sat at 42 211 B — over even the loose budget — and the file
- * grew back because the gate had drifted from the criterion it was written for.
- * The boundary is now the epic's: at 40 960 is fine, 40 961 is refused.
+ * History, kept because it is the reason the boundary is exact: the gate once
+ * read `40 * 1024 + 960` = 41 920 B, i.e. 960 B LOOSER than the epic's
+ * criterion ("≤ 40 960 octets", A2's "test rouge à 40 961 octets"). That
+ * headroom was never a decision — it was an off-by-960 in the constant, and
+ * with it `main` sat at 42 211 B, over even the loose budget. The lesson
+ * stands: the boundary is exact (at the budget is fine, one byte over is
+ * refused), and raising it is a #445 decision, not a fix.
  */
-export const CLAUDE_MD_BUDGET_BYTES = 40 * 1024;
+export const CLAUDE_MD_BUDGET_BYTES = 36 * 1024;
 
 /** Bytes of a file's text, line-ending independent (CRLF counts as LF). */
 export function measureBudgetedBytes(raw: string): number {
