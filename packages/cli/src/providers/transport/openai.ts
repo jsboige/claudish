@@ -9,6 +9,7 @@
 import { callAbortError, sleepUnlessAborted } from "../../handlers/shared/call-context.js";
 import { isQuotaExhaustionError } from "../../handlers/shared/quota-exhaustion.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
+import { classifyConcurrencyRefusal } from "../../handlers/shared/step-skip.js";
 import { log } from "../../logger.js";
 import type { DiscoveryOutcome } from "./probe-discovery.js";
 import { discoverProviderProbeModel } from "./provider-model-discovery.js";
@@ -131,6 +132,18 @@ export class OpenAIProviderTransport implements ProviderTransport {
             .catch(() => "");
           if (isTerminal429(bodyText)) {
             log(`[${this.displayName}] 429 is terminal (billing/quota), not retrying`);
+            return response;
+          }
+          // #679: a plan REQUEST-concurrency refusal (429 + error.code 1302) is
+          // a busy slot, not a rate this ladder can wait out. Retrying burns the
+          // caller's deadline on the one signal only the cascade can act on —
+          // the busy skip (#684). Classified from the text already read above;
+          // main re-reads the body through a bounded helper this base does not
+          // carry (see step-skip.ts).
+          if (classifyConcurrencyRefusal(response.status, bodyText)) {
+            log(
+              `[${this.displayName}] 429 is a plan-concurrency refusal (code 1302), not retrying`
+            );
             return response;
           }
           lastResponse = response;

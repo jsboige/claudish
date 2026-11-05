@@ -1,14 +1,12 @@
 /**
  * #431 on `replatform/v14` — the WIRE CONTRACT, pinned at module level.
  *
- * Why the route suite cannot pin this arm: on main the header is emitted by
- * `ComposedHandler` on its own final Response; this base has no such producer
- * yet (no `media-cap`, no concurrency-refusal marker — see the module header),
- * and an upstream-supplied header never reaches the loop (measured: the
- * handler re-wraps a non-ok body into an Anthropic envelope and the response
- * it returns carries none of the upstream's custom headers). So the reader is
- * pinned here, and the loop's use of it is pinned by the `context` arm in
- * `proxy-server-role-failover-route.test.ts`.
+ * The base's producers: the loop's own `context` classification and, since the
+ * #684 port (row 7b), the `busy` emitter in `ComposedHandler` — both pinned
+ * end-to-end by the route suite (`proxy-server-role-failover-route.test.ts`,
+ * arms S1-S7). What only THIS file can pin is the module's own surface: the
+ * reader, and the concurrency-refusal classifier both the handler emitter and
+ * the transport 429 ladders consume.
  *
  * The two traps this file exists for are the module's own comments: a reason
  * accepted by the union but missing from the reader's list (silent no-op), and
@@ -17,7 +15,9 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  CONCURRENCY_REFUSAL_SKIP_DETAIL,
   STEP_SKIP_HEADER,
+  classifyConcurrencyRefusal,
   encodeStepSkipHeader,
   readStepSkip,
   stepSkipDisabled,
@@ -61,5 +61,68 @@ describe("#431 wire contract", () => {
     expect(stepSkipDisabled({ CLAUDISH_FAILOVER_STEP_SKIP: "1" })).toBe(false);
     expect(stepSkipDisabled({ CLAUDISH_FAILOVER_STEP_SKIP: "0" })).toBe(true);
     expect(stepSkipDisabled({ CLAUDISH_FAILOVER_STEP_SKIP: " 0 " })).toBe(true);
+  });
+});
+
+describe("#679/#684 — the concurrency-refusal classifier (row 7b)", () => {
+  // z.ai's measured shape: HTTP 429, the CODE is the contract (two wordings,
+  // string and numeric). Every pin here is a discriminator against a real
+  // neighbour signal, not a synthetic negative.
+  const body = (code: unknown, message: string) =>
+    JSON.stringify({ error: { code, message, type: "rate_limit_error" } });
+
+  test("429 + code 1302 classifies, in both measured spellings", () => {
+    expect(
+      classifyConcurrencyRefusal(429, body("1302", "Request concurrency limit exceeded"))
+    ).toBe(true);
+    expect(classifyConcurrencyRefusal(429, body(1302, "concurrency limit reached"))).toBe(true);
+  });
+
+  test("the 1308 USAGE wall never matches — a real quota signal, not a busy slot", () => {
+    // The discriminator that justifies the classifier's existence: same
+    // provider, same status, one code apart, opposite handling (1308 marks
+    // the step; 1302 skips it).
+    expect(
+      classifyConcurrencyRefusal(
+        429,
+        body("1308", "Usage limit reached, resets at 2026-11-05T00:00:00Z")
+      )
+    ).toBe(false);
+    expect(classifyConcurrencyRefusal(429, body(1308, "usage limit"))).toBe(false);
+  });
+
+  test("a 429 without the code — ordinary rate limit or Anthropic account cap — is not a refusal", () => {
+    expect(classifyConcurrencyRefusal(429, body(undefined, "Rate limit exceeded"))).toBe(false);
+    expect(
+      classifyConcurrencyRefusal(
+        429,
+        JSON.stringify({
+          error: {
+            type: "rate_limit_error",
+            message: "Number of requests has exceeded your per-account rate limit",
+          },
+        })
+      )
+    ).toBe(false);
+  });
+
+  test("the status gate: a 1302-shaped body under any other status is not a refusal", () => {
+    expect(classifyConcurrencyRefusal(200, body("1302", "concurrency"))).toBe(false);
+    expect(classifyConcurrencyRefusal(503, body(1302, "concurrency"))).toBe(false);
+  });
+
+  test("unparseable and empty bodies read as no", () => {
+    expect(classifyConcurrencyRefusal(429, "<html>throttled</html>")).toBe(false);
+    expect(classifyConcurrencyRefusal(429, "")).toBe(false);
+  });
+
+  test("the skip detail is stable — the loop's marker greps it", () => {
+    expect(CONCURRENCY_REFUSAL_SKIP_DETAIL).toBe("code=1302");
+  });
+
+  test("the emitter's header round-trips through the reader the loop uses", () => {
+    expect(
+      readStepSkip(withHeader(encodeStepSkipHeader("busy", CONCURRENCY_REFUSAL_SKIP_DETAIL)))
+    ).toEqual({ reason: "busy", detail: "code=1302" });
   });
 });

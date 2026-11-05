@@ -10,6 +10,7 @@ import { credentials } from "../../auth/credentials/authority.js";
 import { terminalCredentialError } from "../../auth/credentials/credential-error.js";
 import { callAbortError, sleepUnlessAborted } from "../../handlers/shared/call-context.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
+import { classifyConcurrencyRefusal } from "../../handlers/shared/step-skip.js";
 import { log } from "../../logger.js";
 import { getProviderByName } from "../provider-definitions.js";
 import { isTerminal429 } from "./openai.js";
@@ -184,6 +185,12 @@ export class AnthropicProviderTransport implements ProviderTransport {
           .catch(() => "");
         if (isTerminal429(bodyText)) {
           log(`[${this.displayName}] 429 is terminal (billing/quota), not retrying`);
+          return response;
+        }
+        // #679: same doctrine as the openai ladder — a 1302 busy slot never
+        // resolves inside one request; the cascade's skip is the only action.
+        if (classifyConcurrencyRefusal(response.status, bodyText)) {
+          log(`[${this.displayName}] 429 is a plan-concurrency refusal (code 1302), not retrying`);
           return response;
         }
         lastResponse = response;

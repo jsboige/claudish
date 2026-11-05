@@ -68,6 +68,10 @@ let wallEndpoints = new Set<string>();
 let errorEndpoints = new Set<string>();
 /** Endpoints refusing the prompt as too large (#431's `context` skip). */
 let overflowEndpoints = new Set<string>();
+/** Endpoints answering the z.ai plan REQUEST-concurrency refusal (#679: 429 + code 1302). */
+let busyEndpoints = new Set<string>();
+/** Endpoints answering the z.ai USAGE wall control (#679: 429 + code 1308 — real quota, not a busy slot). */
+let usageEndpoints = new Set<string>();
 
 const SANDBOX_ENV_KEYS = [
   "ZAI_API_KEY",
@@ -155,6 +159,36 @@ function contextOverflow(): Response {
   );
 }
 
+/** The measured z.ai shape (#679): the CODE is the contract — two wordings,
+ *  one status. The transport's 429 ladder must exit on it WITHOUT retrying. */
+function concurrencyRefusal(): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: "1302",
+        message: "Request concurrency limit exceeded",
+        type: "rate_limit_error",
+      },
+    }),
+    { status: 429, headers: { "content-type": "application/json" } }
+  );
+}
+
+/** The 1308 USAGE wall: same provider, same status, one code apart — a real
+ *  quota signal that must keep FAILING the step (mark), never skip it. */
+function usageWall(): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: "1308",
+        message: "Usage limit reached, resets at 2026-11-05T00:00:00Z",
+        type: "rate_limit_error",
+      },
+    }),
+    { status: 429, headers: { "content-type": "application/json" } }
+  );
+}
+
 const SONNET_NOMINAL = "nom-ep@fake-nom";
 const bucketOfNominal = () => {
   const nb = classifyNominalBucket(SONNET_NOMINAL, () => false);
@@ -192,26 +226,28 @@ async function postMessage(model: string): Promise<Response> {
   });
 }
 
+/** The fake provider shape the tests register (see registerFakeEndpoints). */
+const fakeEp = (name: string) => ({
+  kind: "simple",
+  url: `http://fake.invalid/${name}/v1`,
+  format: "openai",
+  apiKey: "test-key",
+});
+
 /** Register the fake providers through the SAME entry point the proxy uses,
  *  with an explicit config: no file is written, so a crashed run cannot leave
  *  a machine's real `~/.claudish/config.json` overwritten. */
-function registerFakeEndpoints(): void {
-  const ep = (name: string) => ({
-    kind: "simple",
-    url: `http://fake.invalid/${name}/v1`,
-    format: "openai",
-    apiKey: "test-key",
-  });
+function registerFakeEndpoints(
+  endpoints: Record<string, string> = { "nom-ep": "nm", "s0-ep": "s0", "s1-ep": "s1" }
+): void {
+  const customEndpoints: Record<string, ReturnType<typeof fakeEp>> = {};
+  for (const [id, leg] of Object.entries(endpoints)) customEndpoints[id] = fakeEp(leg);
   ensureEndpointsRegistered({
     config: {
       version: "1.0.0",
       defaultProfile: "default",
       profiles: {},
-      customEndpoints: {
-        "nom-ep": ep("nm"),
-        "s0-ep": ep("s0"),
-        "s1-ep": ep("s1"),
-      },
+      customEndpoints,
     } as unknown as ClaudishProfileConfig,
     force: true,
   });
@@ -222,6 +258,8 @@ beforeEach(() => {
   wallEndpoints = new Set(["nm"]);
   errorEndpoints = new Set();
   overflowEndpoints = new Set();
+  busyEndpoints = new Set();
+  usageEndpoints = new Set();
   registerFakeEndpoints();
   for (const k of SANDBOX_ENV_KEYS) {
     savedEnv[k] = process.env[k];
@@ -238,6 +276,8 @@ beforeEach(() => {
     if (errorEndpoints.has(which)) return new Response("upstream exploded", { status: 500 });
     if (wallEndpoints.has(which)) return quotaWall();
     if (overflowEndpoints.has(which)) return contextOverflow();
+    if (busyEndpoints.has(which)) return concurrencyRefusal();
+    if (usageEndpoints.has(which)) return usageWall();
     return healthySSE();
   }) as typeof fetch;
 });
@@ -491,5 +531,85 @@ describe("#431 — a step that cannot TAKE this request is skipped, not failed",
     expect(r1.status).toBe(400); // surfaced, not swallowed into a phantom advance
     expect(calls.s0).toBe(1);
     expect(calls.s1).toBe(0);
+  }, 30_000);
+
+  // ── #679/#684 (row 7b): the `busy` arm, from the handler-side emitter ──────
+  // Same discrimination as S1/S2 but through the second producer: the step's
+  // plan slot is busy, the step itself is healthy.
+
+  test("S4: a 1302 concurrency refusal on an intermediate step skips forward — no mark, and the transport ladder does not retry it", async () => {
+    await spin();
+    armCascade();
+    busyEndpoints = new Set(["s0"]);
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200); // s1 served
+    // ONE fetch, not three: the 1302 early-exits the transport's 429 ladder —
+    // retrying a busy plan slot burns the caller's deadline on a signal only
+    // the cascade can act on (#679).
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(1);
+    expect(JSON.stringify(await r1.json())).toContain("s1-ep@fake-s1");
+
+    // THE PIN: no mark. The skipped step is re-paid — faucet property.
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s0).toBe(2);
+    expect(calls.s1).toBe(2);
+  }, 30_000);
+
+  test("S5: the 1308 USAGE wall is not a busy slot — same status, one code apart, the step IS marked", async () => {
+    await spin();
+    armCascade();
+    usageEndpoints = new Set(["s0"]);
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200); // fail-forward, but as a FAILURE
+    expect(calls.s0).toBe(1);
+
+    // The mark is the difference from S4: the benched step is never re-paid.
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(2);
+  }, 30_000);
+
+  test("S6: the kill switch disarms the busy skip too — one switch for the whole #431 wire", async () => {
+    await spin();
+    armCascade();
+    process.env.CLAUDISH_FAILOVER_STEP_SKIP = "0";
+    busyEndpoints = new Set(["s0"]);
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200);
+    expect(calls.s0).toBe(1);
+
+    // Same shape as S2: the switch restored mark-and-bench.
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(200);
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(2);
+  }, 30_000);
+
+  test("S7: a LAST step's 1302 surfaces to the client - 429 preserved, carrying the skip wire", async () => {
+    // Register RESTRICTED (no s1) BEFORE the spin, or it does not take: the
+    // walk's sibling resolution snapshots the registry at proxy startup, so
+    // re-registering after spin leaves the wider set resolvable (measured:
+    // s1 served anyway). With only the walled nominal and this step in the
+    // snapshot, s0 IS the last step - its refusal is what the client sees.
+    // (Main's #684 K1302d shape; on this base reaching it needs the walk
+    // starved, which is what the restricted registration is for.)
+    registerFakeEndpoints({ "nom-ep": "nm", "s0-ep": "s0" });
+    await spin();
+    armCascade({ CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0" });
+    busyEndpoints = new Set(["s0"]);
+
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(429); // the refusal itself, not a synthetic status
+    expect(calls.s0).toBe(1); // one fetch - the ladder exited immediately
+    expect(calls.s1).toBe(0); // nothing else was reachable to walk to
+    // The emitter's annotation rides to the client unchanged (#229 doctrine):
+    // harmless to a client that ignores it, greppable for one that looks.
+    expect(r1.headers.get("x-claudish-step-skip")).toBe("busy; code=1302");
   }, 30_000);
 });

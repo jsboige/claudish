@@ -175,9 +175,16 @@ import {
   createLegIssuer,
   isSameCredentialSilo,
 } from "./shared/responses-leg-issuer.js";
-// #431: the skip-wire header — read by exactly one consumer (the cascade loop)
-// and set here on the `media` refusal below. Wire contract: shared/step-skip.ts.
-import { STEP_SKIP_HEADER, encodeStepSkipHeader } from "./shared/step-skip.js";
+// #431: the skip-wire header — read by exactly one consumer (the cascade
+// loop) and set here on TWO handler-side emitters: the `media` refusal
+// (#575, row 7a) and the `busy` concurrency refusal (#679/#684, row 7b).
+// Wire contract: shared/step-skip.ts.
+import {
+  CONCURRENCY_REFUSAL_SKIP_DETAIL,
+  STEP_SKIP_HEADER,
+  classifyConcurrencyRefusal,
+  encodeStepSkipHeader,
+} from "./shared/step-skip.js";
 import { sniffResponsesStreamHead } from "./shared/stream-head-sniffer.js";
 import { createAnthropicPassthroughStream } from "./shared/stream-parsers/anthropic-sse.js";
 import { createDevinConnectStream } from "./shared/stream-parsers/devin-connect.js";
@@ -2708,6 +2715,23 @@ export class ComposedHandler implements ModelHandler {
           );
           return out;
         }
+        // #679/#684 (row 7b): a z.ai plan REQUEST-concurrency refusal (429 +
+        // error.code 1302) says this request cannot run NOW — the plan's
+        // concurrency slot frees on its own. The step is healthy, so the
+        // envelope carries the busy skip wire and the cascade loop advances a
+        // non-last step with NO mark (#431); on the last step the header rides
+        // to the client unchanged, harmless (#229). Main converts this to a 529
+        // first and annotates that; this base's non-ok doctrine keeps the
+        // upstream status (see "WHY 503 AND NOT 529" above), so both non-ok
+        // return shapes below are annotated.
+        const concurrencyRefusal = classifyConcurrencyRefusal(response.status, errorText);
+        if (concurrencyRefusal) {
+          log(
+            `[ConcurrencyRefusal] provider=${this.provider.name} model=${this.targetModel} ` +
+              `HTTP ${response.status} ${CONCURRENCY_REFUSAL_SKIP_DETAIL} — plan concurrency busy, not a step failure`,
+            true
+          );
+        }
         // Terminal errors (auth / quota / billing / model-unsupported) won't
         // resolve on retry. Leaving a retryable status (429/5xx) makes Claude
         // Code silently retry, showing only "API error · Retrying · attempt N/10"
@@ -2745,7 +2769,7 @@ export class ComposedHandler implements ModelHandler {
           // Carry the ORIGINAL upstream status as a structured field so
           // machine consumers (probe classification) can tell a remapped
           // auth failure from a genuine 400.
-          return c.json(
+          const terminalOut = c.json(
             wrapAnthropicError(
               400,
               surfaced,
@@ -2759,11 +2783,29 @@ export class ComposedHandler implements ModelHandler {
             400 as any,
             verdictHeaders
           );
+          // A provider-declared terminal 429 plus a 1302 body would be
+          // contradictory, but if one ever arrives the skip signal still rides.
+          if (concurrencyRefusal) {
+            terminalOut.headers.set(
+              STEP_SKIP_HEADER,
+              encodeStepSkipHeader("busy", CONCURRENCY_REFUSAL_SKIP_DETAIL)
+            );
+          }
+          return terminalOut;
         }
-        return c.json(
+        const passOut = c.json(
           ensureAnthropicErrorFormat(response.status, errorBody),
           response.status as any
         );
+        // The 1302 refusal's own route: 429 preserved (a synthetic status
+        // would hide the busy signal Claude Code's own retry understands).
+        if (concurrencyRefusal) {
+          passOut.headers.set(
+            STEP_SKIP_HEADER,
+            encodeStepSkipHeader("busy", CONCURRENCY_REFUSAL_SKIP_DETAIL)
+          );
+        }
+        return passOut;
       }
     }
 
