@@ -302,6 +302,11 @@ services:
       # the upstream sent it (no event/type repair). Empty = repair ON. Read once
       # per stream, i.e. per request.
       - CLAUDISH_FRAME_COHERENCE=${CLAUDISH_FRAME_COHERENCE:-}
+      # Anthropic-compatible wire — "0" forwards Claude Code's `defer_loading`
+      # flags untouched. Empty = flags dropped (every tool visible), because the
+      # tool_reference blocks that would load a deferred tool are stripped on this
+      # wire. Read per request.
+      - CLAUDISH_ANTHROPIC_WIRE_UNDEFER=${CLAUDISH_ANTHROPIC_WIRE_UNDEFER:-}
       # #310 — runtime knobs the proxy reads that were never in this list
       # (same absence class as the #304 failover knobs above: the env file only
       # interpolates, so a value set for a name this list does not carry never

@@ -195,6 +195,66 @@ describe("AnthropicAPIFormat — tool_reference stripping", () => {
   });
 });
 
+// The tool_reference strip above makes a deferred tool impossible to load on this
+// wire. Kimi Coding honors `defer_loading` (probe 05/11: a deferred tool behind a
+// placeholder result → the model re-issues ToolSearch 2/2; same tool undeferred →
+// called directly 2/2), so the flag has to go with the blocks that would lift it.
+describe("AnthropicAPIFormat — defer_loading dropped (tool_reference cannot load it here)", () => {
+  const adapter = new AnthropicAPIFormat("k3", "kimi-coding");
+  const request = {
+    tools: [
+      { name: "Bash", description: "run", input_schema: { type: "object" } },
+      { name: "CronList", description: "list", input_schema: { type: "object" }, defer_loading: true },
+      { name: "mcp__srv__tool", input_schema: { type: "object" }, defer_loading: false, cache_control: { type: "ephemeral" } },
+    ],
+  };
+
+  it("drops defer_loading from every tool and keeps every other field", () => {
+    const prev = process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER;
+    delete process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER;
+    try {
+      const tools = adapter.convertTools(request);
+      expect(tools).toEqual([
+        { name: "Bash", description: "run", input_schema: { type: "object" } },
+        { name: "CronList", description: "list", input_schema: { type: "object" } },
+        { name: "mcp__srv__tool", input_schema: { type: "object" }, cache_control: { type: "ephemeral" } },
+      ]);
+      expect(tools.some((t: any) => "defer_loading" in t)).toBe(false);
+      // The client's request is not mutated (it is logged/captured as received).
+      expect(request.tools[1]).toHaveProperty("defer_loading", true);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER;
+      else process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER = prev;
+    }
+  });
+
+  it("an empty value (compose ${VAR:-}) behaves as unset", () => {
+    const prev = process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER;
+    process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER = "";
+    try {
+      expect(adapter.convertTools(request).some((t: any) => "defer_loading" in t)).toBe(false);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER;
+      else process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER = prev;
+    }
+  });
+
+  it("kill switch CLAUDISH_ANTHROPIC_WIRE_UNDEFER=0 passes the tools through untouched", () => {
+    const prev = process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER;
+    process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER = "0";
+    try {
+      expect(adapter.convertTools(request)).toBe(request.tools);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER;
+      else process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER = prev;
+    }
+  });
+
+  it("a request without tools still yields an empty list", () => {
+    expect(adapter.convertTools({})).toEqual([]);
+  });
+});
+
 describe("AnthropicProviderTransport 429 backoff releases the concurrency slot", () => {
   // Same defect and same fix as OpenAIProviderTransport. It bites harder here:
   // these providers (Z.AI, MiniMax, Kimi) share ONE key across the cluster, so
