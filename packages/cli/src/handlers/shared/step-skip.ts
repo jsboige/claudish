@@ -21,20 +21,21 @@
  * On `main` the header is EMITTED by `ComposedHandler` from three sites
  * (`context` overflow recovery turn, `busy` bounded concurrency 529, `media`
  * per-prompt image cap #575) and the transports carry `classifyConcurrencyRefusal`
- * / `isConcurrencyRefusalResponse` (#679). **`replatform/v14` has none of those
- * emission sites** — no `media-cap`, no concurrency refusal marker, no
- * `providers/transport/quota-wall.ts` (the module those helpers read bodies
- * through) — so this port carries the WIRE CONTRACT and its predicates only.
- * The vocabulary is kept identical to main on purpose: the same header read by
- * the same loop on both branches, so a later port of an emission site needs no
- * second spelling.
+ * / `isConcurrencyRefusalResponse` (#679). `replatform/v14` carries ONE of the
+ * three handler sites — the `media` emitter (#575, `media-cap.ts`, set in
+ * `composed-handler.ts` on the classified 400) — plus the loop-internal
+ * producers below; the concurrency refusal marker and
+ * `providers/transport/quota-wall.ts` remain main-only (row 7b of the port
+ * map). The vocabulary is kept identical to main on purpose: the same header
+ * read by the same loop on both branches, so a later port of an emission site
+ * needs no second spelling.
  *
- * v14's producer today is the loop itself: `handleWithCascade` classifies a
- * step's own error body with `isContextOverflowError` (`request-shape.ts`) —
- * the size-refusal shape, measured as an HTTP 400 whose body names the input
- * and a limit. It writes a `context` skip directly (it would be its own reader
- * otherwise); the header path below is what a handler-side producer will use
- * when v14 gains one, and it is pinned now so the contract cannot rot.
+ * v14's producers today: the loop itself (`handleWithCascade` classifies a
+ * step's own error body with `isContextOverflowError` (`request-shape.ts`) and
+ * writes a `context` skip directly — it would be its own reader otherwise),
+ * the loop-construction sites (`unroutable` #769, `busy` #654), and the
+ * handler-side `media` emitter above — which reaches the loop through the
+ * header path below, the seam this wire contract was pinned for.
  */
 
 export const STEP_SKIP_HEADER = "x-claudish-step-skip";
@@ -44,9 +45,9 @@ export type StepSkipReason = "context" | "busy" | "media" | "unroutable";
 /** Every reason the loop will act on. A producer adding one must extend this
  *  AND `readStepSkip` together — a header the reader drops is a silent no-op.
  *  `unroutable` (#769) is produced on the loop's OWN refusal only — no upstream
- *  ever carries it, so no response-shape skip fires on it. On v14 only
- *  `context` is produced today (see the header note above); the other three are
- *  accepted on the wire so the vocabulary does not fork between branches. */
+ *  ever carries it, so no response-shape skip fires on it. Produced on v14
+ *  today: `context` (loop, #815), `unroutable` (loop construction, #769),
+ *  `busy` (budget gate, #654), `media` (handler emitter, #575). */
 const STEP_SKIP_REASONS: readonly StepSkipReason[] = ["context", "busy", "media", "unroutable"];
 
 export interface StepSkipInfo {

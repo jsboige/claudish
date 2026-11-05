@@ -57,6 +57,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { projectDirNameFor } from "../../mcp-session/home-dir.js";
+import { writeJsonAtomic } from "../../test-support/write-json-atomic.js";
 import { wrapPrompt } from "./repl-wrap.js";
 
 /* ───────────────────────────── argv and env ───────────────────────────── */
@@ -1512,7 +1513,10 @@ function dumpClaudeMode(): void {
       settings = settingsArg;
     }
   }
-  writeFileSync(out, JSON.stringify({ argv, env: { ...env }, cwd, settings }, null, 1));
+  // #831 — atomic: the session/hook suites read this back while it is being written, and
+  // a loaded macOS CI leg caught the in-place write mid-flight (`Unexpected EOF`). Rename
+  // onto the path, so `existsSync` proves the content is complete.
+  writeJsonAtomic(out, { argv, env: { ...env }, cwd, settings }, 1);
 }
 
 async function boot(): Promise<void> {
@@ -1520,9 +1524,12 @@ async function boot(): Promise<void> {
   // `{session}` in the path is replaced by this child's --session-id, so several slots of
   // one run can each leave a probe.
   if (env.FAKE_PROBE_FILE && scenario === "env_probe")
-    writeFileSync(
+    // #831 — the measured failure lived here: a reader passed between create and flush,
+    // read "", and `JSON.parse` died on EOF 416 ms in. Atomic rename removes the window.
+    writeJsonAtomic(
       env.FAKE_PROBE_FILE.replace("{session}", sessionId),
-      JSON.stringify({ env: { ...env }, cwd, argv }, null, 1)
+      { env: { ...env }, cwd, argv },
+      1
     );
   if (agent?.startsWith("zzz")) {
     process.stdout.write(

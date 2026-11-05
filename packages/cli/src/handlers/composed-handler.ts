@@ -142,6 +142,16 @@ import {
   classifyConnectionError,
 } from "./shared/connection-error.js";
 import { sniffDevinStreamHead } from "./shared/devin-stream-head-sniffer.js";
+// #575 (#431 row 7a): the engine's per-prompt image cap — a request-SHAPE
+// incapacity classified from the 400 body and answered as a `media` step-skip.
+// v14 port note: `countMediaBlocks` rides THIS import on v14 (no
+// `context-overflow.ts` estimator to share a walk with; see media-cap.ts tail).
+import {
+  classifyMediaCap,
+  countMediaBlocks,
+  mediaCapRefusalText,
+  mediaCapSkipDetail,
+} from "./shared/media-cap.js";
 import { hasActionableLink, hasModelUnsupportedWording } from "./shared/model-unsupported.js";
 import { filterIdentity } from "./shared/openai-compat.js";
 import { hasPlanLimitWording, isQuotaExhaustionError } from "./shared/quota-exhaustion.js";
@@ -165,6 +175,9 @@ import {
   createLegIssuer,
   isSameCredentialSilo,
 } from "./shared/responses-leg-issuer.js";
+// #431: the skip-wire header — read by exactly one consumer (the cascade loop)
+// and set here on the `media` refusal below. Wire contract: shared/step-skip.ts.
+import { STEP_SKIP_HEADER, encodeStepSkipHeader } from "./shared/step-skip.js";
 import { sniffResponsesStreamHead } from "./shared/stream-head-sniffer.js";
 import { createAnthropicPassthroughStream } from "./shared/stream-parsers/anthropic-sse.js";
 import { createDevinConnectStream } from "./shared/stream-parsers/devin-connect.js";
@@ -2656,6 +2669,45 @@ export class ComposedHandler implements ModelHandler {
         const errorBody: any = parsedErrorBody ?? {
           error: { type: "api_error", message: errorText },
         };
+        // #575 (#431 row 7a) — the vLLM per-prompt image cap ("At most 4
+        // image(s) may be provided in one prompt") is a REQUEST-SHAPE
+        // incapacity, not a step failure: the step is healthy, this prompt's
+        // media count is what it cannot take. Emit the `media` step-skip class
+        // so a non-last step advances with no failure mark, no bench, no arm
+        // (#431), and give the reader an exact label — the generic "Request
+        // format may be incompatible with provider" is what sent the 20/10
+        // diagnosis thread hunting a translation bug.
+        //
+        // The status stays 400: nothing about the prompt's SIZE is wrong, so
+        // the #79 recoverable turn (whose whole job is to advance the context
+        // gauge with an input_tokens at or above the real size) would report a
+        // false cause and make the client compact for no reason.
+        const mediaCap = classifyMediaCap(response.status, errorText);
+        if (mediaCap.matched) {
+          // Counted on the CLAUDE-shaped request, not the adapter-built wire
+          // payload: `source.data` is the Anthropic image spelling (an OpenAI
+          // wire body spells images `image_url.url`), and any correct adapter
+          // carries N blocks as N blocks — the number the engine's cap counted.
+          const carried = countMediaBlocks(claudeRequest);
+          logStderr(
+            `[MediaCap] provider=${this.provider.displayName} model=${this.targetModel} ` +
+              `cap=${mediaCap.max ?? "?"} images=${carried} param=${mediaCap.param ?? "?"} — ` +
+              "request-shape incapacity, not a step failure"
+          );
+          const out = c.json(
+            wrapAnthropicError(
+              400,
+              mediaCapRefusalText(mediaCap.max, carried),
+              "invalid_request_error"
+            ),
+            400 as any
+          );
+          out.headers.set(
+            STEP_SKIP_HEADER,
+            encodeStepSkipHeader("media", mediaCapSkipDetail(mediaCap, carried))
+          );
+          return out;
+        }
         // Terminal errors (auth / quota / billing / model-unsupported) won't
         // resolve on retry. Leaving a retryable status (429/5xx) makes Claude
         // Code silently retry, showing only "API error · Retrying · attempt N/10"
@@ -3822,6 +3874,18 @@ export function getRecoveryHint(
     // any model-unsupported body that happens to spell "tokens".
     if (hasModelUnsupportedWording(errorText)) {
       return "Model not supported by this provider. Verify model name.";
+    }
+    // #575 — the engine's per-prompt image cap. This body names neither a token
+    // nor a context, so it used to fall to "Request format may be incompatible
+    // with provider" and read as a translation bug (20/10 diagnosis thread).
+    // The cap is a request-shape refusal: the step advances (#431), nothing is
+    // wrong with the wiring.
+    const mediaCap = classifyMediaCap(status, errorText);
+    if (mediaCap.matched) {
+      return (
+        `This step accepts ${mediaCap.max !== undefined ? `at most ${mediaCap.max} image(s)` : "a limited number of images"} ` +
+        "per prompt and refused on the media count — a step-skip, not a failure."
+      );
     }
     if (lower.includes("context") || lower.includes("too long") || lower.includes("token")) {
       return "Input too large. Reduce message history or use a larger-context model.";
