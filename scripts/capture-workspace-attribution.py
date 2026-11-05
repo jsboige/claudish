@@ -71,6 +71,57 @@ relative to `1/fraction` (a work tour is hundreds of requests; at the default
 IS the answer); the upper end is what a purely short-session population would
 justify. Dividing by the fraction and calling it an estimate was the first
 draft's error — it inflated a 7-session day to ~978.
+
+`--writes` classifies each tour by what its assistant history WROTE outside the
+repo (enquiry #328 C4 / #445 D3): `pr` (gh pr create/merge, git push),
+`gh-write` (gh comment/close/review), `dash` (a roosync_dashboard append/write/
+update), `dm` (a roosync_messages send/reply/amend — for a coordinator the
+dispatch DM IS the tour's output; inbox reads, mark_read and archiving are not
+writes), else `zero`. Ground rules, each measured on the 2026-10-29 corpus:
+
+⚠ TRAP W1 — HISTORY REPLAY. The same tool_use block rides EVERY later request
+of its session (measured: ~151k tool_use occurrences over 2 077 sampled
+requests). Counting occurrences instead of DISTINCT tool_use ids multiplies a
+single `gh pr create` by the length of the session's tail. Pin:
+`pin_history_replay_dedupes_by_id`.
+
+⚠ TRAP W2 — QUOTED TRANSCRIPTS. A pasted conversation inside a USER message
+carries tool_use-shaped JSON. Only ASSISTANT messages are walked. Pin:
+`pin_quoted_transcript_is_not_a_write`.
+
+⚠ TRAP W3 — THE REHEARSAL. `gh pr merge --dry-run` and `git push --dry-run`
+are measured, real shapes in the corpus, and a compound can hold the rehearsal
+and the real merge back to back — the veto is per SEGMENT (`;` `&&` `||`
+newline), never per whole command. Pin: `pin_dry_run_is_not_a_write`.
+
+⚠ TRAP W4 — TOOLSEARCH IS NOT A WRITE. A ToolSearch input selecting
+`roosync_dashboard` mentions the tool by name; only the dashboard tool itself
+with a write action (`append`/`write`/`update`) writes. Pin:
+`pin_toolsearch_is_not_a_dashboard_write`.
+
+⚠ TRAP W5 — COMPACTION HIDES EARLY WRITES. After a compaction the history
+restarts from a summary: tool_use blocks older than the fold are invisible, so
+a tour sampled only past the fold can read `zero` while having written. A body
+whose first user message carries the continuation marker flags the tour
+`compacted`; flagged tours are reported alongside, never folded silently into
+the zero-write share. Pin: `pin_compaction_flags_the_tour`.
+
+⚠ TRAP W6 — PR-CREATE IDS DO NOT SCALE LIKE REQUESTS. A `gh pr create` id is
+carried by every LATER request of its session, so one stride hit on the tail
+yields the session's whole accumulated id set. The linear `1/fraction` scaling
+that is honest for request volume is NOT an estimator here (measured on the
+2026-10-26..11-01 week: 409 distinct ids counted vs a 1/f figure of ~62k for
+1 576 true creations). `pr_create_counted` is the floor; the scaled figure is
+only an upper reading, and the recall gap to the truth is compaction (W5) plus
+the sessions the stride missed entirely.
+
+⚠ TRAP W7 — THE SUBCOMMAND POSITION, NOT THE WORDS. `git push` is matched at
+the subcommand position with global flags walked over (`git -C <path> push`,
+`git -c credential.helper= -c "..." push`, `gh -R <repo> pr create` — the
+fleet's mandated forms since #4243), where a `\bgit\s+push\b` regex reads
+None. The same walk REFUSES matches inside quoted arguments: `git commit -m
+"then git push"` and `grep "gh pr create" log` carry the words, not the act.
+Pin: `pin_fleet_push_forms_and_quoted_words`.
 """
 
 import argparse
@@ -400,6 +451,275 @@ def aggregate_tours(rows: list[dict], fraction: float | None) -> dict:
     return {"workspaces": out, "no_session": no_session}
 
 
+# ---------------------------------------------------------------------------
+# --writes: per-tour external-write classification (#328 C4 / #445 D3)
+# ---------------------------------------------------------------------------
+
+SEGMENT_SPLIT = re.compile(r";|&&|\|\||\n")
+SHELL_TOKEN_RX = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
+DASH_TOOL = "mcp__roo-state-manager__roosync_dashboard"
+DASH_ACTIONS = {"append", "write", "update"}
+MSGS_TOOL = "mcp__roo-state-manager__roosync_messages"
+# send/reply/amend CREATE or mutate a message — a coordinator's dispatch DM is
+# the tour's deliverable. inbox/mark_read/archive/cleanup are bookkeeping.
+MSGS_WRITE_ACTIONS = {"send", "reply", "amend"}
+COMPACT_RX = re.compile(r"continued from a previous conversation", re.IGNORECASE)
+CLASS_RANK = {"pr": 3, "gh-write": 2, "dash": 1, "dm": 1}
+
+# Global flags (before the subcommand) that take their argument as the NEXT
+# token; every other flag-shaped token is skipped as a single token.
+GIT_FLAG_WITH_ARG = {"-C", "-c", "-S", "--git-dir", "--work-tree", "--namespace"}
+GH_FLAG_WITH_ARG = {"-R", "--repo", "--hostname"}
+GH_WRITE_SUBS = {("pr", "comment"), ("pr", "close"), ("pr", "review"),
+                 ("issue", "comment"), ("issue", "close"), ("issue", "review")}
+
+
+def shell_tokens(seg: str) -> list[str]:
+    """Space-split with quote grouping, quotes KEPT on the tokens — nothing is
+    ever unquoted or executed, and a quoted argument stays one token
+    (`-c "credential.helper=!gh auth git-credential"` never leaks the words
+    `gh` or `git` as standalone tokens)."""
+    return SHELL_TOKEN_RX.findall(seg)
+
+
+def _subcommand(tokens: list[str], prog: str, flags_with_arg: set[str]):
+    """(subcommand, index-after-it) for `prog`, walking OVER global flags —
+    or (None, -1). This is TRAP W7's instrument: the subcommand position is
+    what the fleet's mandated forms exercise (`git -C <path> push`, `gh -R
+    <repo> pr create`) and what quoted arguments cannot fake."""
+    try:
+        i = tokens.index(prog)
+    except ValueError:
+        return None, -1
+    i += 1
+    while i < len(tokens):
+        t = tokens[i]
+        if t.startswith("-"):
+            i += 2 if t in flags_with_arg else 1
+            continue
+        return t, i + 1
+    return None, -1
+
+
+def classify_tool_use(name, inp) -> tuple[str | None, bool]:
+    """(write class, is_pr_create) of one tool_use — or (None, False).
+
+    Classes per the enquiry: `pr` = gh pr create/merge or git push; `gh-write`
+    = gh (pr|issue) comment/close/review; `dash` = the dashboard MCP tool with
+    a write action; `dm` = a RooSync message send/reply/amend. A ToolSearch
+    that merely NAMES a tool has a `query` input, not a `command` one, and a
+    read action on the dashboard tool is not a write — both fall to None by
+    shape, not by denylist. The `--dry-run` veto is per SEGMENT: the corpus
+    holds a rehearsal and the real merge in ONE compound command (TRAP W3).
+    """
+    if name == DASH_TOOL and isinstance(inp, dict) \
+            and str(inp.get("action") or "").lower() in DASH_ACTIONS:
+        return "dash", False
+    if name == MSGS_TOOL and isinstance(inp, dict) \
+            and str(inp.get("action") or "").lower() in MSGS_WRITE_ACTIONS:
+        return "dm", False
+    cmd = inp.get("command") if isinstance(inp, dict) else None
+    if not isinstance(cmd, str):
+        return None, False
+    hit_pr = hit_gh = pr_create = False
+    for seg in SEGMENT_SPLIT.split(cmd):
+        if "--dry-run" in seg:
+            continue
+        toks = shell_tokens(seg)
+        if _subcommand(toks, "git", GIT_FLAG_WITH_ARG)[0] == "push":
+            hit_pr = True
+        gh_sub, after = _subcommand(toks, "gh", GH_FLAG_WITH_ARG)
+        if gh_sub in ("pr", "issue"):
+            act = toks[after] if 0 <= after < len(toks) else None
+            if gh_sub == "pr" and act in ("create", "merge"):
+                hit_pr = True
+                pr_create = pr_create or act == "create"
+            elif (gh_sub, act) in GH_WRITE_SUBS:
+                hit_gh = True
+    if hit_pr:
+        return "pr", pr_create
+    if hit_gh:
+        return "gh-write", False
+    return None, False
+
+
+def assistant_tool_uses(payload: dict) -> list[tuple]:
+    """(id, name, input) of every tool_use in ASSISTANT messages.
+
+    USER messages are skipped on purpose: a pasted transcript quotes
+    tool_use-shaped JSON (TRAP W2) and must not write anything.
+    """
+    out: list[tuple] = []
+    for msg in payload.get("messages") or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                out.append((blk.get("id"), blk.get("name"), blk.get("input") or {}))
+    return out
+
+
+def compaction_flagged(payload: dict) -> bool:
+    """True when the history starts with a continuation (post-compaction) summary.
+
+    The first user message of a compacted session names the fold; tool_use
+    older than the fold is invisible from there on (TRAP W5).
+    """
+    for msg in payload.get("messages") or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            c = msg.get("content")
+            text = c if isinstance(c, str) else ""
+            if isinstance(c, list):
+                text = " ".join(b.get("text", "") for b in c
+                                if isinstance(b, dict) and isinstance(b.get("text"), str))
+            return bool(COMPACT_RX.search(text))
+    return False
+
+
+def read_write_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict]:
+    """One row per sampled request: workspace, session, compacted, tool uses.
+
+    No response pairing: the write classes read the request history alone, so
+    only `req-*` members are extracted.
+    """
+    path = archive_for(day, dirs)
+    if not path or not names:
+        return []
+    import py7zr
+
+    with py7zr.SevenZipFile(path) as z:
+        available = {os.path.basename(n): n for n in z.getnames()}
+        targets = [available[n] for n in names if n in available]
+        if not targets:
+            return []
+        z.extract(targets=targets, path=scratch)
+
+    on_disk: dict[str, str] = {}
+    for root, _dirs, files in os.walk(scratch):
+        for fn in files:
+            on_disk.setdefault(fn, os.path.join(root, fn))
+
+    rows: list[dict] = []
+    for name in names:
+        base = os.path.basename(name)
+        fp = on_disk.pop(base, None)
+        if not fp or not os.path.isfile(fp):
+            continue
+        with open(fp, "rb") as f:
+            raw = f.read()
+        os.remove(fp)
+        try:
+            env = json.loads(raw)
+        except ValueError:
+            env = None
+        payload = env.get("body") if isinstance(env, dict) and isinstance(env.get("body"), dict) else env
+        if not isinstance(payload, dict):
+            continue
+        uses = [(uid, nm) + classify_tool_use(nm, inp)
+                for uid, nm, inp in assistant_tool_uses(payload)]
+        rows.append({"day": day, "ws": workspace_key(raw)[0], "session": session_key(raw),
+                     "compacted": compaction_flagged(payload), "uses": uses})
+    for p in list(on_disk.values()):
+        if os.path.isfile(p):
+            os.remove(p)
+    return rows
+
+
+def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
+    """Rows -> per-workspace week table + per-day detail (AC1 shape).
+
+    A TOUR is a distinct session id seen on a day (same unit as --tours); its
+    class is the strongest class among its DISTINCT tool_use ids (pr >
+    gh-write > dash ≈ dm > zero). Tours whose session id is None never enter the
+    class table but keep a `no_session` count. PR creations are counted as
+    DISTINCT ids carrying a `gh pr create` segment, scaled by the fraction of
+    their FIRST-SEEN day (history replay shows the same id on later days —
+    counting it per day would multiply one creation by the tail).
+    """
+    ndays = len({r["day"] for r in rows}) or 1
+    # tour index: (day, ws, session) -> {ids: {id: cls}, compacted, pr_create_ids}
+    tours: dict[tuple, dict] = {}
+    no_session = 0
+    for r in rows:
+        if not r["session"]:
+            no_session += 1
+            continue
+        t = tours.setdefault((r["day"], r["ws"], r["session"]),
+                             {"ids": {}, "compacted": False, "reqs": 0})
+        t["reqs"] += 1
+        t["compacted"] = t["compacted"] or r["compacted"]
+        for uid, _nm, cls, pr_create in r["uses"]:
+            cur = t["ids"].get(uid)
+            if cur is None or (cls is not None and CLASS_RANK[cls] > CLASS_RANK[cur]):
+                t["ids"][uid] = cls
+            if pr_create:
+                t.setdefault("creates", set()).add(uid)
+    # first-seen day of each pr-create id, per ws
+    first_seen: dict[tuple[str, str], tuple[str, str]] = {}   # (ws,id) -> (day, session)
+    for (day, ws, sess), t in tours.items():
+        for uid in t.get("creates", ()):
+            k = (ws, uid)
+            if k not in first_seen or day < first_seen[k][0]:
+                first_seen[k] = (day, sess)
+    per_ws: dict[str, dict] = {}
+    for (day, ws, sess), t in tours.items():
+        w = per_ws.setdefault(ws, {"tours": 0, "zero": 0, "compacted": 0, "reqs": 0,
+                                   "reqs_zero": 0, "cls": collections.Counter(),
+                                   "create_ids": set(), "create_first_day": {}})
+        w["tours"] += 1
+        w["reqs"] += t["reqs"]
+        cls = max((c for c in t["ids"].values() if c), key=lambda c: CLASS_RANK[c], default=None)
+        if cls:
+            w["cls"][cls] += 1
+        else:
+            w["zero"] += 1
+            w["reqs_zero"] += t["reqs"]
+        if t["compacted"]:
+            w["compacted"] += 1
+        for uid in t.get("creates", ()):
+            w["create_ids"].add(uid)
+            d, _s = first_seen[(ws, uid)]
+            w["create_first_day"][uid] = d
+    out_ws = {}
+    rows_per_day = collections.Counter(r["day"] for r in rows)
+    for ws, w in per_ws.items():
+        # scaled requests: each sampled request stands for 1/fraction of its day
+        est_reqs = est_zero = 0.0
+        for (day, _ws2, sess), t in tours.items():
+            if _ws2 != ws:
+                continue
+            frac = rows_per_day[day] / max(totals_by_day.get(day, 1), 1)
+            scale = 1 / frac if frac > 0 else 0.0
+            est_reqs += t["reqs"] * scale
+            if not any(c for c in t["ids"].values()):
+                est_zero += t["reqs"] * scale
+        pr_scaled = 0.0
+        for uid, day in w["create_first_day"].items():
+            frac = rows_per_day[day] / max(totals_by_day.get(day, 1), 1)
+            pr_scaled += (1 / frac) if frac > 0 else 0.0
+        out_ws[ws] = {
+            "tours": w["tours"], "tours_per_day": round(w["tours"] / ndays, 1),
+            "pct_zero": round(100 * w["zero"] / w["tours"], 1) if w["tours"] else None,
+            "pct_compacted": round(100 * w["compacted"] / w["tours"], 1) if w["tours"] else None,
+            "classes": dict(w["cls"]),
+            "reqs_est_per_day": round(est_reqs / ndays),
+            "reqs_zero_est_per_day": round(est_zero / ndays),
+            "pr_create_counted": len(w["create_ids"]),
+            "pr_create_scaled": round(pr_scaled, 1),
+        }
+    per_day_detail: dict[str, dict] = collections.defaultdict(lambda: {"tours": 0, "zero": 0})
+    for (day, ws, sess), t in tours.items():
+        d = per_day_detail[f"{day}|{ws}"]
+        d["tours"] += 1
+        if not any(c for c in t["ids"].values()):
+            d["zero"] += 1
+    return {"ndays": ndays, "no_session": no_session, "workspaces": out_ws,
+            "per_day": dict(per_day_detail)}
+
+
 def load_census(path: str) -> dict[str, int]:
     """{day: responses} from a jsonl of {"day","resp"} rows."""
     census: dict[str, int] = {}
@@ -432,6 +752,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sample", type=int, default=400, help="request bodies per period (default 400)")
     ap.add_argument("--tours", action="store_true",
                     help="tour-level series: per day x workspace (tours, in_tokens, out_tokens)")
+    ap.add_argument("--writes", action="store_true",
+                    help="per-tour external-write classes (#328 C4): pr / gh-write / dash / zero")
     ap.add_argument("--archives-dir", action="append", default=None)
     ap.add_argument("--census", help="jsonl of {day, resp} to scale counts into responses/day")
     ap.add_argument("--json", help="write the full result here")
@@ -449,7 +771,9 @@ def main(argv=None) -> int:
     elif args.start:
         s = date.fromisoformat(args.start)
         e = date.fromisoformat(args.end or args.start)
-        periods_list = periods(s, e, weekly=s.weekday() == 0)
+        # --writes needs per-DAY rows (its table is per lane x day); a Monday
+        # start would otherwise fold the whole span into one weekly period.
+        periods_list = periods(s, e, weekly=s.weekday() == 0 and not args.writes)
     else:
         ap.error("one of --day / --week / --from is required")
 
@@ -461,6 +785,24 @@ def main(argv=None) -> int:
     for days in periods_list:
         label = days[0]
         picked, missing, totals = sample_period(days, dirs, args.sample)
+        if args.writes:
+            rows = []
+            for day, names in picked.items():
+                rows.extend(read_write_rows(day, names, dirs, scratch))
+            agg = aggregate_writes(rows, totals)
+            results[label] = {"period": label, "days": days, "sampled": len(rows),
+                              "req_total": sum(totals.values()), "missing_days": missing, **agg}
+            print(f"{label}  sampled={len(rows)}/{sum(totals.values())}"
+                  f"  no_session={agg['no_session']}"
+                  + (f"  missing={','.join(missing)}" if missing else ""), flush=True)
+            for k, v in sorted(agg["workspaces"].items(), key=lambda kv: -kv[1]["tours"])[:12]:
+                print(f"    {k:<24} tours={v['tours']:>4} ({v['tours_per_day']}/d)"
+                      f"  zero={v['pct_zero']}%  compacted={v['pct_compacted']}%"
+                      f"  {v['classes']}  reqs/d~{v['reqs_est_per_day']}"
+                      f" (zero {v['reqs_zero_est_per_day']})"
+                      f"  pr_create={v['pr_create_counted']} (scaled {v['pr_create_scaled']})",
+                      flush=True)
+            continue
         if args.tours:
             rows: list[dict] = []
             for day, names in picked.items():
@@ -514,6 +856,14 @@ def main(argv=None) -> int:
         print(f"\nwrote {args.json}")
     if not args.census:
         print("\nNOTE: counts are raw samples; pass --census to scale them to responses/day.")
+    if args.writes:
+        print("NOTE: class of a tour = strongest class among its DISTINCT tool_use ids; "
+              "`--dry-run` is vetoed per command segment; a `compacted` flag marks tours whose "
+              "history starts past a compaction fold — early writes are invisible there, so the "
+              "zero-write share reads as an upper bound for them.")
+        print("NOTE: pr_create `scaled` divides by the request fraction, which history-carried "
+              "ids do NOT obey (TRAP W6) — treat `pr_create_counted` as the floor and the scaled "
+              "figure as an upper reading only.")
     if args.tours:
         print("NOTE: `tours` = distinct session ids in the SAMPLE (the floor); the true count sits"
               " in `tours .. tours_hi` — long sessions make the floor tight, a naive division"
