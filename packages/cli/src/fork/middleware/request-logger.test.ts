@@ -89,18 +89,31 @@ describe("request-logger capture (fork)", () => {
   // visible in the directory while the fire-and-forget write is still a JSON
   // prefix. waitForCapture must not hand that prefix to JSON.parse — it did
   // before this pin (existence-only), which is what fell the macOS leg.
+  //
+  // Contained on purpose (CR #859): the pin writes into its OWN directory, never
+  // `capDir`, and the delayed write's timer is cleared in a `finally`. Under the
+  // existence-only mutation this test fails fast — uncontained, its 100 ms timer
+  // then fired after `afterEach` had dropped `capDir`, and whichever test was
+  // running at +100 ms took the blame for the pin's own write.
   it("waitForCapture refuses a half-written capture, then settles when the writer finishes (#831 class)", async () => {
-    mkdirSync(capDir, { recursive: true });
-    const partial = join(capDir, "req-1-0001-2026-11-04T00-00-00-000Z-test.json");
+    const pinDir = join(tmpdir(), `claudish-capture-pin-${process.pid}-${Date.now()}`);
+    mkdirSync(pinDir, { recursive: true });
+    const partial = join(pinDir, "req-1-0001-2026-11-04T00-00-00-000Z-test.json");
     writeFileSync(partial, '{"ts":"2026-11-04T00:00:00.000Z","src":"test"');
-    const settled = waitForCapture(capDir, 5000);
-    setTimeout(() => {
-      writeFileSync(partial, '{"ts":"2026-11-04T00:00:00.000Z","src":"test","machine":"myia-test"}');
-    }, 100);
-    const file = await settled;
-    expect(file).toBe(partial);
-    const json = JSON.parse(readFileSync(file!, "utf8"));
-    expect(json.machine).toBe("myia-test");
+    let writer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = waitForCapture(pinDir, 5000);
+      writer = setTimeout(() => {
+        writeFileSync(partial, '{"ts":"2026-11-04T00:00:00.000Z","src":"test","machine":"myia-test"}');
+      }, 100);
+      const file = await settled;
+      expect(file).toBe(partial);
+      const json = JSON.parse(readFileSync(file!, "utf8"));
+      expect(json.machine).toBe("myia-test");
+    } finally {
+      if (writer !== undefined) clearTimeout(writer);
+      rmSync(pinDir, { recursive: true, force: true });
+    }
   });
 
   // #41 — the workspace half of the attribution chain. `machine` alone let a
