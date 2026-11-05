@@ -216,9 +216,15 @@ def test_non_versioned_sibling_directories_are_not_scanned():
 # --------------------------------------------------------------------------
 
 def test_fresh_snapshot_is_not_flagged_stale():
-    """Inside the window: no staleness flag (the reading is usable as today's)."""
+    """Inside the window: no staleness flag (the reading is usable as today's).
+
+    Dated relative to NOW: a literal date here was a time bomb (31/10 23:50Z went
+    red past 02/11 23:50Z, the 48 h window, measured 05/11)."""
+    fresh = (smx.dt.datetime.now(smx.dt.timezone.utc) - smx.dt.timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z"
+    )
     with tempfile.TemporaryDirectory() as root:
-        _versioned(root, "v1-fresh", _snapshot("2026-10-31T23:50:25.255Z"))
+        _versioned(root, "v1-fresh", _snapshot(fresh))
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, "--stale-hours", "48", MACHINE],
             capture_output=True, text=True,
