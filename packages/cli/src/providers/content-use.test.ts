@@ -76,13 +76,20 @@ function sources(root: string): string[] {
   });
 }
 
+/** Repo-relative path with POSIX separators: the allowlists below are written
+ *  with `/`, and `relative()` yields `\` on Windows — without this, every
+ *  approved reader fails the G1 aggregators gate on a Windows checkout. */
+function posixRelative(root: string, path: string): string {
+  return relative(root, path).replace(/\\/g, "/");
+}
+
 test("G1: content-use.ts owns the sole contributor suffix regex", () => {
   const root = fileURLToPath(new URL("./", import.meta.url));
   const occurrences = sources(root).flatMap((path) => {
     const text = readFileSync(path, "utf8");
     return [...text.matchAll(/\/(?:\\.|[^/\r\n])+\/[dgimsuvy]*/g)]
       .filter((match) => match[0].includes("contributor") && match[0].includes("$"))
-      .map(() => relative(root, path));
+      .map(() => posixRelative(root, path));
   });
   expect(occurrences).toEqual(["content-use.ts"]);
 });
@@ -112,9 +119,9 @@ test("G1: aggregators readers require architecture review", () => {
         .replace(/^\s*\/\/.*$/gm, "");
       return (
         /\.aggregators\b|\[\s*["\']aggregators["\']\s*\]/.test(text) &&
-        !approved.has(relative(root, path))
+        !approved.has(posixRelative(root, path))
       );
     })
-    .map((path) => relative(root, path));
+    .map((path) => posixRelative(root, path));
   expect(unexpected).toEqual([]);
 });

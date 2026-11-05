@@ -150,6 +150,74 @@ prints the two billing notices, and returns the kept candidates (`toRoutePlan`).
 config TUI and the team grid render `explainRoute`, and `describeRouteExplanation` words its
 origin in one line for all three.
 
+## A role's `modelMap` entry picks the LANE, and on the native lane also the VERSION (#218)
+
+`modelMap` (`opus`/`sonnet`/`haiku`; this base has no `fable` slot, and the `subagent` slot is
+not a request keyword) has always answered "which model serves this role". What it did NOT do
+was survive the native passthrough: a request for the bare keyword `opus` reached
+`NativeHandler` with `body.model = "opus"`-class id, and Claude Code's own auth answered with
+whatever the client sent. Measured on main over 48h: the map read `claude-opus-4-8` while
+6 487 native responses served `claude-opus-5`. The configured pin was decorative.
+
+`resolveNativeModelPin` (`proxy-server.ts`) makes it real, under four conditions, ALL required:
+
+1. kill switch: `CLAUDISH_NATIVE_MODEL_PIN` is not the string `"0"` (re-read per request — the
+   fleet flips it without restarting the proxy keeping everyone working; any other value,
+   including unset, keeps the pin armed);
+2. the requested model is bare — no `@`, no `/`;
+3. a role keyword maps to a target, and the target differs from the requested name;
+4. **the target `startsWith("claude-")`** — this guard is load-bearing and is NOT "the name is
+   bare". Bare and native are different predicates: `sonnet: "glm-5.3"` is a perfectly legal
+   bare modelMap entry whose target is not an Anthropic id, and pinning it would send a z.ai
+   wire id to `api.anthropic.com`. A non-Claude target means "this role is not served natively"
+   and the pin refuses, leaving the passthrough untouched.
+
+Two call sites, both required:
+
+- **the cascade loop** (`serveModel`), applied only when `resolvedHandler instanceof NativeHandler`,
+  after the budget decision and before `handler.handle(c, body)`. Placed in the loop and not in
+  the route so the pin is a per-attempt property: `body.model` is restored when the attempt
+  comes back `!response.ok`, which is what lets a later hop (ComposedHandler's) keep the
+  original id for its own telemetry.
+- **`count_tokens`' native branch**, before the fetch. Counting against a different model than
+  the one that answers makes the client's own context accounting drift, and Claude Code budgets
+  its context from exactly that number.
+
+Because the pin mutates the shared `body`, every read of `body.model` for logging or telemetry
+must happen where it already does: before the mutation. A new read added after it reports the
+pinned id as if the client had asked for it.
+
+### #219 — the version above is resolved, not hand-edited
+
+`modelMap.opus` is a hand-maintained string, and Opus 5.5 shipped with a same-day manual edit.
+`providers/native-pin-auto.ts` watches the hosted catalog instead (this base has no Anthropic
+credential to ask `/v1/models`, but it consumes the slim catalog whose `aggregators[]` carry
+corroborated `sourceProviderId: "anthropic"` rows). Two modes behind one gate
+(`CLAUDISH_NATIVE_PIN_AUTO`, re-read every check):
+
+- **unset / `"off"` (default)** — detect and log a greppable `[NativePin] newer anthropic <family>
+  available` line, deduped per (family, newest). Changes nothing.
+- **`"on"`** — adopt: `applyNativePinOverride` re-points that family wherever the pin resolves.
+  Overrides are family-scoped (`applyNativePinOverride`), so an opus adoption never re-points a
+  sonnet pin.
+
+The watch (`startNativePinAutoWatch`, wired in `fork/server/standalone-proxy.ts`, never in the
+proxy core) ticks every 6h after a 30s first delay that rides the startup catalog warm
+(`ensureCatalogReady` — no second fetch), and is `.unref()`ed so it never holds the process up.
+Overridable with `CLAUDISH_NATIVE_PIN_AUTO_INTERVAL_MS`. A catalog failure **keeps the
+configured value**: never un-pins, never guesses. Two traps the selector encodes:
+
+- **dots vs dashes.** The catalog writes `anthropic/claude-opus-5.5`; the Anthropic API wants
+  `claude-opus-5-5`. A naive strip-the-vendor copy pins an id Anthropic rejects — a fleet-wide
+  outage caused by the updater itself (`normalizeAnthropicModelId`).
+- **numeric, not lexicographic.** `4.10 > 4.8` as numbers, `"4-10" < "4-8"` as strings
+  (`compareClaudeFamilyVersions`). And the decoys never parse: `~…-latest` aliases, `:batch`
+  variants, and uncorroborated ids are excluded by construction, because pinning a floating
+  alias 404s on a dateless id.
+
+Once adopted, an override survives a later catalog failure on purpose: reverting to the older
+configured id would be an un-pin.
+
 ## Where a bare name's chain comes from
 
 **There is no built-in routing table.** `providers/default-routing-rules.ts` — 24 hand-written

@@ -61,6 +61,7 @@ if (hostIdx !== -1 && args[hostIdx + 1]) {
 }
 
 import { getRunModelMapping, loadConfig } from "../../profile-config.js";
+import { startNativePinAutoWatch } from "../../providers/native-pin-auto.js";
 import { createProxyServer } from "../../proxy-server.js";
 // v14 seam (D2 doctrine — adopt upstream's mechanism): the fork's
 // `deferSignalExitToHost()` (stats-buffer) and upstream's `claimSignalExit()`
@@ -70,10 +71,13 @@ import { createProxyServer } from "../../proxy-server.js";
 import { claimSignalExit } from "../../signal-owner.js";
 import { type RelayState, createRelayState, startUpstreamProber } from "./relay.js";
 import { emitShutdownDieLine } from "./shutdown-die-log.js";
-// #641 G10 (not yet attached): `startNativePinAutoWatch` re-attaches here when
-// the routing/adapters grain lands — it pulls the fork's catalog-resolver
-// stack (DiskCacheV2 + SlimModelEntry.sources), which upstream has since
-// redesigned (DiskCacheV3), so it ports with that grain, not with the shell.
+// #641 G10 / row 3 (#219): the watch attaches HERE. The earlier note deferred it
+// with the routing/adapters grain because the fork's catalog-resolver stack
+// (DiskCacheV2 + SlimModelEntry.sources) was absent; that blocker is gone on
+// this base — `providers/catalog-client.ts` is v3 and exports the three
+// accessors `native-pin-auto.ts` needs (`ensureCatalogReady`, `refreshCatalog`,
+// `getCatalogEntries`), which is why the module ports with an adapter instead
+// of a second resolver stack.
 
 // Role remapping from the active profile (2026-06-25). Without a modelMap, a
 // client that sends a literal Anthropic role name — e.g. `claude-sonnet-4-6`
@@ -131,6 +135,12 @@ console.log("[claudish-proxy] Press Ctrl+C to stop");
 // mid-body, which each client reports as `Connection lost mid-response`.
 claimSignalExit();
 
+// #219 (row 3): periodic native-pin check against the hosted catalog. Default
+// mode (CLAUDISH_NATIVE_PIN_AUTO unset) only logs when a newer Anthropic family
+// member appears — the pin itself stays the configured value until an operator
+// opts in with =on.
+const stopNativePinWatch = startNativePinAutoWatch(modelMap);
+
 let shuttingDown = false;
 
 /**
@@ -155,6 +165,7 @@ const gracefulExit = async (signal: string): Promise<void> => {
     `\n[claudish-proxy] ${signal} — letting in-flight responses finish (send again to exit now)...`
   );
   stopProber?.();
+  stopNativePinWatch();
   await server.shutdown();
   emitShutdownDieLine("graceful", server.getActiveStreams());
   process.exit(0);
