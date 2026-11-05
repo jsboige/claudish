@@ -154,6 +154,7 @@ import {
   getCustomEndpointResult,
 } from "./providers/endpoint-registration.js";
 import { parseModelSpec } from "./providers/model-parser.js";
+import { applyNativePinOverride } from "./providers/native-pin-auto.js";
 import { proxyRouteDecision } from "./providers/native-route.js";
 import { describeMissingCredential, getProviderByName } from "./providers/provider-definitions.js";
 import {
@@ -384,6 +385,77 @@ function maybeCaptureClassifierRequest(c: Context, body: any): void {
  */
 export function isNativeTarget(target: string): boolean {
   return !target.includes("/") && !target.includes("@");
+}
+
+/** The v14 role set: opus / sonnet / haiku. Main carries a fourth (`fable`);
+ *  this base's `modelMap` has no such slot (its options type reads
+ *  opus/sonnet/haiku/subagent, and `subagent` is not a request keyword — it
+ *  never names a model). Mirrors the substring tier match the serving
+ *  resolution applies at `resolveHandlerForRequest` and `resolveNominalTarget`,
+ *  which is also why a role keyword anywhere in the name counts. */
+function resolveRoleMappedTarget(
+  requestedModel: string,
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string }
+): string | undefined {
+  if (!modelMap) return undefined;
+  const requested = requestedModel.toLowerCase();
+  if (requested.includes("opus")) return modelMap.opus;
+  if (requested.includes("sonnet")) return modelMap.sonnet;
+  if (requested.includes("haiku")) return modelMap.haiku;
+  return undefined;
+}
+
+/**
+ * Native-lane version pin (#218, Epic #641 row 3): which Anthropic model id
+ * the body must carry.
+ *
+ * The role mapping decides the LANE (native vs a budget provider); on the
+ * native lane it historically decided nothing else, because `NativeHandler`
+ * forwards `payload.model` verbatim and the resolved target never reached the
+ * wire. A `modelMap.opus` naming a specific Anthropic version was therefore a
+ * no-op on the version axis — measured on main 2026-09-22: the map read
+ * `claude-opus-4-8` for weeks while 6 487 consecutive native responses in 48 h
+ * were served as `claude-opus-5`, the id the clients named. That is the natural
+ * experiment; the entry classified the lane and pinned nothing.
+ *
+ * This function closes that gap, so `modelMap.opus` means what it reads like:
+ * every request the fleet routes to the native lane for a role is served by the
+ * version the hub configures, without touching any client's own config.
+ *
+ * Deliberately narrow — it returns a pin ONLY when all of these hold:
+ *  - the role resolves to a mapped target (otherwise there is nothing to pin);
+ *  - that target differs from what the client asked for (never rewrite a no-op);
+ *  - the target is an ANTHROPIC id (`claude-*`). Bare and native are NOT the same
+ *    predicate, and conflating them is how this would misfire: the hub's own
+ *    `sonnet: "glm-5.3"` is bare too, and is saved today only by resolving to a
+ *    remote handler. Drop `glm-5.3` from the routing table and `isNative`
+ *    (`!includes("/") && !includes("@")`) calls it native — at which point a pin
+ *    without this guard would put `glm-5.3` on the Anthropic wire. Plain
+ *    passthrough would have sent a real Claude id, so a loose guard here is
+ *    strictly worse than no pin at all. Every native-lane model is `claude-*`;
+ *  - the REQUESTED model is bare too, so an explicit `zai@claude-opus-5` — a
+ *    deliberate provider route that merely contains a role keyword — is left alone.
+ *
+ * #219: an adopted catalog override (`CLAUDISH_NATIVE_PIN_AUTO=on`) replaces the
+ * version within the same family — inert (byte-identical pass-through) unless the
+ * watch resolved and adopted a newer id.
+ *
+ * Kill switch `CLAUDISH_NATIVE_MODEL_PIN=0` restores the pre-pin passthrough. It
+ * is read per request, on purpose: the same rationale as the thinking flags — the
+ * fleet must be able to flip it without restarting the proxy that is at that
+ * moment keeping everyone working.
+ */
+export function resolveNativeModelPin(
+  requestedModel: string,
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string },
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  if (env.CLAUDISH_NATIVE_MODEL_PIN === "0") return undefined;
+  if (requestedModel.includes("@") || requestedModel.includes("/")) return undefined;
+  const roleTarget = resolveRoleMappedTarget(requestedModel, modelMap);
+  if (!roleTarget || roleTarget === requestedModel) return undefined;
+  if (!roleTarget.startsWith("claude-")) return undefined;
+  return applyNativePinOverride(roleTarget);
 }
 
 export async function createProxyServer(
@@ -1656,11 +1728,33 @@ export async function createProxyServer(
       } else {
         if (servingNote) appendSystemNote(body, servingNote);
         if (budgetDecision) releaseBudget = budgetDecision.commit();
+        // Row 3 (#218) — the native-lane version pin. Applied HERE, not at the
+        // route, for main's own reason: only the attempt that actually lands on
+        // NativeHandler may carry a pinned bare Anthropic id, and every later
+        // cascade attempt is a budget provider that must see the body
+        // untouched. `resolvedHandler` is the UNWRAPPED handler — the wrappers
+        // (withAdvisor/withRequestHooks) hide `instanceof`, the same doctrine as
+        // the keyless check above. Restored on a failed attempt so the mutation
+        // cannot outlive it (a ComposedHandler later in the chain reads
+        // payload.model for its `originalModel` telemetry).
+        const pinnedModel =
+          resolvedHandler instanceof NativeHandler
+            ? resolveNativeModelPin(body.model, modelMap)
+            : undefined;
+        const modelBeforePin = body.model;
+        if (pinnedModel) {
+          log(
+            `[Proxy] native pin: '${modelBeforePin}' → '${pinnedModel}' (modelMap role target)`,
+            true
+          );
+          body.model = pinnedModel;
+        }
         // #317: FRESH attempt token per paid upstream attempt — the usage sink
         // keys its max-ledger on it (two paid attempts of one request must
         // land in two slots). No-op when both bars are off.
         openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
         response = await handler.handle(c, body);
+        if (pinnedModel && !response.ok) body.model = modelBeforePin;
         if (servingNote && !response.ok) body.system = systemBeforeNote;
       }
       if (releaseBudget && response) {
@@ -2477,6 +2571,11 @@ export async function createProxyServer(
 
       // If native, we just forward. OpenRouter needs estimation.
       if (handler instanceof NativeHandler) {
+        // Row 3 (#218): counting against a different model than the one that
+        // answers makes the client's own context accounting drift — the same
+        // pin as the serving loop, applied to the body sent upstream.
+        const pinnedModel = resolveNativeModelPin(body.model, modelMap);
+        if (pinnedModel) body.model = pinnedModel;
         const headers: any = { "Content-Type": "application/json" };
         if (anthropicApiKey) headers["x-api-key"] = anthropicApiKey;
 
