@@ -355,6 +355,64 @@ def pin_dm_send_is_a_write():
            % agg["workspaces"]["claudish"]["classes"])
 
 
+def pin_cron_stamp_is_per_request_and_header_confined():
+    # post-#98: the capture ENVELOPE's workload decides, and it decides for
+    # BOTH values — a header saying cron must not override "interactive".
+    _check(wsattr.cron_flagged({"workload": "cron"}, {}) is True,
+           "an envelope workload=cron is a fire")
+    _check(wsattr.cron_flagged({"workload": "interactive"},
+                               {"system": "cc_workload=cron"}) is False,
+           "the envelope arbitrates; a stray header never overrides it")
+    # pre-#98 fallback: the billing header inside `system`
+    _check(wsattr.cron_flagged({}, {"system": [{"type": "text",
+                                               "text": "x-anthropic-billing-header: cc_workload=cron;"
+                                                       " cc_entrypoint=cli"}]}) is True,
+           "the pre-#98 header in system[0] stamps the request")
+    _check(wsattr.cron_flagged({}, {"system": "cc_workload=cron"}) is True,
+           "system as a bare string is read too")
+    # CONFINEMENT: a transcript pasted in `messages` quotes the marker and must
+    # not stamp the request (the W2/W7 trap, avoided by not grepping the file)
+    _check(wsattr.cron_flagged({}, {"messages": [{"role": "user", "content":
+                                                 "look: cc_workload=cron is what we grep"}]}) is False,
+           "a quoted marker in the conversation is not a stamp")
+    _check(wsattr.cron_flagged({}, {"system": "cc_workload=interactive"}) is False,
+           "another workload value is not cron")
+
+
+def pin_cadence_separates_cron_from_human():
+    dash = wsattr.classify_tool_use(wsattr.DASH_TOOL, {"action": "append", "content": "[DONE]"})
+    rows = [
+        # tour s1 is cron-driven (one marked row suffices — TRAP C1), 3 sampled
+        # requests of which 2 carry the stamp, and it writes once
+        {"day": "2026-10-29", "ws": "claudish", "session": "s1", "compacted": False,
+         "cron": False, "uses": [(b"a1", "Bash") + (None, False)]},
+        {"day": "2026-10-29", "ws": "claudish", "session": "s1", "compacted": False,
+         "cron": True, "uses": [(b"a1", "Bash") + (None, False)]},
+        {"day": "2026-10-29", "ws": "claudish", "session": "s1", "compacted": False,
+         "cron": True, "uses": [(b"a1", "Bash") + (None, False),
+                                (b"d1", wsattr.DASH_TOOL) + dash]},
+        # tour s2 is human-driven and writes nothing
+        {"day": "2026-10-29", "ws": "claudish", "session": "s2", "compacted": False,
+         "cron": False, "uses": [(b"a2", "Read") + (None, False)]},
+    ]
+    agg = wsattr.aggregate_writes(rows, {"2026-10-29": 8})
+    c = agg["workspaces"]["claudish"]["cadence"]["cron"]
+    h = agg["workspaces"]["claudish"]["cadence"]["human"]
+    _check(c["tours"] == 1 and h["tours"] == 1, "one cron tour, one human, got %r/%r"
+           % (c["tours"], h["tours"]))
+    _check(c["pct_zero"] == 0.0 and h["pct_zero"] == 100.0,
+           "the writing tour is the cron one, got cron=%r human=%r" % (c["pct_zero"], h["pct_zero"]))
+    _check(c["classes"] == {"dash": 1}, "cron class breakdown, got %r" % (c["classes"],))
+    _check(c["writes_per_tour"] == 1.0 and c["reqs_per_write"] == 3.0,
+           "one write over 3 reqs, got %r/%r" % (c["writes_per_tour"], c["reqs_per_write"]))
+    # a marked row is a REQUEST inside the fire, never a fire: 2 marked rows in
+    # 1 tour stays 2.0 — unscaled, even though the stride sampled only half the
+    # day (scaling it would read 4.0 and invent fires out of turn depth)
+    _check(c["marked_rows_per_tour"] == 2.0,
+           "marked rows count inside the tour, unscaled, got %r"
+           % c["marked_rows_per_tour"])
+
+
 def pin_gh_write_class_and_precedence():
     cls, pc = wsattr.classify_tool_use("Bash", {"command": "git push origin feature/x"})
     _check(cls == "pr", "git push is the pr class, got %r" % cls)
@@ -403,6 +461,8 @@ PINS = [
     pin_gh_write_class_and_precedence,
     pin_fleet_push_forms_and_quoted_words,
     pin_dm_send_is_a_write,
+    pin_cron_stamp_is_per_request_and_header_confined,
+    pin_cadence_separates_cron_from_human,
 ]
 
 
