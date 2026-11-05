@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "hono";
 import type { ProviderTransport } from "../providers/transport/types.js";
 import { ComposedHandler } from "./composed-handler.js";
+import { setRelayModeSnapshot } from "./shared/relay-mode-snapshot.js";
 import { __resetCaptureDirMemo } from "./shared/response-capture.js";
 
 /**
@@ -39,6 +40,7 @@ afterEach(() => {
   delete process.env.CLAUDISH_CAPTURE_DIR;
   delete process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS;
   delete process.env.CLAUDISH_CONNECT_RETRY_MAX;
+  setRelayModeSnapshot(null);
   __resetCaptureDirMemo();
   if (captureDir) {
     rmSync(captureDir, { recursive: true, force: true });
@@ -185,5 +187,76 @@ describe("connection-class failure → durable record (#844)", () => {
     expect(res.status).toBe(200);
     // Recovered ⇒ no failure the client saw ⇒ no durable record.
     expect(readEntries(captureDir)).toBeNull();
+  });
+});
+
+describe("connection-error line carries the relay context (#877)", () => {
+  // Cross-file hygiene: relay.test.ts lives in the same bun test process and
+  // its state machines publish to the same module-level snapshot. Every test
+  // here re-asserts its own starting mode rather than inheriting one.
+  beforeEach(() => {
+    setRelayModeSnapshot(null);
+  });
+
+  test("AUTONOMOUS seat → line says so, with the flip's trigger", async () => {
+    captureDir = mkdtempSync(join(tmpdir(), "conn-err-877-auto-"));
+    process.env.CLAUDISH_CAPTURE_DIR = captureDir;
+    __resetCaptureDirMemo();
+    setRelayModeSnapshot({ mode: "autonomous", downTrigger: "heartbeat" });
+    stubUpstreamThrow(
+      Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("connect ENETUNREACH 203.0.113.7:443"), {
+          code: "ENETUNREACH",
+        }),
+      })
+    );
+    const { c, captured } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    expect(captured.status).toBe(400);
+    const entries = readEntries(captureDir);
+    expect(entries).not.toBeNull();
+    expect(entries!.length).toBe(1);
+    const e = entries![0];
+    // The two fields a post-recreate forensics needs: the seat was serving
+    // locally because the relay had flipped, and the flip was a heartbeat
+    // timeout — not a provider outage.
+    expect(e.relay_mode).toBe("autonomous");
+    expect(e.relay_down_trigger).toBe("heartbeat");
+    // The #844 classification is unchanged by the addition.
+    expect(e.kind).toBe("unreachable");
+    expect(e.code).toBe("ENETUNREACH");
+  });
+
+  test("NOMINAL relay seat → mode present, trigger empty", async () => {
+    captureDir = mkdtempSync(join(tmpdir(), "conn-err-877-nominal-"));
+    process.env.CLAUDISH_CAPTURE_DIR = captureDir;
+    __resetCaptureDirMemo();
+    setRelayModeSnapshot({ mode: "nominal", downTrigger: "" });
+    stubUpstreamThrow(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+    const { c } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    const e = readEntries(captureDir)![0];
+    // A relay seat failing its provider while relaying is the OTHER half of
+    // the distinction: hub reachable, provider not — the WAN is not the seat's.
+    expect(e.relay_mode).toBe("nominal");
+    expect(e.relay_down_trigger).toBe("");
+  });
+
+  test("no relay configured (hub) → both fields absent, not empty", async () => {
+    captureDir = mkdtempSync(join(tmpdir(), "conn-err-877-hub-"));
+    process.env.CLAUDISH_CAPTURE_DIR = captureDir;
+    __resetCaptureDirMemo();
+    setRelayModeSnapshot(null);
+    stubUpstreamThrow(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+    const { c } = makeContext();
+    await makeHandler().handle(c, PAYLOAD);
+
+    const e = readEntries(captureDir)![0];
+    // Absence is the hub's honest answer: there is no relay state in this
+    // process, so the line must not grow fields that would read as a verdict.
+    expect("relay_mode" in e).toBe(false);
+    expect("relay_down_trigger" in e).toBe(false);
   });
 });
