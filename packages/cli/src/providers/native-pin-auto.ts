@@ -34,6 +34,7 @@
 
 import type { SlimModelEntry } from "./all-models-cache.js";
 import { ensureCatalogReady, getCatalogEntries, refreshCatalog } from "./catalog-client.js";
+import { allConnections } from "./content-use.js";
 
 export type NativeFamily = "opus" | "sonnet" | "haiku" | "fable";
 
@@ -126,16 +127,18 @@ export function findNewestAnthropicFamilyMember(
 }
 
 function hasAnthropicCorroboration(entry: SlimModelEntry, normalizedId: string): boolean {
-  // v14 differences from main, both on this base's own vocabulary: its
+  // v14 differences from main, on this base's own vocabulary: its
   // SlimModelEntry carries no `sources` field (main's fallback for
-  // pre-aggregators disk caches), the corroborating row spells the vendor
+  // pre-aggregators disk caches), and the corroborating row spells the vendor
   // `sourceProviderId` and the wire id `externalModelId` (main: `provider` /
-  // `externalId`), and the catalog reader moves opt-in connections OUT of
-  // `aggregators[]` into `optInConnections` (`splitOptInConnections`,
-  // content-use.ts) — read both lists so a corroborating anthropic row is never
-  // hidden by that split.
-  const rows = [...(entry.aggregators ?? []), ...(entry.optInConnections ?? [])];
-  return rows.some(
+  // `externalId`). The connections are read through `allConnections`
+  // (content-use.ts), not by touching `aggregators[]` here: that reader merges
+  // the opt-in connections the catalog split moved out (`splitOptInConnections`)
+  // — so a corroborating anthropic row is never hidden by the split — and G1
+  // (`content-use.test.ts`) gates every direct `aggregators[]` read behind an
+  // architecture-reviewed allowlist. Consuming the canonical reader is the
+  // review-free path, and it is also the only spelling.
+  return allConnections(entry).some(
     (a) =>
       a.sourceProviderId === "anthropic" &&
       normalizeAnthropicModelId(a.externalModelId ?? "") === normalizedId
