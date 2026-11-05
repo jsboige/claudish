@@ -49,18 +49,30 @@ describe("endpoint-token-budget #654", () => {
   // ── AC1: inert without env ─────────────────────────────────────────────
   test("AC1 — no knobs ⇒ evaluate returns null (inert by default)", () => {
     expect(evaluateEndpointTokenBudget("vllm-myia", payloadOfLen(3_500), scope, {})).toBeNull();
-    expect(evaluateEndpointTokenBudget("vllm-myia", payloadOfLen(3_500), scope, process.env)).toBeNull();
+    expect(
+      evaluateEndpointTokenBudget("vllm-myia", payloadOfLen(3_500), scope, process.env)
+    ).toBeNull();
     expect(endpointBudgetSnapshot()).toEqual({});
   });
 
   test("AC1 — knob parsing: garbage and 0-Σ are inert, names normalize", () => {
-    expect(readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: "abc" })).toBeNull();
-    expect(readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: "0" })).toBeNull();
-    expect(readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: " 550000 " })).toEqual({
+    expect(
+      readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: "abc" })
+    ).toBeNull();
+    expect(
+      readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: "0" })
+    ).toBeNull();
+    expect(
+      readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: " 550000 " })
+    ).toEqual({
       sumBudget: 550000,
       bigLimit: undefined,
     });
-    expect(readEndpointBudgetKnobs("qwen-token-plan", { CLAUDISH_ENDPOINT_BIG_LIMIT_QWEN_TOKEN_PLAN: "3" })).toEqual({
+    expect(
+      readEndpointBudgetKnobs("qwen-token-plan", {
+        CLAUDISH_ENDPOINT_BIG_LIMIT_QWEN_TOKEN_PLAN: "3",
+      })
+    ).toEqual({
       sumBudget: undefined,
       bigLimit: 3,
     });
@@ -246,7 +258,10 @@ describe("endpoint-token-budget #654", () => {
         c.close();
       },
     });
-    const res1 = withBudgetRelease(new Response(body1, { status: 201, headers: { "x-probe": "kept" } }), () => n1++);
+    const res1 = withBudgetRelease(
+      new Response(body1, { status: 201, headers: { "x-probe": "kept" } }),
+      () => n1++
+    );
     expect(res1.status).toBe(201); // status and headers survive the wrap
     expect(res1.headers.get("x-probe")).toBe("kept");
     await res1.text();
