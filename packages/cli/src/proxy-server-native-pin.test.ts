@@ -97,6 +97,12 @@ describe("resolveNativeModelPin", () => {
     expect(resolveNativeModelPin("claude-opus-5", pinMap, { CLAUDISH_NATIVE_MODEL_PIN: "" })).toBe(
       "claude-opus-5-5"
     );
+    // The switch is checked BEFORE the #219 override is applied, so an adopted
+    // override cannot outlive it: "0" always restores the client's own id.
+    setNativePinOverridesForTests({ opus: "claude-opus-6-0" });
+    expect(
+      resolveNativeModelPin("claude-opus-5", pinMap, { CLAUDISH_NATIVE_MODEL_PIN: "0" })
+    ).toBeUndefined();
   });
 
   test("#219 override applies on top of the resolved pin, family-scoped", () => {
