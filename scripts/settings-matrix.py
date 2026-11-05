@@ -17,6 +17,14 @@ Blind spot (as of 20/10): an env key that is neither allow-listed nor
 CLAUDE_CODE_SUBAGENT_MODEL). The per-lane shape line in the coordinator
 reference (Phase 2) covers it until RSM publishes the names.
 
+Second blind spot (as of 05/11): `permissions` reaches the snapshot as a bare
+NAME in `otherTopLevelKeys`, its content never. The deny list (`Artifact`,
+`Workflow`, the plan modes...) is invisible here, and its absence from this
+output says nothing about the seat. Measured 05/11: a fleet ASK read "no
+Artifact/Workflow deny on any machine" off this matrix, while ai-01, po-2024
+and po-2028 each carried all four entries in their live settings.json. The
+script now says so on every run (`permission_lines`/`permission_flags`).
+
 Usage: settings-matrix.py [--shared DIR] [--stale-hours 48] [machine ...]
 """
 import argparse
@@ -246,6 +254,42 @@ def label_flags(harmonization, machine, names_visible=True):
     return flags
 
 
+PERMISSIONS_KEY = "permissions"
+
+
+def permissions_published(harmonization):
+    """True when the snapshot carries any of the permissions CONTENT."""
+    return any(
+        key == PERMISSIONS_KEY or key.startswith(PERMISSIONS_KEY + ".") for key in harmonization
+    )
+
+
+def permission_lines(snap):
+    """Per-machine line for the permissions block. Absence of the content must
+    read as "invisible to this instrument", never as "no deny entry"."""
+    harmonization = snap.get("harmonization", {})
+    if permissions_published(harmonization):
+        return []
+    if PERMISSIONS_KEY in (snap.get("otherTopLevelKeys") or []):
+        return [
+            "  permissions: present on the seat, content not published (collector blind spot) "
+            "-- the deny list is unverifiable here, read settings.json on the seat"
+        ]
+    return ["  permissions: absent from the snapshot"]
+
+
+def permission_flags(snaps):
+    """One fleet line while no snapshot publishes the permissions content."""
+    present = [s for s in snaps if s and PERMISSIONS_KEY in (s.get("otherTopLevelKeys") or [])]
+    if present and not any(permissions_published(s.get("harmonization", {})) for s in snaps if s):
+        return [
+            "permissions content published by no snapshot (collector blind spot) -- "
+            "a deny entry (Artifact, Workflow, plan modes) is unverifiable from this matrix; "
+            "a claim of absence needs the seat's own settings.json"
+        ]
+    return []
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--shared", default=os.environ.get("ROOSYNC_SHARED_PATH", ""))
@@ -270,6 +314,7 @@ def main():
             "label keys published by no snapshot (collector blind spot) -- picker-fallback "
             "check suspended fleet-wide, an absent _MODEL_NAME is unverifiable"
         )
+    flags.extend(permission_flags(list(snaps.values())))
     for machine in args.machines:
         snap = snaps[machine]
         print(f"=== {machine}")
@@ -303,6 +348,8 @@ def main():
         for key, marker in sorted(masked.items()):
             print(f"  env.{key}: {presence(marker)} (sensitive, value never shown)")
         flags.extend(credential_flags(machine, masked))
+        for line in permission_lines(snap):
+            print(line)
         print(f"  otherTopLevelKeys = {snap.get('otherTopLevelKeys')}")
 
     for key, values in seen.items():
