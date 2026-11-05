@@ -49,18 +49,30 @@ describe("endpoint-token-budget #654", () => {
   // ── AC1: inert without env ─────────────────────────────────────────────
   test("AC1 — no knobs ⇒ evaluate returns null (inert by default)", () => {
     expect(evaluateEndpointTokenBudget("vllm-myia", payloadOfLen(3_500), scope, {})).toBeNull();
-    expect(evaluateEndpointTokenBudget("vllm-myia", payloadOfLen(3_500), scope, process.env)).toBeNull();
+    expect(
+      evaluateEndpointTokenBudget("vllm-myia", payloadOfLen(3_500), scope, process.env)
+    ).toBeNull();
     expect(endpointBudgetSnapshot()).toEqual({});
   });
 
   test("AC1 — knob parsing: garbage and 0-Σ are inert, names normalize", () => {
-    expect(readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: "abc" })).toBeNull();
-    expect(readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: "0" })).toBeNull();
-    expect(readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: " 550000 " })).toEqual({
+    expect(
+      readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: "abc" })
+    ).toBeNull();
+    expect(
+      readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: "0" })
+    ).toBeNull();
+    expect(
+      readEndpointBudgetKnobs("vllm-myia", { CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA: " 550000 " })
+    ).toEqual({
       sumBudget: 550000,
       bigLimit: undefined,
     });
-    expect(readEndpointBudgetKnobs("qwen-token-plan", { CLAUDISH_ENDPOINT_BIG_LIMIT_QWEN_TOKEN_PLAN: "3" })).toEqual({
+    expect(
+      readEndpointBudgetKnobs("qwen-token-plan", {
+        CLAUDISH_ENDPOINT_BIG_LIMIT_QWEN_TOKEN_PLAN: "3",
+      })
+    ).toEqual({
       sumBudget: undefined,
       bigLimit: 3,
     });
@@ -106,7 +118,7 @@ describe("endpoint-token-budget #654", () => {
     const d1 = evaluateEndpointTokenBudget("ep", p, scope, env)!;
     expect(d1.refused).toBe(false);
     const r1 = d1.commit();
-    expect(endpointBudgetSnapshot()["ep"]).toEqual({ count: 1, sum: 1000, big: 0 });
+    expect(endpointBudgetSnapshot().ep).toEqual({ count: 1, sum: 1000, big: 0 });
     const d2 = evaluateEndpointTokenBudget("ep", p, { machine: "m1", session: "s2" }, env)!;
     expect(d2.refused).toBe(true);
     expect(d2.reason).toBe("sum");
@@ -158,11 +170,11 @@ describe("endpoint-token-budget #654", () => {
     expect(d2.facts.resubmit).toBe(2);
     expect(d2.refused).toBe(false); // NOT double-counted: 1000 ≤ 1500
     const r2 = d2.commit();
-    expect(endpointBudgetSnapshot()["ep"]).toEqual({ count: 1, sum: 1000, big: 0 });
+    expect(endpointBudgetSnapshot().ep).toEqual({ count: 1, sum: 1000, big: 0 });
     r1(); // the predecessor's late release is a no-op — its lease was replaced
-    expect(endpointBudgetSnapshot()["ep"]).toEqual({ count: 1, sum: 1000, big: 0 });
+    expect(endpointBudgetSnapshot().ep).toEqual({ count: 1, sum: 1000, big: 0 });
     r2();
-    expect(endpointBudgetSnapshot()["ep"]).toBeUndefined();
+    expect(endpointBudgetSnapshot().ep).toBeUndefined();
   });
 
   test("AC5 — a DIFFERENT body still adds its own estimate", () => {
@@ -196,7 +208,7 @@ describe("endpoint-token-budget #654", () => {
       const prevRelease = release;
       release = d.commit();
       prevRelease(); // no-op (replaced)
-      expect(endpointBudgetSnapshot()["ep"].count).toBe(1);
+      expect(endpointBudgetSnapshot().ep.count).toBe(1);
       last = d;
     }
     expect(last.facts.resubmit).toBe(10);
@@ -246,7 +258,10 @@ describe("endpoint-token-budget #654", () => {
         c.close();
       },
     });
-    const res1 = withBudgetRelease(new Response(body1, { status: 201, headers: { "x-probe": "kept" } }), () => n1++);
+    const res1 = withBudgetRelease(
+      new Response(body1, { status: 201, headers: { "x-probe": "kept" } }),
+      () => n1++
+    );
     expect(res1.status).toBe(201); // status and headers survive the wrap
     expect(res1.headers.get("x-probe")).toBe("kept");
     await res1.text();

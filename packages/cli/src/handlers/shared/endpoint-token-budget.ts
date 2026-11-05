@@ -172,7 +172,12 @@ const inflight = new Map<string, LeaseRecord[]>();
  *  body been submitted?" is invisible at evaluation time. */
 const sigCounts = new Map<string, number>();
 
-function sweepStale(name: string, leases: LeaseRecord[], now: number, onStale?: (info: string) => void): LeaseRecord[] {
+function sweepStale(
+  name: string,
+  leases: LeaseRecord[],
+  now: number,
+  onStale?: (info: string) => void
+): LeaseRecord[] {
   const live: LeaseRecord[] = [];
   let dropped = 0;
   let droppedTokens = 0;
@@ -189,7 +194,9 @@ function sweepStale(name: string, leases: LeaseRecord[], now: number, onStale?: 
     if (live.length === 0) inflight.delete(name);
     else inflight.set(name, live);
     pruneSigCounts(name, live);
-    onStale?.(`[EndpointBudget] ${name}: dropped ${dropped} stale lease(s) (${droppedTokens} tokens) older than ${LEASE_MAX_AGE_MS}ms — a body never read nor cancelled`);
+    onStale?.(
+      `[EndpointBudget] ${name}: dropped ${dropped} stale lease(s) (${droppedTokens} tokens) older than ${LEASE_MAX_AGE_MS}ms — a body never read nor cancelled`
+    );
   }
   return live;
 }
@@ -326,7 +333,11 @@ export function evaluateEndpointTokenBudget(
 
 /** The countable marker line for a decision — same shape family as the #431
  *  SKIP marker (`reason=busy est=… sum=…/…`), so the fleet greps one format. */
-export function formatBudgetFacts(facts: EndpointBudgetFacts, refused: boolean, reason?: string): string {
+export function formatBudgetFacts(
+  facts: EndpointBudgetFacts,
+  refused: boolean,
+  reason?: string
+): string {
   const parts = [`est=${facts.est}`];
   if (facts.sumBudget !== undefined) parts.push(`sum=${facts.sum}/${facts.sumBudget}`);
   else parts.push(`sum=${facts.sum}`);
@@ -344,7 +355,10 @@ export function clearEndpointTokenBudgets(): void {
 }
 
 /** Read-only introspection for tests and diagnostics. */
-export function endpointBudgetSnapshot(): Record<string, { count: number; sum: number; big: number }> {
+export function endpointBudgetSnapshot(): Record<
+  string,
+  { count: number; sum: number; big: number }
+> {
   const out: Record<string, { count: number; sum: number; big: number }> = {};
   for (const [name, leases] of inflight) {
     out[name] = {
