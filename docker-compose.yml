@@ -163,6 +163,11 @@ services:
       # same tick retries on this model, which the hub resolves on the sonnet
       # role. Empty = the built-in glm-5.3.
       - CLAUDISH_RELAY_PROBE_FALLBACK_MODEL=${CLAUDISH_RELAY_PROBE_FALLBACK_MODEL:-}
+      # Budget of the deep probe's FIRST attempt (#867 track 2, #868), in ms.
+      # Empty = the 10 s default; 0 = kill switch (first attempt back to the full
+      # 30 s); out of [1000, 30000] falls back to the default. Read per probe, but
+      # the name must be listed here or no value ever reaches the container (#310).
+      - CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS=${CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS:-}
       # Native credential guard kill switch (#296): only an explicit "0" disarms;
       # empty = guard on. Listed here because the env file only interpolates —
       # a name absent from this list never reaches the container.
@@ -244,6 +249,9 @@ services:
       # compose line missing at merge, compose-env-coverage red on main. Same
       # initFailover startup read as the knobs above — a flip needs a recreate.
       - CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES=${CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES:-}
+      # #875 — a bucket wall lifts at the reset its refusal announced (shorten
+      # only). Kill switch, default on; same startup read — a flip needs a recreate.
+      - CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET=${CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET:-}
       # #299-B — one-shot overload walk kill switch. Unlike the knobs above this
       # is a read-per-request switch (the fleet flips it mid-flight; no recreate),
       # but a container still needs the NAME here to ever see any value at all.
