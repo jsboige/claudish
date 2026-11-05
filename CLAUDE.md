@@ -32,7 +32,7 @@ Planned-but-unimplemented work lives in `ROADMAP.md`, each item with an explicit
 
 - `bun run build` (CLI + macOS bridge bundles) · `bun run dev`. Use **bun**, never npm or yarn.
 - **Releases are handled by CI/CD — never run `npm publish` by hand.** Bump version → conventional commit → `git tag -a vX.Y.Z -m "…"` → `git push origin main --tags`.
-- **Every PR that resolves an issue carries `Closes #NN` in its body.** GitHub only auto-closes on the keyword — a descriptive mention leaves the issue open with its fix merged and live (measured 12/09: three merged fixes, three orphaned issues).
+- **Every PR that resolves an issue carries `Closes #NN` in its body.** GitHub only auto-closes on the keyword — a descriptive mention leaves the issue open with its fix merged and live (12/09, #65/#79/#80: three merged fixes, three orphaned issues).
 - **A version bump touches three files, all mandatory**: root `package.json`; `packages/cli/package.json` (**this is what CI publishes — stale here and `npm publish` fails**); `packages/cli/src/version.ts` (fallback `VERSION` for compiled binaries).
 
 ## Model Routing (v4.0+)
