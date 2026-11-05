@@ -92,6 +92,7 @@ import type { FallbackCandidate } from "./handlers/fallback-handler.js";
 import { createHandlerSet } from "./handlers/handler-set.js";
 import { loadAdvisorSwapConfig } from "./handlers/native-handler-advisor.js";
 import { NativeHandler } from "./handlers/native-handler.js";
+import { admissionFreezeState } from "./handlers/shared/admission-freeze.js";
 import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
 // #641 G7 — OpenAI-compatible ingress (/v1/chat/completions): the two
 // translation directions are fork files carried verbatim from main (they are
@@ -1116,6 +1117,9 @@ export async function createProxyServer(
   // #218 native-lane version pin, no #693 machine-scoped resolution arm (the
   // ported resolveFailoverTargetForSession takes no machine argument), no #769
   // unroutable-step skip (a RoutingError at construction surfaces).
+  // Port-map row 8 (#306 drain-freeze) IS ported — the proxy half only; the
+  // drain script that poses the flag is main-only surface (see the
+  // admission-freeze module header). Gate below at all three admissions.
   // #609 IS wired below (walkDelegatedTarget): a delegated concrete that fails
   // in-request is followed by the next concrete of the TARGET's path on the same
   // delegating step, before the caller's next step — outside the attempt budget,
@@ -2258,6 +2262,10 @@ export async function createProxyServer(
         role,
         upstream,
         instanceId: getInstanceId(),
+        // #306 — the drain reads THIS to confirm the proxy actually sees its
+        // flag (drain home vs container mount can differ; a VM clock skew can
+        // expire a fresh flag). The reason, never the flag content.
+        admissionFreeze: admissionFreezeState().reason,
         ...(options.relay ? { selfLoop: options.relay.selfLoop } : {}),
       },
       stalled ? 503 : 200
@@ -2396,10 +2404,55 @@ export async function createProxyServer(
     }
   });
 
+  /**
+   * #306 — admission freeze gate for the drain's final pre-restart window.
+   * Returns the 503+Retry-After Response when the freeze is live, null when
+   * admissions flow. Called after the body is read (keep-alive hygiene: an
+   * unread body would poison the next request on the connection) and before
+   * any handler/relay work. In-flight streams never re-enter a route, so they
+   * are untouched by construction; /health is not gated, so the drain keeps
+   * polling right through the freeze.
+   */
+  const drainFreezeGate = (): Response | null => {
+    const state = admissionFreezeState();
+    if (!state.frozen) return null;
+    log(`[DrainFreeze] admission refused — 503 + Retry-After (state=${state.reason})`, true);
+    return new Response(
+      JSON.stringify({
+        type: "error",
+        error: {
+          type: "overloaded_error",
+          message:
+            "Proxy is draining for a restart (admission freeze). Retry shortly — in-flight streams are unaffected.",
+        },
+      }),
+      {
+        status: 503,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "15",
+          // #318 — marks this 503 as OUR deliberate drain window. A relaying
+          // sidecar treats an unmarked 503 as a hub failure (markFail + local
+          // replay, this base's fork/server/relay.ts drainFreeze503 check);
+          // the marker lets it pass this one through like a 4xx instead.
+          // Explicit header, not body sniffing: real provider overloads emit
+          // an Anthropic-shaped overloaded_error body too.
+          "x-claudish-drain-freeze": "1",
+        },
+      }
+    );
+  };
+
   // Token counting
   app.post("/v1/messages/count_tokens", async (c) => {
     try {
       const body = await c.req.json();
+      // #306 — same admission freeze as the serving routes: messages are
+      // refused during the window, so counting for a message that can no
+      // longer be admitted is the asymmetry po-2024 flagged. Same 503 +
+      // Retry-After, in-flight streams untouched.
+      const freeze = drainFreezeGate();
+      if (freeze) return freeze;
       if (typeof body?.model !== "string" || body.model.length === 0) {
         return c.json(wrapAnthropicError(400, "missing required field: model"), 400);
       }
@@ -2454,6 +2507,13 @@ export async function createProxyServer(
     let handlerThrew = false;
     try {
       const body = await c.req.json();
+      // #306 — opt-in admission freeze, BEFORE the relay branch: the freeze
+      // belongs to THIS container's restart, so a frozen admission must not
+      // be forwarded either (a forward would die mid-body when the local
+      // container restarts — strictly worse than a clean retryable 503).
+      const freeze = drainFreezeGate();
+      if (freeze) return freeze;
+
       // Request-metadata trace (debug log only — the [RequestMeta] prefix is
       // NOT structural-log-worthy, so it never reaches the always-on redacted
       // log). Captures the three fields claudish otherwise never reads, to
@@ -2599,7 +2659,8 @@ export async function createProxyServer(
   // this is a translated ingress into the same pipeline. Carried from main's
   // proxy-server.ts route, adapted to the seams that exist on this branch —
   // the deltas are marked #641-G7-GAP inline:
-  //   - no drain-freeze gate (the freeze infra is not ported yet);
+  //   - drain-freeze gate: ported in port-map row 8 (#306, this base's proxy
+  //     half — the drain script that poses the flag stays main-only);
   //   - since G8 the route serves through handleWithCascade like /v1/messages,
   //     so this ingress inherits the budget-failover substitution and the
   //     applyFailoverNotices call below is live (the narrower-than-main gap
@@ -2630,6 +2691,10 @@ export async function createProxyServer(
           400
         );
       }
+      // #306 — same admission freeze as /v1/messages, same placement before
+      // the relay branch, for the same reason.
+      const freeze = drainFreezeGate();
+      if (freeze) return freeze;
       if (openaiBody === null || typeof openaiBody !== "object" || Array.isArray(openaiBody)) {
         return c.json(
           {
@@ -2649,9 +2714,8 @@ export async function createProxyServer(
       // path-aware, so the forward reaches the route the client hit, not
       // /v1/messages. #279: same hop-list gate as /v1/messages — a loop can
       // enter on either ingress.
-      // #641-G7-GAP: no admission-freeze gate here — main places
-      // drainFreezeGate() before the relay branch; the drain/freeze infra is
-      // not ported yet.
+      // #306: the admission freeze was already applied above, before this
+      // branch — a frozen admission is never forwarded.
       const relay = options.relay;
       if (relay?.upstream && requestLoopedBack(c)) {
         log(
