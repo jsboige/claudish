@@ -49,6 +49,17 @@ import {
   setRoleNominalResolver,
   stripServingNoticesFromRequestBody,
 } from "./fork/failover.js";
+// Row 9 of the port map (#101): Claude Code's `cch=` per-turn hash opens the
+// system prompt, so a prefix-caching backend re-reads the whole prefix every
+// turn. transform.ts's stripBillingHeader already runs in step 1 of EVERY
+// ComposedHandler request (transformOpenAIToClaude normalizes before any
+// adapter shapes the payload — anthropic-compat and Codex included) and never
+// for NativeHandler, so upstream cleanliness is transform-guaranteed. What
+// this route-level call adds is what main's fork layer carries it for: parity
+// of the fork seam, and defense if a handler ever serves `body` without that
+// transform step. Native Anthropic traffic keeps the header — it is the party
+// the header is for.
+import { stripBillingHeaderFromBody } from "./fork/middleware/billing-header-strip.js";
 import { collectRoutedBareNames, createProxyAuthMiddleware } from "./fork/middleware/proxy-auth.js";
 // #641 blocker-2 port — capture pipeline (fork extension). request-logger owns
 // the req-*.json capture, the pinned [Request] stdout line and the per-request
@@ -1480,6 +1491,21 @@ export async function createProxyServer(
         if ((process.env.CLAUDISH_FAILOVER_NOTICE_STRIP || "").trim() !== "0") {
           stripServingNoticesFromRequestBody(body);
         }
+        // Row 9 (#101) — the billing-header strip, at the same seam as the
+        // notice strip above: on main it runs at the ROUTE with the entry
+        // handler's `instanceof NativeHandler`, on this base the loop IS the
+        // serving path for both ingresses, so it runs here, on the handler
+        // that actually serves attempt 0. `resolvedHandler` is the unwrapped
+        // one — `withAdvisor(withRequestHooks(…))` hides the `instanceof`
+        // (same rule as the keyless check below). Attempt 0 only: later
+        // attempts inherit the already-stripped body, exactly as main's
+        // single route-level pass leaves the cascade's next steps. The
+        // transform-level strip already cleans every ComposedHandler payload
+        // (see the import comment) — this is the fork-seam parity pass, and
+        // the `isNative` argument is what B3 pins: NativeHandler forwards
+        // THIS object, so a strip here with the wrong flag would take the
+        // header out of Anthropic's own traffic.
+        stripBillingHeaderFromBody(body, resolvedHandler instanceof NativeHandler);
       }
       // #412 — the keyless exemption admits, this decides. A request admitted
       // without a credential of its own may only be served by the native
@@ -2665,8 +2691,10 @@ export async function createProxyServer(
   //     so this ingress inherits the budget-failover substitution and the
   //     applyFailoverNotices call below is live (the narrower-than-main gap
   //     list lives with the cascade wiring block);
-  //   - no stripBillingHeaderFromBody / keylessNativeRequest
-  //     (the billing-strip family is not ported).
+  //   - stripBillingHeaderFromBody: ported in port-map row 9 — not at this
+  //     route but once, in the cascade loop's attempt-0 block, which both
+  //     ingresses funnel through (this route included). keylessNativeRequest
+  //     stays not ported.
   app.post("/v1/chat/completions", async (c) => {
     try {
       // Same client-error terminal 400 as /v1/messages (#548 on main), in this

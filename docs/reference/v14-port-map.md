@@ -34,7 +34,7 @@ Base measured: `replatform/v14` = `d06f3659` (#829 merged), `main` = `47ea6245`.
 | 7b | `#431` handler-side emitter — concurrency refusal | PR **#684** (`d78fea09`, closes #679) | +434/−24, 8 | **Ported** (PR **#869**, rebuilt on `398e2406` after #856's squash-merge replaced the commit it was stacked on; #865 (row 8) is a separate PR over the same files). Classifier byte-faithful; the v14 adaptation: NO 529 (this base keeps the upstream 429 per its own non-ok doctrine), the emitter annotates both non-ok envelope shapes, and the transport 429 ladders exit on 1302 reusing the text they already read. Deliberately NOT ported: `isConcurrencyRefusalResponse` + `quota-wall.ts`'s bounded read (no unread-Response consumer here) and the `markStepSkipEligible` WeakSet (main uses it only to bypass the patient overload backoff, which v14 does not have) | ~~M~~ done |
 | 7c | `#431` handler-side emitter — admission refusal | PR **#573**, already **row 1** | see row 1 | **Not a separate grain.** Verified by file list: #581 and #684 touch `handlers/shared/step-skip.ts`; #573 touches `handlers/shared/context-admission.ts` and touches the step-skip route test only as a route. The gap list counts the #565 admission work a second time here | — |
 | 8 | drain-freeze gate | PR **#314** (`5e3e4269`, issue #306) | +735/−2, 8 | **Ported** (`feat/v14-306-drain-freeze` off `5af7616a`): module verbatim, `/health` field + the three admission gates (messages, count_tokens, chat/completions) and the route suite (9 pins / 4 mutations). The **hub half of #318 is carried**: the gate marks its 503 `x-claudish-drain-freeze: 1`, the marker this base's `fork/server/relay.ts` `drainFreeze503` check already consumes — without it, a frozen hub reads as a hub death (markFail + local replay, sidecars flap AUTONOMOUS). The **writing** half — `claudish-drain.ps1`, `claudish-engine.psm1` and their Pester suites — is main-only surface: this base has no `scripts/` tree, so recreating it is row 2's add/add trap. Ported contract = whatever poses the flag, the proxy honours it | ~~M~~ done |
-| 9 | billing-strip family | **no PR** — `fork/middleware/billing-header-strip.ts` (27 lines), moved by `985643d0` | — | file absent from v14's fork layer. The real work is not the 27 lines but the call sites before each serve | S |
+| 9 | billing-strip family | **no PR** — `fork/middleware/billing-header-strip.ts` (27 lines), moved by `985643d0` | — | **Ported** (PR **#873**): module faithful to main's blob (`d17cdcf3…`) except the two `.replace()` calls collapsed to single lines for this branch's biome (behaviour identical; formatted sha `f45ebcc9…`); ONE call site for main's two — main strips at `/v1/messages` `:3198` and `/v1/chat/completions` `:3350` before `handleWithCascade`, on v14 both ingresses funnel through the cascade loop, so the strip sits in the attempt-0 block next to the notice strip (#747b), on `resolvedHandler instanceof NativeHandler` (the unwrapped handler — the wrapper hides `instanceof`). Attempt 0 only; later attempts reuse the same once-parsed object, exactly as main's single route-level pass leaves its cascade's next steps. **Measured honesty**: `transform.ts`'s `stripBillingHeader` already runs in step 1 of every ComposedHandler request (anthropic-format and Codex legs included) and never for NativeHandler, so upstream cleanliness is transform-guaranteed with or without this call (mutation M1: route pins stay green with the call removed) — the call is fork-seam parity + defense, and its `isNative` argument is the part that is load-bearing: NativeHandler forwards the same body object, so a wrong flag strips Anthropic's own traffic (B3, the one red pin under M2). Main carries the same redundancy (its transform strip arrived later, upstream, in the #499 sync tranche). Tests: main had **zero** for this module; v14 adds 8 unit pins (`fork/middleware/billing-header-strip.test.ts`) + 4 route pins (`proxy-server-billing-strip-route.test.ts`, B4 holds the one-parse-one-object seam claim through a cascade substitution) | ~~S~~ done |
 
 The gap list writes the `#431` emitters as one family. It is **two** grains, not three:
 7a and 7b are separate emitters, and the third number it cites (`#573`, #565) is row 1
@@ -42,14 +42,13 @@ restated. A scheduler that budgeted three emitter grains would buy one of them t
 
 ## Supporting measurement — the fork layer
 
-`replatform/v14` carries 22 files under `packages/cli/src/fork/`, `main` carries 27.
-Six are missing on v14, one exists only on v14:
+`replatform/v14` carries 23 files under `packages/cli/src/fork/`, `main` carries 27.
+Five are missing on v14, one exists only on v14:
 
 ```
 fork/config/profile-extensions.ts
 fork/failover.test.ts                 ← a missing PIN, not a missing feature
 fork/index.ts
-fork/middleware/billing-header-strip.ts
 fork/routes/model-discovery.ts
 fork/server/relay-hub-death.test.ts   ← a missing PIN, not a missing feature
 (v14 only) fork/middleware/proxy-auth-before-relay.test.ts
