@@ -18,58 +18,64 @@ Rules:
   `[Failover] configured=N auto=on`, `/health`, `test -f` on every file bind,
   relay NOMINAL as seen by po-203.
 
-## Current canonical form — hub po-2025 (read IN the container, 29/10 13:2xZ)
+## Current canonical form — hub po-2025 (read IN the container, 05/11 11:22Z)
 
-**This block outranks any cascade/role row further down.** Those rows are dated snapshots of
-23/09 and earlier; they are kept for the audit trail, not as the current shape. "La règle" is
-always the profile plus the `CLAUDISH_FAILOVER_*` values read live — never a statistics table,
-never a coordinator's summary.
+**This block outranks any cascade/role row further down.** Those rows are dated snapshots;
+they are kept for the audit trail, not as the current shape. "La règle" is always the profile
+plus the `CLAUDISH_FAILOVER_*` values read live — never a statistics table, never a
+coordinator's summary. The previous canonical form (29/10) is preserved in the change log
+(row 2026-11-05 00:53).
 
 ```
-CLAUDISH_FAILOVER_ACTIVE   = haiku@myia-po-2027,haiku@myia-po-2023,haiku@myia-po-2024,haiku@myia-po-2028
-CLAUDISH_FAILOVER_SONNET   = mistral@zai-glm-5-3 > kc@k3 > mmc@MiniMax-M3.1-Flash > qwen-token-plan@deepseek-v4.1-flash-1017 > ds@deepseek-flash
-                             LABEL Mistral GLM>Kimi K3>MiniMax M3.1>Qwen prepaid>DeepSeek Flash PAYG
-                             DIRECTION degraded>lateral>lateral>lateral>lateral
-CLAUDISH_FAILOVER_HAIKU    = vllm-myia@swift-1.5-27b!own > role:sonnet     (LABEL Swift 1.5 local (vllm-myia)>Sonnet role)
-CLAUDISH_FAILOVER_OPUS     = cx@gpt-6.1-sol > role:sonnet
-CLAUDISH_FAILOVER_FABLE    = cx@gpt-6-astra > role:opus
-CLAUDISH_FAILOVER_STEP_EXCLUDE = vllm-myia@swift-1.5-27b:myia-ai-01 myia-po-2028
+CLAUDISH_FAILOVER_ACTIVE   = haiku@myia-po-2027,haiku@myia-po-2023,haiku@myia-po-2024,haiku@myia-po-2028,haiku@myia-po-2025
+CLAUDISH_FAILOVER_HAIKU    = vllm-myia@swift-1.5-27b!own > mmc@MiniMax-M3.1-Flash > role:sonnet
+                             LABEL Swift 1.5 local (vllm-myia)>MiniMax M3.1>Sonnet role
+                             DIRECTION degraded>lateral>improved
+CLAUDISH_FAILOVER_SONNET   = mistral@zai-glm-5-3 > qwen-token-plan@deepseek-v4.1-flash-1017 > ds@deepseek-flash
+                             LABEL Mistral GLM>Qwen prepaid>DeepSeek Flash PAYG
+                             DIRECTION degraded>lateral>lateral
+CLAUDISH_FAILOVER_OPUS     = cx@gpt-6.1-sol > role:sonnet      (LABEL GPT-6 Sol>Sonnet role, lateral>degraded)
+CLAUDISH_FAILOVER_FABLE    = cx@gpt-6-astra > role:opus        (LABEL GPT-6 Astra>Opus role, lateral>degraded)
+CLAUDISH_FAILOVER_STEP_EXCLUDE = vllm-myia@swift-1.5-27b:myia-ai-01
 CLAUDISH_FAILOVER_AUTO     = 1
 CLAUDISH_FAILOVER_ROLE_MODELS  = glm-5.1/5.2/5.3:sonnet, glm-4.7:sonnet, minimax-m3:haiku,
                                  gpt-6-sol/6.1-sol/5.6-sol:opus, gpt-6-astra:fable
+config.json (bind) customEndpoints: vllm-myia maxConcurrency=10 · frognano maxConcurrency=16
 ```
 
 Three readings that cost a diagnosis when missed:
 
-- **`kc@k3`, never `kc@k3.1-pro`.** Two distinct ids on the same endpoint and key; the swap landed
-  29/10 (drained recreate `success`, verified by value). `k3.1-pro` stays the id named in the Kimi
-  degradation dossier — do not "correct" one into the other.
-- **po-2028 is ARMED and STEP-EXCLUDED at the same time, on purpose** (user order 29/10): its haiku
-  diverts to the cascade at a MiniMax wall, but no walk sends it to vllm — so it lands on
-  `role:sonnet` instead of straining the local GPU. `myia-ai-01` is excluded for the same reason
-  (the step would saturate, never max).
+- **An armed seat starts its haiku on swift, not on MiniMax.** `_ACTIVE` diverts the whole role
+  for the 5 armed machines, so step 0 (`swift!own`) is their first server; MiniMax is step 1, and
+  `role:sonnet` the last. The profile's `haiku` entry (MiniMax) only serves the seats that are
+  **not** armed — today `myia-ai-01` and the off-fleet clients.
+- **`myia-ai-01` is excluded from swift, durably** (user, 25/10, restated 05/11 ~00:52Z: its
+  condensation threshold of 330k is above the swift window). It is not armed, and
+  `STEP_EXCLUDE` keeps any walk of its requests off vllm. Do not re-propose without the user's
+  word. po-2028 is **no longer** step-excluded (it was on 29/10).
+- **The sonnet ladder no longer carries `kc@k3` or the MiniMax rung** that the 29/10 form had.
+  `_NOTE` and `_RESET` stay **positional** — one field per step — so any rung change means
+  recounting both, or a note lands on the wrong step.
 
-VERIFIED 29/10 13:2xZ by `docker exec claudish-proxy env | grep '^CLAUDISH_FAILOVER_'` on the hub,
-after the drained recreate `success` of 13:20:07Z (new `instanceId` 877f42cb).
-
-- **MiniMax is rung 3 of the sonnet ladder** (user order 29/10 ~13:2xZ: spend the remaining
-  MiniMax stock instead of the DeepSeek PAYG tail). `_NOTE` and `_RESET` are **positional** — one
-  field per step — so adding a rung means recounting both, or a note lands on the wrong step.
-  Measured the same day: GLM walled on 402, Kimi on 429, then sessions pinned to
-  `step 2 (MiniMax M3.1)` — the DeepSeek rung was not reached.
+VERIFIED 05/11 11:22Z by `docker exec claudish-proxy env | grep '^CLAUDISH_FAILOVER_'` on the hub
+(container created 00:53:34Z, started 10:02:33Z, `instanceId` ac111998) and by parsing the bound
+`config.json` (names and `maxConcurrency` only).
 
 ## po-2025 — HUB (canonical since 05/09 cutover)
 
 | Item | Value | Status |
 | --- | --- | --- |
 | Role | Hub, central capture | VERIFIED (traffic attribution) |
-| Image | `2fe342f` | DECLARED 06/09 |
+| Image | `901d1474ed10` (image built 03/11 08:06:32Z) — was `2fe342f` on 06/09 | VERIFIED 05/11 11:22Z (`docker inspect` + `drain.log` "deployed image") |
+| Container | created **05/11 00:53:34Z** (swift-max recreate), last started **05/11 10:02:33Z** (post-outage relaunch), `RestartCount=0` | VERIFIED 05/11 11:22Z (`docker inspect`) |
+| `instanceId` | `ac111998…` (`/health`, `role=hub`) | VERIFIED 05/11 11:22Z |
+| `config.json` (bind) | sha256 `101b01eb`, mtime 05/11 08:02:43Z (`vllm-myia` `maxConcurrency` 12→10) | VERIFIED 05/11 11:22Z |
 | Endpoint | `192.168.0.50:3000` (LAN) | VERIFIED 07/09 14:05Z (ai-01 `/health`) |
 | Deploy dir | `D:\claudish-shadow` | DECLARED 07/09 |
 | Recreate command | drained recreate with `--env-file D:\claudish-shadow\.env` | DECLARED 07/09 |
 | ⚠ Trap | plain `up -d` loads `D:\dev\claudish\.env` (1 line) → **cascades EMPTY** | VERIFIED by incident 07/09 |
-| Cascades | configured=3, auto=1 — SONNET mistral→qwen→PAYG · OPUS qwen→gc→PAYG · HAIKU qwen→PAYG · `ROLE_MODELS` set · `QWEN_THINKING=budget:4096` | DECLARED 07/09 14:01Z (startup line quoted) |
-| Codex OAuth | file bind, 2165 B, expiry ~12-13/09 | DECLARED 07/09 |
+| Cascades | **superseded — see the canonical block above.** 07/09 snapshot: configured=3, auto=1 — SONNET mistral→qwen→PAYG · OPUS qwen→gc→PAYG · HAIKU qwen→PAYG · `ROLE_MODELS` set · `QWEN_THINKING=budget:4096` | DECLARED 07/09 14:01Z (startup line quoted) |
+| Codex OAuth | file bind; the 07/09 expiry (~12-13/09) is long past and the token has been renewed since — the `cx@` lane served live requests on 05/11 (09:53Z, 10:02Z) | VERIFIED by effect 05/11 (live `claude -p --model cx@gpt-6-luna`) |
 | `ClaudishDailyRestart` 04:00 | **DELETED 08/10 10:09:58 local** (user UAC batch v2, gesture G1); last `daily-0400` → `OUTCOME success` 08/10 07:31 local | DECLARED 08/10 (po-2025; absence re-confirmed 10:19:35 local) |
 | Restart epochs 07/09 | ~08:06Z · 13:59Z (incident repair) | VERIFIED (uptime probes) |
 
@@ -148,6 +154,9 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 
 | Date (Z) | Machine | Change | Proof |
 | --- | --- | --- | --- |
+| 2026-11-05 09:57:00 → 10:02:57 | po-2025 | **Hub down ~6 min: the WSL VM was terminated from outside, then the watchdog relaunched Docker Desktop.** Docker backend log (UTC): at 09:57:00.51Z `agent-api` exits 143 (SIGTERM) and every `wsl.exe` child (docker-desktop, the Ubuntu proxy, vpnkit-bridge) is killed by SIGTERM. Nothing precedes it in that log (only `/time` polls), no Hyper-V-Compute event, and the System log has nothing at that second (only Google Drive filesystem warnings). **Emitter not established**: no `wsl --shutdown` / `--terminate` / `-t` tool call between 09:00 and 10:09Z in any of the 5 session transcripts of this machine (vllm, Epita, CoursIA, CoursIA-2, claudish). Recovery: `watchdog.log` 11:02:13 local = 10:02:13Z `ENGINE-DOWN`, port 3000 deaf, commit charge 57.2 % → Docker Desktop relaunched → engine back ~10 s later → `claudish-proxy` started 10:02:33Z (docker-events), `/health` answering; same container (`RestartCount=0`), same env — re-read by value at 11:22Z. Escalated on the dashboards in the same cycle | Docker backend log + `watchdog.log` + docker-events + System/Application logs + transcript scan + `docker inspect` |
+| 2026-11-05 08:09:03 | po-2025 | **`vllm-myia` `maxConcurrency` 12 → 10** in the bound `config.json` (user 05/11 ~08:02Z: « OK pour passer la concurrence à 10 »). Image and `.env` unchanged ⇒ drained `docker restart`, not a recreate. `drain.log` (local time): START 09:02:47, no zero within 300 s (quietest 4), restart at 6 streams in flight at 09:09:03, `/health` answering 09:09:56 → `OUTCOME success`. Coordinated with the vllm lane, whose post-measure DM motivated the step down | `drain.log` + `config.json` parse (`maxConcurrency` only) |
+| 2026-11-05 00:53:34 → 00:54:28 | po-2025 | **Swift-max regime (user Q-74, 3rd accord + amendment).** Drained recreate (reason `swift-max-0511`; START 00:46:46Z, no zero within 300 s, restart at 5 streams in flight, compose `up` 00:53:33Z, `OUTCOME success` 00:54:28Z). Its free-text reason still reads « arms 4to6, stepexclude-lift-ai01 »: the user's correction (« ai-01 n'était pas compatible du fait du seuil de condensation », ~00:52Z) landed in the `.env` (backup `.env.bak-20261105T0056Z-ai01-out`) **before** compose interpolated it, so the container came up with **5 arms and the ai-01 exclusion kept** — read by value at 00:54:59Z. A second recreate started at 00:55:06Z (`swift-max-0511-fix`) was **killed on purpose before its gesture** (00:55:51Z, PID 44576): it had nothing left to change, so `drain.log` has no OUTCOME for it. Changes vs the 29/10 canonical form: `_ACTIVE` + `haiku@myia-po-2025`; `_HAIKU` gains the MiniMax step (`swift!own>mmc@MiniMax-M3.1-Flash>role:sonnet`); `STEP_EXCLUDE` drops `myia-po-2028`; `vllm-myia` `maxConcurrency` 8 → 12 (then 10, row above). **29/10 form, preserved:** `_ACTIVE`=`haiku@myia-po-2027,haiku@myia-po-2023,haiku@myia-po-2024,haiku@myia-po-2028` · `_SONNET`=`mistral@zai-glm-5-3>kc@k3>mmc@MiniMax-M3.1-Flash>qwen-token-plan@deepseek-v4.1-flash-1017>ds@deepseek-flash` (LABEL `Mistral GLM>Kimi K3>MiniMax M3.1>Qwen prepaid>DeepSeek Flash PAYG`, DIRECTION `degraded>lateral>lateral>lateral>lateral`) · `_HAIKU`=`vllm-myia@swift-1.5-27b!own>role:sonnet` · `STEP_EXCLUDE`=`vllm-myia@swift-1.5-27b:myia-ai-01 myia-po-2028` · OPUS/FABLE/AUTO/ROLE_MODELS identical. The date at which `kc@k3` and the MiniMax rung left the sonnet ladder (between 29/10 and 05/11) is not re-derived here | `drain.log` + live `printenv` 00:54:59Z + `.env` backup + `docker inspect` |
 | 2026-10-27 17:01 | po-2028 | **Workspace migrated `C:\dev\claudish` → `D:\dev\claudish`, and the sidecar was re-created from the new location so its compose record and capture bind follow it.** Container labels now read `D:\dev\claudish` for `project.working_dir`, `config_files` and `environment_file`; mounts now bind **`D:\claudish-captures` → `/captures`**; `.env` carries `CLAUDISH_CAPTURE_HOST_DIR=D:\claudish-captures`. Pre-gesture check: **value-level diff container ↔ compose-resolved env = 0 difference, 0 armed cascades** on both sides (never a name-only diff). Gesture: `claudish-drain.ps1 -Detach -Recreate -EnvFile D:\dev\claudish\.env` → `OUTCOME success`, **started at 0 streams / 0 clients interrupted** (32 s compose window); post-gesture `/health` `relay-nominal`, upstream `.50`, new `instanceId c743fddc…`, and a real `POST /v1/messages` answered 200 (`MIGRATION_OK`, served by `MiniMax-M3.1-Flash`). Captures: **1 556 files / 711 742 036 bytes copied and byte-verified identical before the switch**. Residue: the old `C:\claudish-captures` **could not be removed** — `Remove-Item` is blocked by the protected-path guard on that root path (~0.68 GB, no writer left); the old clone `C:\dev\claudish` (clean, same tip) also remains on disk, no longer referenced by the container | container labels + mounts + live `/health` + live request + `drain.log` `OUTCOME success` + file-count/byte comparison |
 | 2026-10-26 23:27 → 2026-10-27 00:20 | po-2023 | **Host reboot (1074 at 23:27:53Z, boot 00:17:47Z per 6005/6008) — WAN edge unserved for ~47 min, then 502 until the `:18182` pipe starts at user logon.** Ingress log W3SVC49 (UTC): last request served **26/10 23:31:29Z**, then silence until **00:18:25Z**; **but the reset clients actually saw is not in that log** — a failed TLS handshake never reaches HTTP, so it is logged at connection level: **HTTPERR `Ssl_HandshakeSecurity`, 401 entries from 23:28Z (one minute after the 1074) to 23:59Z**, the machine accepting TCP while refusing TLS (next boot logged **6008 "previous shutdown unexpected"**). Named sources of those resets: hairpin `90.65.170.144` 237 · `82.66.89.184` 79 (`claude-cli`) · **`34.175.191.173`/`34.17.61.33`** 58 (cloud) · `108.165.33.236` 6 · **`192.168.0.47`** 5 (LAN) · `92.184.105.2/.101` 4 · **`37.187.180.135`** 2 (OVH). ⚠ **So "no error in the access log" does not mean the edge was serving** — two instruments, two questions; **00:18:25 → 00:20:05Z = 13 × 502/3** (`win32 64` — IIS up, pipe not yet listening); first 200 at **00:20:12Z**; then **200 at every single minute from 00:20:12Z to 02:28Z** (1 651 req, 1 581 × 200, 48 × 502, 18 × 404, 3 × 429). The `:18182` relay process was born **00:20:05Z**, i.e. **2 min after boot, at session logon** — that is what bounds this outage, not IIS (HTTP.SYS listening at 00:18:11Z per HttpService 111). Per-seat claims of a TLS reset "at 01:1xZ" are **not this ingress at 01:1xZ**: it answered 200 at every minute of that window, and the only connection-level failures logged in 01:17→01:22Z are **12 × `Ssl_HandshakeSecurity`, all from scanner ranges** (`87.236.176.x`, `195.96.139.x`, `185.247.137.x`, `141.76.94.17`) — **no fleet source**. The real reset window is the shutdown one above (23:28→23:59Z), which is where the cloud / OVH / LAN sources appear by name. **Residue, hub-side to corroborate**: **16 × 502 on `POST /v1/messages`** from 92.184.105.2/.101, 01:47:35 → 01:53:41Z, `time-taken` **22.3-23.1 s** constant, `sc-substatus=0`/`win32=0` ⇒ the pipe/relay's own response, never ARR's (`substatus=3`). Docker Desktop never came back (backend dies on `\\.\pipe\dockerBackendApiServer: Access is denied`; launched elevated in session 0 by Task Scheduler — #186, Q-20261027-1 / Q-P2023-8), so the relay **container** and the embedder `:8004` stayed down; the WAN edge does not depend on them | W3SVC49 log + `Win32_OperatingSystem.LastBootUpTime` + System 1074/6005/6008 + HttpService 111 + live `/health` + `Get-NetTCPConnection` (18182 owner/start) |
 | 2026-10-25 01:59 (mtime) | po-2023 | **WAN edge re-pointed: `models.myia.io` `web.config` now rewrites to `http://localhost:18182/{R:1}` (the host TCP pipe) instead of `http://192.168.0.50:3000` (hub direct).** Detected by measurement, **not** by an announcement: sha256 moved `7ADE6AD6…` → **`49F6BC42…0FF538`**, mtime **2026-10-25 02:59 local**. Under the standing rule (26/10: any TLS/ARR binding change is announced on `global` BEFORE execution) the change **should** have an announcement; **none was found in the intercom window consulted (26/10 23:29 → 27/10 02:29Z) and the author is not established** — recorded as measured, no rollback attempted (façade owned by po-2023's IIS lane; "infra of another workspace: ask, don't apply"). Effect: the WAN path now traverses the `:18182` pipe, which is started from `HKCU\…\Run` at **user logon** — this is what turned a 3-seat dependency into a logon dependency | live `web.config` + SHA256 + `applicationHost.config` site-49 block + `Get-NetTCPConnection` (18182 → `node …\claudish-relay-po2025\relay.js`) + `HKCU\…\Run` read |
