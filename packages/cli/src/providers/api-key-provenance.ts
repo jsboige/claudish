@@ -163,7 +163,7 @@ function readDotenvKey(envVars: string[]): string | null {
 
 function readConfigKey(envVar: string): string | null {
   try {
-    const configPath = join(homedir(), ".claudish", "config.json");
+    const configPath = process.env.CLAUDISH_CONFIG_PATH ?? join(homedir(), ".claudish", "config.json");
     if (!existsSync(configPath)) return null;
     const cfg = JSON.parse(readFileSync(configPath, "utf-8")) as {
       apiKeys?: Record<string, string>;

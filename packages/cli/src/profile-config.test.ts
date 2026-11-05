@@ -1,5 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { mergeLoadedConfig } from "./profile-config.js";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { configExists, configFilePath, getConfigPath, mergeLoadedConfig } from "./profile-config.js";
 
 // #410 — loadConfig() is a hand-rolled field-by-field copy; a field present in
 // the interface but missing from the copy list is silently dropped from every
@@ -39,5 +41,33 @@ describe("mergeLoadedConfig (#410)", () => {
     expect(merged.proxyKey).toBe("pk");
     expect(merged.proxyKeyPrevious).toBe("old-pk");
     expect(merged.providerConcurrency).toEqual({ "glm-coding": 4 });
+  });
+});
+
+// #791 — CLAUDISH_CONFIG_PATH moves the resolved config path for the whole
+// process. Read per call (never latched at import), so a test can set it in
+// beforeAll; unset, the value is the historical ~/.claudish/config.json.
+describe("configFilePath override (#791)", () => {
+  it("unset resolves to ~/.claudish/config.json", () => {
+    const prev = process.env.CLAUDISH_CONFIG_PATH;
+    delete process.env.CLAUDISH_CONFIG_PATH;
+    try {
+      expect(configFilePath()).toBe(join(homedir(), ".claudish", "config.json"));
+    } finally {
+      if (prev !== undefined) process.env.CLAUDISH_CONFIG_PATH = prev;
+    }
+  });
+
+  it("set overrides every reader (getConfigPath and configExists follow it)", () => {
+    const prev = process.env.CLAUDISH_CONFIG_PATH;
+    process.env.CLAUDISH_CONFIG_PATH = join(tmpdir(), "no-such-claudish-791", "config.json");
+    try {
+      expect(configFilePath()).toBe(process.env.CLAUDISH_CONFIG_PATH);
+      expect(getConfigPath()).toBe(process.env.CLAUDISH_CONFIG_PATH);
+      expect(configExists()).toBe(false); // the override is followed, not ignored
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDISH_CONFIG_PATH;
+      else process.env.CLAUDISH_CONFIG_PATH = prev;
+    }
   });
 });

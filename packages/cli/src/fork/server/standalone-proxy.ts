@@ -19,7 +19,7 @@ import { join } from "node:path";
 // Load stored API keys from ~/.claudish/config.json
 function loadStoredApiKeys(): void {
   try {
-    const configPath = join(homedir(), ".claudish", "config.json");
+    const configPath = process.env.CLAUDISH_CONFIG_PATH ?? join(homedir(), ".claudish", "config.json");
     if (!existsSync(configPath)) return;
     const raw = readFileSync(configPath, "utf-8");
     const cfg = JSON.parse(raw) as {

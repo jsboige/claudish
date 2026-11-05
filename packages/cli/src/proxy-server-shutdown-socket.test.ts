@@ -24,16 +24,27 @@
  * unreachable (see test-support/stub-fetch.ts for the measurement).
  */
 
-import { describe, test, expect } from "bun:test";
+import { afterAll, beforeAll, describe, test, expect } from "bun:test";
 import net from "node:net";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
+import { clearRuntimeRegistry } from "./providers/runtime-providers.js";
 import { installStubFetch } from "./test-support/stub-fetch.js";
 
 const PORT_BASE = 19860;
-const CONFIG_PATH = join(homedir(), ".claudish", "config.json");
+
+// #791 — this suite used to overwrite the REAL ~/.claudish/config.json with a
+// minimal object (restore in `finally`) for the ~1.5 s the slow-upstream test
+// runs, so any deferred async work reading the config inside that window saw
+// an amputated object (no modelMap, no providers, one extra `slow-ep`
+// endpoint). It now points the process at a scratch file via
+// CLAUDISH_CONFIG_PATH and pins that the real file is byte-identical from
+// beforeAll to afterAll — red the moment any path writes it again.
+const REAL_CONFIG_PATH = join(homedir(), ".claudish", "config.json");
+const SCRATCH_DIR = mkdtempSync(join(tmpdir(), "claudish-791-shutdown-"));
+const SCRATCH_CONFIG_PATH = join(SCRATCH_DIR, "config.json");
 
 function nextPort(): number {
   return PORT_BASE + Math.floor(Math.random() * 120);
@@ -57,6 +68,24 @@ describe("#630 shutdown waits only for consumable work", () => {
   // well under 1 s can only come from the gate refusing to count the socket,
   // never from the grace having elapsed.
   const GRACE_MS = 5000;
+
+  let realConfigBefore: string | null = null;
+  beforeAll(() => {
+    realConfigBefore = existsSync(REAL_CONFIG_PATH) ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
+    process.env.CLAUDISH_CONFIG_PATH = SCRATCH_CONFIG_PATH;
+  });
+  afterAll(() => {
+    delete process.env.CLAUDISH_CONFIG_PATH;
+    // #791 pin: nothing this suite does may touch the real config.
+    const after = existsSync(REAL_CONFIG_PATH) ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
+    expect(after).toBe(realConfigBefore);
+    // #791 registry channel: createProxyServer registered `slow-ep` from the
+    // scratch config into the process-global runtime-provider map; without
+    // this clear the entry outlives the suite and a later suite's proxy can
+    // still resolve it (the second leak candidate of #791).
+    clearRuntimeRegistry();
+    rmSync(SCRATCH_DIR, { recursive: true, force: true });
+  });
 
   function withGrace<T>(fn: () => Promise<T>): Promise<T> {
     const previous = process.env.CLAUDISH_SHUTDOWN_GRACE_MS;
@@ -96,14 +125,13 @@ describe("#630 shutdown waits only for consumable work", () => {
     const UPSTREAM_DELAY_MS = 1500;
     const realFetch = globalThis.fetch;
 
-    const configExisted = existsSync(CONFIG_PATH);
-    const configBackup = configExisted ? readFileSync(CONFIG_PATH, "utf-8") : null;
     const savedProxyKey = process.env.CLAUDISH_PROXY_KEY;
     const savedPreviousKey = process.env.CLAUDISH_PROXY_KEY_PREVIOUS;
     delete process.env.CLAUDISH_PROXY_KEY;
     delete process.env.CLAUDISH_PROXY_KEY_PREVIOUS;
+    // #791: the scratch file CLAUDISH_CONFIG_PATH points at — not the real one.
     writeFileSync(
-      CONFIG_PATH,
+      SCRATCH_CONFIG_PATH,
       JSON.stringify({
         customEndpoints: {
           "slow-ep": { kind: "simple", url: "http://127.0.0.1:1/slow/v1", format: "openai", apiKey: "test-key" },
@@ -177,12 +205,6 @@ describe("#630 shutdown waits only for consumable work", () => {
       expect(elapsed).toBeLessThan(GRACE_MS);
     } finally {
       restoreFetch();
-      if (configBackup !== null) writeFileSync(CONFIG_PATH, configBackup, "utf-8");
-      else if (!configExisted && existsSync(CONFIG_PATH)) {
-        try {
-          rmSync(CONFIG_PATH);
-        } catch {}
-      }
       if (savedProxyKey === undefined) delete process.env.CLAUDISH_PROXY_KEY;
       else process.env.CLAUDISH_PROXY_KEY = savedProxyKey;
       if (savedPreviousKey === undefined) delete process.env.CLAUDISH_PROXY_KEY_PREVIOUS;
