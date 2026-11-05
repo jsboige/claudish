@@ -244,6 +244,9 @@ services:
       # compose line missing at merge, compose-env-coverage red on main. Same
       # initFailover startup read as the knobs above — a flip needs a recreate.
       - CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES=${CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES:-}
+      # #875 — a bucket wall lifts at the reset its refusal announced (shorten
+      # only). Kill switch, default on; same startup read — a flip needs a recreate.
+      - CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET=${CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET:-}
       # #299-B — one-shot overload walk kill switch. Unlike the knobs above this
       # is a read-per-request switch (the fleet flips it mid-flight; no recreate),
       # but a container still needs the NAME here to ever see any value at all.
