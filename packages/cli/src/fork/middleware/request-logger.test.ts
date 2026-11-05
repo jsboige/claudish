@@ -27,7 +27,18 @@ async function waitForCapture(dir: string, timeoutMs = 2000): Promise<string | n
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const files = readdirSync(dir).filter((f) => f.startsWith("req-") && f.endsWith(".json"));
-    if (files.length > 0) return join(dir, files[0]);
+    for (const f of files) {
+      const path = join(dir, f);
+      // #831 class: a directory entry is not a completed write. The capture
+      // write is fire-and-forget async, so between create and flush the file
+      // reads as a JSON prefix — settle on read+parse, never on existence.
+      try {
+        JSON.parse(readFileSync(path, "utf8"));
+        return path;
+      } catch {
+        // still being written — keep polling
+      }
+    }
     await new Promise((r) => setTimeout(r, 25));
   }
   return null;
@@ -72,6 +83,37 @@ describe("request-logger capture (fork)", () => {
     expect(json.body.model).toBe("claude-haiku-4-5-20251001");
     // filename contract: req-<pid>-<NNNN>-<ts>-<src>.json (split handles win + unix separators)
     expect(file!.split(/[/\\]/).pop()).toMatch(/^req-\d+-\d{4}-[\dT-]+-[A-Za-z0-9._-]+\.json$/);
+  });
+
+  // #831 class, pinned without racing the real writer: a capture name can be
+  // visible in the directory while the fire-and-forget write is still a JSON
+  // prefix. waitForCapture must not hand that prefix to JSON.parse — it did
+  // before this pin (existence-only), which is what fell the macOS leg.
+  //
+  // Contained on purpose (CR #859): the pin writes into its OWN directory, never
+  // `capDir`, and the delayed write's timer is cleared in a `finally`. Under the
+  // existence-only mutation this test fails fast — uncontained, its 100 ms timer
+  // then fired after `afterEach` had dropped `capDir`, and whichever test was
+  // running at +100 ms took the blame for the pin's own write.
+  it("waitForCapture refuses a half-written capture, then settles when the writer finishes (#831 class)", async () => {
+    const pinDir = join(tmpdir(), `claudish-capture-pin-${process.pid}-${Date.now()}`);
+    mkdirSync(pinDir, { recursive: true });
+    const partial = join(pinDir, "req-1-0001-2026-11-04T00-00-00-000Z-test.json");
+    writeFileSync(partial, '{"ts":"2026-11-04T00:00:00.000Z","src":"test"');
+    let writer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = waitForCapture(pinDir, 5000);
+      writer = setTimeout(() => {
+        writeFileSync(partial, '{"ts":"2026-11-04T00:00:00.000Z","src":"test","machine":"myia-test"}');
+      }, 100);
+      const file = await settled;
+      expect(file).toBe(partial);
+      const json = JSON.parse(readFileSync(file!, "utf8"));
+      expect(json.machine).toBe("myia-test");
+    } finally {
+      if (writer !== undefined) clearTimeout(writer);
+      rmSync(pinDir, { recursive: true, force: true });
+    }
   });
 
   // #41 — the workspace half of the attribution chain. `machine` alone let a
