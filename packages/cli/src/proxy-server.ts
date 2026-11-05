@@ -1197,9 +1197,13 @@ export async function createProxyServer(
   // to the seams that exist on this base. Deliberately narrower than main's
   // loop — the gap list is enumerated in the PR and each entry lands as its own
   // grain: no #565 context-admission census, no #654 endpoint token budget, no
-  // #218 native-lane version pin, no #693 machine-scoped resolution arm (the
-  // ported resolveFailoverTargetForSession takes no machine argument), no #769
-  // unroutable-step skip (a RoutingError at construction surfaces).
+  // #218 native-lane version pin, no #769 unroutable-step skip (a RoutingError
+  // at construction surfaces).
+  // #693 (machine-scoped step exclusion) IS wired below: the loop already
+  // reads `machineHeader` for the session budget (#317), so the walk it drives
+  // — armed resolution, session resolution, #299-B overload walk — is the same
+  // machine's, without main's extra `getHandlerForRequest` parameter (this
+  // base resolves at the loop, never inside `getHandlerForRequest`).
   // Port-map row 8 (#306 drain-freeze) IS ported — the proxy half only; the
   // drain script that poses the flag is main-only surface (see the
   // admission-freeze module header). Gate below at all three admissions.
@@ -1436,7 +1440,7 @@ export async function createProxyServer(
         override && rule
           ? { step: rule.steps[override.stepIndex], stepIndex: override.stepIndex }
           : role && !keylessNative
-            ? resolveFailoverTargetForSession(role, sessionKey, bucket, skippedSteps)
+            ? resolveFailoverTargetForSession(role, sessionKey, bucket, skippedSteps, machineHeader)
             : { step: null as FailoverStep | null, stepIndex: -1 };
       const { stepIndex } = resolved;
       // #274: when this attempt serves a role-step's DELEGATION, the bookkeeping
@@ -1895,6 +1899,7 @@ export async function createProxyServer(
           const walk = await resolveTransientStep(role, {
             bucketOf: async (t) => concreteStepBucketOfSync(t),
             nominalBucket: bucket ?? undefined,
+            machine: machineHeader,
           }).catch(() => null);
           if (walk) {
             log(
@@ -2028,6 +2033,7 @@ export async function createProxyServer(
                 bucketOf: async (t) => concreteStepBucketOfSync(t),
                 nominalBucket: bucket ?? undefined,
                 afterStepIndex: walk.stepIndex,
+                machine: machineHeader,
               }).catch(() => null);
               if (budgetSkip) {
                 const skipped = await attemptWalkStep(budgetSkip);
@@ -2085,6 +2091,7 @@ export async function createProxyServer(
                 bucketOf: async (t) => concreteStepBucketOfSync(t),
                 nominalBucket: bucket ?? undefined,
                 afterStepIndex: walk.stepIndex,
+                machine: machineHeader,
               }).catch(() => null);
               if (nextWalk) {
                 log(
