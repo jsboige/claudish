@@ -163,6 +163,11 @@ services:
       # same tick retries on this model, which the hub resolves on the sonnet
       # role. Empty = the built-in glm-5.3.
       - CLAUDISH_RELAY_PROBE_FALLBACK_MODEL=${CLAUDISH_RELAY_PROBE_FALLBACK_MODEL:-}
+      # Budget of the deep probe's FIRST attempt (#867 track 2 / #868). Empty =
+      # the built-in 10 s; "0" = kill switch (first attempt at the full 30 s,
+      # the pre-#867 behavior); out of [1000, 30000] falls back to 10 s. Read
+      # per call. Listed here because the env file only interpolates.
+      - CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS=${CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS:-}
       # Native credential guard kill switch (#296): only an explicit "0" disarms;
       # empty = guard on. Listed here because the env file only interpolates —
       # a name absent from this list never reaches the container.
