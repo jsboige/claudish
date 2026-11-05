@@ -226,10 +226,14 @@ window:
   `HEARTBEAT_INTERVAL_MS = 10_000` (`:1285`) — the probe launches on that tick, inline. One
   container, one process lifetime, three windows on 2026-11-04 (po-2028): 69,70 s − 3 672 ms =
   **66,03 s** · 68,70 s − 2 606 ms = **66,10 s** · 87,11 s − 21 101 ms = **66,01 s** — a 60 s
-  cooldown plus one 6 s alignment draw. po-2023 lands **61,9 s on five windows** (heartbeat
-  threshold 9 s): same envelope, luckier alignment — the non-probe term is bounded by one
-  heartbeat interval, it is not a fixed constant, and quoting one seat's draw as *the* floor
-  would under-state a real outage by up to that interval. The fourth po-2028 window reads
+  cooldown plus 6 s of tick alignment. **For a heartbeat-timeout flip that alignment is not a
+  draw, it is `10 − t`**: `markFail` stamps `lastFlipAt` when the second heartbeat gives up, `t`
+  after its tick (`t` = `CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS`, default `HEARTBEAT_TIMEOUT_MS =
+  4_000`), so the first tick past the cooldown is the seventh and `window − probe = 70 − t` —
+  66 s on the 4 s default, **61,9 s on po-2023's five windows** at 9 s (po-2027 measured the
+  same 61 s at 9 s, #867). Only a flip stamped off-tick (`forward-connect`, `forward-http-*`)
+  draws its alignment anywhere in [60, 70] s. Quoting one seat's 66 s as *the* floor
+  mis-states a seat on another heartbeat timeout by the difference. The fourth po-2028 window reads
   147,24 s − 1 218 ms = **146,0 s** on the same arithmetic — the day po-2025's *host* rebooted
   at 13:44:56Z, the cooldown expired while the hub was still down and the probe waited for its
   hearing. On a first-attempt probe timeout, add the full first budget (30 s default; 10 s under
