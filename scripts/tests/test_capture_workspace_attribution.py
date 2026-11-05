@@ -55,6 +55,7 @@ would silently manufacture a conclusion about WHERE the fleet's responses go:
 """
 
 import importlib.util
+import json
 import os
 import sys
 from datetime import date, timedelta
@@ -437,6 +438,88 @@ def pin_gh_write_class_and_precedence():
            "pr outranks dash within one tour, got %r" % agg["workspaces"]["claudish"]["classes"])
 
 
+def pin_served_model_from_resp_name():
+    # Shapes copied from real captures (06/22 archive and the live 11/05 dir).
+    sse = wsattr.served_model("resp-1-r0003-2026-06-22T06-55-49-811Z-openai-qwen3.6-35b-a3b.sse")
+    _check(sse == "openai-qwen3.6-35b-a3b", "the served id is everything after the timestamp, got %r" % sse)
+    nat = wsattr.served_model("resp-1-r0001-2026-06-22T06-55-46-500Z-native-claude-opus-4-8.sse")
+    _check(nat == "native-claude-opus-4-8", "the wire prefix is kept, got %r" % nat)
+    js = wsattr.served_model("resp-2-r17-2026-11-05T08-19-50-009Z-openai-swift-1.5-27b.json")
+    _check(js == "openai-swift-1.5-27b", "a buffered (.json) response names its model too, got %r" % js)
+    _check(wsattr.served_model("req-1-0001-2026-06-22T06-55-46-378Z-direct.json") is None,
+           "a request name is not a response name")
+
+
+def pin_model_family_mapping():
+    cases = {
+        "openai-glm-5.2": "glm",
+        "anthropic-glm-5.3": "glm",
+        "openai-swift-1.5-27b": "swift",
+        "openai-qwen3.6-35b-a3b": "qwen",
+        "native-claude-opus-4-8": "claude",
+        "anthropic-MiniMax-M3.1-Flash": "minimax",
+        "openai-deepseek-v4.1-flash-1017": "deepseek",
+        "openai-k3": "kimi",
+        "openai-gpt-6-luna": "openai",
+        "openai-something-new": "other",
+    }
+    for served, fam in cases.items():
+        got = wsattr.model_family(served)
+        _check(got == fam, "%s -> %s expected, got %r" % (served, fam, got))
+    _check(wsattr.model_family(None) == wsattr.NO_RESP, "no paired response is its own class, never 'other'")
+
+
+def pin_families_aggregate_per_workspace():
+    rows = [
+        {"ws": "coursia", "session": "s1", "in": 1, "out": 1, "paired": True, "model": "anthropic-glm-5.2"},
+        {"ws": "coursia", "session": "s1", "in": 1, "out": 1, "paired": True, "model": "openai-glm-5.3"},
+        {"ws": "coursia", "session": "s2", "in": 1, "out": 1, "paired": True, "model": "native-claude-opus-4-8"},
+        {"ws": "claudish", "session": "s9", "in": 0, "out": 0, "paired": False, "model": None},
+    ]
+    w = wsattr.aggregate_tours(rows, None)["workspaces"]
+    _check(w["coursia"]["families"] == {"glm": 2, "claude": 1},
+           "families count served responses per workspace, got %r" % w["coursia"]["families"])
+    _check(w["coursia"]["models"]["anthropic-glm-5.2"] == 1 and w["coursia"]["models"]["openai-glm-5.3"] == 1,
+           "the served id keeps the GLM version apart (the C3 discriminant)")
+    _check(w["claudish"]["families"] == {wsattr.NO_RESP: 1}, "an unpaired request lands in (no-resp)")
+
+
+def _hermes_env(system) -> bytes:
+    """A non-CC envelope whose system prompt opens like the live Hermes one (05/11)."""
+    return json.dumps({"machine": "myia-ai-01", "body": {
+        "model": "claude-sonnet-5-5", "system": system,
+        "messages": [{"role": "user", "content": "état du cluster ?"}]}}).encode()
+
+
+def pin_split_noncc_is_opt_in_and_reads_the_system_start():
+    hermes = _hermes_env([{"type": "text", "text": "# Hermes — Orchestrateur du Cluster Myia AI\n"
+                                                     "Tu es Hermes, l'orchestrateur"}])
+    old = wsattr.SPLIT_NONCC
+    try:
+        wsattr.SPLIT_NONCC = False
+        _check(wsattr.workspace_key(hermes) == (wsattr.NON_CC, False),
+               "off by default: (non-cc) keeps its meaning for every existing caller")
+        wsattr.SPLIT_NONCC = True
+        _check(wsattr.workspace_key(hermes) == ("(non-cc:hermes)", False),
+               "the Hermes system prompt gets its own bucket, got %r" % (wsattr.workspace_key(hermes),))
+        # string-form system and OpenAI-ingress leading system message: same key
+        _check(wsattr.workspace_key(_hermes_env("Tu es Hermes, l'orchestrateur"))[0] == "(non-cc:hermes)",
+               "a string `system` is read too")
+        oai = json.dumps({"body": {"messages": [{"role": "system", "content": "Tu es Hermes."},
+                                                {"role": "user", "content": "hi"}]}}).encode()
+        _check(wsattr.workspace_key(oai)[0] == "(non-cc:hermes)", "a leading system-role message is read too")
+        # the name in the CONVERSATION, not the system prompt, is not a signature
+        talk = json.dumps({"body": {"system": "You are a code review assistant.",
+                                    "messages": [{"role": "user", "content": "Tu es Hermes ?"}]}}).encode()
+        _check(wsattr.workspace_key(talk)[0] == wsattr.NON_CC, "a mention in messages must not match")
+        # a Claude Code body is never re-bucketed, whatever its system prompt says
+        cc = _body(b"d:\\\\dev\\\\claudish")
+        _check(wsattr.workspace_key(cc) == ("claudish", True), "CC traffic keeps its workspace key")
+        _check(wsattr.workspace_key(b"not json")[0] == wsattr.NON_CC, "an unparseable body stays (non-cc)")
+    finally:
+        wsattr.SPLIT_NONCC = old
+
+
 PINS = [
     pin_plain_path,
     pin_previous_directory_suffix,
@@ -463,6 +546,10 @@ PINS = [
     pin_dm_send_is_a_write,
     pin_cron_stamp_is_per_request_and_header_confined,
     pin_cadence_separates_cron_from_human,
+    pin_served_model_from_resp_name,
+    pin_model_family_mapping,
+    pin_families_aggregate_per_workspace,
+    pin_split_noncc_is_opt_in_and_reads_the_system_start,
 ]
 
 

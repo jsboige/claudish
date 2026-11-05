@@ -184,11 +184,63 @@ def marker_line(body: bytes) -> str | None:
     return line.strip().rstrip("\\").strip()
 
 
+# --split-noncc: known non-Claude-Code callers, recognised by the START of their
+# system prompt (never by a substring anywhere in the body — a CC transcript that
+# discusses Hermes would match). Off by default: `(non-cc)` keeps its meaning for
+# every existing caller. Signature measured on the live hub 05/11: 235 of ~265
+# non-CC requests in one hour opened with "# Hermes — Orchestrateur du Cluster
+# Myia AI\nTu es Hermes", all from myia-ai-01.
+NON_CC_SIGNATURES: tuple[tuple[str, re.Pattern], ...] = (
+    ("hermes", re.compile(r"\bTu es Hermes\b")),
+)
+SIGNATURE_HEAD = 400
+SPLIT_NONCC = False
+
+
+def system_head(raw: bytes, limit: int = SIGNATURE_HEAD) -> str:
+    """First `limit` characters of the request's system prompt, or "".
+
+    Reads the top-level `system` (string or text blocks), else a leading
+    `role: "system"` message (OpenAI-ingress shape). Envelope and bare body
+    both accepted, like session_key. Never raises.
+    """
+    try:
+        env = json.loads(raw)
+    except ValueError:
+        return ""
+    body = env.get("body") if isinstance(env, dict) and isinstance(env.get("body"), dict) else env
+    if not isinstance(body, dict):
+        return ""
+    sysv = body.get("system")
+    text = ""
+    if isinstance(sysv, str):
+        text = sysv
+    elif isinstance(sysv, list):
+        text = " ".join(b["text"] for b in sysv if isinstance(b, dict) and isinstance(b.get("text"), str))
+    if not text:
+        msgs = body.get("messages")
+        if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
+            c = msgs[0].get("content")
+            text = c if isinstance(c, str) else ""
+    return text[:limit]
+
+
+def non_cc_key(raw: bytes) -> str:
+    """`(non-cc)`, or `(non-cc:<name>)` for a known caller when SPLIT_NONCC is on."""
+    if not SPLIT_NONCC:
+        return NON_CC
+    head = system_head(raw)
+    for name, rx in NON_CC_SIGNATURES:
+        if rx.search(head):
+            return f"{NON_CC[:-1]}:{name})"
+    return NON_CC
+
+
 def workspace_key(body: bytes) -> tuple[str, bool]:
     """(workspace key, came_from_claude_code)."""
     line = marker_line(body)
     if line is None:
-        return NON_CC, False
+        return non_cc_key(body), False
     path = PREVIOUS.sub("", line).strip()
     if not ABSOLUTE.match(path):
         # The marker also appears inside quoted CODE (a script or a prompt that
@@ -251,6 +303,45 @@ def resp_prefix_for(req_name: str) -> str | None:
     if not m:
         return None
     return f"resp-{m.group(1)}-r{m.group(2)}-"
+
+
+RESP_MODEL = re.compile(r"^resp-\d+-r\d+-\d{4}-\d{2}-\d{2}T[\d-]+Z-(.+)\.(?:sse|json)$")
+NO_RESP = "(no-resp)"
+# Ordered: the first family whose needle the served id contains wins. Kimi is
+# also served under a bare `k3` / `k3.1-pro` id (`kc@k3`), hence the `-k3` needle.
+FAMILIES = (
+    ("swift", ("swift",)),
+    ("glm", ("glm",)),
+    ("minimax", ("minimax",)),
+    ("deepseek", ("deepseek",)),
+    ("qwen", ("qwen",)),
+    ("kimi", ("kimi", "-k2", "-k3")),
+    ("claude", ("claude", "opus", "sonnet", "haiku")),
+    ("openai", ("gpt", "codex", "luna")),
+    ("mistral", ("mistral", "devstral", "codestral", "magistral")),
+    ("gemini", ("gemini",)),
+)
+
+
+def served_model(resp_base: str) -> str | None:
+    """`resp-1-r0003-<ts>Z-openai-qwen3.6-35b-a3b.sse` -> `openai-qwen3.6-35b-a3b`.
+
+    The response capture names the WIRE and the model that actually answered —
+    after routing, cascade and failover — which is what separates "this
+    workspace changed" from "the model serving it changed" (#445 grain C3).
+    """
+    m = RESP_MODEL.match(resp_base)
+    return m.group(1) if m else None
+
+
+def model_family(served: str | None) -> str:
+    if not served:
+        return NO_RESP
+    low = served.lower()
+    for fam, needles in FAMILIES:
+        if any(n in low for n in needles):
+            return fam
+    return "other"
 
 
 def usage_max(usage: dict) -> tuple[int, int]:
@@ -418,11 +509,12 @@ def read_tour_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict]
         if raw is None:
             continue
         key, _cc = workspace_key(raw)
-        row = {"ws": key, "session": session_key(raw), "in": 0, "out": 0, "paired": False}
+        row = {"ws": key, "session": session_key(raw), "in": 0, "out": 0, "paired": False, "model": None}
         pref = resp_prefix_for(base)
         if pref:
             for cand_base in list(on_disk):
                 if cand_base.startswith(pref):
+                    row["model"] = served_model(cand_base)
                     usage = usage_from_resp(on_disk[cand_base])
                     if usage is not None:
                         row["in"], row["out"] = usage
@@ -453,8 +545,12 @@ def aggregate_tours(rows: list[dict], fraction: float | None) -> dict:
     per: dict[str, dict] = {}
     no_session = 0
     for r in rows:
-        w = per.setdefault(r["ws"], {"reqs": 0, "sessions": set(), "in": 0, "out": 0, "paired": 0})
+        w = per.setdefault(r["ws"], {"reqs": 0, "sessions": set(), "in": 0, "out": 0, "paired": 0,
+                                     "families": collections.Counter(), "models": collections.Counter()})
         w["reqs"] += 1
+        served = r.get("model")
+        w["families"][model_family(served)] += 1
+        w["models"][served or NO_RESP] += 1
         if r["session"]:
             w["sessions"].add(r["session"])
         else:
@@ -465,7 +561,9 @@ def aggregate_tours(rows: list[dict], fraction: float | None) -> dict:
     out: dict[str, dict] = {}
     for k, v in per.items():
         entry = {"reqs": v["reqs"], "tours": len(v["sessions"]),
-                 "in_tok": v["in"], "out_tok": v["out"], "paired": v["paired"]}
+                 "in_tok": v["in"], "out_tok": v["out"], "paired": v["paired"],
+                 "families": dict(v["families"].most_common()),
+                 "models": dict(v["models"].most_common())}
         if fraction and fraction > 0:
             entry["tours_hi"] = round(len(v["sessions"]) / fraction)
             entry["est_in_tok"] = round(v["in"] / fraction)
@@ -932,7 +1030,11 @@ def main(argv=None) -> int:
     ap.add_argument("--census", help="jsonl of {day, resp} to scale counts into responses/day")
     ap.add_argument("--json", help="write the full result here")
     ap.add_argument("--scratch", default=None, help="extraction directory (default: system temp)")
+    ap.add_argument("--split-noncc", action="store_true",
+                    help="sub-bucket (non-cc) by known system-prompt signature, e.g. (non-cc:hermes)")
     args = ap.parse_args(argv)
+    global SPLIT_NONCC
+    SPLIT_NONCC = args.split_noncc
 
     dirs = tuple(args.archives_dir or DEFAULT_DIRS)
     if args.day:
@@ -1003,8 +1105,9 @@ def main(argv=None) -> int:
             for k, v in sorted(agg["workspaces"].items(), key=lambda kv: -kv[1]["reqs"])[:12]:
                 est = (f"  tours bound {v['tours']}..{v['tours_hi']}  ~in {v['est_in_tok']}  ~out {v['est_out_tok']}"
                        if "tours_hi" in v else "")
+                fams = " ".join(f"{f}:{c}" for f, c in list(v["families"].items())[:4])
                 print(f"    {k:<32} reqs={v['reqs']:>4}  tours={v['tours']:>3}"
-                      f"  in={v['in_tok']}  out={v['out_tok']}  paired={v['paired']}{est}", flush=True)
+                      f"  in={v['in_tok']}  out={v['out_tok']}  paired={v['paired']}{est}  [{fams}]", flush=True)
             continue
         counts: collections.Counter = collections.Counter()
         n = 0
