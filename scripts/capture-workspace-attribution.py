@@ -122,6 +122,28 @@ fleet's mandated forms since #4243), where a `\bgit\s+push\b` regex reads
 None. The same walk REFUSES matches inside quoted arguments: `git commit -m
 "then git push"` and `grep "gh pr create" log` carry the words, not the act.
 Pin: `pin_fleet_push_forms_and_quoted_words`.
+
+⚠ TRAP C1 — THE CRON STAMP IS PER REQUEST, AND A STRIDE MISSES MOST LAUNCHES
+(C5 axis). The marker (`workload` on the envelope post-#98, `cc_workload=cron`
+in the billing header before) is carried by the cron-fired TURN's own requests
+and by nothing else (`live-consumption.py` TRAP 8): continuations and later
+turns of the same session do not carry it, so "unmarked" means "not stamped
+here", never "a human is driving". Two consequences, both kept visible rather
+than corrected away:
+  - a TOUR is `cron` when ANY of its sampled rows is marked. With a stride of
+    ~2.6% of a day's requests, a cron-launched turn whose own row was skipped
+    lands in the `human` bucket. The bias is therefore one-directional:
+    `cron` UNDER-counts, `human` OVER-counts, and the cron zero-write share is
+    biased DOWN — the recommendation errs toward keeping capacity, which is
+    the safe direction;
+  - the FIRE UNIT is the tour, not the row. A first version scaled marked rows
+    by `1/fraction` and reported 14 465 "fires/day" on coursia — the stamp
+    rides every request of the turn, so a marked row is a request inside a
+    fire, never a fire. `tours_per_day` is the fire count (a lower bound, per
+    the bias above), and rows survive only as `marked_rows_per_tour`, which
+    measures how far the stamp reaches inside one tour. C1 (`turn-autopsy.py`)
+    counts turn-starts; the two are not the same unit and are never summed.
+Pin: `pin_cron_stamp_is_per_request_and_header_confined`.
 """
 
 import argparse
@@ -131,6 +153,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date, timedelta
 
 MARKER = b"Primary working directory:"
@@ -464,6 +487,11 @@ MSGS_TOOL = "mcp__roo-state-manager__roosync_messages"
 # the tour's deliverable. inbox/mark_read/archive/cleanup are bookkeeping.
 MSGS_WRITE_ACTIONS = {"send", "reply", "amend"}
 COMPACT_RX = re.compile(r"continued from a previous conversation", re.IGNORECASE)
+# One oversized capture must never take a whole day down: `json.loads` on a
+# multi-hundred-MB member raised MemoryError mid-week on 2026-10-30.
+MAX_CAPTURE_BYTES = 48 * 1024 * 1024
+EXTRACT_BATCH = 40          # members per py7zr extract call (bounded buffers)
+SKIPPED: list[tuple[str, str]] = []   # (day, member) unreadable captures
 CLASS_RANK = {"pr": 3, "gh-write": 2, "dash": 1, "dm": 1}
 
 # Global flags (before the subcommand) that take their argument as the NEXT
@@ -543,6 +571,43 @@ def classify_tool_use(name, inp) -> tuple[str | None, bool]:
     return None, False
 
 
+CRON_ENV_KEY = "workload"
+CRON_HEADER_RE = re.compile(r"cc_workload=cron")
+
+
+def cron_flagged(env, payload: dict) -> bool:
+    """True when THIS request is a cron-fired turn start (C5 axis).
+
+    Two detectors, in the order `live-consumption.py` already fixes: the
+    capture ENVELOPE's `workload` (post-#98, exact) decides when present, and
+    the pre-#98 `cc_workload=cron` billing header is the fallback. Semantics
+    are that script's TRAP 8: the marker is a PER-REQUEST stamp carried by the
+    cron-fired turn's own requests — tool-loop continuations and later turns
+    of the same session do NOT carry it. So "unmarked" means "not stamped on
+    this request", never "a human is driving".
+
+    The header is searched in `system` ONLY, not in the raw body: a transcript
+    pasted into the conversation quotes the marker, and a whole-file byte
+    search would stamp that request cron (the same trap W2/W7 as the write
+    classifier). `live-consumption.py` greps the file; this is deliberately
+    stricter.
+    """
+    wl = env.get(CRON_ENV_KEY) if isinstance(env, dict) else None
+    if isinstance(wl, str) and wl.strip():
+        return wl.strip().lower() == "cron"
+    sysfield = payload.get("system")
+    texts: list[str] = []
+    if isinstance(sysfield, str):
+        texts.append(sysfield)
+    elif isinstance(sysfield, list):
+        for b in sysfield:
+            if isinstance(b, dict) and isinstance(b.get("text"), str):
+                texts.append(b["text"])
+            elif isinstance(b, str):
+                texts.append(b)
+    return any(CRON_HEADER_RE.search(t) for t in texts)
+
+
 def assistant_tool_uses(payload: dict) -> list[tuple]:
     """(id, name, input) of every tool_use in ASSISTANT messages.
 
@@ -583,19 +648,63 @@ def read_write_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict
     """One row per sampled request: workspace, session, compacted, tool uses.
 
     No response pairing: the write classes read the request history alone, so
-    only `req-*` members are extracted.
+    only `req-*` members are extracted. Extraction is batched and size-gated:
+    `py7zr` itself raised MemoryError decompressing one oversized member
+    (2026-10-29), before any post-extraction cap could apply.
     """
     path = archive_for(day, dirs)
     if not path or not names:
         return []
     import py7zr
 
+    # a crashed run leaves extracted members behind; same basenames would then
+    # shadow this day's files, so sweep the scratch first
+    for root, _dirs, files in os.walk(scratch):
+        for fn in files:
+            try:
+                os.remove(os.path.join(root, fn))
+            except OSError:
+                pass
+
     with py7zr.SevenZipFile(path) as z:
+        sizes = {i.filename: i.uncompressed for i in z.list()}
         available = {os.path.basename(n): n for n in z.getnames()}
-        targets = [available[n] for n in names if n in available]
+        targets = []
+        for n in names:
+            member = available.get(n)
+            if member is None:
+                continue
+            if sizes.get(member, 0) > MAX_CAPTURE_BYTES:
+                SKIPPED.append((day, os.path.basename(n)))
+                continue
+            targets.append(member)
         if not targets:
             return []
-        z.extract(targets=targets, path=scratch)
+        for i in range(0, len(targets), EXTRACT_BATCH):
+            batch = targets[i:i + EXTRACT_BATCH]
+            try:
+                z.reset()
+                z.extract(targets=batch, path=scratch)
+            except MemoryError:
+                # fall back to one member at a time: the oversized one is
+                # identified and skipped, the rest of the batch survives
+                for member in batch:
+                    try:
+                        with py7zr.SevenZipFile(path) as z2:
+                            z2.extract(targets=[member], path=scratch)
+                    except (MemoryError, py7zr.Bad7zFile, OSError):
+                        SKIPPED.append((day, os.path.basename(member)))
+            except OSError:
+                # DriveFS can serve an archive and drop it between batches
+                # (measured: captures-2026-10-26.7z listed, then gone). One
+                # bounded retry gives the mount time to rehydrate; a second
+                # failure skips the batch, it does not kill the week.
+                time.sleep(2)
+                try:
+                    z.reset()
+                    z.extract(targets=batch, path=scratch)
+                except (MemoryError, OSError):
+                    SKIPPED.extend((day, os.path.basename(m)) for m in batch)
 
     on_disk: dict[str, str] = {}
     for root, _dirs, files in os.walk(scratch):
@@ -608,20 +717,37 @@ def read_write_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict
         fp = on_disk.pop(base, None)
         if not fp or not os.path.isfile(fp):
             continue
-        with open(fp, "rb") as f:
-            raw = f.read()
+        try:
+            size = os.path.getsize(fp)
+        except OSError:
+            continue
+        if size > MAX_CAPTURE_BYTES:
+            # A capture this large is an outlier (a giant tool result), and
+            # `json.loads` on it is what killed a full week run. Skip it
+            # LOUDLY rather than let one member take the whole day down.
+            SKIPPED.append((day, base))
+            os.remove(fp)
+            continue
+        try:
+            with open(fp, "rb") as f:
+                raw = f.read()
+        except OSError:
+            os.remove(fp)
+            continue
         os.remove(fp)
         try:
             env = json.loads(raw)
-        except ValueError:
-            env = None
+        except (ValueError, MemoryError, RecursionError):
+            SKIPPED.append((day, base))
+            continue
         payload = env.get("body") if isinstance(env, dict) and isinstance(env.get("body"), dict) else env
         if not isinstance(payload, dict):
             continue
         uses = [(uid, nm) + classify_tool_use(nm, inp)
                 for uid, nm, inp in assistant_tool_uses(payload)]
         rows.append({"day": day, "ws": workspace_key(raw)[0], "session": session_key(raw),
-                     "compacted": compaction_flagged(payload), "uses": uses})
+                     "compacted": compaction_flagged(payload),
+                     "cron": cron_flagged(env, payload), "uses": uses})
     for p in list(on_disk.values()):
         if os.path.isfile(p):
             os.remove(p)
@@ -648,9 +774,12 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
             no_session += 1
             continue
         t = tours.setdefault((r["day"], r["ws"], r["session"]),
-                             {"ids": {}, "compacted": False, "reqs": 0})
+                             {"ids": {}, "compacted": False, "reqs": 0,
+                              "cron": False, "cron_rows": 0})
         t["reqs"] += 1
         t["compacted"] = t["compacted"] or r["compacted"]
+        t["cron"] = t["cron"] or bool(r.get("cron"))
+        t["cron_rows"] += 1 if r.get("cron") else 0
         for uid, _nm, cls, pr_create in r["uses"]:
             cur = t["ids"].get(uid)
             if cur is None or (cls is not None and CLASS_RANK[cls] > CLASS_RANK[cur]):
@@ -668,11 +797,31 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
     for (day, ws, sess), t in tours.items():
         w = per_ws.setdefault(ws, {"tours": 0, "zero": 0, "compacted": 0, "reqs": 0,
                                    "reqs_zero": 0, "cls": collections.Counter(),
-                                   "create_ids": set(), "create_first_day": {}})
+                                   "create_ids": set(), "create_first_day": {},
+                                   "cron_tours": 0, "cron_zero": 0, "cron_reqs": 0,
+                                   "cron_writes": 0, "cron_rows_by_day": collections.Counter(),
+                                   "cron_cls": collections.Counter(),
+                                   "human_tours": 0, "human_zero": 0, "human_reqs": 0,
+                                   "human_writes": 0, "human_cls": collections.Counter()})
         w["tours"] += 1
         w["reqs"] += t["reqs"]
         cls = max((c for c in t["ids"].values() if c), key=lambda c: CLASS_RANK[c], default=None)
+        n_writes = len([u for u, c in t["ids"].items() if c])
+        if t["cron"]:
+            w["cron_tours"] += 1
+            w["cron_reqs"] += t["reqs"]
+            w["cron_writes"] += n_writes
+            w["cron_rows_by_day"][day] += t["cron_rows"]
+            if not cls:
+                w["cron_zero"] += 1
+        else:
+            w["human_tours"] += 1
+            w["human_reqs"] += t["reqs"]
+            w["human_writes"] += n_writes
+            if not cls:
+                w["human_zero"] += 1
         if cls:
+            (w["cron_cls"] if t["cron"] else w["human_cls"])[cls] += 1
             w["cls"][cls] += 1
         else:
             w["zero"] += 1
@@ -700,6 +849,30 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
         for uid, day in w["create_first_day"].items():
             frac = rows_per_day[day] / max(totals_by_day.get(day, 1), 1)
             pr_scaled += (1 / frac) if frac > 0 else 0.0
+        # C5: a FIRE is a cron-driven TOUR. The stamp is a per-request marker
+        # that rides every request of that turn, so counting marked rows (even
+        # unscaled) over-counts fires by the depth of the turn — measured at
+        # 14 465 "fires/day" on coursia before this was fixed. Rows are kept
+        # only as `marked_rows_per_tour`, which measures how far the stamp
+        # reaches inside one tour.
+        cron_rows_total = sum(w["cron_rows_by_day"].values())
+        cadence = {}
+        for name, tours_n, zero_n, reqs_n, writes_n, cls_c in (
+                ("cron", w["cron_tours"], w["cron_zero"], w["cron_reqs"],
+                 w["cron_writes"], w["cron_cls"]),
+                ("human", w["human_tours"], w["human_zero"], w["human_reqs"],
+                 w["human_writes"], w["human_cls"])):
+            cadence[name] = {
+                "tours": tours_n,
+                "tours_per_day": round(tours_n / ndays, 2),
+                "pct_zero": round(100 * zero_n / tours_n, 1) if tours_n else None,
+                "writes_per_tour": round(writes_n / tours_n, 2) if tours_n else None,
+                "reqs_per_write": round(reqs_n / writes_n, 1) if writes_n else None,
+                "reqs": reqs_n,
+                "classes": dict(cls_c),
+            }
+        cadence["cron"]["marked_rows_per_tour"] = (
+            round(cron_rows_total / w["cron_tours"], 2) if w["cron_tours"] else None)
         out_ws[ws] = {
             "tours": w["tours"], "tours_per_day": round(w["tours"] / ndays, 1),
             "pct_zero": round(100 * w["zero"] / w["tours"], 1) if w["tours"] else None,
@@ -709,6 +882,7 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
             "reqs_zero_est_per_day": round(est_zero / ndays),
             "pr_create_counted": len(w["create_ids"]),
             "pr_create_scaled": round(pr_scaled, 1),
+            "cadence": cadence,
         }
     per_day_detail: dict[str, dict] = collections.defaultdict(lambda: {"tours": 0, "zero": 0})
     for (day, ws, sess), t in tours.items():
@@ -794,7 +968,9 @@ def main(argv=None) -> int:
                               "req_total": sum(totals.values()), "missing_days": missing, **agg}
             print(f"{label}  sampled={len(rows)}/{sum(totals.values())}"
                   f"  no_session={agg['no_session']}"
-                  + (f"  missing={','.join(missing)}" if missing else ""), flush=True)
+                  + (f"  missing={','.join(missing)}" if missing else "")
+                  + (f"  captures_illisibles={len(SKIPPED)}" if SKIPPED else ""),
+                  flush=True)
             for k, v in sorted(agg["workspaces"].items(), key=lambda kv: -kv[1]["tours"])[:12]:
                 print(f"    {k:<24} tours={v['tours']:>4} ({v['tours_per_day']}/d)"
                       f"  zero={v['pct_zero']}%  compacted={v['pct_compacted']}%"
@@ -802,6 +978,15 @@ def main(argv=None) -> int:
                       f" (zero {v['reqs_zero_est_per_day']})"
                       f"  pr_create={v['pr_create_counted']} (scaled {v['pr_create_scaled']})",
                       flush=True)
+            print("    — cadence (C5) : cron = un tir lancé par cron ; la borne est "
+                  "UNIDIRECTIONNELLE (TRAP C1 : cron sous-compte, human sur-compte)",
+                  flush=True)
+            for k, v in sorted(agg["workspaces"].items(), key=lambda kv: -kv[1]["tours"])[:12]:
+                c = v["cadence"]["cron"]
+                print(f"    {k:<24} cron tours={c['tours']:>3} ({c['tours_per_day']}/d)"
+                      f"  stampes/tour={c['marked_rows_per_tour']}  zero={c['pct_zero']}%"
+                      f"  writes/tir={c['writes_per_tour']}  req/write={c['reqs_per_write']}"
+                      f"  {c['classes']}", flush=True)
             continue
         if args.tours:
             rows: list[dict] = []
