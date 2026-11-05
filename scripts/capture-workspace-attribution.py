@@ -184,11 +184,63 @@ def marker_line(body: bytes) -> str | None:
     return line.strip().rstrip("\\").strip()
 
 
+# --split-noncc: known non-Claude-Code callers, recognised by the START of their
+# system prompt (never by a substring anywhere in the body — a CC transcript that
+# discusses Hermes would match). Off by default: `(non-cc)` keeps its meaning for
+# every existing caller. Signature measured on the live hub 05/11: 235 of ~265
+# non-CC requests in one hour opened with "# Hermes — Orchestrateur du Cluster
+# Myia AI\nTu es Hermes", all from myia-ai-01.
+NON_CC_SIGNATURES: tuple[tuple[str, re.Pattern], ...] = (
+    ("hermes", re.compile(r"\bTu es Hermes\b")),
+)
+SIGNATURE_HEAD = 400
+SPLIT_NONCC = False
+
+
+def system_head(raw: bytes, limit: int = SIGNATURE_HEAD) -> str:
+    """First `limit` characters of the request's system prompt, or "".
+
+    Reads the top-level `system` (string or text blocks), else a leading
+    `role: "system"` message (OpenAI-ingress shape). Envelope and bare body
+    both accepted, like session_key. Never raises.
+    """
+    try:
+        env = json.loads(raw)
+    except ValueError:
+        return ""
+    body = env.get("body") if isinstance(env, dict) and isinstance(env.get("body"), dict) else env
+    if not isinstance(body, dict):
+        return ""
+    sysv = body.get("system")
+    text = ""
+    if isinstance(sysv, str):
+        text = sysv
+    elif isinstance(sysv, list):
+        text = " ".join(b["text"] for b in sysv if isinstance(b, dict) and isinstance(b.get("text"), str))
+    if not text:
+        msgs = body.get("messages")
+        if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
+            c = msgs[0].get("content")
+            text = c if isinstance(c, str) else ""
+    return text[:limit]
+
+
+def non_cc_key(raw: bytes) -> str:
+    """`(non-cc)`, or `(non-cc:<name>)` for a known caller when SPLIT_NONCC is on."""
+    if not SPLIT_NONCC:
+        return NON_CC
+    head = system_head(raw)
+    for name, rx in NON_CC_SIGNATURES:
+        if rx.search(head):
+            return f"{NON_CC[:-1]}:{name})"
+    return NON_CC
+
+
 def workspace_key(body: bytes) -> tuple[str, bool]:
     """(workspace key, came_from_claude_code)."""
     line = marker_line(body)
     if line is None:
-        return NON_CC, False
+        return non_cc_key(body), False
     path = PREVIOUS.sub("", line).strip()
     if not ABSOLUTE.match(path):
         # The marker also appears inside quoted CODE (a script or a prompt that
@@ -978,7 +1030,11 @@ def main(argv=None) -> int:
     ap.add_argument("--census", help="jsonl of {day, resp} to scale counts into responses/day")
     ap.add_argument("--json", help="write the full result here")
     ap.add_argument("--scratch", default=None, help="extraction directory (default: system temp)")
+    ap.add_argument("--split-noncc", action="store_true",
+                    help="sub-bucket (non-cc) by known system-prompt signature, e.g. (non-cc:hermes)")
     args = ap.parse_args(argv)
+    global SPLIT_NONCC
+    SPLIT_NONCC = args.split_noncc
 
     dirs = tuple(args.archives_dir or DEFAULT_DIRS)
     if args.day:
