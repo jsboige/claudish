@@ -683,6 +683,41 @@ Regression pins: `packages/cli/src/fork/failover.test.ts` → *"parses the real
 reset further off than its window via the UTC+8 candidate"*, *"declines a reset
 implausible under BOTH readings"*, and the kill-switch pin.
 
+## The bucket wall lifts at the announced reset, not one rung later (#875, measured 2026-11-05)
+
+The parser above fed the **step** plan (`markStepFailed`) but never the **bucket
+wall**: `armFailover()` took its TTL from the ladder alone (`armTtlFor`, 10 → 20 →
+40 min), so a wall armed just before a reset kept the nominal benched for a whole
+rung after its window reopened. Hub, 05/11: first `1308` at 08:00:46Z announcing
+`2026-11-05 18:33:51` (= **10:33:51Z** under the UTC+8 reading); ladder probes all
+refused with that same reset; re-`ARMED … (ttl 40min, escalated)` at **10:33:04Z —
+47 s before the reset**. The z.ai console showed the 5-hour quota at 1 % by 10:51Z,
+yet the lane served 742 `deepseek-flash` responses (PAYG) and 0 `glm-5.3` from
+10:31 to 10:56Z; the next probe was due ~11:13Z.
+
+`onNominalRefusal` now hands `parseResetAtFromBody(errBody)` to `armFailover`, which
+takes `min(ladder TTL, resetAt − now + 30 s)`:
+
+- **Shorten only.** A reset further off than the rung leaves the ladder exactly as
+  before; the ladder stays the defensive ceiling (`ARM_TTL_MAX_MS`, #409) and keeps
+  its early probes — a window can reopen *before* its announced time (a manual quota
+  reset, for instance), and only a probe catches that.
+- **Strictly future.** A refusal that still names a reset already behind us means
+  the window has not reopened; re-probing every 30 s would be wrong, so the ladder
+  applies. An implausible Z.AI reset never reaches the wall — the parser's guard
+  (above) returns `undefined` first; the other forms (Qwen `MM-DD … UTC`, MiniMax
+  `Resets in N days`) are bounded by the same two rules: past → ladder, beyond the
+  rung → ladder.
+- **Escalation is untouched.** The shortened wall expires through the same
+  `isBucketWalled` path, so the disarm still climbs `armTtlEscalation`, and a
+  nominal success still resets it.
+- The `ARMED` line names the reset when it applies: `(ttl 77s, lifts at the
+  announced reset 2026-11-05T10:33:51.000Z + 30s; ladder step was 40min)`.
+
+Kill switch `CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET=0` (startup read, like
+`RESET_TZ_CANDIDATES`; on a compose deploy the env is fixed at create anyway, #310).
+Pins: `failover.test.ts` → *"#875 — the bucket wall lifts at the announced reset"*.
+
 ## What a recreate costs the ladder, and the steps that fall together (measured 2026-11-01)
 
 The 00:41:30Z deploy of `main` gave the first full-window reading of the ladder
