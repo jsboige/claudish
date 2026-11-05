@@ -18,6 +18,11 @@ import {
   MIN_FORWARD_HEADERS_TIMEOUT_MS,
   MAX_FORWARD_HEADERS_TIMEOUT_MS,
   resolveHeartbeatTimeoutMs,
+  DEEP_PROBE_TIMEOUT_MS,
+  DEEP_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
+  MIN_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
+  MAX_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
+  resolveProbeFirstAttemptTimeoutMs,
   MIN_RELAY_HEARTBEAT_TIMEOUT_MS,
   MAX_RELAY_HEARTBEAT_TIMEOUT_MS,
   type RelayState,
@@ -1289,6 +1294,144 @@ describe("deep probe: quota wall vs hub death", () => {
           (l) =>
             l.includes("first attempt on claude-haiku-4-5-20251001 failed") &&
             l.includes("second attempt on glm-5.3 in the same tick")
+        )
+      ).toBe(true);
+    });
+  });
+
+  // #867 track 2 — the FIRST attempt rides a SHORT budget, the fallback keeps
+  // the full one. Measured on po-2027: 27/39 first attempts expired at the
+  // full 30 s while the glm fallback answered in ~1 s, adding the whole
+  // expired budget on top of the 60 s cooldown floor on 69 % of WAN flips.
+  // The stake is the worst-case latency of the recovery gate. "True if either
+  // passes" is kept; the verdict moves only when a first attempt would have
+  // passed past the short budget AND the fallback fails on a non-quota error.
+  describe("first-attempt budget (#867 track 2)", () => {
+    const okStream = () =>
+      sseResponse(
+        'event: message_start\ndata: {"type":"message_start"}\n\n' +
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      );
+    /** Real-fetch semantics for a never-answering upstream: reject on abort,
+     * exactly what `fetch` does when its signal fires.
+     *
+     * The ref'd keep-alive timer is load-bearing on Windows: measured on bun
+     * 1.3.13, an `AbortSignal.timeout` timer alone does not wake the event loop,
+     * so with no other ref'd handle pending the abort never fires and the test
+     * hangs past bun's own per-test timeout (the whole relay suite then never
+     * finishes). Production always has the prober's setInterval and the server. */
+    const hang = (init: any) =>
+      new Promise<Response>((_, reject) => {
+        const keepAlive = setTimeout(() => {}, 60_000);
+        init.signal?.addEventListener("abort", () => {
+          clearTimeout(keepAlive);
+          reject(init.signal.reason);
+        });
+      });
+    /** A fetch that answers `okStream` after `ms` — unless aborted first. */
+    const lateOk = (ms: number) => (init: any) =>
+      new Promise<Response>((resolve, reject) => {
+        const t = setTimeout(() => resolve(okStream()), ms);
+        init.signal?.addEventListener("abort", () => {
+          clearTimeout(t);
+          reject(init.signal.reason);
+        });
+      });
+    const withBudget = <T>(ms: string, fn: () => Promise<T>): Promise<T> => {
+      const prev = process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS;
+      process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS = ms;
+      return fn().finally(() => {
+        if (prev === undefined) delete process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS;
+        else process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS = prev;
+      });
+    };
+
+    it("resolver: 10 s default · '0' restores the full 30 s · in-range honored · garbage/out-of-range → default", () => {
+      const prev = process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS;
+      try {
+        const D = DEEP_PROBE_FIRST_ATTEMPT_TIMEOUT_MS;
+        const set = (v?: string) => {
+          if (v === undefined) delete process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS;
+          else process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS = v;
+        };
+        set();
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(D);
+        set(""); // compose injects every listed name as "" (#310)
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(D);
+        set("   ");
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(D);
+        set("0"); // the kill switch: pre-#867 behavior byte for byte
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(DEEP_PROBE_TIMEOUT_MS);
+        set(String(MIN_PROBE_FIRST_ATTEMPT_TIMEOUT_MS));
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(MIN_PROBE_FIRST_ATTEMPT_TIMEOUT_MS);
+        set(String(MIN_PROBE_FIRST_ATTEMPT_TIMEOUT_MS - 1)); // below MIN → default, not clamp
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(D);
+        set(String(MAX_PROBE_FIRST_ATTEMPT_TIMEOUT_MS));
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(MAX_PROBE_FIRST_ATTEMPT_TIMEOUT_MS);
+        set(String(MAX_PROBE_FIRST_ATTEMPT_TIMEOUT_MS + 1)); // above MAX → default
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(D);
+        set("garbage");
+        expect(resolveProbeFirstAttemptTimeoutMs()).toBe(D);
+      } finally {
+        if (prev === undefined) delete process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS;
+        else process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS = prev;
+      }
+    });
+
+    it("AC1: a hung first attempt is CUT at the short budget and the fallback recovers in the same tick", async () => {
+      let n = 0;
+      fetchImpl = async (_u: any, init: any) =>
+        n++ === 0 ? hang(init) : Promise.resolve(okStream());
+      // MIN is the floor of the legal range — the pin must live inside it.
+      await withBudget("1000", async () => {
+        const t0 = Date.now();
+        expect(await deepProbe(state())).toBe(true);
+        // RED on the pre-#867 wiring: the hung first attempt would ride the
+        // full 30 s budget and the test would hang past bun's own timeout.
+        expect(Date.now() - t0).toBeLessThan(2500);
+      });
+      expect(fetchCalls.length).toBe(2);
+      expect(callBodyModel(1)).toBe("glm-5.3"); // the fallback decided, in the same tick
+    });
+
+    it("the FALLBACK attempt keeps the FULL budget — never the short one", async () => {
+      let n = 0;
+      fetchImpl = async (_u: any, init: any) =>
+        n++ === 0
+          ? Promise.resolve(new Response("native lane refused", { status: 503 }))
+          : lateOk(1200)(init);
+      await withBudget("1000", async () => {
+        // 1200 ms of fallback latency > the 1000 ms short budget: only the
+        // FULL budget lets it through. RED on a "simplify: pass the budget to
+        // both attempts" regression — the second attempt would abort at 1 s
+        // and the probe would return false on a hub that answered in time.
+        expect(await deepProbe(state())).toBe(true);
+      });
+      expect(fetchCalls.length).toBe(2);
+    });
+
+    it("a timed-out first attempt NAMES its budget on the line the operator greps", async () => {
+      const lines: string[] = [];
+      const origLog = console.log;
+      console.log = (...a: unknown[]) => {
+        lines.push(a.join(" "));
+      };
+      try {
+        let n = 0;
+        fetchImpl = async (_u: any, init: any) =>
+          n++ === 0 ? hang(init) : Promise.resolve(okStream());
+        await withBudget("1000", async () => {
+          expect(await deepProbe(state())).toBe(true);
+        });
+      } finally {
+        console.log = origLog;
+      }
+      // The two budgets now differ; an unlabeled "TimeoutError" cannot say
+      // WHICH bound expired. The before/after measurement of #867 (AC3) greps
+      // this line, so it must carry the number.
+      expect(
+        lines.some((l) =>
+          l.includes("first attempt on claude-haiku-4-5-20251001 failed (timed out after 1000ms")
         )
       ).toBe(true);
     });
