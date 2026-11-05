@@ -344,6 +344,16 @@ let armAfterRefusals = 2;
  * reading fails the plausibility guard (Z.AI emits that form in Asia/Shanghai).
  * The guard still judges the shifted value — kill switch, default on. */
 let resetTzCandidates = true;
+/** #875: a wall whose refusal names a future reset that falls INSIDE the arm TTL
+ * lifts at that reset (+ WALL_RESET_MARGIN_MS) instead of at the ladder step — so
+ * a wall re-armed 47 s before a 5-hour window reopens no longer benches the nominal
+ * for 40 more minutes. Shorten only, never lengthen: the ladder stays the defensive
+ * ceiling and keeps its early probes (a window can reopen BEFORE its announced
+ * time, e.g. on a manual quota reset). Kill switch, default on. */
+let wallTtlFromReset = true;
+/** Slack after an announced reset before the wall lifts: absorbs the provider's
+ * clock running a little behind ours, so the probe does not land just before. */
+const WALL_RESET_MARGIN_MS = 30_000;
 /** When > 0, an under-threshold refusal waits this long and retries the NOMINAL
  * once inside the same request before surfacing the 429. 0 = off (default). */
 let armGraceMs = 0;
@@ -616,6 +626,7 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   };
   armAfterRefusals = Math.max(1, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_AFTER, 2));
   resetTzCandidates = (env.CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES || "").trim() !== "0";
+  wallTtlFromReset = (env.CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET || "").trim() !== "0";
   armGraceMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_GRACE_MS, 0));
   armRetryAfterCeilingMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS, 120_000));
   sessionDwellMs = Math.max(0, parseIntEnv(env.CLAUDISH_FAILOVER_SESSION_DWELL_MS, 600_000));
@@ -1992,14 +2003,35 @@ export function getActiveFailovers(): (ResolvedFailover & { bucket: string })[] 
  *
  * The default bucket is the legacy role-wide one, so `armFailover(role, reason)`
  * keeps its pre-#275 meaning (divert the whole role).
+ *
+ * `resetAt` (#875) is the lift time the refusal announced, when it named one
+ * (`parseResetAtFromBody`). It can only SHORTEN the ladder TTL: a reset that is
+ * past, or further off than the ladder step, leaves the ladder exactly as before.
  */
-export function armFailover(role: FailoverRole, reason: string, bucket: string = LEGACY_ROLE_WIDE_BUCKET): boolean {
+export function armFailover(
+  role: FailoverRole,
+  reason: string,
+  bucket: string = LEGACY_ROLE_WIDE_BUCKET,
+  resetAt?: Date
+): boolean {
   if (!autoArmEnabled) return false;
   // isBucketWalled (not walled.has) so an EXPIRED wall can re-arm.
   if (isBucketWalled(bucket)) return false;
   const rule = rules.get(role);
   if (!rule) return false;
-  const ttlMs = armTtlFor(bucket);
+  const ladderTtlMs = armTtlFor(bucket);
+  let ttlMs = ladderTtlMs;
+  let liftsAtReset = false;
+  if (wallTtlFromReset && resetAt) {
+    const untilReset = resetAt.getTime() - Date.now();
+    // Strictly future: a refusal that still names a reset already behind us means
+    // the window has NOT reopened — the ladder is the right answer, not a re-probe
+    // every 30 s.
+    if (untilReset > 0 && untilReset + WALL_RESET_MARGIN_MS < ladderTtlMs) {
+      ttlMs = untilReset + WALL_RESET_MARGIN_MS;
+      liftsAtReset = true;
+    }
+  }
   walled.set(bucket, { since: new Date(Date.now()), reason, ttlMs });
   for (const key of [...recovering.keys()]) {
     if (key.startsWith(`${role}|`)) recovering.delete(key);
@@ -2022,7 +2054,13 @@ export function armFailover(role: FailoverRole, reason: string, bucket: string =
   const { step } = resolveFailoverTarget(role, bucket);
   logStderr(
     `[Failover] ARMED bucket ${bucket} (${role} nominal) → ${step ? step.label : "cascade"} — ${reason}${
-      ttlMs > ARM_TTL_STEPS_MS[0] ? ` (ttl ${Math.round(ttlMs / 60000)}min, escalated)` : ""
+      liftsAtReset && resetAt
+        ? ` (ttl ${Math.round(ttlMs / 1000)}s, lifts at the announced reset ${resetAt.toISOString()} + ${
+            WALL_RESET_MARGIN_MS / 1000
+          }s; ladder step was ${Math.round(ladderTtlMs / 60000)}min)`
+        : ttlMs > ARM_TTL_STEPS_MS[0]
+          ? ` (ttl ${Math.round(ttlMs / 60000)}min, escalated)`
+          : ""
     }`
   );
   return true;
@@ -2101,7 +2139,8 @@ export function onNominalRefusal(
   const count = (rec?.count || 0) + 1;
   if (count >= armAfterRefusals) {
     nominalRefusals.delete(bucket);
-    if (armFailover(role, reason, bucket)) return { outcome: "armed" };
+    // #875: the refusal's own announced reset bounds the wall (shorten only).
+    if (armFailover(role, reason, bucket, parseResetAtFromBody(errBody))) return { outcome: "armed" };
     // autoArmEnabled off or unconfigured rule: behave like the old call site —
     // not armed, not active, the caller surfaces the raw response.
     return { outcome: "grace", count, needed: armAfterRefusals };
@@ -2897,5 +2936,6 @@ export function resetFailoverForTests(env?: NodeJS.ProcessEnv): void {
     armGraceMs = 0;
     armRetryAfterCeilingMs = 120_000;
     sessionDwellMs = 600_000;
+    wallTtlFromReset = true;
   }
 }

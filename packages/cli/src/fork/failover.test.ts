@@ -2089,6 +2089,136 @@ describe("#91 point 3 — arm-TTL hysteresis (the re-probe backoff)", () => {
   });
 });
 
+// #875 — the bucket wall took its TTL from the ladder alone, so a wall re-armed
+// just before an announced reset benched the nominal for a whole rung after its
+// window reopened. Hub 05/11: re-ARMED 10:33:04Z on the 40-min rung, 47 s before
+// the 10:33:51Z reset (Z.AI announces `18:33:51`, UTC+8); the lane served PAYG
+// until the next probe ~11:13Z. The refusal's own reset now bounds the wall —
+// shorten only, never lengthen, ladder unchanged otherwise.
+describe("#875 — the bucket wall lifts at the announced reset", () => {
+  const ENV = {
+    CLAUDISH_FAILOVER_SONNET: "ds@deepseek-v4-flash",
+    CLAUDISH_FAILOVER_SONNET_LABEL: "DeepSeek",
+    CLAUDISH_FAILOVER_AUTO: "1",
+    CLAUDISH_FAILOVER_ARM_AFTER: "1",
+  } as NodeJS.ProcessEnv;
+  // The real 05/11 08:00:46Z body: reset announced in Asia/Shanghai.
+  const BODY_1308 =
+    '{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-11-05 18:33:51"}}';
+  const AT_REARM = Date.UTC(2026, 10, 5, 10, 33, 4); // 47 s before 10:33:51Z
+  const sec = (n: number) => n * 1000;
+  const min = (n: number) => n * 60 * 1000;
+
+  const realNow = Date.now;
+  let clock = 0;
+
+  beforeEach(() => {
+    Date.now = () => clock;
+  });
+  afterEach(() => {
+    Date.now = realNow;
+  });
+
+  /** Two reset-less disarms so the next arm sits on the 40-min rung, landing at AT_REARM. */
+  function escalateToTopRung(): void {
+    clock = AT_REARM - min(32);
+    expect(armFailover("sonnet", "wall")).toBe(true); // 10 min
+    clock += min(11);
+    expect(isFailoverActive("sonnet")).toBe(false); // disarm #1
+    expect(armFailover("sonnet", "still walled")).toBe(true); // 20 min
+    clock += min(21);
+    expect(isFailoverActive("sonnet")).toBe(false); // disarm #2 — now at AT_REARM
+    expect(clock).toBe(AT_REARM);
+  }
+
+  it("the measured case: armed 47 s before the reset on the 40-min rung → lifts at reset + 30 s", () => {
+    initFailover(ENV);
+    escalateToTopRung();
+    expect(onNominalRefusal("sonnet", "1308", null, BODY_1308).outcome).toBe("armed");
+    clock += sec(76); // 47 s to the reset + 29 s of margin
+    expect(isFailoverActive("sonnet")).toBe(true);
+    clock += sec(2); // reset + 31 s — was benched until +40 min
+    expect(isFailoverActive("sonnet")).toBe(false);
+  });
+
+  it("a refusal still naming a reset that is now PAST arms on the ladder (no 30-s re-probe loop)", () => {
+    initFailover(ENV);
+    escalateToTopRung();
+    expect(onNominalRefusal("sonnet", "1308", null, BODY_1308).outcome).toBe("armed");
+    clock += sec(78);
+    expect(isFailoverActive("sonnet")).toBe(false); // lifted at the reset (disarm #3)
+    // The provider still refuses with the SAME reset, 31 s behind us: the parser
+    // accepts it (its -5 min skew tolerance), the wall must not.
+    expect(parseResetAtFromBody(BODY_1308)?.getTime()).toBe(Date.UTC(2026, 10, 5, 10, 33, 51));
+    expect(onNominalRefusal("sonnet", "1308", null, BODY_1308).outcome).toBe("armed");
+    clock += min(39);
+    expect(isFailoverActive("sonnet")).toBe(true); // the 40-min rung held
+    clock += min(2);
+    expect(isFailoverActive("sonnet")).toBe(false);
+  });
+
+  it("a stale reset the parser declines leaves the ladder unchanged", () => {
+    initFailover(ENV);
+    escalateToTopRung();
+    const stale = BODY_1308.replace("18:33:51", "18:20:00"); // 13 min behind as UTC+8
+    expect(parseResetAtFromBody(stale)).toBeUndefined();
+    expect(onNominalRefusal("sonnet", "1308", null, stale).outcome).toBe("armed");
+    clock += min(39);
+    expect(isFailoverActive("sonnet")).toBe(true);
+  });
+
+  it("a body without a reset keeps the ladder (base 10 min)", () => {
+    initFailover(ENV);
+    clock = AT_REARM;
+    const silent = '{"error":{"code":"1308","message":"Usage limit reached for 5 hour."}}';
+    expect(onNominalRefusal("sonnet", "1308", null, silent).outcome).toBe("armed");
+    clock += min(9);
+    expect(isFailoverActive("sonnet")).toBe(true);
+    clock += min(2);
+    expect(isFailoverActive("sonnet")).toBe(false);
+  });
+
+  it("a reset further off than the rung never LENGTHENS the wall", () => {
+    initFailover(ENV);
+    clock = AT_REARM;
+    // 12:33:51Z under UTC+8 — 2 h ahead, plausible, beyond the 10-min rung.
+    const far = BODY_1308.replace("18:33:51", "20:33:51");
+    expect(parseResetAtFromBody(far)?.getTime()).toBe(Date.UTC(2026, 10, 5, 12, 33, 51));
+    expect(onNominalRefusal("sonnet", "1308", null, far).outcome).toBe("armed");
+    clock += min(11);
+    expect(isFailoverActive("sonnet")).toBe(false); // the ladder's early probe kept
+  });
+
+  it("a reset-shortened wall still climbs the ladder on its disarm", () => {
+    initFailover(ENV);
+    clock = AT_REARM; // first arm of the episode: 10-min rung, reset 47 s ahead
+    expect(onNominalRefusal("sonnet", "1308", null, BODY_1308).outcome).toBe("armed");
+    clock += sec(78);
+    expect(isFailoverActive("sonnet")).toBe(false); // lifted at the reset → disarm #1
+    expect(armFailover("sonnet", "walled again, no reset named")).toBe(true);
+    clock += min(15);
+    expect(isFailoverActive("sonnet")).toBe(true); // 20-min rung, not the base 10
+  });
+
+  it("armFailover takes resetAt directly (any parser form) and shortens to it + 30 s", () => {
+    initFailover(ENV);
+    clock = AT_REARM;
+    expect(armFailover("sonnet", "wall", undefined, new Date(clock + min(2)))).toBe(true);
+    clock += min(2) + sec(29);
+    expect(isFailoverActive("sonnet")).toBe(true);
+    clock += sec(2);
+    expect(isFailoverActive("sonnet")).toBe(false);
+  });
+
+  it("kill switch CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET=0 restores the ladder-only TTL", () => {
+    initFailover({ ...ENV, CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET: "0" } as NodeJS.ProcessEnv);
+    escalateToTopRung();
+    expect(onNominalRefusal("sonnet", "1308", null, BODY_1308).outcome).toBe("armed");
+    clock += min(39);
+    expect(isFailoverActive("sonnet")).toBe(true); // pre-#875: the whole 40-min rung
+  });
+});
+
 // #91 point 4 — per-session dwell. Every provider switch re-colds the prompt
 // cache at BOTH ends; the role-level dampers (points 1-3) bound how often
 // switches happen, this bounds how often ONE CONVERSATION rides them: a session
