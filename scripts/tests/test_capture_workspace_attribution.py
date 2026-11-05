@@ -55,6 +55,7 @@ would silently manufacture a conclusion about WHERE the fleet's responses go:
 """
 
 import importlib.util
+import json
 import os
 import sys
 from datetime import date, timedelta
@@ -483,6 +484,42 @@ def pin_families_aggregate_per_workspace():
     _check(w["claudish"]["families"] == {wsattr.NO_RESP: 1}, "an unpaired request lands in (no-resp)")
 
 
+def _hermes_env(system) -> bytes:
+    """A non-CC envelope whose system prompt opens like the live Hermes one (05/11)."""
+    return json.dumps({"machine": "myia-ai-01", "body": {
+        "model": "claude-sonnet-5-5", "system": system,
+        "messages": [{"role": "user", "content": "état du cluster ?"}]}}).encode()
+
+
+def pin_split_noncc_is_opt_in_and_reads_the_system_start():
+    hermes = _hermes_env([{"type": "text", "text": "# Hermes — Orchestrateur du Cluster Myia AI\n"
+                                                     "Tu es Hermes, l'orchestrateur"}])
+    old = wsattr.SPLIT_NONCC
+    try:
+        wsattr.SPLIT_NONCC = False
+        _check(wsattr.workspace_key(hermes) == (wsattr.NON_CC, False),
+               "off by default: (non-cc) keeps its meaning for every existing caller")
+        wsattr.SPLIT_NONCC = True
+        _check(wsattr.workspace_key(hermes) == ("(non-cc:hermes)", False),
+               "the Hermes system prompt gets its own bucket, got %r" % (wsattr.workspace_key(hermes),))
+        # string-form system and OpenAI-ingress leading system message: same key
+        _check(wsattr.workspace_key(_hermes_env("Tu es Hermes, l'orchestrateur"))[0] == "(non-cc:hermes)",
+               "a string `system` is read too")
+        oai = json.dumps({"body": {"messages": [{"role": "system", "content": "Tu es Hermes."},
+                                                {"role": "user", "content": "hi"}]}}).encode()
+        _check(wsattr.workspace_key(oai)[0] == "(non-cc:hermes)", "a leading system-role message is read too")
+        # the name in the CONVERSATION, not the system prompt, is not a signature
+        talk = json.dumps({"body": {"system": "You are a code review assistant.",
+                                    "messages": [{"role": "user", "content": "Tu es Hermes ?"}]}}).encode()
+        _check(wsattr.workspace_key(talk)[0] == wsattr.NON_CC, "a mention in messages must not match")
+        # a Claude Code body is never re-bucketed, whatever its system prompt says
+        cc = _body(b"d:\\\\dev\\\\claudish")
+        _check(wsattr.workspace_key(cc) == ("claudish", True), "CC traffic keeps its workspace key")
+        _check(wsattr.workspace_key(b"not json")[0] == wsattr.NON_CC, "an unparseable body stays (non-cc)")
+    finally:
+        wsattr.SPLIT_NONCC = old
+
+
 PINS = [
     pin_plain_path,
     pin_previous_directory_suffix,
@@ -512,6 +549,7 @@ PINS = [
     pin_served_model_from_resp_name,
     pin_model_family_mapping,
     pin_families_aggregate_per_workspace,
+    pin_split_noncc_is_opt_in_and_reads_the_system_start,
 ]
 
 
