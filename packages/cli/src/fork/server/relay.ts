@@ -234,8 +234,12 @@ export const DEEP_PROBE_TIMEOUT_MS = 30_000;
  * Capping only the first attempt at 10 s moves the worst case from ~34 s of
  * probe to ~14 s WITHOUT touching coverage: a would-succeed-at-15s haiku
  * attempt now spills to the fallback, which answers in the SAME tick — the
- * probe was already defined as "true if either attempt passes" (#636), so the
- * verdict set is unchanged; only the latency moves. The armement (2 heartbeat
+ * probe was already defined as "true if either attempt passes" (#636). The
+ * verdict changes in ONE case only: a first attempt that would have passed
+ * between this budget and 30 s while the fallback fails on a non-quota error
+ * (a quota wall already counts as liveness). That probe now reads false and
+ * the gate waits for 3 more OK heartbeats. Every expired first attempt
+ * measured on po-2027 was followed by a passing fallback. The armement (2 heartbeat
  * failures) and the cooldown (60 s, the anti-flap) are NOT touched by this
  * constant — that separation is the whole point of putting the cap on the
  * attempt, not on the recovery loop.

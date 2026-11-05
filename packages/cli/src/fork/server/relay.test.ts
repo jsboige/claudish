@@ -1303,8 +1303,9 @@ describe("deep probe: quota wall vs hub death", () => {
   // the full one. Measured on po-2027: 27/39 first attempts expired at the
   // full 30 s while the glm fallback answered in ~1 s, adding the whole
   // expired budget on top of the 60 s cooldown floor on 69 % of WAN flips.
-  // Coverage is NOT the stake ("true if either passes" is unchanged) — only
-  // the worst-case latency of the recovery gate.
+  // The stake is the worst-case latency of the recovery gate. "True if either
+  // passes" is kept; the verdict moves only when a first attempt would have
+  // passed past the short budget AND the fallback fails on a non-quota error.
   describe("first-attempt budget (#867 track 2)", () => {
     const okStream = () =>
       sseResponse(
@@ -1312,10 +1313,20 @@ describe("deep probe: quota wall vs hub death", () => {
           'event: message_stop\ndata: {"type":"message_stop"}\n\n'
       );
     /** Real-fetch semantics for a never-answering upstream: reject on abort,
-     * exactly what `fetch` does when its signal fires. */
+     * exactly what `fetch` does when its signal fires.
+     *
+     * The ref'd keep-alive timer is load-bearing on Windows: measured on bun
+     * 1.3.13, an `AbortSignal.timeout` timer alone does not wake the event loop,
+     * so with no other ref'd handle pending the abort never fires and the test
+     * hangs past bun's own per-test timeout (the whole relay suite then never
+     * finishes). Production always has the prober's setInterval and the server. */
     const hang = (init: any) =>
       new Promise<Response>((_, reject) => {
-        init.signal?.addEventListener("abort", () => reject(init.signal.reason));
+        const keepAlive = setTimeout(() => {}, 60_000);
+        init.signal?.addEventListener("abort", () => {
+          clearTimeout(keepAlive);
+          reject(init.signal.reason);
+        });
       });
     /** A fetch that answers `okStream` after `ms` — unless aborted first. */
     const lateOk = (ms: number) => (init: any) =>
