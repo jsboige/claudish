@@ -24,21 +24,28 @@
  * out. The id is a one-way digest shaped as a UUID (the shape Codex itself
  * sends), never the raw session id.
  *
+ * Affinity comes ONLY from a real Claude Code `session_id` (the JSON-string
+ * or object form of `metadata.user_id`). Everything else — no `user_id`, or a
+ * RAW-STRING `user_id` (the OpenAI ingress maps its `user` field there,
+ * `openai-request-to-anthropic.ts`: an end-user handle, not a conversation) —
+ * keeps the pre-#886 wire: a fresh `x-` UUID per request, no `session-id`,
+ * no key (review 6662979923). #66 point 3 said one shared drawer "remains
+ * structurally wrong" even when only routing precision is at stake, so no
+ * process-wide fallback id exists here — `codexSessionId` returns null and
+ * the caller sends nothing.
+ *
+ * Sub-agents share their parent's `session_id` (the session-budget counter
+ * measured one parent plus 230 sub-agent requests under a single sid), so a
+ * parent and its sub-agents share one affinity id with different prefixes.
+ * Affinity only routes, it never merges state — do not read a
+ * lower-than-expected "after" cache ratio on such a session as a regression.
+ *
  * Kill switch: `CLAUDISH_CODEX_SESSION_AFFINITY=0` (also `false`/`off`), read
  * per request, restores the previous wire exactly (fresh UUID per request, no
  * `prompt_cache_key`). Unset or empty — compose injects "" — means ON.
  */
 
-import { createHash, randomUUID } from "node:crypto";
-
-/**
- * Fallback id for a request that carries no Claude Code session id (an older
- * client, a direct API consumer). Minted once per process: two processes are
- * two different populations and must not share it. On the hub every such
- * request shares this one id — the residual overlap, which costs routing
- * precision only, never correctness.
- */
-const PROCESS_FALLBACK_ID = randomUUID();
+import { createHash } from "node:crypto";
 
 /** Kill switch, read per request. Unset / "" → ON; "0" / "false" / "off" → OFF. */
 export function codexSessionAffinityEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -61,9 +68,10 @@ function sessionIdOf(claudeRequest: any): string | null {
         const p = JSON.parse(uid);
         if (p?.session_id) return String(p.session_id);
       } catch {
-        /* not JSON — the raw string is the client's own stable handle */
+        /* not JSON — a raw string is an end-user handle (the OpenAI ingress
+         * maps its `user` field here), not a conversation id: no affinity */
       }
-      return uid;
+      return null;
     }
     if (typeof uid === "object" && (uid as any).session_id) return String((uid as any).session_id);
   } catch {
@@ -75,11 +83,12 @@ function sessionIdOf(claudeRequest: any): string | null {
 /**
  * The affinity id for this request: a deterministic UUID-shaped digest of the
  * session id (version nibble 4, RFC 4122 variant — the layout any UUID
- * validator accepts), or the per-process fallback when there is no session id.
+ * validator accepts), or NULL when the request carries no real session id —
+ * the caller then sends neither `session-id` nor key (pre-#886 wire).
  */
-export function codexSessionId(claudeRequest: any): string {
+export function codexSessionId(claudeRequest: any): string | null {
   const sid = sessionIdOf(claudeRequest);
-  if (!sid) return PROCESS_FALLBACK_ID;
+  if (!sid) return null;
   const h = createHash("sha256").update(`claudish-codex-affinity:${sid}`).digest("hex");
   const variant = ((Number.parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;

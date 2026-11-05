@@ -44,27 +44,28 @@ describe("codexSessionId", () => {
     const a = codexSessionId(req(sid));
     expect(codexSessionId(req(sid))).toBe(a);
     expect(a).toMatch(UUID);
-    expect(a).not.toBe(sid);
-    expect(a.includes("1111-7000")).toBe(false);
+    expect(a!).not.toBe(sid);
+    expect(a!.includes("1111-7000")).toBe(false);
   });
 
   test("isolates two sessions", () => {
     expect(codexSessionId(req("s-aaa"))).not.toBe(codexSessionId(req("s-bbb")));
   });
 
-  test("reads the object and the non-JSON user_id shapes", () => {
+  test("reads the object shape; a RAW-STRING user_id carries no affinity (6662979923)", () => {
     const fromObject = codexSessionId({ metadata: { user_id: { session_id: "s-obj" } } });
     expect(fromObject).toBe(codexSessionId(req("s-obj")));
+    // The OpenAI ingress maps its `user` field to a raw-string user_id: an
+    // end-user handle, not a conversation — affinity would put every
+    // conversation of that user in ONE backend drawer (#66 point 3).
     const raw = { metadata: { user_id: "user_abc_account__session_xyz" } };
-    expect(codexSessionId(raw)).toBe(codexSessionId(raw));
-    expect(codexSessionId(raw)).toMatch(UUID);
+    expect(codexSessionId(raw)).toBeNull();
   });
 
-  test("without a session id falls back to ONE per-process id, UUID-shaped", () => {
-    const a = codexSessionId(undefined);
-    expect(a).toMatch(/^[0-9a-f-]{36}$/);
-    expect(codexSessionId({})).toBe(a);
-    expect(codexSessionId({ metadata: {} })).toBe(a);
+  test("without a real session id there is NO affinity — null, never a process drawer", () => {
+    expect(codexSessionId(undefined)).toBeNull();
+    expect(codexSessionId({})).toBeNull();
+    expect(codexSessionId({ metadata: {} })).toBeNull();
   });
 });
 
@@ -140,6 +141,41 @@ describe("OpenAICodexTransport", () => {
     await t.getHeaders();
     process.env[ENV] = "off";
     await t.getHeaders(r);
-    expect(seen).toEqual([codexSessionId(r), undefined, undefined]);
+    expect(seen).toEqual([codexSessionId(r)!, undefined, undefined]);
+  });
+
+  test("keyless callers keep the pre-#886 wire: no session-id, no key, fresh x- per call", async () => {
+    delete process.env[ENV];
+    const t = transport() as any;
+    const seen: Array<string | undefined> = [];
+    t.tryOAuthHeaders = async (id?: string) => {
+      seen.push(id);
+      return buildOAuthHeaders("tok", "acct", id);
+    };
+    // No user_id at all, and a raw-string user_id (ingress `user`): both
+    // session-less. If a process-wide fallback id ever grows back inside
+    // codexSessionId, THESE pins go red — session-id present and stable.
+    const ha = await t.getHeaders({ model: "m", messages: [] });
+    const hb = await t.getHeaders({ metadata: { user_id: "hermes" }, model: "m", messages: [] });
+    expect(seen).toEqual([undefined, undefined]);
+    for (const h of [ha, hb]) {
+      expect(h["session-id"]).toBeUndefined();
+      expect(h["thread-id"]).toBeUndefined();
+      expect(h["x-session-id"].startsWith("claudish-")).toBe(true);
+    }
+    expect(ha["x-session-id"]).not.toBe(hb["x-session-id"]);
+    expect(t.transformPayload({ input: [] }, { metadata: { user_id: "hermes" } }).prompt_cache_key).toBeUndefined();
+  });
+
+  test("mutant — a reintroduced shared affinity id is the ONE shape the pins above go red on", () => {
+    // Simulates PROCESS_FALLBACK_ID growing back: every keyless caller handed
+    // the same id lands in one backend drawer. The keyless pins above fail on
+    // exactly this (stable session-id across calls) — the pin is not tautological.
+    const SHARED = "11111111-2222-4333-8444-555555555555";
+    const a = buildOAuthHeaders("tok", "acct", SHARED);
+    const b = buildOAuthHeaders("tok", "acct", SHARED);
+    expect(a["session-id"]).toBe(SHARED);
+    expect(b["session-id"]).toBe(a["session-id"]);
+    expect(b["thread-id"]).toBe(a["thread-id"]);
   });
 });

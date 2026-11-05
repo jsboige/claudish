@@ -66,14 +66,17 @@ const CHATGPT_API_URL = "https://chatgpt.com/backend-api/codex";
 export class OpenAICodexTransport extends OpenAIProviderTransport {
   /**
    * `claudeRequest` — the original Anthropic-format body, from which the
-   * per-session affinity id is derived. Absent (a probe, an internal call),
-   * the headers take the pre-affinity per-request id.
+   * per-session affinity id is derived. Absent (a probe, an internal call) or
+   * session-less (a raw-string `user_id`, no `user_id` at all — review
+   * 6662979923), `codexSessionId` yields null and the headers take the
+   * pre-affinity per-request wire: fresh `x-` id, no `session-id`, no key.
    */
   override async getHeaders(claudeRequest?: any): Promise<Record<string, string>> {
-    const affinityId =
+    const derived =
       claudeRequest !== undefined && codexSessionAffinityEnabled()
         ? codexSessionId(claudeRequest)
-        : undefined;
+        : null;
+    const affinityId = derived ?? undefined;
     const oauthHeaders = await this.tryOAuthHeaders(affinityId);
     if (oauthHeaders) return oauthHeaders;
     // Fall back to API key auth
@@ -151,14 +154,15 @@ export class OpenAICodexTransport extends OpenAIProviderTransport {
         payload = { ...payload, model: normalized };
       }
     }
-    const keyed =
+    const affinity =
       payload &&
       typeof payload === "object" &&
       payload.prompt_cache_key === undefined &&
       claudeRequest !== undefined &&
       codexSessionAffinityEnabled()
-        ? { ...payload, prompt_cache_key: codexSessionId(claudeRequest) }
-        : payload;
+        ? codexSessionId(claudeRequest)
+        : null;
+    const keyed = affinity ? { ...payload, prompt_cache_key: affinity } : payload;
     // Add Codex-specific fields that the opencode reference implementation uses
     // store: false = stateless operation (required by ChatGPT backend for Codex)
     // include: reasoning.encrypted_content = for reasoning continuity across turns
