@@ -149,7 +149,10 @@ export function buildConnectionErrorMessage(
  *
  * Both ladders are bounded and run strictly BEFORE the client sees any event,
  * so never-hang is untouched: worst case is +1.6 s (closed) / +7.5 s of
- * sleeps (link), plus however long the failed connect attempt itself took.
+ * sleeps (link) PLUS the failed attempts' own connect time — for the timeout
+ * classes (ETIMEDOUT / UND_ERR_CONNECT_TIMEOUT) that is up to 1 + MAX full
+ * connect timeouts, not one (CR #906: the old "+7.5 s worst case" wording
+ * undercounted exactly that class).
  *
  * CLAUDISH_CONNECT_RETRY_MAX — retries after the initial attempt (default 2,
  *   "0" disarms; re-read per request so an operator flip needs no restart).

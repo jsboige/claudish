@@ -1250,10 +1250,13 @@ export class ComposedHandler implements ModelHandler {
       // turn 26 times in one morning. A loopback endpoint keeps the single
       // attempt: "refused on localhost" really is stable, and the user needs
       // the honest message now. Pre-headers only, so never-hang is unaffected;
-      // bounded worst case ≈ +1.6 s (closed) / +7.5 s of sleeps (link).
-      // The link ladder's default scope is sidecar/mono-candidate (CR #906):
-      // a chained handler lets FallbackHandler advance instead of sleeping
-      // +7.5 s on a dead endpoint — the hub's LAN failure mode.
+      // bounded worst case ≈ +1.6 s (closed) / +7.5 s of sleeps (link), PLUS
+      // each failed attempt's own connect time — for the timeout classes
+      // (ETIMEDOUT / UND_ERR_CONNECT_TIMEOUT) that is up to 1+MAX full connect
+      // timeouts, not one. The link ladder's default scope is
+      // sidecar/mono-candidate (CR #906): a chained handler lets
+      // FallbackHandler advance instead of sleeping on a dead endpoint —
+      // the hub's LAN failure mode.
       const connKind = classifyConnectionError(error)?.kind ?? null;
       const retryPolicy = connKind
         ? connectRetryPolicy(connKind, endpoint, { monoCandidate: !this.chainedInFallback })
