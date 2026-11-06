@@ -20,6 +20,7 @@ import {
 import {
   ARM_TTL_MAX_MS,
   type DelegationOwner,
+  type FailoverRole,
   type FailoverStep,
   NATIVE_BUCKET,
   buildServingNoteForRequest,
@@ -118,6 +119,17 @@ import {
   createSigningSecrets,
   releaseWhenBodyEnds,
 } from "./handlers/shared/call-context.js";
+// #565 (port-map row 1) — the admission census and the recoverable-turn
+// constructors its refusal answers with. See handlers/shared/context-overflow.ts.
+import {
+  type ContextAdmissionDecision,
+  type DeclaredWindow,
+  buildOverflowRecoveryMessage,
+  buildOverflowRecoveryStream,
+  contextAdmissionDisabled,
+  contextAdmissionRefusalText,
+  decideContextAdmission,
+} from "./handlers/shared/context-overflow.js";
 import {
   endpointPrefixOf,
   evaluateEndpointTokenBudget,
@@ -176,6 +188,7 @@ import {
   route,
   routingRuleProblems,
 } from "./providers/routing-rules.js";
+import { getDeclaredContextLimit } from "./providers/runtime-providers.js";
 import { discoverProviderProbeModel } from "./providers/transport/provider-model-discovery.js";
 import type { ProviderTransport } from "./providers/transport/types.js";
 import {
@@ -1196,9 +1209,15 @@ export async function createProxyServer(
   // the bucket helpers, and the serve loop (nominal → steps, bounded), adapted
   // to the seams that exist on this base. Deliberately narrower than main's
   // loop — the gap list is enumerated in the PR and each entry lands as its own
-  // grain: no #565 context-admission census, no #654 endpoint token budget, no
-  // #218 native-lane version pin, no #769 unroutable-step skip (a RoutingError
-  // at construction surfaces).
+  // grain: no #654 endpoint token budget, no #218 native-lane version pin, no
+  // #769 unroutable-step skip (a RoutingError at construction surfaces).
+  // #565 (the admission census over DECLARED windows, port-map row 1) IS wired
+  // below: before the loop and any handler, the whole resolved path (nominal +
+  // steps, `role:` delegations included) is weighed against the operator
+  // `contextLimit`s the loader registered, and a request larger than every
+  // DECLARED window is refused at admission as a recoverable turn (200 + real
+  // input_tokens — see handlers/shared/context-overflow.ts). Kill switch:
+  // CLAUDISH_CONTEXT_ADMISSION=0.
   // #693 (machine-scoped step exclusion) IS wired below: the loop already
   // reads `machineHeader` for the session budget (#317), so the walk it drives
   // — armed resolution, session resolution, #299-B overload walk — is the same
@@ -1215,8 +1234,10 @@ export async function createProxyServer(
   // non-last step that cannot TAKE this request advances without a failure mark.
   // Its `context` producer is the loop's own reading of the step's error body
   // (`isContextOverflowError`); the header contract is ported and read, but no
-  // handler-side emitter exists on this base yet (media cap / concurrency
-  // refusal / #565 recovery turn are the three producers main has).
+  // handler-side emitter exists on this base yet (media cap and concurrency
+  // refusal are the producers still absent; the #565 recovery-turn constructors
+  // landed with row 1 in context-overflow.ts, but nothing emits them as a step
+  // answer here yet).
   // #747 IS wired below as well (both halves of the (b) arbitration): the
   // serving banners are stripped from assistant history right after the
   // attempt-0 capture (v14's logRequest lives inside the loop, so the strip
@@ -1385,6 +1406,82 @@ export async function createProxyServer(
     const role = roleFromModelName(requestedModel);
     const rule = role ? getFailoverRule(role) : undefined;
     const bucket = nominalBucket ?? (rule ? await nominalBucketOfModel(requestedModel) : undefined);
+    // ── #565 — admission census over DECLARED windows (port-map row 1) ─────
+    // Placed HERE, before the loop and before any handler is built, because the
+    // decision needs the whole PATH (nominal + every cascade step), not the
+    // attempt that happens to be resolved first: a request no declared window
+    // can take is doomed on every candidate, so paying the first round-trip to
+    // learn it is pure waste — and the client gets MiniMax/vLLM jargon instead
+    // of a number it can act on (hub 2026-10-20: a 1.1M-token `/compact` turn).
+    // Both ingress routes funnel through this loop, so the OpenAI-compatible
+    // ingress is covered by construction.
+    //
+    // Declared-only, by design: a provider that declares no `contextLimit` is
+    // NOT assumed unbounded — the census simply cannot see it, and a path with
+    // ANY such candidate falls open to today's behaviour. Refusing on a guessed
+    // window would break the lanes nobody declared (every built-in provider,
+    // today); refusing on the declared SUBSET broke the ones somebody did (hub
+    // 2026-10-22: swift's 262 144 vetoed the haiku path's whole cascade, its
+    // undeclared nominal and PAYG terminator included).
+    //
+    // The answer is the recoverable turn (200 + factual text + real
+    // `usage.input_tokens`), never a bare 400: the gauge advances with the
+    // measured size, so the client's own compaction fires. A 400 here would
+    // reproduce the `/compact` retry loop #79 closed on main — the client would
+    // resend the identical body.
+    if (!contextAdmissionDisabled()) {
+      const windows: DeclaredWindow[] = [];
+      let undeclared = 0;
+      const collectWindow = (target: string | undefined): void => {
+        const at = target ? target.indexOf("@") : -1;
+        // A bare/built-in name, the NATIVE lane (`claude-opus-5` on ai-01 is a
+        // 1M-context lane that declares nothing — a smaller step must never
+        // veto the model the client named) or an unresolved target: each
+        // declares nothing, and each is a candidate that may take the request.
+        if (!target || at <= 0) {
+          undeclared++;
+          return;
+        }
+        const limit = getDeclaredContextLimit(target.slice(0, at));
+        if (limit !== undefined) windows.push({ name: target.slice(0, at), limit });
+        else undeclared++;
+      };
+      // A `role:<r>` step delegates to r's whole path — its nominal and its own
+      // steps — not to whichever concrete its `target` was last refreshed to.
+      // The delegation graph is proven acyclic at load; `seen` only keeps the
+      // census bounded if that proof is ever bypassed.
+      const seen = new Set<FailoverRole>();
+      const collectSteps = (r: FailoverRole): void => {
+        for (const s of getFailoverRule(r)?.steps ?? []) {
+          if (!s.roleRef) {
+            collectWindow(s.target);
+            continue;
+          }
+          if (seen.has(s.roleRef)) continue;
+          seen.add(s.roleRef);
+          // v14 modelMap has no `fable` slot (its role set is wider than the
+          // map) — index by string, the same cast as setRoleNominalResolver.
+          collectWindow((modelMap as Record<string, string | undefined> | undefined)?.[s.roleRef]);
+          collectSteps(s.roleRef);
+        }
+      };
+      collectWindow(resolveNominalTarget(requestedModel).target);
+      if (role) {
+        seen.add(role);
+        collectSteps(role);
+      }
+      const admission: ContextAdmissionDecision = decideContextAdmission(body, windows, undeclared);
+      if (admission.refuse && admission.largest) {
+        const text = contextAdmissionRefusalText(admission.estTokens, admission.largest);
+        log(
+          `[ContextAdmission] REFUSE ${requestedModel}: est=${admission.estTokens} > largest declared ${admission.largest.limit} (${admission.largest.name}) — no upstream fetch`,
+          true // forceConsole — operational event, countable marker
+        );
+        return body?.stream === true
+          ? buildOverflowRecoveryStream(text, admission.estTokens, requestedModel)
+          : c.json(buildOverflowRecoveryMessage(text, admission.estTokens, requestedModel));
+      }
+    }
     // #412 — a keyless request whose NOMINAL is native must not be substituted
     // away by the budget failover (review ai-01 08/10, point 1). Two measured
     // shapes, one answer: (a) in-request, the native 429 arms the role and the
