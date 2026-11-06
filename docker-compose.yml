@@ -369,6 +369,17 @@ services:
       # DeepSeek reasons by default and PAYG bills on output tokens.
       # passthrough (default) | disabled. Re-read per request.
       - CLAUDISH_DEEPSEEK_THINKING=${CLAUDISH_DEEPSEEK_THINKING:-}
+      # PAYG key vault (user mandate 06/11): the raw PAYG keys live ONLY in the
+      # operator's shadow .env — never in config.json, never in the repo. The
+      # config's customEndpoints (anthropic-payg@, oai-payg@) expand them via
+      # ${...} at proxy startup; an unresolvable ${VAR} skips the endpoint with
+      # one stderr warning (validation doctrine). Addressable is NOT serving:
+      # no role, routing entry or cascade step may reference these endpoints
+      # without explicit user arbitration (doctrine 06/11 — subscriptions
+      # first, PAYG = terminal cascade rung at most). Compose lines exist so
+      # the values reach the process at all (the env file only interpolates).
+      - CLAUDISH_ANTHROPIC_PAYG_KEY=${CLAUDISH_ANTHROPIC_PAYG_KEY:-}
+      - CLAUDISH_OPENAI_PAYG_KEY=${CLAUDISH_OPENAI_PAYG_KEY:-}
     command: ["--port", "3000", "--host", "0.0.0.0"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://0.0.0.0:3000/health"]
