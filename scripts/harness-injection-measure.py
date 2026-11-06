@@ -91,6 +91,20 @@ NB garde --since : le ts d'enveloppe et le prefixe du nom de fichier
    passait un jour a l'ISO canonique (`:` trie apres `-`), l'ancienne
    garde-enveloppe deviendrait fausse face a --since=...T13-30 -- la
    garde-nom, qui compare un format a lui-meme, resterait correcte.
+
+9) FENETRE ASYMETRIQUE + FILTRE NATIF MUET. Deux causes distinctes rendent
+   "0 paire" sans que rien ne soit casse. (a) --since bornait les REQUETES
+   mais jamais les REPONSES : `non appariees` additionnait tout l'historique
+   du repertoire et se lisait comme un echec d'appariement (mesure 06/11,
+   po-2024, --since=2026-11-05 : 3 079 "non appariees", 0 echec reel,
+   toutes anterieures a la fenetre). Elles sont desormais comptees a part
+   (`hors fenetre`). (b) Le filtre natif par defaut ecarte silencieusement
+   TOUTE paire servie par un modele non-Anthropic : sur un siege executor
+   (`CLAUDISH_NO_ANTHROPIC=1`, zero trafic natif par construction) il ne
+   reste rien, et la mesure rend "0 paire" avec un exit 0 -- le plancher du
+   siege n'est ni nul ni absent, il est hors du filtre. Relancer avec
+   `--all-parsers` ; le compte des paires ainsi ecartees est maintenant
+   imprime pour que la cause soit lisible.
 --------------------------------------------------------------------------
 """
 import json
@@ -126,6 +140,22 @@ BARE_ROLE_RE = _load_bare_roles().BARE_ROLE_RE
 
 def is_native_served(model):
     return model.lower().startswith("claude") or bool(BARE_ROLE_RE.match(model))
+
+
+def before_since(capture_ts_str, since):
+    """La capture precede-t-elle la borne `--since` ? (PIEGE 9)
+
+    Garde appliquee aux REQUETES **et** aux REPONSES : ne la poser que sur les
+    premieres (etat jusqu'au 06/11) faisait compter tout l'historique du
+    repertoire dans `non appariees`, qui se lisait alors comme un echec
+    d'appariement. Comparaison lexicographique assumee : les deux cotes
+    partagent le format a TIRETS du producteur de captures, jamais l'ISO
+    canonique a deux-points (qui trie differemment, cf. note NB du module).
+    Une borne absente, ou un horodatage illisible, ne borne rien.
+    """
+    if not since or not capture_ts_str:
+        return False
+    return capture_ts_str < since
 
 
 def capture_ts(ts):
@@ -261,7 +291,7 @@ def load_requests(cdir, since):
         # Equivalence garde-nom / garde-enveloppe verifiee sur corpus reel :
         # le prefixe du nom EST le ts d'enveloppe, la comparaison
         # lexicographique tient pour la forme documentee --since=YYYY-MM-DD.
-        if since and m.group(3) < since:
+        if before_since(m.group(3), since):
             continue
         try:
             with open(os.path.join(cdir, fn), encoding="utf-8") as fh:
@@ -309,6 +339,8 @@ def main():
     block_pats = defaultdict(int)  # PIEGE 7 : (nb_blocs, positions) -> requetes
     block_elsewhere = 0            # PIEGE 7 : 1er bloc hors messages[0]
     skipped_unpaired = 0
+    skipped_out_window = 0   # PIEGE 9 : reponses anterieures a --since
+    skipped_non_native = 0   # filtre natif : la cause n0 1 d'un "0 paire"
 
     for fn in os.listdir(cdir):
         if not (fn.startswith("resp-") and fn.endswith(".sse")):
@@ -320,6 +352,14 @@ def main():
         # reponses natives qu'on mesure (179 non appariees sur 245 au premier jet).
         rm = RESP_TS.match(fn)
         resp_ts = rm.group(1) if rm else None
+        # PIEGE 9 : les REQUETES sont bornees par --since (load_requests), les
+        # REPONSES ne l'etaient pas -- `non appariees` additionnait donc tout
+        # l'historique du repertoire et se lisait comme un echec d'appariement.
+        # Mesure 06/11 (po-2024, --since=2026-11-05) : 3 079 "non appariees"
+        # dont 0 echec reel, toutes anterieures a la fenetre.
+        if before_since(resp_ts, since):
+            skipped_out_window += 1
+            continue
         h = HDR.search(txt)
         if not h:
             continue
@@ -335,6 +375,7 @@ def main():
         if machine is not None and req.get("machine") != machine:
             continue
         if not all_parsers and not is_native_served(model):
+            skipped_non_native += 1
             continue  # natives seulement : leur usage est compte par le tokenizer d'Anthropic
         body = req.get("body") or {}
         hbs = harness_blocks(body)
@@ -381,6 +422,11 @@ def main():
     if not pairs:
         print("Aucune paire (pid, reqN) exploitable.")
         print(f"  reponses sans requete appariee : {skipped_unpaired}")
+        if skipped_out_window:
+            print(f"  reponses hors fenetre --since  : {skipped_out_window} (ignorees, pas un echec d'appariement)")
+        if skipped_non_native:
+            print(f"  paires ecartees par le filtre NATIF : {skipped_non_native}")
+            print("    -> siege sans lane Anthropic : relancer avec --all-parsers")
         print("  verifier --since= / --workspace= / --machine= (une machine absente")
         print("  du corpus rend 0 paire, pas tout), ou --all-parsers si aucun modele")
         print("  natif n'est capture (un sidecar en mode NOMINAL n'ecrit rien).")
@@ -389,7 +435,10 @@ def main():
     ratios = sorted(p[0] for p in pairs)
     med_ratio = statistics.median(ratios)
     print()
-    print(f"Paires appariees par (pid, reqN) : {len(pairs)}   (non appariees : {skipped_unpaired})")
+    print(f"Paires appariees par (pid, reqN) : {len(pairs)}   (non appariees : {skipped_unpaired}"
+          + (f" ; hors fenetre : {skipped_out_window}" if skipped_out_window else "")
+          + (f" ; ecartees non-natives : {skipped_non_native}" if skipped_non_native else "")
+          + ")")
     if machine is not None:
         print(f"Portee machine (--machine)       : {machine}")
     print(f"Ratio caracteres injectes / token : mediane {med_ratio:.2f}"
