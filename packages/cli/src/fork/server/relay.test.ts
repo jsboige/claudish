@@ -29,6 +29,10 @@ import {
 } from "./relay.js";
 import { getInstanceId } from "../../instance-id.js";
 import {
+  getRelayModeSnapshot,
+  setRelayModeSnapshot,
+} from "../../handlers/shared/relay-mode-snapshot.js";
+import {
   NOTICE_HEADER,
   noticeToHeaderValue,
 } from "../../handlers/shared/failover-stream-notice.js";
@@ -311,6 +315,25 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
     expect(state.consecutiveFail).toBe(2);
     expect(state.alive).toBe(false);
+  });
+
+  it("the flip publishes the mode snapshot the capture layer reads (#877)", async () => {
+    fetchImpl = async () => {
+      throw new Error("timeout");
+    };
+    const state = deadState();
+    // State creation = a relay is configured in this process: nominal from
+    // boot, so the very first connection-error line can already be joined.
+    expect(getRelayModeSnapshot()).toEqual({ mode: "nominal", downTrigger: "" });
+    await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
+    // 1 failure < threshold: no verdict change to publish.
+    expect(getRelayModeSnapshot()?.mode).toBe("nominal");
+    await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
+    expect(state.alive).toBe(false);
+    // The trigger keeps the reason CLASS (detail suffix stripped) so the
+    // durable connection-error line stays a stable join key.
+    expect(getRelayModeSnapshot()).toEqual({ mode: "autonomous", downTrigger: "forward-connect" });
+    setRelayModeSnapshot(null); // hygiene: the bun process is shared across files
   });
 
   it("HTTP 500 from hub → null + counts as failure", async () => {
