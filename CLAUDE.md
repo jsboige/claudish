@@ -20,13 +20,13 @@ Planned-but-unimplemented work lives in `ROADMAP.md`, each item with an explicit
 
 ## Fleet-Rollout Verification (hard rule, mandate 2026-09-12)
 
-**A fleet-affecting change declared DONE requires a measured per-consumer verification artifact, produced in the same session** — where it actually lands, read from the live config/path, never from the change's intent. "The container moved" is not "the fleet migrated". Founder incident 07-09→11-09: a silently reverted ARR flip served 263.6M tokens off-hub. Consequences:
+**A fleet-affecting change declared DONE requires a measured per-consumer verification artifact, produced in the same session** — where it actually lands, read from the live config/path, never from the change's intent. "The container moved" is not "the fleet migrated" (founder incident: `docs/reference/relay-internals.md`). Consequences:
 
 - **Surveillance covers the path, not just the traffic**: a cycle checking hub health also checks the entry points that feed it (ARR backend, per-machine base URLs) — a silent revert must be catchable within one cycle, not one outage.
 - **An outage detected is an outage escalated — in the SAME cycle** (DM URGENT + dashboard). "Chronic" thresholds (#80-style counts) never apply to a total outage.
 - **An issue treated halfway is an issue in failure**: no next grain until the current issue's DoD is met or the rescope is explicitly recorded.
 - Rollback of a fleet change goes through the same channel as the change: an unlogged revert of shared infra (IIS web.config, .env, NAT) is an incident, not a fix.
-- The hub's entry form is the published container port (`.50:3000`); any change to the fleet-facing entry point (ARR rule, forwarder port, socket owner, published port) is announced on `global` BEFORE it is applied — unannounced, the 07/09 ARR revert and the 30/09 orphan socket each cut part of the fleet undetected (detail: `docs/reference/relay-internals.md`).
+- The hub's entry form is the published container port (`.50:3000`); any change to the fleet-facing entry point (ARR rule, forwarder port, socket owner, published port) is announced on `global` BEFORE it is applied (incidents: same doc).
 
 ## Build, Release, Versioning
 
