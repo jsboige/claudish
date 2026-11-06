@@ -52,7 +52,11 @@ import {
 } from "./provider-definitions.js";
 import type { ProfileContext, ProviderProfile } from "./provider-profiles.js";
 import { reservedNamespaceOwner } from "./reserved-namespace.js";
-import { registerRuntimeProfile, registerRuntimeProvider } from "./runtime-providers.js";
+import {
+  registerDeclaredContextLimit,
+  registerRuntimeProfile,
+  registerRuntimeProvider,
+} from "./runtime-providers.js";
 import { AnthropicProviderTransport } from "./transport/anthropic-compat.js";
 import { LiteLLMProviderTransport } from "./transport/litellm.js";
 import { OpenAIProviderTransport } from "./transport/openai.js";
@@ -143,6 +147,11 @@ export function registerEndpoint(
   const profile = buildProviderProfile(validated, ovr);
   registerRuntimeProvider(def);
   registerRuntimeProfile(name, profile);
+  // #565 — the admission census weighs every candidate on the request's
+  // path before a handler exists, so the declared window is recorded here,
+  // at the single site that knows it, rather than dug back out of an
+  // endpoint the request may never resolve.
+  registerDeclaredContextLimit(name, validated.contextLimit);
   // Register the custom endpoint in the credential authority too, so its key
   // (CUSTOM_<NAME>_KEY — including op:// values) resolves through the single
   // authority like every other provider, instead of an out-of-band env read.

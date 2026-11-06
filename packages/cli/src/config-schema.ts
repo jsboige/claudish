@@ -154,6 +154,18 @@ export const CustomEndpointSimpleSchema = z
     authScheme: CustomEndpointAuthSchemeSchema.optional(),
     modelPrefix: z.string().optional(),
     models: z.array(z.string()).optional(),
+    /**
+     * #565 — the endpoint's DECLARED total context window, in tokens. Read by
+     * the admission census (`handlers/shared/context-overflow.ts`): a request
+     * the estimate says is larger than EVERY window declared on its resolved
+     * path (nominal + cascade steps) is refused at admission with numbers,
+     * answered as a recoverable turn so the client's compaction gauge advances.
+     * An absent entry means "declares nothing" — never "unbounded": a path
+     * with ANY undeclared candidate falls open, so adding this field can only
+     * refuse, never widen. (On main this field also feeds the #441 dynamic
+     * clamp and the #651 derivation — later rows, not ported here.)
+     */
+    contextLimit: z.number().int().min(1).optional(),
     wire: CustomEndpointWireSchema.optional(),
   })
   .superRefine((ep, ctx) => {
@@ -178,6 +190,8 @@ export const CustomEndpointComplexSchema = z
       .optional(),
     modelPrefix: z.string().optional(),
     models: z.array(z.string()).optional(),
+    /** See CustomEndpointSimpleSchema.contextLimit (#565 admission census). */
+    contextLimit: z.number().int().min(1).optional(),
     wire: CustomEndpointWireSchema.optional(),
   })
   .superRefine((ep, ctx) => {
