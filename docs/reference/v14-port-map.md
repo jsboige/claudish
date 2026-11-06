@@ -80,22 +80,32 @@ issue-numbered rows, by `gh api repos/jsboige/claudish/issues/<n>` (a PR returns
 
 ## Known CI flake — do not chase it in a port PR
 
-`hermetic · macOS` intermittently fails `team-liveness-exited-slot.test.ts:91`
-(`idle_seconds >= 1`, received 0). The test sleeps a fixed 1.1 s and floors idle
-to whole seconds, so one late heartbeat frame on a loaded runner drops the value
-to 0. First seen on #869 (`65465b4e`), rerun-green same commit, analysis at
-`issuecomment-6651130218`; seen again on later PRs. The fix, if ever wanted,
-belongs in THAT TEST, never in a port diff — rerun the failed jobs and move on.
+The `hermetic · macOS` lane is intermittently red on a FAMILY of timing/UI tests
+in the team-orchestrator / dialog harness — never on the cascade, relay or
+context-admission suites a port touches. Three distinct instances measured, each
+on a different macOS shard of the same lane, each unrelated to the diff under
+test:
 
-A SECOND, distinct flake shares the `hermetic · macOS` lane: the settle-hold
-suite (`the settle hold (§11.5) > … > H-6 a fatal magmux stderr line during the
-hold: FAILED pane_lost; A1 once`), a ~5 s timing assertion in the
-team-orchestrator harness. Proven a flake on `91412ba6` (the #900 docs commit):
-two `pull_request` runs on the SAME sha, `42204745659` success vs `42204745717`
-failure — identical bytes, only the macOS runner's timing differed. Same rule:
-rerun the failed job, never touch a port diff for it. To tell the two flakes
-apart, read the failing test's name in the job log, not just the lane label —
-this one is `settle hold`, not `team-liveness-exited-slot`.
+- `team-liveness-exited-slot.test.ts:91` (`idle_seconds >= 1`, received 0) — a
+  fixed 1.1 s sleep floors idle to whole seconds; one late heartbeat on a loaded
+  runner drops it to 0. First seen #869 (`65465b4e`), analysis
+  `issuecomment-6651130218`.
+- `the settle hold (§11.5) > … > H-6 a fatal magmux stderr line during the hold:
+  FAILED pane_lost; A1 once` — a ~5 s timing assertion. Proven a flake on
+  `91412ba6` (the #900 docs commit): two `pull_request` runs on the SAME sha,
+  `42204745659` success vs `42204745717` failure, identical bytes.
+- `the dialog > has EXACTLY ONE cursor — the direct answer to "unclear what is
+  happening"` — 1 fail / 6692 tests (42659 expect), on the macOS 3/3 shard of
+  the same #900 docs commit's rerun. A UI/dialog assertion, not a port concern.
+
+**The rule is general, not per-test**: if the failing test lives in the
+team-orchestrator / dialog harness and the diff under test is a port (cascade,
+relay, admission, billing) or docs-only, it is the flake — **rerun the failed
+job and move on**, never touch a port diff for it. Read the failing test's NAME
+in the job log (grep `\(fail\)` near the bun summary `Ran N tests`), not just the
+lane label: the shard number moves between reruns (2/3 then 3/3 on consecutive
+#900 runs), so a green shard last time proves nothing about this time. The fix,
+if ever wanted, belongs in THOSE tests — a follow-up issue, not a port PR.
 
 ## Why this file exists
 
