@@ -290,12 +290,21 @@ foreach ($day in $daysToArchive) {
 
     Push-Location $CaptureDir
     try {
-      # LZMA2, max compression. -md=128m dictionary spans the cross-request
-      # redundancy while keeping the unattended job memory-safe (~1.5 GB).
+      # LZMA2, max compression, with a BOUND on dictionary and threads: an
+      # unattended nightly job must never starve the machine. Measured 06/11
+      # (jsboige/Maintenance#281): -md=128m -mmt=on reached 15.2 G of commit
+      # (99.8 % charge, pagefile pushed 80 -> 91.8 GB, machine unresponsive ~3 h,
+      # user reboot) — the "~1.5 GB" the old comment claimed was refuted by
+      # measurement (4th occurrence of the signature, first fatal one).
+      # -md=32m -mmt=8 caps LZMA2 well under 1 G of commit; the cost is a
+      # slightly lower ratio on redundancy farther apart than 32 MB, visible in
+      # the SUMMARY ratio line. Maintenance's commit-famine guard (armed 06/11,
+      # kills a claudish-captures 7z >= 4 G in famine) stays the backstop, not
+      # the fix.
       # NB: no `--` here — 7-Zip's `--` stops @listfile parsing too, which would
       # make it treat the list as a literal filename. The archive path and the
       # @list arg are both safe (no leading `-`), so `--` is unnecessary.
-      & $SevenZip a -t7z -m0=lzma2 -mx=9 -md=128m -mfb=273 -mmt=on -bso0 -bsp0 "$archivePath" "@$listFile" | Out-Null
+      & $SevenZip a -t7z -m0=lzma2 -mx=9 -md=32m -mfb=273 -mmt=8 -bso0 -bsp0 "$archivePath" "@$listFile" | Out-Null
       $addRc = $LASTEXITCODE
       & $SevenZip t -bso0 -bsp0 "$archivePath" | Out-Null
       $testRc = $LASTEXITCODE

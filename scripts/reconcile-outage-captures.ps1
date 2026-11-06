@@ -120,7 +120,11 @@ $listFile = Join-Path $env:TEMP ("claudish-reconcile-{0}.lst" -f $PID)
 
 Push-Location $CaptureDir
 try {
-  & $SevenZip a -t7z -m0=lzma2 -mx=9 -md=128m -mfb=273 -mmt=on -bso0 -bsp0 "$archivePath" "@$listFile" | Out-Null
+  # -md=32m -mmt=8: same memory bound as compress-captures.ps1 (jsboige/
+  # Maintenance#281 — -md=128m -mmt=on measured 15.2 G of commit, machine
+  # unresponsive ~3 h on 06/11). This script runs on demand, often beside the
+  # nightly job, so the bound matters twice here.
+  & $SevenZip a -t7z -m0=lzma2 -mx=9 -md=32m -mfb=273 -mmt=8 -bso0 -bsp0 "$archivePath" "@$listFile" | Out-Null
   $addRc = $LASTEXITCODE
   & $SevenZip t -bso0 -bsp0 "$archivePath" | Out-Null
   $testRc = $LASTEXITCODE
