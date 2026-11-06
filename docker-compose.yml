@@ -260,10 +260,13 @@ services:
       # read-per-request class as the switch above, same container rule.
       - CLAUDISH_FAILOVER_WALK_BUDGET_MS=${CLAUDISH_FAILOVER_WALK_BUDGET_MS:-}
       # #317 — per-session output-token ceiling (option B). Both empty → inert
-      # (no counting, no refusal, zero added bytes). The WARN-only pose ships
-      # first: set CLAUDISH_SESSION_BUDGET_WARN on the hub, leave CEILING empty
-      # until the user fixes the values. Read-per-request — but a container
-      # needs the NAME here to ever see a value (#304).
+      # (no counting, no refusal, zero added bytes). Hub pose since 27/10:
+      # WARN=5000000, CEILING=20000000 — MEASURED live from the container
+      # (05/11, re-read 06/11); the values entered at that evening's
+      # PAYG-remedy recreate and no user arbitration of these specific
+      # values is on record — the values are the user's call. Read-per-
+      # request — but a container needs the NAME here to ever see a
+      # value (#304).
       - CLAUDISH_SESSION_BUDGET_CEILING=${CLAUDISH_SESSION_BUDGET_CEILING:-}
       - CLAUDISH_SESSION_BUDGET_WARN=${CLAUDISH_SESSION_BUDGET_WARN:-}
       # #431 — step-skip kill switch: "0" restores the pre-#431 behavior (an
