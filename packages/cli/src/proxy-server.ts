@@ -2866,13 +2866,16 @@ export async function createProxyServer(
   // Token counting
   app.post("/v1/messages/count_tokens", async (c) => {
     try {
-      // #548 — same client-error terminal 400 as /v1/messages: c.req.json()
+      // #548 — same client-error terminal 400 as /v1/messages: the body read
       // throws a SyntaxError on empty / non-JSON input that the catch below
       // maps to a retryable 500 (which relays count toward hub hysteresis).
       // Answered before the freeze gate, handler resolution and any forward.
+      // readRequestBody, not c.req.json: a relay-compressed forward carries
+      // content-encoding: gzip and must inflate here too (#717 fix, 06/11) —
+      // the sidecar forwards the path the client hit, this one included.
       let body: any;
       try {
-        body = await c.req.json();
+        body = await readRequestBody(c);
       } catch (parseErr) {
         return c.json(
           wrapAnthropicError(400, `Invalid request body: ${(parseErr as Error)?.message ?? parseErr}`, "invalid_request_error"),

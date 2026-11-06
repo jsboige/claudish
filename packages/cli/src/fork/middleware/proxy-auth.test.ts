@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { gzipSync } from "node:zlib";
 import { Hono } from "hono";
 import { createProxyAuthMiddleware, collectRoutedBareNames } from "./proxy-auth.js";
+import { readRequestBody } from "../server/relay.js";
 import { matchesProxyKey, resolveProxyKeys } from "../../handlers/shared/proxy-keys.js";
 import {
   inboundInFlight,
@@ -407,5 +409,81 @@ describe("collectRoutedBareNames (#410)", () => {
   it("empty/absent config yields an empty set", () => {
     expect(collectRoutedBareNames({}).size).toBe(0);
     expect(collectRoutedBareNames({ routing: {}, customEndpoints: {} }).size).toBe(0);
+  });
+});
+
+// --- #717 root cause: the auth peek must be gzip-aware -----------------------
+//
+// A relay-compressed forward (CLAUDISH_RELAY_COMPRESS) arrives with
+// content-encoding: gzip. Before the 06/11 fix the middleware peeked with a
+// blind c.req.json(): on a gzipped body that decodes the binary as lossy
+// UTF-8 and poisons the body for the route's readRequestBody() — measured
+// live on the hub: every probe arm answered 400 "Unrecognized token '\u001f'"
+// (the mojibake no longer carries the 1f 8b magic bytes). The peek now goes
+// through readRequestBody() itself, so arrayBuffer() is the first touch.
+describe("proxy-auth middleware — gzipped body (#717 fix)", () => {
+  const gzBody = (model: string): Uint8Array =>
+    gzipSync(new TextEncoder().encode(JSON.stringify({ model, max_tokens: 1 })));
+
+  const postGz = (
+    app: Hono,
+    headers: Record<string, string>,
+    model: string
+  ): Promise<Response> =>
+    app.request("/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-encoding": "gzip", ...headers },
+      body: gzBody(model),
+    });
+
+  it("a gzipped body reaches the ROUTE parseable — the auth peek must not poison it", async () => {
+    const app = new Hono();
+    app.use("/v1/*", createProxyAuthMiddleware(["fleet-key"]));
+    app.post("/v1/messages", async (c) => {
+      try {
+        const body = await readRequestBody(c);
+        return c.json({ ok: true, model: body?.model });
+      } catch (e) {
+        return c.json({ ok: false, err: (e as Error).message }, 400);
+      }
+    });
+    const res = await postGz(app, { "x-proxy-key": "fleet-key" }, "gpt-4o");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, model: "gpt-4o" });
+  });
+
+  it("the model is EXTRACTED from a gzipped body — a scoped key's allowlist still gates it (403, not silent 200)", async () => {
+    // Regression discriminator: with the old blind c.req.json() peek, model
+    // stayed undefined on gzipped bodies, the #400 gate silently skipped, and
+    // a scoped key could ride a NON-allowlisted model through a gzipped
+    // request. The 403 proves the peek really parsed the inflated body.
+    const scoped: InboundKeyEntry[] = [
+      { name: "external", key: "scoped-secret", allowModels: ["frognano-4b"] },
+    ];
+    const app = buildApp(["fleet-key"], scoped);
+    expect((await postGz(app, { "x-api-key": "scoped-secret" }, "glm-5.3")).status).toBe(403);
+    expect((await postGz(app, { "x-api-key": "scoped-secret" }, "frognano-4b")).status).toBe(200);
+  });
+
+  it("plain (uncompressed) bodies behave exactly as before", async () => {
+    const app = buildApp(["fleet-key"]);
+    expect((await post(app, { "x-proxy-key": "fleet-key" })).status).toBe(200);
+    expect((await post(app, { "x-proxy-key": "wrong" })).status).toBe(401);
+  });
+
+  it("a malformed gzipped body (valid header, corrupt payload) still defers to the route's 400", async () => {
+    const app = buildApp(["fleet-key"]);
+    const res = await app.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "x-proxy-key": "fleet-key",
+      },
+      // 1f 8b magic but garbage after it: gunzip throws in the peek, the
+      // middleware swallows (malformed body) and the route answers the 400.
+      body: new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef]),
+    });
+    expect(res.status).toBe(200); // buildApp's route is (c) => c.json({ok:true})
   });
 });

@@ -29,6 +29,7 @@ import { markKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 import { logStderr } from "../../logger.js";
 import { parseModelSpec } from "../../providers/model-parser.js";
 import type { ClaudishProfileConfig } from "../../profile-config.js";
+import { readRequestBody } from "../server/relay.js";
 
 /**
  * #410 — the bare model names that leave the native lane: routing-map keys
@@ -63,10 +64,19 @@ export function createProxyAuthMiddleware(
     }
 
     // Peek at body.model to determine target provider.
-    // Hono caches parsed JSON — safe to call again from the route handler.
+    // GZIP-AWARE (#717 root cause, fixed 06/11): the FIRST body read on this
+    // request must go through readRequestBody(). A relay-compressed forward
+    // arrives with content-encoding: gzip, and a blind c.req.json() here
+    // decodes the binary body as lossy UTF-8 — poisoning the body for every
+    // later reader: the route's readRequestBody() then sees mojibake (measured
+    // live on the hub: a gzip body read back as re-encoded UTF-8 whose magic
+    // bytes no longer match 1f 8b, answering 400 "Unrecognized token '\u001f'
+    // on all three probe arms). With readRequestBody here, arrayBuffer() is
+    // the first touch; the route re-reads the same cached buffer and inflates
+    // fine. Hono still caches the parse — safe to call again from the route.
     let model: string | undefined;
     try {
-      const body = await c.req.json();
+      const body = await readRequestBody(c);
       model = body?.model;
     } catch {
       return await next(); // Malformed body — let handler return 400
