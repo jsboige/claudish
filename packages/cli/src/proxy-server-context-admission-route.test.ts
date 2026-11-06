@@ -71,6 +71,7 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_FAILOVER_ACTIVE",
   "CLAUDISH_FAILOVER_AUTO",
   "CLAUDISH_FAILOVER_ARM_AFTER",
+  "CLAUDISH_FAILOVER_SONNET",
   "CLAUDISH_CONTEXT_ADMISSION",
 ];
 const savedEnv: Record<string, string | undefined> = {};
@@ -212,9 +213,14 @@ async function spin(
   modelMap: Record<string, string>,
   env: Record<string, string> = cascadeEnv()
 ): Promise<void> {
+  // Cascades live in process.env: the proxy's own initFailover() reads them at
+  // spin, so a SECOND role's rule (A6) is wired exactly like the fleet's.
+  Object.assign(process.env, env);
   activeProxy = await createProxyServer(0, undefined, undefined, false, undefined, modelMap, {
     quiet: true,
   });
+  // The module reads failover state per request — re-initialising after
+  // startup is the honest shape (and arms the same env for the serve).
   resetFailoverForTests(env);
 }
 
@@ -305,6 +311,27 @@ describe("#565 — admission census through the real /v1/messages route", () => 
     await spin(
       { haiku: "nm-ep@fake-nom" },
       cascadeEnv({ CLAUDISH_FAILOVER_HAIKU: "bare-ep@fake-bare>s1-ep@fake-s1" })
+    );
+    const r = await postMessage({ content: "x".repeat(1_200_000) }); // est ≈ 300k
+    expect(r.status).toBe(200);
+    expect(markerLog.some((l) => l.includes("[ContextAdmission] REFUSE"))).toBe(false);
+    expect(calls.nm).toBe(1); // AUTO arm: the declared nominal serves attempt 0
+  }, 30_000);
+
+  test("A6: a role:<r> step is weighed as r's WHOLE path — r's UNDECLARED nominal stands the census down", async () => {
+    // CR ai-01 6680514571 — the 22/10 shape at the delegation position:
+    // haiku's cascade delegates to sonnet (role:sonnet), sonnet's NOMINAL is
+    // bare-ep (declares nothing — it may take the request) while every other
+    // candidate declares 262 144. Request est ≈ 300k: over every DECLARED
+    // window, but the path is not doomed, so it must SERVE. A port that weighs
+    // only the delegated role's STEPS (deleting the modelMap collectWindow in
+    // proxy-server.ts) refuses here — the mutation this pin exists to kill.
+    await spin(
+      { haiku: "nm-ep@fake-nom", sonnet: "bare-ep@fake-bare" },
+      {
+        ...cascadeEnv({ CLAUDISH_FAILOVER_HAIKU: "role:sonnet>s1-ep@fake-s1" }),
+        CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0",
+      }
     );
     const r = await postMessage({ content: "x".repeat(1_200_000) }); // est ≈ 300k
     expect(r.status).toBe(200);
