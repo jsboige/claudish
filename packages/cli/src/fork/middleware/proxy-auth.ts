@@ -28,6 +28,7 @@ import {
 import { markKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 import { logStderr } from "../../logger.js";
 import { parseModelSpec } from "../../providers/model-parser.js";
+import { readRequestBody } from "../server/relay.js";
 import type { ClaudishProfileConfig } from "../../profile-config.js";
 
 /**
@@ -63,10 +64,14 @@ export function createProxyAuthMiddleware(
     }
 
     // Peek at body.model to determine target provider.
-    // Hono caches parsed JSON — safe to call again from the route handler.
+    // #908 — read through readRequestBody, NOT bare c.req.json(): on a
+    // gzipped request the json() throw here consumed the stream, and the
+    // route's inflate then read the raw bytes — the #717 `'\u001f'` 400,
+    // reproduced with no edge in the path. readRequestBody also caches the
+    // parse, so this peek and the route share one body, gzipped or not.
     let model: string | undefined;
     try {
-      const body = await c.req.json();
+      const body = await readRequestBody(c);
       model = body?.model;
     } catch {
       return await next(); // Malformed body — let handler return 400

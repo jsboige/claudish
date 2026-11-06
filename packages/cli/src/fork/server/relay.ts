@@ -293,6 +293,17 @@ const CONNECT_RETRIES = 1;
 const CONNECT_RETRY_DELAY_MS = 250;
 
 /**
+ * Shared parsed-body slot (#908). The auth middleware pre-reads the body
+ * (proxy-auth.ts peeks at body.model) and Hono's own body cache only covers the
+ * PLAIN `c.req.json()` path: on a gzipped request the middleware's failed
+ * `json()` poisons the stream, and the route's inflate then sees the raw bytes —
+ * the exact `'\u001f'` 400 of #717, reproduced with zero edge in the path
+ * (middleware + route on a bare Hono app, 2026-11-06). Caching the PARSED
+ * result on the raw Request lets every reader share one parse, gzipped or not.
+ */
+const PARSED_BODY = Symbol("claudishParsedBody");
+
+/**
  * Read the JSON request body, inflating a gzipped body if present.
  *
  * WAN external sidecars gzip the forwarded request body (Content-Encoding: gzip)
@@ -301,17 +312,27 @@ const CONNECT_RETRY_DELAY_MS = 250;
  * gzip magic bytes (0x1f 0x8b) rather than trusting the header blindly, which
  * makes this correct (and non-throwing) whether or not the runtime already
  * inflated. Falls back to plain c.req.json() when no gzip encoding is declared —
- * zero cost on the LAN path.
+ * zero cost on the LAN path. Safe to call MORE THAN ONCE per request: the parse
+ * is cached on the raw Request (see PARSED_BODY), which is what lets the auth
+ * middleware and the route agree on one body.
  */
 export async function readRequestBody(c: Context): Promise<any> {
-  const encoding = (c.req.header("content-encoding") ?? "").toLowerCase();
-  if (!encoding.includes("gzip")) {
-    return c.req.json();
+  const rawObj = (c.req as any).raw;
+  if (rawObj && typeof rawObj === "object" && rawObj[PARSED_BODY] !== undefined) {
+    return rawObj[PARSED_BODY];
   }
-  const raw = Buffer.from(await c.req.arrayBuffer());
-  const isGzip = raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b;
-  const jsonBuf = isGzip ? gunzipSync(raw) : raw;
-  return JSON.parse(jsonBuf.toString("utf-8"));
+  const encoding = (c.req.header("content-encoding") ?? "").toLowerCase();
+  let parsed: any;
+  if (!encoding.includes("gzip")) {
+    parsed = await c.req.json();
+  } else {
+    const raw = Buffer.from(await c.req.arrayBuffer());
+    const isGzip = raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b;
+    const jsonBuf = isGzip ? gunzipSync(raw) : raw;
+    parsed = JSON.parse(jsonBuf.toString("utf-8"));
+  }
+  if (rawObj && typeof rawObj === "object") rawObj[PARSED_BODY] = parsed;
+  return parsed;
 }
 
 export function createRelayState(opts: {

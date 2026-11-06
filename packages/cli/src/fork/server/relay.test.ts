@@ -148,6 +148,36 @@ describe("readRequestBody", () => {
     expect(await readRequestBody(c)).toEqual(payload);
   });
 
+  it("called twice (middleware peek + route read) on a gzipped body → ONE parse, shared result (#908)", async () => {
+    const payload = { model: "glm-5.2" };
+    const gz = gzipSync(Buffer.from(JSON.stringify(payload), "utf-8"));
+    // A real Request so the PARSED_BODY cache slot behaves exactly as in
+    // production; arrayBuffer() is counted — the second read must never
+    // touch the (now consumed) stream.
+    const raw = new Request("http://hub/v1/messages", {
+      method: "POST",
+      body: toArrayBuffer(gz),
+      headers: { "content-encoding": "gzip" },
+    });
+    let reads = 0;
+    const c: any = {
+      req: {
+        raw,
+        header: (n: string) => raw.headers.get(n),
+        json: async () => {
+          throw new Error("json() on a gzip body — the poison #908 removed");
+        },
+        arrayBuffer: async () => {
+          reads += 1;
+          return raw.arrayBuffer();
+        },
+      },
+    };
+    expect(await readRequestBody(c)).toEqual(payload);
+    expect(await readRequestBody(c)).toEqual(payload);
+    expect(reads).toBe(1);
+  });
+
   it("content-encoding: gzip but body already inflated (runtime pre-inflate) → magic-byte detect, no throw", async () => {
     const payload = { model: "glm-5.2" };
     const plain = Buffer.from(JSON.stringify(payload), "utf-8");

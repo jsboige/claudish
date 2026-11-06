@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
+import { gzipSync } from "node:zlib";
 import { createProxyAuthMiddleware, collectRoutedBareNames } from "./proxy-auth.js";
+import { readRequestBody } from "../server/relay.js";
 import { matchesProxyKey, resolveProxyKeys } from "../../handlers/shared/proxy-keys.js";
 import {
   inboundInFlight,
@@ -407,5 +409,45 @@ describe("collectRoutedBareNames (#410)", () => {
   it("empty/absent config yields an empty set", () => {
     expect(collectRoutedBareNames({}).size).toBe(0);
     expect(collectRoutedBareNames({ routing: {}, customEndpoints: {} }).size).toBe(0);
+  });
+});
+
+describe("proxy-auth middleware — gzipped request body (#908)", () => {
+  /**
+   * The #717 mystery, solved 2026-11-06: a gzipped POST through the real
+   * middleware came back as the '\u001f' parse 400 on EVERY arm (LAN-direct
+   * hub included), because the middleware's body peek (bare c.req.json())
+   * consumed the stream on the failed parse and the route's inflate then read
+   * the raw bytes. Reproduced with zero edge in the path — middleware + route
+   * on a bare Hono app. This pin is that reproduction, now green: the peek and
+   * the route share one gzip-aware parse via readRequestBody.
+   */
+  it("the middleware's model peek does not poison the route's inflate", async () => {
+    const app = new Hono();
+    app.use("/v1/*", createProxyAuthMiddleware(["k"], [], new Set()));
+    app.post("/v1/messages", async (c) => {
+      const body = await readRequestBody(c);
+      return c.json({ model: body.model });
+    });
+    const gz = gzipSync(Buffer.from(JSON.stringify({ model: "glm-5.2" }), "utf-8"));
+    const res = await app.request("/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "x-proxy-key": "k",
+      },
+      body: gz,
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { model?: string };
+    expect(body.model).toBe("glm-5.2");
+  });
+
+  it("plain bodies through the peek still reach the route unchanged (the LAN path)", async () => {
+    const app = buildApp(["k"]);
+    const res = await post(app, { "x-proxy-key": "k" }, "glm-5.2");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
   });
 });
