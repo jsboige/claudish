@@ -1,41 +1,41 @@
-import { describe, it, expect, afterEach, beforeEach } from "bun:test";
-import { gzipSync } from "node:zlib";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
-import {
-  createRelayState,
-  readRequestBody,
-  forwardToUpstream,
-  deepProbe,
-  heartbeat,
-  proberTick,
-  relayHealthFields,
-  redactUpstreamForLog,
-  appendHop,
-  hopsContainSelf,
-  requestLoopedBack,
-  FORWARD_HEADERS_TIMEOUT_MS,
-  resolveForwardHeadersTimeoutMs,
-  MIN_FORWARD_HEADERS_TIMEOUT_MS,
-  MAX_FORWARD_HEADERS_TIMEOUT_MS,
-  resolveHeartbeatTimeoutMs,
-  DEEP_PROBE_TIMEOUT_MS,
-  DEEP_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
-  MIN_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
-  MAX_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
-  resolveProbeFirstAttemptTimeoutMs,
-  MIN_RELAY_HEARTBEAT_TIMEOUT_MS,
-  MAX_RELAY_HEARTBEAT_TIMEOUT_MS,
-  type RelayState,
-} from "./relay.js";
-import { getInstanceId } from "../../instance-id.js";
-import {
-  getRelayModeSnapshot,
-  setRelayModeSnapshot,
-} from "../../handlers/shared/relay-mode-snapshot.js";
+import { gzipSync } from "node:zlib";
 import {
   NOTICE_HEADER,
   noticeToHeaderValue,
 } from "../../handlers/shared/failover-stream-notice.js";
+import {
+  getRelayModeSnapshot,
+  setRelayModeSnapshot,
+} from "../../handlers/shared/relay-mode-snapshot.js";
+import { getInstanceId } from "../../instance-id.js";
+import {
+  DEEP_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
+  DEEP_PROBE_TIMEOUT_MS,
+  FORWARD_HEADERS_TIMEOUT_MS,
+  MAX_FORWARD_HEADERS_TIMEOUT_MS,
+  MAX_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
+  MAX_RELAY_HEARTBEAT_TIMEOUT_MS,
+  MIN_FORWARD_HEADERS_TIMEOUT_MS,
+  MIN_PROBE_FIRST_ATTEMPT_TIMEOUT_MS,
+  MIN_RELAY_HEARTBEAT_TIMEOUT_MS,
+  type RelayState,
+  appendHop,
+  createRelayState,
+  deepProbe,
+  forwardToUpstream,
+  heartbeat,
+  hopsContainSelf,
+  proberTick,
+  readRequestBody,
+  redactUpstreamForLog,
+  relayHealthFields,
+  requestLoopedBack,
+  resolveForwardHeadersTimeoutMs,
+  resolveHeartbeatTimeoutMs,
+  resolveProbeFirstAttemptTimeoutMs,
+} from "./relay.js";
 
 // ── fetch mock ─────────────────────────────────────────────────────
 const realFetch = globalThis.fetch;
@@ -126,7 +126,11 @@ describe("createRelayState", () => {
   });
 
   it("honors compress + proxyKey", () => {
-    const s = createRelayState({ upstream: "https://models.myia.io", compress: true, proxyKey: "k" });
+    const s = createRelayState({
+      upstream: "https://models.myia.io",
+      compress: true,
+      proxyKey: "k",
+    });
     expect(s.compress).toBe(true);
     expect(s.proxyKey).toBe("k");
   });
@@ -352,12 +356,19 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
   // not the hub's: the hub answered.
   const OVERLOAD_529_BODY = JSON.stringify({
     type: "error",
-    error: { type: "overloaded_error", code: "2064", message: "The server cluster is currently under high load" },
+    error: {
+      type: "overloaded_error",
+      code: "2064",
+      message: "The server cluster is currently under high load",
+    },
   });
 
   it("HTTP 529 is PASSED THROUGH (non-streaming request) — client gets 529 + body, no markFail, no local replay (#299 A)", async () => {
     fetchImpl = async () =>
-      new Response(OVERLOAD_529_BODY, { status: 529, headers: { "content-type": "application/json" } });
+      new Response(OVERLOAD_529_BODY, {
+        status: 529,
+        headers: { "content-type": "application/json" },
+      });
     const state = deadState();
     const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
     expect(r).not.toBeNull(); // non-null ⇒ the caller forwards it; null is the local-replay fallthrough
@@ -368,7 +379,10 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
 
   it("HTTP 529 is PASSED THROUGH (streaming request) and two consecutive 529s keep the relay NOMINAL (#299 A)", async () => {
     fetchImpl = async () =>
-      new Response(OVERLOAD_529_BODY, { status: 529, headers: { "content-type": "application/json" } });
+      new Response(OVERLOAD_529_BODY, {
+        status: 529,
+        headers: { "content-type": "application/json" },
+      });
     const state = deadState();
     const r1 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
     const r2 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
@@ -383,7 +397,10 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
 
   it("a 529 RESETS an existing failure streak (the hub answered — that is liveness evidence)", async () => {
     fetchImpl = async () =>
-      new Response(OVERLOAD_529_BODY, { status: 529, headers: { "content-type": "application/json" } });
+      new Response(OVERLOAD_529_BODY, {
+        status: 529,
+        headers: { "content-type": "application/json" },
+      });
     const state = deadState();
     state.consecutiveFail = 1; // one prior genuine failure
     const r = await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
@@ -435,7 +452,8 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     type: "error",
     error: {
       type: "overloaded_error",
-      message: "Proxy is draining for a restart (admission freeze). Retry shortly — in-flight streams are unaffected.",
+      message:
+        "Proxy is draining for a restart (admission freeze). Retry shortly — in-flight streams are unaffected.",
     },
   });
   const DRAIN_FREEZE_503_HEADERS = {
@@ -445,7 +463,8 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
   };
 
   it("a MARKED 503 is PASSED THROUGH — client gets 503 + body + Retry-After, no markFail, no local replay (#318)", async () => {
-    fetchImpl = async () => new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
+    fetchImpl = async () =>
+      new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
     const state = deadState();
     const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
     expect(r).not.toBeNull(); // non-null ⇒ forwarded to the client; null is the local-replay fallthrough
@@ -464,7 +483,8 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
   });
 
   it("a MARKED 503 passes through for a STREAMING request too, and two keep the relay NOMINAL (#318)", async () => {
-    fetchImpl = async () => new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
+    fetchImpl = async () =>
+      new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
     const state = deadState();
     const r1 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
     const r2 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
@@ -791,12 +811,7 @@ describe("#320 CLAUDISH_RELAY_HEADER_TIMEOUT_MS — configurable, empty-safe, bo
     };
     try {
       const t0 = Date.now();
-      const pending = forwardToUpstream(
-        mockForwardContext({}),
-        { model: "m" },
-        state,
-        60_000
-      );
+      const pending = forwardToUpstream(mockForwardContext({}), { model: "m" }, state, 60_000);
       await new Promise((r) => setTimeout(r, 30)); // reach the header wait
       await proberTick(state); // heartbeat failure #1
       await proberTick(state); // #2 → flip → the waiter is released
@@ -1044,8 +1059,7 @@ describe("deep probe: quota wall vs hub death", () => {
       );
     expect(await deepProbe(state())).toBe(true);
 
-    fetchImpl = async () =>
-      sseResponse('event: message_start\ndata: {"type":"message_start"}\n\n');
+    fetchImpl = async () => sseResponse('event: message_start\ndata: {"type":"message_start"}\n\n');
     expect(await deepProbe(state())).toBe(false); // truncated stream is not recovery
   });
 
@@ -1461,6 +1475,112 @@ describe("deep probe: quota wall vs hub death", () => {
   });
 });
 
+// ── #867 AC2: ONE line per recovery closing the RECOVERED→NOMINAL queue ──
+//
+// The issue's measured cost was a MEDIAN 83 s still-off-relay AFTER the hub was
+// back, reassembled by hand from docker logs: the RECOVERED line and the
+// NOMINAL line existed but nothing tied them, and the cooldown's share of the
+// wait was invisible. The fix is one appended segment on the historical
+// "healthy again" line: queue = wait + probe (same clock, three stamps), with
+// every probe attempt's own latency. AC3's before/after measurement greps THIS
+// line per flip — it replaces the hand re-assembly.
+describe("recovery episode line (#867 AC2)", () => {
+  const state = () => createRelayState({ upstream: "http://hub:3000", proxyKey: "k" });
+  const healthOk = () =>
+    new Response(
+      JSON.stringify({ status: "ok", instanceId: "11111111-1111-4111-8111-111111111111" }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }
+    );
+  const okStream = () =>
+    sseResponse(
+      'event: message_start\ndata: {"type":"message_start"}\n\n' +
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    );
+
+  it("ties the queue into the NOMINAL line: wait + probe + per-attempt latencies, arithmetic exact", async () => {
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.join(" "));
+    };
+    const s = state();
+    try {
+      let healthDown = true;
+      let probe = 0;
+      fetchImpl = async (url: any) => {
+        const u = String(url);
+        if (u.endsWith("/health")) {
+          if (healthDown) throw new Error("connect ECONNREFUSED");
+          return healthOk();
+        }
+        // Attempt 1 (haiku) refuses, attempt 2 (glm-5.3) carries the verdict —
+        // the #636 shape, so BOTH attempts' latencies appear on the line.
+        probe++;
+        return probe === 1
+          ? Promise.resolve(new Response("native lane refused", { status: 503 }))
+          : Promise.resolve(okStream());
+      };
+      await proberTick(s); // heartbeat failure 1/2 — episode opens
+      await proberTick(s); // failure 2/2 → AUTONOMOUS, lastFlipAt = now
+      expect(s.alive).toBe(false);
+      s.lastFlipAt -= 61_000; // the 60 s cooldown is long past (no wall-clock wait)
+      healthDown = false;
+      await proberTick(s); // ok 1/3 → RECOVERED line, recoveredAt stamped
+      expect(s.recoveredAt).toBeGreaterThan(0);
+      await proberTick(s); // ok 2/3
+      await proberTick(s); // ok 3/3 → deep probe → 503 then message_stop → NOMINAL
+    } finally {
+      console.log = origLog;
+    }
+    expect(s.alive).toBe(true);
+    expect(s.recoveredAt).toBeUndefined(); // the queue closed: next episode opens its own
+    const nominal = lines.filter((l) => l.includes("healthy again → NOMINAL (relay resumed)"));
+    expect(nominal.length).toBe(1); // historical substring SURVIVES (fleet greps it)
+    const line = nominal[0]!;
+    expect(line).toContain("queue RECOVERED→NOMINAL ");
+    expect(line).toContain("(cooldown floor 60s)"); // the invisible cost, named
+    expect(line).toContain("+ probe ");
+    // Per-attempt latencies: the refusing first attempt AND the deciding one.
+    expect(line).toMatch(/claude-haiku-4-5-20251001 \d+ms fail \(upstream HTTP 503\)/);
+    expect(line).toMatch(/glm-5\.3 \d+ms ok/);
+    // queue = wait + probe, exactly — one clock, three stamps. A decomposition
+    // that does not add up is a mislabeled line, worse than no line.
+    const q = /queue RECOVERED→NOMINAL (\d+\.\d)s = wait (\d+\.\d)s .* \+ probe (\d+\.\d)s/.exec(
+      line
+    );
+    expect(q).not.toBeNull();
+    expect(Math.abs(Number(q![1]) - (Number(q![2]) + Number(q![3])))).toBeLessThan(0.2);
+  });
+
+  it("without a RECOVERED stamp (jump-straight-to-autonomous states) the line degrades to the probe segment only", async () => {
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.join(" "));
+    };
+    const s = state();
+    s.alive = false; // the overlap-guard test's shape: no episode was ever opened
+    s.lastFlipAt = 0;
+    s.consecutiveOk = 3;
+    try {
+      fetchImpl = async (url: any) =>
+        String(url).endsWith("/health") ? healthOk() : Promise.resolve(okStream());
+      await proberTick(s); // ok heartbeat (no episode → no RECOVERED line) → probe → NOMINAL
+    } finally {
+      console.log = origLog;
+    }
+    expect(s.alive).toBe(true);
+    const nominal = lines.filter((l) => l.includes("healthy again → NOMINAL (relay resumed)"));
+    expect(nominal.length).toBe(1);
+    expect(nominal[0]).toContain("— probe "); // no queue segment…
+    expect(nominal[0]).not.toContain("queue RECOVERED→NOMINAL"); // …never a fabricated one
+    expect(nominal[0]).toMatch(/claude-haiku-4-5-20251001 \d+ms ok/);
+  });
+});
+
 // ── relayHealthFields (#157): /health must say the ROLE, origin-only ──
 //
 // 2026-09-19: a hub recreated as a relay forwarding to itself (ARR loops back)
@@ -1472,20 +1592,26 @@ describe("deep probe: quota wall vs hub death", () => {
 describe("relayHealthFields", () => {
   it("reports hub + null upstream with no relay configured", () => {
     expect(relayHealthFields(undefined)).toEqual({ role: "hub", upstream: null });
-    expect(relayHealthFields({ ...createRelayState({ upstream: "http://h:1" }), upstream: "" })).toEqual(
-      { role: "hub", upstream: null }
-    );
+    expect(
+      relayHealthFields({ ...createRelayState({ upstream: "http://h:1" }), upstream: "" })
+    ).toEqual({ role: "hub", upstream: null });
   });
 
   it("reports relay-nominal while the prober holds the upstream alive", () => {
     const s = createRelayState({ upstream: "https://models.myia.io" });
-    expect(relayHealthFields(s)).toEqual({ role: "relay-nominal", upstream: "https://models.myia.io" });
+    expect(relayHealthFields(s)).toEqual({
+      role: "relay-nominal",
+      upstream: "https://models.myia.io",
+    });
   });
 
   it("reports relay-autonomous once hysteresis has flipped", () => {
     const s = createRelayState({ upstream: "http://192.168.0.50:3000" });
     s.alive = false;
-    expect(relayHealthFields(s)).toEqual({ role: "relay-autonomous", upstream: "http://192.168.0.50:3000" });
+    expect(relayHealthFields(s)).toEqual({
+      role: "relay-autonomous",
+      upstream: "http://192.168.0.50:3000",
+    });
   });
 
   it("publishes only the ORIGIN of an upstream carrying userinfo — /health is unauthenticated", () => {
@@ -1572,7 +1698,10 @@ describe("heartbeat — self-loop detection (#156)", () => {
 
   it("negative: reply WITHOUT instanceId (older image) ⇒ not detected, verdict unchanged (true)", async () => {
     fetchImpl = async () =>
-      new Response(JSON.stringify({ status: "ok" }), { status: 200, headers: { "content-type": "application/json" } });
+      new Response(JSON.stringify({ status: "ok" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
     expect(await heartbeat(state)).toBe(true);
     expect(state.selfLoop).toBe(false);
@@ -1580,7 +1709,8 @@ describe("heartbeat — self-loop detection (#156)", () => {
   });
 
   it("negative: non-JSON 200 body ⇒ not detected, behaviour unchanged (true)", async () => {
-    fetchImpl = async () => new Response("OK", { status: 200, headers: { "content-type": "text/plain" } });
+    fetchImpl = async () =>
+      new Response("OK", { status: 200, headers: { "content-type": "text/plain" } });
     const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
     expect(await heartbeat(state)).toBe(true);
     expect(state.selfLoop).toBe(false);
@@ -1589,10 +1719,13 @@ describe("heartbeat — self-loop detection (#156)", () => {
 
   it("negative: a DIFFERENT instanceId (a real upstream) ⇒ not detected (true)", async () => {
     fetchImpl = async () =>
-      new Response(JSON.stringify({ status: "ok", instanceId: "11111111-2222-3333-4444-555555555555" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      new Response(
+        JSON.stringify({ status: "ok", instanceId: "11111111-2222-3333-4444-555555555555" }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      );
     const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
     expect(await heartbeat(state)).toBe(true);
     expect(state.selfLoop).toBe(false);
@@ -1646,10 +1779,13 @@ describe("heartbeat — self-loop detection (#156)", () => {
 
   it("a normal relay → real upstream stays nominal with selfLoop false (proberTick)", async () => {
     fetchImpl = async () =>
-      new Response(JSON.stringify({ status: "ok", instanceId: "11111111-2222-3333-4444-555555555555" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      new Response(
+        JSON.stringify({ status: "ok", instanceId: "11111111-2222-3333-4444-555555555555" }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      );
     const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
     await proberTick(state);
     await proberTick(state);
@@ -1687,7 +1823,9 @@ describe("redactUpstreamForLog", () => {
   });
 
   it("strips userinfo but keeps host, port and path", () => {
-    expect(redactUpstreamForLog("https://user:secret@hub.example:3000")).toBe("https://hub.example:3000");
+    expect(redactUpstreamForLog("https://user:secret@hub.example:3000")).toBe(
+      "https://hub.example:3000"
+    );
     expect(redactUpstreamForLog("https://user:secret@hub.example:3000/api")).toBe(
       "https://hub.example:3000/api"
     );
@@ -1698,7 +1836,9 @@ describe("redactUpstreamForLog", () => {
   // AND an unencoded `@` in the password. Positive control: the parsable branch
   // must also come back clean, or this test would pass on a regex never run.
   it("strips a password containing an unencoded @, on BOTH branches", () => {
-    expect(redactUpstreamForLog("https://user:p@ss@hub.example:3000")).toBe("https://hub.example:3000");
+    expect(redactUpstreamForLog("https://user:p@ss@hub.example:3000")).toBe(
+      "https://hub.example:3000"
+    );
 
     const out = redactUpstreamForLog("https://user:p@ss@not a url");
     expect(out).toBe("https://not a url");
@@ -1724,7 +1864,9 @@ describe("redactUpstreamForLog", () => {
     // transition lines + the v27 heartbeat FAILED shape line; grows with every
     // new redacted call site.
     expect(logCalls.length).toBeGreaterThan(3);
-    expect(logCalls.filter((l) => l.includes("redactUpstreamForLog(state.upstream)")).length).toBe(6);
+    expect(logCalls.filter((l) => l.includes("redactUpstreamForLog(state.upstream)")).length).toBe(
+      6
+    );
 
     const verbatim = logCalls.filter((l) => /\$\{state\.upstream\}/.test(l));
     expect(verbatim).toEqual([]);
@@ -1753,10 +1895,10 @@ function sseDyingResponse(): Response {
 
 /** Headers arrive and then nothing, ever — the mute-but-200 shape of #108. */
 function sseMuteResponse(): Response {
-  return new Response(
-    new ReadableStream<Uint8Array>({ start() {} }),
-    { status: 200, headers: { "content-type": "text/event-stream" } }
-  );
+  return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
 }
 
 const RECOVERED_SSE =
@@ -1942,7 +2084,9 @@ describe("forwardToUpstream — wire-agnostic re-forward predicates (#286)", () 
     let calls = 0;
     fetchImpl = async () => {
       calls++;
-      return calls === 1 ? sseDyingResponse() : sseResponse(openaiChunkSse("served after the restart"));
+      return calls === 1
+        ? sseDyingResponse()
+        : sseResponse(openaiChunkSse("served after the restart"));
     };
     const state = createRelayState({ upstream: "http://hub:3000" });
     const c = mockForwardContext({});
@@ -1962,7 +2106,10 @@ describe("forwardToUpstream — wire-agnostic re-forward predicates (#286)", () 
     fetchImpl = async () => {
       calls++;
       return sseResponse(
-        openaiChunkSse("PARTIAL-CONTENT").slice(0, openaiChunkSse("PARTIAL-CONTENT").indexOf("data: [DONE]")) +
+        openaiChunkSse("PARTIAL-CONTENT").slice(
+          0,
+          openaiChunkSse("PARTIAL-CONTENT").indexOf("data: [DONE]")
+        ) +
           `data: ${JSON.stringify({ error: { code: "invalid_prompt", message: "request rejected due to usage policy" } })}\n\n`
       );
     };
@@ -1997,16 +2144,23 @@ describe("#229 — relay carries the failover-notice header across both branches
 
   it("non-stream branch: the buffered rebuild keeps the hub-set notice header", async () => {
     fetchImpl = async () =>
-      new Response(JSON.stringify({ id: "x", choices: [{ message: { role: "assistant", content: "hi" } }] }), {
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          [NOTICE_HEADER]: noticeToHeaderValue(NOTICE),
-        },
-      });
+      new Response(
+        JSON.stringify({ id: "x", choices: [{ message: { role: "assistant", content: "hi" } }] }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            [NOTICE_HEADER]: noticeToHeaderValue(NOTICE),
+          },
+        }
+      );
     const state = createRelayState({ upstream: "http://hub:3000" });
 
-    const out = await forwardToUpstream(openAIContext(), { model: "glm-5.2", stream: false, messages: [] }, state);
+    const out = await forwardToUpstream(
+      openAIContext(),
+      { model: "glm-5.2", stream: false, messages: [] },
+      state
+    );
 
     expect(out).not.toBeNull();
     expect(out!.headers.get(NOTICE_HEADER)).toBe(noticeToHeaderValue(NOTICE));
@@ -2028,7 +2182,11 @@ describe("#229 — relay carries the failover-notice header across both branches
     fetchImpl = async () => new Response(hub.body, { status: hub.status, headers });
     const state = createRelayState({ upstream: "http://hub:3000" });
 
-    const out = await forwardToUpstream(openAIContext(), { model: "glm-5.2", stream: true, messages: [] }, state);
+    const out = await forwardToUpstream(
+      openAIContext(),
+      { model: "glm-5.2", stream: true, messages: [] },
+      state
+    );
 
     expect(out).not.toBeNull();
     expect(out!.headers.get(NOTICE_HEADER)).toBe(noticeToHeaderValue(NOTICE));
@@ -2098,14 +2256,21 @@ describe("#279b — hop-list self-detection", () => {
 
   it("requestLoopedBack: true only when the INCOMING request carries our own id (AC-b 1/3)", () => {
     const own = getInstanceId();
-    expect(requestLoopedBack(mockForwardContext({ "x-claudish-hops": `node-b,${own}` }))).toBe(true);
-    expect(requestLoopedBack(mockForwardContext({ "x-claudish-hops": "node-b,node-c" }))).toBe(false);
+    expect(requestLoopedBack(mockForwardContext({ "x-claudish-hops": `node-b,${own}` }))).toBe(
+      true
+    );
+    expect(requestLoopedBack(mockForwardContext({ "x-claudish-hops": "node-b,node-c" }))).toBe(
+      false
+    );
     expect(requestLoopedBack(mockForwardContext({}))).toBe(false); // no header → exactly today's behavior
   });
 
   it("forwardToUpstream appends own id to the hop list, attribution/auth headers untouched (AC-b 2)", async () => {
     fetchImpl = async () =>
-      new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     const state = createRelayState({ upstream: "http://hub:3000", proxyKey: "cluster-key" });
     const c = mockForwardContext({
       "x-claudish-hops": "node-a", // an upstream relay already marked this request
@@ -2124,7 +2289,10 @@ describe("#279b — hop-list self-detection", () => {
 
   it("forwardToUpstream with NO incoming hop header → list starts with own id (boot window marks hop 1)", async () => {
     fetchImpl = async () =>
-      new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     const state = createRelayState({ upstream: "http://hub:3000" });
     await forwardToUpstream(mockForwardContext({}), { model: "glm-5.2" }, state);
     const h = lastFetch!.init.headers as Record<string, string>;
@@ -2167,7 +2335,10 @@ describe("forwardToUpstream — upstream-nonok marker (#763)", () => {
     fetchImpl = async () =>
       new Response(ERROR_BODY, {
         status: 400,
-        headers: { "content-type": "application/json", "content-length": String(ERROR_BODY.length) },
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(ERROR_BODY.length),
+        },
       });
     const state = createRelayState({ upstream: "http://hub:3000" });
     const c = mockForwardContext({});
@@ -2230,7 +2401,11 @@ describe("forwardToUpstream — upstream-nonok marker (#763)", () => {
     const state = createRelayState({ upstream: "http://hub:3000" });
 
     const lines = await captureStderr(async () => {
-      const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+      const r = await forwardToUpstream(
+        mockForwardContext({}),
+        { model: "m", stream: true },
+        state
+      );
       await r!.text(); // drain, as the client would
     });
 
@@ -2344,7 +2519,9 @@ describe("v27 — heartbeat failure shape and episode log", () => {
     const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
     expect(await heartbeat(state)).toBe(true);
     expect(lastFetch!.url).toContain("/health");
-    expect((lastFetch!.init.headers as Record<string, string>)["X-Claudish-Machine"]).toBe("myia-ai-01");
+    expect((lastFetch!.init.headers as Record<string, string>)["X-Claudish-Machine"]).toBe(
+      "myia-ai-01"
+    );
     delete process.env.CLAUDISH_MACHINE;
     expect(await heartbeat(state)).toBe(true);
     expect(lastFetch!.init.headers).toEqual({});

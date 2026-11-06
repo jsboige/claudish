@@ -24,22 +24,29 @@
  * passes `capture: false` so it never writes an orphan resp-*.sse in nominal.
  */
 
+import { gunzipSync, gzipSync } from "node:zlib";
 import type { Context } from "hono";
-import { gzipSync, gunzipSync } from "node:zlib";
-import { log, logStderr } from "../../logger.js";
-import { getInstanceId } from "../../instance-id.js";
+import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
+import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
+import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 import { setRelayModeSnapshot } from "../../handlers/shared/relay-mode-snapshot.js";
 import type { RelayModeSnapshot } from "../../handlers/shared/relay-mode-snapshot.js";
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
-import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
-import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
+import { getInstanceId } from "../../instance-id.js";
+import { log, logStderr } from "../../logger.js";
 import { isQuotaExhaustion } from "../failover.js";
-import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 
 /** Headers we must not blindly forward to the upstream. */
 const HOP_BY_HOP = new Set([
-  "host", "connection", "keep-alive", "transfer-encoding", "te",
-  "trailer", "upgrade", "content-length", "content-encoding",
+  "host",
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "te",
+  "trailer",
+  "upgrade",
+  "content-length",
+  "content-encoding",
 ]);
 
 export interface RelayState {
@@ -83,6 +90,18 @@ export interface RelayState {
    * null once one succeeds. Never read by a decision path.
    */
   hbEpisode?: { startedAt: number; failures: number; firstShape: string } | null;
+  /**
+   * #867 AC2 — recovery-episode bookkeeping, log-only, never read by a decision
+   * path. `recoveredAt` is set when the heartbeat episode closes (the RECOVERED
+   * line: the FIRST ok heartbeat of the recovery), `probeAttempts` is written by
+   * every deepProbe() call. proberTick ties them into ONE line at the NOMINAL
+   * flip — queue RECOVERED→NOMINAL = wait (cooldown floor + tick alignment) +
+   * probe (per-attempt latencies). Before this, the two ends of the ~83 s median
+   * queue existed as separate log lines and only a hand re-assembly of docker
+   * logs could link them; the cooldown's share was invisible.
+   */
+  recoveredAt?: number;
+  probeAttempts?: { model: string; ms: number; ok: boolean; reason: string }[];
 }
 
 // ── Hysteresis tuning ──────────────────────────────────────────────
@@ -413,9 +432,10 @@ export function redactUpstreamForLog(upstream: string): string {
  * upstream configured with userinfo (`https://user:pass@host`, the documented
  * SearXNG form) would leak a credential on it.
  */
-export function relayHealthFields(
-  relay?: RelayState
-): { role: "hub" | "relay-nominal" | "relay-autonomous"; upstream: string | null } {
+export function relayHealthFields(relay?: RelayState): {
+  role: "hub" | "relay-nominal" | "relay-autonomous";
+  upstream: string | null;
+} {
   if (!relay?.upstream) return { role: "hub", upstream: null };
   let upstream: string;
   try {
@@ -530,7 +550,10 @@ export const HOPS_HEADER = "x-claudish-hops";
 
 export function parseHops(value: string | undefined | null): string[] {
   if (!value) return [];
-  return value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  return value
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 /** Append `id` to the incoming hop list, preserving whatever arrived. */
@@ -682,9 +705,7 @@ export async function forwardToUpstream(
   // than /v1/messages. Falls back to /v1/messages when the path is missing
   // (older callers / tests) to preserve the historical behavior.
   const reqPath =
-    typeof c.req?.path === "string" && c.req.path.startsWith("/v1/")
-      ? c.req.path
-      : "/v1/messages";
+    typeof c.req?.path === "string" && c.req.path.startsWith("/v1/") ? c.req.path : "/v1/messages";
   // #323 (review B2): ONE header deadline for the whole relayed turn. Every
   // header leg — the initial attempt, its connect retry, and each #170
   // re-forward — arms `max(0, deadline − now)`, never a fresh budget: 3 legs ×
@@ -824,7 +845,10 @@ export async function forwardToUpstream(
     // role. Pass it through exactly like a 4xx: the hub spoke, the client hears it.
     // forceConsole: the fallthrough line this replaces was forceConsole, and a
     // plain log() is file-only — a no-op on a production relay (debug off).
-    log(`[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`, true);
+    log(
+      `[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`,
+      true
+    );
   }
 
   if (drainFreeze503) {
@@ -834,7 +858,10 @@ export async function forwardToUpstream(
     // capture onto the relay's local cascades (budget/PAYG where the hub's
     // subscriptions would have served), and (c) let two freezes flip the relay
     // AUTONOMOUS because the hub is being maintained. forceConsole, countable.
-    log(`[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)`, true);
+    log(
+      `[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)`,
+      true
+    );
   }
 
   // Success (2xx/3xx/4xx), a relayed 529, or a marked drain-freeze 503. Reset
@@ -849,12 +876,7 @@ export async function forwardToUpstream(
   // just above (a different fact: "no local replay"), so they are excluded —
   // one event, one line. A 5xx never reaches here (it falls through above).
   if (res.status >= 400 && res.status !== 529 && !drainFreeze503) {
-    logUpstreamNonOk(
-      res.status,
-      reqPath,
-      requestBytes,
-      res.headers.get("content-length")
-    );
+    logUpstreamNonOk(res.status, reqPath, requestBytes, res.headers.get("content-length"));
   }
 
   const contentType = res.headers.get("content-type") || "";
@@ -1016,7 +1038,8 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
           );
         }
       }
-      if (isSelf) return noteHeartbeatFailure(state, startedAt, "self-loop (the upstream IS this process)");
+      if (isSelf)
+        return noteHeartbeatFailure(state, startedAt, "self-loop (the upstream IS this process)");
     }
     noteHeartbeatRecovered(state);
     return true;
@@ -1035,7 +1058,12 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
  */
 function shapeOfHeartbeatError(err: unknown, budgetMs: number): string {
   try {
-    const e = err as { name?: unknown; message?: unknown; code?: unknown; cause?: { code?: unknown } };
+    const e = err as {
+      name?: unknown;
+      message?: unknown;
+      code?: unknown;
+      cause?: { code?: unknown };
+    };
     const name = typeof e?.name === "string" ? e.name : "Error";
     if (name === "TimeoutError" || name === "AbortError") return `timeout after ${budgetMs}ms`;
     const code = e?.cause?.code ?? e?.code;
@@ -1069,6 +1097,9 @@ function noteHeartbeatRecovered(state: RelayState): void {
   const ep = state.hbEpisode;
   if (!ep) return; // steady state: silence is the healthy signal
   state.hbEpisode = null;
+  // #867 AC2: the RECOVERED line opens the recovery queue; the NOMINAL flip
+  // closes it and attributes the span (see proberTick).
+  state.recoveredAt = Date.now();
   const over = Date.now() - ep.startedAt;
   log(
     `[Relay] heartbeat RECOVERED after ${ep.failures} failure(s) over ${(over / 1000).toFixed(1)}s — first: ${ep.firstShape}`,
@@ -1193,6 +1224,13 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
   // verdict when the first expires, so it must never be the one cut short.
   const firstBudget = resolveProbeFirstAttemptTimeoutMs();
   const firstResult = await probeAttempt(state, first, firstBudget);
+  // #867 AC2: record each attempt's latency for the recovery line proberTick
+  // emits on success. Overwritten per call (a failed probe's attempts are
+  // visible through their own failure lines; only the winning probe's record
+  // is ever read).
+  state.probeAttempts = [
+    { model: first, ms: firstResult.ms, ok: firstResult.ok, reason: firstResult.reason },
+  ];
   if (firstResult.ok) return true;
   const fallback = probeFallbackModel();
   log(
@@ -1201,6 +1239,12 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
     true
   );
   const secondResult = await probeAttempt(state, fallback);
+  state.probeAttempts.push({
+    model: fallback,
+    ms: secondResult.ms,
+    ok: secondResult.ok,
+    reason: secondResult.reason,
+  });
   // No second "OK" line here: the attempt already logged one, naming the model
   // that passed. The line above names the model that failed. Two OK lines per
   // recovery would read as two probes.
@@ -1215,12 +1259,16 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
 
 /** One deep-probe request. No logging of the verdict — the caller owns it.
  * `timeoutMs` bounds THIS attempt's fetch and body read; the first attempt
- * passes the short #867 budget, the fallback the full one. */
+ * passes the short #867 budget, the fallback the full one. `ms` is the attempt's
+ * own latency (#867 AC2) — what the recovery line reports per attempt. */
 async function probeAttempt(
   state: RelayState,
   model: string,
   timeoutMs = DEEP_PROBE_TIMEOUT_MS
-): Promise<{ ok: boolean; reason: string }> {
+): Promise<{ ok: boolean; reason: string; ms: number }> {
+  // Above the try on purpose: the catch computes the attempt's latency too
+  // (#867 AC2), and a `const` born inside the try is not visible there.
+  const startedAt = Date.now();
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (state.proxyKey) headers["x-proxy-key"] = state.proxyKey;
@@ -1256,7 +1304,6 @@ async function probeAttempt(
       ],
       messages: [{ role: "user", content: "List the current directory using Bash. Do it now." }],
     });
-    const startedAt = Date.now();
     const res = await fetch(`${state.upstream}/v1/messages`, {
       method: "POST",
       headers,
@@ -1271,12 +1318,12 @@ async function probeAttempt(
             `that IS liveness (it routed the request to answer), returning to NOMINAL (model=${model})`,
           true
         );
-        return { ok: true, reason: "quota wall = liveness" };
+        return { ok: true, reason: "quota wall = liveness", ms: Date.now() - startedAt };
       }
-      return { ok: false, reason: `upstream HTTP ${res.status}` };
+      return { ok: false, reason: `upstream HTTP ${res.status}`, ms: Date.now() - startedAt };
     }
     if (!res.body) {
-      return { ok: false, reason: `HTTP ${res.status} with no body` };
+      return { ok: false, reason: `HTTP ${res.status} with no body`, ms: Date.now() - startedAt };
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -1292,21 +1339,23 @@ async function probeAttempt(
         // without a probe" (that silence produced a retracted false reading
         // about where the probe is served, 06/10). One bounded line per
         // probe, on the deep-probe path only — never per heartbeat.
-        log(
-          `[Relay] deep probe OK — message_stop after ${Date.now() - startedAt}ms (model=${model})`,
-          true
-        );
+        const ms = Date.now() - startedAt;
+        log(`[Relay] deep probe OK — message_stop after ${ms}ms (model=${model})`, true);
         try {
           await reader.cancel();
         } catch {
           /* ignore */
         }
-        return { ok: true, reason: "" };
+        return { ok: true, reason: "", ms };
       }
       if (acc.length > 200_000) break; // bound memory
     }
     // Reached only by a stream that ended (or overran) without a terminal frame.
-    return { ok: false, reason: `stream ended after ${acc.length} bytes without message_stop` };
+    return {
+      ok: false,
+      reason: `stream ended after ${acc.length} bytes without message_stop`,
+      ms: Date.now() - startedAt,
+    };
   } catch (e) {
     // Every other exit names its reason; this one carries the last. Without
     // these lines a sidecar held in AUTONOMOUS behind a healthy hub gave no
@@ -1320,9 +1369,13 @@ async function probeAttempt(
     // it must stay visible as such in the logs.
     const name = (e as { name?: string })?.name;
     if (name === "TimeoutError" || name === "AbortError") {
-      return { ok: false, reason: `timed out after ${timeoutMs}ms (${name})` };
+      return {
+        ok: false,
+        reason: `timed out after ${timeoutMs}ms (${name})`,
+        ms: Date.now() - startedAt,
+      };
     }
-    return { ok: false, reason: String(e).slice(0, 200) };
+    return { ok: false, reason: String(e).slice(0, 200), ms: Date.now() - startedAt };
   }
 }
 
@@ -1360,6 +1413,7 @@ export async function proberTick(state: RelayState): Promise<void> {
   ) {
     probingStates.add(state);
     try {
+      const probeStartAt = Date.now();
       const deep = await deepProbe(state);
       if (deep) {
         state.alive = true;
@@ -1367,8 +1421,26 @@ export async function proberTick(state: RelayState): Promise<void> {
         state.consecutiveOk = 0;
         state.lastFlipAt = Date.now();
         publishRelayMode({ mode: "nominal", downTrigger: "" });
+        // #867 AC2 — ONE line per recovery closing the queue the RECOVERED line
+        // opened: queue = wait + probe, exactly (same clock, three stamps). The
+        // wait is where the 60 s cooldown gate and the 10 s tick alignment live
+        // (the issue's invisible cost); the probe segment names every attempt
+        // with its own latency. Grep targets keep their substrings: the line is
+        // an APPEND to the historical "healthy again → NOMINAL (relay resumed)".
+        const now = Date.now();
+        const attempts = (state.probeAttempts ?? [])
+          .map((a) => `${a.model} ${a.ms}ms ${a.ok ? "ok" : `fail (${a.reason})`}`)
+          .join("; ");
+        const probeS = ((now - probeStartAt) / 1000).toFixed(1);
+        const queueSeg =
+          state.recoveredAt !== undefined
+            ? ` — queue RECOVERED→NOMINAL ${((now - state.recoveredAt) / 1000).toFixed(1)}s = ` +
+              `wait ${((probeStartAt - state.recoveredAt) / 1000).toFixed(1)}s ` +
+              `(cooldown floor ${RECOVERY_COOLDOWN_MS / 1000}s) + probe ${probeS}s [${attempts}]`
+            : ` — probe ${probeS}s [${attempts}]`;
+        state.recoveredAt = undefined; // next episode opens its own queue
         log(
-          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)`,
+          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)${queueSeg}`,
           true
         );
       } else {
