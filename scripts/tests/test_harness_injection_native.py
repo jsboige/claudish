@@ -46,6 +46,21 @@ for m in ("glm-5.3", "deepseek-v4.1-flash-1017", "MiniMax-M3.1-Flash",
 # different id and must surface, not silently count as native)
 check("not native: sonnet[1m]", not him.is_native_served("sonnet[1m]"))
 
+# PIEGE 9 (06/11 po-2024) : --since bornait les REQUETES, jamais les REPONSES.
+# `non appariees` additionnait donc tout l'historique du repertoire et se
+# lisait comme un echec d'appariement : 3 079 comptees pour 0 echec reel.
+# La garde est desormais une fonction, appliquee aux deux populations.
+check("fenetre: une reponse anterieure est hors borne",
+      him.before_since("2026-11-04T23-59-59-000Z", "2026-11-05"))
+check("fenetre: une reponse posterieure reste dans la borne",
+      not him.before_since("2026-11-05T00-58-46-183Z", "2026-11-05"))
+check("fenetre: le jour meme a 00:00 reste dans la borne",
+      not him.before_since("2026-11-05T00-00-00-000Z", "2026-11-05"))
+check("fenetre: sans borne, rien n'est exclu",
+      not him.before_since("2020-01-01T00-00-00-000Z", None))
+check("fenetre: horodatage illisible, rien n'est exclu",
+      not him.before_since(None, "2026-11-05"))
+
 if FAILS:
     print(f"\n{len(FAILS)} FAIL(S):")
     for f in FAILS:
