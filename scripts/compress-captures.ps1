@@ -296,9 +296,13 @@ foreach ($day in $daysToArchive) {
       # (99.8 % charge, pagefile pushed 80 -> 91.8 GB, machine unresponsive ~3 h,
       # user reboot) — the "~1.5 GB" the old comment claimed was refuted by
       # measurement (4th occurrence of the signature, first fatal one).
-      # -md=32m -mmt=8 caps LZMA2 well under 1 G of commit; the cost is a
-      # slightly lower ratio on redundancy farther apart than 32 MB, visible in
-      # the SUMMARY ratio line. Maintenance's commit-famine guard (armed 06/11,
+      # -md=32m -mmt=8 measured on ai-01 06/11 (629 MB of real captures, 1 315
+      # files): peak private bytes 2.46 G, working set 1.83 G, ratio 91.6:1.
+      # The thread count is fixed, so the peak does not grow with the core
+      # count. That is ~6x under the incident and under the 4 G guard below,
+      # but NOT "under 1 G": re-measure before writing a smaller figure here.
+      # The cost is a lower ratio on redundancy farther apart than 32 MB,
+      # visible in the SUMMARY ratio line. Maintenance's commit-famine guard (armed 06/11,
       # kills a claudish-captures 7z >= 4 G in famine) stays the backstop, not
       # the fix.
       # NB: no `--` here — 7-Zip's `--` stops @listfile parsing too, which would
