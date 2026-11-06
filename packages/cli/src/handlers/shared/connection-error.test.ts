@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildConnectionErrorMessage, classifyConnectionError } from "./connection-error.js";
+import {
+  buildConnectionErrorMessage,
+  classifyConnectionError,
+  connectRetryPolicy,
+} from "./connection-error.js";
 
 describe("classifyConnectionError", () => {
   test("classifies direct connection error codes", () => {
@@ -143,5 +147,59 @@ describe("buildConnectionErrorMessage", () => {
     const message = buildConnectionErrorMessage("dns", "Provider", "not-a-url");
 
     expect(message).toContain("not-a-url");
+  });
+});
+
+describe("connectRetryPolicy — which connect failures get a bounded retry", () => {
+  /**
+   * The 2026-11-06 widening: on a roaming WAN seat, dns/refused/unreachable
+   * are seconds-long BURSTS, not stable conditions — 26 turns were killed by
+   * blips the old "closed-only" ladder let straight through to a terminal 400
+   * in mono-candidate routing. These tests pin the three edges: the link
+   * ladder exists for remote endpoints, never for loopback, and a single env
+   * var disarms it.
+   */
+  const REMOTE = "https://api.z.ai/api/anthropic/v1/messages";
+  const LOOPBACK = "http://localhost:3000/v1/messages";
+
+  test('"closed" keeps the #251 ladder regardless of endpoint', () => {
+    for (const endpoint of [REMOTE, LOOPBACK]) {
+      const policy = connectRetryPolicy("closed", endpoint);
+      expect(policy?.max).toBe(2);
+      expect(policy?.delaysMs).toEqual([400, 1200]);
+    }
+  });
+
+  test("dns/refused/unreachable on a REMOTE endpoint get the link ladder", () => {
+    for (const kind of ["dns", "refused", "unreachable"] as const) {
+      const policy = connectRetryPolicy(kind, REMOTE);
+      expect(policy?.max).toBe(3);
+      expect(policy?.delaysMs).toEqual([500, 2000, 5000]);
+    }
+  });
+
+  test("a LOOPBACK endpoint never gets the link ladder — 'refused on localhost' is stable", () => {
+    for (const kind of ["dns", "refused", "unreachable"] as const) {
+      expect(connectRetryPolicy(kind, LOOPBACK)).toBeNull();
+    }
+  });
+
+  test("CLAUDISH_CONNECT_RETRY_LINK=0 disarms the link ladder, not the closed ladder", () => {
+    process.env.CLAUDISH_CONNECT_RETRY_LINK = "0";
+    try {
+      expect(connectRetryPolicy("refused", REMOTE)).toBeNull();
+      expect(connectRetryPolicy("closed", REMOTE)?.max).toBe(2);
+    } finally {
+      delete process.env.CLAUDISH_CONNECT_RETRY_LINK;
+    }
+  });
+
+  test("CLAUDISH_CONNECT_RETRY_LINK_MAX=0 is an empty ladder, not a disarm error", () => {
+    process.env.CLAUDISH_CONNECT_RETRY_LINK_MAX = "0";
+    try {
+      expect(connectRetryPolicy("refused", REMOTE)?.max).toBe(0);
+    } finally {
+      delete process.env.CLAUDISH_CONNECT_RETRY_LINK_MAX;
+    }
   });
 });

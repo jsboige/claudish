@@ -35,18 +35,21 @@ afterEach(() => {
   globalThis.fetch = realFetch;
   delete process.env.CLAUDISH_CONNECT_RETRY_MAX;
   delete process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS;
+  delete process.env.CLAUDISH_CONNECT_RETRY_LINK;
+  delete process.env.CLAUDISH_CONNECT_RETRY_LINK_MAX;
+  delete process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS;
 });
 
 /**
  * Fake transport with NO refreshAuth — the auth-retry branch stays out of the
  * way so the connection catch under test is the only error path exercised.
  */
-function makeTransport(): ProviderTransport {
+function makeTransport(endpoint = "http://localhost:19999/v1/chat/completions"): ProviderTransport {
   return {
     name: "sakana",
     displayName: "Sakana Fugu",
     streamFormat: "openai-sse",
-    getEndpoint: () => "http://localhost:19999/v1/chat/completions",
+    getEndpoint: () => endpoint,
     getHeaders: async () => ({}),
   } as unknown as ProviderTransport;
 }
@@ -102,8 +105,8 @@ const PAYLOAD = {
   messages: [{ role: "user", content: "hi" }],
 };
 
-function makeHandler(): ComposedHandler {
-  return new ComposedHandler(makeTransport(), "fugu-ultra", "fugu-ultra", 8464, {});
+function makeHandler(endpoint?: string): ComposedHandler {
+  return new ComposedHandler(makeTransport(endpoint), "fugu-ultra", "fugu-ultra", 8464, {});
 }
 
 describe("ComposedHandler.handle — connection-error surfacing (lot E1)", () => {
@@ -372,7 +375,7 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
     expect(captured.body?.error?.type).toBe("connection_error");
   });
 
-  test("refused is NOT retried — dns/refused/unreachable are stable conditions", async () => {
+  test("refused on a LOOPBACK endpoint is NOT retried — 'server not running' is the whole answer", async () => {
     process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS = "0,0";
     const calls = stubUpstreamSequence([
       () => {
@@ -384,6 +387,60 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
 
     expect(calls()).toBe(1);
     expect(captured.body?.error?.message).toContain("Make sure the server is running");
+  });
+
+  // ── WAN-burst widening (2026-11-06) ────────────────────────────────────────
+  // Measured on a roaming seat: dns/refused/unreachable on a REMOTE endpoint
+  // are seconds-long bursts — 26 turns died to a terminal 400 in one morning
+  // because nothing retried them. The link ladder is bounded, runs before any
+  // client-visible event, and a single env var disarms it.
+
+  const refusedThrow = () => {
+    throw Object.assign(new Error("connect ECONNREFUSED 185.42.17.9:443"), {
+      code: "ECONNREFUSED",
+    });
+  };
+
+  test("refused on a REMOTE endpoint recovers on a retry — the blip no longer kills the turn", async () => {
+    process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS = "0,0,0";
+    const calls = stubUpstreamSequence([
+      refusedThrow,
+      () =>
+        Promise.resolve(
+          new Response(
+            'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+            { status: 200 }
+          )
+        ),
+    ]);
+    const { c } = makeContext();
+    const res = await makeHandler("https://api.example.com/v1/chat/completions").handle(c, PAYLOAD);
+
+    expect(calls()).toBe(2);
+    expect(res.status).toBe(200);
+    const message = (await res.json()) as { type?: string };
+    expect(message.type).toBe("message");
+  });
+
+  test("link ladder exhausted — still the honest 400 connection_error, fetch called 1+3 times", async () => {
+    process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS = "0,0,0";
+    const calls = stubUpstreamSequence([refusedThrow]);
+    const { c, captured } = makeContext();
+    await makeHandler("https://api.example.com/v1/chat/completions").handle(c, PAYLOAD);
+
+    expect(calls()).toBe(4);
+    expect(captured.status).toBe(400);
+    expect(captured.body?.error?.type).toBe("connection_error");
+  });
+
+  test("CLAUDISH_CONNECT_RETRY_LINK=0 restores the single attempt on a remote endpoint", async () => {
+    process.env.CLAUDISH_CONNECT_RETRY_LINK = "0";
+    const calls = stubUpstreamSequence([refusedThrow]);
+    const { c, captured } = makeContext();
+    await makeHandler("https://api.example.com/v1/chat/completions").handle(c, PAYLOAD);
+
+    expect(calls()).toBe(1);
+    expect(captured.body?.error?.type).toBe("connection_error");
   });
 
   test("recovery on the second call — the upstream's answer replaces the connection error", async () => {

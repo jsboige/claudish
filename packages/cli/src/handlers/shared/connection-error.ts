@@ -91,7 +91,7 @@ function hostOf(endpoint: string): string {
 }
 
 /** True when the endpoint points at this machine (loopback / unspecified). */
-function isLoopback(endpoint: string): boolean {
+export function isLoopbackEndpoint(endpoint: string): boolean {
   try {
     const { hostname } = new URL(endpoint);
     return /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[?::1\]?)$/i.test(hostname);
@@ -116,7 +116,7 @@ export function buildConnectionErrorMessage(
       // server is running" would send the user to restart chatgpt.com. For a
       // remote host, give the DNS/network wording instead — that is the far
       // likelier cause, and the advice is right either way.
-      if (isLoopback(endpoint)) {
+      if (isLoopbackEndpoint(endpoint)) {
         return `Cannot connect to ${displayName} at ${endpoint}. Make sure the server is running.`;
       }
       return `Cannot reach ${host} for ${displayName}. This is a network problem on your machine — check your internet connection, VPN, or DNS resolver (e.g. Tailscale MagicDNS) — not ${displayName}.`;
@@ -130,19 +130,35 @@ export function buildConnectionErrorMessage(
 }
 
 /**
- * Bounded same-provider retry for "closed" connect failures (#251).
+ * Bounded same-provider retry for connect failures (#251, widened 2026-11-06).
  *
- * "closed" (ECONNRESET / EPIPE / socket closed before any byte) is the
- * transient class: the host was REACHED, then dropped the connection — the
- * measured case is a z.ai reset surfacing as a blocking 400 in
- * mono-candidate routing (2026-09-24). dns/refused/unreachable are
- * deliberately NOT retried: they are stable conditions, and in a chain the
- * other hosts cover them.
+ * "closed" (ECONNRESET / EPIPE / socket closed before any byte) is the first
+ * class measured as transient: the host was REACHED, then dropped the
+ * connection — the measured case is a z.ai reset surfacing as a blocking 400
+ * in mono-candidate routing (2026-09-24).
+ *
+ * The ORIGINAL comment here said dns/refused/unreachable are "stable
+ * conditions, and in a chain the other hosts cover them". The second half is
+ * true (FallbackHandler advances on the 400) but the first half is not: on a
+ * mobile/WAN link they are bursts, not states — measured 2026-11-06 on a
+ * roaming seat, where api.z.ai refused/unreachable for a few SECONDS at a time
+ * and each blip terminated a turn, 26 times in one morning. So those classes
+ * now get their own ladder, and only where it can help: a LOOPBACK endpoint is
+ * genuinely stable ("nothing is listening" is the whole answer, and the user
+ * needs it immediately), so it keeps the single-attempt behaviour.
+ *
+ * Both ladders are bounded and run strictly BEFORE the client sees any event,
+ * so never-hang is untouched: worst case is +1.6 s (closed) / +7.5 s of
+ * sleeps (link), plus however long the failed connect attempt itself took.
  *
  * CLAUDISH_CONNECT_RETRY_MAX — retries after the initial attempt (default 2,
  *   "0" disarms; re-read per request so an operator flip needs no restart).
  * CLAUDISH_CONNECT_RETRY_DELAYS_MS — comma-separated ladder before each
  *   retry (default "400,1200"; the last entry repeats when MAX exceeds it).
+ * CLAUDISH_CONNECT_RETRY_LINK — "0"/"false"/"no" disarms the link ladder
+ *   (default armed; re-read per request).
+ * CLAUDISH_CONNECT_RETRY_LINK_MAX — default 3.
+ * CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS — default "500,2000,5000".
  */
 export function connectRetryMax(): number {
   const raw = process.env.CLAUDISH_CONNECT_RETRY_MAX;
@@ -159,4 +175,51 @@ export function connectRetryDelaysMs(): number[] {
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isFinite(n) && n >= 0);
   return parsed.length ? parsed : [400, 1200];
+}
+
+/** Link ladder: the classes disproved as "stable" (dns / refused / unreachable). */
+export function connectRetryLinkMax(): number {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK_MAX;
+  if (raw === undefined || raw === "") return 3;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 3;
+}
+
+export function connectRetryLinkDelaysMs(): number[] {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS;
+  if (raw === undefined || raw === "") return [500, 2000, 5000];
+  const parsed = raw
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  return parsed.length ? parsed : [500, 2000, 5000];
+}
+
+/** The link ladder is armed by default; only an explicit no-disarms. */
+export function connectRetryLinkArmed(): boolean {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK?.trim().toLowerCase();
+  return !(raw === "0" || raw === "false" || raw === "no");
+}
+
+export interface ConnectRetryPolicy {
+  max: number;
+  delaysMs: number[];
+}
+
+/**
+ * The bounded retry policy for a connect failure of `kind` against `endpoint`.
+ * `null` (or `max === 0`) means: surface the failure on the first attempt.
+ *
+ * A loopback endpoint never gets the link ladder — "refused on localhost" is
+ * the stable condition the original comment was actually describing, and the
+ * honest "make sure the server is running" must not wait 7.5 s.
+ */
+export function connectRetryPolicy(
+  kind: ConnectionErrorKind,
+  endpoint: string
+): ConnectRetryPolicy | null {
+  if (kind === "closed") return { max: connectRetryMax(), delaysMs: connectRetryDelaysMs() };
+  if (isLoopbackEndpoint(endpoint)) return null;
+  if (!connectRetryLinkArmed()) return null;
+  return { max: connectRetryLinkMax(), delaysMs: connectRetryLinkDelaysMs() };
 }
