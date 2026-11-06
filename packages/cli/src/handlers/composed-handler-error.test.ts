@@ -38,6 +38,7 @@ afterEach(() => {
   delete process.env.CLAUDISH_CONNECT_RETRY_LINK;
   delete process.env.CLAUDISH_CONNECT_RETRY_LINK_MAX;
   delete process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS;
+  delete process.env.CLAUDISH_RELAY_UPSTREAM;
 });
 
 /**
@@ -441,6 +442,34 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
 
     expect(calls()).toBe(1);
     expect(captured.body?.error?.type).toBe("connection_error");
+  });
+
+  test("a CHAINED handler on the hub does NOT pay the link ladder — the chain advances instead (CR #906)", async () => {
+    // The mutation pin for the scope gate: FallbackHandler marks its
+    // candidates at construction, so the refused blip below must surface as a
+    // 400 on the FIRST attempt (fetch called once) and the chain's second
+    // host serves. If the scope gate were removed, this handler would sleep
+    // through the 3-rung ladder before advancing — calls() would read 4.
+    process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS = "0,0,0";
+    let secondCalled = false;
+    const first = makeHandler("https://api.example.com/v1/chat/completions");
+    const calls = stubUpstreamSequence([refusedThrow]);
+    const second = {
+      handle: async () => {
+        secondCalled = true;
+        return new Response("{}", { status: 200 });
+      },
+    };
+    const fb = new FallbackHandler([
+      { name: "first", handler: first },
+      { name: "second", handler: second as any },
+    ]);
+    const { c } = makeContext();
+    const res = await fb.handle(c, PAYLOAD);
+
+    expect(calls()).toBe(1);
+    expect(secondCalled).toBe(true);
+    expect(res.ok).toBe(true);
   });
 
   test("recovery on the second call — the upstream's answer replaces the connection error", async () => {

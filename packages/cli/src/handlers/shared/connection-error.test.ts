@@ -155,14 +155,15 @@ describe("connectRetryPolicy — which connect failures get a bounded retry", ()
    * The 2026-11-06 widening: on a roaming WAN seat, dns/refused/unreachable
    * are seconds-long BURSTS, not stable conditions — 26 turns were killed by
    * blips the old "closed-only" ladder let straight through to a terminal 400
-   * in mono-candidate routing. These tests pin the three edges: the link
-   * ladder exists for remote endpoints, never for loopback, and a single env
-   * var disarms it.
+   * in mono-candidate routing. The CR scope: the link ladder is armed by
+   * default for its two in-scope shapes (solo handler, relay sidecar) and NOT
+   * for a chained handler on the hub — the fallback chain advances instead of
+   * sleeping +7.5 s on a dead endpoint.
    */
   const REMOTE = "https://api.z.ai/api/anthropic/v1/messages";
   const LOOPBACK = "http://localhost:3000/v1/messages";
 
-  test('"closed" keeps the #251 ladder regardless of endpoint', () => {
+  test('"closed" keeps the #251 ladder regardless of endpoint or scope', () => {
     for (const endpoint of [REMOTE, LOOPBACK]) {
       const policy = connectRetryPolicy("closed", endpoint);
       expect(policy?.max).toBe(2);
@@ -170,24 +171,50 @@ describe("connectRetryPolicy — which connect failures get a bounded retry", ()
     }
   });
 
-  test("dns/refused/unreachable on a REMOTE endpoint get the link ladder", () => {
+  test("mono-candidate (solo handler) on a REMOTE endpoint gets the link ladder", () => {
     for (const kind of ["dns", "refused", "unreachable"] as const) {
-      const policy = connectRetryPolicy(kind, REMOTE);
+      const policy = connectRetryPolicy(kind, REMOTE, { monoCandidate: true });
       expect(policy?.max).toBe(3);
       expect(policy?.delaysMs).toEqual([500, 2000, 5000]);
     }
   });
 
-  test("a LOOPBACK endpoint never gets the link ladder — 'refused on localhost' is stable", () => {
-    for (const kind of ["dns", "refused", "unreachable"] as const) {
-      expect(connectRetryPolicy(kind, LOOPBACK)).toBeNull();
+  test("a CHAINED handler on the hub gets NO link ladder — the chain advances instead (CR #906)", () => {
+    // No CLAUDISH_RELAY_UPSTREAM, no monoCandidate: FallbackHandler absorbs
+    // the blip by advancing to the next host; sleeping first buys nothing.
+    expect(connectRetryPolicy("refused", REMOTE)).toBeNull();
+    expect(connectRetryPolicy("refused", REMOTE, { monoCandidate: false })).toBeNull();
+  });
+
+  test("CLAUDISH_RELAY_UPSTREAM set (sidecar) arms the ladder even for a chained handler", () => {
+    process.env.CLAUDISH_RELAY_UPSTREAM = "https://models.myia.io";
+    try {
+      const policy = connectRetryPolicy("refused", REMOTE, { monoCandidate: false });
+      expect(policy?.max).toBe(3);
+    } finally {
+      delete process.env.CLAUDISH_RELAY_UPSTREAM;
     }
   });
 
-  test("CLAUDISH_CONNECT_RETRY_LINK=0 disarms the link ladder, not the closed ladder", () => {
+  test("CLAUDISH_CONNECT_RETRY_LINK=1 forces the ladder out of scope (operator override)", () => {
+    process.env.CLAUDISH_CONNECT_RETRY_LINK = "1";
+    try {
+      expect(connectRetryPolicy("refused", REMOTE, { monoCandidate: false })?.max).toBe(3);
+    } finally {
+      delete process.env.CLAUDISH_CONNECT_RETRY_LINK;
+    }
+  });
+
+  test("a LOOPBACK endpoint never gets the link ladder — 'refused on localhost' is stable", () => {
+    for (const kind of ["dns", "refused", "unreachable"] as const) {
+      expect(connectRetryPolicy(kind, LOOPBACK, { monoCandidate: true })).toBeNull();
+    }
+  });
+
+  test("CLAUDISH_CONNECT_RETRY_LINK=0 disarms everywhere, even in scope — not the closed ladder", () => {
     process.env.CLAUDISH_CONNECT_RETRY_LINK = "0";
     try {
-      expect(connectRetryPolicy("refused", REMOTE)).toBeNull();
+      expect(connectRetryPolicy("refused", REMOTE, { monoCandidate: true })).toBeNull();
       expect(connectRetryPolicy("closed", REMOTE)?.max).toBe(2);
     } finally {
       delete process.env.CLAUDISH_CONNECT_RETRY_LINK;
@@ -197,7 +224,7 @@ describe("connectRetryPolicy — which connect failures get a bounded retry", ()
   test("CLAUDISH_CONNECT_RETRY_LINK_MAX=0 is an empty ladder, not a disarm error", () => {
     process.env.CLAUDISH_CONNECT_RETRY_LINK_MAX = "0";
     try {
-      expect(connectRetryPolicy("refused", REMOTE)?.max).toBe(0);
+      expect(connectRetryPolicy("refused", REMOTE, { monoCandidate: true })?.max).toBe(0);
     } finally {
       delete process.env.CLAUDISH_CONNECT_RETRY_LINK_MAX;
     }

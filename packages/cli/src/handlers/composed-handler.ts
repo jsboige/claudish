@@ -421,6 +421,15 @@ export class ComposedHandler implements ModelHandler {
   private readonly sessionInputSeeds = new Map<string, number>();
   /** Full routed model string (e.g. "zai@glm-4.7"). Used for provider routing and display echo. */
   private targetModel: string;
+
+  /**
+   * Set by FallbackHandler at construction when this handler is one candidate
+   * of a chain (#905): the chain absorbs a connect blip by advancing to the
+   * next host, so the link retry ladder's default scope (solo handlers — the
+   * 400 would kill the turn — and relay sidecars) does not apply. Read per
+   * request by the connect-retry decision; FallbackHandler is the only writer.
+   */
+  public chainedInFallback = false;
   /**
    * Bare model name (e.g. "glm-4.7"), provider prefix stripped. Used for model identity:
    * dialect selection, catalog lookup, middleware routing, context tracking. Never contains '@'.
@@ -1242,8 +1251,13 @@ export class ComposedHandler implements ModelHandler {
       // attempt: "refused on localhost" really is stable, and the user needs
       // the honest message now. Pre-headers only, so never-hang is unaffected;
       // bounded worst case ≈ +1.6 s (closed) / +7.5 s of sleeps (link).
+      // The link ladder's default scope is sidecar/mono-candidate (CR #906):
+      // a chained handler lets FallbackHandler advance instead of sleeping
+      // +7.5 s on a dead endpoint — the hub's LAN failure mode.
       const connKind = classifyConnectionError(error)?.kind ?? null;
-      const retryPolicy = connKind ? connectRetryPolicy(connKind, endpoint) : null;
+      const retryPolicy = connKind
+        ? connectRetryPolicy(connKind, endpoint, { monoCandidate: !this.chainedInFallback })
+        : null;
       const recovered =
         connKind && retryPolicy && retryPolicy.max > 0
           ? await retryConnectError(

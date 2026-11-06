@@ -155,8 +155,10 @@ export function buildConnectionErrorMessage(
  *   "0" disarms; re-read per request so an operator flip needs no restart).
  * CLAUDISH_CONNECT_RETRY_DELAYS_MS — comma-separated ladder before each
  *   retry (default "400,1200"; the last entry repeats when MAX exceeds it).
- * CLAUDISH_CONNECT_RETRY_LINK — "0"/"false"/"no" disarms the link ladder
- *   (default armed; re-read per request).
+ * CLAUDISH_CONNECT_RETRY_LINK — tri-state, re-read per request:
+ *   "0"/"false"/"no" disarms the link ladder everywhere (kill switch);
+ *   "1"/"true"/"yes" arms it everywhere (operator force, hub included);
+ *   unset → armed only in its default scope (see connectRetryPolicy).
  * CLAUDISH_CONNECT_RETRY_LINK_MAX — default 3.
  * CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS — default "500,2000,5000".
  */
@@ -195,10 +197,25 @@ export function connectRetryLinkDelaysMs(): number[] {
   return parsed.length ? parsed : [500, 2000, 5000];
 }
 
-/** The link ladder is armed by default; only an explicit no-disarms. */
+/** The link ladder's kill switch: only an explicit no disarms it. */
 export function connectRetryLinkArmed(): boolean {
   const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK?.trim().toLowerCase();
   return !(raw === "0" || raw === "false" || raw === "no");
+}
+
+/** Operator force: an explicit yes arms the link ladder even out of scope. */
+export function connectRetryLinkForced(): boolean {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+/**
+ * Relay sidecar (CLAUDISH_RELAY_UPSTREAM set) — this process rides a roaming
+ * WAN link by construction, so the link classes are bursts for it even when
+ * its routing built a fallback chain. Re-read per request.
+ */
+export function relayUpstreamSet(): boolean {
+  return !!process.env.CLAUDISH_RELAY_UPSTREAM?.trim();
 }
 
 export interface ConnectRetryPolicy {
@@ -213,13 +230,26 @@ export interface ConnectRetryPolicy {
  * A loopback endpoint never gets the link ladder — "refused on localhost" is
  * the stable condition the original comment was actually describing, and the
  * honest "make sure the server is running" must not wait 7.5 s.
+ *
+ * The link ladder's DEFAULT scope is narrow (CR #906): a relay sidecar
+ * (roaming WAN link — the process-wide condition this ladder was cut for) or
+ * a mono-candidate chain (no FallbackHandler above this handler, so the 400
+ * kills the turn — the #905 measurement: 26 dead turns in one morning). A
+ * handler that is one candidate of a fallback chain does NOT get it by
+ * default: the chain absorbs the blip by advancing to the next host, and
+ * sleeping +7.5 s per request on a dead endpoint (the hub's LAN failure
+ * mode) buys nothing the advance doesn't already provide. CLAUDISH_CONNECT_
+ * RETRY_LINK="1" forces it on anywhere; "0" disarms it everywhere.
  */
 export function connectRetryPolicy(
   kind: ConnectionErrorKind,
-  endpoint: string
+  endpoint: string,
+  scope: { monoCandidate?: boolean } = {}
 ): ConnectRetryPolicy | null {
   if (kind === "closed") return { max: connectRetryMax(), delaysMs: connectRetryDelaysMs() };
   if (isLoopbackEndpoint(endpoint)) return null;
   if (!connectRetryLinkArmed()) return null;
+  const inScope = connectRetryLinkForced() || relayUpstreamSet() || (scope.monoCandidate ?? false);
+  if (!inScope) return null;
   return { max: connectRetryLinkMax(), delaysMs: connectRetryLinkDelaysMs() };
 }
