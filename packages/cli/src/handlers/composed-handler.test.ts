@@ -915,18 +915,21 @@ describe("#518 stats volet — recordStats records this stream's tokens, not the
   }
 
   test("two sessions on one handler: B's stats line carries B's own input and output", async () => {
-    const { existsSync, readFileSync, writeFileSync, mkdirSync } = await import("node:fs");
-    const { homedir } = await import("node:os");
+    const { writeFileSync } = await import("node:fs");
     const { join } = await import("node:path");
     const { initStats, resetStatsForTests } = await import("../stats.js");
     const { readBuffer, clearBuffer, appendEvent } = await import("../stats-buffer.js");
 
-    // Arm the stats module against a scratch config (stats are opt-in; the real
-    // ~/.claudish/config.json is backed up and restored, stats-buffer precedent).
-    const configPath = join(homedir(), ".claudish", "config.json");
-    mkdirSync(join(homedir(), ".claudish"), { recursive: true });
-    const hadConfig = existsSync(configPath);
-    const prevConfig = hadConfig ? readFileSync(configPath, "utf-8") : null;
+    // Arm the stats module against a scratch config (#791): CLAUDISH_CONFIG_PATH
+    // points the whole process at a temp file, so initStats never reads — and
+    // this test never rewrites — the real ~/.claudish/config.json it used to
+    // back up and restore.
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const scratchDir = mkdtempSync(join(tmpdir(), "claudish-791-stats-"));
+    const configPath = join(scratchDir, "config.json");
+    const prevConfigEnv = process.env.CLAUDISH_CONFIG_PATH;
+    process.env.CLAUDISH_CONFIG_PATH = configPath;
     const prevStatsEnv = process.env.CLAUDISH_STATS;
     delete process.env.CLAUDISH_STATS;
     writeFileSync(configPath, JSON.stringify({
@@ -960,10 +963,8 @@ describe("#518 stats volet — recordStats records this stream's tokens, not the
     } finally {
       (globalThis as any).fetch = original;
       if (prevStatsEnv === undefined) delete process.env.CLAUDISH_STATS; else process.env.CLAUDISH_STATS = prevStatsEnv;
-      // Restore the real config, then put the user's buffered events back (the
-      // two test events were flushed toward disk by appendEvent's setImmediate).
-      if (hadConfig) writeFileSync(configPath, prevConfig!, "utf-8");
-      else { try { require("node:fs").unlinkSync(configPath); } catch { /* ignore */ } }
+      if (prevConfigEnv === undefined) delete process.env.CLAUDISH_CONFIG_PATH; else process.env.CLAUDISH_CONFIG_PATH = prevConfigEnv;
+      rmSync(scratchDir, { recursive: true, force: true });
       clearBuffer();
       for (const e of bufferBefore) appendEvent(e);
       resetStatsForTests(); // leave the module inert — later tests must not record into the real buffer

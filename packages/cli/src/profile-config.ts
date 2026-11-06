@@ -11,12 +11,21 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-// Config directory and file paths
+// Config directory and file paths.
+// CLAUDISH_CONFIG_PATH overrides the file location (#791). It is read per
+// call, never latched at module load, so a test can point the whole process
+// at a scratch file in beforeAll. Unset — the only fleet state — the
+// resolved value is exactly what it was before the override existed.
 const CONFIG_DIR = join(homedir(), ".claudish");
-const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+const DEFAULT_CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const LOCAL_CONFIG_FILENAME = ".claudish.json";
+
+/** Resolved config path: CLAUDISH_CONFIG_PATH when set, ~/.claudish/config.json otherwise. */
+export function configFilePath(): string {
+  return process.env.CLAUDISH_CONFIG_PATH ?? DEFAULT_CONFIG_FILE;
+}
 
 export type ProfileScope = "local" | "global";
 
@@ -191,8 +200,11 @@ const DEFAULT_CONFIG: ClaudishProfileConfig = {
  * Ensure global config directory exists
  */
 function ensureConfigDir(): void {
-  if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
+  // With CLAUDISH_CONFIG_PATH set, the directory to guarantee is the one the
+  // overridden file lives in (a scratch dir may not exist yet).
+  const dir = dirname(configFilePath());
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
   }
 }
 
@@ -264,12 +276,12 @@ export function mergeLoadedConfig(
 export function loadConfig(): ClaudishProfileConfig {
   ensureConfigDir();
 
-  if (!existsSync(CONFIG_FILE)) {
+  if (!existsSync(configFilePath())) {
     return { ...DEFAULT_CONFIG };
   }
 
   try {
-    const content = readFileSync(CONFIG_FILE, "utf-8");
+    const content = readFileSync(configFilePath(), "utf-8");
     const config = JSON.parse(content) as ClaudishProfileConfig;
     return mergeLoadedConfig(config);
   } catch (error) {
@@ -283,21 +295,21 @@ export function loadConfig(): ClaudishProfileConfig {
  */
 export function saveConfig(config: ClaudishProfileConfig): void {
   ensureConfigDir();
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), "utf-8");
+  writeFileSync(configFilePath(), JSON.stringify(config, null, 2), "utf-8");
 }
 
 /**
  * Check if global config file exists
  */
 export function configExists(): boolean {
-  return existsSync(CONFIG_FILE);
+  return existsSync(configFilePath());
 }
 
 /**
  * Get global config file path
  */
 export function getConfigPath(): string {
-  return CONFIG_FILE;
+  return configFilePath();
 }
 
 // ─── Local Config ────────────────────────────────────────
