@@ -24,29 +24,22 @@
  * passes `capture: false` so it never writes an orphan resp-*.sse in nominal.
  */
 
-import { gunzipSync, gzipSync } from "node:zlib";
 import type { Context } from "hono";
-import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
-import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
-import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
+import { gzipSync, gunzipSync } from "node:zlib";
+import { log, logStderr } from "../../logger.js";
+import { getInstanceId } from "../../instance-id.js";
 import { setRelayModeSnapshot } from "../../handlers/shared/relay-mode-snapshot.js";
 import type { RelayModeSnapshot } from "../../handlers/shared/relay-mode-snapshot.js";
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
-import { getInstanceId } from "../../instance-id.js";
-import { log, logStderr } from "../../logger.js";
+import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
+import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
 import { isQuotaExhaustion } from "../failover.js";
+import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 
 /** Headers we must not blindly forward to the upstream. */
 const HOP_BY_HOP = new Set([
-  "host",
-  "connection",
-  "keep-alive",
-  "transfer-encoding",
-  "te",
-  "trailer",
-  "upgrade",
-  "content-length",
-  "content-encoding",
+  "host", "connection", "keep-alive", "transfer-encoding", "te",
+  "trailer", "upgrade", "content-length", "content-encoding",
 ]);
 
 export interface RelayState {
@@ -92,13 +85,14 @@ export interface RelayState {
   hbEpisode?: { startedAt: number; failures: number; firstShape: string } | null;
   /**
    * #867 AC2 — recovery-episode bookkeeping, log-only, never read by a decision
-   * path. `recoveredAt` is set when the heartbeat episode closes (the RECOVERED
-   * line: the FIRST ok heartbeat of the recovery), `probeAttempts` is written by
-   * every deepProbe() call. proberTick ties them into ONE line at the NOMINAL
-   * flip — queue RECOVERED→NOMINAL = wait (cooldown floor + tick alignment) +
-   * probe (per-attempt latencies). Before this, the two ends of the ~83 s median
-   * queue existed as separate log lines and only a hand re-assembly of docker
-   * logs could link them; the cooldown's share was invisible.
+   * path. `recoveredAt` is set when a heartbeat episode closes INTO a queue
+   * (the RECOVERED line, only when the relay is already AUTONOMOUS — a blip
+   * recovered in NOMINAL opens no queue, CR ai-01 6680495144), `probeAttempts`
+   * is written by every deepProbe() call. proberTick ties them into ONE line at
+   * the NOMINAL flip — queue RECOVERED→NOMINAL = wait (cooldown floor + tick
+   * alignment) + probe (per-attempt latencies). Before this, the two ends of the
+   * ~83 s median queue existed as separate log lines and only a hand re-assembly
+   * of docker logs could link them; the cooldown's share was invisible.
    */
   recoveredAt?: number;
   probeAttempts?: { model: string; ms: number; ok: boolean; reason: string }[];
@@ -432,10 +426,9 @@ export function redactUpstreamForLog(upstream: string): string {
  * upstream configured with userinfo (`https://user:pass@host`, the documented
  * SearXNG form) would leak a credential on it.
  */
-export function relayHealthFields(relay?: RelayState): {
-  role: "hub" | "relay-nominal" | "relay-autonomous";
-  upstream: string | null;
-} {
+export function relayHealthFields(
+  relay?: RelayState
+): { role: "hub" | "relay-nominal" | "relay-autonomous"; upstream: string | null } {
   if (!relay?.upstream) return { role: "hub", upstream: null };
   let upstream: string;
   try {
@@ -550,10 +543,7 @@ export const HOPS_HEADER = "x-claudish-hops";
 
 export function parseHops(value: string | undefined | null): string[] {
   if (!value) return [];
-  return value
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+  return value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
 }
 
 /** Append `id` to the incoming hop list, preserving whatever arrived. */
@@ -705,7 +695,9 @@ export async function forwardToUpstream(
   // than /v1/messages. Falls back to /v1/messages when the path is missing
   // (older callers / tests) to preserve the historical behavior.
   const reqPath =
-    typeof c.req?.path === "string" && c.req.path.startsWith("/v1/") ? c.req.path : "/v1/messages";
+    typeof c.req?.path === "string" && c.req.path.startsWith("/v1/")
+      ? c.req.path
+      : "/v1/messages";
   // #323 (review B2): ONE header deadline for the whole relayed turn. Every
   // header leg — the initial attempt, its connect retry, and each #170
   // re-forward — arms `max(0, deadline − now)`, never a fresh budget: 3 legs ×
@@ -845,10 +837,7 @@ export async function forwardToUpstream(
     // role. Pass it through exactly like a 4xx: the hub spoke, the client hears it.
     // forceConsole: the fallthrough line this replaces was forceConsole, and a
     // plain log() is file-only — a no-op on a production relay (debug off).
-    log(
-      `[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`,
-      true
-    );
+    log(`[Relay] hub HTTP 529 (provider overload) — passed through to client, no local replay (#299)`, true);
   }
 
   if (drainFreeze503) {
@@ -858,10 +847,7 @@ export async function forwardToUpstream(
     // capture onto the relay's local cascades (budget/PAYG where the hub's
     // subscriptions would have served), and (c) let two freezes flip the relay
     // AUTONOMOUS because the hub is being maintained. forceConsole, countable.
-    log(
-      `[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)`,
-      true
-    );
+    log(`[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)`, true);
   }
 
   // Success (2xx/3xx/4xx), a relayed 529, or a marked drain-freeze 503. Reset
@@ -876,7 +862,12 @@ export async function forwardToUpstream(
   // just above (a different fact: "no local replay"), so they are excluded —
   // one event, one line. A 5xx never reaches here (it falls through above).
   if (res.status >= 400 && res.status !== 529 && !drainFreeze503) {
-    logUpstreamNonOk(res.status, reqPath, requestBytes, res.headers.get("content-length"));
+    logUpstreamNonOk(
+      res.status,
+      reqPath,
+      requestBytes,
+      res.headers.get("content-length")
+    );
   }
 
   const contentType = res.headers.get("content-type") || "";
@@ -1038,8 +1029,7 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
           );
         }
       }
-      if (isSelf)
-        return noteHeartbeatFailure(state, startedAt, "self-loop (the upstream IS this process)");
+      if (isSelf) return noteHeartbeatFailure(state, startedAt, "self-loop (the upstream IS this process)");
     }
     noteHeartbeatRecovered(state);
     return true;
@@ -1058,12 +1048,7 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
  */
 function shapeOfHeartbeatError(err: unknown, budgetMs: number): string {
   try {
-    const e = err as {
-      name?: unknown;
-      message?: unknown;
-      code?: unknown;
-      cause?: { code?: unknown };
-    };
+    const e = err as { name?: unknown; message?: unknown; code?: unknown; cause?: { code?: unknown } };
     const name = typeof e?.name === "string" ? e.name : "Error";
     if (name === "TimeoutError" || name === "AbortError") return `timeout after ${budgetMs}ms`;
     const code = e?.cause?.code ?? e?.code;
@@ -1097,9 +1082,11 @@ function noteHeartbeatRecovered(state: RelayState): void {
   const ep = state.hbEpisode;
   if (!ep) return; // steady state: silence is the healthy signal
   state.hbEpisode = null;
-  // #867 AC2: the RECOVERED line opens the recovery queue; the NOMINAL flip
-  // closes it and attributes the span (see proberTick).
-  state.recoveredAt = Date.now();
+  // #867 AC2: a RECOVERED opens the recovery queue ONLY when there is one —
+  // a one-failure blip recovered while the relay is still NOMINAL leaves no
+  // stamp to fabricate a later flip's queue from (CR ai-01 6680495144:
+  // reproduced, queue 3600.0s dated from an hour-old NOMINAL blip).
+  if (!state.alive) state.recoveredAt = Date.now();
   const over = Date.now() - ep.startedAt;
   log(
     `[Relay] heartbeat RECOVERED after ${ep.failures} failure(s) over ${(over / 1000).toFixed(1)}s — first: ${ep.firstShape}`,
@@ -1340,7 +1327,10 @@ async function probeAttempt(
         // about where the probe is served, 06/10). One bounded line per
         // probe, on the deep-probe path only — never per heartbeat.
         const ms = Date.now() - startedAt;
-        log(`[Relay] deep probe OK — message_stop after ${ms}ms (model=${model})`, true);
+        log(
+          `[Relay] deep probe OK — message_stop after ${ms}ms (model=${model})`,
+          true
+        );
         try {
           await reader.cancel();
         } catch {
