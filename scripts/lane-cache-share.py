@@ -128,6 +128,11 @@ def report(rows, hourly=False, rates=None):
 
 
 def self_test():
+    # normalize_bound: colon and Z spellings must land on the capture format.
+    assert normalize_bound("2026-11-06T00:02:00Z") == "2026-11-06T00-02-00"
+    assert normalize_bound("2026-11-06T00:02:00") == "2026-11-06T00-02-00"
+    assert normalize_bound("2026-11-06T00-02-00") == "2026-11-06T00-02-00"
+    assert normalize_bound("2026-11-06") == "2026-11-06"
     def sse(path, start_usage, delta_usage):
         with open(path, "w", encoding="utf-8") as f:
             f.write("event: message_start\n")
@@ -164,11 +169,28 @@ def self_test():
     print("self-test OK")
 
 
+def normalize_bound(v):
+    """Accept both capture-format bounds (YYYY-MM-DDTHH-MM-SS) and the
+    ISO-habit spellings (T HH:MM:SS, optional trailing Z). The window test is
+    a plain string compare against the file-name timestamp, so a colon-form
+    bound silently excludes whole hours — measured 06/11: a `T00:02:00Z`
+    since dropped every hour-00 capture of the window, hiding the entire
+    gpt-6.1-sol failover lane (00:02-00:28) behind "no response with a
+    non-zero prompt in the window"."""
+    v = v.strip()
+    if v.endswith("Z"):
+        v = v[:-1]
+    head, sep, tail = v.partition("T")
+    if sep and ":" in tail:
+        tail = tail.replace(":", "-")
+    return head + sep + tail
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("captures", nargs="?")
-    ap.add_argument("since", nargs="?", help="capture timestamp, YYYY-MM-DDTHH-MM-SS (UTC), inclusive")
-    ap.add_argument("until", nargs="?", help="capture timestamp, exclusive")
+    ap.add_argument("since", nargs="?", help="capture timestamp, YYYY-MM-DDTHH-MM-SS (UTC; HH:MM:SS also accepted), inclusive")
+    ap.add_argument("until", nargs="?", help="capture timestamp, exclusive; same formats as since")
     ap.add_argument("--lane", default=".", help="regex on the served-lane suffix of the file name")
     ap.add_argument("--hourly", action="store_true")
     ap.add_argument("--rates", help="IN,CACHED,OUT per 1M tokens — adds the weighted spend split")
@@ -185,7 +207,7 @@ def main(argv=None):
         if len(parts) != 3:
             ap.error("--rates takes three numbers: IN,CACHED,OUT")
         rates = tuple(parts)
-    rows = collect(a.captures, a.since, a.until, re.compile(a.lane))
+    rows = collect(a.captures, normalize_bound(a.since), normalize_bound(a.until), re.compile(a.lane))
     if not rows:
         print("no response with a non-zero prompt in the window")
         return 1
