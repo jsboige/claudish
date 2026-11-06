@@ -87,6 +87,16 @@ to 0. First seen on #869 (`65465b4e`), rerun-green same commit, analysis at
 `issuecomment-6651130218`; seen again on later PRs. The fix, if ever wanted,
 belongs in THAT TEST, never in a port diff — rerun the failed jobs and move on.
 
+A SECOND, distinct flake shares the `hermetic · macOS` lane: the settle-hold
+suite (`the settle hold (§11.5) > … > H-6 a fatal magmux stderr line during the
+hold: FAILED pane_lost; A1 once`), a ~5 s timing assertion in the
+team-orchestrator harness. Proven a flake on `91412ba6` (the #900 docs commit):
+two `pull_request` runs on the SAME sha, `42204745659` success vs `42204745717`
+failure — identical bytes, only the macOS runner's timing differed. Same rule:
+rerun the failed job, never touch a port diff for it. To tell the two flakes
+apart, read the failing test's name in the job log, not just the lane label —
+this one is `settle hold`, not `team-liveness-exited-slot`.
+
 ## Why this file exists
 
 On 2026-11-03 this lane published a triage calling #769 "the nearest design work". It
