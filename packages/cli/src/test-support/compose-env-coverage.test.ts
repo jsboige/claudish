@@ -90,6 +90,10 @@ const EXEMPT: ReadonlyArray<{ name: string; why: string }> = [
     name: "CLAUDISH_CATALOG_TTL_HOURS",
     why: "launcher cache-warm CLI knob; the proxy reads CLAUDISH_CATALOG_URL, not the warm TTL",
   },
+  {
+    name: "CLAUDISH_CONFIG_PATH",
+    why: "#791 host-side (CLI/test) override of the config file location; the container's path is fixed by the compose bind mount (~/.claudish/config.json), and the fleet state is unset — never a proxy-container knob",
+  },
   { name: "CLAUDISH_TEST_ENV_ALLOW", why: "test harness gate (test-support/env-gate.ts)" },
   { name: "CLAUDISH_TEST_ENV_STRICT", why: "test harness gate (test-support/env-gate.ts)" },
   { name: "CLAUDISH_TEST_HOME_SANDBOX", why: "test harness preload (test-preload.ts)" },

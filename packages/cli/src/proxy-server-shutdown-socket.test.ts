@@ -70,12 +70,18 @@ describe("#630 shutdown waits only for consumable work", () => {
   const GRACE_MS = 5000;
 
   let realConfigBefore: string | null = null;
+  let previousConfigPath: string | undefined;
   beforeAll(() => {
     realConfigBefore = existsSync(REAL_CONFIG_PATH) ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
+    // CR 6673025851: restore the PRIOR env, not delete — a suite running under
+    // an outer CLAUDISH_CONFIG_PATH (a wrapper harness, a -p invocation) must
+    // find it intact after us.
+    previousConfigPath = process.env.CLAUDISH_CONFIG_PATH;
     process.env.CLAUDISH_CONFIG_PATH = SCRATCH_CONFIG_PATH;
   });
   afterAll(() => {
-    delete process.env.CLAUDISH_CONFIG_PATH;
+    if (previousConfigPath === undefined) delete process.env.CLAUDISH_CONFIG_PATH;
+    else process.env.CLAUDISH_CONFIG_PATH = previousConfigPath;
     // #791 pin: nothing this suite does may touch the real config.
     const after = existsSync(REAL_CONFIG_PATH) ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
     expect(after).toBe(realConfigBefore);
