@@ -28,6 +28,8 @@ import type { Context } from "hono";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { log, logStderr } from "../../logger.js";
 import { getInstanceId } from "../../instance-id.js";
+import { setRelayModeSnapshot } from "../../handlers/shared/relay-mode-snapshot.js";
+import type { RelayModeSnapshot } from "../../handlers/shared/relay-mode-snapshot.js";
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
 import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
 import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
@@ -317,6 +319,10 @@ export function createRelayState(opts: {
   compress?: boolean;
   proxyKey?: string;
 }): RelayState {
+  // A relay is configured in THIS process ⇒ the capture layer can say the mode
+  // from boot (#877). On a hub this constructor never runs, so the snapshot
+  // stays null and connection-error lines carry no relay fields at all.
+  setRelayModeSnapshot({ mode: "nominal", downTrigger: "" });
   return {
     upstream: opts.upstream.replace(/\/+$/, ""),
     compress: opts.compress ?? false,
@@ -328,6 +334,23 @@ export function createRelayState(opts: {
     headerWaiters: new Set(),
     selfLoop: false,
   };
+}
+
+/**
+ * #877 — the flip's reason, reduced to the stable vocabulary the durable
+ * connection-error line joins on (`heartbeat` / `forward-connect` /
+ * `forward-http-<status>`). markFail's raw reason can carry a detail suffix
+ * (`forward-connect: getaddrinfo ENOTFOUND …`); the detail stays in the log
+ * line, the snapshot keeps the class.
+ */
+function triggerFromReason(reason: string): string {
+  const colon = reason.indexOf(":");
+  return (colon === -1 ? reason : reason.slice(0, colon)).trim();
+}
+
+/** Single write point for the snapshot — keeps mode and trigger coherent. */
+function publishRelayMode(snapshot: RelayModeSnapshot): void {
+  setRelayModeSnapshot(snapshot);
 }
 
 /**
@@ -411,6 +434,10 @@ function markFail(state: RelayState, reason: string): void {
   if (state.alive && state.consecutiveFail >= FAIL_THRESHOLD) {
     state.alive = false;
     state.lastFlipAt = Date.now();
+    // #877 — the durable connection-error line must be able to say the seat
+    // was AUTONOMOUS *and why it flipped*, for the windows `docker logs` no
+    // longer holds after a recreate.
+    publishRelayMode({ mode: "autonomous", downTrigger: triggerFromReason(reason) });
     // #323 (review B1) — release the in-flight header waits on the flip. The
     // flip is the earliest trustworthy verdict that those waits are dead (the
     // stall detector + 2 heartbeats ≈ 200s, vs a 360s budget they would each
@@ -1339,6 +1366,7 @@ export async function proberTick(state: RelayState): Promise<void> {
         state.consecutiveFail = 0;
         state.consecutiveOk = 0;
         state.lastFlipAt = Date.now();
+        publishRelayMode({ mode: "nominal", downTrigger: "" });
         log(
           `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)`,
           true

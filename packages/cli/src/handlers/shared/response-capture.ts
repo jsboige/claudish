@@ -18,6 +18,7 @@ import { mkdirSync, appendFileSync } from "fs";
 import { writeFile } from "fs/promises";
 
 import { getInstanceId } from "../../instance-id.js";
+import { getRelayModeSnapshot } from "./relay-mode-snapshot.js";
 import { respMarkerLine } from "./traffic-markers.js";
 
 // The resp-*.sse write is FIRE-AND-FORGET, for the same reason the request-side
@@ -220,6 +221,15 @@ export function appendUpstreamError(entry: {
  * without CLAUDISH_CAPTURE_DIR. Sibling file — `upstream-errors.log`'s
  * NDJSON shape (status/body) is read by traffic tooling and must not grow
  * a second variant.
+ *
+ * #877: the line also carries the relay context of THIS process when one is
+ * configured — `relay_mode` ("autonomous"|"nominal") and `relay_down_trigger`
+ * (the flip's reason class, empty when not flipped). Measured po-2027
+ * (03→05/11): 199 client-visible 400s where 185/199 sat inside an AUTONOMOUS
+ * episode, and after a recreate `docker logs` is gone, so nothing durable
+ * could join "the hub was unreachable" with "the provider was unreachable" —
+ * the only distinction between THIS seat's WAN and a provider outage. On a
+ * hub (no relay state) both fields are absent; there is nothing to say.
  */
 export function appendConnectionError(entry: {
   model: string;
@@ -233,6 +243,7 @@ export function appendConnectionError(entry: {
   if (!captureDir) return;
   try {
     if (!ensureCaptureDir(captureDir)) return;
+    const relay = getRelayModeSnapshot();
     const line = JSON.stringify({
       ts: new Date().toISOString(),
       model: entry.model,
@@ -241,6 +252,7 @@ export function appendConnectionError(entry: {
       code: entry.code,
       endpoint: String(entry.endpoint).slice(0, 512),
       elapsed_ms: Math.round(entry.elapsed_ms),
+      ...(relay ? { relay_mode: relay.mode, relay_down_trigger: relay.downTrigger } : {}),
     });
     appendFileSync(`${captureDir}/connection-errors.log`, line + "\n");
   } catch {

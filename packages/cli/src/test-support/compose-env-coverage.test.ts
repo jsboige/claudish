@@ -109,6 +109,21 @@ const EXEMPT_NAMES = new Set(EXEMPT.map((e) => e.name));
  *  name uppercased, non-alphanumerics as `_` (`vllm-myia` → `VLLM_MYIA`). */
 const ENDPOINT_BUDGET_FAMILY_RE = /^CLAUDISH_ENDPOINT_(?:TOKEN_BUDGET|BIG_LIMIT)_[A-Z0-9_]+$/;
 
+/**
+ * PAYG key vault (user mandate 06/11): config.json customEndpoints reference
+ * the operator's raw keys via `${CLAUDISH_ANTHROPIC_PAYG_KEY}` /
+ * `${CLAUDISH_OPENAI_PAYG_KEY}` expansion — read by the generic ${VAR}
+ * resolver (custom-endpoints-loader.ts `process.env[match[1]]`), which no
+ * static scan can bind to these literals. The names are deployment-specific
+ * by design (the shadow .env carries the values; the repo carries only the
+ * compose interpolation lines). Anchored the same way as the #654 family
+ * below: honored only while the expansion read is live.
+ */
+const PAYG_VAULT_NAMES: ReadonlySet<string> = new Set([
+  "CLAUDISH_ANTHROPIC_PAYG_KEY",
+  "CLAUDISH_OPENAI_PAYG_KEY",
+]);
+
 /** Recursively collect non-test .ts files under packages/cli/src. */
 function collectSourceFiles(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
@@ -130,6 +145,8 @@ export interface ScanResult {
   dynamicSuffixes: Set<string>;
   /** #654 — template reads of the per-endpoint budget family. */
   dynamicEndpointBudget: boolean;
+  /** 06/11 — the generic `${VAR}` apiKey resolver (custom endpoints). */
+  dynamicApiKeyExpansion: boolean;
 }
 
 /**
@@ -142,6 +159,7 @@ export function scanSources(files: { path: string; text: string }[]): ScanResult
   const staticReads = new Map<string, string[]>();
   let dynamicBareRole = false;
   let dynamicEndpointBudget = false;
+  let dynamicApiKeyExpansion = false;
   const dynamicSuffixes = new Set<string>();
   const dotRe = /(?:process\.env|\benv\b)\.(CLAUDISH_[A-Z0-9_]+)/g;
   const bracketRe = /(?:process\.env|\benv\b)\[\s*["'](CLAUDISH_[A-Z0-9_]+)["']\s*\]/g;
@@ -152,6 +170,11 @@ export function scanSources(files: { path: string; text: string }[]): ScanResult
   // #654 — the per-endpoint budget knobs read by template
   // (`CLAUDISH_ENDPOINT_TOKEN_BUDGET_${suffix}`, `…_BIG_LIMIT_${suffix}`).
   const dynamicEndpointBudgetRe = /env\[`CLAUDISH_ENDPOINT_(?:TOKEN_BUDGET|BIG_LIMIT)_\$\{[^}]+\}`\]/;
+  // 06/11 — the `${VAR}` apiKey expansion resolver's dynamic bracket read.
+  // Anchored to its exact shape (`process.env[match[1]]`): a rename of the
+  // capture variable kills the detector, and with it the vault allowance in
+  // deadComposeEntries — that coupling is the liveness pin, as for #654.
+  const dynamicApiKeyExpansionRe = /process\.env\[match\[1\]\]/;
   for (const f of files) {
     const lines = f.text.split("\n");
     lines.forEach((line, i) => {
@@ -165,10 +188,11 @@ export function scanSources(files: { path: string; text: string }[]): ScanResult
       }
       if (dynamicBareRe.test(line)) dynamicBareRole = true;
       if (dynamicEndpointBudgetRe.test(line)) dynamicEndpointBudget = true;
+      if (dynamicApiKeyExpansionRe.test(line)) dynamicApiKeyExpansion = true;
       for (const m of line.matchAll(dynamicSuffixRe)) dynamicSuffixes.add(m[1]);
     });
   }
-  return { staticReads, dynamicBareRole, dynamicSuffixes, dynamicEndpointBudget };
+  return { staticReads, dynamicBareRole, dynamicSuffixes, dynamicEndpointBudget, dynamicApiKeyExpansion };
 }
 
 /** Extract the CLAUDISH_* names the compose environment: list injects. */
@@ -220,6 +244,15 @@ export function deadComposeEntries(scan: ScanResult, composeNames: Set<string>):
     // bounded by the endpoint-name spelling itself, which the resolver
     // rejects loudly at load.
     .filter((n) => !(scan.dynamicEndpointBudget && ENDPOINT_BUDGET_FAMILY_RE.test(n)))
+    // 06/11 PAYG key vault — same anchor class as the #654 family above: the
+    // literals are consumed by the generic ${VAR} resolver, which no static
+    // scan can enumerate. Only honored while that read is live
+    // (dynamicApiKeyExpansion); delete the resolver and both literals are
+    // dead again, as they should be. Accepted price: a typo'd vault literal
+    // also passes direction 2; bounded by the config.json spelling itself,
+    // which the loader rejects loudly at startup (unresolvable ${VAR} skips
+    // the endpoint with a stderr warning).
+    .filter((n) => !(scan.dynamicApiKeyExpansion && PAYG_VAULT_NAMES.has(n)))
     .sort();
 }
 
@@ -383,6 +416,31 @@ describe("#310 compose env coverage (all CLAUDISH_*)", () => {
       },
     ]);
     expect(synthetic.dynamicEndpointBudget).toBe(true);
+  });
+
+  test("the 06/11 PAYG vault literals are pinned and only live while the ${VAR} resolver is", () => {
+    // Same two-direction pin as the #654 family above: (1) the detector sees
+    // the generic ${VAR} apiKey resolver; (2) the two deployment literals
+    // stay in compose (without the interpolation line the value never reaches
+    // the container — #310's whole failure mode) and are counted as read.
+    expect(scan.dynamicApiKeyExpansion).toBe(true);
+    expect(composeNames.has("CLAUDISH_ANTHROPIC_PAYG_KEY")).toBe(true);
+    expect(composeNames.has("CLAUDISH_OPENAI_PAYG_KEY")).toBe(true);
+    expect(deadComposeEntries(scan, composeNames)).not.toContain("CLAUDISH_ANTHROPIC_PAYG_KEY");
+    expect(deadComposeEntries(scan, composeNames)).not.toContain("CLAUDISH_OPENAI_PAYG_KEY");
+    // The allowance is keyed to the live resolver read: kill the read and the
+    // literals are dead again — the allowance can never outlive its code.
+    const noResolver = scanSources([{ path: "synthetic-none.ts", text: "const x = 1;\n" }]);
+    expect(deadComposeEntries(noResolver, new Set(["CLAUDISH_ANTHROPIC_PAYG_KEY"])))
+      .toEqual(["CLAUDISH_ANTHROPIC_PAYG_KEY"]);
+    // Detector liveness on a synthetic source (the resolver's exact shape).
+    const synthetic = scanSources([
+      {
+        path: "synthetic-apikey-expansion.ts",
+        text: `return process.env[match[1]] ?? "";\n`,
+      },
+    ]);
+    expect(synthetic.dynamicApiKeyExpansion).toBe(true);
   });
 
   test("positive control: the bracket read shape is live (synthetic fixture)", () => {

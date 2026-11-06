@@ -260,10 +260,13 @@ services:
       # read-per-request class as the switch above, same container rule.
       - CLAUDISH_FAILOVER_WALK_BUDGET_MS=${CLAUDISH_FAILOVER_WALK_BUDGET_MS:-}
       # #317 — per-session output-token ceiling (option B). Both empty → inert
-      # (no counting, no refusal, zero added bytes). The WARN-only pose ships
-      # first: set CLAUDISH_SESSION_BUDGET_WARN on the hub, leave CEILING empty
-      # until the user fixes the values. Read-per-request — but a container
-      # needs the NAME here to ever see a value (#304).
+      # (no counting, no refusal, zero added bytes). Hub pose since 27/10:
+      # WARN=5000000, CEILING=20000000 — MEASURED live from the container
+      # (05/11, re-read 06/11); the values entered at that evening's
+      # PAYG-remedy recreate and no user arbitration of these specific
+      # values is on record — the values are the user's call. Read-per-
+      # request — but a container needs the NAME here to ever see a
+      # value (#304).
       - CLAUDISH_SESSION_BUDGET_CEILING=${CLAUDISH_SESSION_BUDGET_CEILING:-}
       - CLAUDISH_SESSION_BUDGET_WARN=${CLAUDISH_SESSION_BUDGET_WARN:-}
       # #431 — step-skip kill switch: "0" restores the pre-#431 behavior (an
@@ -302,6 +305,15 @@ services:
       # the upstream sent it (no event/type repair). Empty = repair ON. Read once
       # per stream, i.e. per request.
       - CLAUDISH_FRAME_COHERENCE=${CLAUDISH_FRAME_COHERENCE:-}
+      # #886 — Codex session-affinity kill switch: "0" restores the pre-#886
+      # wire on the cx@ lane (a fresh x-session-id per request, no session-id
+      # header, no prompt_cache_key). Empty = affinity ON. Read per request.
+      - CLAUDISH_CODEX_SESSION_AFFINITY=${CLAUDISH_CODEX_SESSION_AFFINITY:-}
+      # Anthropic-compatible wire — "0" forwards Claude Code's `defer_loading`
+      # flags untouched. Empty = flags dropped (every tool visible), because the
+      # tool_reference blocks that would load a deferred tool are stripped on this
+      # wire. Read per request.
+      - CLAUDISH_ANTHROPIC_WIRE_UNDEFER=${CLAUDISH_ANTHROPIC_WIRE_UNDEFER:-}
       # #310 — runtime knobs the proxy reads that were never in this list
       # (same absence class as the #304 failover knobs above: the env file only
       # interpolates, so a value set for a name this list does not carry never
@@ -360,6 +372,17 @@ services:
       # DeepSeek reasons by default and PAYG bills on output tokens.
       # passthrough (default) | disabled. Re-read per request.
       - CLAUDISH_DEEPSEEK_THINKING=${CLAUDISH_DEEPSEEK_THINKING:-}
+      # PAYG key vault (user mandate 06/11): the raw PAYG keys live ONLY in the
+      # operator's shadow .env — never in config.json, never in the repo. The
+      # config's customEndpoints (anthropic-payg@, oai-payg@) expand them via
+      # ${...} at proxy startup; an unresolvable ${VAR} skips the endpoint with
+      # one stderr warning (validation doctrine). Addressable is NOT serving:
+      # no role, routing entry or cascade step may reference these endpoints
+      # without explicit user arbitration (doctrine 06/11 — subscriptions
+      # first, PAYG = terminal cascade rung at most). Compose lines exist so
+      # the values reach the process at all (the env file only interpolates).
+      - CLAUDISH_ANTHROPIC_PAYG_KEY=${CLAUDISH_ANTHROPIC_PAYG_KEY:-}
+      - CLAUDISH_OPENAI_PAYG_KEY=${CLAUDISH_OPENAI_PAYG_KEY:-}
     command: ["--port", "3000", "--host", "0.0.0.0"]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://0.0.0.0:3000/health"]
