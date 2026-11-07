@@ -29,16 +29,12 @@ export class FallbackHandler implements ModelHandler {
 
   constructor(candidates: FallbackCandidate[]) {
     this.candidates = candidates;
-    // #905 scope marking: a chained ComposedHandler lets this handler absorb a
-    // connect blip by advancing, so its link retry ladder stays out of the
-    // default scope (solo handlers and relay sidecars keep it). Marked here —
-    // chain assembly is the only place that knows the handler is not alone.
-    // Known edge: handler instances are cached per target and an explicit
-    // provider@model request can later retrieve the same marked instance solo;
-    // the error direction is conservative (no ladder, pre-#905 behavior).
-    for (const { handler } of candidates) {
-      if (handler instanceof ComposedHandler) handler.chainedInFallback = true;
-    }
+    // #905 initially marked chained candidates here so the connect-retry
+    // ladder could skip them; CR #906 (second round) removed that arm — the
+    // ladder's default scope is the relay sidecar env alone, and the hub's
+    // solo nominals are covered by the #299-B cascade walk instead. Nothing
+    // to mark anymore; the constructor stays because the chain shape itself
+    // is what handle() iterates.
   }
 
   // INVARIANT: Each candidate handler (ComposedHandler) must NOT mutate the Hono

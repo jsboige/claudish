@@ -423,14 +423,6 @@ export class ComposedHandler implements ModelHandler {
   private targetModel: string;
 
   /**
-   * Set by FallbackHandler at construction when this handler is one candidate
-   * of a chain (#905): the chain absorbs a connect blip by advancing to the
-   * next host, so the link retry ladder's default scope (solo handlers — the
-   * 400 would kill the turn — and relay sidecars) does not apply. Read per
-   * request by the connect-retry decision; FallbackHandler is the only writer.
-   */
-  public chainedInFallback = false;
-  /**
    * Bare model name (e.g. "glm-4.7"), provider prefix stripped. Used for model identity:
    * dialect selection, catalog lookup, middleware routing, context tracking. Never contains '@'.
    * @invariant !bareModelName.includes("@")
@@ -1253,14 +1245,14 @@ export class ComposedHandler implements ModelHandler {
       // bounded worst case ≈ +1.6 s (closed) / +7.5 s of sleeps (link), PLUS
       // each failed attempt's own connect time — for the timeout classes
       // (ETIMEDOUT / UND_ERR_CONNECT_TIMEOUT) that is up to 1+MAX full connect
-      // timeouts, not one. The link ladder's default scope is
-      // sidecar/mono-candidate (CR #906): a chained handler lets
-      // FallbackHandler advance instead of sleeping on a dead endpoint —
-      // the hub's LAN failure mode.
+      // timeouts, not one. The link ladder's default scope is the relay
+      // sidecar only (CR #906, second round): on the hub, a cascade-backed
+      // role's nominal comes back here as a SOLO handler, but its connect 400
+      // is walk-class (#299 B) and handleWithCascade serves the next step —
+      // a ladder would stack sleeps in front of a walk that already recovers
+      // the turn. CLAUDISH_CONNECT_RETRY_LINK="1" forces it on anyway.
       const connKind = classifyConnectionError(error)?.kind ?? null;
-      const retryPolicy = connKind
-        ? connectRetryPolicy(connKind, endpoint, { monoCandidate: !this.chainedInFallback })
-        : null;
+      const retryPolicy = connKind ? connectRetryPolicy(connKind, endpoint) : null;
       const recovered =
         connKind && retryPolicy && retryPolicy.max > 0
           ? await retryConnectError(

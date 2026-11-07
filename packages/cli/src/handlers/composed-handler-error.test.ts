@@ -394,7 +394,10 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
   // Measured on a roaming seat: dns/refused/unreachable on a REMOTE endpoint
   // are seconds-long bursts — 26 turns died to a terminal 400 in one morning
   // because nothing retried them. The link ladder is bounded, runs before any
-  // client-visible event, and a single env var disarms it.
+  // client-visible event, and a single env var disarms it. Since CR #906
+  // (second round) its DEFAULT scope is the relay sidecar, so the mechanics
+  // tests below set CLAUDISH_RELAY_UPSTREAM to be in scope — on the hub the
+  // ladder is off by default and the #299-B walk owns recovery (next block).
 
   const refusedThrow = () => {
     throw Object.assign(new Error("connect ECONNREFUSED 185.42.17.9:443"), {
@@ -402,7 +405,8 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
     });
   };
 
-  test("refused on a REMOTE endpoint recovers on a retry — the blip no longer kills the turn", async () => {
+  test("refused on a REMOTE endpoint recovers on a retry — the blip no longer kills the turn (sidecar scope)", async () => {
+    process.env.CLAUDISH_RELAY_UPSTREAM = "https://hub.myia.io";
     process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS = "0,0,0";
     const calls = stubUpstreamSequence([
       refusedThrow,
@@ -423,7 +427,8 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
     expect(message.type).toBe("message");
   });
 
-  test("link ladder exhausted — still the honest 400 connection_error, fetch called 1+3 times", async () => {
+  test("link ladder exhausted — still the honest 400 connection_error, fetch called 1+3 times (sidecar scope)", async () => {
+    process.env.CLAUDISH_RELAY_UPSTREAM = "https://hub.myia.io";
     process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS = "0,0,0";
     const calls = stubUpstreamSequence([refusedThrow]);
     const { c, captured } = makeContext();
@@ -436,6 +441,7 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
 
   test("CLAUDISH_CONNECT_RETRY_LINK=0 restores the single attempt on a remote endpoint", async () => {
     process.env.CLAUDISH_CONNECT_RETRY_LINK = "0";
+    process.env.CLAUDISH_RELAY_UPSTREAM = "https://hub.myia.io";
     const calls = stubUpstreamSequence([refusedThrow]);
     const { c, captured } = makeContext();
     await makeHandler("https://api.example.com/v1/chat/completions").handle(c, PAYLOAD);
@@ -444,12 +450,28 @@ describe("ComposedHandler.handle — bounded same-provider connect retry (#251)"
     expect(captured.body?.error?.type).toBe("connection_error");
   });
 
+  test("a SOLO handler on the HUB pays ONE fetch — no link ladder by default (CR #906, second round)", async () => {
+    // The first #906 cut armed the ladder here (mono-candidate = solo). On the
+    // hub that is every cascade-backed role's nominal: the 400 is walk-class
+    // (#299 B) and handleWithCascade serves a step, so the ladder only stacks
+    // sleeps in front of a recovering walk. The arm is GONE — restore it and
+    // calls() reads 4 (1 + the 3 rungs).
+    process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS = "0,0,0";
+    const calls = stubUpstreamSequence([refusedThrow]);
+    const { c, captured } = makeContext();
+    await makeHandler("https://api.example.com/v1/chat/completions").handle(c, PAYLOAD);
+
+    expect(calls()).toBe(1);
+    expect(captured.status).toBe(400);
+    expect(captured.body?.error?.type).toBe("connection_error");
+  });
+
   test("a CHAINED handler on the hub does NOT pay the link ladder — the chain advances instead (CR #906)", async () => {
-    // The mutation pin for the scope gate: FallbackHandler marks its
-    // candidates at construction, so the refused blip below must surface as a
-    // 400 on the FIRST attempt (fetch called once) and the chain's second
-    // host serves. If the scope gate were removed, this handler would sleep
-    // through the 3-rung ladder before advancing — calls() would read 4.
+    // The mutation pin for the scope gate: the refused blip below must surface
+    // as a 400 on the FIRST attempt (fetch called once) and the chain's second
+    // host serves. If the gate were removed (or a scope arm re-added), this
+    // handler would sleep through the 3-rung ladder before advancing —
+    // calls() would read 4.
     process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS = "0,0,0";
     let secondCalled = false;
     const first = makeHandler("https://api.example.com/v1/chat/completions");

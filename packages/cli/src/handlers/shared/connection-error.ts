@@ -234,25 +234,26 @@ export interface ConnectRetryPolicy {
  * the stable condition the original comment was actually describing, and the
  * honest "make sure the server is running" must not wait 7.5 s.
  *
- * The link ladder's DEFAULT scope is narrow (CR #906): a relay sidecar
- * (roaming WAN link — the process-wide condition this ladder was cut for) or
- * a mono-candidate chain (no FallbackHandler above this handler, so the 400
- * kills the turn — the #905 measurement: 26 dead turns in one morning). A
- * handler that is one candidate of a fallback chain does NOT get it by
- * default: the chain absorbs the blip by advancing to the next host, and
- * sleeping +7.5 s per request on a dead endpoint (the hub's LAN failure
- * mode) buys nothing the advance doesn't already provide. CLAUDISH_CONNECT_
- * RETRY_LINK="1" forces it on anywhere; "0" disarms it everywhere.
+ * The link ladder's DEFAULT scope is the relay sidecar ONLY (CR #906, second
+ * round): `CLAUDISH_RELAY_UPSTREAM` set — the process rides a roaming WAN link
+ * by construction, and every dead turn measured in #905 (26 in one morning)
+ * lived there, chain or not. The hub and plain CLI are excluded by default:
+ * a cascade-backed role's NOMINAL is an explicit `provider@model` that comes
+ * back as a solo handler, but its connect 400 is walk-class (#299 B,
+ * isOverloadWalkClass on connection_error) and `handleWithCascade` serves the
+ * first servable step — a ladder here would only stack up to 7.5 s of sleeps
+ * (per request, on every role) in front of a walk that already recovers the
+ * turn. Nobody has measured link blips there; the operator force exists for
+ * the day someone does. CLAUDISH_CONNECT_RETRY_LINK="1" forces it on
+ * anywhere; "0" disarms it everywhere.
  */
 export function connectRetryPolicy(
   kind: ConnectionErrorKind,
-  endpoint: string,
-  scope: { monoCandidate?: boolean } = {}
+  endpoint: string
 ): ConnectRetryPolicy | null {
   if (kind === "closed") return { max: connectRetryMax(), delaysMs: connectRetryDelaysMs() };
   if (isLoopbackEndpoint(endpoint)) return null;
   if (!connectRetryLinkArmed()) return null;
-  const inScope = connectRetryLinkForced() || relayUpstreamSet() || (scope.monoCandidate ?? false);
-  if (!inScope) return null;
+  if (!connectRetryLinkForced() && !relayUpstreamSet()) return null;
   return { max: connectRetryLinkMax(), delaysMs: connectRetryLinkDelaysMs() };
 }
