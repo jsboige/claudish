@@ -58,12 +58,19 @@ services:
     # next recreate, so the bound was one deploy away from reverting silently:
     # this file is the durable source, and these values EQUAL the measured runtime
     # state, so the next recreate changes nothing.
-    # Doctrine: memswap_limit = mem_limit (no swap escape hatch), pids_limit in
-    # 512..4096, both above measured usage with margin — 98.95 MiB / 1 GiB and
+    # Doctrine: memswap_limit = mem_limit (no swap escape hatch — on these hosts
+    # swap imitates a wedge), pids_limit in 512..4096 and >= 4x the measured PID
+    # count, both above measured usage with margin — 98.95 MiB / 1 GiB and
     # 31 / 512 pids measured 07/11, OOMKilled=false over the container's life.
-    mem_limit: 1g
-    memswap_limit: 1g
-    pids_limit: 512
+    #
+    # Per-seat overridable on purpose: this one file builds the hub AND every
+    # sidecar, and the hub relays for the whole fleet — a seat that needs more
+    # raises CLAUDISH_MEM_LIMIT / CLAUDISH_PIDS_LIMIT in ITS OWN env file rather
+    # than editing a shared file. The same variable feeds limit and swap, so the
+    # two can never diverge.
+    mem_limit: ${CLAUDISH_MEM_LIMIT:-1g}
+    memswap_limit: ${CLAUDISH_MEM_LIMIT:-1g}
+    pids_limit: ${CLAUDISH_PIDS_LIMIT:-512}
     ports:
       # Host port is per-machine: 3000 is already taken on some sidecar hosts.
       # Container side stays 3000 — see `command:` below.
