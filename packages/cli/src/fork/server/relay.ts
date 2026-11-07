@@ -83,6 +83,19 @@ export interface RelayState {
    * null once one succeeds. Never read by a decision path.
    */
   hbEpisode?: { startedAt: number; failures: number; firstShape: string } | null;
+  /**
+   * #867 AC2 — recovery-episode bookkeeping, log-only, never read by a decision
+   * path. `recoveredAt` is set when a heartbeat episode closes INTO a queue
+   * (the RECOVERED line, only when the relay is already AUTONOMOUS — a blip
+   * recovered in NOMINAL opens no queue, CR ai-01 6680495144), `probeAttempts`
+   * is written by every deepProbe() call. proberTick ties them into ONE line at
+   * the NOMINAL flip — queue RECOVERED→NOMINAL = wait (cooldown floor + tick
+   * alignment) + probe (per-attempt latencies). Before this, the two ends of the
+   * ~83 s median queue existed as separate log lines and only a hand re-assembly
+   * of docker logs could link them; the cooldown's share was invisible.
+   */
+  recoveredAt?: number;
+  probeAttempts?: { model: string; ms: number; ok: boolean; reason: string }[];
 }
 
 // ── Hysteresis tuning ──────────────────────────────────────────────
@@ -1069,6 +1082,11 @@ function noteHeartbeatRecovered(state: RelayState): void {
   const ep = state.hbEpisode;
   if (!ep) return; // steady state: silence is the healthy signal
   state.hbEpisode = null;
+  // #867 AC2: a RECOVERED opens the recovery queue ONLY when there is one —
+  // a one-failure blip recovered while the relay is still NOMINAL leaves no
+  // stamp to fabricate a later flip's queue from (CR ai-01 6680495144:
+  // reproduced, queue 3600.0s dated from an hour-old NOMINAL blip).
+  if (!state.alive) state.recoveredAt = Date.now();
   const over = Date.now() - ep.startedAt;
   log(
     `[Relay] heartbeat RECOVERED after ${ep.failures} failure(s) over ${(over / 1000).toFixed(1)}s — first: ${ep.firstShape}`,
@@ -1193,6 +1211,13 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
   // verdict when the first expires, so it must never be the one cut short.
   const firstBudget = resolveProbeFirstAttemptTimeoutMs();
   const firstResult = await probeAttempt(state, first, firstBudget);
+  // #867 AC2: record each attempt's latency for the recovery line proberTick
+  // emits on success. Overwritten per call (a failed probe's attempts are
+  // visible through their own failure lines; only the winning probe's record
+  // is ever read).
+  state.probeAttempts = [
+    { model: first, ms: firstResult.ms, ok: firstResult.ok, reason: firstResult.reason },
+  ];
   if (firstResult.ok) return true;
   const fallback = probeFallbackModel();
   log(
@@ -1201,6 +1226,12 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
     true
   );
   const secondResult = await probeAttempt(state, fallback);
+  state.probeAttempts.push({
+    model: fallback,
+    ms: secondResult.ms,
+    ok: secondResult.ok,
+    reason: secondResult.reason,
+  });
   // No second "OK" line here: the attempt already logged one, naming the model
   // that passed. The line above names the model that failed. Two OK lines per
   // recovery would read as two probes.
@@ -1215,12 +1246,16 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
 
 /** One deep-probe request. No logging of the verdict — the caller owns it.
  * `timeoutMs` bounds THIS attempt's fetch and body read; the first attempt
- * passes the short #867 budget, the fallback the full one. */
+ * passes the short #867 budget, the fallback the full one. `ms` is the attempt's
+ * own latency (#867 AC2) — what the recovery line reports per attempt. */
 async function probeAttempt(
   state: RelayState,
   model: string,
   timeoutMs = DEEP_PROBE_TIMEOUT_MS
-): Promise<{ ok: boolean; reason: string }> {
+): Promise<{ ok: boolean; reason: string; ms: number }> {
+  // Above the try on purpose: the catch computes the attempt's latency too
+  // (#867 AC2), and a `const` born inside the try is not visible there.
+  const startedAt = Date.now();
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (state.proxyKey) headers["x-proxy-key"] = state.proxyKey;
@@ -1256,7 +1291,6 @@ async function probeAttempt(
       ],
       messages: [{ role: "user", content: "List the current directory using Bash. Do it now." }],
     });
-    const startedAt = Date.now();
     const res = await fetch(`${state.upstream}/v1/messages`, {
       method: "POST",
       headers,
@@ -1271,12 +1305,12 @@ async function probeAttempt(
             `that IS liveness (it routed the request to answer), returning to NOMINAL (model=${model})`,
           true
         );
-        return { ok: true, reason: "quota wall = liveness" };
+        return { ok: true, reason: "quota wall = liveness", ms: Date.now() - startedAt };
       }
-      return { ok: false, reason: `upstream HTTP ${res.status}` };
+      return { ok: false, reason: `upstream HTTP ${res.status}`, ms: Date.now() - startedAt };
     }
     if (!res.body) {
-      return { ok: false, reason: `HTTP ${res.status} with no body` };
+      return { ok: false, reason: `HTTP ${res.status} with no body`, ms: Date.now() - startedAt };
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -1292,8 +1326,9 @@ async function probeAttempt(
         // without a probe" (that silence produced a retracted false reading
         // about where the probe is served, 06/10). One bounded line per
         // probe, on the deep-probe path only — never per heartbeat.
+        const ms = Date.now() - startedAt;
         log(
-          `[Relay] deep probe OK — message_stop after ${Date.now() - startedAt}ms (model=${model})`,
+          `[Relay] deep probe OK — message_stop after ${ms}ms (model=${model})`,
           true
         );
         try {
@@ -1301,12 +1336,16 @@ async function probeAttempt(
         } catch {
           /* ignore */
         }
-        return { ok: true, reason: "" };
+        return { ok: true, reason: "", ms };
       }
       if (acc.length > 200_000) break; // bound memory
     }
     // Reached only by a stream that ended (or overran) without a terminal frame.
-    return { ok: false, reason: `stream ended after ${acc.length} bytes without message_stop` };
+    return {
+      ok: false,
+      reason: `stream ended after ${acc.length} bytes without message_stop`,
+      ms: Date.now() - startedAt,
+    };
   } catch (e) {
     // Every other exit names its reason; this one carries the last. Without
     // these lines a sidecar held in AUTONOMOUS behind a healthy hub gave no
@@ -1320,9 +1359,13 @@ async function probeAttempt(
     // it must stay visible as such in the logs.
     const name = (e as { name?: string })?.name;
     if (name === "TimeoutError" || name === "AbortError") {
-      return { ok: false, reason: `timed out after ${timeoutMs}ms (${name})` };
+      return {
+        ok: false,
+        reason: `timed out after ${timeoutMs}ms (${name})`,
+        ms: Date.now() - startedAt,
+      };
     }
-    return { ok: false, reason: String(e).slice(0, 200) };
+    return { ok: false, reason: String(e).slice(0, 200), ms: Date.now() - startedAt };
   }
 }
 
@@ -1360,6 +1403,7 @@ export async function proberTick(state: RelayState): Promise<void> {
   ) {
     probingStates.add(state);
     try {
+      const probeStartAt = Date.now();
       const deep = await deepProbe(state);
       if (deep) {
         state.alive = true;
@@ -1367,8 +1411,26 @@ export async function proberTick(state: RelayState): Promise<void> {
         state.consecutiveOk = 0;
         state.lastFlipAt = Date.now();
         publishRelayMode({ mode: "nominal", downTrigger: "" });
+        // #867 AC2 — ONE line per recovery closing the queue the RECOVERED line
+        // opened: queue = wait + probe, exactly (same clock, three stamps). The
+        // wait is where the 60 s cooldown gate and the 10 s tick alignment live
+        // (the issue's invisible cost); the probe segment names every attempt
+        // with its own latency. Grep targets keep their substrings: the line is
+        // an APPEND to the historical "healthy again → NOMINAL (relay resumed)".
+        const now = Date.now();
+        const attempts = (state.probeAttempts ?? [])
+          .map((a) => `${a.model} ${a.ms}ms ${a.ok ? "ok" : `fail (${a.reason})`}`)
+          .join("; ");
+        const probeS = ((now - probeStartAt) / 1000).toFixed(1);
+        const queueSeg =
+          state.recoveredAt !== undefined
+            ? ` — queue RECOVERED→NOMINAL ${((now - state.recoveredAt) / 1000).toFixed(1)}s = ` +
+              `wait ${((probeStartAt - state.recoveredAt) / 1000).toFixed(1)}s ` +
+              `(cooldown floor ${RECOVERY_COOLDOWN_MS / 1000}s) + probe ${probeS}s [${attempts}]`
+            : ` — probe ${probeS}s [${attempts}]`;
+        state.recoveredAt = undefined; // next episode opens its own queue
         log(
-          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)`,
+          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)${queueSeg}`,
           true
         );
       } else {

@@ -1461,6 +1461,153 @@ describe("deep probe: quota wall vs hub death", () => {
   });
 });
 
+// ── #867 AC2: ONE line per recovery closing the RECOVERED→NOMINAL queue ──
+//
+// The issue's measured cost was a MEDIAN 83 s still-off-relay AFTER the hub was
+// back, reassembled by hand from docker logs: the RECOVERED line and the
+// NOMINAL line existed but nothing tied them, and the cooldown's share of the
+// wait was invisible. The fix is one appended segment on the historical
+// "healthy again" line: queue = wait + probe (same clock, three stamps), with
+// every probe attempt's own latency. AC3's before/after measurement greps THIS
+// line per flip — it replaces the hand re-assembly.
+describe("recovery episode line (#867 AC2)", () => {
+  const state = () => createRelayState({ upstream: "http://hub:3000", proxyKey: "k" });
+  const healthOk = () =>
+    new Response(
+      JSON.stringify({ status: "ok", instanceId: "11111111-1111-4111-8111-111111111111" }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }
+    );
+  const okStream = () =>
+    sseResponse(
+      'event: message_start\ndata: {"type":"message_start"}\n\n' +
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    );
+
+  it("ties the queue into the NOMINAL line: wait + probe + per-attempt latencies, arithmetic exact", async () => {
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.join(" "));
+    };
+    const s = state();
+    try {
+      let healthDown = true;
+      let probe = 0;
+      fetchImpl = async (url: any) => {
+        const u = String(url);
+        if (u.endsWith("/health")) {
+          if (healthDown) throw new Error("connect ECONNREFUSED");
+          return healthOk();
+        }
+        // Attempt 1 (haiku) refuses, attempt 2 (glm-5.3) carries the verdict —
+        // the #636 shape, so BOTH attempts' latencies appear on the line.
+        probe++;
+        return probe === 1
+          ? Promise.resolve(new Response("native lane refused", { status: 503 }))
+          : Promise.resolve(okStream());
+      };
+      await proberTick(s); // heartbeat failure 1/2 — episode opens
+      await proberTick(s); // failure 2/2 → AUTONOMOUS, lastFlipAt = now
+      expect(s.alive).toBe(false);
+      s.lastFlipAt -= 61_000; // the 60 s cooldown is long past (no wall-clock wait)
+      healthDown = false;
+      await proberTick(s); // ok 1/3 → RECOVERED line, recoveredAt stamped
+      expect(s.recoveredAt).toBeGreaterThan(0);
+      await proberTick(s); // ok 2/3
+      await proberTick(s); // ok 3/3 → deep probe → 503 then message_stop → NOMINAL
+    } finally {
+      console.log = origLog;
+    }
+    expect(s.alive).toBe(true);
+    expect(s.recoveredAt).toBeUndefined(); // the queue closed: next episode opens its own
+    const nominal = lines.filter((l) => l.includes("healthy again → NOMINAL (relay resumed)"));
+    expect(nominal.length).toBe(1); // historical substring SURVIVES (fleet greps it)
+    const line = nominal[0]!;
+    expect(line).toContain("queue RECOVERED→NOMINAL ");
+    expect(line).toContain("(cooldown floor 60s)"); // the invisible cost, named
+    expect(line).toContain("+ probe ");
+    // Per-attempt latencies: the refusing first attempt AND the deciding one.
+    expect(line).toMatch(/claude-haiku-4-5-20251001 \d+ms fail \(upstream HTTP 503\)/);
+    expect(line).toMatch(/glm-5\.3 \d+ms ok/);
+    // queue = wait + probe, exactly — one clock, three stamps. A decomposition
+    // that does not add up is a mislabeled line, worse than no line.
+    const q = /queue RECOVERED→NOMINAL (\d+\.\d)s = wait (\d+\.\d)s .* \+ probe (\d+\.\d)s/.exec(
+      line
+    );
+    expect(q).not.toBeNull();
+    expect(Math.abs(Number(q![1]) - (Number(q![2]) + Number(q![3])))).toBeLessThan(0.2);
+  });
+
+  it("without a RECOVERED stamp (jump-straight-to-autonomous states) the line degrades to the probe segment only", async () => {
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.join(" "));
+    };
+    const s = state();
+    s.alive = false; // the overlap-guard test's shape: no episode was ever opened
+    s.lastFlipAt = 0;
+    s.consecutiveOk = 3;
+    try {
+      fetchImpl = async (url: any) =>
+        String(url).endsWith("/health") ? healthOk() : Promise.resolve(okStream());
+      await proberTick(s); // ok heartbeat (no episode → no RECOVERED line) → probe → NOMINAL
+    } finally {
+      console.log = origLog;
+    }
+    expect(s.alive).toBe(true);
+    const nominal = lines.filter((l) => l.includes("healthy again → NOMINAL (relay resumed)"));
+    expect(nominal.length).toBe(1);
+    expect(nominal[0]).toContain("— probe "); // no queue segment…
+    expect(nominal[0]).not.toContain("queue RECOVERED→NOMINAL"); // …never a fabricated one
+    expect(nominal[0]).toMatch(/claude-haiku-4-5-20251001 \d+ms ok/);
+  });
+
+  it("a RECOVERED seen while still NOMINAL opens NO queue — a stale blip never dates a later flip (CR ai-01 6680495144)", async () => {
+    const lines: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => {
+      lines.push(a.join(" "));
+    };
+    const s = state();
+    try {
+      let healthDown = true;
+      fetchImpl = async (url: any) => {
+        const u = String(url);
+        if (u.endsWith("/health")) {
+          if (healthDown) throw new Error("connect ECONNREFUSED");
+          return healthOk();
+        }
+        return Promise.resolve(okStream());
+      };
+      // ai-01's own sidecar today: FAILED 06:53:10Z, RECOVERED 06:53:17Z, NO flip.
+      await proberTick(s); // heartbeat failure 1/2 — episode opens, relay still NOMINAL
+      expect(s.alive).toBe(true);
+      healthDown = false;
+      await proberTick(s); // ok 1/3 → RECOVERED line while still NOMINAL
+      expect(s.hbEpisode).toBeNull(); // the episode closed…
+      expect(s.recoveredAt).toBeUndefined(); // …but NO queue opened (the fix)
+      // The next AUTONOMOUS comes from the FORWARD path (hub 5xx with /health
+      // fine), so no fresh heartbeat episode ever re-stamps. An hour passes.
+      s.alive = false;
+      s.lastFlipAt = 0;
+      s.consecutiveOk = 3;
+      await proberTick(s); // heartbeat ok → probe → NOMINAL flip
+    } finally {
+      console.log = origLog;
+    }
+    expect(s.alive).toBe(true);
+    const nominal = lines.filter((l) => l.includes("healthy again → NOMINAL (relay resumed)"));
+    expect(nominal.length).toBe(1);
+    // The pre-fix line here read "queue RECOVERED→NOMINAL 3600.0s = wait 3600.0s".
+    expect(nominal[0]).toContain("— probe ");
+    expect(nominal[0]).not.toContain("queue RECOVERED→NOMINAL");
+  });
+});
+
 // ── relayHealthFields (#157): /health must say the ROLE, origin-only ──
 //
 // 2026-09-19: a hub recreated as a relay forwarding to itself (ARR loops back)
