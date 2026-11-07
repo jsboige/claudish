@@ -600,8 +600,23 @@ non-elevated shape failed on `Accès refusé` / `0x80070005` **and nothing else*
 the only acceptable failure.
 
 State at 2026-11-01 21:0xZ: installer committed and dry-run/non-elevated-verified;
-**registration awaits its single elevation window**. Until it is registered the
-`HKCU` value remains the only launcher and the reboot hole stays open.
+registration awaiting its single elevation window.
+
+**Executed 2026-11-07 (Q65b), in a simpler shape than the design above**: a
+**logon** scheduled task `ClaudishRelayPo2025` now runs `start-guarded.ps1`
+(PS 5.1, lives beside `relay.js` in `D:\Production\claudish-relay-po2025\`, not
+in-repo) — probe `:18182`, start the pipe only when nothing holds it, one UTC log
+line per action. The `HKCU` Run value is **removed** (its data archived in the Q65b
+proposal). Live proof at registration: task `Ready`, guard test `LastTaskResult 0`,
+the live pipe's pid untouched.
+
+Honest residue, same as the finding that opened Q65: a logon task is still
+**session-scoped** — a reboot without an opened session still leaves the edge dead.
+What the gesture buys is visibility (Task Scheduler + history) and an idempotent
+relauncher, not boot survival. The boot-trigger organ above
+(`install-relay-autostart.ps1` + `relay-guard.ps1`) stays committed and undeployed;
+it remains the shape that actually closes the hole. `fleet-state.md` row 97 tracks
+which launcher is live.
 
 ## Compose environment surface
 
