@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, readdirSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { declaredPortRows } from "./port-claims.js";
 
 /**
  * In-process route suites bind REAL loopback ports, so two files declaring the
@@ -20,37 +19,12 @@ import { join, relative, sep } from "node:path";
  * which matters because several suites document their neighbours in prose.
  */
 
-const SRC_ROOT = join(import.meta.dir, "..");
-const SELF = "port-allocation.test.ts";
-const PORT_DECL = /^\s*(?:const|let)\s+([A-Za-z_]*[Pp][Oo][Rr][Tt][A-Za-z_]*)\s*=\s*(\d{4,5})\b/gm;
+const SELF = "test-support/port-allocation.test.ts";
 
-interface Declaration {
-  file: string;
-  name: string;
-  port: number;
-}
-
-function collectTestFiles(dir: string, out: string[] = []): string[] {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === "node_modules") continue;
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) collectTestFiles(full, out);
-    else if (entry.name.endsWith(".test.ts")) out.push(full);
-  }
-  return out;
-}
-
-function declaredPorts(): Declaration[] {
-  const rows: Declaration[] = [];
-  for (const file of collectTestFiles(SRC_ROOT)) {
-    if (file.endsWith(SELF)) continue;
-    const text = readFileSync(file, "utf8");
-    const rel = relative(SRC_ROOT, file).split(sep).join("/");
-    for (const match of text.matchAll(PORT_DECL)) {
-      rows.push({ file: rel, name: match[1]!, port: Number(match[2]!) });
-    }
-  }
-  return rows;
+function declaredPorts() {
+  // Shared scan (#791): the same module feeds the random-port skip-set, so the
+  // convention and its enforcement cannot drift apart again.
+  return declaredPortRows(SELF).map(({ file, name, port }) => ({ file, name, port }));
 }
 
 describe("port allocation across in-process test suites", () => {
