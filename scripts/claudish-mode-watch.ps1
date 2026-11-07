@@ -25,6 +25,16 @@
 
     2026-10-28T00:12:34Z role=relay-nominal instance=66c786a1 up=22089 streams=1
     2026-10-28T00:13:34Z role=UNAVAILABLE reason=timeout
+    2026-10-28T00:14:34Z role=relay-nominal instance=66c786a1 up=22149 streams=1 health=stalled http=503
+
+  /health answers HTTP 503 while a stream is STALLED (proxy-server.ts,
+  `stalled ? 503 : 200`): the proxy was REACHED and ANSWERED, which is a
+  different incident from unreachability, and the health payload (role,
+  instance, up, streams, status) is parsed out of the error body so the mode
+  series keeps its continuity through stalled windows. Measured 2026-11-07:
+  one night of 16 ticks read as UNAVAILABLE while the sidecar answered
+  "[Health] hit ... status=stalled" for every one of them. Only a
+  connection-level failure (refused, timeout, no HTTP answer) is UNAVAILABLE.
 
   A sample is written EVERY tick, not only on change: a steady line proves the
   watcher was alive, and `-Report` derives the transitions. Writing only on
@@ -113,17 +123,7 @@ function Add-LogLine([string]$line) {
     [System.IO.File]::AppendAllText($LogPath, $line + "`n", (New-Object System.Text.UTF8Encoding($false)))
 }
 
-function New-Sample {
-    $stamp = Get-UtcStamp
-    try {
-        $health = Invoke-RestMethod -Uri "$BaseUrl/health" -TimeoutSec $TimeoutSec -Method Get
-    }
-    catch {
-        $reason = "error"
-        if ($_.Exception.Message -match "timed out|timeout") { $reason = "timeout" }
-        return ("{0} role=UNAVAILABLE reason={1}" -f $stamp, $reason)
-    }
-
+function Format-HealthLine([string]$stamp, $health, [string]$extra) {
     $role = $health.role
     if (-not $role) { $role = "unknown" }
     $instance = "none"
@@ -132,8 +132,42 @@ function New-Sample {
     if ($null -ne $health.uptimeSec) { $up = $health.uptimeSec }
     $streams = "na"
     if ($null -ne $health.activeStreams) { $streams = $health.activeStreams }
+    return ("{0} role={1} instance={2} up={3} streams={4}{5}" -f $stamp, $role, $instance, $up, $streams, $extra)
+}
 
-    return ("{0} role={1} instance={2} up={3} streams={4}" -f $stamp, $role, $instance, $up, $streams)
+function New-Sample {
+    $stamp = Get-UtcStamp
+    try {
+        $health = Invoke-RestMethod -Uri "$BaseUrl/health" -TimeoutSec $TimeoutSec -Method Get
+    }
+    catch {
+        # Timeout first: there is no HTTP answer to interrogate.
+        if ($_.Exception.Message -match "timed out|timeout") {
+            return ("{0} role=UNAVAILABLE reason=timeout" -f $stamp)
+        }
+        # An HTTP answer with a non-2xx code means the proxy WAS reached.
+        # /health returns 503 while a stream is stalled (stalled ? 503 : 200,
+        # proxy-server.ts) - not unreachability. PS 5.1 parks the HTTP error
+        # body in ErrorDetails.Message, so the health payload stays readable
+        # through the 503 and the mode series keeps its continuity.
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -gt 0) {
+            $parsed = $null
+            try {
+                if ($_.ErrorDetails.Message) { $parsed = $_.ErrorDetails.Message | ConvertFrom-Json }
+            } catch {}
+            if ($parsed -and $parsed.role) {
+                $hstatus = "na"
+                if ($parsed.status) { $hstatus = $parsed.status }
+                return (Format-HealthLine $stamp $parsed (" health={0} http={1}" -f $hstatus, $code))
+            }
+            return ("{0} role=UNAVAILABLE reason=http{1}" -f $stamp, $code)
+        }
+        return ("{0} role=UNAVAILABLE reason=error" -f $stamp)
+    }
+
+    return (Format-HealthLine $stamp $health "")
 }
 
 function ConvertFrom-LogLine([string]$line) {

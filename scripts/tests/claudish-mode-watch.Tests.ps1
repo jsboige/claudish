@@ -66,6 +66,18 @@ BeforeAll {
         [pscustomobject]@{ role = $role; instanceId = $instance; uptimeSec = $up; activeStreams = $streams }
     }
 
+    # An HTTP-level error the way PS surfaces it: .Exception.Response carries
+    # the status code, .ErrorDetails.Message the response body. A plain string
+    # throw (the other tests) has neither - that is the connection-refused shape.
+    function New-HttpErrorRecord([int]$Code, [string]$BodyJson) {
+        $resp = [pscustomobject]@{ StatusCode = $Code }
+        $inner = [System.Exception]::new("Response status code does not indicate success: $($Code).")
+        $inner | Add-Member -NotePropertyName Response -NotePropertyValue $resp -Force
+        $err = [System.Management.Automation.ErrorRecord]::new($inner, 'WebCmdletWebResponseException', [System.Management.Automation.ErrorCategory]::InvalidOperation, $null)
+        if ($BodyJson) { $err.ErrorDetails = [System.Management.Automation.ErrorDetails]::new($BodyJson) }
+        return $err
+    }
+
     function Write-Ledger([string]$Path, [string[]]$Lines) {
         [System.IO.File]::WriteAllText(
             $Path,
@@ -196,6 +208,36 @@ Describe 'claudish-mode-watch' {
             $r.Code | Should -Be 0
             $r.Out | Should -Match 'role=UNAVAILABLE reason=error'
             $r.Out | Should -Not -Match 'reason=timeout'
+        }
+
+        It 'reads the health payload THROUGH a 503-stalled answer: role kept, health=stalled http=503, no UNAVAILABLE' {
+            # /health answers 503 while a stream is stalled (stalled ? 503 : 200,
+            # proxy-server.ts). The proxy was REACHED: reading that as UNAVAILABLE
+            # hid one night's whole mode series (16 ticks, measured 2026-11-07,
+            # every one answered "[Health] hit ... status=stalled"). The role
+            # must survive the 503 or the transition log loses exactly the
+            # windows it exists to date.
+            $global:MWState.Error = New-HttpErrorRecord 503 '{"role":"relay-nominal","status":"stalled","instanceId":"66c786a1b2c3d4e5","uptimeSec":22149,"activeStreams":1}'
+            $root = New-LedgerRoot
+            $ledger = Join-Path $root 'ledger.log'
+
+            $r = Invoke-Watch -Ledger $ledger
+
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'role=relay-nominal instance=66c786a1 up=22149 streams=1 health=stalled http=503'
+            $r.Out | Should -Not -Match 'UNAVAILABLE'
+        }
+
+        It 'an HTTP error with no parseable body degrades to reason=httpNNN, not the generic error' {
+            $global:MWState.Error = New-HttpErrorRecord 502 ''
+            $root = New-LedgerRoot
+            $ledger = Join-Path $root 'ledger.log'
+
+            $r = Invoke-Watch -Ledger $ledger
+
+            $r.Code | Should -Be 0
+            $r.Out | Should -Match 'role=UNAVAILABLE reason=http502'
+            $r.Out | Should -Not -Match 'reason=error'
         }
 
         It 'keeps sampling after an outage: UNAVAILABLE then NOMINAL in the same ledger' {
