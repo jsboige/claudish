@@ -29,6 +29,12 @@ export class FallbackHandler implements ModelHandler {
 
   constructor(candidates: FallbackCandidate[]) {
     this.candidates = candidates;
+    // #905 initially marked chained candidates here so the connect-retry
+    // ladder could skip them; CR #906 (second round) removed that arm — the
+    // ladder's default scope is the relay sidecar env alone, and the hub's
+    // solo nominals are covered by the #299-B cascade walk instead. Nothing
+    // to mark anymore; the constructor stays because the chain shape itself
+    // is what handle() iterates.
   }
 
   // INVARIANT: Each candidate handler (ComposedHandler) must NOT mutate the Hono
