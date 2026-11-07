@@ -63,6 +63,10 @@ describe("team-cli: --interactive reaches runWithGrid as mode (G3, #27)", () => 
     expect((await run(["--models", "qwen3.6-35b-a3b", "--mode", "interactive"])).mode).toBe(
       "interactive"
     );
-    expect((await run(["--models", "qwen3.6-35b-a3b"])).mode).toBe("default");
+    // replatform/v14: the BARE default mode here is "json" (panes), not the
+    // grid — a deliberate divergence from main (whose default is the grid).
+    // Pin the explicit default spelling instead of main's bare invocation,
+    // which on v14 takes the pane path and wants an input.md.
+    expect((await run(["--models", "qwen3.6-35b-a3b", "--mode", "default"])).mode).toBe("default");
   });
 });
