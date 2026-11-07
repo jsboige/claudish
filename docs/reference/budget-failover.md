@@ -1,0 +1,876 @@
+# Budget failover + Qwen thinking — full reference
+
+**Deferred from `CLAUDE.md` (v7.2+ section).** The config table and the arming/quota gotchas stay in `CLAUDE.md`; this file holds the rationale and the measurements. Canonical env template with inline comments: `.env.sidecar.example`.
+
+## Not the same thing as `FallbackHandler`
+
+`FallbackHandler` swaps *providers* for the *same* model when a provider is unhealthy — a transport concern. Budget failover substitutes the *model itself* for a whole **role** (`opus`/`sonnet`/`haiku`/`fable`) when that role's metered plan is exhausted — a subscription concern. They compose: a failover target still gets the normal provider fallback chain.
+
+## Why it exists
+
+The cluster runs on weekly-metered plans (Anthropic, MiniMax, Z.AI). When a plan burns faster than its reset window, the choice is to stop working or to serve the role from another pool. Serving it *silently* is the dangerous option: the agent keeps assuming capabilities it no longer has, or — in the MiniMax→DeepSeek direction — fails to use capabilities it just gained. So every substitution is announced.
+
+## Where the notice goes: condensation
+
+`ComposedHandler` appends it to the collected message on the non-streaming path (`stream: false`), which in practice is `/compact`. That boundary is chosen because it is the only moment in an agentic session where the context is rebuilt from scratch anyway — the notice costs nothing there, is guaranteed to survive into the continuing context, and the prompt cache is already cold so re-routing is free. `appendFailoverNoticeToMessage` targets the **trailing** text block (clients may read `content[0]`) and **never throws**: a thrown error would turn a working condensation into a failed one, and a session that cannot condense eventually stalls.
+
+## Configuration (env, read at proxy startup)
+
+| Var | Meaning |
+|---|---|
+| `CLAUDISH_FAILOVER_<ROLE>` | Routing target for the role. Any spec `getHandlerForRequest` accepts. |
+| `..._LABEL` | Human name used in the notice. Defaults to the target string. |
+| `..._DIRECTION` | `degraded` (default) · `improved` · `lateral`. Unset means degraded — never flatter the substitute. |
+| `..._NOTE` | Extra guidance appended to that role's notice line — the condensation notice and the per-session stream notice alike. |
+| `CLAUDISH_FAILOVER_ACTIVE` | Roles armed **now**, comma-separated, or `none`. Use to conserve a plan *before* it dies. A `role@machine` piece (e.g. `haiku@myia-po-2027`) arms the role **only for requests whose `X-Claudish-Machine` names that machine** (case-insensitive); every other machine stays on the nominal. The route keys those requests on a `machine:<name>` bucket, so the cascade and the notices follow unchanged, and the per-session notice states the operator routing instead of an exhaustion. |
+| `CLAUDISH_FAILOVER_AUTO` | `1` = also arm on genuine upstream quota exhaustion. |
+
+**With nothing set, every code path is inert** — no routing change, no notice, zero added bytes. Configuring a target does **not** activate it; arming is separate and deliberate.
+
+**`isQuotaExhaustion` is deliberately narrower than `FallbackHandler.isRetryableError`.** 402 arms on status alone; 429 arms only when the body names a quota/credit/balance/weekly/plan wall — a plain per-minute rate limit must **not** burn the weekly switch because a burst hit a 60-second window. 401 and 404 **never** arm: those are wiring mistakes, and swapping the model would hide a bad key or a bad model id behind a plausible-looking answer.
+
+**Placement.** These belong on the machine that actually *calls* the models. A NOMINAL sidecar only relays, so on a sidecar they matter solely for AUTONOMOUS (hub-down) mode — the hub is the normal home. A failover target must be resolvable *on that machine*: pointing a sidecar at a custom endpoint defined only in the hub's `config.json` configures a fallback that fails exactly when it is needed.
+
+## `CLAUDISH_QWEN_THINKING`
+
+Qwen reasons by default, so an unset `thinking` is not neutral — it means "think, at length", and the Token Plan bills on **output**. Values: `disabled` (default) · `passthrough` · `budget:<n>`. Re-read on **every request**, deliberately: the fleet flips this during a budget crunch, and a cached value would require restarting the proxy that is at that moment the thing keeping everyone working.
+
+The subtlety this encodes: Qwen exposes **two switches on two wires, and each endpoint ignores the other's form**. The OpenAI-compatible endpoint takes `enable_thinking` + `thinking_budget`; the Anthropic-compatible one takes the native `thinking` object. `QwenModelDialect.prepareRequest` therefore branches on `ctx.wireFormat` (`PrepareRequestContext`, threaded from `ComposedHandler.resolveStreamFormat()`). Before this, the adapter converted `thinking` → `enable_thinking` unconditionally, which on the Anthropic wire **deleted the only switch that works**.
+
+Measured against Qwen Token Plan, `max_tokens: 400`, prompt `"Reponds exactement: ok"` (2026-08-11): baseline `67 in / 43 out` with a thinking block; `enable_thinking: false` → `67 / 48`, still thinking; `thinking: {type: "disabled"}` → `31 / 1`. Note the **input** count moves too (67 → 31) — Alibaba appears to inject a reasoning preamble when thinking is on. That makes a crisp post-deploy check: **if `input_tokens` drops from 67 to 31 on that prompt, the native switch reached Qwen.**
+
+---
+
+# Cascade, notices and backoff (merged from `CLAUDE.md`, 2026-08-23)
+
+Detail deferred from the decision layer when `CLAUDE.md` was restructured. Source commits:
+`823e614` (transitive cascade + recovery notices), `7a94e23` (stream notice + `NativeHandler`
+status propagation), `30a974f`, `a84f509` (auto-arm TTL), `65e1822`/`d211972`
+(`CLAUDISH_FAILOVER_ROLE_MODELS`), `6bd6f7a` (fail-forward), `b8e47ba`/`ffb7f39` (reset-time),
+`ca97e58` (`CLAUDISH_GLM_THINKING`).
+
+## Transitive cascade of degradations (2026-08-12)
+
+A role's failover is an **ordered list of substitute steps**, not a single target. When the nominal
+walls, serve step 0; when step 0 *also* walls, serve step 1; and so on. Opus to GLM today is not a
+special route — it is Opus to Qwen where Qwen is also dead, so the walk falls to Qwen's own successor
+GLM. The last step (typically PAYG) is always served when everything above is down, because PAYG has
+no weekly wall.
+
+**GLM is a rolling ~5h window** — it dies AND restarts every 5h, not a consumable pool like the Qwen
+weekly quota; DeepSeek PAYG fills GLM's holes. Modeling the cascade as a walk means the expected
+end-of-week state (GLM down 3-4h, PAYG holding everyone for ~1h until the GLM reset) needs no new
+routing: each step simply walls in sequence.
+
+## Pin the PAYG step to a rolling alias, not a versioned id (2026-09-10)
+
+A versioned id pinned in a cascade never updates itself: a new provider build arrives and the step
+keeps serving the old one until an operator edits the env and recreates. DeepSeek PAYG exposes
+`deepseek-flash` as a **rolling alias** alongside versioned ids — and its `/models` listing is
+incomplete: versioned ids it does not list still serve (probe before trusting either direction).
+Pinning the final PAYG step to the alias (`ds@deepseek-flash`, hub po-2025 since 2026-09-10) adopts
+each new Flash release **the moment the provider rolls the alias**, no nudge. Trade-off: an alias
+roll is unreviewed — after any provider release, check which build the alias actually serves.
+Subscription steps (`qwen-token-plan@deepseek-v4.1-flash`, hub po-2025 since 2026-09-23) stay version-pinned because plans
+publish versioned builds only: those DO need the manual env-edit + drained recreate. Build selection is
+evidence-based: on 2026-09-23 the HF catalog showed `DeepSeek-V4-Flash-0731` (2026-07-31) superseded by
+`DeepSeek-V4.1-Flash` (2026-09-10) — the old id was replaced after an acceptance probe (`deepseek-v4.1-flash`
+200 on the MaaS subscription; the dash spelling `deepseek-v4-1-flash` is 400). When probing
+an id one-shot (`stream:false`), give it `max_tokens ≥ 64` — the thinking block consumes the budget
+first and a low cap returns empty text, which reads like a failure but is not.
+
+## Environment, per step
+
+All `>`-separated fields are position-preserving against the step list.
+
+| Variable | Meaning |
+|---|---|
+| `CLAUDISH_FAILOVER_<ROLE>` | Ordered cascade of substitutes, `>`-separated. Step 0 serves when the nominal walls, step 1 when step 0 also walls. No separator = single-step (backward compatible). The nominal itself is NOT in the list. Any spec `getHandlerForRequest` accepts, per step. |
+| `..._LABEL` | Human name(s) for the notice. Missing/padded entries default to the step's target string. |
+| `..._DIRECTION` | Per step: `degraded` (default) · `improved` · `lateral`. Unset means degraded — never flatter the substitute. |
+| `..._NOTE` | Extra guidance appended to that step's notice line. |
+| `..._RESET` | Operator-declared wall-lift time per step, ISO 8601 (empty entry = none). While set and in the future the step is skipped entirely — no probe — then probed the moment it passes, so recovered budget is consumed rather than stranded. For walls whose body carries no date (Mistral's subscription 402). A body-parsed date (Qwen names its reset instant, MiniMax counts down — `parseResetAtFromBody`) **wins over** the declared one. Log surface: `ttl=until <ISO>` instead of `ttl=<N>min`. |
+| `CLAUDISH_FAILOVER_ROLE_MODELS` | Deployment-specific `pattern:role,pattern:role` aliases (lowercase substring match) so clients naming the nominal model directly (`glm-5.3`, `MiniMax-M3`) instead of a role keyword (`claude-sonnet-4-6`) still get cascade protection. Role keywords win when both match; unset = keywords only. Used by `roleFromModelName`, the single role-detection source shared by the swap and the cascade loop. |
+
+### Nominal mapping and failover must not duplicate a target
+
+The nominal itself is never a cascade step. In particular, while the active profile maps Fable directly to `cx@gpt-6-astra`, keep `CLAUDISH_FAILOVER_FABLE` empty. Putting Astra in both places would make a quota wall retry the same target, consume an extra upstream round trip, and emit a misleading fallback notice.
+
+The future Fable cutover is atomic: remove the direct Astra mapping so native `claude-fable-5-1` becomes nominal, and set Astra as Fable step 0 in the same configuration change. Native Anthropic Fable remains restricted to ai-01 by the fleet leak policy.
+
+⚠ **Compose passes these one by one.** `_RESET` was missing from the passthrough until `ffb7f39`,
+so only the body-parsed path (Qwen) worked; Mistral's silent 402 fell back to a 10-60 min backoff and
+was re-probed in a loop instead of being held until its real reset date. Verify with
+`docker exec <container> printenv CLAUDISH_FAILOVER_SONNET_RESET`.
+
+## Resolution and the cascade loop
+
+**Resolution is a single source of truth.** `resolveFailoverTarget(role)` walks the rule's steps,
+skipping TTL-failed ones, returning the first live step (or the last step anyway, since PAYG is meant
+to always work). It is the ONLY resolution path — used by BOTH the swap in `getHandlerForRequest`
+AND the `handleWithCascade` loop. The loop never passes an override target in: it mutates failover
+state (`armFailover` / `markStepFailed`), and the next iteration re-reads through the same resolver.
+
+**`handleWithCascade`** (`proxy-server.ts`, on both `/v1/messages` and `/v1/chat/completions`)
+replaces the old single-shot retry with a bounded loop: nominal, then step 0, then step 1, and so on,
+capped at `steps.length + 1` attempts.
+
+- On `response.ok`: nominal success resets all step failures for the role (fresh episode); step
+  success resets just that step.
+- On `!ok` plus `isQuotaExhaustion`: a nominal wall arms the role; a step wall marks that step failed.
+- Non-quota errors: wiring (401/404) returns as-is without advancing; any OTHER non-quota error on an
+  INTERMEDIATE step fail-forwards to the next step (`STEP-ADVANCE`) and marks the step
+  `nonQuota` — which **forfeits the dwell of any session pinned there** (#276, see below)
+  instead of re-pinning the session at the successor.
+
+**The marker carries the body's structured identity (#739b).** `STEP-ADVANCE` reads
+`HTTP 400 (non-quota) from step N; body=<class>; trying next step`, where `<class>` is
+`stepFailBodyClass(errBody)` (`failover.ts`): up to two structured tokens from the upstream
+error body — `error.code`, `error.type`, top-level `code`, code before type — matched against
+`[A-Za-z0-9._-]{1,64}` and dropped whole on any mismatch. **Free text never reaches the marker**
+(prose messages, hostile tokens): the docker log is readable by anyone with hub access, and a
+marker that echoed provider prose would put arbitrary upstream bytes on it. Why this exists
+(measured 29/10): two 400s from the same provider, one classified and one not 37 s apart, were
+indistinguishable after the fact — the unrecognized one left **no line in any instrument**
+(the failover journal keeps only `[Failover]` markers and an error response writes no capture),
+so "find the text difference" had no substrate. The class rides `why`, so the backoff record
+(`markStepFailed`) carries it too. Top-level `type` is deliberately not a candidate:
+Anthropic's envelope sets it to the literal `"error"` on every failure. Pins incl. the
+never-echo-prose guard: `failover.test.ts` (`stepFailBodyClass` describe).
+
+**Per-session dwell, in brief.** With a session key (`metadata.user_id`), `resolveFailoverTargetForSession`
+pins a conversation to its resolved step for `CLAUDISH_FAILOVER_SESSION_DWELL_MS` (default 10 min,
+sliding — renewed by activity, never pins the nominal): the pin HOLDS while the step is servable, even
+through role-level disarm/re-arm churn; it YIELDS on genuine advancement (re-pins at the new step) and
+on verified nominal recovery past `CLAUDISH_FAILOVER_RECOVERY_GRACE_MS` (#294 — `onNominalSuccess`
+stamp, no re-pin back to the nominal) and on a verified **earlier-step** recovery past that same
+grace (#619 — `stepRecoveredAt` stamp, re-pins at the recovered step). **#276 carve-out:** when the
+pinned step died of a NON-quota error, the yield does NOT re-pin — the dwell is forfeited for one
+dwell window (a tombstone covering the same request's sibling resolution), so the session rejoins
+the general resolution each request and returns to the nominal as soon as its bucket wall expires.
+Measured driver (2026-09-28): a pinned session rode the PAYG tail for hours past a healthy
+47%-credit nominal because the re-pinned pin was the only thing outliving the 10-min wall. Markers:
+`DWELL … yielded — nominal recovered Ns ago` (#294) · `DWELL … yielded — step N (…) recovered Ns
+ago; re-resolving` (#619) · `DWELL … yielded — step N (…) died non-quota; dwell forfeited,
+re-resolving unpinned` (#276).
+
+Bounded, no `while(true)`, never hangs. The **c-reuse invariant** is load-bearing: handlers must not
+mutate the Hono `Context` before returning a non-ok `Response`, so re-calling `handler.handle(c, body)`
+across iterations is safe.
+
+## Per-step backoff (cascade TTL)
+
+Each step tracks its own failure count plus last-failure timestamp in
+`stepFailures: Map<role, StepFailure[]>`. `stepTtlMs(count)` indexes
+`BACKOFF_MS = [10m, 30m, 1h, 4h, 24h]` (caps at 24h). A TTL-failed step is skipped by
+`resolveFailoverTarget` until its TTL elapses.
+
+**One rung per failure EPISODE, never per concurrent failure (#553).** The ladder is meant to grow
+with repeated episodes: a re-probe that fails after the bench elapsed. A mark that lands while the
+step's record still binds (TTL or known reset not yet elapsed — the step is already benched) on the
+same concrete comes from requests that were in flight before the bench and failed together. Such a
+mark refreshes `lastFailure` (and the other record fields) but keeps the count. Its `[Failover] step`
+line reads `count=N (same episode)`. Measured trigger, hub 20/10 00:19Z: `haiku[1]` (Kimi) went
+count 2 → 4, i.e. a 4 h bench, within one second, and the cascade paid the next steps for those
+hours. A mark on a different concrete (a `role:` step whose delegation moved, #331) is a new episode
+and escalates. Pins: `failover.test.ts` "#553: …" (4 mutations executed).
+
+**An own-capacity step benches on its own short ladder — `!own` (#553 defect 2).** A step can declare
+itself OUR OWN capacity by a suffix on the target: `CLAUDISH_FAILOVER_HAIKU=vllm-myia@swift-1.5-27b:8!own>role:sonnet`.
+The suffix is stripped BEFORE the `provider@model[:concurrency]` grammar parses (concurrency still reads
+8), and the class is declared inline so it is visible in `docker inspect` and recovered by
+`-RebuildEnvFromContainer` — a side table keyed by step index was rejected: it drifts on every cascade
+edit and silently re-classes the wrong step. Such a step cannot exhaust a credit; it saturates or is
+down, and retrying it is free — the cost of under-benching is one fast-failing request, the cost of
+over-benching is paid traffic diverted to `role:sonnet`. Its **non-quota** failures therefore bench it on
+`OWN_BACKOFF_MS = [30s, 2m, 5m]`, capped: a sustained outage re-probes every 5 min at most, so a bench
+can never outlive an announced maintenance window by more than one rung — no window plumbing needed.
+Three non-negotiables: (a) **the classifier owns quota semantics** — a QUOTA-shaped refusal on an `!own`
+step keeps the default ladder; (b) **the ladder is recorded on the failure record** (`StepFailure.own`),
+never re-derived at read time, or the short bench would be re-judged with the 10-min quota rung; (c) the
+class travels with the DECLARED step, never through `role:` delegation — a delegated concrete keeps its
+own record's ladder. `initFailover` attests each class at startup (`[Failover] OWN <role>[<i>] (label) —
+own-capacity step: …`) and each `[Failover] step …` line prints `ttl=30s own`. Kill switch
+`CLAUDISH_FAILOVER_OWN_BACKOFF=0` reverts every declaration to the default ladder while the suffix stays
+parseable; an unknown class (`!fast`) warns, is stripped anyway (leaving it in the target would fail as a
+provider error far from its cause) and keeps the default ladder. Measured trigger (ai-01:vllm, 19→20/10):
+**41 × 502** at ~14 min intervals from our own vLLM front, each one benching step 0 for 10 minutes and
+sending the whole haiku lane onto the paid steps. Pins: `failover.test.ts` §"#553 defect 2: own-capacity
+backoff" (6 pins, 6 mutations executed, all killed).
+
+**Reset-time dominance.** The backoff assumes the wall's duration is unknown. When it IS known —
+body-parsed, or declared via `..._RESET` — `StepFailure.resetAt` holds the step skipped until that
+instant, overriding the backoff entirely (a 24h-capped re-probe cycle against an 11-day wall is pure
+waste). The moment the reset passes, the step becomes probeable again, so a recovered budget is
+consumed rather than stranded behind its own backoff. Success on the step, or nominal recovery,
+clears `resetAt` with the rest of the failure state.
+
+**Z.AI states its reset in UTC+8, and the message measures itself (2026-10-27).** GLM's wall body is
+`"Usage limit reached for 5 hour. Your limit will reset at 2026-10-28 02:45:56"` — a four-digit date
+and, decisively, no timezone marker. `parseResetAtFromBody` reads it as UTC and then runs the
+self-check: a reset can never be further off than the window the same body states (`for 5 hour`).
+Read as UTC this one lands **8 h 45** ahead, i.e. outside the window, so the value is declined and
+the step falls back to `[10m, 30m, 1h, 4h]` — which is exactly what the hub logged at 17:57Z
+(`step sonnet[0] (Mistral GLM) walled — count=2 ttl=30min`) while the provider had already stated an
+absolute lift time.
+
+The anchor that settles the timezone comes from the recoveries, not from the body. Measured twice on
+27/10, the nominal recovered at **08:35:58Z** and **13:45:54Z** (`DWELL … yielded — nominal recovered
+Ns ago`, logged at 08:37:59Z and 13:47:54Z). The announced timestamp read as **UTC+8** is
+`2026-10-27T18:45:56Z` — **5 h 00 min 02 s** after the 13:45:54Z recovery, the stated window to the
+second. Read as UTC it is 8 h 45 after a window that opened at 13:45, which cannot be true. So on
+Z.AI the timestamp is Beijing time.
+
+Nothing here is a code change: declining an implausible UTC reading is the safe side, and the
+operator gains the reading rule. Two consequences worth keeping:
+
+- **A client that surfaces this text literally is 8 h late.** ai-01's Hermes bot reported it as
+  `anthropic.RateLimitError` and planned around `2026-10-28 02:45:56` — a reset that is really
+  `2026-10-27T18:45:56Z`.
+- **It bounds a PAYG episode that would otherwise look open-ended.** With the nominal walled and
+  steps 0 (Mistral, 402) and 1 (Qwen, walled until 11/11) both unavailable, `sonnet` served
+  **1,596 `deepseek-flash` (PAYG) responses between 16:32:03Z and 17:59:41Z** (~1,093/h), against
+  ~3,550 over the 12:15→13:46Z episode (~2,340/h). The UTC+8 reset predicts the episode ends
+  ~18:46Z ⇒ ~2,400 responses. **Falsification:** GLM resumes serving after 18:46Z; if it does not,
+  the UTC+8 reading is wrong and 02:45Z stands.
+
+**Result, measured the same evening: the UTC+8 reading survives, and one of my own projections did not.**
+The last 429 on the nominal was **18:18:36Z**. The hub disarmed the bucket and re-probed at
+**18:58:36.99Z**, and GLM served **17 s later** (`[ttft] model=glm-5.3`, 18:58:53.78Z). The announced
+`18:45:56Z` falls inside the 40-minute window the observation brackets, `[18:18:36, 18:58:53]`; the UTC
+reading (`2026-10-28T02:45:56Z`, ~8 h later) falls outside it and is **excluded**. This is not proof to
+the second — the hub's re-probe cadence, not the provider, sets the resolution — but the alternative
+is excluded by 8 hours.
+
+Two things the same episode corrected:
+
+- **The episode ran longer than the reset bound implied**, because the bound is on the wall and the
+  window is on the *next probe*: 16:32:03Z → **18:58:53Z = 2 h 26 min**, not 2 h 14.
+- **The volume projection was wrong by 43 %.** 3,427 `deepseek-flash` (PAYG) responses were served,
+  not the ~2,400 projected above: 1,596 by 18:00Z, then **1,831 in the last 59 min (~1,868/h against
+  ~1,093/h earlier)**. A constant-rate projection over a two-hour window cannot see a rate that
+  doubles inside it. The reset bound and the volume bound are different claims, and only the first
+  one held.
+
+**Critical invariant: `stepFailures` survives the role-arm TTL cycle.** The role-level auto-arm TTL
+(10 min) re-probes the nominal on expiry — but it must NOT re-probe a TTL-failed step. Without this,
+the 10-min nominal re-probe would re-probe a weekly-walled Qwen every 10 minutes, defeating the
+backoff that caps it at ~6 probes over 6 days. The schedule fits both failure shapes: Qwen's weekly
+wall is probed a handful of times then left alone; GLM's 10m+30m+1h+4h is about 5h30, which naturally
+lands a probe shortly after its 5h window resets. `stepFailures` IS cleared (whole role) when the
+**nominal** recovers — a healthy nominal means a fresh episode.
+
+## The three notice moments
+
+Notices are centralized in `applyFailoverNotices` (`proxy-server.ts`), covering `ComposedHandler`
+AND `NativeHandler` — moving them out of `composed-handler` closed the gap where Opus-on-native
+recovered silently.
+
+1. **Condensation** (`appendFailoverNoticeToMessage`, non-streaming / `/compact` path). Appended to
+   the collected message. That boundary is chosen because it is the only moment in an agentic session
+   where the context is rebuilt from scratch anyway — the notice costs nothing there, is guaranteed to
+   survive into the continuing context, and the prompt cache is already cold so re-routing is free.
+   Targets the **trailing** text block (clients may read `content[0]`) and **never throws**: a thrown
+   error would turn a working condensation into a failed one, and a session that cannot condense
+   eventually stalls. Fires at every condensation while a role is armed, naming the
+   **currently-resolved step** with depth ("the 2nd fallback") plus which prior steps are exhausted.
+
+2. **Moment of failover** (`consumeStreamNotice` plus `prependNoticeToAnthropicStream`, streaming
+   path). The FIRST streamed response a session receives under an active role failover gets a notice
+   prepended as content block 0, with every real block's `index` shifted by `+1`. The substitute model
+   then reads its own prior turn — starting with this notice — on the next turn's history.
+   **Depth-aware re-notify:** `notifiedSessions` is `Map<role, Map<sessionKey, stepIndex>>`, so when the
+   resolved step changes mid-session the notice fires *again* naming the new depth — one notice per
+   resolved step per session. Never-throws: any stream parse anomaly degrades to passthrough; the
+   worst case is a missing notice, never a broken stream. Zero bytes on non-failover traffic. Tests:
+   `handlers/shared/failover-stream-notice.test.ts`.
+
+3. **Recovery** (`buildFailoverNotice` / `buildStreamRecoveryText`, same two channels). When a role
+   returns to nominal, a symmetric notice fires. Detection is the auto-arm TTL probe (no background
+   timer): when the 10-min TTL expires, the next request probes nominal; on success,
+   `onNominalSuccess` seeds a `recovering` state (`RECOVERY_CONDENSATIONS=3`) carrying the step it WAS
+   serving. Re-arming a role clears stale recovery — we are back in failover, and a stale recovery
+   notice would mislead. Config-arms do not self-probe, so their recovery is the operator lifting them.
+
+The three compose: one stream notice at the moment of failover (per resolved step), then one at each
+condensation for the rest of the window, then recovery notices when nominal returns.
+
+### ✅ Resolved defect (2026-08-23, issue #34 / PR #36) — the recovery notice read as a prompt injection
+
+Until 2026-08-23, recovery from a `degraded` step emitted, under the header
+`**[claudish] Nominal model restored.**`, in content block 0:
+
+> ~~The context you inherit was built under a weaker model (LABEL) — recalibrate upward: resume your
+> normal capability and risk appetite, and clean up any over-conservative decisions made under the
+> substitute.~~
+
+A fleet agent reported this as a suspected prompt injection in its own invocation context, and was
+right to: nothing in the frame lets a recipient distinguish "my proxy is talking to me" from "someone
+wrote this into my context". The `[claudish]` prefix is a naming convention, not evidence. Two
+specific problems:
+
+- **"risk appetite"** named a *safety* posture, while the intent is *capability* calibration. An agent
+  applying security rules must treat "resume your normal risk appetite" as suspect — and should.
+- **"clean up any over-conservative decisions"** asked the agent to **undo** decisions already taken.
+  That was the phrasing closest to an actual injection.
+
+PR #36 rewrote every recovery site (condensation + stream, both directions) to working-scope
+language — `resume your normal working scope: you can take on tasks you deferred under the
+substitute` — with a regression guard in `failover.test.ts` asserting the notices never match
+`/risk appetite/i`, `/clean up (any )?over-conservative/i`, or `/recalibrate upward/i` again. The
+factual announcement (role, model, direction) is unchanged. Standing rule for any future notice
+wording: keep it **factual**, express capability or working scope rather than risk posture, and
+never instruct an agent to reverse prior decisions.
+
+## The serving note and the history strip (#747, arbitrated 28/10)
+
+The notices above are written for TWO readers, and the split became a defect: served models
+**imitate** the banners left in assistant history. Measured 28/10 on the hub (issue #747, po-2024
+Maintenance captures): GLM-5.3 — the sonnet *nominal* — and Kimi K3.1 Pro each OPENED a reply with a
+**forged** `[claudish] You are serving…` banner copied from history (fragmented deltas prove
+model-written; a real notice arrives as one contiguous block). A forged banner names a cascade that
+never existed ("GLM-5.3, 1st sonnet fallback" — it is the nominal), misleads the operator reading
+the IDE, and misleads the model about its own identity. Removing a model fixes nothing: the nominal
+does it too.
+
+User arbitration 28/10 ("OK pour b"): **keep the client-visible banner; move what the MODEL must
+know to the request side; strip serving banners from forwarded history.** Three pieces, wired in
+`handleWithCascade` (`proxy-server.ts`):
+
+1. **The banner is unchanged for the human** — `prependNoticeToAnthropicStream` block 0 and the
+   condensation append still fire exactly as above (doctrine 2026-08-12). The instrument to tell a
+   real banner from a forged one stays: contiguous in the raw SSE = injected; fragmented =
+   model-written (`.tmp/banner-in-resp.py` pattern, #747).
+
+2. **The request-side serving note** (`buildServingNoteForRequest`, `failover.ts`): while a
+   SUBSTITUTE serves (a cascade step, `stepIndex >= 0`), the same facts the banner states are
+   appended to the top-level `system` of the forwarded request — **every such request**, not once
+   per depth: the history no longer carries the information. Nominal attempts carry no note. The
+   note is applied around the upstream call only (mutate-before / restore-on-failure, the native
+   pin's pattern) so a walk or skip advance never double-appends into a later attempt.
+
+3. **The history strip** (`stripServingNoticesFromRequestBody`, `failover.ts`): at the top of
+   `handleWithCascade` — AFTER both routes' `logRequest` (the capture keeps the client's verbatim
+   history; the banner-count instruments read it) and before any handler sees the body — every
+   assistant text block has its serving-banner segments removed: the stream notice's own block-0
+   (whole-block drop), a FORGED banner fused to model text, and the condensation append tail.
+   Assistant-only: the imitation trigger is the *turn-opening* pattern; condensation and recovery
+   notices ride other message shapes and are deliberately untouched, as is a truncated banner (no
+   full capability tail → no cut — a wrong cut would eat real content). A message that would strip
+   to empty is left alone: structure beats completeness. Never throws.
+
+Kill switches (read per request): `CLAUDISH_FAILOVER_REQUEST_NOTE=0` (no system note) and
+`CLAUDISH_FAILOVER_NOTICE_STRIP=0` (banners travel upstream again) — independent seams. Pins:
+`serving-notice-strip.test.ts` (unit) and `proxy-server-serving-note-route.test.ts` (route — the
+upstream request body is the instrument).
+
+Known residue, accepted: the system note itself contains the banner text, so a single occurrence
+per request remains model-visible — an instruction-shaped line in `system`, not a history of
+assistant turns opening with banners, which is the pattern that triggered imitation. The operator
+`..._NOTE` tail is not stripped (free-form text; no fleet step carries one).
+
+## `CLAUDISH_GLM_THINKING` measurements
+
+Probed 2026-08-20 against the `gc@` Coding Plan (`glm-5.3`, prompt "Reponds exactement: ok",
+`max_tokens: 500`):
+
+| `thinking` sent | HTTP | output tokens | reasoning chars |
+|---|---|---|---|
+| absent | 200 | 37 | 131 — **GLM thinks by default** |
+| `{"type":"enabled"}` | 200 | 41 | 148 |
+| `{"type":"disabled"}` | 200 | **3** | **0** — the switch works |
+| enabled plus `budget_tokens` | 200 | 35 | tolerated, **ignored** |
+
+History this encodes: `GLMModelDialect` used to delete `thinking` unconditionally (a GLM-4.x-era
+artifact), and the OpenAI `buildPayload` never emitted the field either. Net effect: GLM silently
+thought by default on **every** request, the client's ask was meaningless, and no lever existed to
+stop it while the Coding Plan's 5h window burned. `passthrough` preserves the effective historical
+behavior; the `zai@` anthropic wire is unprobed, so only an explicit `disabled` sets the field there
+(mirroring Qwen's anthropic-wire bet).
+
+# Decision records moved from `CLAUDE.md` (2026-10-05, #23 pass 2)
+
+Each section below is the CLAUDE.md bullet verbatim at `main@ac279833`; CLAUDE.md keeps a decision line that points here.
+
+## Role delegation `role:<r>` (#274)
+
+**A cascade step can delegate to another ROLE — `role:<r>` (#274), the operator's "when X maxes, become role Y" made config.** The delegation resolves to the target role's NOMINAL when its bucket is healthy, else the target's currently-resolved cascade step (shared walk state — delegated traffic joins the existing resolution instead of re-walking walled steps); e.g. `CLAUDISH_FAILOVER_OPUS=cx@gpt-6-sol>role:sonnet` serves Sol, then sonnet's nominal `gc@glm-5.3`, then whatever sonnet itself is serving when its own bucket walls. This removes the interim duplication (deployed 2026-09-28 13:41Z) where a healthy role's nominal had to be copied as step 0 of every other role's cascade — that step-0 duplication is removed from the `.env` once #274 deploys. Rules that keep it safe: the cascade lists fallbacks only (a role's own nominal NEVER appears in its cascade); the delegation graph is proven **acyclic at load** (`delegationAcyclic` — Sonnet's chain stays model-only by design, so delegations terminate there; a cycle is refused with a loud log, never a runtime loop); the **dwell pin and the notices pin/name the CONCRETE resolved step, never the role reference** (a `role:` step's `target` is refreshed at every resolution to the model actually serving it, so a pinned delegation step HOLDS while the delegation still resolves — never a provider switch back to an earlier probeable step inside the dwell; a `wasNominal` yield that did exactly that was removed in review 01/10, its flag surviving delegated successes — which reset the OWNER's coordinate, not the delegating step's — so one nominal wall unpinned every session on the step for hours); and failover bookkeeping happens on **both levels, each exactly once** — the delegating role's step records dwell/skip/notice, while the concrete model ALSO records against the owning cascade, whose coordinate is DERIVED FROM THE RESOLUTION ITSELF (`resolveDelegationOwner` — a reverse target→step lookup cannot find it: a role-step's `target` is refreshed in place, so the search returns the delegating step; measured by the coordinator's probe 29/09): a delegated qualifying wall of the target's nominal goes through the TARGET's `onNominalRefusal` (delegated traffic itself accumulates the target's arm — it never waits for direct traffic), and a delegated wall of the target's step marks THAT step's backoff. Route-level pin: `proxy-server-role-failover-route.test.ts` (S1/S2/S4, one mutation per branch). The nominal resolver is injected by proxy-server (`setRoleNominalResolver((r) => modelMap?.[r])`) — unset (tests), a role-step falls to the target's own cascade, and if the target has none the delegation is skipped (never a placeholder).
+
+**A `role:` step's per-step backoff binds only the CONCRETE it was recorded against (#331).** `resolveSkippingFailed` used to test `isStepTtlFailed` BEFORE ever re-resolving the delegation, so the delegating step's backoff — recorded off a refusal of ONE concrete the delegation happened to serve — froze it for up to the 24 h cap even after the target role's own resolution had advanced to a healthy step. Measured on the hub (po-2025, 2026-10-04, `modelMap` absent so the delegation resolved straight into sonnet's cascade): `haiku[1]` = `role:sonnet` accumulated **408 walls at TTL 1440 min** while sonnet served healthily from its own cascade; haiku went unanswered for hours (the last-resort fallback re-served the delegation each request and every refusal re-marked the same step). The fix, per the author's decision of record: `markStepFailed` records the CONCRETE the failed attempt served (`StepFailure.concrete`, threaded from `delegation.concrete` at every proxy-side mark), and the TTL of a `role:` step binds **only while `resolveRoleStep` keeps resolving to that same concrete** — at the walk (`stepTtlBinds` in `resolveSkippingFailed` AND in the one-shot overload walk `resolveTransientStep` — the walk kept the bare test in the first cut, review 06/10 point 1), at the dwell pin's servable test, and at the last-step fallback (where a role-step frozen on its CURRENT concrete now surfaces the refusal instead of re-paying it — the anti-408 half). Non-negotiables preserved: intra-request advancement (within one request the resolution cannot move on its own, so the same concrete stays skipped — since #609 the delegation walk moves it explicitly, excluding every concrete already paid), the #274 two-level bookkeeping (untouched — reads only), a record WITHOUT a concrete binds (the pre-#331 shape — conservative; the #263 revisit re-mark now CARRIES the concrete: intra-request the delegation cannot move so the record binds identically, but a concrete-less re-mark would re-freeze the step for its whole backoff the moment the delegation advances — review 06/10 point 2), and a #261 config closure binds a role-step regardless of where the delegation points. One intersection the fix had to touch: the **#263 revisit guard was index-keyed** — a delegation that advanced mid-request re-resolved the same step INDEX on a different concrete, and the guard re-marked it WITHOUT a concrete, re-freezing it in-request (the intra-request half of the freeze, found while writing pin R1); the guard is now keyed by the concrete PAID (`triedConcretes: Map<stepIndex, Set<concrete>>`), which is the same-concrete rule the decision of record states — the #263 cascade-revisit pin holds unchanged. Seam pins T1-T6 (`failover.test.ts` §#331) + route pins R1/V1 (role-failover) and W17 (overload walk) through the real loop (hub shape: delegation resolves the target's cascade steps, s0 walls, the next attempt follows the advance to s1, the direct tail never paid).
+
+**A delegation walks its target's remaining path INSIDE the request (#609).** A `role:` step resolved ONE concrete per request: when that concrete failed, the loop advanced to the caller's next step — and a delegating LAST step has none, so the request surfaced the wall while the target role still had live steps. Re-resolution could not help, because it handed the same dead concrete back: a delegated wall of the target's NOMINAL goes through the target's grace/arm semantics (a first refusal under `ARM_AFTER` does not wall the bucket), and the non-quota last-step branch writes no mark at all. Measured on the hub 2026-10-22 (MiniMax wall + vLLM engine wedged 22:08→22:25:19Z): a haiku session received `[Failover] haiku: every step walled — last: glm-5.3 429`, while five minutes later a haiku probe was served in 545 ms by `role:sonnet → ds@deepseek-flash` — sonnet's PAYG terminator had been alive throughout. Now, when the delegated concrete fails — a quota wall on any step, a non-quota failure on an intermediate step, a non-quota NON-wiring failure on the last step — `resolveDelegationExcluding` (`failover.ts`) serves the next concrete of the target's path: its nominal (unless that bucket is walled), then each step whose backoff does not bind, recursing into nested delegations, then the target's last model step as the "PAYG always serves" bet. It **excludes every concrete this request already paid** — the union of `triedConcretes` over every step index, not just the delegating one: a concrete walled on another step of the caller is never re-paid inside the target's path. The attempt rides the #299-B `forceTarget` seam on the SAME delegating step index, so dwell, skip and notice still record against the delegating step, and the notice names the concrete that SERVED (`step.target` is refreshed by the walk). It runs outside the caller's attempt budget (`attempt--`) and is bounded by `delegationCandidateBound` (target nominal + steps, nested delegations counted through — each walk adds its concrete to the exclusion, the bound is the belt). Each failure writes exactly what it wrote before (the #274 two-level bookkeeping, the #331 concrete-keyed marks): the walk adds no mark, wall or arm of its own. A wiring fault (`isWiringError`: 401/403/404, or a 400 naming an unknown model) on the last step surfaces unchanged — no walk hides a mistyped id — and a target path walled end to end still surfaces the #409 429, naming the last concrete paid, each candidate paid once. `[Failover] DELEGATION-WALK <role>[<i>] — <failed> failed in this request; trying <next> (<owner>)` is the countable marker (stdout). Route pins D1-D8 with seven mutations (walk off / per-step-index exclusion / nominal not excluded / last-step offer dropped / wiring guard dropped / `step.target` not refreshed / step exclusion dropped): `proxy-server-delegation-walk-route.test.ts`; six role-failover pins (S1/S2/S4/N1/B1/last-resort) moved from "surfaces the wall" to "serves in-request". **The walk tests a bucket WALL on the target's NOMINAL only** (`isBucketWalled(bucket)` plus the legacy role-wide bucket) — a STEP candidate is filtered by its own per-step backoff (`stepTtlBinds`) and by the request's exclusion set, never by its own bucket's wall. That asymmetry is deliberate: a bucket is a provider METER shared across roles (#275), and the wall authority for a step is the mark of the cascade that owns it; testing the wall again inside the delegation walk would install a second, divergent wall authority there — one able to skip a concrete that another role legitimately serves on the same bucket. The cost of leaving it out is one attempt that dies on the wall and then joins the exclusion set, bounded by `delegationCandidateBound`.
+
+## Per-step backoff and `_RESET` closures (#261, #275)
+
+- **Per-step backoff `[10m, 30m, 1h, 4h, 24h]`, and a known reset time overrides it entirely.** Re-probing a 24h-capped cycle against an 11-day wall is pure waste, so `..._RESET` (or a date parsed from the body — Qwen names its reset, MiniMax counts down) holds the step skipped until that instant, then makes it probeable the moment it passes. ⚠ **A `..._RESET` in the future is a CLOSURE, on two planes (#261)**: it closes a HEALTHY step outright (never selected by the walk, never the last-step fallback — "PAYG always serves" yields to an explicit closure, and a dwell pin on the step yields), and `initFailover` logs one `[Failover] CLOSED <role>[<i>] … until <date>` marker per closed step at startup so the gesture is visibly biting. A step that HAS failed is governed by its failure record's own date instead — body-parsed wins over the config value at mark time ("the live body knew better"); the two planes trade places only across a restart, whose state wipe leaves every step healthy (which is exactly why the closure is evaluated on the config plane — measured 2026-09-25 on the hub: a `_RESET` deployed by drained recreate on healthy Qwen steps served **865 responses** over the weekend because the config date only ever extended the backoff of already-walled steps). **`stepFailures` survives the bucket-wall TTL cycle**: without that, the 10-min nominal re-probe would re-probe a weekly-walled step every 10 minutes, defeating the backoff. It is cleared for the role when the nominal recovers AND no wall remains anywhere (probe-storm guard, #275): while a sibling bucket is still walled the early reset is withheld — a long-lived wall (a Kimi weekly, 7 days) holds it off, but the steps still expire on their own ladder, so it is only a loss of *early* reset, never a leak.
+
+## Session dwell and verified-recovery yield (#91, #294, #619)
+
+- **A session keeps its resolved step for a minimum dwell** (`CLAUDISH_FAILOVER_SESSION_DWELL_MS`, default 10 min, `0` = off) — the role-level dampers bound how often switches *happen*; the dwell bounds how often *one conversation* rides them. `resolveFailoverTargetForSession` (the routing seam for `getHandlerForRequest` and the cascade loop) pins a session to its step: the pin **holds** while the step is servable, even as the role-level state churns (disarm→nominal probe→re-arm — that oscillation moves traffic only *between* conversations), and **yields** on genuine advancement (the pinned step itself TTL-failed). The dwell is *sliding*: an active session renews it every request; an idle session's pin lapses after the window. Nominal is never pinned — pinning it would feed a session back into the wall its own refusal just armed (#91 point 4). The pin **also yields on VERIFIED nominal recovery**: the **FIRST** nominal request served since the last arm (`onNominalSuccess` stamps only on first success AND only when no wall is live — a busy nominal must not keep pushing the stamp forward, or the grace would measure since the LAST success and a nominal serving anyone every <grace would hold every pin forever; and an in-flight success landing under a live wall proves nothing about the meter — its stamp would age unseen and mass-un-pin at the wall's TTL expiry; both coordinator probes P1/P3, 01/10), held for `CLAUDISH_FAILOVER_RECOVERY_GRACE_MS` (default 2 min, `0` = yield immediately) — without this exit an active conversation rode its fallback until it *ended*, measured 2026-10-01 on a MiniMax wall: new sessions returned to the nominal within ~2 min of the lift while pinned cron conversations were still ~70% on the Kimi fallback 20 min later. The grace bounds an intermittent wall's isolated success to one switch per arm cycle, a re-arm voids the marker (the pin re-holds), a config-armed role never stamps (always active), and the marker is keyed role|bucket so a sibling bucket's recovery cannot un-pin sessions whose own nominal is still walled (the mixed state of 2026-09-28: role-keyed, every request of the still-walled bucket would yield→re-resolve→re-pin with two log lines each). A delegated success stamps the OWNER's role|bucket — a real success in that bucket, wherever the request came from. `[Failover] DWELL <role> session …<id> yielded — nominal recovered Ns ago` is the countable marker.
+
+- **The pin also yields to a recovered EARLIER cascade step (#619).** The nominal-recovery exit's step-level sibling: `resetStepSuccess` stamps the FIRST success of a step since its last failure mark (`stepRecoveredAt`, keyed `role|j` — the failure record's own scope, NOT the nominal's `role|bucket`: a cascade step's meter is role-scoped, so a recovered step has recovered for every bucket of the role, and `markStepFailed` — which carries no bucket — can void the stamp, which it always does: the grace must measure from a verified post-mark success, never age through a bench). A pin on a LATER step yields once some `j < pin.stepIndex` holds a stamp older than the same `CLAUDISH_FAILOVER_RECOVERY_GRACE_MS` AND is servable under the walk's own predicate — a step this request already skipped (#431) and an operator closure (#261, the one binding plane that writes no failure record, hence the one the mark-side voiding cannot cover) are excluded, and a dead `role:` delegation is not a target. Re-resolution lands on `j` (or an even earlier servable step) and re-pins there. Measured 2026-10-23 (the defect this closes): the local engine behind `haiku[0]` (`vllm-myia@swift-1.5-27b`) rebooted 07:46Z and decoded again 07:54Z — zero hub traffic reached it until ~08:18Z while session-less canaries served on it in 0.3–0.85 s; the sessions re-pinned past its bench never returned and kept paying sonnet's lane down to its PAYG terminator. The stamp voids on the step's next mark, bounding an intermittent step to one switch per mark cycle. **The stamp must POST-DATE the pin (#625 review).** `pinnedAt` is the instant the current pin was CREATED — a sliding renewal touches only `until` — and a stamp at or before it is news the session already had when it pinned past the step, so it moves nothing. Without that ordering a skip-created pin flaps on EVERY request: #431 writes no mark, so nothing voids the stamp, and the session would yield to `j`, be skipped by it again, and re-pin at `j+1` forever (cost per turn: a real upstream round-trip for `media`, a 400 or a lost learned cap for `context`, the whole `STEP_BUSY_WAIT_MS` for `busy`). With it, a genuine yield that skips again re-pins with a fresh `pinnedAt` and switches exactly once. **The yield needs a second request to exist at all**: a stamp is only written by a request the step actually served, so a seat where every remaining session is pinned deep keeps its pins until such a request lands (a new session, a session-less call, a forfeited pin) — no blind probing with a live turn, which is the deliberate trade. Deliberately NOT the removed `wasNominal` yield (review 01/10): that flag survived delegated successes — the reset cleared the OWNER's coordinate — so one nominal wall un-pinned every session on that step for hours; a step stamp certifies the step itself. `[Failover] DWELL <role> session …<id> yielded — step N (<label>) recovered Ns ago; re-resolving` is the countable marker.
+
+## Non-quota death forfeits the dwell (#276)
+
+- **A NON-quota death of the pinned step forfeits the dwell instead of re-pinning the successor (#276).** `markStepFailed(..., { nonQuota: true })` — set only at the proxy's STEP-ADVANCE site, so quota marks and unmarked records keep the ordinary advancement/re-pin — makes a live pin on that step yield with **no re-pin**, under a one-dwell-window **tombstone** that also covers the sibling resolution of the same cascade attempt (the loop resolves twice per attempt, swap + loop read; without the tombstone the second resolution re-pins the deeper step in-request and the fix is erased). The walk itself still fail-forwards within the request — what changes is that the session rejoins the general resolution on every subsequent request, so it returns to the nominal the moment its bucket wall expires. Measured driver (2026-09-28, hub po-2025): armed 11:05Z, a session dwell-pinned to step 2 received the wrapped content-filter false positive `HTTP 400 {"code":"InvalidParameter", … "data_inspection_failed"}` at 12:31Z, the advance re-pinned it at the PAYG tail and the renewed dwell held it there for **hours** while the nominal sat healthy at 47% — the re-pinned pin was the only thing outliving the 10-min bucket wall, and with every active session pinned the nominal was never probed, so no #294 recovery stamp ever landed either. A resolution landing on the nominal clears the tombstone (forfeit served); after one dwell window, ordinary dwell resumes. `[Failover] DWELL <role> session …<id> yielded — step N (label) died non-quota; dwell forfeited, re-resolving unpinned` is the countable marker (the step-level verb distinguishes too: `failed (non-quota)` vs `walled`). Route pins + 3 mutations (predicate / tombstone / quota-scope): `proxy-server-nonquota-unpin-route.test.ts`; seam pins incl. the bounded forfeit: `failover.test.ts` (#276 describe).
+
+## One-shot overload walk (#299-B)
+
+- **A nominal's transient OVERLOAD walks the cascade once, writing no failure state (#299-B).** A 529 on the nominal — or a 429/503 the patient backoff already exhausted into a 529, or a `400 connection_error` (the proxy's own synthesis of a transport failure, #298 A; clause carried from #302) — (`isOverloadWalkClass`, `composed-handler.ts`; deliberately NOT folded into `isTransientOverload`, which also gates the ~5-min patient backoff and would delay every overloaded turn by minutes) — is the PROVIDER saying "unreachable/overloaded", not the role's plan being walled: before this, the refusal reached the client verbatim and a cron conversation retried a dozen times against the same refusing provider, then dropped (measured 2026-10-02: MiniMax-M3, the haiku nominal, ~30 % of attempts 529). `handleWithCascade` now tries the **FIRST SERVABLE** cascade step ONCE for that request only — `resolveTransientStep` (`failover.ts`, the #302 idea) picks it read-only, skipping TTL-failed steps (per-step backoff), steps in walled buckets (a weekly wall on step 0 must not turn every 529 into a round-trip at a target we know is dead; #348 buckets bare targets CANONICALLY through the injected async resolver — `providerBucketOf("glm-5.3")` reads `glm` where the wall lives on the route() primary `glm-coding` — and skips the NOMINAL's own bucket too: same bucket, same capacity the 529 just refused. ⚠ The bucketer is `concreteStepBucketOf` (classify + catalog + route on the target AS-IS), NEVER `nominalBucketOfModel`: a step target is already concrete, and the request-side mapping re-maps a role-keyworded step id onto `modelMap[role]` — the nominal's OWN bucket — so the same-bucket skip then jumped a healthy step on another meter (probe-proven in review, 06/10: cascade step `s0-ep@fake-sonnet-b` skipped though healthy and differently-bucketed; with a `--model` default, EVERY keyword-free step target would bucket as the default model). The #274 delegation-owner sites (`failover.ts:1189`-class) still call `nominalBucketOfModel` on concretes — same shape, NOT fixed here (tracked separately)) and role-steps whose delegation cannot resolve concrete (so a ROLE NAME can never reach the wire as a model id); null ⇒ no servable step ⇒ surface the original rather than substitute blind — the attempt goes through `getHandlerForRequest(..., forceTarget)` (bypasses the modelMap and the 2a swap, so the walk neither re-resolves the nominal nor writes the dwell pin) and changes NO failure state: **no arm, no stepFailures mark, no bucket wall, no dwell pin** (no *failure* state — a served attempt still mirrors the loop's *success* bookkeeping, `resetStepSuccess` + owner-side `onNominalSuccess`, which a wall never feeds; review of #326) — the #170 re-forward's separation (`no markFail`). The **native lane is excluded** (`anthropic-native/*` buckets): its meter is the client's own Anthropic credential, and serving the turn from a non-Claude step without a notice would contradict "every substitution is announced" on the one model the client picked deliberately, while Claude Code already retries its 529s itself. A step that also fails (or throws — a step with no credential makes routing throw, and the catch is what keeps the turn retryable: without it the client gets a terminal 400 instead of the 529) surfaces the ORIGINAL overload — never the step's own incident — after draining the dead walk response's body (`cancel()`, so no upstream connection hangs on it); bounded by construction to one attempt. **#348 bounds what the walk may cost the client's REMAINING patience** — and at the default the 429/503 walk class NEVER fires: it reaches the walk at ≈365 s, past the 300 s budget, for EVERY client (direct included — the relayed case is not the only excluded one; the choice is deliberate: the measured driver was a direct MiniMax 529 at seconds, and a class that cannot fire at the default would otherwise read as live in `isOverloadWalkClass`'s doc). It is skipped — original surfaced, one `[Failover] WALK <role> skipped — budget Nms > Mms` marker — when the nominal attempt already spent more than `CLAUDISH_FAILOVER_WALK_BUDGET_MS` (default 300 s, `0` = off, read per request, compose carries the name) measured from the request entering the cascade: a 429/503 overload reaches the walk at ≈365 s (transport ladder ~60 s + patient backoff ~305 s), already past the relay's 360 s header deadline — the sidecar fell through and served locally, the hub's walk output is unread (inference, billing not measured) — and cramping the 600 s client timeout for a direct client whose walk step is also slow; 300 s keeps the direct sum under 600 s while the measured driver (a direct MiniMax 529, seconds) still walks. **No client-gone skip exists, by measurement — a client abort is UNDETECTABLE at the walk branch on this stack** (Bun + @hono/node-server, request body already consumed by the cascade; probe matrix, 2×2 healthy/aborted, checked 400 ms after the abort): the adapter's Request signal arms only from `outgoing.on("close")`, which under Bun's node:http never fires before the FIRST write — so `c.req.raw.signal.aborted` reads false exactly when the check would run (a first probe on raw `Bun.serve`, where it DOES flip, was the wrong stack); `incoming.destroyed`/`close`/`complete` are true on every HEALTHY request too (Bun destroys the message once read — a predicate built on it skips EVERY walk: measured 11/22 red the moment it shipped, caught by pin W16 before merge); socket state (`destroyed`/`readyState`, both incoming and outgoing) is `open` in both rows; and events subscribed at entry (`incoming` "aborted"/"close", socket "close", `outgoing` "close") are identical in both. Consequence, accepted knowingly: the walk may fire into an abandoned request — bounded by the budget alone and one attempt by construction. Anyone re-adding a client-gone predicate must first discriminate an aborted client from a healthy one, which no current signal does. The armed walk's own bare-target blindness (`resolveConcreteTarget`, the "the failover module must not make a proxy-side route() call" branch) is deliberately NOT fixed here: the sync core's stance holds, and its blindness is self-correcting — a walled bare step fails, STEP-ADVANCE marks it, backoff holds it off — where the walk's never would be (it writes no failure state by design), which is why the walk needed the canonical bucketter first. `[Failover] WALK <role> one-shot (HTTP <status> on nominal <model>) → <concrete> (step N)` is the countable marker (`log(..., true)` → stdout, not `logStderr` — a test capturing only stderr is blind to it). Kill switch `CLAUDISH_FAILOVER_OVERLOAD_WALK=0`, read per request (a container needs the name in compose, #304; `docker-compose.yml` carries it). Route pins W1-W4, W7-W19 + predicate pins P1-P6; mutations (remove the walk / let it arm / drop the kill switch / shrink the predicate to 529-only / drop the native exclusion / walk `steps[0]` instead of first-servable / drop the walled-bucket skip / drop the step arg at the TTL check — the #261 rebase hazard, an optional param that compiles either way / rethrow in the walk's catch / drop the budget skip / drop the canonical bucketter for bare targets / drop the nominal-bucket skip): `proxy-server-overload-walk-route.test.ts`.
+
+## Step skip — a step that cannot take THIS request (#431)
+
+- **A context overflow on a non-last cascade step skips forward (#431 AC1).** Two measured shapes made the pre-#431 behavior wrong on a step with a healthy successor: (a) vLLM counts `prompt + max_tokens` against `--max-model-len` and **REFUSES rather than trims** (RAPPORTÉ, not measured in this repo — Swift lane, vLLM v0.31; first live occurrence measured by ai-01:vllm 2026-10-10 08:03:12Z: 801 241-byte request body ≈ 200k-token prompt → `HTTP 400 "maximum context length"`, UA Bun/1.3.14 via the hub, legitimate MEDIUM key), so a local cascade step with a 262 144 window cannot take a 240k-prompt turn that every cloud step accepts at 1M — and `ComposedHandler`'s recoverable-turn machinery (the 2026-09-10/11 wedged-session fix) answered that refusal as **HTTP 200** with the factual notice plus an inflated `usage`, which the cascade loop read as SUCCESS: it reset the step's failure count and handed the client the notice *as the model's answer*; on a compaction request (`/compact`, the `stream:false` caller) the notice would have been the session's *summary*. (b) A saturated endpoint limiter (`customEndpoints.maxConcurrency` → `ConcurrencyLimiter`) held the turn in an **unbounded FIFO** before any fetch — the first-event watchdog never saw it. The signal is an out-of-band response header, `x-claudish-step-skip` (`handlers/shared/step-skip.ts`): `context` rides the overflow recovery turn (classified from upstream **or** short-circuited by the learned cap — one builder sets it on both paths), `busy` rides the bounded 529 the handler answers when a loop-marked step attempt's concurrency wait expires, `media` rides the engine's per-prompt image cap (below). `handleWithCascade` acts on it **only** for a non-last step with a successor: `[Failover] SKIP <role>[<i>] reason=context|busy|media est=… cap=…|wait=…ms|images=… (<target>) — advancing to next step, no failure mark` (forceConsole) is the countable marker; the discarded recovery stream is drained (`cancel()`), the step index joins the request-scoped `skippedSteps` set that BOTH resolutions of each later attempt exclude (the handler swap and the loop read run twice per attempt and must agree — a divergence builds one step's handler while advancing past another), and **no fleet state is written**: no `markStepFailed`, no bucket wall, no arm — the step is healthy, the request just does not fit (a fresh session with a small context resolves the same step again, pinned by nothing). The **dwell pin on the skipped step yields** for that request (`resolveFailoverTargetForSession` deletes it — WITHOUT a #276 tombstone: the step did not die; the re-pin lands on the successor, which is now what serves this oversized session) — `[Failover] DWELL <role> session …<id> yielded — step N skipped for this request (#431); re-resolving`. The recovery turn is **unchanged on the last step** (its notice IS the client's answer, single round-trip) **and on the non-cascade path**. The vllm-lane asks are covered by construction: the skipped step is never re-attempted for the same request (the exclusion set + `triedConcretes`), and no local retry of the overflow happens (the skip only ever advances).
+- **A per-prompt image cap is a skip, not a failure (#575).** The vLLM engine counts media blocks BEFORE any token arithmetic and refuses a prompt carrying more than its cap — `{"error":{"message":"At most 4 image(s) may be provided in one prompt. (parameter=image)","type":"BadRequestError","param":"image","code":400}}`, captured verbatim in `test-fixtures/upstream-errors/vllm-image-cap-400.json` (10 hits 12–20/10: 7 swift, 3 frognano). Measured 20/10 on the hub: CoursIA-2's blocked-compaction session (4.4 MB) retried this shape four times in 45 s; sixteen minutes later the SAME session trimmed to 949 569 B got the real `maximum context length` 400 and taught the learned cap in one shot — two different refusals, one session, and the generic recovery hint ("Request format may be incompatible with provider") sent the diagnosis thread hunting a translation bug. It must NOT take the failure path: the step is healthy and a screenshot-heavy history would bench it for 10 min and climb the backoff rungs across retries of a shape it will never accept. `classifyMediaCap` (`handlers/shared/media-cap.ts`) is **narrow on purpose** — status 400 plus the engine's own cap phrasing; a bare `"param":"image"` (invalid base64, unsupported media type) stays an ordinary 400. The handler answers `x-claudish-step-skip: media; images=<n> cap=<n> param=image` — the count comes from `countMediaBlocks`, the SAME walk as the #441 clamp estimator — and **keeps HTTP 400**: nothing about the prompt's SIZE is wrong, so the #79 recoverable turn (whose whole job is to advance the context gauge with an inflated `input_tokens`) would report a false cause and make the client compact for nothing. On the last step / nominal / non-cascade path the label replaces both the engine's jargon and the generic hint: "This step accepts at most N image(s) per prompt, this request carries M. The engine refuses on the media count, not on the prompt's size — drop or describe images to run on this model." The wording must never match `isQuotaExhaustion` (pinned) — a screenshot count is not a wall. Marker `[MediaCap] provider=… cap=… images=… param=…`. Pins: `handlers/shared/media-cap.test.ts` (real body, status gate, narrowness, count, wire round-trip, wording) + `K25`/`K26` in `proxy-server-step-skip-route.test.ts`; mutations: handler branch disabled ⇒ K25/K26 red, classifier matching nothing ⇒ the real-body pins red.
+- **`maxOutputTokens` clamps `max_tokens` before the request leaves (#431 AC2).** Per-endpoint field in `customEndpoints` (both simple and complex kinds; `z.number().int().min(1).optional()`); clamped DOWN only, on the Claude-level request inside `ComposedHandler.handle` — before `adapter.buildPayload`, so the openai (`max_tokens`/`max_completion_tokens`) and anthropic wires inherit it from one seam. Driver: 200/200 sampled Haiku turns send `max_tokens: 32000`; a 240k prompt + 32k against a 262 144 window is a refusal, +8k is served. Unset = verbatim passthrough.
+- **A busy step skips after a bounded wait (#431 AC3).** `ConcurrencyLimiter.run(task, waitBudgetMs)` bounds the QUEUE wait (not the task): on expiry it rejects with `StepBusyError` **after removing its own resolver from the FIFO** (a freed slot that wakes an abandoned promise decrements `active` for a waiter that will never increment — the slot leaks forever), the transports thread `enqueueRequest(fn, { busyWaitMs })`, and `ComposedHandler` answers the labeled `529 overloaded_error` with the skip header. The budget is REQUEST-scoped: the loop marks the Hono Context of a step attempt (`markCascadeStepAttempt`, a WeakMap — nominal/walk/non-cascade read undefined and keep the unbounded FIFO, which AC3 pins as "the nominal path keeps its current behavior"), read from `CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS` (default 2000 ms, `0` = off, read per request; compose carries the name). The bound applies only at the initial admission call site, not inside the transport's own 429-retry ladder. **CR (10/10) tightened four edges of this contract**: (S1) the gate runs at every 429-retry iteration, so the bound now arms on the FIRST admission only — a StepBusyError on a retry surfaced as a skip for a request the backend had already 429'd, and the re-queue spent the budget twice; (S2/S3) the loop marks a bound only for a NON-LAST step — on the last step and the nominal it re-marks 0 (clears a stale bound from an earlier attempt of the same request), so a long-but-finite queue wait on the final step surfaces as the client's answer instead of an empty skip; (S4) the skip-advance also requires `attempt + 1 < maxAttempts` — a skip on the last loop iteration had no attempt to advance to and fell through to an empty 200 without `message_stop`; (B1) **the notices name the step that actually served the turn**: the loop records the served step on the request's Context (`recordServedStepForNotices`, WeakMap), and `applyFailoverNotices` prefers it over the general resolver — `resolveFailoverTarget` cannot see request-local skips, so a successor-served turn announced the SKIPPED step's name in both notice channels (stream block 0 and the condensation append). Two minors rode along: `readStepBusyWaitMs` parses strictly (`"2s"` is a typo for 2000, not 2 ms) and clamps to [0, 60 000]; `ConcurrencyLimiter`'s timeout-vs-grant race (a release firing between the race settling and the FIFO lookup) falls through to run the task on the granted slot instead of abandoning it — an abandoned grant strands every later waiter.
+- **Kill switch**: `CLAUDISH_FAILOVER_STEP_SKIP=0` (read per request) restores the pre-#431 behavior everywhere — no skip-advance, no busy marking. Route pins K1-K11 (+ K25/K26 for the #575 media class) + five mutations (skip-advance block / swap-threading exclusion / the clamp / the busy bound / the switch gate — each exactly its pins red): `proxy-server-step-skip-route.test.ts`; limiter pins (timeout, no slot leak, no-budget unchanged, `0` = off): `concurrency-limiter.test.ts`. The header is diagnostic on the surface paths (same doctrine as `x-claudish-failover-notice`, #229) — harmless to a client that ignores it, greppable for one that looks.
+
+## Unroutable cascade step skips forward — host-local routability (#769)
+
+- **A step this HOST cannot route is an impasse, not a failure — it skips forward, like #431.** `getHandlerForRequest` throws a `RoutingError` at handler CONSTRUCTION (guard 6b) when an explicit `provider@model` has no resolvable credential: no upstream call is paid, no body exists, so no classifier runs and nothing advances — before #769 the walk stopped on that dead step and the client got a terminal routing 400 for a cascade that still had servable steps. The skip writes **no fleet state**: no `markStepFailed`, no bucket wall, no arm, no pin (the step is healthy; the host simply cannot call it), the step index joins the same request-scoped `skippedSteps` set the #431 family uses, and the countable marker is `[Failover] SKIP <role>[<i>] reason=unroutable <concrete> — advancing to next step, no failure mark (#769)` (forceConsole). A delegation path may hold another routable concrete: `walkDelegatedTarget()` is tried first (#609 semantics) — and the catch records the dead concrete in the request's `triedConcretes` BEFORE that call (review R1, 31/10): an unroutable concrete was never *paid*, so without the entry the #609 exclusion set did not know it and the walk re-offered the same dead nominal until `delegationCandidateBound` was hit, never reaching the delegation's own routable steps (measured: two `trying <dead> (… nominal)` lines, then SKIP, target step never called — pin U3, red when the `add` is dropped).
+- **The LAST step cannot skip: it refuses in the labelled overload form.** `529` + `overloaded_error` + `x-claudish-step-skip: unroutable; <concrete>`, never a routing 400 — the gap is host-local, and a bare routing 400 would read to the client as its own mistake (same wire shape as the budget-synth 529). `unroutable` is a `StepSkipReason`: it is produced **only** on this loop's own refusal — no upstream ever carries it, so no response-shape skip can fire on it.
+- **The discriminator is WHO named the target.** `stepIndex >= 0` (the cascade named it) → skip; `stepIndex === -1` (the CLIENT named it: an explicit `provider@model` on the request) → the throw stands, terminal 400 with the env-var hint, unchanged (`proxy-server-routing-error.test.ts`, the #331 contract).
+- **The two ingresses tolerate the ENTRY resolution's throw.** `/v1/messages` and the OpenAI-compatible ingress resolve a handler BEFORE `handleWithCascade` (to label the log, strip the billing header, and write the #412 dwell pin), and that resolution swaps to the armed cascade's CURRENT step — so a pre-armed cascade whose current step is unroutable threw there, outside the loop. On a `RoutingError` with a cascade role the entry now logs `[Failover] entry-resolution UNROUTABLE <role> (<model>)` and proceeds with no handler: the loop re-resolves per attempt and skips forward. **That entry marker is per-REQUEST, not per-episode** — it fires on every request while an armed cascade's current step stays unroutable, so a count of it reads volume (how many requests paid the detour), not how many routing gaps occurred. A client-named spec has no role and still throws.
+- **The overload walk advances ONE hop, exactly like a budget refusal.** The #299-B walk's catch used to swallow the throw as a classless failure (the original 529 surfaced, pin W14) — it now returns `{ served: null, unroutable: true }`, the caller resolves the next servable step after `walk.stepIndex` and attempts it once; a second unroutable target surfaces the ORIGINAL overload.
+- **Routability is HOST-LOCAL, and value-parity of a cascade string does not imply parity of routability.** The same `kimi@…>s1-ep@…` string is routable on a seat holding the provider credential (env, `config.json` `apiKeys`, or a configured custom endpoint by name) and unroutable on a sidecar without it; a `role:` step is routable only if its delegation resolves to a target this host can call, and the `!own` step class is routable only on the machine that owns the endpoint (the suffix is stripped at parse — the handler sees the stripped target). A cascade that "works on the hub" can therefore be one step shorter elsewhere: the skip markers are the only signal, and they are counted per request, not per machine. Route pins: W14 (rewritten — the walk now advances instead of surfacing the 529), W14b (both targets unroutable → the original 529, never a 400), U1 (armed cascade, first step unroutable → next step serves), U2 (last step unroutable → labelled 529 refusal, header + env-var hint in the message) in `proxy-server-overload-walk-route.test.ts`.
+
+## Per-machine step exclusion (#693)
+
+**`CLAUDISH_FAILOVER_STEP_EXCLUDE=<stepTarget>:<machine>[ <machine>…][,…]` subtracts a cascade step for ONE machine's requests while the cascade stays ONE global list per role.** Driver (hub 2026-10-25, user mandate): the haiku cascade's step 0 is the local engine (`vllm-myia@swift-1.5-27b!own`, ~3-4 concurrent 190k-prompt slots), and ai-01's condensation threshold (330k) makes its haiku prompts structurally oversized for it — yet when the MiniMax nominal walls, AUTO arms the role for EVERYONE and ai-01's walk starts at the engine it must never draw on (measured evening window: 94% of ai-01's haiku landed on swift). The mandate shape — ai-01: `Minimax > role:sonnet`; small machines: swift pinned via the existing `role@machine` arms — needs per-machine walk order, which neither `role@machine` (same list for everyone) nor client settings (a settings-pinned `swift-1.5-27b` carries NO role at the hub: no `ROLE_MODELS` alias, no cascade, no bascule to `role:sonnet` when the engine saturates) can express. Syntax decisions that are load-bearing: **comma separates ENTRIES, spaces separate machines within one entry** (a comma inside the machine list would be eaten by the entry split — the natural copy-paste from `ACTIVE`'s comma list); the **split is at the LAST colon** (`role:sonnet:myia-ai-01` must parse — a first-colon split reads target `role`, machine `sonnet:myia-ai-01`, and the delegation steps could never be excluded); matching is on the **class-stripped step target, lowercased both sides** (`vllm-myia@swift-1.5-27b` even though the cascade says `…!own`), and a role step is indexed under BOTH its resolved keyword (`sonnet`) and its env form (`role:sonnet`) so an operator can write either. Semantics: the exclusion applies to **every walk of the role for that machine's requests** — the armed resolution (`resolveFailoverTarget`), the session-dwell variant (`resolveFailoverTargetForSession`), and the #299-B overload walk (`resolveTransientStep`) — with the exact treatment of a #431 skip (**no mark, no wall, no arm — the step does not exist for this machine**), and indexes stay in the GLOBAL list's space (exclusion never renumbers), so every index-keyed record (dwell pins, `stepFailures`, `stepRecoveredAt`) keeps one meaning. The **dwell pin yields** on a step newly excluded for the machine (same yield as #431's, its own log line — `pinned to step N … yielded — step N excluded for this machine`), and a **#619 recovery yield never lands on an excluded step** (the exclusion rides the same effective skip set `recoveredStepForPin` reads). The **last-step fallback refuses an excluded last step** ("PAYG always serves" is a bet about capacity, not about config — the raw refusal surfaces, same ruling as a #261 closure). Guards at load (`initFailover`, after the rules exist): a target matching NO cascade step is ignored with a log listing the declared steps (a typo silently no-ops otherwise); a malformed entry is ignored with the wanted syntax; and an exclusion set covering **every step of a role for one machine is dropped outright** ("machine-stranding refused") — the walk could only strand the request. Startup banners: one `[Failover] STEP-EXCLUDE <role>[<i>] '<target>' for <machines>` line per matched entry, and the armed banner resolves a `role@machine` arm WITH its machine so it shows the walk that machine actually takes. Threading: `getHandlerForRequest` gains a trailing `machine` param (the routes pass `x-claudish-machine`; the cascade loop passes its `machineHeader`; the #412 recursion preserves it; the #299-B forceTarget seam does not need it — 2a is bypassed there), and the machine-blind callers (canary, notices, `describeResolved` for role-wide arms) keep the global walk by construction. Compose carries the name (#310; startup read — a flip needs a recreate). Unit pins (walk / case-insensitivity / unknown target / malformed / all-steps refusal / last-step fallback / pin yield): `failover.test.ts` §#693; route pins X1-X3 (served-by proof through the REAL /v1/messages + count_tokens, dwell pin at the machine's own step) with mutation proof (drop `machine` at the 2a resolution ⇒ X1/X3 red): `proxy-server-step-exclude-route.test.ts`.
+
+## Failover targets on sidecars; armed state by value
+
+- **A failover target must resolve on the machine that calls the models.** Pointing a sidecar at a custom endpoint defined only in the hub's `config.json` configures a fallback that fails exactly when it is needed. The hub is the normal home — but **"only in AUTONOMOUS mode" is not the same as "rarely"**. ⚠ **The ai-01 sidecar is NOT armed — and a count that says otherwise is counting names.** `docker inspect` shows **23 `CLAUDISH_FAILOVER_*` present and 0 non-empty** (re-measured 2026-09-19). Compose injects all 23 with a `${VAR:-}` default, so **they exist whether or not anything is armed**: `grep -c '^CLAUDISH_FAILOVER_'` on a container's env returns 23 on every machine and can never answer the question. A 2026-09-18 edit here claimed "it is armed now — 23 in the live container" on exactly that miscount; it is **withdrawn**. What refuted it is `install-sidecar.ps1 -RebuildEnvFromContainer` (#141), whose `Get-ArmedCascadeCount` requires `=.+` and reported **0 armed recovered** from the same container. **Count armed state by value — `grep -cE '^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+'` — never by name.** Measured on the ai-01 sidecar over the 5 days to 2026-08-25: **124 requests served locally, 70 completed, 54 failed — every one of them the same `HTTP 429 [GLM Coding]`**, ~62s each walking the full retry ladder against a plan wall with nowhere to fall to. ⚠ That window is the **worst** one, not the norm, and it must not be quoted as a current loss rate: ai-01 re-counted by file on 2026-09-02 (623 req / 539 resp = 84 unanswered at most, which refuted its own finer-grained 132) and found the deficit concentrated on 20-25/08 — **28-30/08 and 02/09 show a deficit of zero, and the sidecar logged no 429 or 402 at all in the preceding 12h**. The benefit of arming is real but episodic, contingent on a wall being up at that moment. AUTONOMOUS is rare *and* it is exactly when the hub cannot help, so an unconfigured cascade there costs whole agent turns — one of the captures is four consecutive `msgs=2` startup attempts over four minutes, an agent that never booted. **Arm the cascade on sidecars too.** Note that arming is not enough on its own: `roleFromModelName()` matches only `opus|sonnet|haiku|fable`, so a client naming a bare provider id (`glm-5.2`) resolves to `null` and the cascade stays blind — either set `CLAUDISH_FAILOVER_ROLE_MODELS`, or have clients name roles neutrally.
+
+**A second measurement of the same failure mode — po-2028, 2026-10-29 evening — and it has the same shape.** While the hub rebooted (announced, instrumented reboot #207), the po-2028 sidecar went AUTONOMOUS **four times in 18 minutes**: 21:22:17→21:25:04Z (167 s), 21:27:37→21:28:44Z (67 s), 21:30:47→21:31:54Z (67 s), 21:37:37→21:39:55Z (138 s) — **439 s in total**, the hub flapping back up and down while Docker finished booting. po-2023 measured **the same four flaps from its own seat** (21:22:19, 21:27:35, 21:30:42, 21:37:39): two instruments, one event. In that window the seat served **77 requests locally** — **51 refused, every one of them the same wall** (`gc@glm-5.3` answering `HTTP 429 {"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-10-30 08:00:15"}}`) — and **26 answered** (the other role, on a PAYG step). An un-armed role therefore does not degrade, it **closes**: 100 % of that role's requests fail, and because there is no next step to walk, the refusal reaches the client as a plain `429` (`Rate limit reached for requests`) — the same client-visible signature an un-armed hub would produce, from the opposite cause. Two honest caveats: (1) the **same-account coupling is NOT established** — the local nominal rides `gc@glm-5.3` (the coding plan) while the hub's step 0 rides `mistral@zai-glm-5-3`, so the two 5-hour windows are not proven to be one account; the discriminator is the reset instant (local `2026-10-30 08:00:15`, hub-side still to be read); (2) the wall was already up when the hub went down, so the episode shows the two failures **coinciding**, not one causing the other. What it does show is the *shape* of the risk: a role with one un-armed step has no failure mode other than total loss of that role for the duration of the outage. (po-2028's seat stays **un-armed by deliberate decision** — user arbitration 2026-10-29, re-examination open — so this paragraph records a measurement, not an applied change.)
+
+
+---
+
+# Migrated verbatim from the repo-level `CLAUDE.md` (#445 A1, 2026-10-12)
+
+## Budget Failover (v7.2+)
+
+Substitutes the *model itself* for a whole **role** (`opus`/`sonnet`/`haiku`/`fable`) when that role's metered plan is exhausted — a subscription concern, distinct from `FallbackHandler`, which swaps *providers* for the same model (a transport concern). They compose. Every substitution is **announced**, because silent degradation leaves the agent assuming capabilities it lost (or missing ones it gained).
+
+**Three notice moments, two channels**, centralized in `applyFailoverNotices` so `ComposedHandler` *and* `NativeHandler` are covered: at **condensation** (appended to the `/compact` message — the one moment context is rebuilt anyway — naming the currently-resolved step and its depth); at the **moment of failover** (prepended as stream content block 0, every real block's `index` shifted `+1`, re-fired when the resolved step changes mid-session); and on **recovery** (symmetric, so the model recalibrates after the nominal returns). None of the three may throw — a missing notice beats a broken stream, and a thrown error would turn a working condensation into a failed one.
+
+> ⚠ **Notices state facts, never instructions — doctrine 2026-08-23.** The recovery notice originally told the agent to "resume your normal capability and **risk appetite**" and to "clean up any over-conservative decisions made under the substitute". Arriving unexplained in content block 0, that was indistinguishable from a prompt injection: it was reported as one on 2026-08-23 by a fleet agent whose security reflex fired correctly, before being traced back to our own code. Rewritten factual in #126 ("Capability note: …", plus a "Remaining fallbacks: …" depth enumeration after the step being served). Standing rule for any new notice: which role, which model, which direction — state capability or scope, never risk posture, and never ask an agent to undo decisions it already made.
+
+**A role's failover is an ordered list of steps, not a single target.** `CLAUDISH_FAILOVER_<ROLE>` is `>`-separated: step 0 serves when the nominal walls, step 1 when step 0 *also* walls, and so on; the last step is typically PAYG, which has no weekly wall. Opus→GLM is not a special route — it is Opus→Qwen with Qwen also dead, falling through to Qwen's own successor. GLM is a **rolling ~5h window** (it dies *and* restarts every 5h, unlike Qwen's consumable weekly pool), so PAYG naturally fills GLM's holes with no extra routing.
+
+**A wall is keyed by provider BUCKET, never by role (#275).** The arm used to exile every request of a role on any member's refusal; since #275 a qualifying refusal while serving the nominal walls `bucket(nominal)`, and only requests whose own resolved nominal sits in a walled bucket divert to *their* role's cascade. Contagion is provider-scoped and nothing else: the OpenAI Pro plan exhausting walls `openai-codex` (Sol AND astra divert, across roles); the GLM Coding 5h window walls `glm-coding`; a sonnet-role Sol wall never touches a sonnet request served by a healthy GLM nominal. The request-side derivation is `classifyNominalBucket` (`fork/failover.ts`) — it mirrors step 2c's guard exactly: explicit targets bucket on their CANONICAL provider name (`parseModelSpec` resolves shortcuts, so `gc@glm-5.3` and bare `glm-5.3` — whose `route()` primary is `glm-coding` — converge on one bucket); a bare `claude-*` (or any unmapped bare name, absent a user routing override) NEVER consults `route()` — under a hub with no Anthropic key the chain's answer would be `openrouter`, mis-bucketing the native lane — and takes a **per-model** native bucket (`anthropic-native/<model>`): the native meter is the *client's* credential, so a native sonnet 429 must never exile native opus. Config-arms (`CLAUDISH_FAILOVER_ACTIVE`) still divert the whole role regardless of bucket, and `armFailover(role, reason)` without a bucket keeps the legacy role-wide `*` wall.
+
+**A cascade step can delegate to another ROLE — `role:<r>` (#274).** It resolves to the target role's NOMINAL when that bucket is healthy, else to the target's currently-resolved step (shared walk state) — e.g. `CLAUDISH_FAILOVER_OPUS=cx@gpt-6-sol>role:sonnet`. Invariants: a role's own nominal NEVER appears in its cascade; the delegation graph is proven **acyclic at load** (a cycle is refused with a loud log, never a runtime loop); dwell pins and notices name the CONCRETE resolved step, never the role reference, and a pinned delegation step HOLDS while the delegation resolves (a `wasNominal` yield that un-pinned whole sessions was removed in review 01/10 — do not reintroduce it); bookkeeping runs on both levels exactly once, the owner's coordinate DERIVED from the resolution (`resolveDelegationOwner`), never from a reverse target→step lookup, which finds the delegating step. Nominal resolver unset (tests) ⇒ a role-step falls to the target's own cascade, or is skipped — never a placeholder. **#331: a `role:` step's per-step backoff binds only the CONCRETE it was recorded against** (`StepFailure.concrete`, threaded from `delegation.concrete` at every mark) — the TTL freezes the step only while the delegation keeps resolving to that same concrete, at BOTH walks (armed `resolveSkippingFailed` AND the one-shot overload walk `resolveTransientStep`), the dwell pin's servable test and the last-step fallback (where a frozen-on-current-concrete role-step surfaces the refusal instead of re-paying it — the anti-408 half; measured: `haiku[1]`=`role:sonnet` at 408 walls/24 h TTL while sonnet served). The #263 revisit guard is keyed by the concrete PAID (`triedConcretes`), not the step index — a delegation that advanced mid-request serves a different concrete, not a re-payment. A record without a concrete binds (conservative); a #261 closure binds regardless. Pins T1-T6 + routes R1/W17/V1: same files. Record: `docs/reference/budget-failover.md` §Role delegation.
+
+Env, read at proxy startup (canonical annotated template: `.env.sidecar.example`): `CLAUDISH_FAILOVER_<ROLE>` (the `>`-separated cascade), `..._LABEL`, `..._DIRECTION` (`degraded` default · `improved` · `lateral`), `..._NOTE`, `..._RESET` (operator-declared wall-lift per step, ISO 8601), `CLAUDISH_FAILOVER_ROLE_MODELS` (aliases so clients naming the nominal model directly still get cascade protection), `CLAUDISH_FAILOVER_ACTIVE`, `CLAUDISH_FAILOVER_AUTO`, and the #91 grace-before-arming knobs `CLAUDISH_FAILOVER_ARM_AFTER` (consecutive qualifying nominal refusals before arming; 1 restores arm-on-first-refusal) · `CLAUDISH_FAILOVER_ARM_GRACE_MS` (wait-and-retry the nominal once in-request) · `CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS` (a 429 naming a retry-after below this is a burst and never arms — a wall speaks in hours) · `CLAUDISH_FAILOVER_SESSION_DWELL_MS` (minimum time a session keeps its resolved step; see the dwell bullet below) · `CLAUDISH_FAILOVER_RECOVERY_GRACE_MS` (how long a verified nominal recovery must hold before dwell pins yield back to it; see the dwell bullet below). All `>`-separated fields are position-preserving against the step list. ⚠ **In a compose-deployed container the environment is fixed at create time: a name absent from `docker-compose.yml`'s `environment:` list NEVER reaches the process** — the env file only interpolates names that list carries. #304 measured exactly this failure: the five #91/#293 knobs above plus `CLAUDISH_NATIVE_MODEL_PIN` shipped documented (`.env.sidecar.example`) but unreachable in every compose deployment. `packages/cli/src/test-support/compose-env-coverage.test.ts` now cross-checks code↔compose in both directions (every name the code reads must be injected; every failover entry must be read) with positive controls. Consequence for "re-read per request" flags (`*_THINKING`, per-request kill switches): they mean no proxy restart — but in a container a NEW value still enters the environment only at the next **recreate**. These failover knobs are startup reads (`initFailover`) anyway.
+
+- **With nothing set every code path is inert.** Configuring a target does **not** activate it — arming is separate and deliberate.
+- **Unset `_DIRECTION` means degraded** — never flatter the substitute.
+- **`isQuotaExhaustion` is deliberately narrower than `FallbackHandler.isRetryableError`**: 402 arms on status alone; 429 arms *only* when the body names a quota/credit/balance/weekly/plan wall — a per-minute burst must not burn the weekly switch. **401 and 404 never arm**: those are wiring mistakes, and swapping the model would hide a bad key or bad model id behind a plausible-looking answer.
+- **`resolveFailoverTarget(role)` is the single resolution path** — used by both the swap in `getHandlerForRequest` and the `handleWithCascade` loop. The loop never passes an override target in; it mutates failover state and the next iteration re-reads. No double resolution.
+- **`handleWithCascade` is bounded, never `while(true)`**: nominal → step 0 → step 1 → …, capped at `steps.length + 1` attempts. The **c-reuse invariant** is load-bearing — a handler must not mutate the Hono `Context` before returning a non-ok `Response`, or re-calling `handler.handle()` across iterations breaks.
+- **Per-step backoff `[10m, 30m, 1h, 4h, 24h]`, and a known reset time overrides it** (`..._RESET`, or a date parsed from the body — Qwen names its reset, MiniMax counts down). ⚠ **A `..._RESET` in the future is a CLOSURE (#261)**: it closes a HEALTHY step outright (never selected, never the last-step fallback, a dwell pin on it yields), and `initFailover` logs one `[Failover] CLOSED <role>[<i>] … until <date>` per closed step — so before any deploy, read the `_RESET` values **by value** and list every future date with the step it will close. A step that HAS failed follows its failure record's date (body-parsed wins). `stepFailures` survives the bucket-wall TTL cycle (else a weekly-walled step is re-probed every 10 min) and is cleared only when the nominal recovers AND no wall remains anywhere (#275 probe-storm guard). Record: `docs/reference/budget-failover.md` §Per-step backoff.
+- **The bucket-wall TTL itself grows while the wall holds (10 m → 20 m → 40 m, capped), per bucket** — a flat 10-minute disarm/re-arm oscillated for the whole duration of a wall: ~6 provider switches per hour, each flipping the serving model twice with a cold prompt-cache at both ends (measured on the hub: 107 arms ≈ 214 model transitions per 24 h, #91). Each TTL expiry that re-arms escalates the next arm's TTL; any nominal success on that bucket resets it (fresh episode); a re-arm more than 40 min after the last disarm starts back at base. `[Failover] ARMED bucket <bucket> (<role> nominal) …` / `… (ttl Nmin, escalated)` and `DISARMED bucket <bucket> → probing nominals … next arm TTL grows to Nmin` keep the hub log countable (#91 point 3).
+- **A session keeps its resolved step for a minimum dwell** (`CLAUDISH_FAILOVER_SESSION_DWELL_MS`, default 10 min, `0` = off; sliding — every request renews it). `resolveFailoverTargetForSession` pins the session: the pin **holds** through role-level churn (disarm → probe → re-arm moves traffic only *between* conversations) and **yields** when the pinned step itself TTL-fails. Nominal is never pinned. The pin also **yields on VERIFIED nominal recovery**: the FIRST nominal success since the last arm, stamped only while no wall is live, held `CLAUDISH_FAILOVER_RECOVERY_GRACE_MS` (default 2 min), keyed role|bucket so a sibling bucket's recovery never un-pins (stamping every success holds pins forever; stamping under a live wall mass-un-pins at its expiry — both caught by coordinator probes, 01/10). Marker: `[Failover] DWELL <role> session …<id> yielded — nominal recovered Ns ago`. Record: `docs/reference/budget-failover.md` §Session dwell.
+- **A NON-quota death of the pinned step forfeits the dwell instead of re-pinning the successor (#276).** `markStepFailed(..., { nonQuota: true })` — set only at the step-advance site — makes the pin yield with **no re-pin**, under a one-dwell-window tombstone that also covers the sibling resolution of the same cascade attempt (the loop resolves twice per attempt; without the tombstone the second resolution re-pins in-request). Without it, a content-filter 400 on step 2 re-pinned a session at the PAYG tail for hours while the nominal sat healthy (hub, 2026-09-28). A resolution landing on the nominal clears the tombstone. Marker: `… died non-quota; dwell forfeited, re-resolving unpinned`. Pins: `proxy-server-nonquota-unpin-route.test.ts`, `failover.test.ts` (#276). Record: `docs/reference/budget-failover.md` §Non-quota death forfeits the dwell.
+- **A nominal's transient OVERLOAD walks the cascade once, writing no failure state (#299-B).** `isOverloadWalkClass` (529; a 429/503 the patient backoff already exhausted into a 529; `400 connection_error`) — deliberately NOT folded into `isTransientOverload`, which gates the ~5-min patient backoff — makes `handleWithCascade` try the FIRST SERVABLE step once, picked read-only by `resolveTransientStep` (skips TTL-failed steps, walled buckets and unresolvable role-steps; none ⇒ surface the original). Through `forceTarget`: **no arm, no stepFailures mark, no bucket wall, no dwell pin** (success bookkeeping is still mirrored). Native lane excluded (the client's own credential; substitutions are announced). A step that fails **or throws** surfaces the ORIGINAL overload — the catch is load-bearing: without it the client gets a terminal 400 instead of a retryable 529. Marker `[Failover] WALK <role> one-shot …` (stdout). **#348**: the walk is skipped — one `WALK <role> skipped — budget Nms > Mms` marker — when the nominal already spent `CLAUDISH_FAILOVER_WALK_BUDGET_MS` (default 300 s, `0` = off, per request); **at that default the 429/503 walk class NEVER fires** (it arrives at ≈365 s, past the budget, for every client — only the direct-529 and `400 connection_error` classes ever walk). No client-gone skip exists — a client abort is undetectable pre-write on this stack (W16 pins the negative result); bare step targets are bucketed canonically as THEMSELVES (`concreteStepBucketOf` — a role-keyworded step id must not re-map onto the nominal's bucket, W19) with the nominal's own bucket skipped. The probe matrix, the canonical-bucketer rationale and the armed-walk asymmetry: `docs/reference/budget-failover.md` §One-shot. Pins W1-W4/W7-W19 + P1-P6: `proxy-server-overload-walk-route.test.ts`. Record: `docs/reference/budget-failover.md` §One-shot overload walk.
+- **A failover target must resolve on the machine that calls the models** — a sidecar pointed at a custom endpoint defined only in the hub's `config.json` fails exactly when it is needed. **Arm the cascade on sidecars too**: AUTONOMOUS is rare but is exactly when the hub cannot help (ai-01 sidecar, 20-25/08: 54 of 124 locally served requests failed on `HTTP 429 [GLM Coding]` with nowhere to fall — the worst window, not a current rate). ⚠ **Count armed state by VALUE** — `grep -cE '^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+'` — never by name: compose injects every name with a `${VAR:-}` default, so all containers show all of them (a 2026-09-18 "ai-01 is armed" claim was that miscount; it holds 0 non-empty). And `roleFromModelName()` matches only `opus|sonnet|haiku|fable`: a client naming a bare provider id resolves to `null` and the cascade stays blind — set `CLAUDISH_FAILOVER_ROLE_MODELS`. Record: `docs/reference/budget-failover.md` §Failover targets on sidecars.
+- **A cascade step that cannot take THIS request skips forward (#431)** — context overflow (vLLM refuses `prompt + max_tokens > max_model_len`, never trims; the recovery turn is HTTP 200, which the loop used to read as success and hand back as the answer — on `/compact` it would have been the session's *summary*), a saturated endpoint limiter (unbounded FIFO), or the engine's per-prompt IMAGE cap (#575: "At most N image(s)", counted before any token arithmetic — a screenshot-heavy history would bench a healthy step for 10 min; the 400 stays a 400, with the exact label instead of the generic format hint). The signal is the `x-claudish-step-skip` response header (`context`/`busy`/`media`), set by ComposedHandler, acted on ONLY for a non-last step: advance with **no markStepFailed, no wall, no arm** — the step is healthy, the request does not fit — and the dwell pin on the skipped step yields for that request (re-pins at the successor). The skipped index is excluded from BOTH resolutions of every later attempt (swap + loop read run twice per attempt). Marker `[Failover] SKIP <role>[<i>] reason=context|busy …` (forceConsole). **AC2**: `customEndpoints.maxOutputTokens` clamps `max_tokens` down pre-conversion (one seam covers openai + anthropic wires). **AC3**: `CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS` (default 2000, `0` = off, per request) bounds ONLY step attempts — the loop marks the request Context, the nominal keeps its unbounded FIFO; a timed-out waiter removes its own resolver from the FIFO or the slot leaks. Kill switch `CLAUDISH_FAILOVER_STEP_SKIP=0` restores the pre-#431 behavior. Pins K1-K11 + 5 mutations: `proxy-server-step-skip-route.test.ts`. Record: `docs/reference/budget-failover.md` §Step skip.
+- **A session's UPSTREAM output tokens can be capped (#317 option B, `fork/session-budget.ts`).** Counter per `(X-Claudish-Machine, session_id)`, keyed on the dwell seam — subagents share the parent's sid, so one counter sees the parent and every subagent together (measured, swarm bc377615: one counter saw the parent + 230 subagent requests). 24 h sliding window, every cascade attempt counted (upstream usage, not client responses). Bars: `CLAUDISH_SESSION_BUDGET_CEILING` — refusal, served locally as a labeled 429 with `retry-after` = the real window remainder, BEFORE any upstream is paid — and `CLAUDISH_SESSION_BUDGET_WARN` — marker-only, defaults to 80% of the ceiling when only the ceiling is armed. Both inert without env. The hub has carried `CLAUDISH_SESSION_BUDGET_WARN=5000000` and `CLAUDISH_SESSION_BUDGET_CEILING=20000000` since the 27/10 recreate — **measured live from the container (05/11, re-read by value 06/11)**. Provenance, stated exactly: the values entered at that evening's 20:26Z PAYG-remedy recreate under an agent-to-agent ACK (the consumption mandate of the day), and **no user arbitration of these specific values is on record** — the earlier "WARN-only until the user fixes the values" pose ended at that recreate, but the values themselves remain the user's call to confirm or change. A registry question holds that confirmation open. An agent never arms the ceiling or moves either value alone. The refusal body wording is load-bearing: no quota-class word may appear, or `isQuotaExhaustion` would arm the failover off our own ceiling (pinned against the real predicate). Read per request, but a container still needs a recreate for a new value.
+
+### `CLAUDISH_QWEN_THINKING`
+
+`disabled` (default) · `passthrough` · `budget:<n>`. **Unset is not neutral** — Qwen reasons by default, so unset means "think, at length", and the Token Plan bills on **output**. Re-read on **every request**, deliberately: the fleet flips this during a budget crunch, and a cached value would require restarting the proxy that is at that moment keeping everyone working.
+
+**Two switches on two wires, and each endpoint ignores the other's form**: the OpenAI-compatible endpoint takes `enable_thinking` + `thinking_budget`, the Anthropic-compatible one takes the native `thinking` object. `QwenModelDialect.prepareRequest` branches on `ctx.wireFormat`; converting unconditionally (the old behavior) **deleted the only switch that works** on the Anthropic wire. Post-deploy check: on prompt `"Reponds exactement: ok"`, `input_tokens` dropping 67 → 31 proves the native switch reached Qwen. Full measurements: `docs/reference/budget-failover.md`.
+
+### `CLAUDISH_GLM_THINKING`
+
+`passthrough` (default) · `disabled`. GLM's switch is **binary** on the OpenAI wire (`thinking: {"type":"enabled"|"disabled"}`) — no budget control, unlike Qwen. Re-read on every request, same crunch-flip rationale.
+
+**GLM thought by default and had no off switch at all**: `GLMModelDialect` deleted `thinking` unconditionally (a GLM-4.x-era artifact) and the OpenAI `buildPayload` never emitted the field either, so the client's ask was inert in both directions. Probed 2026-08-20 against the `gc@` Coding Plan (`glm-5.3`, prompt `"Reponds exactement: ok"`): field absent → 37 output tokens / 131 reasoning chars; `{"type":"disabled"}` → **3 tokens, 0 reasoning**; `budget_tokens` tolerated and **ignored**. `passthrough` preserves today's effective behavior; the `zai@` anthropic wire is unprobed, so only an explicit `disabled` sets the field there.
+
+# #654 — in-flight token budget per endpoint (2026-10-24)
+
+A **capacity** concern, not a budget concern despite the name: a local engine
+saturates on CONTEXT, not request count. Measured 2026-10-24 on the Swift
+engine (co-signed engine-side by ai-01:vllm): six ~200K-token bodies ≈ 1.2M KV
+tokens against **750,747** available → ~1 token/s for 20 min, 58 preemptions,
+watchdog restart. Six requests is nothing to a request-count limiter; six
+200K contexts is the whole engine.
+
+## The two knobs
+
+```
+CLAUDISH_ENDPOINT_TOKEN_BUDGET_<NAME>   # Σ in-flight ESTIMATED tokens
+CLAUDISH_ENDPOINT_BIG_LIMIT_<NAME>      # max concurrent requests over 100K tokens
+```
+
+`<NAME>` = custom-endpoint name, uppercased, `[^A-Za-z0-9]` → `_`
+(`vllm-myia` → `VLLM_MYIA`). Read **per request**; in a container a new value
+enters at the next recreate (#310 — and these names are per-endpoint, so the
+compose `environment:` allowlist carries the literal for the endpoint this
+deployment arms — `VLLM_MYIA` is in compose since #663 r1 — and every other
+endpoint adds its own line; see `.env.sidecar.example`). **Unset = inert**
+(AC1); garbage and `0`-Σ are inert too — a typo must not invent a budget.
+
+Starting point from the measurement: Σ ≈ 550K (KV 750,747 minus generation
+headroom), BIG_LIMIT 3. ⚠ **The registry is per PROCESS**: a sidecar in
+AUTONOMOUS mode keeps its own leases — hub and sidecar calling the same engine
+each admit up to the full Σ independently. The Σ of every process's budget
+must fit the engine's KV; with two callers, budget each at most ~half.
+
+## How a refusal travels
+
+On the **#431 busy wire** — never a failure. The gate runs at attempt time,
+before any upstream call:
+
+- **Non-last cascade step** → skip forward: `skippedSteps.add`, no
+  `markStepFailed`, no wall, no arm; the dwell pin yields. The engine never
+  sees the request (pinned: `calls[tag] === 0`).
+- **Nominal** → the same 529 the bounded busy wait synthesizes, picked up by
+  the **#299-B one-shot walk** (`isOverloadWalkClass` matches the 529 status
+  regardless of body): first servable step, zero state, nothing benched.
+  Since #663 r1 the walk itself **evaluates each candidate step's budget**
+  before calling it (the walk bypassed the gate until then): a walk target at
+  full Σ is refused with **zero calls** and the walk advances to the next
+  servable step — same no-state semantics, one extra hop (pinned in
+  `proxy-server-step-skip-route.test.ts` B7). A walk target that fits is
+  committed and its response wrapped with the same release the direct path
+  uses.
+- **No diversion possible** (last step, unconfigured role, walk disabled) →
+  **serve anyway** + `[EndpointBudget]` stderr marker: the budget bounds
+  admission, it never refuses a servable request.
+
+Marker shape (grep-family of the #431 SKIP line):
+`[Failover] SKIP sonnet[0] reason=busy est=… sum=x/y big=x/y resubmit=k reason=… (…)`
+and `[EndpointBudget] <ep> resubmit=k in flight (…) — estimate replaces its
+predecessor (#654 AC5)` for echoes.
+
+## Reading a wall from the hub when the provider console is frozen (2026-10-31)
+
+A provider's usage console can be **freshly written and stale at once**: on
+31/10 the reader ran at 18:06:38Z and 18:10:39Z, four minutes apart, and both
+printed *"Resets in 4 hr 21 min"*, with the DeepSeek balance identical to the
+cent. The file's mtime was current; its content was not. **A fresh mtime is not
+a live reading**, and no quota figure derives from it.
+
+When the console is out, the hub's own log is the measurement — three greps,
+one per question:
+
+```powershell
+# 1. refusals that NAME the wall, per provider per hour (a 429 alone is not a wall)
+docker logs claudish-proxy -t --since <iso> 2>&1 |
+  Select-String 'names a quota/plan wall'
+
+# 2. service actually rendered, per hour per concrete
+docker logs claudish-proxy -t --since <iso> 2>&1 |
+  Select-String '\[resp\] .* model=([A-Za-z0-9.\-]+) '
+
+# 3. arm/disarm transitions — a DISARM followed by a re-ARM minutes later
+#    is the wall still up, seen from the probe
+docker logs claudish-proxy -t --since <iso> 2>&1 |
+  Select-String 'ARMED bucket|DISARMED bucket|RECOVERED'
+```
+
+Reading rules that change the verdict:
+
+- **A wall marker count of 1–3/h is the probe rate, not traffic.** After a wall
+  lands the cascade re-probes its nominal on the TTL; those lines are the probe
+  speaking, and they never enter a demand estimate.
+- **The number to quote is zero**: zero `[resp]` lines for the walled concrete
+  between two of its arms. That is the wall's floor, measured, with no console.
+- **`[resp] model=` is the resolved concrete on the hub** (the client's
+  requested id on a NOMINAL sidecar — see `traffic-analysis.md`), so the two
+  ends of a wall are read on one machine without touching a provider.
+- A recreate **wipes the in-process wall, bench and dwell state**: after one,
+  expect a re-probe burst and fresh re-walls within minutes. That is not a
+  regression, and it is not a recovery either until a nominal actually serves.
+
+Measured shape on 31/10 (illustration, never a benchmark): the MiniMax wall
+landed 13:30:44Z — 321 responses served in h13Z, then **zero** through h19Z
+while haiku traffic kept flowing; GLM re-walled 19:13Z and the sonnet role was
+served by DeepSeek Flash PAYG (1 734 responses h18Z, 1 141 h19Z).
+
+## A 429 salve that is neither quota nor hub load: GLM plan concurrency, `code=1302` (measured 2026-11-01)
+
+The WAN façade counted 77 client-visible 429s in five minutes (08:53→08:58Z,
+one remote seat's cron workload ramped to ~30 req/min, the 429s **interleaved
+with 200s**) and asked the hub to corroborate. Hub journal, same window:
+
+- **204 `[ConcurrencyRefusal] provider=GLM Coding model=gc@glm-5.3 HTTP 429
+  code=1302 — plan concurrency busy, not a step failure`** (38/32/24/64/44/2
+  per minute), **137 GLM streams completed** in the same window, and **zero
+  `code=1308` the whole day** (918 `[ConcurrencyRefusal]` lines total since
+  the 00:41Z recreate — 917 on `gc@glm-5.3`, 1 on `gc@glm-5.2`, all 1302).
+- Context: GLM had **RECOVERED at 06:18:00Z** (serving sonnet nominally after
+  the 04:27 wall fell), so the salve is a *healthy* nominal meeting its plan's
+  **concurrency** ceiling under a burst — chronic background pressure all day,
+  with the salve as its peak.
+- The pair that settles the classification: **204 concurrency 429s at
+  08:53–08:58 armed nothing** (no `glm-coding` transition until 10:31), then
+  **one qualifying refusal at 10:31:59 re-armed the wall** (ARM-GRACE 1/2 →
+  `ARMED bucket glm-coding`). Same bucket, two refusal classes, two
+  behaviors, same day.
+
+Reading rules that fall out:
+
+- **`1302` is concurrency; `1308` is the quota wall** — different answers, no
+  console needed to tell them apart. 1308 (`Usage limit reached … will reset
+  at …`, the po-2028 29/10 corpus) names a time-boxed wall and qualifies to
+  arm; 1302 names busy slots, never arms (the marker says so: *not a step
+  failure*), and the client sees 429s **interleaved with 200s as slots free**
+  — the interlacing is the signature. A dated pure-1302 corpus (01/11
+  08:53–08:58Z) now exists for whatever classifier work wants the pair
+  separated (#781).
+- **Counting client-side 429s alone misattributes the wall.** 77 surfaced at
+  one WAN client; 204 were refused hub-side across all callers. The salve is
+  the GLM plan's concurrency ceiling — not a hub rate limit, not a proxy
+  throughput wall.
+
+## Z.AI announces its reset in UTC+8, so the wall lifts on the ladder, not on the clock (measured 2026-11-02)
+
+`parseResetAtFromBody` reads the `1308` form (`Usage limit reached for 5 hour.
+Your limit will reset at YYYY-MM-DD HH:mm:ss`, no timezone marker) as **UTC** and
+then refuses any value the message's own stated window cannot justify. That guard
+is right, and the reason it fires on every real Z.AI body is measured below — the
+provider means **Asia/Shanghai**, 8 h ahead.
+
+Three wall episodes on the hub, each with its announced reset and the moment GLM
+actually served again (captures, per-minute; the bucket re-probes at each
+`DISARMED … probing nominals`, TTL 10 → 20 → 40 min):
+
+| episode | last `1308` | next successful probe | opening bracket | announced − 8 h | bracket offset |
+|---|---|---|---|---|---|
+| A | 02:38:58 | 03:19:06 | (02:38:58, 03:18:58] | **02:56:47** ✓ | 7 h 38 → 8 h 18 |
+| B | 08:16:12 | 08:56:50 | (08:16:12, 08:56:14] | **08:19:06** ✓ | 7 h 23 → 8 h 03 |
+| C | 13:27:06 | 14:08 (probe at 14:07:06) | (13:27:06, 14:07:06] | **13:56:50** | 7 h 50 → 8 h 30 |
+
+The intersection of the three brackets is **[7 h 50, 8 h 03] ≈ 8 h 00**: UTC+8 fits
+every episode, while UTC and UTC+1 are refuted outright (under those readings GLM
+would have stayed walled until 10:56 / 16:19, yet it served from 03:19 / 08:56).
+Episode C is the clean one: the wall lifted at 13:27:06 + 40 min = **14:07:06**,
+seven minutes *after* the announced−8h instant, so the lift was the TTL and the
+true opening sits in the bracket above.
+
+What it costs, bounded: the UTC-read value is declined, so the step falls to the
+bucket TTL and is blind between the true opening and the next probe — **22.3 min**
+(A), **37.7 min** (B), ~10 min (C). Those windows carried 721 + 1 409 + 281
+responses; at GLM's measured peak (≈ 21/min) the share GLM would have absorbed is
+≈ **1 400 responses/day ≈ 2.5 $/day ≈ 74 $/month** at the observed PAYG unit cost.
+That is ~7 % of the current run rate: real, and not a path to the 300 €/month
+target.
+
+Two verdicts from this measurement:
+
+- **Raising `CLAUDISH_FAILOVER_ARM_AFTER` (Q-76 study) stays rejected.** The
+  `1302` throttle never arms — `isQuotaExhaustion` matches neither "rate limit" nor
+  "per minute" — so the day's 34 arms came from 39 genuine `1308` walls and are
+  legitimate. The cost is the *lift time*, not the refusal count.
+- **The UTC+8 candidate landed (user arbitration 02/11: "tu n'as pas à me demander
+  ma permission pour réparer des instruments défectueux").** When the UTC reading
+  fails the plausibility guard, the parser now tries the same instant read as
+  Asia/Shanghai and runs the **same guard** on the shifted value. A body that really
+  were UTC yields a past instant, is declined, and yesterday's backoff applies
+  unchanged — the guard stays the only judge, and a wrong accept is bounded by the
+  stated window (one probe pays it back). Kill switch:
+  `CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES=0`.
+
+Regression pins: `packages/cli/src/fork/failover.test.ts` → *"parses the real
+2026-11-02 Z.AI bodies at announced − 8h"* (the three bodies above), *"accepts a
+reset further off than its window via the UTC+8 candidate"*, *"declines a reset
+implausible under BOTH readings"*, and the kill-switch pin.
+
+## The bucket wall lifts at the announced reset, not one rung later (#875, measured 2026-11-05)
+
+The parser above fed the **step** plan (`markStepFailed`) but never the **bucket
+wall**: `armFailover()` took its TTL from the ladder alone (`armTtlFor`, 10 → 20 →
+40 min), so a wall armed just before a reset kept the nominal benched for a whole
+rung after its window reopened. Hub, 05/11: first `1308` at 08:00:46Z announcing
+`2026-11-05 18:33:51` (= **10:33:51Z** under the UTC+8 reading); ladder probes all
+refused with that same reset; re-`ARMED … (ttl 40min, escalated)` at **10:33:04Z —
+47 s before the reset**. The z.ai console showed the 5-hour quota at 1 % by 10:51Z,
+yet the lane served 742 `deepseek-flash` responses (PAYG) and 0 `glm-5.3` from
+10:31 to 10:56Z; the next probe was due ~11:13Z.
+
+`onNominalRefusal` now hands `parseResetAtFromBody(errBody)` to `armFailover`, which
+takes `min(ladder TTL, resetAt − now + 30 s)`:
+
+- **Shorten only.** A reset further off than the rung leaves the ladder exactly as
+  before; the ladder stays the defensive ceiling (`ARM_TTL_MAX_MS`, #409) and keeps
+  its early probes — a window can reopen *before* its announced time (a manual quota
+  reset, for instance), and only a probe catches that.
+- **Strictly future.** A refusal that still names a reset already behind us means
+  the window has not reopened; re-probing every 30 s would be wrong, so the ladder
+  applies. An implausible Z.AI reset never reaches the wall — the parser's guard
+  (above) returns `undefined` first; the other forms (Qwen `MM-DD … UTC`, MiniMax
+  `Resets in N days`) are bounded by the same two rules: past → ladder, beyond the
+  rung → ladder.
+- **Escalation is untouched.** The shortened wall expires through the same
+  `isBucketWalled` path, so the disarm still climbs `armTtlEscalation`, and a
+  nominal success still resets it.
+- The `ARMED` line names the reset when it applies: `(ttl 77s, lifts at the
+  announced reset 2026-11-05T10:33:51.000Z + 30s; ladder step was 40min)`.
+
+Kill switch `CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET=0` (startup read, like
+`RESET_TZ_CANDIDATES`; on a compose deploy the env is fixed at create anyway, #310).
+Pins: `failover.test.ts` → *"#875 — the bucket wall lifts at the announced reset"*.
+
+## What a recreate costs the ladder, and the steps that fall together (measured 2026-11-01)
+
+The 00:41:30Z deploy of `main` gave the first full-window reading of the ladder
+*before and after* a wipe. Two findings, both decision-grade, neither a defect.
+
+**The ladder rebuilds from rung 1, so the first ~40 minutes are not a state.**
+GLM `ARMED` 00:41:37 (ttl 10 min) → `DISARMED` 00:51:37 → re-`ARMED` 00:51:56
+(ttl 20 min) → `DISARMED` 01:12:00 → **`RECOVERED` 01:12:18**, after which the
+nominal served 3 h 15 min (`glm-5.3`: 1 060 / 1 103 / 1 191 `[resp]` in h01–h03)
+before re-walling at 04:27:10 and re-arming at rung 2 (04:37:15, ttl 20 min).
+A wall that was already up before the recreate therefore re-establishes itself
+within 2 minutes and then **re-escalates from 10 min, not from where it stood**.
+Read the first rung after a deploy as the ladder booting, never as a regression.
+
+**The sonnet ladder's prepaid steps refuse together — a walled GLM lands on
+PAYG, not on Kimi or Qwen.** One request, one walk, four seconds:
+
+```text
+04:27:10 [Failover] step sonnet[0] (Mistral GLM)  walled — count=1 ttl=10min (HTTP 402)
+04:27:11 [Failover] step sonnet[1] (Kimi K3)      walled — count=1 ttl=10min (HTTP 429)
+04:27:14 [Failover] step sonnet[2] (Qwen prepaid) walled — count=1 ttl=until 2026-11-11T16:00:00Z (HTTP 429)
+```
+
+Same shape at 01:05:12/13/15 and again at 04:37:16/17. Qwen's refusal is by
+construction (the dated closure), but **Kimi's 429 is a measured second wall,
+not a configured one** — so behind GLM there is no prepaid capacity left, and
+any reasoning of the form "GLM walls, the next two steps absorb" is wrong on
+this fleet. The PAYG landings follow precisely: `deepseek-flash` 544 responses
+since the recreate, in h01 (247, before GLM recovered at 01:12) and h04 (297,
+after it re-walled at 04:27) — **zero** in h02–h03 while GLM served.
+
+Two corroborations worth keeping:
+
+- **A scheduled upstream outage is visible as a 502 burst, not a connect
+  error.** ai-01's backup window took swift down 02:00→02:50:54Z; the hub
+  logged `step haiku[0] … failed (non-quota) … (HTTP 502 … body=api_error)`
+  from 02:01:26 to 02:50:43, five marks, ttl escalating 30 s → 2 min → 5 min,
+  and the engine's boot line lands 11 s after the last mark. An announced
+  window and the log agree to the minute.
+- **MiniMax never served since the recreate.** Across 6 306 `[resp]` lines,
+  `MiniMax-M3.1` appears **zero** times, while the console (live this time)
+  read weekly **100 % used, resets in 19 h 20 min** ≈ 2026-11-02T00:00Z. The
+  hub-side zero and the console agree — which is the point of quoting the
+  zero rather than a marker count.
+
+### The counter-read: when the first rung after a deploy IS a regression
+
+The rule above — the first rung after a deploy is the ladder booting — needs
+its negative, or it will swallow real failures. Three shapes measured on this
+fleet are **not** a boot:
+
+1. **Non-quota marks are a path failure, not a rung.** A boot re-arms *walls*:
+   markers that name a quota/plan wall, `step … walled … (HTTP 429)`. A
+   **non-quota** mark (`step … failed (non-quota) … body=api_error`) says the
+   step could not be reached or served. Measured 01/11: swift's 502 burst
+   02:01:26→02:50:43 — five marks, ttl climbing 30 s → 2 min → 5 min, **zero
+   responses for 49 minutes** — was the announced engine backup, a real
+   outage, not a ladder boot.
+2. **The concrete never serves.** A boot *ends* in service: GLM recovered at
+   01:12:18 and served 1 060 `[resp]` in the same hour. If the hour after a
+   deploy shows the role's nominal concrete at **zero** `[resp]` while its
+   cascade steps serve, the deploy broke the nominal path — read the landing,
+   not the intent.
+3. **The armed list differs by value.** `configured=N armed=[…]` is the boot
+   line; diff it against the pre-deploy line **by value** (never by name).
+   Four arms in, four arms out, identical targets. Anything else is a config
+   regression wearing a boot's clothing.
+
+And a timing bound: a boot is over in ~40 minutes (arm cycles at 10 min then
+20 min). Marks still escalating two hours later with no `RECOVERED` and no
+`[resp]` are either a standing wall (expected — MiniMax until its reset) or an
+outage; "boot" stops being an explanation after the second disarm.
+
+### MiniMax re-entry: what the ladder does when the weekly reset lands (2026-11-02)
+
+The weekly reset is expected **~2026-11-02T00:00Z**. Console liveness was
+proven first (two passes 4 h 58 min apart on 01/11, countdown advanced
+4 h 59 min: "resets in 19 h 20 min" → "14 h 21 min", weekly 100 % used
+throughout — an identical countdown at two passes is the frozen signature).
+Procedure, hub-side, no console required:
+
+1. **The disarm.** The wall TTL ladder had climbed to 240 min (count=4 at
+   02:50:44Z on 01/11); after the reset the next probe returns non-429, so
+   expect `DISARMED bucket minimax-coding → probing nominals` **without** a
+   re-ARM in the following TTL window.
+2. **The recovery line.** Expect `RECOVERED … (minimax-coding) → nominal` —
+   the shape of the 01:12:18Z sonnet recovery — plus dwell pins yielding
+   (`DWELL haiku session … yielded`).
+3. **The proof.** The first `[resp] … model=MiniMax-M3.1` line after 00:00Z.
+   The number to quote, by the zero rule above, is served responses per hour,
+   cross-checked against the wall-marker count, which should fall back to the
+   probe rate (1–3/h).
+4. **The sidecar corollary.** Sidecar cascades carrying
+   `mmc@MiniMax-M3.1-Flash` as a sonnet step un-wall on their own probes;
+   their reading lives in their own journals, not the hub's.
+
+If the wall re-arms past 00:00Z + one TTL with the console still reading
+weekly 100 %, the reset has not landed — the live countdown is the arbiter.
+
+## The estimator: bytes / 3.5
+
+`JSON.stringify(body).length / 3.5` — deliberately NOT the `/4`
+count_tokens convention (undercounts 12-14% on these bodies — exactly #565's
+blind spot) and NOT the media-aware clamp estimator (base64 media DOES
+consume engine KV; deflating it would understate the load the budget bounds).
+Measured twice: 914,723 B / 262,145 real tokens = **3.49** (reqN=931, hub
+capture vs engine `input_tokens`); ai-01:vllm's independent measure ≈ 3.5.
+
+## AC5 — a resubmission is not new demand (arbitrated 24/10)
+
+The registry keys each lease by (machine, session, FNV-1a body signature). An
+identical resubmission while its predecessor is in flight **REPLACES** the
+predecessor's estimate instead of adding a second one — the measured echo rate
+is ~56%, and a budget counting its own echo would trip on itself and divert a
+lane that has room. The replacement is applied inside the evaluation (an echo
+can never trip a budget its predecessor fits under) but durably registered
+only on `commit()`; a superseded lease's late release is a no-op. `resubmit=k`
+(k ≥ 2) rides the marker line (AC5b) so the echo rate is readable hub-side.
+**Coalescing and routing a resubmission to the next step are deliberately out
+of scope** — both change what the client receives; follow-up issue if AC5b
+shows the echo rate holding after AC1-4 land.
+
+## Lease lifetime
+
+The lease is released when the response's **bytes** stop flowing (end, cancel,
+or stream error — `withBudgetRelease`, an explicit reader pump because
+`pipeThrough(TransformStream)` flush does not fire on consumer cancel). A
+bodyless response releases immediately. A lease older than **15 min** is
+dropped at the next admission (lazy sweep, `[EndpointBudget]` stale-drop
+marker) — the guard for a body never read nor cancelled, which would
+otherwise starve the lane forever.
+
+## Pins and mutation proofs
+
+Unit: `endpoint-token-budget.test.ts` (17 pins — knobs, estimator incl. the
+914,723 B anchor, Σ/big refusal shapes, AC4 short-pass, AC5 replace + AC5b
+copy counter, stale sweep, release semantics incl. the #663 r1 never-hang pin:
+an upstream stream error releases the lease AND closes the wrapper — the
+client's reader completes, never throws). Route: `proxy-server-step-skip-route.test.ts`
+B1-B7 (zero upstream calls on the budgeted endpoint, no bench after a budget
+skip, real in-flight Σ via a holder, big-cap short-pass, echo replacement,
+nominal walk, and the #663 r1 walk-skip: a walk whose first servable step is
+a budgeted endpoint at full Σ → zero calls to it, successor serves).
+Mutations: `/3.5` → `/4` kills 8 unit pins; replacement
+disabled kills both AC5 pins; refusals-never-divert kills B1/B3/B4/B6/B7 and
+leaves B2 (inert) + B5 (replace) green; `controller.error` restored in
+`withBudgetRelease`'s catch kills the never-hang pin.
+
+## Where a wall actually comes from
+
+A status code never names the window that produced it: the same `429` is a
+5-hour quota, a 7-day window, a monthly budget or a per-second rate limit — and
+each has a different remedy and a different reset anchor. The providers' own
+consoles, the reading recipe and the baseline ledger live in
+[`subscription-consoles.md`](subscription-consoles.md)
+(`python scripts/console-tabs.py list`).

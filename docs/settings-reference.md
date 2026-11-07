@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Claudish is a proxy tool that wraps Claude Code with support for non-Anthropic AI providers. It intercepts Claude Code's API calls and reroutes them to providers like OpenRouter, Google Gemini, OpenAI, MiniMax, Kimi, GLM, and local models (Ollama, LM Studio, vLLM, MLX). Configuration is layered: CLI flags override environment variables, which override profile settings from config files. The routing syntax uses `provider@model[:concurrency]` (v4.0+, preferred) or the legacy `prefix/model` format (still supported, deprecated). Auto-routing selects a provider automatically based on available credentials. The priority chain is configurable via `defaultProvider` (v7.0.0+). The default chain (when no `defaultProvider` is set and only `OPENROUTER_API_KEY` is present) is: OpenCode Zen → provider subscription plan → native API → OpenRouter fallback. When `LITELLM_BASE_URL` + `LITELLM_API_KEY` are set without explicit `defaultProvider`, legacy auto-promotion puts LiteLLM first. Configuration files live at `~/.claudish/config.json` (global) and `.claudish.json` (local/project); local always takes precedence.
+Claudish is a proxy tool that wraps Claude Code with support for non-Anthropic AI providers. It intercepts Claude Code's API calls and reroutes them to providers like OpenRouter, Google Gemini, OpenAI, MiniMax, Kimi, GLM, and local models (Ollama, LM Studio, vLLM, MLX). Configuration is layered: CLI flags override environment variables, which override profile settings from config files. The routing syntax uses `provider@model[:concurrency]` (v4.0+, preferred) or the legacy `prefix/model` format (still supported, deprecated). Auto-routing selects a provider automatically based on available credentials. The priority chain is configurable via `defaultProvider` (v7.0.0+). The default chain (when no `defaultProvider` is set and only `OPENROUTER_API_KEY` is present) is: OpenCode Zen → provider subscription plan → native API → OpenRouter fallback. LiteLLM is never promoted into that chain automatically — it must be named through `defaultProvider` (see §6.3). Configuration files live at `~/.claudish/config.json` (global) and `.claudish.json` (local/project); local always takes precedence.
 
 ---
 
@@ -21,20 +21,18 @@ All flags recognized by `parseArgs()` in `packages/cli/src/cli.ts`.
 |------|-------|------|---------|-------------|
 | `--model` | `-m` | string | none (prompts interactively) | Model to use. Accepts `provider@model` syntax, legacy `prefix/model`, or bare model name for auto-detection |
 | `--default-provider` | | string | none | Default provider for auto-routing (v7.0.0+). Overrides env var and config file. Valid: built-in provider names or custom endpoint names |
-| `--config` | | path | none | Use this file as the run's ONLY config, replacing both the global and project config. Consumed before `parseArgs()` — see [Config File Override](#44-config-file-override---config) |
-| `--accept-served-model` | | boolean | false | Allow a reasoning-off that the connection serves with a DIFFERENT model (catalog `served_model_changes`; e.g. Kimi Code `k3`: thinking off is served by K2.8 Preview). Without it reasoning stays on and the log says why. Env: `CLAUDISH_ACCEPT_SERVED_MODEL=1` (v10.5.0+) |
 | `--model-opus` | | string | none | Model for Opus role (planning, complex tasks) |
 | `--model-sonnet` | | string | none | Model for Sonnet role (default coding) |
 | `--model-haiku` | | string | none | Model for Haiku role (fast tasks, background) |
+| `--model-fable` | | string | none | Model for Fable role (version-independent family mapping) |
 | `--model-subagent` | | string | none | Model for sub-agents (Task tool) |
-| `--classifier-provider` | | string | none (off) | Set to `anthropic` to route Claude Code's auto-mode permission classifier to native Anthropic while the main loop runs on another provider. See [Classifier Passthrough](models/model-mapping.md#auto-mode-classifier-passthrough) |
-| `--classifier-model` | | string | `claude-sonnet-5` | Native Claude model the classifier request is rewritten onto. Setting it also enables classifier passthrough |
+| `--model-freshness` | | action | | Check configured Fable/Astra pins via catalog metadata; no inference or mutation |
 | `--port` | | number | random (3000–9000) | Proxy server port |
 | `--auto-approve` | `-y` | boolean | false | Skip permission prompts (passes `--dangerously-skip-permissions` to Claude Code) |
 | `--no-auto-approve` | | boolean | | Explicitly enable permission prompts (overrides -y) |
 | `--dangerous` | | boolean | false | Pass `--dangerouslyDisableSandbox` to Claude Code |
 | `--interactive` | `-i` | boolean | auto | Interactive mode (default when no prompt argument given) |
-| `--debug-claudish` | `-d` | boolean | false | Enable debug logging to `logs/claudish_*.log`; also sets `--log-level debug` unless overridden |
+| `--debug` | `-d` | boolean | false | Enable debug logging to `logs/claudish_*.log`; also sets `--log-level debug` unless overridden |
 | `--log-level` | | string | `"info"` | Log verbosity: `debug` (full content), `info` (truncated content), `minimal` (labels only) |
 | `--quiet` | `-q` | boolean | auto | Suppress `[claudish]` log messages (default in single-shot mode) |
 | `--verbose` | `-v` | boolean | auto | Show `[claudish]` messages (default in interactive mode) |
@@ -42,19 +40,20 @@ All flags recognized by `parseArgs()` in `packages/cli/src/cli.ts`.
 | `--monitor` | | boolean | false | Proxy to real Anthropic API and log all traffic (uses Claude Code's native auth) |
 | `--stdin` | | boolean | false | Read prompt from stdin instead of positional arguments |
 | `--free` | | boolean | false | Show only free models in interactive model selector |
-| `--profile` | | string | default profile | Named profile for model mapping |
-| `--cost-track` | | boolean | false | Enable cost tracking; also enables monitor mode |
-| `--cost-audit` | | action | | Show cost analysis report and exit |
-| `--cost-reset` | | action | | Reset accumulated cost statistics and exit |
-| `--models` | `-s` / `--models-search` | action | | List ALL models (from OpenRouter + LiteLLM + local Ollama) or fuzzy-search by query |
-| `--models-top` | | action | | List curated recommended models and exit |
-| `--models-refresh` | | boolean | false | Force refresh of model catalog cache (used with `--models` or `--models-top`) |
+| `--profile` | `-p` | string | default profile | Named profile for model mapping |
+| `--cost-tracker` | | boolean | false | Enable cost tracking; also enables monitor mode |
+| `--audit-costs` | | action | | Show cost analysis report and exit |
+| `--reset-costs` | | action | | Reset accumulated cost statistics and exit |
+| `--models` / `--list-models` | `-s` / `--search` | action | | List ALL models (from OpenRouter + LiteLLM + local Ollama) or fuzzy-search by query |
+| `--top-models` | | action | | List curated recommended models and exit |
+| `--force-update` | | boolean | false | Force refresh of model catalog cache (used with `--models` or `--top-models`) |
 | `--summarize-tools` | | boolean | false | Summarize tool descriptions to reduce prompt size for local/small models |
 | `--version` | | action | | Show version and exit |
 | `--help` | `-h` | action | | Show help message and exit |
 | `--help-ai` | | action | | Show AI agent usage guide (from `AI_AGENT_GUIDE.md`) and exit |
 | `--init` | | action | | Install Claudish skill in `.claude/skills/claudish-usage/SKILL.md` |
 | `--mcp` | | action | | Run as MCP server |
+| `--gemini-login` | | action | | Login to Gemini Code Assist via OAuth |
 | `--gemini-logout` | | action | | Clear Gemini OAuth credentials |
 | `--kimi-login` | | action | | Login to Kimi/Moonshot AI via OAuth |
 | `--kimi-logout` | | action | | Clear Kimi OAuth credentials |
@@ -68,7 +67,7 @@ All flags recognized by `parseArgs()` in `packages/cli/src/cli.ts`.
 
 **`--json` implies `--quiet`**: When `--json` is set, `config.quiet` is forced to `true` regardless of other flags.
 
-**`--cost-track` enables monitor mode**: Setting `--cost-track` automatically sets `config.monitor = true` if it is not already set.
+**`--cost-tracker` enables monitor mode**: Setting `--cost-tracker` automatically sets `config.monitor = true` if it is not already set.
 
 ---
 
@@ -90,53 +89,6 @@ These are top-level subcommands recognized before flag parsing begins (checked i
 | `claudish telemetry off` | Disable telemetry |
 | `claudish telemetry status` | Show current telemetry consent and configuration |
 | `claudish telemetry reset` | Reset telemetry consent to unasked state |
-| `claudish keychain status` | macOS Keychain backend state and how many keys are stored |
-| `claudish keychain list` | Stored variables, with `••••1234` identification tails (never full values) |
-| `claudish keychain import [opts]` | Copy keys from environment variables and/or 1Password into the Keychain |
-| `claudish keychain set <ENV_VAR>` | Store one key — prompted, or piped on stdin; never passed in argv |
-| `claudish keychain rm <ENV_VAR>` | Remove one key from the Keychain |
-| `claudish keychain enable\|disable` | Turn the backend on/off. Moves no secrets; stored items are left untouched |
-| `claudish hooks list [--json]` | Every hook, built-in and user, in the order their actions apply, with severity, scope and load errors |
-| `claudish hooks check <file> [--json]` | Load one hook module on its own and validate it; exit 1 when invalid |
-| `claudish hooks init [dir]` | Write `example-hook.ts` and `claudish-hooks.d.ts` into `dir` (default `~/.claudish/hooks`); never overwrites |
-| `claudish hooks corpus [--write] [--json]` | Replay recorded transcripts offline and count plan-mode divergences per model |
-| `claudish hooks telemetry [--enable\|--disable]` | Show or set `hooks.telemetry.enabled` |
-| `claudish subscription models antigravity --raw --json` | Print the account's raw Antigravity `fetchAvailableModels` response text as one JSON line (schema `claudish.subscription-model-list.v1`), for the models-index wire-probe runner. macOS only; never prompts. Every exit prints exactly one line: exit 0 on any answer from the backend, 3–7 per failure class, 2 on a usage error, 1 on an internal error. Contract: `ai-docs/architecture/providers/antigravity.md` § Raw model list for models-index |
-
-**macOS Keychain (macOS only).** Keys are stored as one generic-password item per environment
-variable under the service name `claudish`, so each is individually visible and deletable in
-Keychain Access.app. The Keychain is consulted **after** `config.json` and **before** 1Password —
-it is local and needs no desktop-app handshake, but an explicit environment variable or a
-config-stored key still wins.
-
-`claudish keychain import` options:
-
-| Option | Meaning |
-|---|---|
-| `--from env\|1password\|all` | Which source to copy from (default `all`) |
-| `--only VAR,VAR` | Restrict to these variables |
-| `--dry-run` | Print the plan and stop; writes nothing |
-| `--yes` | Skip the confirmation prompt |
-
-Import prints a plan marking each key `new` / `overwrite` / `unchanged` and asks before writing,
-because an overwritten Keychain value cannot be recovered. Environment variables are collected
-first and 1Password fills only the gaps, matching runtime precedence.
-
-The config TUI's **Providers** tab writes to the Keychain by default on macOS: `s` stores a key
-there (the input box names the destination), and `x` removes the key from both the Keychain and
-`config.json`.
-
-The config TUI's **1Password** tab can copy secrets across without leaving the interface:
-
-| Key | Action |
-|---|---|
-| `c` | Copy the selected entry into the Keychain — a key becomes one item, a set or an environment becomes one item per variable |
-| `C` | Copy **every** 1Password entry into the Keychain (the equivalent of `claudish keychain import --from 1password`) |
-
-Both **overwrite** an existing Keychain item without a confirmation prompt. That is deliberate:
-1Password still holds every value, so a replaced item is a refresh rather than a loss. The status
-line reports exactly what happened — `3 new · 1 replaced` — and names any variable that could not
-be stored.
 
 **Scope flags for profile commands**:
 - `--local`: Target `.claudish.json` in the current working directory
@@ -147,17 +99,7 @@ be stored.
 
 ## 3. Environment Variables
 
-Claudish loads `.env` from the current working directory at startup, the way dotenv does: a variable already set in your environment is never overwritten, and no `$` expansion is applied. It reads that one file. `.env.local`, `.env.<NODE_ENV>` and `.env.<NODE_ENV>.local` are not read: claudish starts Bun with `--no-env-file`, so Bun's own env-file loading is off.
-
-A `.env` may set **only provider API keys and claudish model settings**:
-
-- each provider's key variable and its aliases (§3.3, plus the bundled endpoints' vendor keys), and every `CUSTOM_<NAME>_KEY` (§7.5). This list is taken from claudish's provider definitions, so a new provider's key is covered when it ships;
-- `ANTHROPIC_API_KEY` and `VERTEX_LOCATION`;
-- `CLAUDISH_MODEL`, `CLAUDISH_MODEL_OPUS`, `CLAUDISH_MODEL_SONNET`, `CLAUDISH_MODEL_HAIKU` and `CLAUDISH_MODEL_SUBAGENT`.
-
-Every other variable in the file is ignored, with one stderr line naming them (names only, never values); set those in your shell or an MCP server's `env`. That includes every `*_BASE_URL`, `OLLAMA_HOST`, `CLAUDISH_PORT` and `CLAUDISH_RECOVERY`, and a custom endpoint key named anything but `CUSTOM_<NAME>_KEY` (an `apiKey` of `"${MY_CUSTOM_API_KEY}"` reads it from your shell). The working directory is often a checkout you have not reviewed, and several variables choose what code runs or where your data goes: `CLAUDE_PATH` names the Claude Code executable claudish starts, `BUN_OPTIONS` and `NODE_OPTIONS` load a module into every child, a base URL or host would send your existing key to whatever server it names, and `GOOGLE_APPLICATION_CREDENTIALS` points gcloud at a credentials file (an `external_account` JSON can name a local file and a `token_url` gcloud uploads it to), so it is shell-only like the base URLs.
-
-The **control variables** steer claudish itself: `CLAUDISH_CONFIG`, `CLAUDISH_PANE_CHILD`, `CLAUDISH_PANE_ENV`, `CLAUDISH_PANE_CWD`, `CLAUDISH_HOOK_INBOX`, `CLAUDISH_HOOK_SESSION` and `CLAUDISH_BIN`. They count only from your shell, an MCP server's `env`, or the parent claudish that started the process. If Bun was started without `--no-env-file` (a hand-typed `bun <path>/index.js`, or `bun <path>/claudish.cjs`), claudish cannot tell a file's value from yours: it drops every control variable and every name that directory's env files set, then reads the provider API keys and model settings in `.env` as usual, with one stderr line (see [Config File Override](#44-config-file-override---config)).
+Claudish automatically loads `.env` from the current working directory at startup using dotenv. All variables below can be set in `.env`.
 
 ### 3.1 Claudish-Specific Variables
 
@@ -170,12 +112,9 @@ The **control variables** steer claudish itself: `CLAUDISH_CONFIG`, `CLAUDISH_PA
 | `CLAUDISH_MODEL_OPUS` | Override model for Opus role | none |
 | `CLAUDISH_MODEL_SONNET` | Override model for Sonnet role | none |
 | `CLAUDISH_MODEL_HAIKU` | Override model for Haiku role | none |
+| `CLAUDISH_MODEL_FABLE` | Override model for Fable role | none |
 | `CLAUDISH_MODEL_SUBAGENT` | Override model for sub-agents | none |
-| `CLAUDISH_CLASSIFIER_PROVIDER` | Set to `anthropic` to route the auto-mode permission classifier to native Anthropic (default off). See [Classifier Passthrough](models/model-mapping.md#auto-mode-classifier-passthrough) | none (off) |
-| `CLAUDISH_CLASSIFIER_MODEL` | Native Claude model the classifier request is rewritten onto; setting it also enables classifier passthrough | `claude-sonnet-5` |
-| `CLAUDISH_CLASSIFIER_DEBUG` | Set to `1` to append each incoming request's model/params/system/headers to `logs/classifier-capture.jsonl` for classifier-detection debugging | none (off) |
 | `CLAUDISH_SUMMARIZE_TOOLS` | Summarize tool descriptions (`true` or `1` to enable) | false |
-| `CLAUDISH_KEYCHAIN_FILE` | Point every macOS Keychain operation at a specific keychain FILE instead of your login keychain. Intended for testing — create one with `security create-keychain` (it is not added to the search list, so nothing else on the machine is affected) | none (login keychain) |
 | `CLAUDISH_TELEMETRY` | Override telemetry (`0`, `false`, or `off` to disable) | from config |
 | `CLAUDISH_ACTIVE_MODEL_NAME` | (Internal) Set by Claudish to display model name in status line | auto |
 | `CLAUDISH_IS_LOCAL` | (Internal) Set to `"true"` for local models; used by status line to show "LOCAL" instead of cost | auto |
@@ -192,10 +131,15 @@ The **control variables** steer claudish itself: `CLAUDISH_CONFIG`, `CLAUDISH_PA
 | `ANTHROPIC_DEFAULT_OPUS_MODEL` | Claude Code opus model var | `CLAUDISH_MODEL_OPUS` (lower priority) |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL` | Claude Code sonnet model var | `CLAUDISH_MODEL_SONNET` (lower priority) |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Claude Code haiku model var | `CLAUDISH_MODEL_HAIKU` (lower priority) |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | Claude Code fable model var | `CLAUDISH_MODEL_FABLE` (lower priority) |
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Claude Code subagent model var | `CLAUDISH_MODEL_SUBAGENT` (lower priority) |
-| `ANTHROPIC_API_KEY` | Placeholder to suppress Claude Code API key dialog | (placeholder set by Claudish) |
-| `ANTHROPIC_AUTH_TOKEN` | Placeholder to suppress Claude Code login screen | (placeholder set by Claudish) |
+| `ANTHROPIC_API_KEY` | Non-secret onboarding placeholder in proxy-only mode | (placeholder set by Claudish) |
+| `ANTHROPIC_AUTH_TOKEN` | Non-secret onboarding placeholder in proxy-only mode | (placeholder set by Claudish) |
 | `CLAUDE_PATH` | Custom path to Claude Code binary | `~/.claude/local/claude`, then global `PATH` |
+
+The two placeholder values only satisfy Claude Code's local API/login checks. They do **not** authenticate an upstream provider or the Claudish hub. Hub access is authenticated separately, commonly through `x-proxy-key` in `ANTHROPIC_CUSTOM_HEADERS`; provider credentials remain on the Claudish host.
+
+Claudish applies the placeholders together with `forceLoginMethod: "console"` only when every configured role is proxied to a non-native provider. Monitor mode and any configuration containing a `native-anthropic` mapping preserve the user's Claude/Anthropic authentication instead. An OS-managed policy forcing `forceLoginMethod: "claudeai"` cannot be overridden by a temporary `--settings` file and blocks proxy-only onboarding until an administrator permits Console/API authentication.
 
 **Priority for model selection (highest to lowest)**:
 1. CLI flag (`--model`, `--model-opus`, etc.)
@@ -211,62 +155,29 @@ The **control variables** steer claudish itself: `CLAUDISH_CONFIG`, `CLAUDISH_PA
 | `OPENROUTER_API_KEY` | OpenRouter (default backend / universal fallback) | | https://openrouter.ai/keys |
 | `GEMINI_API_KEY` | Google Gemini direct API (`g@`, `google@`) | | https://aistudio.google.com/app/apikey |
 | `OPENAI_API_KEY` | OpenAI direct API (`oai@`) | | https://platform.openai.com/api-keys |
-| `MINIMAX_API_KEY` | MiniMax (`mm@`, `mmax@`) | | https://platform.minimax.io/user-center/basic-information/interface-key (China platform: https://www.minimaxi.com/, and set `MINIMAX_BASE_URL`) |
+| `MINIMAX_API_KEY` | MiniMax (`mm@`, `mmax@`) | | https://www.minimaxi.com/ |
 | `MINIMAX_CODING_API_KEY` | MiniMax Coding Plan (`mmc@`) | | https://platform.minimax.io/ |
 | `MOONSHOT_API_KEY` | Kimi/Moonshot (`kimi@`, `moon@`) | `KIMI_API_KEY` | https://platform.moonshot.cn/ |
-| `KIMI_CODING_API_KEY` | Kimi Coding Plan (`kc@`); also accepts OAuth via `claudish --kimi-login` | | https://www.kimi.com/code |
+| `KIMI_CODING_API_KEY` | Kimi Coding Plan (`kc@`); also accepts OAuth via `claudish --kimi-login` | | https://kimi.com/code |
 | `ZHIPU_API_KEY` | GLM/Zhipu direct API (`glm@`, `zhipu@`) | `GLM_API_KEY` | https://open.bigmodel.cn/ |
 | `GLM_CODING_API_KEY` | GLM Coding Plan at Z.AI (`gc@`) | `ZAI_CODING_API_KEY` | https://z.ai/subscribe |
-| `ZAI_API_KEY` | Z.AI Anthropic-compatible API (`zai@`) | | https://z.ai/manage-apikey/apikey-list |
-| `SAKANA_API_KEY` | Sakana Fugu API / token plan (`sakana@`, `fugu@`) | | https://console.sakana.ai/get-started |
-| `SAKANA_CODING_API_KEY` | Sakana Fugu Subscription (`sc@`) | `SAKANA_API_KEY` | https://console.sakana.ai/get-started |
-| `QWEN_TOKEN_PLAN_API_KEY` | Alibaba Token Plan (`qtoken@`) — Model Studio subscription, metered in Credits | _(none by design — see the note below)_ | https://docs.qwencloud.com/token-plan/overview |
-| `QWEN_CODING_PLAN_API_KEY` | Alibaba Coding Plan (`qcode@`) — Model Studio subscription, metered in requests | _(none by design — see the note below)_ | https://www.alibabacloud.com/help/en/model-studio/coding-plan |
-| `META_API_KEY` | Meta Model API, metered (`meta@`). Never signs the `muse@` subscription, which uses `claudish login muse` or the Muse Code CLI's Keychain login | | https://dev.meta.ai |
-| `DASHSCOPE_API_KEY` | Alibaba PAYG (`qpay@`) — Model Studio pay-as-you-go, billed per token | _(none by design — see the note below)_ | https://www.alibabacloud.com/help/en/model-studio/get-api-key |
-| `OLLAMA_API_KEY` | OllamaCloud hosted API (`oc@`, `llama@`, `lc@`) | | https://ollama.com/settings/keys |
-| `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) — **required** | | https://opencode.ai/console (Settings > Service accounts) |
-| `OPENCODE_GO_API_KEY` | OpenCode Zen Go plan (`zgo@`, `zengo@`) — **required** | | https://opencode.ai/console (Settings > Service accounts) |
+| `ZAI_API_KEY` | Z.AI Anthropic-compatible API (`zai@`) | | https://z.ai/ |
+| `OLLAMA_API_KEY` | OllamaCloud hosted API (`oc@`, `llama@`, `lc@`, `meta@`) | | https://ollama.com/account |
+| `OPENCODE_API_KEY` | OpenCode Zen (`zen@`); optional for free models (falls back to `"public"` bearer) | | https://opencode.ai/ |
 | `XAI_API_KEY` | xAI / Grok (direct API, detected in model selector) | | https://x.ai/ |
 | `LITELLM_API_KEY` | LiteLLM proxy (`ll@`, `litellm@`) | | https://docs.litellm.ai/ |
 | `POE_API_KEY` | Poe (`poe@`) | | https://poe.com/ |
-| `VERTEX_PROJECT` | Vertex AI (`v@`, `vertex@`) — GCP project ID; optional, see the note below | `GOOGLE_CLOUD_PROJECT` | GCP Console |
+| `VERTEX_API_KEY` | Vertex AI Express mode (`v@`, `vertex@`) | | https://console.cloud.google.com/vertex-ai |
+| `VERTEX_PROJECT` | Vertex AI OAuth mode — GCP project ID | `GOOGLE_CLOUD_PROJECT` | GCP Console |
 | `VERTEX_LOCATION` | Vertex AI region | `us-central1` | |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCP service account JSON file (Vertex OAuth) | | GCP Console |
-| `GOOGLE_CLOUD_PROJECT` | GCP project ID (Vertex AI) | `GOOGLE_CLOUD_PROJECT_ID` | |
+| `GOOGLE_CLOUD_PROJECT` | GCP project ID (also used by Gemini Code Assist OAuth) | `GOOGLE_CLOUD_PROJECT_ID` | |
 
-**Note on Vertex AI (changed 2026-09-21)**: Vertex has ONE authentication mode — OAuth over a Google Cloud project, using Application Default Credentials (`gcloud auth application-default login`) or a service account (`GOOGLE_APPLICATION_CREDENTIALS`). It reaches every Vertex model, partner models (Anthropic Claude, Mistral, etc.) included.
+**Note on Vertex AI**: Vertex supports two authentication modes:
+- Express mode (`VERTEX_API_KEY`): Uses the Gemini API endpoint; supports Gemini models only.
+- OAuth mode (`VERTEX_PROJECT` + Application Default Credentials via `gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`): Supports all Vertex models including partner models (Anthropic Claude, Mistral, etc.).
 
-The Express API-key mode (`VERTEX_API_KEY`) is **removed**, not deprecated: the variable is no longer read anywhere. Express served Gemini models from the plain Gemini API endpoint, which `GEMINI_API_KEY` and `g@` already do.
-
-You do not have to set `VERTEX_PROJECT`. Claudish resolves the project in this order, and stops at the first answer:
-
-1. `VERTEX_PROJECT`, then `GOOGLE_CLOUD_PROJECT`
-2. `quota_project_id` in `~/.config/gcloud/application_default_credentials.json`
-3. `gcloud config get project`
-
-If none of them answers, the error says so and names both remedies (`VERTEX_PROJECT=…` or `gcloud config set project …`). The project is resolved once per process and never written to disk, so `gcloud config set project` takes effect on the next run. `VERTEX_LOCATION` defaults to `us-central1`.
-
-**Note on OpenCode Zen (changed 2026-08-22)**: `OPENCODE_API_KEY` is now **required** for every model on the zen endpoint. Claudish previously sent `"Bearer public"` when no key was set, on the basis that free-tier models (cost.input === 0) needed no credential. The endpoint answers `401 — Missing API key` to that token, and because the fallback also made the provider report **Ready** without ever issuing a request, the failure only surfaced under a live test. The fallback has been removed; a Zen row with no key now correctly reads "not set".
-
-**Note on OpenCode Zen Go (changed 2026-09-02)**: `zgo@` used to accept `OPENCODE_API_KEY` as an alias, on the documented claim that a key minted for one OpenCode tier is refused by the other with a `401`. That claim was measured and is false — a Zen Go key is accepted by the plain Zen endpoint (`200`), against a bogus-key control that endpoint answers `401`. The alias is removed: `zgo@` requires `OPENCODE_GO_API_KEY`. The reason is billing, not access — `opencode-zen-go` is classified as a flat-rate plan, so a metered Zen key reaching it would have been reported as `SUB` at `$0` while OpenCode billed per token. If you previously ran `zgo@` on `OPENCODE_API_KEY`, set `OPENCODE_GO_API_KEY` to the key your Lite Plan subscription minted.
-
-**Note on Alibaba Model Studio — four products, three isolated silos.** Model Studio (also fronted by the QwenCloud console; same service, two consoles) sells four things whose keys and base URLs are, in Alibaba's own words, "completely isolated and must be used in matching pairs". Every silo answers every other silo's key with a near-identical 401, so picking the wrong key is both easy and hard to diagnose. Each silo has its own provider and its own variable, so you can hold all three keys at the same time:
-
-| Product | Billing unit | Prefix | Key | Host |
-|---------|--------------|--------|-----|------|
-| **Coding Plan** | Subscription metered in **requests** — 6,000 per 5h, 45,000 per week, 90,000 per month ($50/month in Alibaba's published pricing as of 2026-09-17) | `qcode@` | `QWEN_CODING_PLAN_API_KEY` | `coding-intl.dashscope.aliyuncs.com` |
-| **Token Plan — Individual** | Subscription metered in **Credits** | `qtoken@` | `QWEN_TOKEN_PLAN_API_KEY` | `token-plan.ap-southeast-1.maas.aliyuncs.com` |
-| **Token Plan — Team** | Subscription metered in **Credits**, one key per seat | `qtoken@` | `QWEN_TOKEN_PLAN_API_KEY` | `token-plan.ap-southeast-1.maas.aliyuncs.com` |
-| **Credit Packs** | Extra Credits with a limited validity window | n/a — a top-up on Token Plan Credits | — | — |
-| **Pay-as-you-go** | Metered **per token** | `qpay@` | `DASHSCOPE_API_KEY` | `dashscope-intl.aliyuncs.com` |
-
-- **One product, one variable, one prefix.** Each Alibaba product is named by the variable that opens it and the prefix that selects it, and no product accepts a second spelling of either. A name that identifies a vendor (`QWEN_…`) or a category (`…CLOUD_PLAN…`) is true of more than one of these three products and therefore selects none of them, which is how a subscription key ends up signing a metered request.
-- **No key ever crosses a silo.** A Coding Plan key set as the Token Plan's variable is rejected by the Token Plan host, and the reverse holds too; `DASHSCOPE_API_KEY` is metered and must never stand in for either subscription, which would cross a plan with a per-token bill. Claudish names the sibling variables in its "no API key" and 401 messages precisely because they are the keys you are most likely to already have exported.
-- **The key format identifies nothing.** Alibaba documents `sk-sp-…` as the Coding Plan's format; a measured Token Plan key has the same prefix. Claudish never infers a product from a key's bytes, and neither should you.
-- **A bare Qwen name tries the Coding Plan first.** `qwen3.*` and `qwen3-*` names route Coding Plan → Token Plan → OpenCode Zen Go → PAYG → OpenRouter, each step only when its credential is present (see §5.3). The Coding Plan serves other vendors' namespaces (`glm-4.7`, `glm-5`, `kimi-k2.5`, `MiniMax-M2.5`) alongside both Qwen naming styles, and its model-list endpoint is public — it answers in full with no credential at all — so neither the name nor the list can establish that *your* key covers a model. Alibaba answers an id outside the plan with `400 Model not exist` (measured on the Token Plan and PAYG hosts), and claudish does not move on to the next candidate after that error. To pin one product, name it: `qcode@qwen3-coder-plus`, `qtoken@qwen3.7-plus`.
-- **Credit Packs need no configuration.** They change the Credits balance, never the route or the dynamic models catalog.
-- **Individual vs Team is not modelled.** A key's edition is not derivable from anything claudish can read, so nothing in claudish depends on it.
+**Note on OpenCode Zen**: Free-tier models (cost.input === 0) work without any API key; Claudish automatically uses `"Bearer public"`. Paid models on the zen endpoint require `OPENCODE_API_KEY`.
 
 ### 3.4 Custom Endpoints (Remote Providers)
 
@@ -274,17 +185,13 @@ If none of them answers, the error says so and names both remedies (`VERTEX_PROJ
 |----------|----------|---------|
 | `GEMINI_BASE_URL` | Google Gemini API | `https://generativelanguage.googleapis.com` |
 | `OPENAI_BASE_URL` | OpenAI API (also for Azure-compatible) | `https://api.openai.com` |
-| `MINIMAX_BASE_URL` | MiniMax API | `https://api.minimax.io`; set `https://api.minimaxi.com` for a China-platform key |
+| `MINIMAX_BASE_URL` | MiniMax API | `https://api.minimaxi.com` |
 | `MINIMAX_CODING_BASE_URL` | MiniMax Coding Plan endpoint | `https://api.minimax.io` |
 | `MOONSHOT_BASE_URL` | Kimi/Moonshot API | `https://api.moonshot.ai` |
 | `KIMI_BASE_URL` | Alias for `MOONSHOT_BASE_URL` | |
 | `ZHIPU_BASE_URL` | GLM/Zhipu API | `https://open.bigmodel.cn` |
 | `GLM_BASE_URL` | Alias for `ZHIPU_BASE_URL` | |
 | `ZAI_BASE_URL` | Z.AI API | `https://api.z.ai` |
-| `QWEN_TOKEN_PLAN_BASE_URL` | Alibaba Token Plan endpoint | `https://token-plan.ap-southeast-1.maas.aliyuncs.com` |
-| `QWEN_CODING_PLAN_BASE_URL` | Alibaba Coding Plan endpoint | `https://coding-intl.dashscope.aliyuncs.com` |
-| `DASHSCOPE_BASE_URL` | Alibaba PAYG endpoint; repoint here for a mainland-China account | `https://dashscope-intl.aliyuncs.com` |
-| `META_BASE_URL` | Meta Model API (`meta@`) | `https://api.meta.ai` |
 | `OLLAMACLOUD_BASE_URL` | OllamaCloud hosted API | `https://ollama.com` |
 | `OPENCODE_BASE_URL` | OpenCode Zen API (base; `/v1/chat/completions` appended) | `https://opencode.ai/zen` |
 | `LITELLM_BASE_URL` | LiteLLM proxy server URL (**required** to enable LiteLLM routing) | none |
@@ -305,6 +212,8 @@ If none of them answers, the error says so and names both remedies (`VERTEX_PROJ
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
+| `GEMINI_CLIENT_ID` | Custom OAuth client ID for Gemini Code Assist | built-in (from Claudish installation) |
+| `GEMINI_CLIENT_SECRET` | Custom OAuth client secret for Gemini Code Assist | built-in (from Claudish installation) |
 
 These are only needed if you want to use your own Google Cloud OAuth application instead of Claudish's built-in credentials.
 
@@ -360,58 +269,16 @@ These are only needed if you want to use your own Google Cloud OAuth application
 - **`defaultProfile`**: Name of the profile to use when `--profile` is not specified.
 - **`defaultProvider`** (v7.0.0+): Default provider for auto-routing. Accepts built-in provider names (`"openrouter"`, `"litellm"`, `"openai"`, `"anthropic"`, `"google"`) or a custom endpoint name. See Section 6.1 for precedence. Absent means use legacy auto-detection.
 - **`customEndpoints`** (v7.0.0+): Named map of custom endpoint definitions. See Section 7.5 for schema.
-- **`keychain`** (macOS): `{ "enabled": true }` turns on the macOS Keychain credential backend. It records only that the backend is in USE — the stored variable names are deliberately not mirrored here, because the Keychain enumerates its own contents and a second copy of that list is a second thing that can go stale. Set automatically on the first successful write; `claudish keychain disable` clears it without removing any stored item. When absent or `false`, claudish performs no Keychain I/O at all.
 - **`profiles`**: Map of profile name to profile object. Each profile has:
   - **`name`**: Profile identifier (matches the map key).
   - **`description`**: Optional human-readable description.
-  - **`models`**: Model mapping with optional keys `opus`, `sonnet`, `haiku`, `subagent`. Each value is a full model spec (e.g., `"google@gemini-3-pro"`). Absent keys mean no override for that role.
+  - **`models`**: Model mapping with optional keys `opus`, `sonnet`, `haiku`, `fable`, `subagent`. Each value is a full model spec (e.g., `"google@gemini-3-pro"`). Absent keys mean no override for that role.
   - **`createdAt`** / **`updatedAt`**: ISO 8601 timestamps (managed by Claudish).
 - **`telemetry`**: Consent state.
   - **`enabled`**: Whether telemetry is on. Default is `false` until user explicitly opts in.
   - **`askedAt`**: ISO 8601 timestamp of when the user was last prompted. Absent means never prompted.
   - **`promptedVersion`**: Claudish version string at time of prompting.
 - **`routing`**: Custom routing rules (see Section 7). Absent means use default auto-routing chain.
-- **`hooks`**: The hook system. Read from this file (or the `--config` override) only. Full guide:
-  [Hooks](advanced/hooks.md).
-
-  ```jsonc
-  "hooks": {
-    "modules": ["~/.claudish/hooks/verify-tests.ts"],   // absolute, "~/…", or relative to this file's directory
-    "severity": { "plan-mode/*": "warn", "hook:verify-tests/*": "fix" },
-    "injection": { "maxConsecutive": 3 },              // 1..20, default 3
-    "observer": { "enabled": false, "mode": "off" },    // mode: "off" | "suggest"
-    "telemetry": { "enabled": false }                   // upload consent; default off
-  }
-  ```
-
-  - **`modules`**: Hook modules (`.ts` or `.js`), loaded in order. A module that fails to load is
-    skipped with one stderr line; claudish always starts.
-  - **`severity`**: `"[modelGlob:]hookIdGlob"` → `"off"` | `"warn"` | `"fix"`. Model-scoped keys
-    beat unscoped keys; within each group an exact id beats a glob and a longer glob beats a shorter
-    one. User hook ids are `hook:<module file name>/<id>`.
-  - **`injection.maxConsecutive`**: The most hook-caused turns in a row in one session. A turn the
-    caller or a person starts resets the count.
-  - **`observer`**: The built-in `observer/divergence` hook: `enabled`, `mode`, `model`,
-    `timeoutMs`, `watchTools`.
-  - **`telemetry.enabled`**: Consent to upload behaviour telemetry. Separate from the top-level
-    `telemetry` consent. Local journaling (`~/.claudish/behavior-journal.jsonl`) is always on.
-
-  An invalid `hooks` block prints one `[claudish] hooks config:` line per problem and runs with
-  built-in hooks only.
-- **`behavior`** (removed): The earlier hook config block. claudish no longer reads it. When the
-  global config still has one, claudish prints once per process what each key moved to, and ignores
-  it otherwise:
-
-  ```
-  [claudish] the "behavior" config block is no longer read. Move it to "hooks":
-  [claudish]   behavior.rules → hooks.severity
-  ```
-
-  The moves are `behavior.rules` → `hooks.severity`; `behavior.hooks` → `hooks.modules` (each module
-  rewritten to `apiVersion: 1`); `behavior.observer` → `hooks.observer`; `behavior.telemetry` →
-  `hooks.telemetry` (consent is **not** carried over); `behavior.preset` → removed. The block stays
-  in the file, and saves keep it, until you delete it. `claudish hooks list` reports whether it is
-  still there.
 
 ### 4.2 `.claudish.json` (Local/Project Configuration)
 
@@ -422,9 +289,6 @@ Same schema as `~/.claudish/config.json`. Placed in the project root directory (
 - Default profile: local `defaultProfile` takes precedence if the local config exists and specifies one.
 - Custom routing rules: local `routing` key **entirely replaces** global routing rules (no merge).
 - Local config does not include `telemetry` (consent is global only).
-- A `hooks` key in `.claudish.json` is ignored, with one stderr line:
-  `[claudish] hooks in <path> ignored: hooks are read from the global config only`. A project file
-  is controlled by the repository, and claudish does not run code it names.
 
 **Note**: The default profile in the local config is looked up first in local profiles, then in global profiles. A local config can reference global profiles by name.
 
@@ -433,48 +297,11 @@ Same schema as `~/.claudish/config.json`. Placed in the project root directory (
 | File | Purpose | Auto-updated |
 |------|---------|-------------|
 | `config.json` | Global config: profiles, telemetry, routing | Manual (via `claudish profile` commands) |
-| `all-models.json` | Cached full model catalog from OpenRouter | Every 2 days, or on `--models-refresh` |
+| `all-models.json` | Cached full model catalog from OpenRouter | Every 2 days, or on `--force-update` |
 | `litellm-models-{hash}.json` | Cached LiteLLM model list per server (hash = SHA-256 of `LITELLM_BASE_URL`) | On each LiteLLM model fetch |
 | `kimi-oauth.json` | Kimi OAuth credentials (access + refresh tokens) | On `claudish --kimi-login` |
-| `meta-muse-oauth.json` | claudish's own Muse Code login (0600) | On `claudish login muse`; deleted by `claudish logout muse` |
-| `meta-muse-borrowed.json` | claudish's copy of the Muse Code CLI's login, so `team` slots and MCP sessions can sign without a Keychain dialog (0600) | After an interactive launch reads the Keychain and Meta confirms the subscription; deleted by `claudish logout muse` |
-| `muse-keychain-read.lock` | Held while one process waits on the Muse Keychain dialog, so other processes wait instead of opening a second one | Removed when the read ends |
-| `logs/` | Debug log files (created when `--debug-claudish` is used) | Per session |
-| `hooks/` | Default directory of `claudish hooks init` | On `claudish hooks init` |
-| `behavior-journal.jsonl` | Local journal of every hook decision | On every hook decision |
-| `behavior-outbox.jsonl` | Behaviour-telemetry reports waiting for upload (only with `hooks.telemetry.enabled`) | At exit; drained by a later run |
-| `behavior-divergences.jsonl` | Verdicts of the built-in observer | When the observer is on |
-
-### 4.4 Config File Override (`--config`)
-
-`--config <file>` (env: `CLAUDISH_CONFIG`) makes that file the **only** config for the run. It
-replaces **both** `~/.claudish/config.json` and the project `.claudish.json` — the project file is
-not merged back in.
-
-```bash
-claudish --config ./qa-config.json --model glm@glm-4.6 "task"
-CLAUDISH_CONFIG=/abs/qa-config.json claudish --model glm@glm-4.6 "task"
-```
-
-| Detail | Behavior |
-|---|---|
-| Precedence | The `--config` flag wins over `CLAUDISH_CONFIG`; a dangling `--config` (or one followed by another flag) is a usage error, not a silent fallback |
-| Flag visibility | Consumed and stripped before `parseArgs()`, so the child `claude` process never sees it |
-| Child processes | Re-exported as an absolute `CLAUDISH_CONFIG` and set explicitly in the environment of every `claudish` child that team and MCP sessions spawn, so each child reads the same file, whatever the child's working directory holds |
-| Writes | `claudish config` saves target the override file — the machine config is never mutated with override-derived data |
-| Env vars | Still resolve first: a shell env var or `.env` entry beats the override file's `apiKeys` |
-| `.env` | `CLAUDISH_CONFIG` must come from the shell, an MCP server's `env`, or a parent claudish: it names the hook modules claudish imports, the endpoints your keys are sent to, and the 1Password sources it reads. No env file in the working directory can set it. claudish starts Bun with `--no-env-file`, and its own `.env` load sets provider API keys and model settings only, ignoring `CLAUDISH_CONFIG` with one stderr line. If Bun loaded the directory's env files anyway (started without `--no-env-file`), `CLAUDISH_CONFIG` is ignored for the whole run, with one stderr line; use `--config` then |
-| Scope | Config only. OAuth credential files (`kimi-oauth.json`, `gemini-oauth.json`, …) stay machine-level |
-
-**It is substitution, not "1Password off".** The override does not suppress 1Password — it changes
-which file the 1Password sources are read from. An override file that names no `op://` source has
-no 1Password sources at all, so the lazy SDK gate never opens and no auth prompt appears. An
-override file that *does* name an `op://` ref resolves it normally.
-
-The same rule applies to the macOS Keychain: the override changes which file the `keychain.enabled`
-flag is read from. An override file without that flag performs no Keychain I/O; one with it reads
-the same machine Keychain as usual. (To redirect the Keychain itself — for testing — use
-`CLAUDISH_KEYCHAIN_FILE`, which is a separate axis from `--config`.)
+| `gemini-oauth.json` | Gemini Code Assist OAuth credentials | On `claudish --gemini-login` |
+| `logs/` | Debug log files (created when `--debug` is used) | Per session |
 
 ---
 
@@ -496,21 +323,6 @@ ll@my-model                      # LiteLLM proxy with auto catalog resolution
 
 Provider part is **case-insensitive**. Shortcuts are resolved to canonical provider names.
 
-**Request mode and speed markers (v10.5.0+).** A model spec may end in `+pro` and/or
-`#<speed>` (`fast`, `priority`, `flex`, `ultrafast`, `standard`):
-
-```
-cx@gpt-6-sol+pro          # reasoning mode pro
-oai@gpt-6-sol#fast        # fast speed tier (sent as the connection's native value, e.g. service_tier=priority)
-oai@gpt-6-sol+pro#flex    # both, in either order
-```
-
-A marker is only a REQUEST. Each catalog connection publishes which modes and speeds it offers
-(`claudish --probe <model>` prints them); a value the connection does not offer is refused with
-the list it does offer, never silently dropped or guessed. A faster tier can bill at a higher
-rate. The markers need a catalog connection (or a custom endpoint); they are refused elsewhere.
-`-pro`/`-fast` are NOT markers: `gpt-6-sol-pro` and `kimi-k3-fast` are separate models.
-
 ### 5.2 Provider Shortcuts
 
 #### Remote Providers
@@ -519,6 +331,7 @@ rate. The markers need a catalog connection (or a custom endpoint); they are ref
 |-------------|-------------------|-------|
 | `g`, `gemini` | `google` | Direct Google Gemini API (`GEMINI_API_KEY`) |
 | `oai` | `openai` | Direct OpenAI API (`OPENAI_API_KEY`) |
+| `cx`, `codex` | `openai-codex` | OpenAI Codex — Responses API (`OPENAI_CODEX_API_KEY` or OAuth via `claudish login codex`; `OPENAI_API_KEY` is accepted as an auth-header alias but does **not** make the lane routable — plain OpenAI keys get 400 on `/v1/responses`; `OPENAI_CODEX_BASE_URL` overrides) |
 | `or`, `openrouter` | `openrouter` | OpenRouter (`OPENROUTER_API_KEY`) |
 | `mm`, `mmax` | `minimax` | MiniMax direct API (`MINIMAX_API_KEY`) |
 | `mmc` | `minimax-coding` | MiniMax Coding Plan (`MINIMAX_CODING_API_KEY`) |
@@ -527,20 +340,11 @@ rate. The markers need a catalog connection (or a custom endpoint); they are ref
 | `glm`, `zhipu` | `glm` | GLM/Zhipu direct API (`ZHIPU_API_KEY` or `GLM_API_KEY`) |
 | `gc` | `glm-coding` | GLM Coding Plan at Z.AI (`GLM_CODING_API_KEY` or `ZAI_CODING_API_KEY`) |
 | `zai` | `zai` | Z.AI Anthropic-compatible API (`ZAI_API_KEY`) |
-| `sakana`, `fugu` | `sakana` | Sakana Fugu API / token plan (`SAKANA_API_KEY`) |
-| `sc` | `sakana-coding` | Sakana Fugu Subscription (`SAKANA_CODING_API_KEY` or `SAKANA_API_KEY`) |
-| `qtoken` | `qwen-token-plan` | Alibaba Token Plan — Model Studio subscription, Credits (`QWEN_TOKEN_PLAN_API_KEY`) |
-| `qcode` | `qwen-coding` | Alibaba Coding Plan — Model Studio subscription, requests (`QWEN_CODING_PLAN_API_KEY`) |
-| `qpay` | `qwen-payg` | Alibaba PAYG — Model Studio pay-as-you-go, per token (`DASHSCOPE_API_KEY`) |
-| `oc`, `llama`, `lc` | `ollamacloud` | OllamaCloud hosted API (`OLLAMA_API_KEY`). `meta` is no longer an OllamaCloud shortcut |
-| `meta` | `meta` | Meta Model API, metered (`META_API_KEY`) |
-| `muse` | `meta-muse-code` | Muse Code subscription (`claudish login muse`, or the Muse Code CLI's Keychain login); see [Muse Code](usage/muse-code.md) |
-| `zen` | `opencode-zen` | OpenCode Zen (`OPENCODE_API_KEY` required) |
-| `zengo`, `zgo` | `opencode-zen-go` | OpenCode Zen Go subscription plan (`OPENCODE_GO_API_KEY` required) |
-| `v`, `vertex` | `vertex` | Vertex AI — Application Default Credentials (`VERTEX_PROJECT` optional) |
-| `mistral` | `mistralai` | Direct Mistral API (`MISTRAL_API_KEY`) |
-| `ag`, `antigravity` | `antigravity` | Gemini via your Antigravity subscription (`claudish login antigravity`) |
-| `go` | `antigravity` | _deprecated alias_ — Gemini Code Assist was retired by Google |
+| `oc`, `llama`, `lc`, `meta` | `ollamacloud` | OllamaCloud hosted API (`OLLAMA_API_KEY`) |
+| `zen` | `opencode-zen` | OpenCode Zen (`OPENCODE_API_KEY`; optional for free models) |
+| `zengo`, `zgo` | `opencode-zen-go` | OpenCode Zen Go subscription plan |
+| `v`, `vertex` | `vertex` | Vertex AI (`VERTEX_API_KEY` or `VERTEX_PROJECT`) |
+| `go` | `gemini-codeassist` | Gemini Code Assist via OAuth (`claudish --gemini-login`) |
 | `litellm`, `ll` | `litellm` | LiteLLM proxy (`LITELLM_BASE_URL` + `LITELLM_API_KEY`) |
 | `poe` | `poe` | Poe API (`POE_API_KEY`) |
 
@@ -566,11 +370,8 @@ When no `provider@` prefix is given, Claudish detects the provider from the mode
 | `moonshot/*` or `moonshot-*` or `kimi-*` | Kimi | |
 | `zhipu/*` or `glm-*` or `chatglm-*` | GLM | |
 | `z-ai/*` or `zai/*` | Z.AI | |
-| `fugu*` or `sakana/*` | Sakana Fugu | |
 | `ollamacloud/*` or `meta-llama/*` or `llama-*` or `llama3*` | OllamaCloud | |
-| `qwen3.*` (dotted Model Studio names, e.g. `qwen3.7-plus`) | Alibaba Token Plan (`qtoken@`) | Bare-name routing chain: Alibaba Coding Plan (`qcode@`), Alibaba Token Plan (`qtoken@`), OpenCode Zen Go, Alibaba PAYG (`qpay@`), then OpenRouter — each step only if that credential is present |
-| `qwen3-*` (hyphenated, e.g. `qwen3-coder-plus`) | Auto-routed (no direct API) | Same routing chain as `qwen3.*` |
-| `qwen*` (everything else) | Auto-routed (no direct API) | Falls to OpenRouter or LiteLLM |
+| `qwen*` | Auto-routed (no direct API) | Falls to OpenRouter or LiteLLM |
 | `poe:*` | Poe | Literal `poe:` prefix |
 | `anthropic/*` or `claude-*` | Native Anthropic | Claude Code's own auth, no proxy |
 | `vendor/model` (unknown vendor) | Error | Must use explicit `openrouter@vendor/model` |
@@ -584,7 +385,7 @@ The old `prefix/model` format works but emits a deprecation warning suggesting t
 |---------------|----------|----------------|
 | `g/` | Google Gemini | `g@` |
 | `gemini/` | Google Gemini | `gemini@` |
-| `ag/`, `antigravity/` | Antigravity (Gemini subscription) | `ag@` |
+| `go/` | Gemini Code Assist | `go@` |
 | `oai/` | OpenAI | `oai@` |
 | `or/` | OpenRouter | `or@` |
 | `mmax/`, `mm/` | MiniMax | `mm@` |
@@ -594,8 +395,6 @@ The old `prefix/model` format works but emits a deprecation warning suggesting t
 | `glm/`, `zhipu/` | GLM | `glm@` |
 | `gc/` | GLM Coding | `gc@` |
 | `zai/` | Z.AI | `zai@` |
-| `sakana/`, `fugu/` | Sakana Fugu | `sakana@`, `fugu@` |
-| `sc/` | Sakana Subscription | `sc@` |
 | `oc/` | OllamaCloud | `oc@` |
 | `zen/` | OpenCode Zen | `zen@` |
 | `zengo/`, `zgo/` | OpenCode Zen Go | `zengo@` |
@@ -636,11 +435,14 @@ The fallback chain is **configurable** via the `defaultProvider` setting. Set it
 1. CLI flag `--default-provider`
 2. `CLAUDISH_DEFAULT_PROVIDER` env var
 3. `defaultProvider` in config file
-4. Legacy LITELLM auto-promotion (if `LITELLM_BASE_URL` + `LITELLM_API_KEY` set without explicit `defaultProvider`)
-5. `OPENROUTER_API_KEY` present → OpenRouter
-6. Hardcoded `"openrouter"`
+4. `OPENROUTER_API_KEY` present → OpenRouter
+5. Hardcoded `"openrouter"`
 
 Valid values: any built-in provider name (`"openrouter"`, `"litellm"`, `"openai"`, `"anthropic"`, `"google"`) or a custom endpoint name from `customEndpoints`.
+
+**Where it applies (proxy side, #468):** the proxy server resolves the effective default once at startup and passes it to `route()`, so **every bare-name chain served through the proxy** gets the default appended as a final fallback hop (deduped — `or` ≡ `openrouter`; explicit `provider@model` targets are never affected). Before #468 the proxy routed bare names with **no** fallback hop at all, whatever `defaultProvider` said — the setting only governed the CLI-side chain.
+
+**Strict no-fallback mode takes TWO settings**: `routing["*"] = []` in user config AND a present-empty default — **in the env form only** (`CLAUDISH_DEFAULT_PROVIDER=""`). The resolver is asymmetric here (pinned): an env value that is present but empty is an explicit opt-out, but a config-file `defaultProvider: ""` is **not** — the truthiness guard in `resolveDefaultProvider()` (`default-provider.ts`) drops it and falls through to `OPENROUTER_API_KEY`/the hardcoded `openrouter` (precedence steps 4–5). An absent default is not an empty one either: with nothing set, the fallback hop resolves to the hardcoded `openrouter` and lands on every bare-name chain, an empty one included. Compose-deployed containers pass `CLAUDISH_DEFAULT_PROVIDER` empty by default (`docker-compose.yml`), which keeps them opt-out; a non-empty value there would add an OpenRouter (PAYG) hop to every bare-name chain.
 
 ### 6.2 Default chain (no `defaultProvider` set)
 
@@ -651,13 +453,21 @@ When `defaultProvider` is absent and only `OPENROUTER_API_KEY` is present:
    - `kimi` → Kimi Coding Plan (`kc@kimi-for-coding`) if `KIMI_CODING_API_KEY` or OAuth present.
    - `minimax` → MiniMax Coding Plan (`mmc@`) if `MINIMAX_CODING_API_KEY` present.
    - `glm` → GLM Coding Plan at Z.AI (`gc@`) if `GLM_CODING_API_KEY` or `ZAI_CODING_API_KEY` present.
-   - `gemini-*` → `antigravity` (subscription) → `google` (direct API) → `openrouter`.
+   - `google` → Gemini Code Assist (`go@`) if OAuth credentials present.
 3. **Native provider API** — if the detected native provider has an API key or OAuth credentials.
 4. **OpenRouter** — if `OPENROUTER_API_KEY` is set (universal fallback).
 
-### 6.3 Legacy LiteLLM auto-promotion
+### 6.3 LiteLLM is never promoted automatically
 
-When `LITELLM_BASE_URL` and `LITELLM_API_KEY` are set but `defaultProvider` is absent, LiteLLM is added to the chain first (before OpenCode Zen). Claudish emits a one-shot stderr hint recommending you set `defaultProvider: "litellm"` explicitly. This preserves backward compatibility with pre-v7.0.0 behavior.
+Setting `LITELLM_BASE_URL` + `LITELLM_API_KEY` does **not** make LiteLLM the default. It once did, and the stderr hint that used to suggest making it explicit is gone too — `buildLegacyHint()` is a stub returning `null`, and `resolveDefaultProvider()` has no LiteLLM branch at all (`default-provider.ts`). Both were removed in commit 5 of the model-catalog/routing redesign.
+
+To route through LiteLLM by default, say so explicitly:
+
+```jsonc
+{ "defaultProvider": "litellm" }      // ~/.claudish/config.json
+```
+
+or `CLAUDISH_DEFAULT_PROVIDER=litellm`. Explicit `litellm@model` targets are unaffected and always were.
 
 If none of the chain entries have valid credentials, Claudish returns an error with instructions on how to authenticate.
 
@@ -753,33 +563,14 @@ For OpenAI- or Anthropic-compatible servers:
 | `kind` | `"simple"` | yes | Discriminator |
 | `url` | string | yes | Base URL of the server |
 | `format` | `"openai"` or `"anthropic"` | yes | Wire format |
-| `apiKey` | string | yes, unless `authScheme: "none"` | API key; supports `${VAR}` env expansion. Must be **omitted** under `authScheme: "none"` |
-| `authScheme` | `"bearer"`, `"x-api-key"` or `"none"` | no | Auth header scheme (default: `bearer`) |
+| `apiKey` | string | no | API key; supports `${VAR}` env expansion |
 | `modelPrefix` | string | no | Prepended to model name before sending to API |
 | `models` | string[] | no | Restrict to listed models; omit to allow any |
-| `wire` | object | no | How requests are built — see **Declaring the wire** below |
+| `maxConcurrency` | integer 0–32 | no | Max concurrent in-flight requests (0 = unlimited, 1 = sequential; omit = unbounded). For capacity-limited backends (single-GPU vLLM). An out-of-range value **fails validation and skips the whole entry** — the endpoint leaves the routing table. |
+| `maxOutputTokens` | integer ≥ 1 | no | #431 — clamps `max_tokens` DOWN to this before the request leaves (never up; unset = verbatim). vLLM counts `prompt + max_tokens` against `--max-model-len` and refuses rather than trims: a ~240k prompt with the fleet-standard `max_tokens: 32000` against a 262144 window is a refusal; with the cap at 8192 the same prompt is served. Same field on simple and complex kinds. |
+| `contextLimit` | integer ≥ 1 | no | #441 — the endpoint's TOTAL window (`--max-model-len` on vLLM: prompt + output counted together, refusal never trim). When set, `max_tokens` is clamped per request to `contextLimit − promptEstimate − max(2048, est/64)` (the proportional margin tracks the /4→/3.5 estimator drift on code-dense prompts — pre-review #442). The clamp estimate replaces each image/document base64 block with a fixed **1600-token allocation** (`estimateClampTokens`) — a 1 MB screenshot scores ~1.6k tokens, not ~750k (#442 review: without this, a screenshot turn clamped 16384 → 558). Below a useful floor of `min(max_tokens asked, 4096)` the clamp **stands down** (max_tokens verbatim) so the upstream refusal stays recoverable (#431 SKIP). This is the dynamic complement of `maxOutputTokens`: a compaction turn at the RX95 window (~250k prompt) with the fleet-standard `max_tokens: 32000` ships ~8.4k against a 262144 window instead of 400ing. Smallest cap wins when both fields are set. Unset = verbatim passthrough. Zero-code alternative (#441 option A): a plain `maxOutputTokens: 12000` also fits the RX95 window, but caps EVERY request — `contextLimit` only caps the ones near the window. Same field on simple and complex kinds. |
 
 Usage: `claudish --model my-vllm@llama3.1-70b "task"`
-
-**No-credential endpoints**: for a local router or a server on a trusted network, set
-`authScheme: "none"` and omit `apiKey`. claudish then sends no auth header at all:
-
-```json
-{
-  "customEndpoints": {
-    "localrouter": {
-      "kind": "simple",
-      "url": "http://127.0.0.1:8402/v1",
-      "format": "openai",
-      "authScheme": "none"
-    }
-  }
-}
-```
-
-A placeholder such as `"apiKey": "none"` is **not** equivalent — it is a literal key and goes
-out as `Authorization: Bearer none`, which some gateways reject. Declared `headers` are still
-sent under `authScheme: "none"`, so a gateway whose auth lives in a custom header works.
 
 ### Complex endpoint
 
@@ -795,7 +586,7 @@ Full control over transport, auth, headers, and stream format:
       "baseUrl": "https://llm.corp.internal",
       "apiPath": "/api/v2/chat/completions",
       "apiKey": "${CORP_LLM_KEY}",
-      "authScheme": "x-api-key",
+      "authScheme": "X-Api-Key",
       "headers": { "X-Team": "platform" },
       "streamFormat": "openai-sse",
       "modelPrefix": "",
@@ -812,44 +603,17 @@ Full control over transport, auth, headers, and stream format:
 | `transport` | string | yes | Transport type (e.g., `"openai"`, `"anthropic"`) |
 | `baseUrl` | string | yes | Server base URL |
 | `apiPath` | string | no | Custom API path (overrides default for transport) |
-| `apiKey` | string | yes, unless `authScheme: "none"` | API key; supports `${VAR}` env expansion. Must be **omitted** under `authScheme: "none"` |
-| `authScheme` | `"bearer"`, `"x-api-key"` or `"none"` | no | Auth header scheme (default: `bearer`). `"none"` sends **no auth header at all** — for a local router or a trusted-network server; do not fake it with a placeholder key, which goes out as a real `Authorization: Bearer <placeholder>`. **Lowercase enum** — a capitalized `"X-Api-Key"` fails validation and the entire entry is skipped |
+| `apiKey` | string | no | API key; supports `${VAR}` env expansion |
+| `authScheme` | string | no | Auth header scheme (default: `Bearer`; use `X-Api-Key` for header-name auth) |
 | `headers` | object | no | Additional HTTP headers |
 | `streamFormat` | string | no | Stream parser override (e.g., `"openai-sse"`, `"anthropic-sse"`) |
 | `modelPrefix` | string | no | Prepended to model name |
 | `models` | string[] | no | Restrict to listed models |
-| `wire` | object | no | How requests are built — see **Declaring the wire** below |
-
-### Declaring the wire (v10.5.0+)
-
-claudish never chooses a request's output-limit field or reasoning parameters from the model
-name. A catalog provider gets them from the cloud models catalog; a custom endpoint gets them
-from its `wire` block, or from these documented defaults:
-
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `api` | the transport's API | `"chat-completions"`, `"responses"` (openai transport only) or `"anthropic-messages"` |
-| `tokenParam` | `max_tokens` (`max_output_tokens` on Responses) | The output-limit field; `"none"` sends no limit |
-| `reasoning` | nothing sent | `effort: { path, values?, default? }`, `enable: [{path, value}]`, `disable: [{path, value}]` |
-
-Paths are RFC 6901 pointers into the request body. `effort.values` maps claudish's effort
-names (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) to the endpoint's own values;
-when omitted, the names are sent as they are. A requested effort the endpoint does not list is
-clamped to the nearest one it does. Example for a vLLM server running a Qwen thinking model:
-
-```json
-"wire": {
-  "tokenParam": "max_tokens",
-  "reasoning": {
-    "enable":  [{ "path": "/chat_template_kwargs/enable_thinking", "value": true }],
-    "disable": [{ "path": "/chat_template_kwargs/enable_thinking", "value": false }]
-  }
-}
-```
-
-Before v10.5.0 claudish picked these from the model name (a Qwen name got `enable_thinking`,
-a `gpt-5` name got `max_completion_tokens`); such an endpoint now needs the block above, or
-`--model-params`, to keep that behaviour.
+| `maxConcurrency` | integer 0–32 | no | Same as the simple kind |
+| `maxOutputTokens` | integer ≥ 1 | no | #431 — same as the simple kind: clamps `max_tokens` down before the request leaves |
+| `contextLimit` | integer ≥ 1 | no | #441 — same as the simple kind: dynamic `contextLimit − promptEstimate − max(2048, est/64)` clamp |
+| `omitReasoningContent` | boolean | no | Drops `reasoning_content` from outbound assistant messages (strict-schema backends) |
+| `clientAttribution` | boolean | no | #686/#718 — opt-in: outbound requests carry `x-claudish-client: <machine>:<workspace>` (composed from the inbound `x-claudish-machine`/`x-claudish-workspace` on **either ingress**, a missing part reading `unknown` — never absent) plus the client's machine header verbatim. For YOUR OWN engine fronts where one credential covers ~all traffic and the header is the only client discriminant. Never default-on: a custom endpoint can point at a third party (Aliyun, Mistral) and internal names must not leak there. Kill switch `CLAUDISH_CLIENT_ATTRIBUTION=0` (read per request). Both wires (openai + anthropic); pinned at the route level by `proxy-server-client-attribution.test.ts` (#682) |
 
 ### Environment variable expansion
 
@@ -870,50 +634,53 @@ Claudish validates all `customEndpoints` entries with Zod at proxy startup. Inva
 
 Each valid custom endpoint calls `registerRuntimeProvider()` (injects into the provider resolver) and `registerRuntimeProfile()` (injects into the transport layer). The endpoint name becomes a valid provider shortcut immediately.
 
-### Predefined endpoints
+---
 
-25 vendors ship inside the package as a bundled catalog (`providers/predefined-catalog.ts`). Each row compiles into exactly the complex `customEndpoints` entry documented above and travels the same registration path — there is no separate transport or provider table.
+## 7.6 Scoped Inbound Keys (#400)
 
-**A bundled row activates only when its key is already present locally** — the vendor's own env var (e.g. `GROQ_API_KEY`), one of its aliases, `CUSTOM_<NAME>_KEY`, `config.apiKeys`, or (on macOS, when the backend is enabled) the **Keychain**. The check is synchronous. The Keychain qualifies because presence for every vendor is answered by a single enumeration rather than a lookup per vendor; 1Password cannot be reached synchronously at all, so a key stored *only* behind an `op://` reference will not make its vendor appear — use `enable` below, export the variable, or copy it into the Keychain with `claudish keychain import`.
+For external consumers (a shared GPU lane, a friend testing the fleet): a key that authenticates exactly like the proxy key but reaches **only** the models its allowlist names. Subscriptions stay fleet-internal; revoking the external is deleting one config entry, never rotating `CLAUDISH_PROXY_KEY` fleet-wide.
 
 ```json
 {
-  "predefinedEndpoints": {
-    "enabled": true,
-    "enable": ["groq", "cerebras"],
-    "disable": ["perplexity"]
+  "apiKeys": {
+    "INBOUND_EXTERNAL_KEY": "ck-xxxxxxxx"
+  },
+  "inboundKeys": {
+    "external-jamin": {
+      "key": "${INBOUND_EXTERNAL_KEY}",
+      "allowModels": ["swift-1.5-27b", "qwen3.6-35b-a3b", "frognano-4b"]
+    }
   }
 }
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | boolean | `true` | `false` turns the whole catalog off |
-| `enable` | string[] | `[]` | Register these rows regardless of whether a key is present |
-| `disable` | string[] | `[]` | Never register these rows (beats `enable`) |
+| Field         | Type     | Required | Description                                                        |
+|---------------|----------|----------|--------------------------------------------------------------------|
+| `key`         | string   | yes      | Secret; supports `${VAR}` expansion from `apiKeys` first, then env |
+| `allowModels` | string[] | yes      | Model ids this key may serve. Non-empty.                           |
 
-Env kill switch: `CLAUDISH_NO_PREDEFINED_ENDPOINTS=1`.
+Semantics (resolved in `handlers/shared/inbound-keys.ts`):
 
-Other behaviours worth knowing:
+- **Bare names** pass iff the **client-sent model string** is allowlisted. For a bare name that string *is* the parsed id (`parseModelSpec` returns it unchanged) — the `routing` / `customEndpoints` resolution that picks the serving target runs **later**, inside the route handler, so it never feeds this gate. A name that exists only as a routing **alias** is therefore refused unless the alias is listed **as the client spells it**. Measured 2026-10-08 on the hub: `swift-1.5-27b` → `403`, which listed only `qwen3.6-35b-a3b`; both spellings name the same routing target (`vllm-myia@qwen3.6-35b-a3b`), so the two are independent allowlist entries, not one name in two forms.
+- **Explicit provider forms** (`provider@model`) pass only on an **exact raw allowlist hit** — `or@swift-1.5-27b` is refused, an allowlisted id must not ride onto a different transport's wire.
+- Anything else is a labeled `403 permission_error` (`[InboundKey] key '<name>' is not permitted to use model '<model>'…`) + one `[InboundKey] refused key=<name> model=<model>` marker per refusal. Wording deliberately free of quota-class words (#296 doctrine: `isQuotaExhaustion` must never arm on it).
+- The gate runs **before** the Anthropic passthrough exemption — a scoped key never rides the native lane either.
+- Applies to every ingress this auth covers: `/v1/messages`, `/v1/chat/completions`, `/v1/messages/count_tokens`.
+- **Attribution**: requests authed by a scoped key carry `inbound_key: "<name>"` in the capture envelope (`req-*.json`) — key-based, stable where external IPs are dynamic. The stdout `[Request]` line is unchanged (pinned consumer contract).
 
-- **A `customEndpoints` entry of the same name REPLACES the bundled row entirely** — no merge. Your entry gets `CUSTOM_<NAME>_KEY`, so it does **not** inherit the vendor's conventional variable; add `"apiKey": "${GROQ_API_KEY}"` to keep using it. Claudish warns when that variable is set and would now be ignored.
-- **A row's base URL can be overridden**, when it declares one (e.g. `TUNING_ENGINES_BASE_URL` on `tuningengines`), from `config.endpoints["TUNING_ENGINES_BASE_URL"]` — what `claudish config` and the Providers tab's URL editor write — or from the environment variable of the same name. Config wins over environment, matching the `apiKeys` rule.
-- **A malformed base-URL override skips the row rather than falling back** to the bundled public URL, whichever source it came from. Silently redirecting a typo to a vendor's public host would leak the traffic a self-hosted gateway exists to contain. An unexpanded `${VAR}` placeholder is treated as *unset*, not as malformed.
-- **Turning a row off takes effect on the next start.** Runtime registration cannot be undone within a live process, so a row disabled mid-session keeps answering until claudish restarts. Claudish prints a warning naming the row and the reason rather than leaving that silent.
-- **No model list ships with a row.** Catalog vendors get a free-text model prompt in the picker; model metadata comes from models-index or is absent.
-- **Nothing claudish ships puts a bundled row in a bare-name routing chain.** No row declares native model patterns or a legacy prefix, and none is bound to a route in the cloud models catalog, so a row is reachable only as `vendor@model` — an ambient key can add a picker row but cannot silently receive a request. Routing proposes a provider only when a catalog connection resolves to it, so an unbound row cannot be proposed for any model. (`together` and `fireworks` are bound on purpose: they are gateways the catalog maps, and activating one is you naming it.) The other exception is also your own doing: the fallback is appended to every bare chain, so setting `"defaultProvider": "groq"` does route bare names there.
-- An invalid `predefinedEndpoints` block warns once and is treated as absent, never as "off".
-- **Evidence:** every shipped row is *probe*-verified — its configured path was confirmed to reach the vendor's own auth layer, and a deliberately bogus sibling path was confirmed to answer differently. **No row is live-verified**; that establishes the route, not the vendor's streaming dialect on a successful turn.
+Validation doctrine (same as `customEndpoints`): an entry failing validation — missing/empty key, unresolvable `${VAR}`, empty `allowModels`, a key value equal to a full-access proxy key or duplicated across entries — is **skipped with one stderr warning, never a crash**. Inert with no `inboundKeys` config: zero behavior change. An entry may also carry a `maxConcurrency` (#406) capping that key's concurrent in-flight requests: acquired at authentication, released on the response lifecycle (immediately for a non-SSE response, on stream close/cancel for SSE); at the cap the refusal is a labeled `429` whose wording deliberately never arms `isQuotaExhaustion`. An unreadable cap (`0`, negative, non-integer, `null`) **skips the entry** — never "unlimited".
+
+Requires a proxy restart to take effect (config read once per proxy lifetime — same lifecycle as `customEndpoints`).
 
 ---
 
 ## 8. Model Mapping Priority
 
-For each role slot (opus, sonnet, haiku, subagent), resolution from highest to lowest priority:
+For each role slot (opus, sonnet, haiku, fable, subagent), resolution from highest to lowest priority:
 
-1. CLI flag: `--model-opus`, `--model-sonnet`, `--model-haiku`, `--model-subagent`
-2. `CLAUDISH_MODEL_OPUS`, `CLAUDISH_MODEL_SONNET`, `CLAUDISH_MODEL_HAIKU`, `CLAUDISH_MODEL_SUBAGENT`
-3. `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`
+1. CLI flag: `--model-opus`, `--model-sonnet`, `--model-haiku`, `--model-fable`, `--model-subagent`
+2. `CLAUDISH_MODEL_OPUS`, `CLAUDISH_MODEL_SONNET`, `CLAUDISH_MODEL_HAIKU`, `CLAUDISH_MODEL_FABLE`, `CLAUDISH_MODEL_SUBAGENT`
+3. `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_FABLE_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`
 4. Profile `models` fields from active profile (local `.claudish.json` first, then global `~/.claudish/config.json`)
 5. No mapping set: Claude Code uses its own internal defaults for that role
 
@@ -959,14 +726,14 @@ For local Qwen models, setting `CLAUDISH_QWEN_NO_THINK=1` prepends `/no_think` t
 | Path | Purpose | Auto-update Trigger |
 |------|---------|---------------------|
 | `~/.claudish/config.json` | Global settings, profiles, telemetry, routing | Profile/telemetry commands |
-| `~/.claudish/all-models.json` | Full OpenRouter model catalog | Every 2 days; or `--models-refresh` |
-| `~/.claudish/recommended-models-cache-v2.json` | Recommended list projection (`--models-top`, MCP `list_models`) | After 24 h; or `--models-refresh` |
+| `~/.claudish/all-models.json` | Full OpenRouter model catalog | Every 2 days; or `--force-update` |
 | `~/.claudish/litellm-models-{hash}.json` | LiteLLM model list (one file per unique `LITELLM_BASE_URL`) | On each LiteLLM model list fetch |
 | `~/.claudish/kimi-oauth.json` | Kimi OAuth access + refresh tokens | `claudish --kimi-login` |
+| `~/.claudish/gemini-oauth.json` | Gemini Code Assist OAuth tokens | `claudish --gemini-login` |
 | `.claudish.json` | Local/project config | Profile commands with `--local` |
-| `.env` | Provider API keys and claudish model settings (loaded at startup; every other variable is ignored, see §3) | Manual |
+| `.env` | Environment variables (auto-loaded at startup) | Manual |
 
-Cache files can be force-refreshed with `claudish --models --models-refresh` or `claudish --models-top --models-refresh`. The `--models-refresh` flag deletes `all-models.json`, `pricing-cache.json`, `recommended-models-cache-v2.json`, and all `litellm-models-*.json` files before fetching fresh data.
+Cache files can be force-refreshed with `claudish --models --force-update` or `claudish --top-models --force-update`. The `--force-update` flag deletes `all-models.json`, `pricing-cache.json`, and all `litellm-models-*.json` files before fetching fresh data.
 
 ---
 
@@ -984,17 +751,16 @@ When routing through aggregators like OpenRouter or LiteLLM, models require vend
 1. User specifies bare model name (e.g., `or@qwen3-coder-next`).
 2. Resolver searches the provider's cached model catalog for an exact suffix match.
 3. If found, uses the vendor-prefixed ID (e.g., `qwen/qwen3-coder-next`).
-4. If not found in cache, falls back to static map (`OPENROUTER_VENDOR_MAP`) for cold starts.
+4. If the in-memory cache is cold, falls back to the disk cache (`~/.claudish/all-models.json`, persisted by the last successful refresh); if that is absent too, the bare name is passed through unchanged — there is no static fallback map (removed upstream `ba650d5`).
 
 **Rules**:
 - Exact match only; no fuzzy or normalized matching.
-- Dynamic catalogs (from provider APIs) are primary; static map is cold-start fallback only.
+- Dynamic catalogs (from provider APIs) are primary; disk cache next; passthrough unchanged otherwise.
 - Resolution is synchronous (`resolveModelNameSync()`) using in-memory cache + `readFileSync`.
 
 **Current resolvers**:
-- **OpenRouter**: Searches `_cachedOpenRouterModels` + `all-models.json` by exact suffix.
+- **OpenRouter**: Searches the slim in-memory catalog + `all-models.json` by exact suffix (modelId → aliases → externalId → suffix).
 - **LiteLLM**: Searches `litellm-models-{hash}.json` by exact match and prefix-stripping.
-- **Static fallback**: `OPENROUTER_VENDOR_MAP` for OpenRouter when no cache exists.
 
 ---
 
@@ -1005,7 +771,7 @@ This reference does NOT cover:
 1. **Claude Code flags**: The full list of flags that can be passed through to Claude Code (use `claude --help`). Claudish forwards any unrecognized flag automatically.
 2. **Cost tracking internals**: The detailed algorithm for cost accumulation and the format of cost data files.
 3. **MCP server protocol**: The specific MCP tool definitions and protocol details when running in `--mcp` mode.
-4. **Smoke test configuration**: The `scripts/smoke/` configuration for provider smoke tests.
+4. **Smoke test configuration**: The `packages/cli/scripts/smoke/` configuration for provider smoke tests.
 5. **Token file format**: The internal token counting files used by `writeTokenFile` for the status line display.
 
 ---
@@ -1034,7 +800,7 @@ claudish --model-opus g@gemini-3-pro --model-sonnet oai@gpt-5.3
 claudish -y --dangerous --model g@gemini-2.0-flash "task"
 
 # Debug
-claudish --debug-claudish --model g@gemini-2.0-flash "task"
+claudish --debug --model g@gemini-2.0-flash "task"
 
 # Profile management
 claudish init
@@ -1045,7 +811,7 @@ claudish profile use myprofile --global
 # Model discovery
 claudish --models               # all models
 claudish --models gemini        # search
-claudish --models-top           # curated list
+claudish --top-models           # curated list
 claudish --models --json        # JSON output
 
 # OAuth login

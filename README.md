@@ -5,7 +5,7 @@
 ### Claude Code. Any Model.
 
 [![npm version](https://img.shields.io/npm/v/claudish.svg?style=flat-square&color=00D4AA)](https://www.npmjs.com/package/claudish)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](./package.json)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-Compatible-d97757?style=flat-square)](https://claude.ai/claude-code)
 
 **Use your existing AI subscriptions with Claude Code.** Works with Anthropic Max, Gemini Advanced, ChatGPT Plus/Codex, Kimi, GLM, OllamaCloud — plus 580+ models via OpenRouter and local models for complete privacy.
@@ -19,7 +19,7 @@
 **Claudish** (Claude-ish) is a CLI tool that allows you to run Claude Code with any AI model by proxying requests through a local Anthropic API-compatible server.
 
 **Supported Providers:**
-- **Cloud:** OpenRouter (580+ models), Google Gemini, OpenAI, MiniMax, Kimi, GLM, Z.AI, Sakana Fugu, OllamaCloud, OpenCode Zen
+- **Cloud:** OpenRouter (580+ models), Google Gemini, OpenAI, MiniMax, Kimi, GLM, Z.AI, OllamaCloud, OpenCode Zen
 - **Local:** Ollama, LM Studio, vLLM, MLX
 - **Enterprise:** Vertex AI (Google Cloud)
 
@@ -37,10 +37,6 @@
 | **MiniMax** | `claudish --model mm@minimax-m2.1` |
 | **OllamaCloud** | `claudish --model oc@qwen3-next` |
 | **OpenCode Zen Go** | `claudish --model zgo@glm-5` |
-| **Alibaba Coding Plan** | `claudish --model qcode@qwen3.7-plus` |
-| **Alibaba Token Plan** | `claudish --model qtoken@qwen3.7-plus` |
-| **Alibaba PAYG** | `claudish --model qpay@qwen3.7-plus` |
-| **Muse Code** (Meta) | `claudish --model muse@muse-spark-1.3` |
 
 **100% Offline Option — Your code never leaves your machine:**
 ```bash
@@ -77,7 +73,6 @@ Claudish is a **BYOK AI coding assistant**:
 - ✅ **Autonomous mode** - Bypass all prompts with flags
 - ✅ **Context inheritance** - Runs in current directory with same `.claude` settings
 - ✅ **Claude Code flag passthrough** - Forward any Claude Code flag (`--agent`, `--effort`, `--permission-mode`, etc.) in any order
-- ✅ **Classifier passthrough** - In hybrid setups, keep Claude Code's auto-mode permission classifier on real Claude (Anthropic) while your main loop runs on another provider (`--classifier-provider anthropic`)
 - ✅ **Vision proxy** - Non-vision models automatically get image descriptions via Claude, so every model can "see"
 
 ## Installation
@@ -150,29 +145,7 @@ claudish --init
 - Follow best practices for Claudish usage
 - Suggest specialized agents for different tasks
 
-### Option 1: Log in with a subscription you already pay for (no API key)
-
-If you have ChatGPT Plus/Pro, an Antigravity plan, a Kimi or GLM coding plan, a
-SuperGrok subscription, or Anthropic Max, `claudish login` uses it directly. No
-API key, no per-token billing.
-
-```bash
-claudish login                 # interactive picker of every provider you can log into
-claudish login codex           # ChatGPT Plus/Pro (OpenAI's own PKCE flow)
-claudish login antigravity     # Gemini via your Antigravity plan
-claudish login grok            # SuperGrok / X Premium+
-claudish login kimi            # Kimi
-claudish login muse            # Muse Code (Meta), or reuse the Muse Code CLI's login
-
-# Then just name the model
-claudish --model cx@gpt-5.5 "implement user authentication"
-claudish --model ag@gemini-3.6-flash "add tests"
-```
-
-Run `claudish --probe cx@gpt-5.5` afterwards to confirm the credential resolved
-and see which provider will actually serve the request.
-
-### Option 2: Interactive Mode
+### Option 1: Interactive Mode (Easiest)
 
 ```bash
 # Just run it - will prompt for API key and model
@@ -183,7 +156,7 @@ claudish
 # Start coding!
 ```
 
-### Option 3: With Environment Variables
+### Option 2: With Environment Variables
 
 ```bash
 # Set up environment
@@ -225,7 +198,7 @@ claudish --help-ai > claudish-agent-guide.md
    claudish --models gemini
 
    # Get top recommended models (JSON)
-   claudish --models-top --json
+   claudish --top-models --json
    ```
 
 2. **Run Claudish through sub-agent** (recommended pattern):
@@ -277,12 +250,11 @@ claudish --help-ai > claudish-agent-guide.md
 - ✅ Use file-based patterns to avoid context window pollution
 - ✅ Delegate to sub-agents instead of running directly
 - ✅ Return summaries only (not full conversation transcripts)
-- ✅ Choose appropriate model for task (see `--models` or `--models-top`)
+- ✅ Choose appropriate model for task (see `--models` or `--top-models`)
 
 **Resources:**
 - Full AI agent guide: `claudish --help-ai`
 - Skill document: `skills/claudish-usage/SKILL.md` (in repository root)
-- Model integration: `skills/claudish-integration/SKILL.md` (in repository root)
 
 ## Usage
 
@@ -303,18 +275,16 @@ claudish [OPTIONS] <claude-args...>
 | `--model-opus <model>` | | Model for Opus role (planning, complex tasks) | |
 | `--model-sonnet <model>` | | Model for Sonnet role (default coding) | |
 | `--model-haiku <model>` | | Model for Haiku role (fast tasks) | |
+| `--model-fable <model>` | | Model for Fable role (version-independent family mapping) | |
 | `--model-subagent <model>` | | Model for sub-agents (Task tool) | |
-| `--classifier-provider <name>` | | Route the auto-mode permission classifier to native Anthropic (`anthropic`) | Off |
-| `--classifier-model <model>` | | Native Claude model for the classifier passthrough (also enables it) | `claude-sonnet-5` |
+| `--model-freshness` | | Check configured Fable/Astra pins without inference | |
 | `--profile <name>` | `-p` | Named profile for model mapping | Default profile |
-| `--config <file>` | | Use this file as the run's ONLY config (replaces global + project) | |
-| `--op-env <id>` | | Load env vars from a 1Password Environment (highest priority) | |
 | `--interactive` | `-i` | Interactive mode (persistent session) | Auto when no prompt |
 | `--auto-approve` | `-y` | Skip permission prompts | `false` |
 | `--no-auto-approve` | | Explicitly enable permission prompts | |
 | `--dangerous` | | Pass `--dangerouslyDisableSandbox` | `false` |
 | `--port <port>` | | Proxy server port | Random (3000-9000) |
-| `--debug-claudish` | `-d` | Enable debug logging to `logs/` | `false` |
+| `--debug` | `-d` | Enable debug logging to `logs/` | `false` |
 | `--log-level <level>` | | Log verbosity: `debug`, `info`, `minimal` | `info` |
 | `--quiet` | `-q` | Suppress `[claudish]` messages | Default in single-shot |
 | `--verbose` | `-v` | Show `[claudish]` messages | Default in interactive |
@@ -323,17 +293,18 @@ claudish [OPTIONS] <claude-args...>
 | `--free` | | Show only free models in selector | `false` |
 | `--monitor` | | Proxy to real Anthropic API and log traffic | `false` |
 | `--summarize-tools` | | Summarize tool descriptions (for local models) | `false` |
-| `--cost-track` | | Enable cost tracking (enables monitor mode) | `false` |
-| `--cost-audit` | | Show cost analysis report | |
-| `--cost-reset` | | Reset accumulated cost statistics | |
-| `--models [query]` | `-s` (`--models-search`) | List all models or fuzzy search | |
-| `--models-top` | | Show curated recommended models | |
-| `--models-refresh` | | Force refresh model cache | |
+| `--cost-tracker` | | Enable cost tracking (enables monitor mode) | `false` |
+| `--audit-costs` | | Show cost analysis report | |
+| `--reset-costs` | | Reset accumulated cost statistics | |
+| `--models [query]` | `-s` | List all models or fuzzy search | |
+| `--top-models` | | Show curated recommended models | |
+| `--force-update` | | Force refresh model cache | |
 | `--init` | | Install Claudish skill in current project | |
 | `--mcp` | | Run as MCP server | |
-| `login [provider]` | | Log in to a subscription provider via OAuth (no argument = interactive picker) | |
-| `logout [provider]` | | Clear a provider's OAuth credentials | |
-| `--kimi-logout` | | Deprecated alias for `claudish logout kimi` | |
+| `--gemini-login` | | Login to Gemini Code Assist via OAuth | |
+| `--gemini-logout` | | Clear Gemini OAuth credentials | |
+| `--kimi-login` | | Login to Kimi via OAuth | |
+| `--kimi-logout` | | Clear Kimi OAuth credentials | |
 | `--help-ai` | | Show AI agent usage guide | |
 | `--version` | | Show version | |
 | `--help` | `-h` | Show help message | |
@@ -343,7 +314,7 @@ claudish [OPTIONS] <claude-args...>
 
 ### Environment Variables
 
-Claudish loads provider API keys and model settings (`CLAUDISH_MODEL`, `CLAUDISH_MODEL_*`) from `.env` in the current directory at startup; any other variable there is ignored, so set the rest in your shell. For the full list, see [Settings Reference](docs/settings-reference.md).
+Claudish automatically loads `.env` from the current directory at startup. For the full list, see [Settings Reference](docs/settings-reference.md).
 
 #### API Keys (at least one required for cloud models)
 
@@ -355,59 +326,17 @@ Claudish loads provider API keys and model settings (`CLAUDISH_MODEL`, `CLAUDISH
 | `MINIMAX_API_KEY` | MiniMax (`mm@`, `mmax@`) | |
 | `MINIMAX_CODING_API_KEY` | MiniMax Coding Plan (`mmc@`) | |
 | `MOONSHOT_API_KEY` | Kimi/Moonshot (`kimi@`) | `KIMI_API_KEY` |
-| `KIMI_CODING_API_KEY` | Kimi Coding Plan (`kc@`) | Or OAuth via `claudish login kimi` |
+| `KIMI_CODING_API_KEY` | Kimi Coding Plan (`kc@`) | Or OAuth via `--kimi-login` |
 | `ZHIPU_API_KEY` | GLM/Zhipu (`glm@`) | `GLM_API_KEY` |
 | `GLM_CODING_API_KEY` | GLM Coding Plan (`gc@`) | `ZAI_CODING_API_KEY` |
 | `ZAI_API_KEY` | Z.AI (`zai@`) | |
-| `SAKANA_API_KEY` | Sakana Fugu (`sakana@`, `fugu@`) | |
-| `SAKANA_CODING_API_KEY` | Sakana Fugu Subscription (`sc@`) | `SAKANA_API_KEY` |
-| `QWEN_CODING_PLAN_API_KEY` | Alibaba Coding Plan (`qcode@`) | _(separate key and host)_ |
-| `QWEN_TOKEN_PLAN_API_KEY` | Alibaba Token Plan (`qtoken@`) | _(separate key and host)_ |
-| `DASHSCOPE_API_KEY` | Alibaba PAYG (`qpay@`) | _(separate key and host)_ |
-| `META_API_KEY` | Meta Model API, metered (`meta@`) | _(never signs the `muse@` subscription)_ |
 | `OLLAMA_API_KEY` | OllamaCloud (`oc@`) | |
-| `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) | |
-| `OPENCODE_GO_API_KEY` | OpenCode Zen Go plan (`zgo@`) | _(separate from the metered Zen credential)_ |
+| `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) — optional for free models | |
 | `LITELLM_API_KEY` | LiteLLM (`ll@`) — requires `LITELLM_BASE_URL` | |
 | `POE_API_KEY` | Poe (`poe@`) | |
-| `VERTEX_PROJECT` | Vertex AI (`v@`) — optional; the ADC quota project or `gcloud config get project` is used otherwise | `GOOGLE_CLOUD_PROJECT` |
+| `VERTEX_API_KEY` | Vertex AI Express (`v@`) | |
+| `VERTEX_PROJECT` | Vertex AI OAuth mode (`v@`) | `GOOGLE_CLOUD_PROJECT` |
 | `ANTHROPIC_API_KEY` | Placeholder (suppresses Claude Code dialog) | |
-
-#### Bundled Endpoint Catalog
-
-25 extra vendors ship inside the package as predefined endpoints. **Each appears only when its key is already present locally** (env var, alias, or `config.apiKeys`) — set the variable and `vendor@model` starts working with no config file. A key that lives only in 1Password does not activate a row (activation is synchronous); use `predefinedEndpoints.enable` for that case. See [Predefined Endpoints](docs/settings-reference.md#predefined-endpoints).
-
-All 25 rows ship *probe*-verified — the configured path was confirmed to reach the vendor's own auth layer, and a bogus sibling path to answer differently. **None is live-verified**: that is strong evidence about routing and weak evidence about a vendor's streaming dialect on a successful turn. The endpoint layer itself was verified end to end against a real API.
-
-| Variable | Provider | Notes |
-|----------|----------|-------|
-| `GROQ_API_KEY` | Groq (`groq@`) | |
-| `CEREBRAS_API_KEY` | Cerebras (`cerebras@`) | |
-| `TOGETHER_API_KEY` | Together AI (`together@`) | |
-| `FIREWORKS_API_KEY` | Fireworks AI (`fireworks@`) | |
-| `DEEPINFRA_API_KEY` | DeepInfra (`deepinfra@`) | |
-| `NEBIUS_API_KEY` | Nebius AI Studio (`nebius@`) | |
-| `HYPERBOLIC_API_KEY` | Hyperbolic (`hyperbolic@`) | |
-| `SAMBANOVA_API_KEY` | SambaNova Cloud (`sambanova@`) | |
-| `NOVITA_API_KEY` | Novita AI (`novita@`) | |
-| `BASETEN_API_KEY` | Baseten (`baseten@`) | |
-| `PERPLEXITY_API_KEY` | Perplexity Sonar (`perplexity@`) | |
-| `VENICE_API_KEY` | Venice AI (`venice@`) | |
-| `CHUTES_API_KEY` | Chutes (`chutes@`) | |
-| `FEATHERLESS_API_KEY` | Featherless AI (`featherless@`) | |
-| `PARASAIL_API_KEY` | Parasail (`parasail@`) | |
-| `INFERENCE_NET_API_KEY` | Inference.net (`inference-net@`) | |
-| `AIMLAPI_API_KEY` | AI/ML API (`aimlapi@`) | |
-| `REQUESTY_API_KEY` | Requesty (`requesty@`) | |
-| `NANOGPT_API_KEY` | NanoGPT (`nanogpt@`) | |
-| `COHERE_API_KEY` | Cohere (`cohere@`) | OpenAI-compatibility layer |
-| `SCALEWAY_API_KEY` | Scaleway Generative APIs (`scaleway@`) | |
-| `UPSTAGE_API_KEY` | Upstage Solar (`upstage@`) | |
-| `WRITER_API_KEY` | Writer Palmyra (`writer@`) | |
-| `MOONSHOT_CN_API_KEY` | Moonshot AI China region (`moonshot-cn@`) | Different service from `MOONSHOT_API_KEY` / `moonshot@` above |
-| `TUNING_ENGINES_API_KEY` | Tuning Engines (`tuningengines@`) | Self-hosted: also set `TUNING_ENGINES_BASE_URL` |
-
-Every one of these also accepts `CUSTOM_<NAME>_KEY` as an alias, and any of them can be replaced outright by a `customEndpoints` entry of the same name.
 
 #### Claudish Settings
 
@@ -419,6 +348,7 @@ Every one of these also accepts `CUSTOM_<NAME>_KEY` as an alias, and any of them
 | `CLAUDISH_MODEL_OPUS` | Model for Opus role | |
 | `CLAUDISH_MODEL_SONNET` | Model for Sonnet role | |
 | `CLAUDISH_MODEL_HAIKU` | Model for Haiku role | |
+| `CLAUDISH_MODEL_FABLE` | Model for Fable role | |
 | `CLAUDISH_MODEL_SUBAGENT` | Model for sub-agents | |
 | `CLAUDISH_SUMMARIZE_TOOLS` | Summarize tool descriptions (`true`/`1`) | `false` |
 | `CLAUDISH_TELEMETRY` | Override telemetry (`0`/`false`/`off` to disable) | From config |
@@ -426,10 +356,6 @@ Every one of these also accepts `CUSTOM_<NAME>_KEY` as an alias, and any of them
 | `CLAUDISH_LOCAL_QUEUE_ENABLED` | Enable/disable local model queue | `true` |
 | `CLAUDISH_DEFAULT_PROVIDER` | Default provider for bare model routing (v7.0.0+) | Auto-detected |
 | `CLAUDISH_QWEN_NO_THINK` | Disable thinking for Qwen models (`1`) | |
-| `CLAUDISH_NO_PREDEFINED_ENDPOINTS` | Turn the bundled endpoint catalog off entirely (`1`) | Catalog on |
-| `CLAUDISH_CLASSIFIER_PROVIDER` | Route auto-mode permission classifier to native Anthropic (`anthropic`) — see [Classifier Passthrough](docs/models/model-mapping.md#auto-mode-classifier-passthrough) | Off |
-| `CLAUDISH_CLASSIFIER_MODEL` | Native Claude model for the classifier passthrough (also enables it) | `claude-sonnet-5` |
-| `CLAUDISH_CLASSIFIER_DEBUG` | Dump raw requests to `logs/classifier-capture.jsonl` for classifier-detection debugging (`1`) | Off |
 
 #### Claude Code Compatibility
 
@@ -439,6 +365,7 @@ Every one of these also accepts `CUSTOM_<NAME>_KEY` as an alias, and any of them
 | `ANTHROPIC_DEFAULT_OPUS_MODEL` | Fallback for `CLAUDISH_MODEL_OPUS` |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL` | Fallback for `CLAUDISH_MODEL_SONNET` |
 | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Fallback for `CLAUDISH_MODEL_HAIKU` |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | Fallback for `CLAUDISH_MODEL_FABLE` |
 | `CLAUDE_CODE_SUBAGENT_MODEL` | Fallback for `CLAUDISH_MODEL_SUBAGENT` |
 | `CLAUDE_PATH` | Custom path to Claude Code binary |
 
@@ -448,14 +375,10 @@ Every one of these also accepts `CUSTOM_<NAME>_KEY` as an alias, and any of them
 |----------|----------|---------|
 | `GEMINI_BASE_URL` | Gemini API | `https://generativelanguage.googleapis.com` |
 | `OPENAI_BASE_URL` | OpenAI/Azure | `https://api.openai.com` |
-| `MINIMAX_BASE_URL` | MiniMax | `https://api.minimax.io` (China-platform keys: `https://api.minimaxi.com`) |
+| `MINIMAX_BASE_URL` | MiniMax | `https://api.minimaxi.com` |
 | `MOONSHOT_BASE_URL` | Kimi/Moonshot | `https://api.moonshot.ai` |
 | `ZHIPU_BASE_URL` | GLM/Zhipu | `https://open.bigmodel.cn` |
 | `ZAI_BASE_URL` | Z.AI | `https://api.z.ai` |
-| `QWEN_CODING_PLAN_BASE_URL` | Alibaba Coding Plan | `https://coding-intl.dashscope.aliyuncs.com` |
-| `QWEN_TOKEN_PLAN_BASE_URL` | Alibaba Token Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com` |
-| `DASHSCOPE_BASE_URL` | Alibaba PAYG | `https://dashscope-intl.aliyuncs.com` |
-| `META_BASE_URL` | Meta Model API (`meta@`) | `https://api.meta.ai` |
 | `OLLAMACLOUD_BASE_URL` | OllamaCloud | `https://ollama.com` |
 | `OPENCODE_BASE_URL` | OpenCode Zen | `https://opencode.ai/zen` |
 | `LITELLM_BASE_URL` | LiteLLM proxy server | _(required with LITELLM_API_KEY)_ |
@@ -464,15 +387,13 @@ Every one of these also accepts `CUSTOM_<NAME>_KEY` as an alias, and any of them
 | `LMSTUDIO_BASE_URL` | LM Studio (local) | `http://localhost:1234` |
 | `VLLM_BASE_URL` | vLLM (local) | `http://localhost:8000` |
 | `MLX_BASE_URL` | MLX (local) | `http://127.0.0.1:8080` |
-| `TUNING_ENGINES_BASE_URL` | Tuning Engines (`tuningengines@`), self-hosted gateway | `https://api.tuningengines.com` |
-
-**A malformed base-URL override SKIPS the provider — it never falls back to the public host.** You set the variable to keep traffic inside your own network; quietly redirecting a typo to a vendor's public endpoint would send exactly the data you were isolating to exactly the place you were isolating it from.
 
 **Priority order**: CLI flags > `CLAUDISH_*` env vars > `ANTHROPIC_*` env vars > profile config > interactive selector.
 
 **Important Notes:**
-- Set `ANTHROPIC_API_KEY=sk-ant-api03-placeholder` (or any value) to suppress the Claude Code login dialog
-- In interactive mode, if no API key is set, you'll be prompted to enter one
+- When Claudish launches Claude Code in proxy-only mode, it sets non-secret placeholders in both `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`, and applies `forceLoginMethod: "console"`. Together these bypass local Claude/Anthropic onboarding; they do not authenticate any upstream provider.
+- Hub access is authenticated separately (for example with `x-proxy-key`), while provider credentials remain on the Claudish host.
+- Native Anthropic mappings and monitor mode do not receive placeholders: they intentionally preserve the user's real Claude/Anthropic authentication.
 
 ### Configuration Files
 
@@ -482,7 +403,7 @@ Claudish uses a two-scope configuration system:
 |------|-------|---------|
 | `~/.claudish/config.json` | Global | Profiles, telemetry, routing rules (shared across projects) |
 | `.claudish.json` | Local | Project-specific profiles and routing rules (overrides global) |
-| `.env` | Local | Provider API keys and model settings (auto-loaded at startup) |
+| `.env` | Local | Environment variables (auto-loaded at startup) |
 
 **Profile configuration** (`~/.claudish/config.json`):
 
@@ -523,96 +444,6 @@ claudish profile edit <name>                # Edit profile
 
 For the complete configuration reference, see [Settings Reference](docs/settings-reference.md).
 
-## 1Password Integration
-
-Resolve provider API keys from 1Password instead of storing them in plaintext. Claudish reads [secret references](https://developer.1password.com/docs/cli/secret-references/) (`op://vault/item/field`) and resolves them at startup — the secret never lives in your config or shell history.
-
-**Authentication** is automatic, in this order:
-
-1. **`OP_SERVICE_ACCOUNT_TOKEN`** — a [service-account token](https://developer.1password.com/docs/service-accounts/) for headless/CI use (resolved via the official 1Password SDK, in-process, no `op` CLI needed). Service accounts can only read **shared** vaults, not your Private vault.
-2. **`op` CLI session** — if you're signed into the 1Password desktop app (`op signin`), claudish uses that session (interactive, Touch ID). This is the zero-setup path on a laptop.
-
-If a config value or env var starts with `op://` and neither auth method works, claudish **fails with a clear message** rather than running with a missing key. If no `op://` reference is present, claudish never touches 1Password (zero overhead for non-users).
-
-> **About the authorization prompt:** When claudish reads a secret via the `op` CLI session, the 1Password desktop app shows an authorization prompt. By design, 1Password labels that prompt with the **requesting process** — i.e. your terminal (`tmux`, `iTerm`, etc.) — not "claudish". This is a 1Password behavior that no app can override; the prompt always names the process, never the integration. claudish *is* identified as `claudish` in 1Password's **activity/audit log**, just not in the live prompt. To avoid the prompt entirely (e.g. CI, or if the terminal name bothers you), use a `OP_SERVICE_ACCOUNT_TOKEN` — the service-account path authenticates directly against the 1Password API with **no desktop prompt at all**.
-
-### Single references
-
-Point any API key at a 1Password field:
-
-```json
-{
-  "apiKeys": {
-    "OPENROUTER_API_KEY": "op://Shared/OpenRouter/credential",
-    "OPENAI_API_KEY": "op://Shared/OpenAI/api-key"
-  }
-}
-```
-
-A `${VAR}` in a custom-endpoint `apiKey` and an `op://...` value are both resolved the same way. Multiple references are resolved in a single batch (one auth prompt).
-
-### Glob import — many keys from one item
-
-If you keep all your provider keys in one 1Password item (each field named after its env var, e.g. `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`), import them all with one entry. Add a top-level `onepassword` array of glob paths:
-
-```json
-{
-  "onepassword": [
-    "op://Jack/AI LLM keys/*/*_API_KEY"
-  ]
-}
-```
-
-The glob position mirrors the `op://` path structure:
-
-| Pattern | Imports |
-|---------|---------|
-| `op://Vault/Item/*` | all **top-level** (sectionless) fields |
-| `op://Vault/Item/*_API_KEY` | top-level fields ending in `_API_KEY` |
-| `op://Vault/Item/Section/*` | all fields in `Section` |
-| `op://Vault/Item/*/*_API_KEY` | `*_API_KEY` fields across **all** sections |
-| `op://Vault/Item/M*/*` | all fields in sections starting with `M` |
-
-Each matched **field label becomes the env var name** (trimmed of whitespace). Labels that aren't valid env var names (e.g. `Customer Key`) are skipped with a warning. Only matched fields are decrypted — claudish lists field names first, then fetches values only for the ones you import.
-
-Preview what a glob would import **without revealing any secret values**:
-
-```bash
-claudish op --list "op://Jack/AI LLM keys/*/*_API_KEY"
-#   OPENROUTER_API_KEY   ✓  (section: Open router)
-#   ANTHROPIC_API_KEY    ✓  (section: Claude)
-#   Customer Key         ✗  skipped (not a valid env var name)
-#   9 importable, 1 skipped
-```
-
-Or run a one-off session with keys loaded inline, no config needed:
-
-```bash
-claudish op "op://Jack/AI LLM keys/*/*_API_KEY" --model openrouter@deepseek/deepseek-r1 "task"
-```
-
-### Finding the path
-
-In the 1Password app, hover a field → its menu → **Copy Secret Reference** gives `op://Vault/Item/[Section/]Field`. For a glob, you only need the vault and item names (visible in the sidebar and title) plus `/*` — claudish discovers the fields. The `claudish op --list` preview confirms a glob before you commit it to config.
-
-### 1Password Environments
-
-[1Password Environments](https://www.1password.dev/environments) (named sets of env vars) load via `--op-env <id>`, where `<id>` is the Environment ID copied from the desktop app (Developer → View Environments → Manage environment → Copy environment ID):
-
-```bash
-claudish --op-env <environment-id> --model openrouter@... "task"
-```
-
-Environment values are the **highest-priority source** (they override config and shell env). Requires the `op` CLI **≥ 2.35 (beta)** — the latest stable `op` (2.34.0) does not yet include the `op environment` command.
-
-### Zero-code alternative
-
-You can also wrap claudish with `op run` (no config changes needed), using an env file of `op://` references:
-
-```bash
-op run --env-file=.env -- claudish --model openrouter@... "task"
-```
-
 ## Model Routing (v4.0.0+)
 
 Claudish uses **`provider@model[:concurrency]`** syntax for explicit routing, plus **smart auto-detection** for native providers:
@@ -638,21 +469,12 @@ claudish --model ollama@llama3.2:3 "code review"  # 3 concurrent requests
 | `kimi@`, `moon@` | Kimi Direct | `MOONSHOT_API_KEY` | `kimi@kimi-k2` |
 | `glm@`, `zhipu@` | GLM Direct | `ZHIPU_API_KEY` | `glm@glm-4` |
 | `zai@` | Z.AI Direct | `ZAI_API_KEY` | `zai@glm-4` |
-| `mistral@` | Mistral | `MISTRAL_API_KEY` | `mistral@mistral-large-2512` |
-| `sakana@`, `fugu@` | Sakana Fugu | `SAKANA_API_KEY` | `fugu@fugu-ultra` |
-| `sc@` | Sakana Fugu Subscription | `SAKANA_CODING_API_KEY` | `sc@fugu-ultra` |
-| `qcode@` | Alibaba Coding Plan | `QWEN_CODING_PLAN_API_KEY` | `qcode@qwen3.7-plus` |
-| `qtoken@` | Alibaba Token Plan | `QWEN_TOKEN_PLAN_API_KEY` | `qtoken@qwen3.7-plus` |
-| `qpay@` | Alibaba PAYG | `DASHSCOPE_API_KEY` | `qpay@qwen3.7-plus` |
-| `meta@` | Meta Model API (metered) | `META_API_KEY` | `meta@muse-spark-1.3` |
-| `muse@` | Muse Code subscription (Meta) | _(`claudish login muse`, or the Muse Code CLI's Keychain login)_ | `muse@muse-wonder-full-1.0` |
-| `llama@`, `lc@` | OllamaCloud | `OLLAMA_API_KEY` | `llama@llama-3.1-70b` |
+| `llama@`, `lc@`, `meta@` | OllamaCloud | `OLLAMA_API_KEY` | `llama@llama-3.1-70b` |
 | `oc@` | OllamaCloud | `OLLAMA_API_KEY` | `oc@llama-3.1-70b` |
-| `zen@` | OpenCode Zen | `OPENCODE_API_KEY` | `zen@gpt-5-nano` |
-| `zgo@`, `zengo@` | OpenCode Zen Go plan | `OPENCODE_GO_API_KEY` | `zgo@glm-5` |
-| `v@`, `vertex@` | Vertex AI | _(Application Default Credentials; `VERTEX_PROJECT` optional)_ | `v@gemini-2.5-flash` |
-| `ag@`, `antigravity@` | Antigravity (Gemini subscription) | _(OAuth via `claudish login antigravity`)_ | `ag@gemini-3.6-flash` |
-| `go@` | _deprecated alias → `ag@`_ | _(OAuth)_ | `go@gemini-2.5-flash` |
+| `zen@` | OpenCode Zen (free/paid) | `OPENCODE_API_KEY` _(optional)_ | `zen@gpt-5-nano` |
+| `zgo@`, `zengo@` | OpenCode Zen Go plan | `OPENCODE_API_KEY` | `zgo@glm-5` |
+| `v@`, `vertex@` | Vertex AI | `VERTEX_API_KEY` | `v@gemini-2.5-flash` |
+| `go@` | Gemini CodeAssist | _(OAuth)_ | `go@gemini-2.5-flash` |
 | `poe@` | Poe | `POE_API_KEY` | `poe@GPT-4o` |
 | `ollama@` | Ollama (local) | _(none)_ | `ollama@llama3.2` |
 | `lms@`, `lmstudio@` | LM Studio (local) | _(none)_ | `lms@qwen2.5-coder` |
@@ -671,13 +493,9 @@ When no provider is specified, Claudish auto-detects from model name:
 | `abab-*`, `minimax/*` | MiniMax Direct | `abab-6.5` |
 | `kimi-*`, `moonshot-*` | Kimi Direct | `kimi-k2` |
 | `glm-*`, `zhipu/*` | GLM Direct | `glm-4` |
-| `fugu-*`, `sakana/*` | Sakana Fugu | `fugu-ultra` |
-| `qwen3.*`, `qwen3-*` | Alibaba subscriptions, OpenCode Go, PAYG, then OpenRouter | `qwen3.7-plus` |
 | `poe:*` | Poe | `poe:GPT-4o` |
 | `claude-*`, `anthropic/*` | Native Anthropic | `claude-sonnet-4` |
 | **Unknown `vendor/model`** | **Error** | Use `openrouter@vendor/model` |
-
-**Alibaba product rosters**: Coding Plan, Token Plan, and PAYG use separate credentials and endpoints. The catalog supplies each product's route and model wire ID; account discovery narrows the models actually available to your key. Cross-vendor models on an Alibaba plan can be selected explicitly, for example `qtoken@glm-5.2`.
 
 ### Examples
 
@@ -696,16 +514,9 @@ claudish --model openrouter@deepseek/deepseek-r1 "deep analysis"
 claudish --model llama@llama-3.1-70b "code review"
 claudish --model oc@llama-3.2-vision "analyze image"
 
-# Vertex AI - Google Cloud (Application Default Credentials)
-gcloud auth application-default login                # once
-claudish --model v@gemini-2.5-flash "task"           # project from ADC / gcloud config
-VERTEX_PROJECT=my-project claudish --model vertex@gemini-2.5-flash "explicit project"
-
-# Alibaba Cloud Model Studio products
-claudish --model qcode@qwen3.7-plus "implement feature"
-claudish --model qtoken@qwen3.7-plus "implement feature"
-claudish --model qpay@qwen3.7-plus "implement feature"
-claudish --model qtoken@glm-5.2 "review"
+# Vertex AI - Google Cloud
+VERTEX_API_KEY=... claudish --model v@gemini-2.5-flash "task"
+VERTEX_PROJECT=my-project claudish --model vertex@gemini-2.5-flash "OAuth mode"
 
 # Local models with concurrency control
 claudish --model ollama@llama3.2:3 "review"     # 3 concurrent requests
@@ -746,7 +557,7 @@ Register your own OpenAI-compatible endpoints in `~/.claudish/config.json`. See 
       "kind": "simple",
       "url": "http://gpu-box:8000/v1",
       "format": "openai",
-      "apiKey": "${VLLM_API_KEY}"
+      "apiKey": "none"
     }
   },
   "defaultProvider": "my-vllm"
@@ -754,26 +565,6 @@ Register your own OpenAI-compatible endpoints in `~/.claudish/config.json`. See 
 ```
 
 Then route to it with: `claudish --model my-vllm@llama3 "task"`
-
-**If the endpoint needs no credential** (a local router, an inference server on a trusted
-network), say so with `authScheme: "none"` and omit `apiKey` — claudish then sends no auth
-header at all:
-
-```json
-{
-  "customEndpoints": {
-    "localrouter": {
-      "kind": "simple",
-      "url": "http://127.0.0.1:8402/v1",
-      "format": "openai",
-      "authScheme": "none"
-    }
-  }
-}
-```
-
-Do **not** use a placeholder like `"apiKey": "none"` for this — that is a literal key, and it
-goes out as `Authorization: Bearer none`, which some gateways reject.
 
 ### Legacy Syntax (Deprecated)
 
@@ -815,7 +606,7 @@ List all models:
 ```bash
 claudish --models              # List all OpenRouter models
 claudish --models gemini       # Search for specific models
-claudish --models-top          # Show curated recommendations
+claudish --top-models          # Show curated recommendations
 ```
 
 ## Claude Code Flag Passthrough (NEW in v5.3.0)
@@ -1011,7 +802,7 @@ claudish "debug issue" --verbose
 claudish "analyze code" --cwd /path/to/project
 
 # Multiple flags
-claudish --model openai/gpt-5.3-codex "task" --verbose --debug-claudish
+claudish --model openai/gpt-5.3-codex "task" --verbose --debug
 ```
 
 ### Monitor Mode
@@ -1020,14 +811,14 @@ claudish --model openai/gpt-5.3-codex "task" --verbose --debug-claudish
 
 ```bash
 # Enable monitor mode (requires real Anthropic API key)
-claudish --monitor --debug-claudish "implement a feature"
+claudish --monitor --debug "implement a feature"
 ```
 
 **What Monitor Mode Does:**
 - ✅ **Proxies to REAL Anthropic API** (not OpenRouter) - Uses your actual Anthropic API key
 - ✅ **Logs ALL traffic** - Captures complete requests and responses
 - ✅ **Both streaming and JSON** - Logs SSE streams and JSON responses
-- ✅ **Debug logs to file** - Saves to `logs/claudish_*.log` when `--debug-claudish` is used
+- ✅ **Debug logs to file** - Saves to `logs/claudish_*.log` when `--debug` is used
 - ✅ **Pass-through proxy** - No translation, forwards as-is to Anthropic
 
 **When to use Monitor Mode:**
@@ -1041,8 +832,8 @@ claudish --monitor --debug-claudish "implement a feature"
 # Monitor mode requires a REAL Anthropic API key (not placeholder)
 export ANTHROPIC_API_KEY='sk-ant-api03-...'
 
-# Use with --debug-claudish to save logs to file
-claudish --monitor --debug-claudish "your task"
+# Use with --debug to save logs to file
+claudish --monitor --debug "your task"
 
 # Logs are saved to: logs/claudish_TIMESTAMP.log
 ```
@@ -1072,7 +863,7 @@ data: {"type":"content_block_start",...}
 === End Streaming Response ===
 ```
 
-**Note:** Monitor mode charges your Anthropic account (not OpenRouter). Use `--debug-claudish` flag to save logs for analysis.
+**Note:** Monitor mode charges your Anthropic account (not OpenRouter). Use `--debug` flag to save logs for analysis.
 
 ### Output Modes
 
@@ -1295,11 +1086,7 @@ Claudish implements the Anthropic Messages API's `interleaved-thinking` protocol
 
 ### Documentation
 
-For complete protocol documentation, see:
-- [STREAMING_PROTOCOL.md](./STREAMING_PROTOCOL.md) - Complete SSE protocol spec
-- [PROTOCOL_FIX_V2.md](./PROTOCOL_FIX_V2.md) - Critical V2 protocol fix (event ordering)
-- [COMPREHENSIVE_UX_ISSUE_ANALYSIS.md](./COMPREHENSIVE_UX_ISSUE_ANALYSIS.md) - Technical analysis
-- [THINKING_BLOCKS_IMPLEMENTATION.md](./THINKING_BLOCKS_IMPLEMENTATION.md) - Implementation summary
+Protocol documentation lives in `docs/` (see `docs/reference/proxy-pipeline-notes.md` for the SSE pipeline).
 
 ## Dynamic Reasoning Support (NEW in v1.4.0)
 
@@ -1445,12 +1232,6 @@ bun tests/debug-snapshot.ts
 - ✅ Usage metrics (present in message_start and message_delta)
 - ✅ Stop reasons (always present and valid)
 - ✅ Cache metrics (creation and read tokens)
-
-**Documentation:**
-- [Quick Start Guide](./QUICK_START_TESTING.md) - Get started with testing
-- [Snapshot Testing Guide](./SNAPSHOT_TESTING.md) - Complete testing documentation
-- [Implementation Details](./ai_docs/IMPLEMENTATION_COMPLETE.md) - Technical implementation summary
-- [Protocol Compliance Plan](./ai_docs/PROTOCOL_COMPLIANCE_PLAN.md) - Detailed compliance roadmap
 
 ### Install Globally
 

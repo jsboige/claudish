@@ -1,0 +1,284 @@
+# Relay Sidecar Deployment Runbook
+
+The relay/sidecar design (v7.2+, see `CLAUDE.md` → "Relay / Sidecar Mode") removes po-2023 as a single point of failure: each machine runs its own claudish container that **relays** to the hub in nominal mode and **takes over locally** (AUTONOMOUS) when the hub dies. The relay code lives in [`packages/cli/src/fork/server/relay.ts`](../../packages/cli/src/fork/server/relay.ts); the per-machine installer is [`scripts/install-sidecar.ps1`](../../scripts/install-sidecar.ps1).
+
+This runbook deploys a sidecar on each cluster machine **except web1** (which keeps pointing at `models.myia.io` directly), **except the hub machine** — po-2025 since the 2026-09 migration (`192.168.0.50`), po-2023 (`192.168.0.46`) before it — and **except po-2027** (hub-direct via the WAN edge, no local container; see the bullet under the matrix).
+
+## Architecture reminder — one binary, three modes
+
+| `CLAUDISH_RELAY_UPSTREAM` | Mode | Behavior |
+| --- | --- | --- |
+| **unset** | HUB | Always local. Unchanged. |
+| set + hub **alive** | **NOMINAL relay** | Forwards the raw request to the hub; response repiped through the never-hang passthrough. No local capture (hub captures centrally). |
+| set + hub **dead** | **AUTONOMOUS** | Local pipeline + local capture. Leak-policy hard (never Anthropic on machines with `CLAUDISH_NO_ANTHROPIC=1`). |
+
+Hysteresis: 2 consecutive heartbeat failures → AUTONOMOUS; recovery needs 3 OK heartbeats + 60s cooldown + a deep tool-call probe before returning to NOMINAL (anti-flap).
+
+## Prerequisite — choose the client authentication contract
+
+Every machine's Claude Code `settings.json` must carry the cluster proxy key in the **`x-proxy-key`** custom header (NOT `x-api-key` — that triggers the hub's native swap and strips OAuth, breaking Opus). Keep that real hub credential separate from Claude Code's local authentication fields.
+
+### Hybrid / Anthropic pass-through
+
+Use this contract only on a machine that already has the required Claude/Anthropic OAuth and is authorized to route a native Anthropic lane:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Claudish-Machine: <MACHINE>\nx-proxy-key: <CLUSTER_KEY>"
+  }
+}
+```
+
+The empty token deliberately lets local OAuth authenticate native requests. Do not add proxy-only placeholders or force Console login to this profile.
+
+### Proxy-only / no Anthropic account
+
+Use this contract for a client whose advertised roles all resolve through non-Anthropic providers on the hub:
+
+```json
+{
+  "forceLoginMethod": "console",
+  "disableClaudeAiConnectors": true,
+  "env": {
+    "ANTHROPIC_API_KEY": "sk-ant-api03-placeholder-not-used-proxy-handles-auth-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "ANTHROPIC_AUTH_TOKEN": "placeholder-token-not-used-proxy-handles-auth",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Claudish-Machine: <MACHINE>\nx-proxy-key: <CLUSTER_KEY>"
+  }
+}
+```
+
+The two constant placeholders only bypass Claude Code's local onboarding checks. They are not provider credentials and must never be replaced with the real cluster key. `x-proxy-key` is the sole real client credential in this example; upstream provider credentials remain on the hub. Do not advertise a `claude-*` target in a proxy-only role mapping.
+
+After the sidecar is installed, repoint `ANTHROPIC_BASE_URL` to the **local** sidecar (`http://localhost:3000`) instead of the hub IP/subdomain.
+
+## Per-machine sidecar config
+
+| Machine | `-Upstream` | `-Compress` | `-NoAnthropic` | Note |
+|---|---|---|---|---|
+| myia-ai-01 | `http://192.168.0.50:3000` | — | **no** | The one Anthropic authority; Opus traverses the relay via the header fix (OAuth preserved). **LAN since the 2026-09-07 recreate** — measured 2026-10-15 at the live path: container env `CLAUDISH_RELAY_UPSTREAM=http://192.168.0.50:3000`, in-container `wget …/health` → 200, `/health` `relay-nominal`. The 2026-08-10 "no route" finding was against the old hub `.46` (see "Docker cannot reach the LAN hub") — diagnose from inside the container, never inherit this row. Also needs `-HostPort 3002 -ContainerName claudish-sidecar` (3000 taken by a third-party service). |
+| myia-po-2024 | `http://192.168.0.50:3000` | — | yes | LAN — **repointed** (measured 2026-10-15: bun-process launcher AND live `/health` upstream both carry `.50`; the 2026-09-14 `.46` drift is cleared — see the dated correction under "A hub migration does not propagate") |
+| myia-po-2025 | **none** | — | — | **The hub — no sidecar, never `CLAUDISH_RELAY_UPSTREAM`.** On 2026-09-19 a sidecar-model `.env` here (`https://models.myia.io`) made the hub relay to itself through the edge for 4 h 40, `200` all along and invisible from outside; `CLAUDISH_NO_ANTHROPIC=1` is not the hub's policy either. |
+| myia-po-2026 | `http://192.168.0.50:3000` | — | yes | LAN — **HS matériel, hors service** (user declaration, 10/10 per Maintenance#91); the `.46` drift below is a dead record, no longer to correct |
+| myia-po-2023 | `http://host.docker.internal:18182` | — | **no — never set (deviation)** | No longer the hub; runs the relay sidecar. Measured 2026-10-17 from the seat: container env `CLAUDISH_RELAY_UPSTREAM=http://host.docker.internal:18182` and live `/health` agree (`role: relay-nominal`, `selfLoop: false`). The upstream is the **host-side tunnel, deliberately not a LAN IP** — the 2026-09 migration lesson for this seat; never "fix" it to `192.168.0.50`. Compose dir = the dev clone itself (`D:\Dev\claudish`, read from the container's compose working-dir label). **Deviation**: `CLAUDISH_NO_ANTHROPIC` is absent from the compose `.env` — never set in any of its 11 backup generations back to 2026-08, not dropped — so compose interpolates it empty and the truthiness read at `proxy-server.ts:1177` leaves the leak backstop **disarmed**. Bounded exposure: NOMINAL forwards everything to the hub (hub policy governs); in AUTONOMOUS a bare native request would *attempt* api.anthropic.com instead of being refused locally. Fix = one line in the compose-dir `.env` + drained recreate (`claudish-drain.ps1 -Recreate -EnvFile` — cascades are armed in that `.env`, `FAILOVER_AUTO=1`); scheduled gesture, not done in the docs pass that measured it. **Client path — recorded in `fleet-state.md` only** (§po-2023 client-path cell): since ~19/10 the seat's clients are hub-direct (0 client requests through this relay over 6 consecutive 5 h windows, last closed 21/10 04:47Z). One record per cell: the matrix of record is `fleet-state.md`, not this install-flags table. |
+| myia-po-2028 | `http://192.168.0.50:3000` | — | yes | Fleet canevas install (onboarding 19-20/10, replaces HS po-2026): container `claudish-proxy`, live `/health` `relay-nominal`, capture host dir **`D:\claudish-captures`**, compose dir **`D:\dev\claudish`** (workspace migrated `C:`→`D:` 27/10, re-created from the new location — both read from the container, labels and mounts, not from a file). **Hub attribution verified by the coordinator 20/10** — hub captures `req-1-11628…02-54-37` carry `machine=myia-po-2028`. The `-Upstream` literal is the fleet-canevas value; the seat's own pass should read it live from the container before this row is treated as measured-from-seat. |
+
+- **web1**: no sidecar — stays on `https://models.myia.io` directly.
+- **po-2027**: no sidecar either — **hub-direct via the WAN edge** (`https://models.myia.io` with `X-Claudish-Machine: myia-po-2027`, cluster key fp `6302afdc`); `docker ps -a --filter name=claudish` is empty on that seat. Measured 2026-10-16 and recorded as the #291 matrix row in `fleet-state.md` — this doc previously implied a sidecar belonged there (only web1 and the hub were excepted), which the matrix row now contradicts. Four lanes share the seat (`claudish`, `CoursIA`, `CoursIA-2`, `roo-extensions`).
+- **po-2023**: its row above was measured from the seat on 2026-10-17, closing the gap noted 2026-10-16 — the row (not this bullet) is the live record, including the `-NoAnthropic` deviation it carries.
+
+### A hub migration does not propagate to a sidecar's upstream
+
+`CLAUDISH_RELAY_UPSTREAM` is a **literal baked into the sidecar's `.env` at install time**. Nothing re-resolves it: move the hub and every sidecar keeps forwarding to the old address until someone edits that file by hand.
+
+The 2026-09 migration (hub po-2023 `192.168.0.46` → po-2025 `192.168.0.50`) exposed this on **po-2024**, where a standalone sidecar (`:3914`, auto-started from HKCU `Run` via `.start-claudish-sidecar.ps1`) still carries the hardcoded `http://192.168.0.46:3000`. It relays po-2024 → po-203 → hub, re-introducing po-203 into a path the sidecar design exists to remove. This document previously stated that **po-2026's `.env` was repointed to `.50` by hand on 2026-09-13 — that never landed**: measured 2026-09-23, the compose `.env` (`C:\dev\claudish\.env`, mtime 2026-07-26) and the live container env **both** still carry `.46`. Both machines are in the same drift state; po-2026's is latent only because its client points at the hub directly and the sidecar serves zero streams. The repoint was planned for the next drained recreate, via `[PROPOSAL]` + single ACK (coordinator arbitration 2026-09-22) — **mooted: po-2026 went hard-down (HS matériel) on 10/10** per the user's declaration (Maintenance#91, on-site ~00:30), so the drift is a dead record, no longer scheduled for a repoint. Nothing flagged the drift on either machine until the live paths were cross-read — a settings file alone proves nothing about the container. **Update 2026-10-15 (po-2024)**: that machine's drift is cleared — the bun-process launcher file and the live `/health` (`upstream: http://192.168.0.50:3000`, role `relay-nominal`) both carry `.50` (measured while answering po-2027:claudish's onboarding). Only **po-2026** carried the drift state above, and it is out of service.
+
+### The compose dir may be a different clone than the one you develop in
+
+On po-2026 the sidecar's compose project lives in **`C:\dev\claudish`**, while the working/dev tree is `D:\Dev\claudish`. The `.env` that governs the container is the one **in the compose dir**, not the one nearest your editor — a repoint edited into the wrong clone is a silent no-op on the running container (and a plausible origin for "repointed" claims that never landed). Read the authoritative path from the container itself:
+
+```powershell
+docker inspect claudish-proxy --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+```
+
+Then verify the change the same way the change is consumed: `docker inspect <container> --format '{{range .Config.Env}}{{println .}}{{end}}' | Select-String '^CLAUDISH_RELAY_UPSTREAM='` — **filter before anything is printed**: the unfiltered env carries `CLAUDISH_PROXY_KEY` in clear, and a console output tends to end up in a transcript, a capture or a dashboard. The **container env**, never the file alone, is the live path (a start does not reload `.env`; only a recreate does).
+
+**Why a per-consumer verification misses it**: `ANTHROPIC_BASE_URL` on po-2024 reads `http://192.168.0.50:3000` — correct. The drift lives in a **second, independent consumer** (an auto-start process), not in the settings file. Verifying "where each client lands" therefore means **enumerating processes**, not reading `~/.claude/settings.json`:
+
+```powershell
+Get-NetTCPConnection -State Established | Where-Object RemotePort -in 3000,3001,3002 |
+  ForEach-Object { "$($_.OwningProcess) -> $($_.RemoteAddress):$($_.RemotePort)" }
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'claudish|sidecar|proxy' } |
+  Select-Object ProcessId, CommandLine
+```
+
+Any hub move must walk this list on every machine. A machine whose only evidence of migration is its settings file is **unverified**, not migrated.
+
+## Prerequisites on each sidecar machine
+
+1. **Docker** + `docker compose`.
+2. **`config.json`** at `~/.claudish/config.json` with provider keys (`ZAI_API_KEY` / `GLM_CODING_API_KEY` / `MINIMAX_CODING_API_KEY`, routing, profiles). The installer refuses to proceed without one — copy from the hub's `~/.claudish/config.json` and adjust per machine.
+3. **Captures dir** (default `D:\claudish-captures`; override with `-CapturesDir` on machines without a D: drive).
+4. **Windows PowerShell 5.1 or PowerShell 7** — the installer runs under both (every native call that redirects stderr is scoped off `$ErrorActionPreference = 'Stop'`, the PS 5.1 NativeCommandError trap — #549/#569).
+
+## Install (run ON the target machine)
+
+```powershell
+# From a clone of the fork (or the installer clones it for you at C:\Dev\claudish)
+cd D:\Dev\claudish   # if already cloned here; else the script clones to C:\Dev\claudish
+
+# ai-01 (Anthropic authority — NO -NoAnthropic; port 3000 taken)
+.\scripts\install-sidecar.ps1 -Machine myia-ai-01 `
+    -Upstream http://192.168.0.50:3000 -ProxyKey '<CLUSTER_KEY>' -HostPort 3002 -ContainerName claudish-sidecar
+
+# a LAN machine (e.g. po-2026)
+.\scripts\install-sidecar.ps1 -Machine myia-po-2026 `
+    -Upstream http://192.168.0.50:3000 -ProxyKey '<CLUSTER_KEY>' -NoAnthropic
+
+# a machine whose CONTAINER cannot reach .50 (diagnosed from inside, see Troubleshooting)
+#   -Upstream https://models.myia.io        (no -Compress: see "WAN upstream — measured traps")
+# Never on the hub machine (po-2025): it runs no sidecar.
+```
+
+The installer is **idempotent**: it pulls latest `main`, (re)writes the `.env`, and recreates the container. It will not clobber an existing `config.json` — and since #141 it will not clobber runtime-policy lines either: any `CLAUDISH_FAILOVER_*`, `CLAUDISH_QWEN_THINKING`, `CLAUDISH_GLM_THINKING`, `SEARXNG_URL` or set-but-empty `CLAUDISH_CAPTURE_DIR` lines already present in the `.env` are carried over verbatim on rewrite (before #141 the wholesale rewrite silently dropped them, so an armed cascade lived only in the container's Docker env record — and the installer's own `compose up` wiped it).
+
+What it sets (in `<RepoDir>/.env`, consumed by `docker-compose.yml`):
+- `CLAUDISH_PROXY_KEY` — the cluster gate key (same everywhere).
+- `CLAUDISH_RELAY_UPSTREAM` — the hub URL.
+- `CLAUDISH_MACHINE` (`-Machine`) — the canonical fleet id (e.g. `myia-po-2024`). Since #345 the relay's own liveness probe sends it as `X-Claudish-Machine` so the hub attributes that probe to the machine instead of filing it as a header-less phantom lane. Operator knowledge, never derived inside the container (its hostname is the container id).
+- `CLAUDISH_RELAY_COMPRESS=1` (only with `-Compress`; WAN uplink gzip).
+- `CLAUDISH_NO_ANTHROPIC=1` (only with `-NoAnthropic`; leak-policy local backstop).
+- `CLAUDISH_CONFIG_DIR` / `CLAUDISH_CAPTURE_HOST_DIR` — the host bind-mount paths.
+- `CLAUDISH_HOST_PORT` (`-HostPort`, default 3000) — the published host port. **Required on any machine where 3000 is already taken** (ai-01, where a third-party service holds it). The container side always stays 3000.
+- `CLAUDISH_CONTAINER_NAME` (`-ContainerName`, default `claudish-proxy`) — give a sidecar its own name so logs and scripts never confuse it with the hub container.
+- `CLAUDISH_CAPTURE_DIR=` (empty, only with `-NoCapture`) — disables capture writing. Escape hatch for disk-starved hosts only; it destroys the outage-capture trail that `reconcile-outage-captures.ps1` depends on.
+
+### Recovering an armed cascade that exists only in the container (#141)
+
+If the cascades were armed by hand (container env, never written to the `.env` — the pre-#141 default), **any recreate wipes them**. Two protections:
+
+- **Refusals.** The installer **exits non-zero** before writing anything when the `.env` it is about to produce carries no armed `CLAUDISH_FAILOVER_*` while the live container has one; `claudish-drain.ps1 -Recreate` refuses the same condition against its `-EnvFile` (an env file can *exist* and still gut the cascades — it merely lacks them).
+- **Recovery.** `install-sidecar.ps1 -RebuildEnvFromContainer` rebuilds the `.env` from the live container's env record (`docker inspect`), reports which armed vars were missing (names only), and verifies the write by reading it back — no pull, no compose, container untouched. The output file contains `CLAUDISH_PROXY_KEY`: local file only, never committed, never displayed. `-WriteEnvOnly` refreshes the `.env` (with the preserve rules above) without touching the container.
+
+### An armed cascade is blind to bare model ids without `ROLE_MODELS` — measured both ways, 2026-09-22
+
+Arming `CLAUDISH_FAILOVER_<ROLE>` is necessary but not sufficient: `roleFromModelName()` matches only `opus|sonnet|haiku|fable`, so a client naming the model directly (`model=glm-5.2` in an sdk-ts request, no role anywhere) resolves to `null` and the cascade never engages — the request walks the full retry ladder against the wall with nowhere to fall. Two measurements the same morning:
+
+- **Without the mapping** (ai-01 sidecar, 08:35Z, *reported by ai-01*): 7 consecutive dead turns against the GLM 5h wall — every one a full ladder of retries, ~62s each, no fallback ever taken.
+- **With it** (hub po-2025, 08:05Z): a bare `model=glm-5.2` request hit the same wall, `[Failover] ARMED sonnet → Mistral GLM — HTTP 429 from glm-5.2`, Mistral also walled (402), the session was pinned to step 2 (Kimi K3) and the **turn completed** (`resp … model=k3 … closed=true stop=tool_use`).
+
+The line the hub runs (copy into the sidecar `.env` when arming, adjusting to the models its clients actually name — check the `[Request] model=` lines in the container log):
+
+```
+CLAUDISH_FAILOVER_ROLE_MODELS=glm-5.2:sonnet,glm-5.3:sonnet,minimax-m3:haiku
+```
+
+Once written it survives every installer rewrite (#141 carries `CLAUDISH_FAILOVER_*` verbatim); the gap is that nothing provisions it by default — `.env.sidecar.example` documents the var empty, and this runbook's arming checklist never mentioned it until now.
+
+### Refreshing the image — tag the OLD `latest` BEFORE the build (measured 2026-11-03)
+
+An image refresh is `build` + a drained `-Recreate`, and those two steps have an order: reversed, the rollback tag protects the wrong image. Measured on po-2027 (WAN client seat, image 85 commits behind, refresh built from `main` `b2927f16`):
+
+- **Tag the image the container is RUNNING before `docker compose build`.** The build retags `claudish-claudish-proxy:latest`, which leaves the previous image untagged, and the builder reclaims untagged images: after that build, `docker inspect <container> --format '{{.Image}}'` still answered (a running container holds its layers) while `docker tag <id> …:pre-deploy-<UTC>` answered **`No such image`** — the rollback target no longer existed in the store. A `docker tag latest …:pre-deploy-<UTC>` placed *after* `build` is worse than none: it captures the NEW image under a rollback name and attests to a return path that would redeploy the change.
+- **Recovering a lost rollback tag: rebuild from the commit the running image was built from.** The deployment clone's reflog names it (on that seat `264b916`, the state of the 27/10 install); `git checkout --detach <sha> && docker compose build` reproduced the image with the **same `CreatedAt` to the second** (`2026-10-27 17:49:13`), which is what made the rebuilt tag a credible rollback rather than an unverified guess. Then tag it, restore the clone to `main`, rebuild, and **assert the two ids differ before draining**:
+
+```powershell
+docker images --format "{{.Repository}}:{{.Tag}} {{.ID}} {{.CreatedAt}}" | grep claudish-proxy
+# latest                      <new id>  built today
+# pre-deploy-<UTC>            <old id>  the build date of the OLD image
+```
+
+- **Read the drain's OUTCOME, not its duration.** On that seat: `START pid … 18:59:09` → `OUTCOME success (docker compose up -d returned; /health answering)` at `19:03:04`; on the hub the same script found no true zero in 300 s and cut 4 streams. Same code, different outcomes — both correct. The line to poll is the first `OUTCOME` **after your own `START pid …`** (older `OUTCOME` lines belong to previous runs), and a cut reported there is the script working, not an incident.
+
+### WAN upstream (`models.myia.io`) — measured traps, 2026-10-27
+
+A client-only seat (po-2027) had to sidecar over the **WAN edge** because its Wi-Fi subnet cannot reach the LAN hub at all (ARP `Unreachable` on `.46/.47/.49/.50/.54`, measured by ai-01 from that seat). Five facts from that install, each measured:
+
+- **A 4 s `/health` heartbeat is a LAN calibration — on this edge it manufactures outages.** The relay flips AUTONOMOUS after 2 consecutive heartbeat failures at `HEARTBEAT_TIMEOUT_MS = 4_000`, while the deep probe — a much larger budget — answered `message_stop` in **1.0-1.4 s on every tick sampled**. Measured on that seat, 2026-10-27: **20 AUTONOMOUS windows between 07:00:37Z and 09:36:37Z**, one every ~5-8 min, most closing 2.8-3 min later (two long ones, 37 min and 16 min); header-latency samples on the same link reached **3 897 ms and 18 118 ms**. The edge was never down — the bound was. Every window serves the in-flight requests **locally**: **121 `glm-5.3-flash` responses were served off-hub** (08:14:53Z → 14:40:59Z — first and last capture, so the episodes outlived the interval counted above), totalling **1 309 795 input + 210 830 output tokens** from each capture's terminal `message_delta`, on a seat credential the hub never sees. The billing fact is measured — that account's Z.AI 5-hour reset moved from `16:00:59` to `21:14:52` (a direct `glm-4.5-air` probe returned `1308 … reset at 21:14:52`); attributing the shift to these tokens alone is an **inference**, not a measurement. Two reading cautions: 121 counts **off-hub service**, not AUTONOMOUS windows (a NOMINAL forward that hits its header deadline also captures), and the 20 count the windows observed over 07:00-09:36Z, which the 14:39-14:40Z captures show was not the whole flap. Fix on a WAN upstream: `CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS=9000` in the per-machine `.env` (range 2000-9000; above 9 s the 10 s tick would stack waits instead of measuring them). The env is fixed at create time (#310), so the value needs a recreate — plan it with a drain. Judging mode by `docker logs` alone hides this: the flap is a few minutes of AUTONOMOUS inside every ~10.
+- **`-Compress` is unusable through this edge — run WAN sidecars without it.** A gzipped request body arrives at the hub with its `content-encoding: gzip` gone, so the hub's JSON parser sees raw gzip bytes: `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid request body: JSON Parse error: Unrecognized token '\u001f'"}}` (`0x1f` is the gzip magic byte). ⚠ **Where the loss happens was first mis-attributed to the edge, and a three-arm probe on po-2023 on 2026-10-27 shows the edge cannot be the culprit.** Same 51-byte gzipped body (`1f 8b` verified), same `content-encoding: gzip` header, same proxy key, three destinations: **(a) `http://192.168.0.50:3000/v1/messages` — the hub direct on the LAN, no IIS in the path**, (b) `http://192.168.0.46:18182/v1/messages` — the raw TCP pipe, (c) `https://models.myia.io/v1/messages` — the full ingress. **All three return the identical 400 with `'\u001f'`.** (a) bypasses the edge entirely and still fails ⇒ the failure is **observable at the hub's own `/v1/messages`**, not between the edge and the hub. The earlier "discrimination" (gzipped POST to `models.myia.io` with the sidecar bypassed) exercised the edge **and** the hub, so it could not separate them — the missing arm was the LAN-direct one. Also excluded by reading, not by inference: `D:\Production\claudish-relay-po2025\relay.js` is an 850-byte **raw `net` pipe** (`net.createServer` + `down.pipe(up).pipe(down)`) — it cannot modify a header. The hub's inflater (`relay.ts readRequestBody`, gated on `content-encoding` containing `gzip`) is pinned by `relay.test.ts`, so the open question is **why the deployed hub answers with the un-inflated body** — a hub-side code/deploy question, not an ingress one. **Operationally unchanged: run WAN sidecars without `-Compress`** until that is settled, and retest with all three arms (the LAN-direct arm is the one that decides).
+
+- **SOLVED 2026-11-06 (PR #907 `63621bf5`, merged — issue #908) — neither the edge nor the hub's deploy: the auth middleware poisoned the body for the route.** The gate `registerForkExtensions` mounts for `/v1/*` peeks at `body.model` with a bare `await c.req.json()`; on a gzipped request that call decodes the raw gzip bytes as UTF-8 **lossily** — the parsed body is mojibake — measured in #907, a ~50-byte gzip reads back as 114 bytes starting `1f ef…`, which is also why the magic-byte gate fails afterwards (the leading `\u001f` of the 400) — and Hono caches that corrupted parse for the route's later read, which 400s identically. Reproduced with **zero edge in the path** on a bare Hono app (middleware + route, same repo Hono, inside the sidecar container). The discriminator that found it: the same gzipped probe **passes** through the real proxy on a host with no proxy keys (middleware not mounted) and **fails** through the identical code in the container (keys configured ⇒ middleware mounted) — which is also why the hub failed arm (a): the hub always has proxy keys. **Fix (as merged)**: the middleware peeks through `readRequestBody()` — the gzip-aware path reads the raw body once via `c.req.arrayBuffer()` (populating Hono's raw-body cache), gunzips, parses — and deliberately adds **no parse cache**: every reader re-reads the shared raw bytes and parses for itself. **Operational consequence:** `-Compress` stays off until the three-arm probe is re-run against a hub image carrying #907 (the LAN-direct arm should flip green; #908 stays open until that AC3) — and note the exposure this closes beyond the relay: Claude Code itself started gzipping large request bodies toward Anthropic endpoints in late 2026 ([changelog](https://code.claude.com/docs/en/changelog)), so any client aimed at a keyed proxy would have hit this same 400 on every large gzipped request.
+- **A stale Docker Hub login makes the build die on a public image**: `failed to authorize: … 401 Unauthorized: incorrect username or password` at `load metadata for docker.io/oven/bun`. Nothing is wrong with the image or the network — a stored credential is sent to `auth.docker.io`. `docker logout` (then `docker pull oven/bun:1.3-alpine` to confirm) is the whole fix. Worth checking first on any client machine that never pulls.
+- **AUTONOMOUS has to be fueled, or it is a parachute with no fabric.** The installer writes no provider credential; the mounted `config.json` supplies them, and the name must be the provider's canonical one. Measured both ways on po-2027: the `or@…` lane (the client's own role map) failed `OpenRouter 401 Missing Authentication header` — no `OPENROUTER_API_KEY` on that seat (the failure is captured in `captures/upstream-errors.log`); switching the role map to `zai@…` failed differently — `Explicit model "zai@glm-5.3-flash" could not be routed — its provider has no credential`, because `config.json` carried only a custom-named `ZAI_API_KEY2`. Adding the canonical `ZAI_API_KEY` **alias inside `apiKeys`** fixed it — and that seam is durable: unlike a `.env` line outside the #141 preserve list, the installer never rewrites `config.json`. Note what a free tier buys: once the chain ran, the probe returned **429 `1308` "Usage limit reached for 5 hour … reset at 16:00:59"** — key accepted (401 is death), chain complete, and no fuel until the window resets. A free tier is a partial-day net, not a net; the durable answer is a PAYG credential or a cascade, which is a user/coordinator arbitration.
+- **The cutoff test can be run locally, without touching the hub or the edge.**
+
+  ```powershell
+  # 1. dead upstream, dry seam, forced recreate
+  .\scripts\install-sidecar.ps1 -Machine <m> -Upstream https://127.0.0.1:9 -ProxyKey $key `
+      -NoAnthropic -ContainerName claudish-sidecar -RepoDir C:\Dev\claudish -WriteEnvOnly
+  docker compose -f C:\Dev\claudish\docker-compose.yml --project-directory C:\Dev\claudish up -d --force-recreate
+  # 2. wait ~45 s (2 consecutive upstream health failures → AUTONOMOUS),
+  #    then probe with the model id the CLIENT actually sends (e.g. claude-sonnet-5-5),
+  #    never an explicit `or@…` id — an explicit id bypasses the role map under test.
+  #    Success = a local [claudish] [Request] line + either 200/message_stop or a provider
+  #    wall (429/1308 = credential accepted; 401 = no credential).
+  # 3. restore the real upstream with -WriteEnvOnly + recreate, then re-assert NOMINAL
+  #    (probe 200 + message_stop + NO local [Request] line).
+  ```
+
+  This replaces the hub-stop in `## Validation` item 3 for any seat that must not interrupt other clients.
+
+## Repoint the client
+
+After the installer reports **SIDECAR INSTALLED … mode: NOMINAL relay**, edit this machine's `~/.claude/settings.json`:
+
+```json
+"ANTHROPIC_BASE_URL": "http://localhost:<HostPort>"
+```
+
+Keep the selected authentication contract intact: an empty `ANTHROPIC_AUTH_TOKEN` for hybrid/OAuth pass-through, or both non-secret placeholders plus `forceLoginMethod: "console"` for proxy-only. In both cases, keep the `x-proxy-key` + `X-Claudish-Machine` custom header.
+
+> **No restart needed for live sessions** (measured 19/10 on po-2024, #531): Claude Code re-reads `ANTHROPIC_BASE_URL` from `settings.json` **per request**, so sessions launched before the repoint migrate on their own within minutes — the #531 retirement gate is itself the proof (a cron session born before the switch kept working straight through the old endpoint being stopped). A rollback by editing the value back reaches live sessions just as fast.
+
+> **The repoint is the risky step, and it is the one that caused the 2026-08-10 ai-01 outage.** Stand the container up and validate it *before* touching `ANTHROPIC_BASE_URL`, so a failed install never costs the machine its agents. Keep the previous value at hand to roll back.
+
+## Validation
+
+1. **NOMINAL mode**: `docker logs <ContainerName> 2>&1 | Select-String 'Relay|NOMINAL|upstream'` should show the prober reporting the hub alive. A request through `http://localhost:<HostPort>` is relayed (the installer's end-to-end probe already confirms this).
+2. **Native path (ai-01 only)**: the installer probe uses `glm-5.3` — the traffic class the relay header bug *spared*. It proves nothing about native passthrough. On ai-01 the real acceptance is **a live Opus turn from Claude Code after the repoint**: an HTTP probe cannot carry the OAuth that the bug destroyed, so it is blind by construction.
+3. **Failover**: stop the hub (`docker stop claudish-proxy` **on po-2023**) → within ~20s this sidecar flips AUTONOMOUS → a glm/minimax request still succeeds (served locally). Restart the hub → after hysteresis the sidecar returns to NOMINAL. (Coordinate the hub-stop with the cluster — it briefly interrupts every direct-to-hub client too.)
+4. **Attribution survives**: `traffic-live.ps1` / captures still show `machine=<MACHINE>` on this machine's requests — the relay preserves `X-Claudish-Machine` by design.
+
+### Validation when the sidecar is a bun PROCESS, not a container
+
+Some machines run the relay as a bare `bun packages/cli/src/fork/server/standalone-proxy.ts --port <P> --host 127.0.0.1` launched from `HKCU\...\Run`, because port 3000 is taken or Docker's egress cannot reach the LAN. `docker logs` does not exist there, so **the launcher has to create the log** — and if it does not, G2 silently becomes unverifiable.
+
+That is not hypothetical. Measured on po-2024, 2026-09-21: the launcher invoked bun directly under a hidden `pwsh`, so the sidecar's **stdout was discarded entirely** — the process was healthy, relaying, and carried no log at all. From outside, "no `[ttft]` line" is indistinguishable from "the relay never forwarded anything", and `[ttft]` is the *only* instrument that sees forwarded volume on a sidecar (a relayed request writes no capture and emits no `[Request]`).
+
+**Redirect with the child's file handle, never with a PowerShell pipe.** `*>>` is implemented through `Out-File` and buffers, so the line that proves forwarding can stay invisible for as long as the buffer holds — an instrument that reports late reads exactly like an instrument that reports nothing:
+
+```powershell
+$logPath = Join-Path $env:USERPROFILE ".claudish\sidecar-stdout.log"
+$errPath = Join-Path $env:USERPROFILE ".claudish\sidecar-stderr.log"
+foreach ($p in @($logPath, $errPath)) {   # rotation happens at LAUNCH only — see the third trap
+    if ((Test-Path -LiteralPath $p) -and ((Get-Item -LiteralPath $p).Length -gt 8MB)) {
+        Move-Item -LiteralPath $p -Destination "$p.1" -Force
+    }
+}
+$bunExe = Join-Path $env:APPDATA "npm\node_modules\bun\bin\bun.exe"
+if (-not (Test-Path -LiteralPath $bunExe)) { $bunExe = (Get-Command bun.exe -ErrorAction Stop).Source }
+Start-Process -FilePath $bunExe -ArgumentList 'packages/cli/src/fork/server/standalone-proxy.ts','--port','3914','--host','127.0.0.1' `
+    -RedirectStandardOutput $logPath -RedirectStandardError $errPath -WindowStyle Hidden -Wait
+```
+
+**Redirect both streams or the fix is half a fix.** `-RedirectStandardError` is not optional here: claudish writes a large share of its operational markers to stderr, so a launcher that captures stdout alone reproduces the same blindness on the other half — and `Start-Process` *refuses* a null path (`Impossible de valider l'argument … L'argument est nul ou vide` / `Cannot validate argument … null or empty`), so an undefined `$errPath` is a hard binding failure at launch, not a silent degradation. That refusal is the good case: the launcher dies loudly instead of starting a blind sidecar.
+
+Three traps found while making that change, all worth keeping:
+
+- **`Start-Process -FilePath 'bun'` fails** with *"%1 is not a valid Win32 application"* (localized, e.g. *"%1 n'est pas une application Win32 valide"*) — the name resolves to a shim, not the exe. Resolve it (`Join-Path $env:APPDATA "npm\node_modules\bun\bin\bun.exe"`, falling back to `(Get-Command bun.exe).Source`); the same command line works fine when the shell resolves it, which is why the defect hides.
+- **The instrument has to be proven while the process is ALIVE**, not after it exits: a redirect that only flushes at exit passes every post-mortem check and still leaves you blind in production. The check is a real turn followed by reading the file *before* stopping the sidecar — po-2024: `200` + `message_stop`, then `1` `[ttft]` line readable at 315 bytes with `0` `[Request]` (the correct NOMINAL signature).
+- **The rotation above runs at launch, so it bounds nothing while the sidecar is up.** These launchers are `HKCU\...\Run` entries: they fire once per logon, and a relay that stays up for weeks writes one unbounded file the whole time (`uptimeSec` past 200 000 is ordinary on these machines). The 8 MB check is a floor against accumulation *across* logons, not a size cap — if the log has to stay bounded in production, that is a separate rotation, not this line.
+
+## Troubleshooting — Docker cannot reach the LAN hub
+
+**Symptom**: the installer's probe returns 200 with `message_stop`, but the sidecar logs `[Relay] upstream … DOWN → AUTONOMOUS`, and every request shows a local `[claudish] [Request]` line plus a fresh capture file. The sidecar looks healthy while silently bypassing the hub.
+
+**Cause**: Docker's egress is not the host's egress. On ai-01 (2026-08-10) `curl http://192.168.0.46:3000/health` returned `{"status":"ok"}` **from the host** while the same request **from inside the container** timed out and `ping` lost 100% of packets — internet egress worked fine. Docker Desktop on Windows routinely has no route to a physical LAN address. **It is not a constant (measured 2026-10-15)**: the same ai-01 container reaches the hub `.50` from inside (`wget` → 200) and has relayed on LAN since the 2026-09-07 recreate — the route depends on the target and on Docker Desktop's state, so the diagnosis below is run at each install, never inherited from a table row.
+
+**Diagnose from inside the container** (host-side tests prove nothing here):
+
+```powershell
+docker exec <ContainerName> wget -qO- --timeout=5 http://192.168.0.50:3000/health   # LAN
+docker exec <ContainerName> wget -qO- --timeout=8 https://models.myia.io/health     # WAN
+```
+
+**Fix**: use the WAN endpoint as the upstream — it is the same hub, reachable from the container:
+
+```powershell
+.\scripts\install-sidecar.ps1 -Machine myia-ai-01 -Upstream https://models.myia.io ...
+```
+
+Leave `-Compress` off on a machine that is physically on the LAN: the uplink is not the constrained direction there, and the hub inflates either way.
+
+**Related sharp edge — the first request after a restart may be served locally.** `forwardToUpstream` bounds the *header* phase at 5s; a cold DNS+TLS handshake to a WAN upstream can exceed that, so the request falls through to local (by design — never hang). It logs nothing, because `markFail` only logs on the 2-failure transition. Warm up before judging the mode; the installer now does exactly that.
+
+**How to tell NOMINAL from AUTONOMOUS** (the only reliable test): in NOMINAL the relay branch sits *before* `logRequest`/capture, so a relayed request emits **no** `[claudish] [Request]` line and writes **no** capture file. Either artifact appearing means the request was served locally.
+
+## Known limitation — NOMINAL leak policy is soft
+
+`CLAUDISH_NO_ANTHROPIC=1` is a **local/autonomous** backstop: it reroutes bare native targets to the budget sonnet (glm) inside the sidecar's own pipeline. In NOMINAL mode the sidecar forwards the raw request to the hub, where `CLAUDISH_NO_ANTHROPIC` is **unset** (the hub must allow native so ai-01/po-2023 Opus works). So a relayed executor Opus is not hard-blocked at the hub — identical to today's direct-to-hub behavior. Leak prevention for executor Opus relies on **not selecting Opus on those machines** + the 6h surveillance cron / `traffic-anthropic.ps1`, exactly as before. This deployment does not change that posture.
+
+## Pilot (already done on po-2023 before fleet rollout)
+
+A sidecar on `:3001` → hub `:3000` validated: (1) NOMINAL relay of glm/minimax; (2) **Opus passthrough via the relay header fix** (client OAuth preserved → Anthropic 200); (3) failover AUTONOMOUS + hysteresis recovery; (4) never-hang on mid-stream hub kill. See the plan at `~/.claude/plans/expressive-bubbling-charm.md`.

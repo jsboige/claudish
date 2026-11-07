@@ -2,173 +2,65 @@
 
 Planned-but-unimplemented work for Claudish. Items here are deliberately scoped, with explicit **trigger conditions** — what needs to be true upstream or in our codebase before each item moves to active development. If a trigger condition isn't met, leave the item parked.
 
-For shipped features see `CLAUDE.md`; for the engineering rationale behind them see `ai-docs/architecture/`. For ad-hoc research and validation sessions, see `ai-docs/sessions/`.
+For shipped features and current architecture, see `CLAUDE.md`. For ad-hoc research and validation sessions, see `ai-docs/sessions/` (`ai-docs/` is a gitignored local research-session dir — every citation to it below is provenance, not a repo path).
 
 ---
 
-## Session push notifications — removed 2026-10-16
+## Channel notifications
 
-Status: **removed** (10.7.0). The server no longer declares `experimental: {"claude/channel": {}}`
-and sends no `notifications/claude/channel` frame; hosts poll `list_sessions` and read the session
-records. Rationale and what replaced each fact: `ai-docs/architecture/mcp-sessions.md` ("Push
-notifications were removed").
+### Phase 1 — SEP-1686 forward-compat fields ✅ Shipped
 
-The old phases are closed with it: Phase 1 (the SEP-1686 forward-compat fields `task_id`,
-`status`, `created_at`, `last_updated_at` on the channel frame) was deleted with the frame, and
-Phase 2 (`notifications/tasks/status` behind `CLAUDISH_NOTIFY_VIA_TASKS`) and Phase 3 (flip the
-default, drop the legacy method) have no legacy method left to migrate from.
+Status: complete (this branch).
 
-**Trigger to reconsider a push** (all must hold):
-- Claude Code delivers `notifications/tasks/status` (SEP-1686) into the **agent's context** — not
-  only the CLI UI — WITHOUT `--channels`, `.mcp.json` registration or an interactive-only host.
-  Those three gates are why the channel push reached almost no one.
-- The TypeScript MCP SDK ships a server-side helper for emitting it
-  (`modelcontextprotocol/typescript-sdk#1041`).
-- A live `create_session` run shows the completion arriving in the orchestrator agent's context.
+The channel bridge now emits `task_id`, `status` (5-value SEP-1686 enum), `created_at`, `last_updated_at` alongside our existing fields. Wire format pinned by `channel-wire-format.test.ts` (8 tests, perturbation-verified). No consumer behavior change.
 
-**Effort if triggered**: small. The facts are already in `SessionManager` (`sessionEventFor`, the
-`waits.jsonl` transitions); a push is one subscriber on the pane's `onTransition` and `onChange`
-hooks plus a payload builder and its wire-format test.
+See: `ai-docs/sessions/dev-research-mcp-tool-progress-20260508-235612-8d9da3e8/sep-1686-migration-schema.md` (gitignored local session dir — provenance, not a repo path)
+
+### Phase 2 — `notifications/tasks/status` behind a flag
+
+Status: blocked on upstream. Not started.
+
+When ready, we add a `CLAUDISH_NOTIFY_VIA_TASKS=1` env var. When set, the bridge emits `notifications/tasks/status` with a restructured payload (flatten `meta.task_id → params.taskId`, etc.) alongside the existing `notifications/claude/channel`. Add a parallel test fixture pinning the new wire format.
+
+**Trigger conditions** (all must hold):
+- Claude Code ships a release whose CHANGELOG mentions SEP-1686 / `notifications/tasks/status` receiver support, AND the new method surfaces task notifications into the **agent's context** (not just CLI UI).
+- The TypeScript MCP SDK ships a server-side helper for emitting `notifications/tasks/status`. Reference impl is `modelcontextprotocol/typescript-sdk#1041` — merged 2025-11-27, so **this trigger is MET** (verified 2026-10-16). The two remaining gates below still block the item.
+- We've manually verified per-child completion notifications surface in the orchestrator agent's context during a `team` run.
+
+**Effort**: small. Most work is already done in Phase 1 (the data is in `meta`); Phase 2 is mainly a payload-reshape function + new test fixture + env-var gate.
+
+Reference: same migration schema doc as Phase 1.
+
+### Phase 3 — Flip default + drop the legacy method
+
+Status: blocked on Phase 2.
+
+Default to `notifications/tasks/status`. Keep emitting `notifications/claude/channel` for one major version as a fallback for users still on older Claude Code versions. Then remove.
+
+**Trigger condition**: 6+ months after Phase 2 ships AND > ~80% of Claudish users are on Claude Code versions with Tasks receiver support (heuristic — measure via `--probe` telemetry if we ever add it, otherwise judgment call).
 
 ---
 
-## `notifications/progress` — shipped as a KEEPALIVE; the CLI-UI use case is still parked
+## ~~Optional: `notifications/progress` as a secondary CLI-UI signal~~ — Parked
 
-Status: **shipped 2026-08-14, on grounds the original parking decision never weighed.** This item used to read *"Optional: `notifications/progress` as a secondary CLI-UI signal — Parked"*. That feature is still not viable. What shipped is a different feature wearing the same notification.
+Status: **investigated, decisively parked, with a corrected rationale**. Not implementing.
 
-The parking decision was **right about rendering and wrong about relevance**. Progress notifications render nowhere — that finding stands, re-confirmed on 2.1.231 — but they also reset the client's MCP idle timer, and nothing else claudish emits does. The old note's own footnote, *"not entirely inert — it still resets the client's request timeout"*, turned out to be the whole reason to build it.
-
-### What re-opened it: measured 2026-08-14 against Claude Code **2.1.231**
-
-A real `team` call died with `MCP server "plugin:claudish:claudish" tool "team" sent no response or progress for 1800s; aborting`. Probe: three tools, identical 90s duration, `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=30000` throughout, differing only in what they put on the transport while working.
-
-| Tool emits during the 90s | Outcome |
-|---|---|
-| nothing | **aborted at 30s** |
-| `notifications/progress` every 10s | **survived 90s** → returned normally |
-| `notifications/claude/channel` every 10s | **aborted at 30s** |
-
-The silent/progress pair is the decisive comparison: same duration, same window, same server, same transport, one variable. The channel arm emitted 3 frames with no emit errors before being killed, so its abort is not an emission failure.
-
-Channel and progress are therefore **complementary, not alternatives** — channel is the visible surface with no keepalive, progress is the invisible keepalive:
-
-| | visible to agent/human | resets idle timer |
-|---|---|---|
-| `notifications/claude/channel` | ✓ | ✗ |
-| `notifications/progress` | ✗ | ✓ |
-
-**Shipped**: `packages/cli/src/mcp/progress-heartbeat.ts` — a time-driven 10s heartbeat, armed by the CallTool dispatch on `team`, `run_prompt`, and `compare_models`. Time-driven and not event-driven because `team` already emitted a channel frame on every state change and still died at exactly 1800s: a model that thinks for 30 minutes produces no state changes. Knobs, degradation rules, and the idle-window defaults are in CLAUDE.md ("The `notifications/progress` keepalive").
-
-**`anthropics/claude-code#58687` is STALE.** It reports that the client sends no `_meta.progressToken`, and was closed as not planned. On 2.1.231 the token **is** sent — observed value `2`, in every probe arm, including runs against the older `progress-regression-mock.ts`.
-
-### Still open: rendering — original trigger condition #2 remains UNMET
-
-1. ~~Claude Code's MCP SDK fixes the strict-token-validation bug~~ — **met 2026-07-29** (verified on 2.1.220).
-2. **Claude Code ships UI/agent rendering for progress notifications from custom MCP servers** (`anthropics/claude-code#4157`, `#51713`) — **still unmet**, and this stays a live watch item. Progress displays nowhere, so the "secondary CLI-UI signal" this item was originally about does not exist yet. Re-run both probes on each client upgrade. If rendering returns, the heartbeat's `message` field becomes user-visible for free, at which point its content rules (structural only — tool name, elapsed seconds, counts; never prompt text or paths) stop being a privacy precaution and start being a UX decision.
-
-### Measurement trail — how the conclusion was reached
-
-Kept in full: the 2026-08-14 finding only overturns the *relevance* verdict, not the evidence underneath it.
-
-**2026-05-09, Claude Code 2.1.133 — two blockers, both fatal on the evidence then available:**
+We considered emitting `notifications/progress` from `team`'s child-completion callback as a richer terminal UI signal. Two issues, one of which we initially got wrong:
 
 - ❌ **Claude Code does not render progress notifications anywhere observable.** Verified 2026-05-09 against Claude Code 2.1.133 with `progress-regression-mock.ts`'s `slow_with_many_progress` tool emitting 5 distinct progress messages over ~10s. Mid-flight pane capture showed no terminal-UI rendering. The agent reported verbatim: *"I did not observe any progress messages during the call... nothing was surfaced to the agent context."* Matches the Anthropic-attributed comment on `anthropics/claude-code#4157`: *"Claude Code doesn't currently have a generic UI for displaying real-time progress from custom MCP servers."*
 - ❌ **The transport-kill regression is NOT fixed in 2.1.133 — earlier note that it was, was wrong.** A first test on 2026-05-09 (`progress-regression-mock.ts`'s `slow_ping_with_progress` + `simple_ping`) reported the regression resolved. **That test was insufficient.** It used sequential `await` ordering, putting all progress notifications strictly *before* the tool response, which avoids the race. The actual trigger documented in `GLips/Figma-Context-MCP#362` is **concurrent or quick-succession tool calls** where a progress notification arrives at the client *after* its `progressToken` cleanup has run. The MCP SDK then treats it as a protocol violation (`"Connection error: Received a progress notification for an unknown token"`) and tears down stdio. This bug is documented as still affecting Claude Code 2.1.x in the field. **The `team` use case (N concurrent child sessions, each with its own `progressToken`) is the exact pattern that triggers the bug.**
 
-The conclusion drawn at the time — that this would both fire into a void and destabilize `team` — followed correctly from those two bullets. Both have since moved: the transport kill was fixed (below), and the `team`-concurrency premise was a misreading. `team`'s N children are OS processes spawned by `team-orchestrator.ts`, not MCP requests; they carry no `progressToken` at all, so a `team` call has exactly **one** token and emits at most one frame per interval. The shipped heartbeat additionally keys no state by token, so parallel `tools/call` requests have nothing to collide over.
+So implementing this not only adds code that fires into a void — it would actively destabilize `team`. Two independent reasons not to do it.
 
-### Re-measured 2026-07-29 against Claude Code **2.1.220** — one blocker is gone, one is confirmed harder
-
-Probes: `packages/cli/src/mcp-session/test-helpers/capability-probe.ts` (agent context, `-p`) and
-`progress-regression-mock.ts` driven through an interactive tmux session (terminal UI).
-Full findings: `ai-docs/sessions/dev-arch-20260729-171308-1dad34b5/capability-findings.md`.
-
-- ✅ **Blocker 2 (transport kill) is FIXED.** Emitting 3 progress notifications no longer tears down
-  stdio: the immediately-following `probe_ping` call returned `pong`, with no `STDIN_END` and no emit
-  errors. The stated reason for parking — that `team`'s concurrent `progressToken`s would destabilize
-  the transport — no longer holds. **Caveat:** the probe emitted from ONE tool call; true N-concurrent
-  emission across simultaneous children is still unproven.
-- ❌ **Blocker 1 (no rendering) CONFIRMED, now on both surfaces.** Previously only agent context was
-  tested. Now both:
-  - *Agent context* (`-p`): agent answered **NO** to seeing any of `PROBE-STEP-1/2/3` while the server
-    log shows all 3 emitted.
-  - *Interactive terminal UI*: sampled the screen every 1.2 s for 31 s, spanning the full 7.5 s
-    emission window of `slow_with_many_progress`. The tool row rendered as a static
-    `⏺ pmock - slow_with_many_progress (MCP)` across 20 consecutive samples. **Not one** of the five
-    messages ("scanning files", "parsing AST", "running checks", "aggregating results",
-    "writing output") ever appeared.
-
-This matches `anthropics/claude-code#51713` — MCP tool calls are unconditionally collapsed, showing
-only the server/tool name with no streaming output. Per that issue, progress DID render up to
-**2.1.101** and regressed by **2.1.116**; our original 2.1.133 measurement therefore landed inside the
-regression window. **#51713 is closed, but the regression is still live in 2.1.220.**
-
-Note `notifications/progress` is not entirely inert — it still resets the client's request timeout.
-It simply has no display.
-
-↑ **That footnote was the whole answer, and it sat here unread for two weeks.** A line written as a
-caveat to a rejection was in fact the only reason to build the thing; the 2026-08-14 probe above
-exists because a `team` run died at 1800s and sent someone back to re-read it. Worth generalising:
-when parking an item, state what the mechanism *does* do, not only what it fails to do — the residual
-capability is the part a future failure will need.
-
-**Superseded on the DISPLAY axis by**: `team` reports live per-model stats over
-`notifications/claude/channel` (measured working) plus a `status.txt` in the session directory. See
-"Live team progress" below. That remains true and unchanged — channel is still the only mechanism
-that reaches a reader. It is not, however, a substitute on the *liveness* axis, which is what the
-2026-08-14 measurement settled.
+**Trigger condition for un-parking** (both must hold):
+1. Claude Code's MCP SDK fixes the strict-token-validation bug (the underlying cause of `Figma-Context-MCP#362`); look for changes in `@modelcontextprotocol/sdk` Client to ignore unknown progress tokens instead of treating them as fatal.
+2. Claude Code ships UI/agent rendering for progress notifications from custom MCP servers (issue `anthropics/claude-code#4157`).
 
 **References**:
-- Original empirical session: `ai-docs/sessions/dev-research-mcp-tool-progress-20260508-235612-8d9da3e8/` (lost — session dirs are gitignored and died with their worktree)
-- Community-research session that surfaced the corrected understanding: `ai-docs/sessions/dev-research-mcp-progress-community-20260509-213410-c058a909/` (lost — same)
-- Re-measurement against 2.1.220: `ai-docs/sessions/dev-arch-20260729-171308-1dad34b5/capability-findings.md` (lost — same)
-- Idle-timeout measurement against 2.1.231 (the three-arm probe): `ai-docs/reports/mcp-progress-keepalive/findings.md`
-- Keepalive implementation design: `ai-docs/reports/mcp-progress-keepalive/architecture.md`
-- Test artifacts: `packages/cli/src/mcp-session/test-helpers/progress-regression-mock.ts`, `capability-probe.ts`, `capability-probe-2.ts`
-- Field evidence of the transport-kill bug the latch defends against: <https://github.com/GLips/Figma-Context-MCP/issues/362>
-- Stale `progressToken` claim: <https://github.com/anthropics/claude-code/issues/58687>
-
----
-
-## Live team progress — shipped
-
-`team` runs take minutes and, in `--quiet` print mode, children emit nothing until they finish. There
-was previously no signal at all between "started" and "done". Two transports now carry live per-model
-stats, chosen because they are the two that actually reach a reader:
-
-| Transport | Reaches | Requires |
-|---|---|---|
-| `notifications/claude/channel` | the agent's context (renders as a `<channel>` block) | the channel gating in CLAUDE.md — `--channels`, interactive, `.mcp.json` |
-| `<session>/status.txt` | a human, via `tail -f` | nothing; works headless and in CI |
-
-`notifications/progress` carries none of this — it renders nowhere (2.1.220, unchanged on 2.1.231).
-It now runs alongside as a pure keepalive, on the separate liveness grounds established above.
-
-**How per-model attribution works.** `token-tracker.ts` writes tokens/cost to
-`~/.claudish/tokens-<port>.json`, keyed to a port each child picks for itself, so an orchestrator
-spawning N children could not tell which file belonged to which model. `CLAUDISH_TOKEN_FILE` now
-overrides that path, and `runModels` points each child at `<session>/stats/<id>.json`.
-
-**Format** — plain ASCII, no ANSI (channel frames render escapes literally):
-
-```
-team: 2 models, 2 done, 7s, 102.9k tok, $0.104
-  01 or@gemini-3.6-fla… done    160B    48.1k/234  $0.049
-  02 grok-4.5           done    118B     54.6k/19  $0.055
-```
-
-**Knobs**: `onProgress` (callback) and `progressIntervalSeconds` (default 5) on `TeamRunOptions`.
-
-**A third transport reaches the polling orchestrator** (v9.2.0). The two above reach an agent's
-context and a human's terminal; neither reaches a caller polling `team(mode:"status")`, which is
-how every review panel actually watches a run. That caller had only `outputSize`, which is written
-once at completion and so reads 0 for a slot's whole life — and orchestrators read it as progress
-and reported working slots as dead. `live_output_bytes_by_slot` now carries the same live count
-`status.txt` shows, in the same unit `outputSize` ends up holding. See
-`ai-docs/architecture/team-lifecycle.md`.
-
-**Implementation**: `packages/cli/src/team-stats.ts`, wired in `team-orchestrator.ts` (ticker +
-child env) and `mcp-server.ts` (`ChannelNotifier` passed into `defineTools`).
+- Original empirical session: `ai-docs/sessions/dev-research-mcp-tool-progress-20260508-235612-8d9da3e8/` (gitignored local session dir — provenance, not a repo path)
+- Community-research session that surfaced the corrected understanding: `ai-docs/sessions/dev-research-mcp-progress-community-20260509-213410-c058a909/` (gitignored local session dir — provenance, not a repo path)
+- Test artifacts: `packages/cli/src/channel/test-helpers/progress-regression-mock.ts`
+- Field evidence of the still-active bug: <https://github.com/GLips/Figma-Context-MCP/issues/362>
 
 ---
 
@@ -184,96 +76,140 @@ Anthropic's [official plugin marketplace](https://github.com/anthropics/claude-p
 
 **Counter-consideration**: submitting to Anthropic's allowlist invites security review and ties our release cadence partially to theirs. Not worth doing for a small team's internal use.
 
-Reference: research findings under `ai-docs/sessions/dev-research-channel-config-alternatives-20260508-233443-3f43f254/` confirm this is the only documented path to remove the dev flag for individual users.
+Reference: research findings under `ai-docs/sessions/dev-research-channel-config-alternatives-20260508-233443-3f43f254/` (gitignored local session dir — provenance, not a repo path) confirm this is the only documented path to remove the dev flag for individual users.
 
 ---
 
-## ~~Gemini Code Assist: use `fetchAvailableModels` for the served set~~ (CLOSED — moot)
+## Adaptive / shared backoff pacer for burst rate-limits
 
-**Status**: CLOSED as moot (2026-08-05). The `gemini-codeassist` provider was
-removed entirely, so there is no longer a `getServedCodeAssistModels()` to
-migrate. The endpoint's request shape — the trigger condition below — WAS
-captured in the meantime (body `{ project }`, not `{ metadata }`) and is in
-production use on the Antigravity path (`getServedAntigravityModels` in
-`auth/antigravity-user.ts`). Retained for the record only.
+Status: not started. Deliberately deferred — current per-request backoff is judged sufficient for the present load.
 
-**Original status**: not started
+**What ships today** (the in-stream rate-limit fix): when an `anthropic-sse` provider (notably Z.AI) delivers its burst/RPM limit as HTTP 200 + an in-stream `[1302]` SSE error, ComposedHandler peeks the stream start, detects it, and **temporizes with a per-request jittered exponential backoff** (1s/2s/4s + 0–750ms), retrying the same provider up to 3× before returning 429 so FallbackHandler switches providers (e.g. Z.AI → GLM Coding, a separate quota). The transport layer (`AnthropicProviderTransport.enqueueRequest`) adds a second jittered backoff on genuine HTTP 429. Both are **per-request and independent** — there is no shared, cross-request pressure gauge.
 
-`getServedCodeAssistModels()` in `auth/gemini-oauth.ts` infers which models a
-tier serves by reading the bucket list from `retrieveUserQuota`. That is an
-inference, not an answer: it only reports models that have a quota bucket, and it
-costs a quota round-trip on the auth path.
+This produces *implicit* aggregate self-throttling: under a storm, more requests hit 429 → more requests back off → offered load drops. It does not, however, make *new arrivals* probe more cautiously while a storm is in progress — each new request still fires at full rate on its first attempt. With the stated load (≤50% of the 5h sustained quota even at peak; only the instantaneous burst limit is hit occasionally, and the cluster shares one key per provider), that residual gap is acceptable and a coordinated pacer would be over-engineering.
 
-The backend exposes a purpose-built endpoint, `v1internal:fetchAvailableModels`.
-Probing on 2026-08-01 confirmed it exists on both `cloudcode-pa.googleapis.com`
-and `daily-cloudcode-pa.googleapis.com` — both answered HTTP 400 *"Unknown name
-metadata: Cannot find field"* rather than 404, so the method is real and only its
-request shape is unknown. Antigravity's logs show it in normal use.
+**What this item would add**: a shared per-provider pressure gauge (e.g. AIMD — additive-increase/multiplicative-decrease — with time decay) that admission-paces *new* requests as the recent error rate climbs, so the fleet spreads requests **more** under a sustained storm rather than only after each individual request fails. This is the "écarter encore plus les requêtes quand le taux d'erreurs augmente" idea — correct in principle, but only worth the complexity (shared state across 6 machines, or per-process approximation; tuning; new failure modes) if the simpler per-request backoff proves insufficient.
 
-**Trigger condition**: the quota-bucket inference produces a wrong served set in
-practice (a served model missing from the list, or a listed model that 404s), OR
-someone captures the correct `fetchAvailableModels` request shape.
+**Trigger conditions** (any one):
+- Sustained-quota utilization regularly approaches its ceiling (not just the instantaneous burst limit) — i.e. the "we have headroom" premise stops holding.
+- Capture/telemetry shows the in-stream-rate-limit fix's 3-retry budget is frequently exhausted (turns still failing over to fallback or to the client) despite the backoff — meaning synchronized full-rate probing during storms is the dominant remaining failure.
+- The cluster grows enough that uncoordinated per-request backoff visibly re-collides on the burst limit even with jitter.
 
-**Effort estimate**: small once the payload shape is known — one function swap
-behind the existing `getServedCodeAssistModels()` seam, with the quota-bucket
-path kept as the fallback.
+**Effort**: medium. A per-process AIMD gauge is small; a genuinely *shared* cross-machine gauge needs a coordination point (shared store or a designated pacer) and is the bulk of the cost.
+
+**Reference**: in-stream rate-limit fix — `packages/cli/src/handlers/shared/stream-peek.ts`, `composed-handler.ts` (peek+retry block), `providers/transport/anthropic-compat.ts` (`enqueueRequest`). Root-cause analysis in this session's capture diagnosis.
 
 ---
 
-## Gemini Code Assist: individuals/Ultra tier needs an Antigravity-issued token
+## Signature-based role routing — MultiConnector absorption (#82)
 
-**Status**: SHIPPED — the `antigravity` provider (`ag@`) reuses the Antigravity
-CLI's own token. See CLAUDE.md → "Antigravity Provider (ag@)".
+Status: design proposition, not arbitrated. No code.
 
-The finding that unblocked it: the two backend checks are independent —
-`loadCodeAssist` gates on request IDENTITY (`User-Agent` + `metadata.ideType`),
-but `streamGenerateContent` gates on the TOKEN'S OAuth CLIENT (headers can't fake
-it — 403 PERMISSION_DENIED for a gemini-cli token no matter the identity). So
-claudish does NOT spoof its way in; it **reuses the user's own Antigravity token**
-(the same one the `agy` CLI mints) from the shared macOS keychain store, and
-self-refreshes with client creds extracted at runtime from the user's local `agy`
-binary — never shipped. Verified end-to-end on Google AI Ultra with
-`gemini-3.6-flash-high`.
+A per-signature offload policy: compute a prompt-shape signature (tools + system prefix + client model) once at the `/v1/messages` route, and when an operator-armed table (`CLAUDISH_SIGNATURE_ROUTING=1` + bind-mounted `CLAUDISH_SIGNATURE_TABLE`) matches, route by the table's role instead of the client's named model — one `effectiveModel` for every downstream consumer (bucket, cascade, dwell, handler), never at failover depth > 0, never onto a native lane the client didn't name. Tables are produced by offline vetting campaigns against the capture corpus (oracle: Opus on ai-01, post-reset) and proposed, never auto-applied. Full design, measured ground and invariants: `docs/reference/signature-routing.md`.
 
-**Remaining follow-up**: Linux/Windows keyring backends (macOS `security` only
-today). Still genuinely open.
+**Trigger conditions** (all must hold):
+- Explicit arbitration GO from the user on the design doc (routing changes get specified, arbitrated, then built — #79/#21 precedent).
+- Gate M1 measured: per-session signature stability on one archived capture day (the sigres exports carry no session key, so this needs a re-run keyed by `sessionKey`); if the p90 session carries > 1 signature, the per-session pin variant is the design that gets built.
+- The extractor is unified (one module serving the online route and the offline measurer) before any table is trusted — a drift silently orphans entries.
 
-**Closed follow-up — a `claudish login antigravity` that does its own OAuth.**
-Not deferred: *impossible*. Antigravity's client secret is baked per `agy`
-release and rotates on auto-update (proven — the extracted secret was revoked
-within a day, and there is no dynamic client registration), so claudish can
-never hold one. v7.33.0 ships the reachable version instead: `claudish login
-antigravity` installs and delegates to `agy`, which owns the whole credential
-lifecycle. Refresh delegates the same way (`agy models`). Do not re-open this
-expecting a claudish-native OAuth flow.
+**Effort**: medium — route-level signature read + table load + pins; the vetting campaign machinery is the larger half and is owned with CoursIA (semantic-fleet side, `IChatClient` over `/v1/chat/completions`).
+
+**Reference**: `docs/reference/signature-routing.md`; capability map + concentration measurements in issue #82; coordinator review of the first draft in PR #339.
 
 ---
 
-## The two bundled `claudish-usage` SKILL.md copies are stale and never mention `team`
+## Haiku → swift debrayage — staged widening (Q-po2025-31)
 
-Status: not started.
+Status: design arbitrated in vehicle (option b, ai-01 coordination 2026-10-27), gates not met. No config change pending.
 
-`skills/claudish-usage/SKILL.md` and `packages/cli/skills/claudish-usage/SKILL.md` (the
-latter shipped in the npm package's `files` array and installed into a project by
-`cli.ts:2408`) were last touched at v4.5.1. Neither mentions `team` at all, and they have
-drifted from each other on model ids (`openai/gpt-5` vs `openai/gpt-5.3`).
+The mechanics are already live (cascade step 0 = `vllm-myia@swift-1.5-27b!own`, three machines armed, `AUTO=1`, ai-01 STEP_EXCLUDEd, po-2028 excluded by user decision) and the six armed machines' haiku already touches zero MiniMax. The remaining surface is the one that matters: **lifting the ai-01 exclusion — 66 % of the residual MiniMax haiku burn (~1.8 B cache-read / 21.6 h)** — behind two measured gates: Gate R (engine reliability: ECONNRESET rate < 2 %, ttft p95 < 10 s, no UNEXPLAINED ENDINGs over 24 h — **failed as of 2026-10-27 04:10Z**, wedge active) and Gate C (a 30-min agent-sdk-shaped load probe at target concurrency, engine capacity numbers from the vllm lane). Each widening step is one drained recreate with a prior `global` announce; po-2028 is durably out.
 
-They are NOT the plugin skill. The skill agents actually load is
-`plugins/claudish/skills/claudish-usage/SKILL.md` in the magus-src repo, which is current
-and which carries the `team` lifecycle documentation. So these two copies cannot teach a
-wrong `team` procedure — they say nothing about `team` — but a user who runs the
-install-skill path gets a document that is four major versions behind on everything else.
+**Trigger conditions** (all must hold before the ai-01 proposal goes to the user):
 
-Found while fixing the `outputSize`-as-progress misreading (v9.2.0); deliberately left
-alone there, because rewriting an unrelated stale document inside a bug fix is scope creep.
+- Gate R green for 24 h (hub-seat canaries + `failover-events.log` mark rate).
+- Gate C probe passed at the agent-sdk shape (52 % of ai-01 haiku; sessions re-read 120–190k context per turn).
+- User arbitration on Q-po2025-31 lifting the STEP_EXCLUDE line.
 
-**Trigger condition**: someone reports confusion from the installed skill, OR the
-install-skill path is touched for any other reason. Whoever picks it up must first decide
-whether these copies should exist at all — a third copy of a document whose real home is
-another repo is the actual defect, and deleting them plus pointing the CLI at the plugin
-may be the correct fix rather than syncing a third copy forever.
+**Effort**: small config + one drained recreate; the cost is the measurement discipline, not the change.
 
-**Effort**: small to decide, medium if the answer is "sync", small if the answer is "delete".
+**Reference**: `docs/reference/haiku-swift-debrayage.md`; mandate + measurements provenance therein.
+---
+
+## Workload routing — agent-sdk vs interactive, refining the 25/10 machine-level arbitration
+
+Status: design proposition, not arbitrated. No code.
+
+The 25/10 arbitration ("ai-01 = MiniMax, never swift") is machine-level, but the census says the MiniMax burn driver is a workload (52 % `agent-sdk` planned work), not the machine. The hub already sees the workload marker in the request body (`cc_entrypoint=` / `cc_workload=`, the same fields `scripts/traffic-consumption.py` buckets the census by) — so the route can divert *planned* haiku to swift while *interactive* ai-01 stays MiniMax, and the #693 `STEP_EXCLUDE` narrows from machine-wide to workload-scoped so the two rules share one vocabulary. Full design (signal verification, seam choice, composability, pins): `docs/reference/workload-routing.md`.
+
+**Trigger conditions** (both must hold):
+
+- The user refines the 25/10 arbitration to workload level (routing changes get specified, arbitrated, then built — same precedent as #82).
+- The haiku→swift unlock's reliability door passes (PR #704 porte R — engine ECONNRESET/hairpin fixed and capacity measured); this item is the mechanism inside that design's W door and does not bypass it.
+
+**Effort**: small-medium — one per-request substitution at the `resolveNativeModelPin` seam + `STEP_EXCLUDE` predicate extension + three-request pin.
+
+**Reference**: `docs/reference/workload-routing.md`; dispatch context in issue #641 QUEUE v6 (ai-01, 27/10); census ground in the MiniMax consumption investigation (ai-01, 26/10).
+
+---
+
+## Relay verdict — continuous refutation evidence (WAN false positives)
+
+Status: not started. The **bounded** mitigation shipped — `CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS` (#714/#715, range 2000-9000 ms) and its documentation (`docs/deployment/relay-sidecar-deployment.md`, `docs/reference/relay-internals.md`) — and was deployed on the first WAN-upstream seat on 2026-10-27. This item is the structural fix the same incident exposed, deliberately not folded into that PR.
+
+The asymmetry, read from the code: `proberTick` (`relay.ts:1105`) does exactly one thing while NOMINAL — a `/health` GET — and acts on its result; `deepProbe`, the only instrument that could refute the verdict, runs **solely** in the AUTONOMOUS branch, behind 3 OK heartbeats and the 60 s cooldown. So the state that decides whether traffic reaches the hub is held by the cheapest instrument available, a false positive is cheap to enter and expensive to leave, and once flipped nothing upstream is sent — no client request can refute it. Measured 2026-10-27 on po-2027: 20 AUTONOMOUS windows, 380 requests served locally (121 answered, 259 refused by the provider wall), while the deep probe answered `message_stop` in 1.0-1.4 s every time it was finally consulted. Raising the bound shrinks the false-positive rate; it does not give the harness an instrument that can say *"the hub would have served that"*.
+
+Candidate designs (unarbitrated, listed so the arbitration has something concrete to reject):
+
+- **Low-rate real probe while NOMINAL** — a bounded tool-call stream at a period long enough to cost nothing measurable, so a false positive is contradicted before the second heartbeat failure lands.
+- **A "would-have-worked" counter** — on the first request served after a flip, replay the forward once **without diverting the client** and record the outcome; the metric is *flips contradicted within one turn*, which today does not exist at all.
+
+**Trigger conditions** (both must hold):
+
+- Either a second WAN-upstream sidecar is onboarded, **or** a flap is measured on a seat already running the `9000` bound — a false positive that survives the raised bound means the bound is the wrong *instrument*, not merely undersized.
+- The coordinator accepts one of the designs above. A liveness probe spends provider budget on every tick it runs; that cost, not the code, is why this is parked rather than done.
+
+**The minimal form of the second design — one replay per switch, nothing else** (the shape to implement *if* the trigger fires; recorded here so the arbitration can price it without designing it):
+
+- **Seam**: once per AUTONOMOUS *entry*, on the first request that got served locally, and only **after** the client's answer is complete. One replay of the identical body down the existing forward path, bounded by the heartbeat bound, result reduced to a boolean.
+- **What it answers**: `flipContradicted` — *did the hub that this node just declared dead serve the very request it refused to send it?* Logged as one greppable line, never a capture (a replay is a measurement, not traffic), and never counted as a served turn.
+- **Cost**: one request per flip, zero on a seat that does not flap — which is why this form is priced against the periodic probe, not beside it. A quiet seat pays nothing.
+- **Not in scope, on purpose**: no client diversion (the local answer has already been produced), no re-arm (the hysteresis machine owns that path and a replay is not a liveness measurement), no second replay for the same entry, and nothing that can throw — a replay that fails is `flipContradicted=false`, not an error on a request that already succeeded.
+- **Acceptance**: synthetic flap with the hub reachable by replay → `flipContradicted=1` and the **client still received the local answer**; genuine outage → `0`; every terminating path still emits `message_stop`; and a pin that a second request in the same AUTONOMOUS entry does *not* replay.
+
+**Effort**: small-to-medium — one probe path (or one replay seam) + counters + a hysteresis regression pin.
+
+**Reference**: `docs/reference/relay-internals.md` §heartbeat knob and §"where the liveness harness stops seeing"; issue #711, PRs #714/#715; the 27/10 measurement in `docs/deployment/relay-sidecar-deployment.md`.
+
+---
+## Capture pipeline port to v14 (#641 blocker 2)
+
+Status: executed 27/10 — PR #722 (port: 3 verbatim files + 10 wired, 8 invariants mutation-tested) and PR #723 (the 17 mechanical lint errors) sit on `replatform/v14` awaiting coordinator review. Remaining for acceptance: the consumer read-back of a live v14 capture corpus (needs a v14 build with `CLAUDISH_CAPTURE_DIR`), and the spec doc deletion on main at merge time. The `test:strict` baseline learn for v14 is blocked: the strict runner itself is among the manifest-absent files.
+
+The go/no-go evaluation for `replatform/v14` → `main` (#641) lists the absent capture pipeline as hard blocker 2: v14 carries zero capture writers, so the traffic-measurement apparatus (`claudish_traffic`, `traffic-*.ps1`, attribution #98/#400/#566/#662, leak-policy greps, `turn-autopsy.py`) dies at landing. The port is narrow — v14 already has the parsers, `instance-id.ts`, `inbound-keys.ts` and `HOPS_HEADER`; it moves 3 files and wires 9 call sites, with producer-side format pins traveling along.
+
+**Trigger conditions** (both must hold):
+
+- Direction (B) — finishing the re-stack INTO v14 — is confirmed as the landing strategy (the NO-GO verdict on direct landing is accepted; re-stacking direction recommended, not yet user-arbitrated).
+- The coordinator schedules the blocker (it gates every GO re-evaluation of #641 alongside channel mode and context admission).
+
+**Effort**: small-to-medium — 3 file copies, 9 anchored wires, test carry-over; the real risk is silent invariant drift (reqN freeze at ingestion, hops seating, pre-strip capture), covered by the acceptance run in the spec.
+
+**Reference**: `docs/reference/capture-pipeline-port-v14.md`; go/no-go evaluation on #641 (comment 6434476328).
+
+---
+
+## Catalog cache write on read-only mounts — honor a writable cache path
+
+Status: not started. The fallback chain (disk cache → passthrough-unchanged) works by design and nothing user-visible degrades, so this is polish plus log hygiene, not a defect fix.
+
+Docker deployments that mount `/root/.claudish` read-only make every catalog refresh log `[Catalog] cache write skipped (unwritable path): EROFS…` — `openrouter.ts:392` catches the failed `all-models.json` write. Measured on the hub seat: it fires on every catalog refresh, including mid-run (14:21:51Z on 28/10 with no restart in the window), not only at container boot. The container already carries `CLAUDISH_MODEL_CACHE_PATH=/var/cache/claudish/all-models.json`, yet the write still lands on the read-only home — either the catalog writer ignores the var or the var postdates the code path.
+
+**Trigger conditions** (either holds):
+
+- Cold-start catalog latency is measured as a problem on a read-only-mount seat (the in-container warm cache never persists), or
+- The per-refresh stderr warning is reported as operational noise by a fleet coordinator.
+
+**Effort**: small — route the catalog write through `CLAUDISH_MODEL_CACHE_PATH` (first verify why it is ignored today), or demote the warning to debug level when the fallback succeeds. One unit test with a mocked unwritable path.
 
 ---
 
@@ -286,353 +222,3 @@ Each item should follow the structure above:
 - **Effort estimate** (optional): rough sizing if the item moves toward action.
 
 If a trigger condition has been met, move the item to *In Progress* and create the implementation tasks. If a trigger condition becomes irrelevant or wrong, delete the item rather than leave it stale.
-
----
-
-## Consolidate the two channel test-helper stand-ins
-
-`packages/cli/src/mcp-session/test-helpers/` now holds **two** helpers that can echo argv:
-
-- `fake-claudish.ts` — the original; consumed by BOTH `channel/session-manager.test.ts` and
-  `team-orchestrator.test.ts`, the latter via `--print-argv` to assert the exact spawn
-  contract *including flag order*
-- `fake-channel-stream-json.ts` — added 2026-08-22 during the stream-json transport rewrite,
-  with its own `--print-argv`
-
-**Why this is parked rather than ignored.** The duplication already caused one outage of the
-guard it exists to protect. Migrating the channel tests to the new helper made `--print-argv`
-look dead in the old one; removing it turned the two `runModels — pinned spawn identity`
-tests red — and they failed EMPTY rather than asserting, so the assertions pinning the
-`--verbose`-before-`--quiet` invariant silently stopped RUNNING at exactly the moment the
-argv change made that invariant most likely to break. A guard that cannot execute reads as
-coverage. Restored the same day; a header comment on `fake-claudish.ts` now names both
-consumers, which stops the specific recurrence but not the class.
-
-**Proposed shape** (assessed 2026-08-22, not executed): keep `fake-channel-stream-json.ts`,
-give it an explicit raw/immediate argv mode distinct from its framed mode, move the two
-orchestrator tests onto it, then delete `fake-claudish.ts` after a repository-wide reference
-check.
-
-**Trigger conditions — all must hold:**
-
-1. No session is concurrently editing `team-orchestrator.test.ts` (it moved twice on
-   2026-08-22 alone; this work rewrites two of its tests).
-2. A repository-wide reference check finds no consumer of `fake-claudish.ts` beyond the two
-   known test files — a third consumer changes the answer from "consolidate" to "document".
-3. The seven channel regression guards (G1–G7) are green BEFORE starting, so any red during
-   the move is attributable to the move.
-
-**Do not start if** the only motivation is tidiness. The comment already prevents the known
-failure; this is worth doing when someone is in these files anyway, not as its own errand.
-
----
-
-## Ultracode pro-preset: broaden past the OpenRouter-only roster
-
-Status: shipped, deliberately narrow.
-
-`--pro-on-ultracode` applies a model's catalog provider-preset while a Claude Code
-session is in ultracode. It reads BOTH halves of the fact from the slim catalog's
-`routeVariant` — `baseModelId` says which model the preset applies to, `preset`
-(`reasoning.mode=pro`) says what to send — via `lookupVariantPresets()` in
-`adapters/model-catalog.ts`. There is no model name regex and no hardcoded payload;
-the `--model-params` parser doubles as the preset parser.
-
-The gate is PROVIDER-SCOPED, and today that means OpenRouter only. Measured against
-the live catalog on 2026-08-27 (`queryModels?catalog=slim`), exactly 3 of 753 entries
-carry a `routeVariant`, all three of them `gpt-5.6-*-pro`, all recorded on
-`provider: "openrouter"`. The base models are served much more widely —
-`gpt-5.6-sol` lists openai, openrouter, opencode-zen and openai-codex — but each
-`-pro` SKU exists on OpenRouter's roster alone.
-
-**Why scoped rather than applied everywhere — now measured, not assumed.** Sending
-`reasoning.mode=pro` to `gpt-5.6-sol` on each vendor (2026-08-27, real requests):
-
-| Vendor | Result |
-|---|---|
-| `openrouter` | accepted (200) |
-| `openai` (`api.openai.com/v1/responses`) | accepted (200) |
-| `openai-codex` (ChatGPT OAuth backend) | **400** — `` `reasoning.mode` is not supported with this model `` |
-
-So the parameter is neither OpenRouter-only nor universal. Applying it unscoped would
-hard-400 every ultracode turn on `cx@`, which is the single most likely route for this
-model family. The provider gate is what prevents that.
-
-`oai@` accepting it means the CATALOG under-reports reality — the fix belongs in
-models-index, not in a client-side exception list.
-
-**Trigger conditions** (either is sufficient):
-
-1. models-index records a `routeVariant` preset (or an equivalent per-vendor preset
-   field) on a non-OpenRouter vendor row for the same base model. The client change is
-   then zero — `lookupVariantPresets(model, provider)` already returns it.
-2. A live run proves the parameter is accepted on another host, at which point the
-   fact belongs in the catalog first (see `TASK_pro_preset_vendor_coverage.md` in the
-   models-index repo), NOT in a claudish-side exception list.
-
-**Do not** work around this by dropping the provider argument or adding a per-provider
-allowlist in the CLI. That reintroduces exactly the hardcoded roster this design
-removed, and `feedback_backend_repo_boundary` puts the data gap in the backend's repo.
-
-**Effort**: none in claudish if trigger 1 lands. The gate already reads whatever the
-catalog says.
-
-Reference: `TASK_pro_preset_vendor_coverage.md` (models-index repo).
-
----
-
-## `--effort-override` accepts only the seven canonical levels
-
-Status: shipped, deliberately narrow.
-
-`--effort-override <level>` pins reasoning effort verbatim and skips
-`clampToAdvertisedEffort()`. It is NOT `--effort` — that name belongs to Claude Code
-and claudish forwards it untouched in `claudeArgs` (pinned by
-`cli-passthrough.test.ts`). The two compose: `--effort` says what to ask for,
-`--effort-override` says do not clamp what I asked for.
-
-It accepts only `none|minimal|low|medium|high|xhigh|max`, because the value flows
-through the `EffortLevel`-typed pipeline in `base-api-format.ts`. A provider-specific
-value outside that set has an existing escape hatch that needs no new flag:
-`--model-params reasoning_effort=<value>`, which lands on the payload after every
-adapter has finished.
-
-**Trigger condition**: a provider ships a native effort vocabulary that is neither one
-of the seven nor reachable by a single `--model-params` key — e.g. an effort knob whose
-parameter NAME differs per dialect AND whose values are provider-specific. Only then
-does a dialect-aware native-value path earn its complexity.
-
-**Do not** widen `EffortLevel` itself to accommodate one provider. It is the canonical
-vocabulary Claude Code emits, and the clamp table is what maps it onto each provider.
-
----
-
-## `--advisor`: a reasoning-only panel reply is recorded as a stub
-
-Status: not started. Recorded as a known limitation of the any-model advisor work; the reply is
-now NAMED, not accepted.
-
-A routed panel member's answer arrives as an Anthropic message from its chain, and
-`extractAdvice` (`packages/cli/src/handlers/advisor-route-plan.ts`) takes only `text` blocks. A
-reply with reasoning and no text is S4 with `emptyReason: "reasoning-only"` (or
-`max-tokens-during-reasoning` when the output limit cut it off), and the stub text says so
-(`emptyAdviceReason`, `handlers/native-handler-advisor.ts`). The main model receives a failure, not
-advice, for a call that was billed (or drew on a subscription).
-
-This is visible, not silent: the failure text names the model and the reason, the call raises one
-warning, and the `advisor_call` record says `stub` with `emptyReason` and `stopReason`.
-
-**Why parked.** The shape question is settled: each chain's stream parser hands reasoning to the
-advisor as a `thinking` block. What remains is a product decision: reasoning without a final
-answer is the model's working, not its conclusion, and whether it counts as advice is the owner's
-call. If `max-tokens-during-reasoning` is what real runs show, the first remedy is the lowest
-advertised reasoning effort for the advisor handler set, before a larger output budget.
-
-**Trigger condition**: a real run shows a panel model returning reasoning with empty content, or
-a user reports stub advice from a reasoning model.
-
-**Must still hold after the change:** a reply with no text at all stays `stub`; if reasoning is
-accepted as advice, the `advisor_call` record says so, so a reader can tell it apart from an
-answer.
-
-**Effort**: small.
-
-Reference: `ai-docs/reports/advisor-build-report-20260911.md` ("Known limitations").
-
----
-
-## `openai-sse` parser: one `catch` drops every per-chunk error without a log line
-
-Status: not started. Found during the any-model advisor work; not specific to the advisor.
-
-In `packages/cli/src/handlers/shared/stream-parsers/openai-sse.ts`, the `try` at `:534` opens
-with `JSON.parse(dataStr)` and closes at `:896` with `} catch (e) {}`. It covers the parse and
-all chunk handling after it: usage, text deltas, reasoning, and tool calls. Any exception in
-those 360 lines is dropped, and the loop moves to the next line. A malformed chunk, or a bug in
-tool-call handling, can drop a tool call while the turn still ends with `end_turn`.
-
-The raw chunk is logged verbatim at `:528` under `--debug`, so the input survives. The fact that
-it was dropped does not. `openai-sse` is the default stream format for every adapter that does
-not override it (`packages/cli/src/adapters/base-api-format.ts:605`), so the effect reaches most
-foreign providers. During the advisor work this cost a full investigation of the SSE log
-truncation defect.
-
-The catches at `:267` and `:270` are different: they guard `enqueue` and `close` on a stream
-that can already be closed, and are correct.
-
-**Why parked.** Out of scope for the advisor work, and the file is shared by every OpenAI-shaped
-provider, so a change needs its own test run across the stream-format fixtures.
-
-**Trigger condition**: the next edit to `openai-sse.ts`, or any report of a tool call that
-vanished or a turn that ended early on an OpenAI-shaped provider.
-
-**Must still hold after the change:** one bad chunk still does not end the stream; the error is
-logged with enough context to find the chunk in a debug log; the replayed fixtures in
-`format-translation.test.ts` stay green.
-
-**Effort**: small for a log line; medium if the `try` is narrowed to the parse.
-
----
-
-## Local `bun run test` skips the macOS bridge suite
-
-Status: not started. Local only; CI is not affected.
-
-`package.json:23` runs `bun run --cwd packages/cli test && bun run --cwd packages/macos-bridge
-test`. On `bun` 1.4.0 the two `displayWidth` Unicode-oracle tests in
-`packages/cli/src/tui/viz/color.test.ts` fail, the CLI suite exits non-zero, and `&&` stops
-before the bridge suite starts. A local `bun run test` therefore reports nothing about the
-bridge.
-
-CI pins `bun` 1.3.10 (`.github/workflows/test.yml:58`), where the CLI suite is green and the
-bridge suite runs: run `34544453952` on the `v9.3.0` merge printed `Ran 3257 tests across 211
-files`, then `Ran 20 tests across 1 file`.
-
-**Why parked.** Nothing is unguarded in CI today. The risk arrives when the CI pin moves to a
-`bun` version where the two tests fail: CI then goes red and, the same way, stops running the
-bridge suite.
-
-**Trigger condition**: the CI `bun` pin is raised, or someone relies on a local run to check a
-bridge change.
-
-**Must still hold after the change:** the root `test` script still fails when either suite
-fails; both suites report even when the first one fails.
-
-**Effort**: small.
-
----
-
-## Regression test: a Responses stream that dies mid tool-call
-
-Status: DONE. Fix shipped, unit test written and mutation-proven, and the client-side
-behaviour verified end to end against a real Claude Code run (see
-`ai-docs/reports/truncated-toolcall-live-verification.md`). Kept here for the method,
-which is reusable for any "does the harness honour this wire signal" question.
-
-The fix is in `openai-responses-sse.ts`: when `openToolBlocks` is non-empty in the
-parser's catch block, the turn ends with an SSE `error` event instead of `end_turn`,
-so Claude Code cannot execute a tool call whose argument JSON was cut mid-object.
-Rationale and the evidence behind it: `ai-docs/architecture/adapters.md`, section
-"A stream that dies mid tool-call".
-
-**Trigger condition**: a stable connection to the Codex backend. Nothing else blocks it.
-
-**The spec** (kept here because `ai-docs/sessions/` does not survive a fresh clone):
-
-Append one `describe` block to
-`packages/cli/src/handlers/shared/stream-parsers/openai-responses-sse.test.ts`, reusing
-its `createMockContext` / `parseClaudeSseStream` helpers. Derive the upstream body from
-the REAL capture `test-fixtures/sse-responses/gpt-5.6-sol-responses-turn1.sse` — do not
-hand-write SSE. In that fixture the first `function_call` item is added at line 94, its
-first argument delta is line 97, and it completes at line 103.
-
-- Test 1 — cut the fixture just after line 97, then `controller.error(new TypeError("The
-  socket connection was closed unexpectedly"))`, which is the production error text.
-  Assert: an `event: error` frame with `error.type === "api_error"`; NO `message_delta`
-  carrying `stop_reason: "end_turn"`; a `tool_use` `content_block_start` WAS emitted (or
-  the test can pass vacuously by the tool never starting); every block start has exactly
-  one matching stop.
-- Test 2 — cut during `response.output_text.delta`, before any `function_call` item, and
-  error the stream identically. Assert `stop_reason: "end_turn"` and a text block
-  containing `[Stream error:`. This pins the branch that must NOT change.
-
-**Acceptance criterion**: mutation-test it. Force the `if (toolCallCutOff)` condition to
-`false`, confirm test 1 goes red and test 2 stays green, then restore the file by copy —
-never `git checkout` or `git stash`, the index is shared with sibling worktrees.
-
-**VERIFIED 2026-09-10**: Claude Code DOES discard a partial tool block on a mid-stream
-`error` event. Measured before/after against the same mock upstream: released v9.0.8
-executed the truncated `Write` and returned `InputValidationError`, while the fixed build
-executed no tool at all and retried the turn. Method and raw evidence:
-`ai-docs/reports/truncated-toolcall-live-verification.md`.
-
-## Picker: the `all-filtered` notice must say "no capability data", not "not chat-capable"
-
-Status: not started. Found in the v10.1.1 release review (merge of the strict chat rule with v10.1.0's picker outcome states).
-
-`buildDiscoveredModelOutcome` (`model-selector.ts`) returns `all-filtered` whenever every served row fails `isReportedChatCapable`, and `DiscoveryNotice.tsx` renders it as "served N models, none of them chat-capable". That wording dates from when an undescribed model counted as chat. Under the strict rule it also fires when nobody DESCRIBED the rows: LM Studio's picker path reads `/v1/models` (no `type` field) while `--probe` reads `/api/v0/models` and its `type`, so the two screens disagree about the same daemon. Hiding the rows is correct; the sentence is false. Carry the undescribed count (`unavailableForMissingCapability` already computes it for the probe path) on the variant and word the notice from it; optionally read LM Studio's `type` in the picker fetcher too.
-
-**Trigger condition**: the next change to `buildDiscoveredModelOutcome` or `DiscoveryNotice.tsx`, or the first user report of a picker notice calling local models not chat-capable.
-
-## Picker tests: cover admission by catalog evidence alone
-
-Status: not started. Found in the same review.
-
-No picker-level test covers an `openai-models-list` provider (13 builtins plus LM Studio), whose discovered rows carry no `reported` and are admitted by the catalog alone; only the negative case is tested. `model-selector-discovery.test.ts` also now uses `mock.module("…/all-models-cache.js")` (contained, restored in `afterAll`), and its STATE C endpoint assertion is circular because the fixture sets the endpoint. Add a positive case (a served id the catalog fixture knows by alias is kept with no `reported`), assert the endpoint on a path the fixture does not control, and replace the module mock with a test-only catalog hook like `catalog-client`'s `_setCatalogEntriesForTest`.
-
-**Trigger condition**: before the next change to the discovered-row admission path, or with the item above.
-
-## MCP pane children: follow-ups deferred from the 10.4.0 migration
-
-Status: not started. Deferred during code review of the pane migration (PR #288); each line names the
-finding id in `ai-docs/reports/mcp-magmux-panes/session-record/implementation-log.md` ("Code-review fixes
-(iteration 1)"), where the reason is recorded.
-
-- **Background-shell orphan between refreshes.** A shell started and orphaned between two 2 s group refreshes
-  is never recorded in the pane's group file, so the watcher cannot reap it. Trigger: any report of a
-  leftover process after a pane closed, or the next change to `pane-registry.ts` group snapshots.
-- **A-L2 — shutdown reap ≈ 6–7 s instead of ≈ 3 s.** Watchers already cover an early SIGKILL. Trigger: an MCP
-  host that kills the server before ~7 s on shutdown.
-- **A-L5 — spurious re-wake after a screen-only settle.** Needs a deterministic degraded-mode fixture.
-  Trigger: a degraded (no-transcript) turn reported as a model re-wake in the field.
-- **A-L9 — a prompt starting `/word ` is typed as a slash command.** Needs a product decision (escape it, or
-  document it). Trigger: the first prompt that starts with a slash but is not a command.
-- **B-L4 — `run_id` falls back to the basename before the first flush.** Needs the id minted before
-  prehydrate. Trigger: the next change to `team(mode="run")` start-up ordering.
-- **C-L1 — an `invalid_args` spawn model is recorded as `pane_lost`.** Trigger: the next change to
-  `create_session` argument handling.
-- **C-L5 — accounting freezes at the terminal transition.** Outside observers read `tokens.json`, so they are
-  unaffected today. Trigger: a consumer that reads final tokens from the session row instead.
-- **gpt-5-mini cost is estimated** (`stats/*.json` prices it at $2/$8 per M with `is_estimated:true`), so
-  `cost_usd` may be overstated for it. Trigger: the catalog publishing real gpt-5-mini pricing.
-- **`proxy-server.test.ts` "keyless custom endpoint" timed out at 5 s in CI** (once, on PR #288; it
-  passes 3/3 locally; main's own CI also failed once on 2026-09-26, cause not checked). Trigger: a second
-  CI failure of that test.
-
----
-
-## Pane sessions: follow-ups from the 10.7.0 MCP update
-
-Status: not started. Evidence: `ai-docs/reports/2026-10-16-mcp-update-validation.md`. The turn
-that never settled after its background agents finished mid-turn was fixed in 11.0.0 (`a6739184`).
-Adopting magmux's `--controller claude-code` input gate, and the prompt typed twice under load,
-were closed by the `resize_session` redesign: panes need magmux 0.17.0, every prompt goes through
-one gated magmux `send` bound to the pane's own transcript, and the retype nudge
-(`PaneSession.nudge`, `awaitClearedBox`) and the `editorMode` overlay key are gone
-(`ai-docs/architecture/pane-session.md`).
-
-- **An upstream stream error is shown as assistant text, so the turn reads COMPLETED.** A
-  `create_session` on `gpt-6.1-sol` (`cx@`, claudish 10.6.3) ended its only turn with the
-  assistant text `[API Error: server_is_overloaded Our servers are currently overloaded. Please
-  try again later.]`; `upstreamErrors` was `[]`, `reason` null, state COMPLETED, after 27 tool calls
-  and no work done. A caller reading only the state takes it for a finished task. Trigger: find
-  where the Responses stream converts a mid-stream `error` event into a text block, and check it
-  on 10.7.0 first.
-- **`redactSecrets` misses three credential shapes.** On 2026-10-20 `redact.ts` left these
-  unmasked: `x-api-key: <value>` in a header, `https://user:password@host`, and a lowercase
-  `?token=<value>` query (`Authorization: Bearer <value>` is masked). `SlotRow.recent` passes a
-  Bash command or WebFetch url through it; the same text is already on the child's screen via
-  `capture_session`, so `recent` adds no exposure, but every caller of `redactSecrets` shares
-  the gap. Trigger: next change to `redact.ts`, or a report of a leaked key.
-
----
-
-## Pane children: an in-child mod as a state channel
-
-Status: parked. Decided 2026-10-13 from the UI-independent-signals research
-(`ai-docs/reports/pane-ui-independent-signals.md`, Layer 4).
-
-A Claude Code mod loaded with `--plugin-dir` runs inside the pane child and reports busy (`PromptHint`
-`isWorking`), dialog open (`classic.PermissionRequest`) and prompt submit directly, measured 11/11 in real
-claudish panes. It is not used because it is the least stable surface measured: the engine's own types say
-EARLY ACCESS, Anthropic can serve it off remotely with no local override (#99130 served it off on
-2.1.288/289), it stays off until a folder's trust prompt is answered, and loading it delays SessionStart by
-about 250 ms. Its `$.prompt.submit` is also not an input path for claudish: prompts are always typed or
-pasted as a user would.
-
-**Trigger condition** (all must hold): the mod API types drop "EARLY ACCESS"; #99130 is closed with the
-remote switch removed or overridable; and the session registry reader (`pane/session-registry.ts`) has
-shown a state it cannot express that a mod can.
-
-**Effort**: medium — a mod bundle shipped with claudish, a per-pane socket in the control dir, and a
-"no mod heartbeat → registry/screen" fallback.

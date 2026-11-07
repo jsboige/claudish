@@ -1,0 +1,670 @@
+# Relay / sidecar mode — internals
+
+**Deferred from `CLAUDE.md` (v7.2+ section).** The mode table, env vars and hard gotchas stay in `CLAUDE.md`; this file holds the mechanism. Operational runbook: `docs/deployment/relay-sidecar-deployment.md`.
+
+## Motivation (historical)
+
+Historically every cluster machine pointed Claude Code's `ANTHROPIC_BASE_URL` directly at po-2023's proxy container. That made po-2023 a **single point of failure** — when it crashed (2026-07-02), the whole cluster stalled. The relay design removes that: each capable machine runs its own claudish container (a **sidecar**) that relays to the central hub in nominal mode but takes over locally when the hub dies.
+
+## Components (`packages/cli/src/fork/server/relay.ts`)
+
+- `forwardToUpstream(c, body, state)` — builds outbound headers (copies inbound minus hop-by-hop, **preserves `X-Claudish-Machine`** so central attribution survives the relay, then **injects the cluster key as `x-proxy-key`** — NOT `x-api-key` — and **keeps the client `authorization`**). The `x-proxy-key` form passes the hub's auth gate without triggering `NativeHandler`'s proxyKey→Anthropic swap, so a relayed native (Opus) request from ai-01 passes through to Anthropic on ai-01's own OAuth (the hub stores no Anthropic key). `x-api-key` would arm the swap → strip auth → 401. Optionally gzips the request body, `fetch`es `${upstream}/v1/messages`. Pre-stream failure → returns `null` (caller falls through to local for that request). Success streaming → repiped via `createAnthropicPassthroughStream(…, { capture: false })` (ping keepalive + `finalizeWithError`, so a mid-stream hub death still emits a terminal `message_stop`).
+- `startUpstreamProber(state)` — heartbeat `GET /health` every 10s. **Hysteresis:** 2 consecutive failures → AUTONOMOUS (fast failover); recovery needs 3 OK heartbeats **+ 60s cooldown + a deep tool-call probe** (role-shaped `claude-haiku-4-5-20251001` by default — see the #613 bullet below — which must complete with `message_stop`) before returning to NOMINAL (anti-flap).
+- `readRequestBody(c)` — inflates a gzipped request body on the hub (detects gzip magic bytes, so it's correct whether or not the runtime auto-inflates). Zero cost on the uncompressed LAN path.
+
+## Wiring
+
+The relay branch sits in the `/v1/messages` route **before** `interceptWebTools` / `getHandlerForRequest` / `logRequest` — so nominal forwards bypass local capture automatically (mode-aware capture for free). `standalone-proxy.ts` reads the env, builds `RelayState`, passes it in `ProxyServerOptions.relay`, and starts the prober.
+
+## Which routes relay, which stay local (Refs #291)
+
+Only the two serving routes forward (`forwardToUpstream` has exactly two call sites, `proxy-server.ts:2218` inside `/v1/messages` `:2186` and `:2350` inside `/v1/chat/completions` `:2329`):
+
+| Route | Nominal relay mode |
+| --- | --- |
+| `POST /v1/messages` | forwarded raw to the hub (`:2218`) |
+| `POST /v1/chat/completions` | forwarded raw to the hub (`:2350`) |
+| `POST /v1/messages/count_tokens` | **never relayed** — always local |
+
+`/v1/messages/count_tokens` (`:2013`) resolves a handler locally through `getHandlerForRequest` (`:2031`) and counts on this node even when the relay is NOMINAL — only the native case fetches `api.anthropic.com/v1/messages/count_tokens` directly (`:2123`). Consequence: in NOMINAL, `CLAUDISH_NO_ANTHROPIC` **acts on `count_tokens`** (a `claude-*` count is rerouted to the budget sonnet and counted locally) while forwarded `/v1/messages` traffic never reaches the guard — the local policy sees only the routes that stay home. Measured 18/10 on po-2024: 7 `[Proxy] NO_ANTHROPIC: rerouting native 'claude-opus-4-8' → budget 'glm-5.2'` lines during a fully NOMINAL window (route attribution of those specific events: unproven from the log line alone — the coordinator's `count_tokens` hypothesis is the candidate, po-2023 owns the pairing).
+
+## Leak-policy backstop (defense in depth)
+
+`CLAUDISH_NO_ANTHROPIC=1` (set on every machine ≠ ai-01) makes `getHandlerForRequest` reroute any bare native (`isNative`) target to the budget `modelMap.sonnet` instead of real `api.anthropic.com`. Depth-guarded recursion + a fail-closed refusal handler prevent both infinite loops and leaks on a misconfigured mapping. See memory `leak-policy-binary-by-machine`.
+
+## Compression (Phase B, WAN only)
+
+LAN sidecars do **not** compress (the hub decompresses to proxy anyway; the LAN isn't the bottleneck). WAN externals (po-2025, web1 → models.myia.io) set `CLAUDISH_RELAY_COMPRESS=1` → native `Content-Encoding: gzip` on the **request body only** (never the SSE response — gzip buffering would risk a hang). The uplink (system + history + tools) is the constrained asymmetric direction.
+
+## Outage capture reconciliation (Phase C)
+
+On a sidecar, loose captures exist *only* because an outage forced AUTONOMOUS mode — so any loose `req-*/resp-*` files ARE outage captures. `scripts/reconcile-outage-captures.ps1` packs them into `reconcile/outage-<machine>-<start>_<end>.7z` (machine-namespaced, no collision with daily `captures-YYYY-MM-DD.7z`), uploads to GDrive `reconcile/`, and deletes loose only after a verified archive + confirmed off-site copy. The hub merges them nightly; attribution is correct because each `req-*.json` body carries `machine` (commit 141d160). `CaptureUtils.psm1` → `Get-OutageArchives`.
+
+## The two upstream failure signatures
+
+A relay flap has **two** signatures, and they do not mean the same thing. Only the first is local.
+
+| Signature | What it is | Who absorbs it |
+|---|---|---|
+| **Connect failure** — refused / reset, fails in milliseconds | *client-side transport* **only under #80's precondition — the hub independently reachable at the same moment** (there: the Docker Desktop tunnel); a refusal with the hub down is the hub, not the transport | the single +250 ms retry (#80 part 2); an absorbed retry does **not** `markFail` |
+| **Invalid response** — TCP accepted, nothing valid returned | **hub-end availability**: the port is open, the process answers nothing readable | nobody — it reaches the client |
+
+Measured on po-203, **2026-10-08 `08:48:52→08:50:55Z`**, the same signature on **three independent
+paths to the same hub**: the host's own `curl http://192.168.0.50:3000/health` (**no Docker in the
+path at all**), the `:18182` TCP relay (`relay.js`, a raw `net` pipe), and **IIS ARR on the ingress**,
+which logged **34 × 502** (substatus 3/6, **win32 12152 = `ERROR_WINHTTP_INVALID_SERVER_RESPONSE`**)
+over the window — the failed entries including real client `POST /v1/messages` from
+`claude-cli/2.1.292|2.1.293`. Between the probes bracketing the window, the hub's `/health`
+`instanceId` changed (`9a8295e5…` → `99c2feef…`) and `uptimeSec` reset — read from po-203's side as
+a process replacement **bounded to that interval** (an id change dates nothing by itself); the relay
+returned NOMINAL 32 s later. **The replacement is corroborated hub-side, and its cause is a Docker
+Desktop engine recovery — see below.**
+
+**Measured again on 2026-10-23, and it inverts the reading.** 19 AUTONOMOUS transitions on the
+po-203 relay (04:11→08:39Z) looked like a hub outage. The hub-side cross-check eliminated the hub:
+po-2025's watchdog persisted 21 OK probes with a monotone `uptimeSec`, its capture store showed no
+gap across 10 031 captures, and **1 525 po-203 captures were served during the very episodes the
+relay called down**. What the flap measured was **upstream latency through the `:18182` tube**, not
+availability: headers ran 3 893-10 899 ms over 04:46→07:31Z (12 episodes), then 247-343 ms after
+07:46Z while heartbeats kept failing (6 episodes — tube or seat, **not established**: no portproxy
+telemetry). The 2026-10-08 case above is the counter-example that keeps this honest: **same
+instrument, opposite verdict**, which is exactly why the three hub-side proofs (persisted watchdog
+probes with monotone uptime, per-10-minute capture gaps, presence of the flapping seat in the
+captures) are required before either reading. Discriminator on the seat itself: **slow headers +
+failing heartbeats = slow upstream; fast headers + failing heartbeats = local tube/seat.** A
+`/health` heartbeat timeout is never, on its own, evidence the hub is down — it shares the tube and
+the host with everything else.
+
+**Attribution at fleet scale — the #730 grid (po-2027, 27/10→01/11, 42 episodes / 424.2 min).**
+The same doctrine applied to five days of AUTONOMOUS episodes on one seat, every class carrying its
+proof, two recomputes assumed (grid + provenance:
+[#730 comment](https://github.com/jsboige/claudish/issues/730#issuecomment-6574563173)):
+
+| class | episodes | min | share | proof |
+|---|---:|---:|---:|---|
+| HUB — named 5xx | 7 | 12.4 | 2.9 % | 502/503 named by the hub |
+| HUB — by construction | 6 | 73.0 | 17.2 % | 30/10 drain cluster (5 episodes) + 01/11 00:41 hub recreate |
+| not hub-side — the probe itself | 4 | 5.3 | 1.2 % | hub journal 0×5xx AND 36-92 capture files per window |
+| seat — Netwtw14 | 8 | 46.3 | 10.9 % | seat `System` journal join |
+| undetermined | 17 | 287.2 | 67.7 % | `/v1/messages` plane alive in every window (captures); no hub event, no seat signal |
+
+The undetermined class is the largest by time and is **bounded, not opaque**: in every one of its
+windows the hub was serving the seat's message traffic, so the residual points at the heartbeat
+path itself — which no current instrument sees. Three limits bound any re-measure: container logs
+die with the container (the 21 windows ≤ 31/10 have no hub-side journal, ever), `/health` is never
+captured (captures cover `/v1/messages` only), and `failover-events.log` only starts 01/11 05:16Z.
+**The single measure that closes the undetermined class is the `[Health]` marker (#812)** —
+heartbeat lines logged hub-side — which lands at the next natural hub recreate.
+
+**What the hub-side journal holds (po-2025, `~/.claudish/docker-events.log` — the durable collector
+of issue #169).** At 08:50:56Z a `container start claudish-proxy` **carrying the same container id**
+(`32c3f1378a91`) — and between 06:34:11Z and that event **no `create`, `stop`, `die`, `kill` or
+`destroy` at all**. A container cannot be *started* without having been stopped, and the daemon that
+would have logged the stop was itself gone. ⚠ **`com.docker.compose.replace=claudish-proxy`
+identifies no actor and no recreate**: it is stamped at creation and persists, so it reads as a
+recreate on a container that was never recreated (its `environment_file=D:\claudish-shadow\.env` is
+a creation-time fact for the same reason) — and the refutation here is direct, since **no `create`
+event exists anywhere in the window**. The same-second sibling closes it: `08:50:58Z start
+myia_vllm-mini-frognano-4b d5d45279654c`, again the id created earlier (08:26:33) with no prior
+`die` — **two bare starts, 2 s apart, on two containers of two different compose projects = the
+Docker Desktop engine restart signature**, the same shape the watchdog names the same day
+(`ENGINE-DOWN: docker CLI cannot reach the engine`, then `DIAG[engine-down]: port 3000 DEAF
+(refused)`); a create/start/die/destroy burst of ephemeral containers at 08:00–08:01Z shows the
+engine had already bounced that morning. Not a reboot: the System log 08:40–08:56Z holds no
+41/6008/1074.
+
+**Reconciled 2026-10-10 (issue #419, c.6093767933) — the two readings were never in conflict.**
+po-2025's watchdog uptime comes from `docker inspect State.StartedAt` (the daemon-held container
+record), *not* from a probe; the `/health` `instanceId`/`uptimeSec` pair is the in-process view; and
+`watchdog.log` is stamped **local (UTC+2)** while `docker inspect` and `/health` are **UTC** —
+comparing the two without conversion fabricates a false 2 h gap. The corrected readings are
+`2.2 h` at `08:47:25Z` → `0.2 h` at `09:02:04Z`: **`StartedAt` and the process identity reset
+together at the event**, the two instruments agree, and the "contradiction" was a transcription
+error on po-2025's side, retracted. What stays unestablished is only the *cause of the engine
+event*, never the shape of what the relay saw.
+
+Day scale stays counted by the journal's shape (a `start` with no logged `stop`) — the honest unit,
+since the collector can also lose ticks (#417/#419): **3 such `start`s on 2026-10-08** (06:34:11Z,
+08:50:56Z, 11:20:37Z — the last with no observed process replacement, `RestartCount=0`,
+`StartedAt=12:02:02Z`), against **2 drained gestures** that day; over the whole available journal,
+**20 such `start`s across 82 hub `start`s since 22/09**. `drain.log` is silent on all three —
+correctly so for an engine recovery: **there was nothing to drain**. That silence is why the durable
+collector matters here: `scripts/docker-events-collect.ps1` (#169).
+
+**The fully-attributed counter-example (2026-10-10 01:03:47Z).** One night later the same fleet
+produced the pair with a cause we own end to end: a **watchdog proactive** restart (uptime 11.9 h
+≥ 11 h, quiet window), drain to a true zero in **84 s** — `0 in flight — no client interrupted` —
+`docker restart` back in 9 s, `OUTCOME success`. `StartedAt` and the process counters reset
+together, and **the two edge 502s that night (01:03:42/46Z) are the stop-start interval of that
+restart** — the sharpest available measurement of what a hub restart costs on a fallback-less WAN
+path (po-203, 2026-10-10).
+
+**Day scale (2026-10-08, closed).** **11 AUTONOMOUS episodes, 11 recoveries** (03:26:02 → 11:13:21);
+**10 of the 11 have matching 502 minutes**, and **179 of the day's 184 502s fall inside a flap
+window** (13 729 requests, 1.3 %). The single episode with no 502 anywhere
+(**05:49:05→05:50:28**, 83 s) is the one consistent with the local transport class: the two
+signatures coexist, neither abolishes the other.
+
+⚠ **The relay tally is a lagging, insensitive proxy, and two blind spots make it lossy.** The
+heartbeat arms on **2 consecutive** failures, so it never flaps on a single-minute blip (2026-10-08:
+502s at **00:09, 03:12, 03:41, 03:44, 19:52** — present in the 502 record, absent from the tally),
+and it can miss a hub restart outright (**12:01**: one 502, the hub's process replaced ~12:02 — **no
+flap at all**). Reading the tally alone therefore **under-counts** hub unavailability *on the WAN
+ingress*. The instrument that does not is the **ingress IIS log** (`W3SVC49/u_ex<yymmdd>.log`):
+`awk '$12==502'` over the **status / substatus / win32** columns — with its own scope: it sees
+**only the requests that traverse it**; LAN-direct clients and sidecar traffic on the `:18182`
+tunnel never appear. Joined to `/health`'s `instanceId` + `uptimeSec` for process identity, an
+`instanceId` change *bounds* a replacement between two observations; it does not date it, absent a
+corroborating timestamped event.
+
+**`/health` also publishes `eventLoopMax60sMs` (windowed max, retires), `eventLoopBlockedMs5m`
+(floored sum of lag over ~5 min — weighs a block by its length) and `eventLoopMaxMs` (cumulative
+high-water since start) — the #587 gate instrument** for the "relays flip AUTONOMOUS while the hub
+loop was merely busy" class: if these stay at a few ms during an episode, neither a cached `/health`
+nor a separate listener would have answered it, and the A/B choice is moot. A tick ≥ 250 ms late
+additionally logs one `[EventLoop] lag=<n>ms` line (timestamped by `docker logs -t`), joinable with
+the sidecars' `→ AUTONOMOUS` transitions on the same clock. It is a manual 20 ms tick
+probe, **not** `perf_hooks.monitorEventLoopDelay` — that API is a measured stub on the production
+runtime (a 200 ms synchronous block records 0 on oven/bun 1.3.14, script and test context alike).
+⚠ **Windows seats read with a floor**: the 20 ms interval fires at ~31 ms there (timer granularity),
+so every tick "lags" ~11 ms — p50-style readings carry that floor, and it is why the blocked sum
+floors at 50 ms. The hub (Linux) is unaffected. **The probe runs on the MONOTONIC clock**
+(`performance.now()`, #615 review): `Date.now()` is wall time, so an NTP resync or the WSL2 VM clock
+catching up after host load would step it forward and manufacture a phantom `[EventLoop]` line — the
+false positive that would then correlate with an AUTONOMOUS flip caused by the same host event — while
+a backward step silently drops samples. The line's wall time comes from `docker logs -t`, which is the
+clock the sidecar transitions are read on. Appended keys only (#156/#439 discipline); nothing
+in the data path or the health route gates on them.
+
+**Client impact beyond the 502s — #410 owns the defect; the *timing tie* now holds.** The Zod
+rejection is real and measured: `config.json` carried `maxConcurrency: 16`, the image then in
+service (07/10) caps at 8, and an endpoint failing validation is dropped whole (by design, with a
+stderr warning), so the entire `frognano` entry was skipped and **`frognano-4b` and `mini` stayed
+down until the revert at 11:17:25Z** — about 2.5 h. *"The 08:50:56Z restart re-read `config.json`"*
+holds because the replacement at that instant is corroborated hub-side (same container id restarted
+by the engine, no `create` anywhere in the window): the process did restart there, and a process
+restart is the instant a config never validated against the *running* image takes effect. (Read
+strictly, the 2.5 h window is bounded by two observable ends — the restart and the 11:17:25Z revert
+— and the general rule survives whatever timestamp the restart carries.) On ai-01 the same window
+sent clients to the walled last step of the local cascade, a 403 (#409).
+
+**Consequence, standing.** On this fleet **a relay flap is a reading of hub *reachability from the
+relay* — not a local Docker artifact, and not a cause localisation**: the three concordant paths
+qualify *this* window (the failures sat at the hub end of the path on 08/10); they do not
+pre-locate the cause of future flaps. Never let *"impact client nul"* cover the **WAN entry**. Only
+the relay-**bypassed** *local* clients are shielded from a hub outage — which is the measured
+argument for pointing the WAN entry at a relay rather than straight at the hub
+(`models.myia.io`, IIS site id=49).
+
+## Reading the relay's verdict lines (§Verdicts)
+
+Every verdict line is a decision the relay made under its own arming rules — the line says what the
+relay concluded, never why the conclusion is true. Reading rules, each anchored to a measured
+window:
+
+- **The transition line names its TRIGGER, and the trigger is not the cause.** `DOWN after 2
+  failure(s) (heartbeat) → AUTONOMOUS` arms on the heartbeat channel; `DOWN after 2 failure(s)
+  (forward-connect: …)` arms on forwarded requests. The parenthetical says which channel tripped —
+  deciding between client-side transport and hub-end availability still takes the two-signatures
+  table above.
+- **Count episodes by lines that END with `AUTONOMOUS`** — the word mid-line is not a transition
+  (the ~6× overcount rule of `traffic-analysis.md` applies verbatim).
+- **`(aborted-on-autonomous)` lines are the trip cost, not client errors.** In-flight forwards
+  aborted when the mode armed are re-served locally (`this request served LOCALLY [n/2 before
+  AUTONOMOUS]` — the counter is the arming count this forward fed, the #80 precondition in action).
+- **Recovery is two lines, and the second is the verdict.** `deep probe OK — message_stop after
+  <n>ms` then `healthy again → NOMINAL (relay resumed)`: the deep probe (a real tool-call stream)
+  is the gate; the heartbeats only earned it a hearing. Measured 31/10 on po-2024: hub entry down
+  05:12:59Z, sidecar AUTONOMOUS 05:13:12Z (13 s later), entry back 05:36:32Z, deep probe OK
+  (8 332 ms) → NOMINAL 05:36:36Z — 23 min 24 s autonomous, 301 requests served locally, zero
+  client errors. The probe's seconds are dead time added to recovery by design: hysteresis's price.
+- **The protocol has a floor, and `window − probe` is how you subtract it: only the 60 s cooldown
+  is hard — the rest is at most one heartbeat interval of tick alignment, so the floor lives in
+  [60, 70] s, and any excess above it is real hub downtime, not recovery latency.** The gate at
+  `relay.ts:1243` fires on the first tick where 3 consecutive OK heartbeats (`OK_THRESHOLD = 3`)
+  AND `RECOVERY_COOLDOWN_MS = 60_000` since the flip both hold, and ticks run every
+  `HEARTBEAT_INTERVAL_MS = 10_000` (`:1285`) — the probe launches on that tick, inline. One
+  container, one process lifetime, three windows on 2026-11-04 (po-2028): 69,70 s − 3 672 ms =
+  **66,03 s** · 68,70 s − 2 606 ms = **66,10 s** · 87,11 s − 21 101 ms = **66,01 s** — a 60 s
+  cooldown plus 6 s of tick alignment. **For a heartbeat-timeout flip that alignment is not a
+  draw, it is `10 − t`**: `markFail` stamps `lastFlipAt` when the second heartbeat gives up, `t`
+  after its tick (`t` = `CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS`, default `HEARTBEAT_TIMEOUT_MS =
+  4_000`), so the first tick past the cooldown is the seventh and `window − probe = 70 − t` —
+  66 s on the 4 s default, **61,9 s on po-2023's first 2026-11-04 flip** at 9 s (po-2027
+  measured the same 61 s at 9 s, #867). Only a flip stamped off-tick (`forward-connect`,
+  `forward-http-*`) draws its alignment anywhere in [60, 70] s. Quoting one seat's 66 s as *the*
+  floor mis-states a seat on another heartbeat timeout by the difference. **It is a floor
+  measured from `markFail`, not an expected duration**: the seventh tick only opens the door if
+  the OK streak is complete, and each tick that misses it adds 10 s. The other four po-2023
+  windows that evening read 73,1 s (one tick late) and 559,0 / 601,1 / 663,9 s, where the door
+  opened, the probe failed at it, and recovery waited on retries (the #867 class). The fourth po-2028 window reads
+  147,24 s − 1 218 ms = **146,0 s** on the same arithmetic — the day po-2025's *host* rebooted
+  at 13:44:56Z, the cooldown expired while the hub was still down and the probe waited for its
+  hearing. On a first-attempt probe timeout, add the full first budget (30 s default; 10 s under
+  `CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS`, #868) plus the fallback attempt. **A reader quoting
+  raw `DOWN → NOMINAL` durations over-states every episode by the protocol's own floor**; the
+  subtraction is what tells a 70 s heartbeat blip from a 150 s outage.
+- **The probe's first attempt is intermittent within one seat, so a fixed order is not the fix.**
+  Same container and process lifetime: **3 of 4** windows on 2026-11-03 fell back to `glm-5.3`
+  after a haiku `TimeoutError` (second attempt 1 586 / 1 169 / 1 242 ms), while **0 of 4** did on
+  2026-11-04 (first attempt succeeded in 3 672 / 2 606 / 21 101 / 1 218 ms). A seat-constant
+  reading of "haiku-first is chronically slow" (27 of 39 probe timeouts on po-2027, #867, 134
+  client-visible `Cannot reach api.z.ai` that day) is one same-seat flip away from being wrong.
+  What this supports is a **short budget on the first attempt**, not a reordering.
+- **A quiet AUTONOMOUS window says nothing about the hub** — once autonomous the relay sends
+  nothing upstream, so no client request can refute the verdict (the asymmetry pinned above);
+  corroborate hub-side (watchdog probes, capture gaps) before reading a flap window as hub time.
+
+### The entry probe's mode-dependent verdicts (§Verdicts, `hub-entry-probe.py`)
+
+Three of the probe's verdicts turn on this seat's relay mode, and **only a live `/health` may
+supply it** (`role=relay-nominal|relay-autonomous`, trap T9). The last `→ NOMINAL` / `→ AUTONOMOUS`
+line in the container log is a fallback that can be hours stale: a stale `NOMINAL` would render
+`PROBE-BLIND` — exit 2, *do not escalate* — on exactly the hang the probe exists to catch (a
+sidecar can freeze on the same event-loop mechanism as the hub, stop writing transitions, and leave
+the log's last word `NOMINAL`); a stale `AUTONOMOUS` conjures a false `ENTRY-UNRESPONSIVE`. With no
+live role those shapes degrade to `UNKNOWN` — absence of a signal is not a signal. Pinned: two
+timeouts + log-only `NOMINAL` → `UNKNOWN`, not `PROBE-BLIND`.
+
+- **`ENTRY-UNRESPONSIVE`** — both layers fail to answer **before the timeout** *and* the seat's
+  relay is live-AUTONOMOUS: a hang measured at two independent layers, corroborated by a live
+  relay. Measured live 30/10 15:21Z: TCP accepted on the published port, no HTTP answer in 15 s.
+- **`PROBE-BLIND`** — the same two timeouts but a live-NOMINAL seat: the hub answers the relay's
+  heartbeats, so the probe's own path is blind, not the entry. Exit 2.
+- **`FACADE-UNRESPONSIVE`** — L1 alive while the façade produced **no status at all**: timeout,
+  refusal, DNS or TLS error (trap T10). A REFUSED façade *did* answer (RST) — that is why the
+  verdict reads "no status", not "no answer": the pre-#779 reason string ("never answered before
+  the timeout") was wrong for a refusal, and the same branch returned `NOMINAL` for refused / DNS /
+  TLS — a façade serving nothing read as healthy.
+
+Exit codes: `0` NOMINAL · `1` degraded (ENTRY-DOWN, ENTRY-UNRESPONSIVE, PATH-BROKEN,
+FACADE-502-ONLY, FACADE-UNRESPONSIVE, SEAT-DETACHED) · `2` inconclusive (`UNKNOWN`,
+`PROBE-BLIND`) or usage error.
+
+## Tests
+
+`relay.test.ts` (16 — hysteresis, header build incl. ai-01 Opus passthrough, gzip, never-hang delegation). Budget-free resilience E2E: `bun run packages/cli/src/fork/server/relay-e2e.ts` (real prober + mock hub: NOMINAL → FAILOVER → RECOVERY over real HTTP, ~2-3 min).
+
+## Fleet deployment
+
+`scripts/install-sidecar.ps1` idempotently stands up a sidecar on a target machine (clone/pull, per-machine `.env`, `docker compose up --build`, end-to-end probe). Runbook + per-machine config table: `docs/deployment/relay-sidecar-deployment.md`. Sidecars go on every machine except the hub (po-2025 since the 05/09 cutover) and web1 (stays on `models.myia.io`); po-2023 runs the relay + WAN edge instead. The client prerequisite — the `x-proxy-key` custom header — is documented in memory `proxy-key-custom-header-auth`.
+
+## Stable entry form & announcement convention (roo-extensions#3963)
+
+The hub lane guarantees ONE shape for its fleet-facing entry: **the published container port
+`.50:3000`** on po-2025. Everything in front of it (the ARR rule on po-203, the `:18182` host
+forwarder, `models.myia.io`) is the façade owner's infrastructure, not the hub's contract.
+
+**Engagement (2026-10-03, user-approved 2026-10-19): any change to the fleet-facing entry
+point — ARR rewrite target, forwarder port, socket owner, published port — is announced on the
+`global` dashboard BEFORE it is applied**, same channel discipline as side-effect announcements.
+Founding incidents: the 07/09 silent ARR revert (2 779 req / 263.6 M tokens served invisibly by
+the po-203 local cascade, 4 days undetected) and the 30/09 orphan `:3000` socket (502/reset for
+~80 min, fleet cut mid-afternoon). Both were shape changes nobody announced; the convention
+exists so the next one is at least visible before it bites.
+
+## 2026-10-30 — the entry form was down ~55 min, and no lane said so
+
+Measured from a seat (po-2024), not from the hub: **the fleet-facing entry form
+(`192.168.0.50:3000`) did not answer between 09:36:59Z and 10:32:23Z**, the WAN
+façade `models.myia.io` answered **502** throughout, and the hub container that
+serves now (instance `ca6c14b5…`) started at **10:32:01Z**. The outage was
+visible only in the seat's own relay log — no dashboard, no incident, no
+announcement, while the convention above was in force.
+
+**The evidence, by source (each line carries its provenance):**
+
+| Fact | Value | Source |
+|---|---|---|
+| Relay leaves NOMINAL → AUTONOMOUS | 09:26:48Z (`DOWN after 2 failure(s) (heartbeat)`), brief NOMINAL blip 09:36:42Z (deep probe OK after 28 304 ms), AUTONOMOUS again **09:36:59Z**, NOMINAL again **10:32:23Z** | this seat's sidecar container log, `[Relay]` lines |
+| Published port unreachable | TCP refused at 10:26Z and 10:31Z (3 probes × 10 s) | measured from po-2024 |
+| WAN façade | HTTP **502** on `https://models.myia.io` at ~10:26–10:29Z | measured from po-2024 |
+| Hub process start | **10:32:01Z** — `uptimeSec` 76 / 728 / 1019 at 10:33:18Z / 10:44:10Z / 10:49:00Z (three samples, exact 1× rate) | hub `/health`, read from po-2024 |
+| Hub upstream degrading before the entry died | `[Failover] STEP-ADVANCE haiku — HTTP 502 (non-quota) from step 0` at 09:19Z, 09:24Z, 09:43Z, 09:57Z, 09:58Z; `step haiku[0] (Swift 1.5 local) failed (non-quota) — count=38` | `~/.claudish/failover-events.log` on po-2025 |
+| Silence on the hub side | **no** failover event between **09:58:07Z** and **10:32:23Z** | same ledger |
+| The hub seat's own surveillance was blind | `watchdog.log`: last tick before the gap 09:17:09Z, first after **10:32:18Z** — **75 min / 5 ticks missing**, the entry after the gap reading `DEGRADED (uptime=0h)` | `~/.claudish/watchdog.log` on po-2025 (timestamps are host-local, UTC+1) |
+
+The hub container's own lifecycle that morning is **not** told here: a
+seat-side reading of `docker-events.log` once saw a "restart storm" in it,
+and the hub lane's post-mortem refuted that reading with the same journal
+(zero lifecycle events on `claudish-proxy` that window, an empty `drain.log`,
+119 requests served inside the alleged "stopped" window). The hub-side
+chronology lives in **`docs/reference/hub-outage-2026-10-30.md`** (#785);
+this section keeps only what a seat measured.
+
+**The hub's durable ledger cannot certify its own outage window.** In
+`failover-events.log` the `ts` is the *line's* docker timestamp but the
+`instanceId` is the one the proxy reported **when the collection tick ran**
+(`scripts/failover-events-collect.ps1`). After a restart, lines written before
+it but collected after it carry the **new** instance id: the ledger shows lines
+stamped 09:18–09:58Z attributed to `ca6c14b5…`, the instance that only started
+at 10:32:01Z. The instance id is a `randomUUID()` at module load
+(`packages/cli/src/instance-id.ts`), so it cannot survive a restart — the
+attribution is the collector's, and it is misleading. Read the ledger's
+`ts`, not its `instanceId`, to date an event.
+
+**What was missing is the PATH, not the traffic.** No instrument asked "is the
+entry form up?": the traffic instruments count requests (and the MCP
+`claudish_traffic` renders a **false GAP** on a healthy relay sidecar — memory
+`traffic-mcp-false-gap`), `fleet-matrix.ps1` describes the local seat,
+`seat-readiness-audit.ps1` answers "would this seat survive the hub dying",
+`claudish-mode-watch.ps1` persists the local role. `scripts/hub-entry-probe.py`
+(new) probes the entry form in layers and says **which** layer is down:
+`NOMINAL` · `ENTRY-DOWN` · `PATH-BROKEN` · `FACADE-502-ONLY` · `SEAT-DETACHED`
+· `UNKNOWN` (exit 0 / 1 / 2). One probe cannot tell "hub dead" from "path
+dead" — that distinction decides who gets paged. Pins:
+`scripts/tests/test_hub_entry_probe.py`.
+
+**Two rules, restated because both were broken on the day:**
+
+1. **An outage detected is an outage escalated — in the SAME cycle** (the
+   repo-level rule). This one was detected at 09:26:48Z and was still
+   unannounced at 11:00Z, four cycles later. A seat that observes the fleet
+   entry form down escalates it: `global` dashboard + DM to the coordinator,
+   with the measured window, the sources, and what the seat could not
+   determine.
+2. **A change to the fleet-facing entry point is announced BEFORE it is
+   applied** (roo-extensions#3963, above). The rule needs no restart storm to
+   stand: the door was dead from ~09:30Z and nobody announced it, whatever
+   the mechanism turned out to be (a host reboot — below). The announcement
+   is what tells the other seats; the mechanism arrives later, in the
+   post-mortem.
+
+**The hub lane's post-mortem answered what this seat could not determine**
+(full hub-side chronology: **`docs/reference/hub-outage-2026-10-30.md`**,
+#785): the container **never crashed** (`started=10:32:02Z`,
+exit 0, no OOM, no drain entry that day) — the **host rebooted** at
+**10:29:08Z** (Event 1074, `Explorer.EXE`, "Autre (non planifié)", clean
+shutdown 6006/6005, no 41/6008) and the container came back three minutes
+later. So the 75-minute watchdog gap is the **host being down**, not a dead
+scheduler. Corroborated on that seat by bursts of `event streamer: error: EOF`
+and a vhdx compaction skipped twelve days running.
+
+**The mechanism is recurrent, and it is the hub's own event loop.** The hub
+publishes `eventLoopBlockedMs5m`: 5 295 ms at 13:01Z, then 38 623 → 40 641 →
+42 272 → 45 153 → **59 833 ms** at 14:52Z — **20 % of five minutes** with only
+2 active streams, so not load (po-2023, RAPPORTÉ). It ran out at **15:19:57Z**:
+the seat's forward died on a closed socket, AUTONOMOUS at **15:20:11Z**,
+`/health` **3/3 timing out at 15 s**, the façade likewise, while `.50:80`,
+`.50:135` and the WAN stayed open and the published port **accepted the TCP
+connection** — the process was hung, not the path (measured from po-2024,
+15:21–15:23Z). That live episode is why the probe grew **`ENTRY-UNRESPONSIVE`**
+and **`PROBE-BLIND`**: its first version rendered the hang `UNKNOWN`, i.e. it
+called a measurement an absence of signal. The per-minute event-loop series
+(#760, `08d25348c`) is the instrument that dates these stalls on the hub seat.
+
+**Still open on the hub lane:** the ledger's `instanceId` attribution (§3
+above) is a documented defect, not a fixed one — now **#782**, with the
+suggested route (`State.StartedAt`, a per-restart anchor).
+
+## 2026-10-31 — the WAN façade's IIS logs are UTC, not local
+
+`u_ex*.log` under `W3SVC49` (the `models.myia.io` site on po-2023) timestamps
+in **UTC**, per the W3C default. Measured on the 31/10 05:13→05:36Z outage:
+the 502 storm reads `05:13:16→05:36:47` in-log and matches the relay's UTC
+window to the second, while a naive local-time (UTC+1) filter lands one hour
+after the outage and reads it as calm — 393× 200, exactly the post-recovery
+traffic. Reading rule: before joining an IIS window to a relay/docker window,
+anchor on a shared event (a restart's 502 burst), never on an assumed
+timezone.
+
+That same window, counted at the façade (impact of the hub outage): **220×
+502** on `:443` — 49 workload POSTs (`/v1/messages`, bodies 311–707 KB, client
+retry loops) from two remote seats (`IP-A [redacted]`, `IP-B [redacted]`), 164
+canary `/health` 502s, 3 localhost probes, 4 scanner hits. The outage read
+from outside was **not binary**: 200s flowed until **05:21Z** interleaved
+with the first 502s (flapping phase), zero 200s **05:22→05:36Z** (hard-down,
+even `/health` degraded to 400), recovery **05:36:15Z+**. The separate
+04:52:55–04:53:28Z burst (18× 502) is the hub-seat watchdog's proactive
+restart, not the outage.
+
+## 2026-11-01 — two missed heartbeats, neither corroborated hub-side
+
+ai-01's sidecar went AUTONOMOUS twice outside any announced window —
+02:53:21→02:54:41Z (80 s) and 10:57:21→10:58:28Z (67 s, one request served
+locally) — with no hub restart (uptime continuous, `ffc2b819`). The hub
+journal read over both instants **discards a hub-side stall for both**, and
+with it the first reading of "the hub missed heartbeats":
+
+- **Episode 1 (02:53Z) is observer-side.** Hub log density shows no dip
+  (156→231 lines/min through the window), GLM ttfts sit at 1.2–6.0 s, and
+  requests from po-2023/24/27/28 were accepted continuously — but **not one
+  `machine=myia-ai-01` request** lands from 02:52:30 until 02:54:37.78, three
+  seconds before the sidecar recovered. The hub served everyone else while the
+  observing machine's own traffic was absent; the window overlaps the tail of
+  ai-01's `Backup-Ubuntu-WSL`.
+- **Episode 2 (10:57Z) has the hub demonstrably serving.** `[Request]` lines
+  land at 10:57:40/48/52/56 — four of them from ai-01's own host (three
+  Hermes + one sdk-cli), in the middle of the window in which its sidecar's
+  heartbeats were failing. Host→hub worked while container→hub did not. The
+  hub was under real pressure (9 active streams, deepseek-flash headers
+  4.7–51.9 s, swift streams closing at 120 s and 369 s) — but the highest
+  `eventLoopBlockedMs5m` anyone read is **859.6 ms** (12:07Z), and a 60+ s
+  loop block leaves fingerprints (a log-density gap, a ttft explosion) that
+  neither window shows. The sidecar's relayed `[ttft]` of 4.6–10.2 s at midday
+  are real upstream waits passed through — hub-side avg 8.1 s headers over
+  n=392 (12:00–12:15Z), the sonnet role on DeepSeek PAYG after GLM re-walled
+  at 10:31:59 — not queueing at the hub. And the hub's own `[EventLoop]
+  lag=` threshold marker fired **exactly once all day — 267 ms at 06:13:24Z,
+  between the two episodes** — and not once inside either window: the loop
+  never crossed the marker's floor while a heartbeat was being missed.
+
+Reading rule: **a missed heartbeat is an observer event until the hub journal
+corroborates it.** Before calling a heartbeat miss a hub outage, read (1)
+per-minute log density over the window, (2) whether `[Request]` lines —
+including from the observing machine's host — kept landing, (3) upstream
+ttfts and the loop gauges. Two consecutive `/health` failures → AUTONOMOUS is
+the designed hysteresis doing its job; episode 2's total cost was one request
+served locally.
+
+The instrument gap that kept the residual question open on 01/11: **`/health`
+arrivals were not logged hub-side** — a case-insensitive grep for "health"
+over 214 640 log lines returned 24 hits, all prompt text. "Heartbeat never
+arrived" (container NAT, path) therefore could not be distinguished from
+"answered slowly" (loop pressure) from the hub journal alone; the
+discriminator called for was a heartbeat-arrival marker hub-side, or the
+sidecar's own failure shape (connect timeout vs slow response). **That marker
+shipped in #812** (`[Health] hit peer=… machine=… status=…`), so the gap is
+closed — but read it for what it is:
+
+- **It is an arrival marker, emitted by the machine that RECEIVES the probe**
+  (`proxy-server.ts`, the `/health` route, before the gauges are read: a
+  stalled instance still proves it was reached). It measures "this instance
+  was reached, by that peer" — never the caller's own continuity, and never
+  the hub's ability to serve (`status=ok` is that one reply's verdict).
+- **`machine=-` means the prober is not a relay heartbeat *from a current
+  build*.** A v27 relay heartbeat always sends `X-Claudish-Machine` — but only
+  when `machineName()` is non-empty (`CLAUDISH_MACHINE`), and an image that
+  predates #812 (`210de4bc`, 02/11 — the commit that gave the heartbeat its
+  header, as a #587 instrument) sends no header at all: an OLD sidecar is a
+  relay heartbeat that arrives anonymous. Its deep recovery probe, by contrast,
+  has named itself since 06/10 (`fb16ef2d`), so named probes next to anonymous
+  heartbeats from one seat point at its image date, not at its network. The
+  rest of the `machine=-` lines are local watchdogs (typically 30 s via the
+  Docker port-forward, appearing as `127.0.0.1`), routers or browsers. Their
+  cadence says nothing about the prober's 10 s interval
+  (`HEARTBEAT_INTERVAL_MS`, `relay.ts`).
+- **A relay's outbound heartbeat is silent when it succeeds** — `relay.ts`
+  logs failure episodes only. A seat's continuity toward the hub therefore
+  reads in the HUB's journal (`[Health] hit … machine=<that seat>`), never in
+  its own local `[Health]` lines. Reading 740 local lines as "my heartbeat
+  works" was exactly the trap, caught and corrected on 03/11.
+- **A named-arrival gap is an image question before it is a network question**
+  (measured 04/11 on po-2025's 26 h hub corpus, 50 301 arrivals): po-2027
+  shows the full 10 s cadence — 4 127 named arrivals, no gap — but ONLY from
+  its 03/11 18:02Z rebuild on; the same seat, same network, same WAN edge
+  produced ZERO named arrivals in the 10 h before it. The "~×130 undercount"
+  first read as WAN edge stripping, then as ARR answering before the hub, was
+  the seat's own pre-rebuild image (both hypotheses dead: 3 named probes
+  transited the WAN edge named). Before reading a named gap as a network
+  hole, check the seat's image date — in the same corpus po-2024 and po-2028
+  are absent from the named arrivals altogether.
+
+With the marker in place, #587's thesis — event-loop blocking under load
+driving NOMINAL→AUTONOMOUS transitions — stays **refuted for these two
+transitions** (loop sub-second, hub serving) while the midday upstream
+pressure itself was real and measured.
+
+### A third transition, and it sits exactly at the recovery floor
+
+po-2023's relay (same hub, different machine and path) tripped a third time
+at **16:35:12.54Z → 16:36:21.90Z** — **69 s**, against **69 s** for its own
+10:57:13.90Z → 10:58:23.09Z episode. Two different transitions, same duration
+to the tenth of a second is not a coincidence of outages: **the number
+measures the recovery protocol, not the outage.** Recovery needs 3 OK
+heartbeats + a 60 s cooldown + a deep tool-call probe, so any condition that
+clears inside that window reports the floor — reading "69 s" as "69 s of
+downtime" over-states every episode.
+
+The reading rule above holds on this seat too, and it has one datum the
+ai-01 episodes lack: the **same pipe carried real traffic healthy 10 minutes
+before and 4 minutes after** (canari `[ttft]` 283 ms at 16:25:06, 272 ms at
+16:40:09). The heartbeat failed inside a window whose path was demonstrably
+working on either side. Combined with the hub journal finding — `[Request]`
+lines from the observing host landing DURING the 10:57 window, `/health`
+arrivals not logged at all — the shape that survives every measurement is:
+**the heartbeat probe is its own client, and it can fail while the data path
+is fine.** That is a probe-design property (#587's mechanism remains
+unrefuted as a *cause class*, but it is not demonstrated by these
+transitions), and it does not call for a hub restart, a config-arm, or an
+investigation thread of its own.
+
+**v27 closes the gap, in code — with the reading rule that goes with it.** Two
+markers now ship together. The hub logs one
+`[Health] hit peer=<addr> machine=<id> status=<ok|stalled>` line per
+**arrival** (`proxy-server.ts`, kill switch `CLAUDISH_HEALTH_ARRIVAL_LOG=0`,
+read per call), emitted *before* the gauges are read so even a stalled instance
+proves it was reached. The prober logs the **failure shape** of an episode
+(`relay.ts`): `[Relay] heartbeat FAILED after <ms> — <shape>` on the first
+failure, `[Relay] heartbeat RECOVERED after N failure(s) over <s> — first:
+<shape>` on the first success — episode-latched on purpose, so a multi-hour
+outage is two lines and not a flood. The probe also carries
+`X-Claudish-Machine`, so an arrival is attributed to a machine instead of
+staying an anonymous peer.
+
+Read the pair, never one alone:
+
+| Hub-side arrivals for the observer | Sidecar-side shape | Reading |
+| --- | --- | --- |
+| **No `[Health] hit` line at all** across the gap | `timeout after <budget>ms` | **Never arrived** — container path, NAT, or the observer's own host down. The hub never saw the packet: look at the tube and at the observer's host, not at the loop. |
+| Arrivals present, roughly one per tick | `timeout after <budget>ms` | **Arrived, answered slowly** — the hub received the probe and its reply did not come back inside the budget (loop pressure, or the socket starving behind a large response). |
+| Arrivals present with `status=stalled` | `HTTP 503` | The hub **answered with its own stall verdict** — a hub-side condition by construction, no inference needed. |
+| A burst of arrivals at one instant after a silent gap | `timeout`, then OK | **Backlog drained** — replies queued behind a block; the two timestamps bracket it. |
+
+⚠ **Deployment honesty (Fleet-Rollout Verification).** Both markers ship in
+code; neither is live on any seat until **that seat's container is recreated**
+(compose injects `CLAUDISH_HEALTH_ARRIVAL_LOG` at create time only, #310, and a
+sidecar needs the new image). Until then, a `[Health]` grep returning nothing is
+**not** evidence that no heartbeat arrived.
+
+## The `:18182` pipe's launcher — logon-only, and the guard that replaces it (Q65)
+
+The façade's forwarder (`D:\Production\claudish-relay-po2025\relay.js`, a raw TCP
+pipe `:18182 → hub .50:3000`, born of the docker-bridge ARP limitation) was started
+**only by an `HKCU\…\Run` value** — at LOGON, in an interactive session, with no
+service, no scheduled task, no watchdog. Measured consequence (27/10): a reboot
+without an opened session leaves the fleet-facing entry **dead with no automatic
+recovery**, and po-2027/web1/web2 have no other path to the hub.
+
+User arbitration 2026-11-01 (Q65, option b): convert it to a **startup task with a
+guard**. The organ is `scripts/install-relay-autostart.ps1` (registers) +
+`scripts/relay-guard.ps1` (what the task runs), pinned by
+`scripts/tests/relay-autostart.Tests.ps1`.
+
+- **Trigger 1 at startup** — fires before any logon, which is the hole being closed.
+- **Trigger 2, once + repetition every 10 min** — the guard. It probes the port and
+  starts the pipe ONLY when nothing listens: **it never kills or restarts a live
+  pipe** (hub liveness behind the pipe is the relay container's hysteresis, not the
+  guard's), so it coexists with the legacy `HKCU` launcher — whichever starts first
+  wins, the other is a no-op.
+- **It does not delete the `HKCU` value.** That removal is a separate, reversible
+  step to be taken only after the guard has proven it restarts a dead pipe.
+- The guard logs one UTC line per **action** (not per tick, or a 10-minute cadence
+  would bury the signal), never on the happy path.
+
+**Three Windows PowerShell 5.1 findings, each measured while building it** (the
+interpreter scheduled tasks actually use — not pwsh 7):
+
+| Finding | Shape |
+|---|---|
+| `$PSScriptRoot` is **empty inside a `param()` default** under `-File` | `Join-Path $PSScriptRoot …` threw `ParameterArgumentValidationError` before any side effect; resolve it at body scope |
+| `-RepetitionDuration ([TimeSpan]::MaxValue)` is **rejected** | serialises to `Duration P99999999DT23H59M59S` → `0x80041318`, "incorrectly formatted or out of bounds". An **empty** Duration is the "repeat indefinitely" shape |
+| A `-Daily` trigger cannot take `-RepetitionInterval` + `-RepetitionDuration` | parameter set does not resolve; use `-Once -At <now+1m> -RepetitionInterval <n>` |
+
+**The discovery worth keeping: XML validation happens BEFORE the privilege check.**
+A non-elevated `Register-ScheduledTask` therefore validates the task XML — which is
+what makes the UAC discipline's "run the whole chain non-elevated first" a real
+validator rather than a formality. The `TimeSpan.MaxValue` defect above was caught
+by exactly that run (an object-graph dry-run had passed it), and the final
+non-elevated shape failed on `Accès refusé` / `0x80070005` **and nothing else** —
+the only acceptable failure.
+
+State at 2026-11-01 21:0xZ: installer committed and dry-run/non-elevated-verified;
+registration awaiting its single elevation window.
+
+**Executed 2026-11-07 (Q65b), in a simpler shape than the design above**: a
+**logon** scheduled task `ClaudishRelayPo2025` now runs `start-guarded.ps1`
+(PS 5.1, lives beside `relay.js` in `D:\Production\claudish-relay-po2025\`, not
+in-repo) — probe `:18182`, start the pipe only when nothing holds it, one UTC log
+line per action. The `HKCU` Run value is **removed** (its data archived in the Q65b
+proposal). Live proof at registration: task `Ready`, guard test `LastTaskResult 0`,
+the live pipe's pid untouched.
+
+Honest residue, same as the finding that opened Q65: a logon task is still
+**session-scoped** — a reboot without an opened session still leaves the edge dead.
+What the gesture buys is visibility (Task Scheduler + history) and an idempotent
+relauncher, not boot survival. The boot-trigger organ above
+(`install-relay-autostart.ps1` + `relay-guard.ps1`) stays committed and undeployed;
+it remains the shape that actually closes the hole. `fleet-state.md` row 97 tracks
+which launcher is live.
+
+## Compose environment surface
+
+`docker-compose.yml` carries a default for every relay variable, so the hub runs with **no `.env` at
+all**: `CLAUDISH_RELAY_UPSTREAM`, `CLAUDISH_RELAY_COMPRESS`, `CLAUDISH_NO_ANTHROPIC`,
+`CLAUDISH_HOST_PORT`, `CLAUDISH_CONTAINER_NAME`, `CLAUDISH_CAPTURE_HOST_DIR`,
+`CLAUDISH_CAPTURE_DIR`, plus the `CLAUDISH_FAILOVER_*` family.
+
+`CLAUDISH_CONTAINER_NAME` is what lets one host run hub and sidecar side by side (`claudish-proxy`
+vs `claudish-sidecar`); `scripts/install-sidecar.ps1` sets it per machine. Pass-through is
+**per-variable** in compose — a variable absent from the list silently never reaches the container,
+which is how `CLAUDISH_FAILOVER_*_RESET` was inert until `ffb7f39`.
+
+
+---
+
+# Migrated verbatim from the repo-level `CLAUDE.md` (#445 A1, 2026-10-12)
+
+## Relay / Sidecar Mode (v7.2+)
+
+One binary, three modes, selected by `CLAUDISH_RELAY_UPSTREAM`. Each machine runs its own container so the hub stops being a single point of failure.
+
+| `CLAUDISH_RELAY_UPSTREAM` | Mode | Behavior |
+| --- | --- | --- |
+| **unset** | **HUB** (po-2025 since the 05/09 cutover — was po-2023) | Always local. Zero change vs. before. |
+| set + hub **alive** | **NOMINAL relay** | Forwards the raw request to the hub; response repiped through the never-hang passthrough. **No local capture** (hub captures centrally). |
+| set + hub **dead** (hysteresis) | **AUTONOMOUS** | Falls through to the normal local pipeline + local capture. |
+
+Gotchas:
+
+- **The cluster key is injected as `x-proxy-key`, NOT `x-api-key`**, and the client `authorization` is kept. `x-api-key` arms `NativeHandler`'s proxyKey→Anthropic swap, which strips auth → **401**. `X-Claudish-Machine` must survive the hop or central attribution is lost. Since #282 the native lane **strips `x-proxy-key` and every `x-claudish-*` header before api.anthropic.com** (`stripProxyOwnHeaders`, shared by `NativeHandler.handle` and the native `count_tokens` path) — the key swap READ `x-proxy-key` without removing it, and the passthrough sent the cluster credential to the Anthropic upstream on every native request (measured 2026-09-29; ignoring is not stripping). Since #289 the **vision fallback** (image descriptions `ComposedHandler` asks of `services/vision-proxy.ts` on non-vision models) is the third site: `sanitizeVisionAuthHeaders` runs the same strip AND the same proxy-key→stored-key swap (oat → `authorization: Bearer`, else `x-api-key`; policy injected by proxy-server via `setVisionAuthPolicy`) — the path used to forward the inbound `x-api-key` verbatim to `api.anthropic.com/v1/messages`. Since #315 a non-matching key ALSO crosses the shape gate before that call: only an `sk-ant-` key leaves (`stripForeignVisionApiKey` on the extracted `isAnthropicShapedCredential` — one predicate shared by the native refusal #296 B, the mixed strip #305 and the vision drop, so the sites cannot drift); a foreign key is dropped and the description call degrades like the pre-existing missing-credential case (401 → null → images stripped, turn continues), under the SAME kill switch as the native guard (`CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD=0`, one switch one policy).
+- **Loop topology is detected by identity, on two planes (#156/#279).** `/health` publishes a per-process `instanceId` (random, derived from nothing); `heartbeat()` comparing the upstream's id to its own catches a node forwarding to ITSELF whatever the URL (the 2026-09-19 ARR-loop shape — one forceConsole marker, heartbeat counts failed, hysteresis settles AUTONOMOUS stable instead of flapping). What the heartbeat CANNOT see — the optimistic boot window before the first tick, and A→B→A cycles (each node's /health is answered by the other) — the request itself witnesses: every forward appends the sender's id to the `x-claudish-hops` header, and a node finding its own id in the list it received serves locally with one marker, never a refusal. The hop append must never touch `authorization` / `x-proxy-key` / `X-Claudish-Machine`.
+- **The heartbeat bound is a knob, and on a WAN upstream the 4 s default is a false-positive generator (#711).** `CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS` (default `4_000`, range `2_000..9_000` — the max stays **under** the 10 s tick, or each tick launches another stalled heartbeat and the waits stack instead of measuring; empty/garbage fall back to the default per the same `Number("") === 0` trap as the header budget) is resolved **per tick** via `resolveHeartbeatTimeoutMs()`. Measured 2026-10-27 on the first WAN-upstream sidecar (po-2027 → `models.myia.io`): **20 AUTONOMOUS windows in 2 h 36** (07:00:37Z-09:36:37Z, one every ~5-8 min) while the deep probe answered `message_stop` in **1.0-1.4 s on every tick sampled** and header latency samples reached **3 897 ms / 18 118 ms**. Those 20 are a **floor, not a total**: local captures show off-hub service still happening at 09:42-09:53Z and again at 14:39-14:40Z, i.e. after the counted interval had closed. In all, **121 `glm-5.3-flash` responses were served locally, off-hub** (08:14:53Z → 14:40:59Z, first-to-last capture), totalling **1 309 795 input + 210 830 output tokens**, read from each capture's terminal `message_delta`. ⚠ That number counts **off-hub service, not AUTONOMOUS-mode responses**: a NOMINAL relay whose forward hits the header deadline also falls through to the local pipeline and captures (see the capture-vs-mode-switch bullet below). What is measured directly is the account's Z.AI 5-hour reset moving from `16:00:59` to `21:14:52`; attributing that shift to these tokens alone is an **inference** (no other consumer of the key is known), and the token total is the figure that makes it arbitrable. A liveness bound tighter than the link it measures does not detect an outage — it manufactures one. A LAN hub keeps the default; a WAN seat sets `9000`.
+- **The liveness harness is asymmetric too: the probe that could refute a verdict runs only when the verdict is already bad (#711 follow-up).** `proberTick` (`relay.ts:1105`) does exactly one thing while NOMINAL — a `/health` GET — and `markFail`s on its result. `deepProbe` — a real tool-call stream that must reach `message_stop` — runs **only** in the AUTONOMOUS branch, behind 3 OK heartbeats + the 60 s cooldown. Two consequences, both measured on the WAN seat on 2026-10-27:
+  - The state that decides whether traffic reaches the hub is held by the **cheapest instrument in the box**, so a false positive is cheap to enter and expensive to leave: 20 windows over 07:00-09:36Z, 121 responses served off-hub, with the probe answering in 1.0-1.4 s every time it was finally consulted.
+  - Once AUTONOMOUS the relay sends **nothing** upstream, so no client request can refute the verdict — the only counter-evidence is the recovery probe itself. Nothing in the log ever says *"I declared the hub dead and the next real request would have worked"*; that reading had to be reconstructed afterwards from captures and header-latency samples. **The absence of a failure line during AUTONOMOUS is not evidence the hub was down.**
+  - And a passing probe is still not the client's question: it resolves through `modelMap.haiku`, the `CLAUDISH_NO_ANTHROPIC` reroute or a cascade step (#613, #636), so `deep probe OK` means *the hub can answer on its haiku lane* — never *the model this client asked for is servable*.
+
+  These are the bounds of what `/health` + the deep probe can witness. A harness that cannot see what it claims to see must say where its sight ends.
+- **Hysteresis is asymmetric on purpose**: 2 consecutive `/health` failures → AUTONOMOUS (fast failover); recovery needs 3 OK heartbeats **+ 60s cooldown + a deep tool-call probe** (`claude-haiku-4-5-20251001` by default — `CLAUDISH_RELAY_PROBE_MODEL` overrides it per seat, `=glm-5.3` restores the pre-#613 behavior — and the probe must reach `message_stop`). Anti-flap. ⚠ The model choice is load-bearing (#613): the old hardcoded `glm-5.3` resolves on the SONNET role, so a z.ai-only outage with a healthy hub kept every sidecar AUTONOMOUS indefinitely. A role-shaped id makes the probe **measure the hub's servability on its haiku lane** — `modelMap.haiku` when that mapping is non-native, otherwise `modelMap.sonnet` via the `CLAUDISH_NO_ANTHROPIC` reroute, and that precondition is pinned in `proxy-server-role-map.test.ts` so a hub-side haiku remap goes red instead of silently bringing the probe back to z.ai. It **moves** the dependency off z.ai, it does not remove it: a non-walk-class 5xx from the haiku nominal fails the probe exactly as z.ai used to. The haiku lane walks its cascade only when its quota bucket is walled, when a config arm covers it (`haiku@<machine>` arms key on the probe's `X-Claudish-Machine`, so recovery behavior becomes per-seat), or on a transient overload/connect (#299-B / #598) one-shot. Hub measurement, 2026-10-24 (reported on #636): no `modelMap` at all, and a real sidecar haiku turn resolved to the `swift-1.5-27b` concrete through the `haiku@myia-po-2027` arm with **zero** `NO_ANTHROPIC: rerouting` markers over 24 h. **A fourth outcome, and the one that traps a seat (#636 review round 2)**: a bare `claude-*` with no `haiku@<that seat>` arm and no wall takes its per-model native bucket — hub `CLAUDISH_NO_ANTHROPIC` set → `anthropicRefusalHandler` (**503**), unset → a native call with **no credential** (**401**). The probe carries no `authorization` by design, so either answer repeats on every attempt and that seat would never return to NOMINAL. Hence **one second attempt in the same tick** on `CLAUDISH_RELAY_PROBE_FALLBACK_MODEL` (default `glm-5.3` — the pre-#613 model; empty/whitespace = unset per #310): the probe is true if **either** attempt passes, each line names the model that decided, a quota wall still passes on attempt 1 without spending the fallback, and the bound is **two fetches per tick, never three**. ⚠ The retry fires on **any** failure of attempt 1 (non-OK, bodyless, truncated stream, timeout) — a declared superset of the refusal/401 shape that motivated it: two 30 s timeouts now cost 60 s inside one tick, still overlapped-guarded by `probingStates`. **Since #867 the first attempt no longer carries the full budget**: `resolveProbeFirstAttemptTimeoutMs()` caps it at **10 s** — `CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS` (range `1_000..30_000`, `0` = the kill switch restoring the full 30 s; empty/garbage/out-of-range → the 10 s default, same `Number("") === 0` trap as the other relay knobs). Measured on po-2027 over 50 WAN flips (2026-11-03→05): **27 of 39 completed first attempts expired at the full 30 s** while the glm fallback answered in 1 012–1 606 ms, and the first attempts that succeeded took 11.0–29.4 s — on ~69 % of flips the recovery queue paid the whole expired budget on top of the cooldown floor (`window − probe ≈ 70 − t`, the formula verified in #867). Coverage is unchanged (true if either passes, still two fetches, AC4); only the worst case moves: ~34 s of probe → ~14 s. A timed-out attempt now logs `timed out after <budget>ms` so the two budgets stay distinguishable in the logs — the AC3 before/after measurement greps that number. **The fallback keeps the FULL 30 s**: it is the attempt that carries the verdict when the first expires, so it is never the one cut short.
+- **`CLAUDISH_NO_ANTHROPIC=1` on every machine except ai-01** — reroutes bare native targets to the budget `modelMap.sonnet` instead of `api.anthropic.com`. Defense in depth, not the primary policy.
+- **`CLAUDISH_HOST_PORT` is load-bearing, not cosmetic**: port 3000 is already taken on some hosts (ai-01), so a hardcoded binding makes `docker compose up` fail outright. The container side always stays 3000.
+- **Two capture variables, one letter apart in meaning and deliberately not in spelling**: `CLAUDISH_CAPTURE_HOST_DIR` (host bind path) vs `CLAUDISH_CAPTURE_DIR` (in-container path, **empty = write nothing**). Keep capture **on** for sidecars: a forwarded request writes nothing, so any file that appears IS a forward-path outage capture — the trail `reconcile-outage-captures.ps1` needs. But **capture files are not a count of mode switches**: capture follows *local serving*, and a request served locally because its own forward failed (`header-timeout after <budget>ms` — see `CLAUDISH_RELAY_HEADER_TIMEOUT_MS`, default 360s since #320, relay still NOMINAL) captures just as an AUTONOMOUS one does. Measured on po-203, 2026-09-13: **68 loose files over 2h20 against a single 71s AUTONOMOUS episode in the surrounding 28h** — reading files as mode switches over-counts by ~30×. The `-direct` / `-openai` field in the filename is the handler label, not the mode. Disabling capture is a disk-starvation escape hatch that silently destroys that trail.
+- **An armed cascade is always hand-added, so it can live only in the container record (#141, fixed).** `install-sidecar.ps1` generates the per-machine `.env` with exactly `CLAUDISH_PROXY_KEY` / `CLAUDISH_RELAY_UPSTREAM` / `CLAUDISH_CONFIG_DIR` / `CLAUDISH_CAPTURE_HOST_DIR` / `CLAUDISH_HOST_PORT` / `CLAUDISH_CONTAINER_NAME` (+ optional `COMPRESS`/`NO_ANTHROPIC`/`CAPTURE_DIR=`) and **never a single `CLAUDISH_FAILOVER_*`** — arming is a provisioning act, not an install one. Until #141 the rewrite also **dropped** any that were there, so an armed state survived on `unless-stopped` luck alone; since #141 the installer carries runtime-policy lines over verbatim, **exits non-zero before writing** an `.env` that would gut a live armed cascade (`claudish-drain.ps1 -Recreate` refuses the same condition), and `-RebuildEnvFromContainer` recovers a state that exists only in the container. The 07/09 hub wipe was therefore not an operator slip but the tool's default outcome — the hub only survives because po-2025 maintains `D:\claudish-shadow\.env` by hand, and that file carries **17 armed** of the 23. **Before any sidecar recreate: diff the target env file against `docker inspect`'s `.Config.Env` on NON-EMPTY assignments, and reconstruct the file first** (its output carries `CLAUDISH_PROXY_KEY` — local file only, never committed, never printed). ⚠ **Diff by value, not by name**: every container shows all 23 names whatever its state, so a name diff answers a different question than the one asked — it was wrong about ai-01 (reported armed, actually **0 non-empty**, 2026-09-19), and it is what makes a partially-filled file deceptive (po-203: 16 lines in the file look recreatable, and whether the 7 absent names matter depends entirely on whether they hold values). `install-sidecar.ps1 -RebuildEnvFromContainer` does this correctly and is the tool to use rather than a hand-rolled grep.
+- **The relay branch must stay before `interceptWebTools` / `getHandlerForRequest` / `logRequest`** in the `/v1/messages` route — that ordering is what makes capture mode-aware for free.
+- **A forward connect failure gets exactly one retry (+250 ms) before falling through (#80 part 2)** — the container → `host.docker.internal` tunnel resets chronically (~1 per 8 min measured over 12 h, 87 failures). A connect failure fails in milliseconds, so the retry absorbs the blip at no perceptible cost, and an **absorbed retry does not `markFail`** — the chronic blips no longer feed the AUTONOMOUS hysteresis nor divert requests to the local cascades (invisible to the central capture, and potentially PAYG where the hub's subscriptions would have served). A header deadline is never retried (that would double the budgeted stall), nor is an HTTP 5xx (the hub answered; hysteresis owns it). `[Relay] forward connect failed (…) — retrying 1/1` is the countable marker.
+- **A relayed non-OK response left NO local trace before #763, so the emitting seat could not answer "did it pass through me?" from its own logs.** By construction: `[ttft]` is written on the first USEFUL event (a 4xx has none), `[Request]` comes from `logRequest` — never reached on the relay branch — and a nominal relay writes no capture on purpose (the hub captures centrally). A burst of rejected requests therefore looked exactly like a burst that bypassed the sidecar; measured 29/10 on po-2024, 26 `POST /v1/chat/completions` rejected 400 before inference (bodies 890 524 → 1 002 085 bytes) left **zero** lines naming the route in 112 log lines. Since #763 every non-OK that is passed through emits **one bounded line**, `[relay] upstream-nonok status=… route=… bytes_in=… bytes_out=…` — never a body, never a header value (the docker log is readable by the whole hub, the same discipline as #761's STEP-ADVANCE marker), and `bytes_in` is the **pre-gzip** request size so a compressing WAN external and a LAN sidecar stay comparable. A 529 and a marked drain-freeze 503 keep their own single line (a different fact: "no local replay") and emit no marker — one event, one line. Instrumentation only: no new retry, no capture, no behavior change on any path.
+- ⚠ **Two upstream failure signatures — only one is a client-side transport artifact.** A **connect** failure (fails in ms, absorbed by the +250 ms retry above) is client-side transport **only under #80's precondition — the hub independently reachable at the same moment**; a refusal with the hub down is the hub, not the transport. **TCP accepted with an invalid response** is *hub-end unavailability on that window*, and it **is client-visible on the WAN entry** — generalising the #80 sentence to every relay flap is how the fleet ledger kept writing *"impact client nul"* beside episodes that cost real client requests. A flap reads hub *reachability from the relay*, never cause location. Count WAN client impact from the **ingress IIS log** (`W3SVC49`, status/substatus/win32 columns — its own ingress only), **never from the relay's own tally** — its 2-consecutive-failure heartbeat is blind to single-minute blips. Evidence and day-scale correlation — the 08:50:56Z replacement is **corroborated hub-side and attributed to a Docker Desktop engine recovery** (same container id restarted, no `create` in the window; the earlier `com.docker.compose.replace` hypothesis is refuted; #419 reconciled 10/10): `docs/reference/relay-internals.md` § *The two upstream failure signatures*.
+- **`hub HTTP 500` is the *relay's* reading, and until #212 the hub could not corroborate it — read the hub's own stall signature before hunting a provider.** `relay.ts` maps `res.status >= 500` to `markFail(forward-http-${status})` and so arms the AUTONOMOUS hysteresis on the status alone, whatever produced it — with **two carve-outs, both pass-throughs because in both the hub answered and is alive**: a relayed **529** (a provider's overload, #299 A) and a **503 marked `x-claudish-drain-freeze: 1`** (the hub's own drain window, #318) reach the client with no `markFail` and no local replay; every other 5xx, and an unmarked 503, keeps the fallthrough. The same rebuild now also relays `retry-after` on **every** non-streaming error (a hub-relayed 429 reaches the client with its `Retry-After`, which Claude Code honors) and re-emits the drain-freeze marker so the pass-through composes across A→B→hub chains. Measured 2026-09-22 `03:18:02→03:19:48Z` (hub po-2025, 106 s): **18 requests across 6 machines (po-2023…po-2027, ai-01) and 4 models** got no response at all, the hub logged **nothing** for any of them — no `[ttft]`, so no upstream was ever reached — while its per-minute throughput collapsed `32 → 4 → 1 → 24`. Two exclusions to reuse rather than re-derive: the compaction (its `compaction.log` is **UTC**: `01:50:15Z→02:43:22Z`, ended **35 min before**) and the drained restart (`02:03:01Z`, **1h15 before**, 0 streams cut). The decisive evidence was the **host's** log, not the proxy's: `Tcpip` **4231 ephemeral-port exhaustion** (1×/day on 4 of the last 7 days, dynamic range at the Windows default 16384, `TcpTimedWaitDelay` unset) and `DNS-Client` **1014**. The general instrument rule this leaves behind: the hub's `/v1/messages` and `/count_tokens` 500 branches logged through `log()` — **file-only, a no-op with debug off, which is how a hub runs** — so *an empty hub log was never evidence of a healthy hub*; since #212 both branches emit `[Proxy] ERROR 500 on POST <path>` via `logStderr`.
+
+Tests: `relay.test.ts` (**45 as of 2026-09-20** — hysteresis, header build incl. ai-01 Opus passthrough, gzip, never-hang delegation, pre-visible re-forward; the "16" written here previously had drifted to 40 before #170 added 5, so treat a bare count as dated or don't write one). Budget-free E2E: `bun run packages/cli/src/fork/server/relay-e2e.ts` (~2-3 min). Internals: `docs/reference/relay-internals.md`. Fleet install: `scripts/install-sidecar.ps1` + `docs/deployment/relay-sidecar-deployment.md`.

@@ -106,10 +106,14 @@ export class AnthropicAPIFormat extends BaseAPIFormat {
         // Strip tool_reference from tool_result content arrays
         if (block.type === "tool_result" && Array.isArray(block.content)) {
           const filtered = block.content.filter((c: any) => c.type !== "tool_reference");
-          // Keep at least a minimal text block so tool_result content is never empty
+          // Keep a non-empty placeholder: Kimi Coding rejects empty text blocks
+          // with HTTP 400 `text content is empty`.
           return {
             ...block,
-            content: filtered.length > 0 ? filtered : [{ type: "text", text: "" }],
+            content:
+              filtered.length > 0
+                ? filtered
+                : [{ type: "text", text: "[unsupported tool references omitted]" }],
           };
         }
         return block;
@@ -119,10 +123,29 @@ export class AnthropicAPIFormat extends BaseAPIFormat {
   }
 
   /**
-   * Pass through Claude tools as-is — no OpenAI conversion.
+   * Pass through Claude tools — no OpenAI conversion — minus `defer_loading`.
+   *
+   * Claude Code marks most tools `defer_loading: true` and loads them on demand:
+   * the model calls ToolSearch, whose tool_result carries `tool_reference` blocks
+   * that the API expands into the tool's schema. convertMessages() strips those
+   * blocks (some backends reject them), so on this wire a deferred tool can NEVER
+   * be loaded. A backend that ignores `defer_loading` sees every tool anyway; a
+   * backend that honors it (Kimi Coding, measured 05/11) keeps the tool hidden
+   * forever — the model re-issues ToolSearch, then falls back to `echo "invoking
+   * <tool>"` shells. Dropping the flag makes every tool visible, which is what the
+   * ignoring backends already serve.
+   *
+   * Kill switch `CLAUDISH_ANTHROPIC_WIRE_UNDEFER=0` (read per request) passes the
+   * tools through untouched.
    */
   override convertTools(claudeRequest: any, _summarize?: boolean): any[] {
-    return claudeRequest.tools || [];
+    const tools = claudeRequest.tools || [];
+    if (process.env.CLAUDISH_ANTHROPIC_WIRE_UNDEFER === "0") return tools;
+    return tools.map((tool: any) => {
+      if (!tool || typeof tool !== "object" || !("defer_loading" in tool)) return tool;
+      const { defer_loading: _dropped, ...rest } = tool;
+      return rest;
+    });
   }
 
   /**
