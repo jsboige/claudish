@@ -32,8 +32,40 @@ import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
 import { clearRuntimeRegistry } from "./providers/runtime-providers.js";
 import { installStubFetch } from "./test-support/stub-fetch.js";
+import { declaredPortClaims } from "./test-support/port-claims.js";
 
 const PORT_BASE = 19860;
+const PORT_SPAN = 120;
+
+// #791 — a random draw inside [PORT_BASE, PORT_BASE+SPAN) overlaps the FIXED
+// ports sibling route suites claim (19863 cascade-revisit, 19871
+// native-passthrough-strip, 19881 hop-gate, …): CI run 42224660315 caught
+// `nextPort()` landing on 19863 after a sibling's listener lingered. The fix is
+// not another hand-kept list (those drifted — see port-allocation.test.ts) but
+// the same file-scan that pin enforces: every port another test file declares
+// is skipped, and so is anything actually bound at draw time.
+const SIBLING_PORT_CLAIMS = declaredPortClaims("proxy-server-shutdown-socket.test.ts");
+
+/** True when nothing on this host currently binds the port (IPv4 wildcard). */
+function isPortBindable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.listen(port, "0.0.0.0", () => {
+      probe.close(() => resolve(true));
+    });
+  });
+}
+
+async function nextPort(): Promise<number> {
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const port = PORT_BASE + Math.floor(Math.random() * PORT_SPAN);
+    if (SIBLING_PORT_CLAIMS.has(port)) continue;
+    if (!(await isPortBindable(port))) continue;
+    return port;
+  }
+  throw new Error(`#791: no free port found in ${32} draws across [${PORT_BASE}, ${PORT_BASE + PORT_SPAN})`);
+}
 
 // #791 — this suite used to overwrite the REAL ~/.claudish/config.json with a
 // minimal object (restore in `finally`) for the ~1.5 s the slow-upstream test
@@ -45,10 +77,6 @@ const PORT_BASE = 19860;
 const REAL_CONFIG_PATH = join(homedir(), ".claudish", "config.json");
 const SCRATCH_DIR = mkdtempSync(join(tmpdir(), "claudish-791-shutdown-"));
 const SCRATCH_CONFIG_PATH = join(SCRATCH_DIR, "config.json");
-
-function nextPort(): number {
-  return PORT_BASE + Math.floor(Math.random() * 120);
-}
 
 /** A request whose body never arrives: headers promise 500 bytes, 11 are sent. */
 function openHalfWrittenRequest(port: number): { socket: net.Socket; closed: () => boolean } {
@@ -103,7 +131,7 @@ describe("#630 shutdown waits only for consumable work", () => {
   }
 
   test("a half-written request earns nothing: shutdown() returns at the settle, not the grace", async () => {
-    const port = nextPort();
+    const port = await nextPort();
     const proxy = await createProxyServer(port, undefined, undefined, false, undefined, undefined, { quiet: true });
 
     const half = openHalfWrittenRequest(port);
@@ -127,7 +155,7 @@ describe("#630 shutdown waits only for consumable work", () => {
   test("a complete request whose response is in progress IS waited for, up to the grace", async () => {
     // The /compact shape: `stream:false`, body fully received, upstream slow.
     // The endpoint URL is never dialed for real — the stub answers it.
-    const port = nextPort();
+    const port = await nextPort();
     const UPSTREAM_DELAY_MS = 1500;
     const realFetch = globalThis.fetch;
 
@@ -219,7 +247,7 @@ describe("#630 shutdown waits only for consumable work", () => {
   }, 20_000);
 
   test("the listening socket is really closed — fast must not mean 'forgot to stop'", async () => {
-    const port = nextPort();
+    const port = await nextPort();
     const proxy = await createProxyServer(port, undefined, undefined, false, undefined, undefined, { quiet: true });
 
     const half = openHalfWrittenRequest(port);
@@ -242,7 +270,7 @@ describe("#630 shutdown waits only for consumable work", () => {
   }, 15_000);
 
   test("a second shutdown() call is harmless", async () => {
-    const port = nextPort();
+    const port = await nextPort();
     const proxy = await createProxyServer(port, undefined, undefined, false, undefined, undefined, { quiet: true });
 
     await proxy.shutdown();
@@ -251,4 +279,81 @@ describe("#630 shutdown waits only for consumable work", () => {
     await proxy.shutdown();
     expect(true).toBe(true);
   }, 15_000);
+
+  test("#791 a draw landing on a sibling suite's claimed port is redrawn (skip-set)", async () => {
+    // The draw window overlaps FIXED sibling claims (19863 cascade-revisit,
+    // 19871 native-passthrough-strip, …) — the collision CI run 42224660315
+    // caught. Mutant: delete the `SIBLING_PORT_CLAIMS.has(port)` continue and
+    // this pin is red — the first (forced) draw would be returned as-is.
+    const claimedInSpan = [...SIBLING_PORT_CLAIMS]
+      .filter((p) => p >= PORT_BASE && p < PORT_BASE + PORT_SPAN)
+      .sort((a, b) => a - b);
+    expect(claimedInSpan.length).toBeGreaterThan(0); // guards a vacuous pin
+
+    const target = claimedInSpan[0]!;
+    const targetFraction = (target - PORT_BASE) / PORT_SPAN;
+    // Second draw: a deterministic fraction whose port is unclaimed (0.5 →
+    // 19920 today; walk a few candidates so the pin survives new claims).
+    const free = [0.5, 0.75, 0.25, 0.9]
+      .map((f) => PORT_BASE + Math.floor(f * PORT_SPAN))
+      .find((p) => !SIBLING_PORT_CLAIMS.has(p))!;
+    const freeFraction = (free - PORT_BASE) / PORT_SPAN;
+
+    const realRandom = Math.random;
+    let draws = 0;
+    Math.random = () => (draws++ === 0 ? targetFraction : freeFraction);
+    try {
+      const port = await nextPort();
+      expect(port).not.toBe(target);
+      expect(port).toBe(free);
+      expect(draws).toBe(2); // exactly one rejection, then the clean draw
+    } finally {
+      Math.random = realRandom;
+    }
+  }, 10_000);
+
+  test("#791 a draw landing on a port already bound on this host is redrawn (bind probe)", async () => {
+    // The skip-set cannot know a port a LINGERING listener (a sibling suite's
+    // unreleased server, the collision shape CI actually hit) still holds —
+    // only the bind probe can. Mutant: delete the isPortBindable continue and
+    // this pin is red.
+    const candidates = Array.from({ length: PORT_SPAN }, (_, i) => PORT_BASE + i).filter(
+      (p) => !SIBLING_PORT_CLAIMS.has(p)
+    );
+    expect(candidates.length).toBeGreaterThan(2); // room for the held port AND the escape draw
+
+    let holder: net.Server | null = null;
+    let held: number | null = null;
+    for (const p of candidates) {
+      const s = net.createServer();
+      const ok = await new Promise<boolean>((resolve) => {
+        s.once("error", () => resolve(false));
+        s.listen(p, "0.0.0.0", () => resolve(true));
+      });
+      if (ok) {
+        holder = s;
+        held = p;
+        break;
+      }
+    }
+    expect(held).not.toBeNull();
+
+    try {
+      const heldFraction = (held! - PORT_BASE) / PORT_SPAN;
+      const escape = candidates.find((p) => p !== held)!;
+      const escapeFraction = (escape - PORT_BASE) / PORT_SPAN;
+      const realRandom = Math.random;
+      let draws = 0;
+      Math.random = () => (draws++ === 0 ? heldFraction : escapeFraction);
+      try {
+        const port = await nextPort();
+        expect(port).not.toBe(held);
+        expect(port).toBe(escape);
+      } finally {
+        Math.random = realRandom;
+      }
+    } finally {
+      holder?.close();
+    }
+  }, 10_000);
 });
