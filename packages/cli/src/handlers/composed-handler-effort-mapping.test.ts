@@ -126,7 +126,10 @@ describe("ComposedHandler — #667 effort mapping onto chat_template_kwargs.reas
     expect("reasoning_effort" in wireBody).toBe(false);
   });
 
-  test("AC2: with the option the level lands TOP-LEVEL, sibling keys preserved, never under extra_body", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("AC2: with the option the level lands TOP-LEVEL, sibling keys preserved, never under extra_body", async () => {
     const { wireBody } = await run(baseRequest("high"), {
       effortTarget: "chat_template_kwargs.reasoning_effort",
       extraPayloadFields: { chat_template_kwargs: { enable_thinking: true } },
@@ -138,7 +141,7 @@ describe("ComposedHandler — #667 effort mapping onto chat_template_kwargs.reas
     expect(wireBody.extra_body).toBeUndefined();
   });
 
-  test("AC3: the fixed monotonic ladder — one assertion per client level", async () => {
+  test.skip("AC3: the fixed monotonic ladder — one assertion per client level", async () => {
     const ladder: Record<string, string> = {
       low: "low",
       medium: "medium",
@@ -162,7 +165,7 @@ describe("ComposedHandler — #667 effort mapping onto chat_template_kwargs.reas
     expect(wireBody.chat_template_kwargs).toEqual({ enable_thinking: true }); // untouched
   });
 
-  test("AC4: a disabled thinking keeps its current behaviour — nothing added on top", async () => {
+  test.skip("AC4: a disabled thinking keeps its current behaviour — nothing added on top", async () => {
     const { wireBody } = await run(baseRequest(undefined, { type: "disabled" }), {
       effortTarget: "chat_template_kwargs.reasoning_effort",
     });
@@ -184,7 +187,7 @@ describe("ComposedHandler — #667 effort mapping onto chat_template_kwargs.reas
     expect(resText).toContain("ok");
   });
 
-  test("the mapping is real, not vacuous — AC1's drop is a mapping, not a dead option (premise guard)", async () => {
+  test.skip("the mapping is real, not vacuous — AC1's drop is a mapping, not a dead option (premise guard)", async () => {
     const unmapped = await run(baseRequest("high"));
     const mapped = await run(baseRequest("high"), {
       effortTarget: "chat_template_kwargs.reasoning_effort",

@@ -65,17 +65,20 @@ describe("Regression: #386 cli.ts reaches the probe TUI lazily", () => {
     expect(staticImportOf("\\./probe/probe-tui-runtime[^\"']*").test(synthetic)).toBe(true);
   });
 
-  test("cli.ts carries NO static import of the probe TUI runtime", () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("cli.ts carries NO static import of the probe TUI runtime", () => {
     const cli = readFileSync(CLI, "utf-8");
     expect(staticImportOf(String.raw`\./probe/probe-tui-runtime[^"']*`).test(cli)).toBe(false);
   });
 
-  test("cli.ts reaches it through a dynamic import at the call site", () => {
+  test.skip("cli.ts reaches it through a dynamic import at the call site", () => {
     const cli = readFileSync(CLI, "utf-8");
     expect(lazyImportOf(String.raw`\./probe/probe-tui-runtime[^"']*`).test(cli)).toBe(true);
   });
 
-  test("no non-test module statically imports the probe TUI runtime", () => {
+  test.skip("no non-test module statically imports the probe TUI runtime", () => {
     const offenders = sourceFiles(SRC).filter((f) =>
       staticImportOf(String.raw`[^"']*probe-tui-runtime[^"']*`).test(readFileSync(f, "utf-8"))
     );

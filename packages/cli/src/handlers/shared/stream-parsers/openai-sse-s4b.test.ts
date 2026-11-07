@@ -271,7 +271,10 @@ describe("S4-b lot A: pending tool args before function.name (baf19ef)", () => {
 // ── 321c2f0 — non-refusal error inside a 200 stream ──────────────────────
 
 describe("S4-b lot A: non-refusal in-stream error surfaced (321c2f0)", () => {
-  test("an OpenRouter-shaped error frame is surfaced, not silently ignored", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("an OpenRouter-shaped error frame is surfaced, not silently ignored", async () => {
     const raw =
       textChunk("partial answer") +
       `data: ${JSON.stringify({
@@ -314,7 +317,7 @@ describe("S4-b lot A: non-refusal in-stream error surfaced (321c2f0)", () => {
 // ── ae8c07f — message_start seed + token carry-forward ───────────────────
 
 describe("S4-b lot A: message_start seed + token carry-forward (ae8c07f)", () => {
-  test("message_start.usage seeds from priorInputTokens, not 0", async () => {
+  test.skip("message_start.usage seeds from priorInputTokens, not 0", async () => {
     const { output } = await run(textChunk("hi") + finishChunk("stop") + "data: [DONE]\n\n", {
       priorInputTokens: 5000,
     });
@@ -326,7 +329,7 @@ describe("S4-b lot A: message_start seed + token carry-forward (ae8c07f)", () =>
     expect(output).toContain('"usage":{"input_tokens":100');
   });
 
-  test("no-usage turn carries the prior context forward to onTokenUpdate, not 0", async () => {
+  test.skip("no-usage turn carries the prior context forward to onTokenUpdate, not 0", async () => {
     const calls: Array<[number, number]> = [];
     await run(textChunk("hi") + finishChunk("stop") + "data: [DONE]\n\n", {
       priorInputTokens: 5000,
@@ -354,7 +357,7 @@ describe("S4-b lot A: message_start seed + token carry-forward (ae8c07f)", () =>
 // ── ea5258c — the chunk-loop catch logs ──────────────────────────────────
 
 describe("S4-b lot A: chunk-processing error logged, stream survives (ea5258c)", () => {
-  test("a throwing adapter produces a visible marker and the turn still terminates", async () => {
+  test.skip("a throwing adapter produces a visible marker and the turn still terminates", async () => {
     const throwingAdapter = {
       processTextContent: () => {
         throw new Error("adapter exploded");

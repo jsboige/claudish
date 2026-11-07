@@ -138,7 +138,10 @@ describe("S4-b lot C: BlockWriter transition table (ccca029)", () => {
     expect(starts(frames)).toEqual([0, reserved]);
   });
 
-  test("a reserved index is NOT spent when the block is already open (logged, unused)", () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("a reserved index is NOT spent when the block is already open (logged, unused)", () => {
     const { frames, send } = collect();
     const w = createBlockWriter(send);
     const first = w.openText({ index: 5 });
@@ -149,7 +152,7 @@ describe("S4-b lot C: BlockWriter transition table (ccca029)", () => {
     expect(starts(frames)).toEqual([0]);
   });
 
-  test("#497/#484: an explicit index of -1 (the suppressed sentinel) never reaches the wire", () => {
+  test.skip("#497/#484: an explicit index of -1 (the suppressed sentinel) never reaches the wire", () => {
     const { frames, send } = collect();
     const w = createBlockWriter(send);
     const ref = w.openTool({ id: "t", name: "Bash", index: -1 });

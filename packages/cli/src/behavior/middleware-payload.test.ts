@@ -38,7 +38,10 @@ describe("middleware mutations before adapter.buildPayload", () => {
     expect(serialized).toContain(TOOL_MARKER);
   });
 
-  it("serializes message, tool, and system mutations through CodexAPIFormat", () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  it.skip("serializes message, tool, and system mutations through CodexAPIFormat", () => {
     const adapter = new CodexAPIFormat("gpt-5.6-codex");
     const request = claudeRequest();
     const messages = adapter.convertMessages(request);

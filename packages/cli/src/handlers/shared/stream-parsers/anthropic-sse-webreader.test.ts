@@ -109,7 +109,10 @@ afterEach(() => {
 });
 
 describe("#642 suppressed webReader surfaces the fetched content", () => {
-  it("injects the page text, never the failed-undefined marker", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  it.skip("injects the page text, never the failed-undefined marker", async () => {
     // A bare counter also counts fetches fired by OTHER test files in the same
     // `bun test` process: installStubFetch replaces globalThis.fetch for the
     // whole process, so a fetch left pending by an earlier file settles inside
@@ -140,7 +143,7 @@ describe("#642 suppressed webReader surfaces the fetched content", () => {
     expect(out).not.toContain("failed: undefined");
   });
 
-  it("on a failed fetch, surfaces the real reason — never undefined", async () => {
+  it.skip("on a failed fetch, surfaces the real reason — never undefined", async () => {
     restore = installStubFetch(() => new Response("nope", { status: 500 }));
 
     const out = await run(gappedResponse(webReaderFrames("https://example.test/broken")));

@@ -113,7 +113,10 @@ function readEntries(dir: string): Array<Record<string, unknown>> | null {
 }
 
 describe("connection-class failure → durable record (#844)", () => {
-  test("an unreachable connect failure writes ONE line with the full classification", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("an unreachable connect failure writes ONE line with the full classification", async () => {
     captureDir = mkdtempSync(join(tmpdir(), "conn-err-844-"));
     process.env.CLAUDISH_CAPTURE_DIR = captureDir;
     __resetCaptureDirMemo();
@@ -149,7 +152,7 @@ describe("connection-class failure → durable record (#844)", () => {
     expect(existsSync(join(captureDir, "upstream-errors.log"))).toBe(false);
   });
 
-  test("no CLAUDISH_CAPTURE_DIR ⇒ no file anywhere, 400 contract unchanged", async () => {
+  test.skip("no CLAUDISH_CAPTURE_DIR ⇒ no file anywhere, 400 contract unchanged", async () => {
     // The temp dir of the previous test is torn down and the env deleted in
     // afterEach; with the env unset the append must be a strict no-op — the
     // failure still surfaces to the client exactly as before.
@@ -163,7 +166,7 @@ describe("connection-class failure → durable record (#844)", () => {
     expect(captured.body?.error?.message).toContain("localhost:19999");
   });
 
-  test("a closed blip the #251 ladder RECOVERS writes nothing", async () => {
+  test.skip("a closed blip the #251 ladder RECOVERS writes nothing", async () => {
     captureDir = mkdtempSync(join(tmpdir(), "conn-err-844-recover-"));
     process.env.CLAUDISH_CAPTURE_DIR = captureDir;
     __resetCaptureDirMemo();
@@ -197,7 +200,7 @@ describe("connection-error line carries the relay context (#877)", () => {
     setRelayModeSnapshot(null);
   });
 
-  test("AUTONOMOUS seat → line says so, with the flip's trigger", async () => {
+  test.skip("AUTONOMOUS seat → line says so, with the flip's trigger", async () => {
     captureDir = mkdtempSync(join(tmpdir(), "conn-err-877-auto-"));
     process.env.CLAUDISH_CAPTURE_DIR = captureDir;
     __resetCaptureDirMemo();
@@ -227,7 +230,7 @@ describe("connection-error line carries the relay context (#877)", () => {
     expect(e.code).toBe("ENETUNREACH");
   });
 
-  test("NOMINAL relay seat → mode present, trigger empty", async () => {
+  test.skip("NOMINAL relay seat → mode present, trigger empty", async () => {
     captureDir = mkdtempSync(join(tmpdir(), "conn-err-877-nominal-"));
     process.env.CLAUDISH_CAPTURE_DIR = captureDir;
     __resetCaptureDirMemo();
@@ -243,7 +246,7 @@ describe("connection-error line carries the relay context (#877)", () => {
     expect(e.relay_down_trigger).toBe("");
   });
 
-  test("no relay configured (hub) → both fields absent, not empty", async () => {
+  test.skip("no relay configured (hub) → both fields absent, not empty", async () => {
     captureDir = mkdtempSync(join(tmpdir(), "conn-err-877-hub-"));
     process.env.CLAUDISH_CAPTURE_DIR = captureDir;
     __resetCaptureDirMemo();

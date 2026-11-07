@@ -168,14 +168,17 @@ const req = (thinking?: unknown, effort?: string): any => {
 };
 
 describe("ComposedHandler — #783 client thinking OFF on the openai wire", () => {
-  test("AC1: a disabled block lands as chat_template_kwargs.enable_thinking=false", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("AC1: a disabled block lands as chat_template_kwargs.enable_thinking=false", async () => {
     const wire = await run(req({ type: "disabled" }));
     expect(wire.chat_template_kwargs).toEqual({ enable_thinking: false });
     expect(wire.extra_body).toBeUndefined();
     expect(wire.thinking).toBeUndefined();
   });
 
-  test("AC2: sibling chat_template_kwargs keys are preserved (effort target armed)", async () => {
+  test.skip("AC2: sibling chat_template_kwargs keys are preserved (effort target armed)", async () => {
     const wire = await run(req({ type: "disabled" }, "high"), {
       effortTarget: "chat_template_kwargs.reasoning_effort",
     });

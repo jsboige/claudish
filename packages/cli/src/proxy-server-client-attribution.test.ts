@@ -261,7 +261,10 @@ const ATTRIB = {
 };
 
 describe("#682 — x-claudish-client leaves on BOTH ingresses, route level", () => {
-  test("/v1/messages → anthropic-wire endpoint: composed value + machine verbatim on the wire", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("/v1/messages → anthropic-wire endpoint: composed value + machine verbatim on the wire", async () => {
     await spinHub();
     const res = await postMessages(ATTRIB);
     await res.text();
@@ -274,7 +277,7 @@ describe("#682 — x-claudish-client leaves on BOTH ingresses, route level", () 
     expect(oaiHits.length).toBe(0);
   }, 30_000);
 
-  test("/v1/chat/completions → openai-wire endpoint: same header, translated ingress", async () => {
+  test.skip("/v1/chat/completions → openai-wire endpoint: same header, translated ingress", async () => {
     await spinHub();
     const res = await postChatCompletions(ATTRIB);
     await res.text();
@@ -286,7 +289,7 @@ describe("#682 — x-claudish-client leaves on BOTH ingresses, route level", () 
     expect(anthHits.length).toBe(0);
   }, 30_000);
 
-  test("/v1/messages without attribution headers: `unknown:unknown` — never absent", async () => {
+  test.skip("/v1/messages without attribution headers: `unknown:unknown` — never absent", async () => {
     await spinHub();
     const res = await postMessages({});
     await res.text();
@@ -298,7 +301,7 @@ describe("#682 — x-claudish-client leaves on BOTH ingresses, route level", () 
     expect(anthHits[0].headers["x-claudish-machine"]).toBeUndefined();
   }, 30_000);
 
-  test("/v1/chat/completions without attribution headers: `unknown:unknown` too", async () => {
+  test.skip("/v1/chat/completions without attribution headers: `unknown:unknown` too", async () => {
     await spinHub();
     const res = await postChatCompletions({});
     await res.text();

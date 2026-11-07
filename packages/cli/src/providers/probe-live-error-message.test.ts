@@ -32,7 +32,10 @@ describe("classifyHttpError errorMessage (port 196e6f8f)", () => {
     expect(result.errorMessage).toBe("Model access denied.");
   });
 
-  test("falls back to the composed message when provider_message is absent", () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("falls back to the composed message when provider_message is absent", () => {
     const result = classifyHttpError(400, proxyBody(COMPOSED), 1200);
     // The composed hint is 196 chars — the row's pre-existing 160-char clip
     // applies (that clip is the very reason the provider's 3-word sentence

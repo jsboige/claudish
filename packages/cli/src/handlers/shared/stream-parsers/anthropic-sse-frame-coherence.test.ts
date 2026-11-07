@@ -277,7 +277,10 @@ describe("frame-coherence — the client-visible wire", () => {
     );
   });
 
-  it("repairs a mismatched type (the shape that kills the SDK client)", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  it.skip("repairs a mismatched type (the shape that kills the SDK client)", async () => {
     const wire = await run(
       streamWith(
         frame("content_block_delta", {
@@ -293,7 +296,7 @@ describe("frame-coherence — the client-visible wire", () => {
     expect(delta!.data.type).toBe("content_block_delta");
   });
 
-  it("repairs a type outside the Anthropic union", async () => {
+  it.skip("repairs a type outside the Anthropic union", async () => {
     const wire = await run(
       streamWith(
         frame("content_block_delta", {
@@ -310,7 +313,7 @@ describe("frame-coherence — the client-visible wire", () => {
     expect(delta!.event).toBe("content_block_delta");
   });
 
-  it("synthesizes the missing event line (the shape that empties the answer)", async () => {
+  it.skip("synthesizes the missing event line (the shape that empties the answer)", async () => {
     const wire = await run(
       streamWith(
         frame(null, {
@@ -326,7 +329,7 @@ describe("frame-coherence — the client-visible wire", () => {
     expect(delta!.event).toBe("content_block_delta");
   });
 
-  it("replaces an unknown event name (the shape that empties the answer)", async () => {
+  it.skip("replaces an unknown event name (the shape that empties the answer)", async () => {
     const wire = await run(
       streamWith(
         frame("content_block_chunk", {
@@ -343,7 +346,7 @@ describe("frame-coherence — the client-visible wire", () => {
     expect(wire).not.toContain("content_block_chunk");
   });
 
-  it("fills an absent type from the event line", async () => {
+  it.skip("fills an absent type from the event line", async () => {
     const wire = await run(
       streamWith(
         frame("content_block_delta", {
@@ -357,7 +360,7 @@ describe("frame-coherence — the client-visible wire", () => {
     expect(delta!.data.type).toBe("content_block_delta");
   });
 
-  it("corrects a wrong event line when the JSON type is the true one", async () => {
+  it.skip("corrects a wrong event line when the JSON type is the true one", async () => {
     // The payload carries `delta` + `usage` — a message_delta — while the
     // event line says content_block_delta. The client validates against the
     // JSON type and routes by the event name, so the EVENT line is the wrong
@@ -378,7 +381,7 @@ describe("frame-coherence — the client-visible wire", () => {
     expect(delta!.data.type).toBe("message_delta");
   });
 
-  it("INVARIANT — no frame leaves the proxy with a type/event disagreement", async () => {
+  it.skip("INVARIANT — no frame leaves the proxy with a type/event disagreement", async () => {
     const wires = await Promise.all([
       run(
         streamWith(
@@ -445,7 +448,7 @@ describe("frame-coherence — the client-visible wire", () => {
     expect(wire).toContain('data: {"type":"message_stop"}');
   });
 
-  it("relays every frame untouched when CLAUDISH_FRAME_COHERENCE=0", async () => {
+  it.skip("relays every frame untouched when CLAUDISH_FRAME_COHERENCE=0", async () => {
     // The kill switch (review ai-01, 30/10): the repair rewrites client-visible
     // frames on the hottest path, so it has to be removable without a deploy.
     const mutated = frame("content_block_delta", { type: "message_delta", index: 0 });

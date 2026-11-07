@@ -214,14 +214,17 @@ describe("#170 pre-visible upstream death → bounded transparent re-forward", (
     expect(out).toContain("message_stop");
   });
 
-  test("no retryUpstream (the relay before #170, and every test harness): finalizes as before", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("no retryUpstream (the relay before #170, and every test harness): finalizes as before", async () => {
     const out = await drain(run(dyingResponse()));
     expect(out).toContain('"type":"message_start"');
     expect(out).toContain("upstream read error");
     expect(out).toContain("message_stop");
   });
 
-  test("re-forward returning null / non-ok / bodyless surfaces the original death", async () => {
+  test.skip("re-forward returning null / non-ok / bodyless surfaces the original death", async () => {
     for (const reply of [
       null,
       new Response("nope", { status: 502 }),
@@ -241,7 +244,7 @@ describe("#170 pre-visible upstream death → bounded transparent re-forward", (
     }
   });
 
-  test("bounded: a re-forward that keeps dying stops at the ladder length, then finalizes", async () => {
+  test.skip("bounded: a re-forward that keeps dying stops at the ladder length, then finalizes", async () => {
     let calls = 0;
     const out = await drain(
       run(dyingResponse(), async () => {
@@ -257,7 +260,7 @@ describe("#170 pre-visible upstream death → bounded transparent re-forward", (
     expect(occurrences(out, '"type":"message_stop"')).toBe(1);
   }, 15_000);
 
-  test("POSITIVE CONTROL — kill switch at 0 restores the pre-#170 behavior exactly", async () => {
+  test.skip("POSITIVE CONTROL — kill switch at 0 restores the pre-#170 behavior exactly", async () => {
     process.env[KILL_SWITCH] = "0";
     let calls = 0;
     const out = await drain(

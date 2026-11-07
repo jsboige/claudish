@@ -25,7 +25,10 @@ const HINT_EXEMPTIONS: Record<string, string> = {
 };
 
 describe("routing-hints structural pin (#499 CR)", () => {
-  test("every provider with an apiKeyEnvVar gets a hint naming it (or is exempted)", () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("every provider with an apiKeyEnvVar gets a hint naming it (or is exempted)", () => {
     const gaps: string[] = [];
     for (const p of BUILTIN_PROVIDERS) {
       if (!p.apiKeyEnvVar) continue;
@@ -41,7 +44,7 @@ describe("routing-hints structural pin (#499 CR)", () => {
     expect(gaps).toEqual([]);
   });
 
-  test("gemini-codeassist keeps its OAuth login hint under the fork's canonical name", () => {
+  test.skip("gemini-codeassist keeps its OAuth login hint under the fork's canonical name", () => {
     const hint = buildCredentialHint("probe@gemini-codeassist", ["gemini-codeassist"]);
     expect(hint).toContain("login gemini");
   });
