@@ -1,0 +1,150 @@
+/**
+ * #445 — byte budgets for the harness files an agent loads on every turn.
+ *
+ * Input tokens are re-read from cache on every turn, so a file that is always
+ * loaded is paid (size × turns). On PAYG lanes (DeepSeek) that input dominates
+ * the bill. Slimming passes do not hold on their own: `CLAUDE.md` went
+ * 27 KB → 116 KB → 82 KB → 94 KB between 23/08 and 11/10 because every PR
+ * appends its gotcha to the file that is always loaded. A budget nobody checks
+ * is a wish; this test is the check.
+ *
+ * Rule of the budget: the always-loaded file holds DECISIONS (what an agent
+ * must know before acting). Measurements, incident narratives and history go
+ * to a non-loaded reference file, with a one-line pointer left behind.
+ *
+ * Adding a row: the path is repo-relative, the budget is in BYTES (UTF-8 —
+ * accented French costs more than its character count), and `detail` names
+ * where overflow goes, because that is what the failure message tells the
+ * author to do.
+ */
+import { describe, expect, test } from "bun:test";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import {
+  CLAUDE_MD_BUDGET_BYTES,
+  claudeMdBudgetMessage,
+  measureBudgetedBytes,
+  withinClaudeMdBudget,
+} from "./claude-md-budget";
+
+const REPO_ROOT = resolve(import.meta.dir, "..", "..", "..", "..");
+
+interface Budget {
+  path: string;
+  maxBytes: number;
+  detail: string;
+}
+
+const BUDGETS: Budget[] = [
+  {
+    // Read once per coordinator cycle and kept in context for every turn of it.
+    // 52 746 B before #445 (A3); the verbatim original lives in reference.md.
+    path: ".claude/skills/claudish-coordinate/SKILL.md",
+    maxBytes: 16 * 1024,
+    detail: ".claude/skills/claudish-coordinate/reference.md (section of the same name)",
+  },
+  {
+    // Injected into every /worker cycle on the four worker seats. 13 975 B
+    // before #445 (A4); the verbatim original lives in reference.md.
+    // 6.5 KiB: raised from 6 KiB by the #445 lead after the CR #447 corrections
+    // (total kind→tag partition) did not fit in 6144 B — see c.6123115622.
+    path: ".claude/skills/worker/SKILL.md",
+    maxBytes: 6.5 * 1024,
+    detail: ".claude/skills/worker/reference.md (section of the same name)",
+  },
+  {
+    // Loaded on every turn by every agent working in this repo — the decision
+    // layer itself. 94 365 B before #445 (A1); each moved narrative now lives in
+    // a docs/reference/<theme>.md file named by the pointer table at its top.
+    path: "CLAUDE.md",
+    maxBytes: CLAUDE_MD_BUDGET_BYTES,
+    detail: "docs/reference/<theme>.md (see the pointer table at the top of CLAUDE.md)",
+  },
+];
+
+describe("harness byte budgets (#445)", () => {
+  test("positive control: every budgeted file exists and is non-empty", () => {
+    // A renamed or deleted file would otherwise pass the size check vacuously.
+    for (const b of BUDGETS) {
+      const full = join(REPO_ROOT, b.path);
+      expect(existsSync(full), `${b.path} is budgeted but does not exist — update BUDGETS`).toBe(
+        true
+      );
+      expect(statSync(full).size).toBeGreaterThan(0);
+    }
+  });
+
+  for (const b of BUDGETS) {
+    test(`${b.path} ≤ ${b.maxBytes} bytes`, () => {
+      // Measured as committed (LF), not as checked out: under core.autocrlf=true a
+      // Windows working copy carries one extra byte per line, which would make the
+      // verdict depend on the machine running the suite.
+      const raw = readFileSync(join(REPO_ROOT, b.path), "utf-8");
+      const size = Buffer.byteLength(raw.replace(/\r\n/g, "\n"), "utf-8");
+      expect(
+        size,
+        b.path === "CLAUDE.md"
+          ? claudeMdBudgetMessage(size, b.maxBytes)
+          : `${b.path} is ${size} B, over its ${b.maxBytes} B budget (+${size - b.maxBytes}). ` +
+              "It is loaded on every turn: move the measurements / incident narrative / history into " +
+              `${b.detail} and leave a one-line pointer. Raising the budget is a #445 decision, not a fix.`
+      ).toBeLessThanOrEqual(b.maxBytes);
+    });
+
+    test(`${b.path}: every reference pointer resolves`, () => {
+      // A slimmed file is only lossless while the place it points to exists.
+      // Skills point at a sibling reference.md; CLAUDE.md points at
+      // docs/reference/<theme>.md files relative to the repo root.
+      const full = join(REPO_ROOT, b.path);
+      const text = readFileSync(full, "utf-8");
+      // The sibling-reference.md guard is the A3 skill structure; scoping it to
+      // SKILL.md avoids a false positive on CLAUDE.md, whose "reference.md"
+      // substring only ever occurs inside "settings-reference.md".
+      if (b.path.includes("SKILL.md") && text.includes("reference.md")) {
+        expect(
+          existsSync(join(dirname(full), "reference.md")),
+          `${b.path} points to reference.md, which is missing`
+        ).toBe(true);
+      }
+      // CR #449 (non-blocking): CLAUDE.md also points at docs/settings-reference.md,
+      // docs/three-layer-architecture.md and docs/deployment/*.md — match any
+      // docs/ path, the existence check is the same and the cost is nil.
+      const refs = text.match(/docs\/[A-Za-z0-9/._-]+\.md/g) ?? [];
+      for (const r of refs) {
+        expect(existsSync(join(REPO_ROOT, r)), `${b.path} points to ${r}, which is missing`).toBe(
+          true
+        );
+      }
+    });
+  }
+});
+
+describe("CLAUDE.md budget boundary (#445 A2)", () => {
+  // A budget nobody checks is a wish; a budget nobody can trip is decoration.
+  // These pins make the gate falsifiable: raise CLAUDE_MD_BUDGET_BYTES by one
+  // byte and the first test below goes red.
+
+  test("the budget is 36 864 B", () => {
+    expect(CLAUDE_MD_BUDGET_BYTES).toBe(36 * 1024);
+  });
+
+  test("one byte over the budget is refused, exactly at the budget is accepted", () => {
+    expect(withinClaudeMdBudget(CLAUDE_MD_BUDGET_BYTES)).toBe(true);
+    expect(withinClaudeMdBudget(CLAUDE_MD_BUDGET_BYTES + 1)).toBe(false);
+  });
+
+  test("the size measured is line-ending independent", () => {
+    // core.autocrlf=true would otherwise make the verdict depend on the seat.
+    const LF = String.fromCharCode(10);
+    const CR = String.fromCharCode(13);
+    const lf = `a${LF}b${LF}`;
+    const crlf = `a${CR}${LF}b${CR}${LF}`;
+    expect(measureBudgetedBytes(crlf)).toBe(measureBudgetedBytes(lf));
+  });
+
+  test("the failure message says where the detail goes", () => {
+    const msg = claudeMdBudgetMessage(CLAUDE_MD_BUDGET_BYTES + 1);
+    expect(msg).toContain("docs/reference/<theme>.md");
+    expect(msg).toContain("one-line pointer");
+  });
+});

@@ -16,6 +16,12 @@ function filesUnder(dir: string): string[] {
   return files;
 }
 
+// The retired term is a TS API concept (model-selector's "roster" → served set).
+// The fleet OPS scripts (.ps1/.py, arrived from main) use "roster" for the
+// machine/session roster — a different, legitimate vocabulary (main-forward
+// sync #919). Scan TS/JS sources only.
+const SCANNED = /\.(ts|tsx|js|mjs|cjs)$/;
+
 test("packages and scripts contain no retired terminology", () => {
   // Mutation target: packages/cli/src/model-selector.ts:336. Restoring its previous
   // wording ("roster") is a representative one-line rename revert and must be
@@ -23,6 +29,7 @@ test("packages and scripts contain no retired terminology", () => {
   const findings: string[] = [];
   for (const root of [join(repositoryRoot, "packages"), join(repositoryRoot, "scripts")]) {
     for (const file of filesUnder(root)) {
+      if (!SCANNED.test(file)) continue;
       for (const [index, line] of readFileSync(file, "utf-8").split("\n").entries()) {
         if (/\b(roster|served[- ]set)\b/i.test(line)) {
           findings.push(`${relative(repositoryRoot, file)}:${index + 1}: ${line.trim()}`);

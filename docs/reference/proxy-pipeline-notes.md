@@ -1,0 +1,323 @@
+# Proxy pipeline notes — non-streaming, inline system messages, capture, debugging
+
+**Deferred from `CLAUDE.md`.** The hard constraints stay as one-liners in `CLAUDE.md`; this file holds the reasoning, the regression-test inventory, and the step-by-step workflows.
+
+## Non-streaming (`stream: false`) support
+
+Claude Code's agentic loop always sends `stream: true`, but **`/compact` (context condensation) and any non-streaming Anthropic API caller send `stream: false`** and expect a single JSON `message` body (`Content-Type: application/json`), NOT SSE. Returning SSE to such a client surfaces as `"API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request"` and **blocks the affected operation** (a session that can't compact eventually overflows and the agent stalls — a never-hang-priority violation).
+
+Every adapter's `buildPayload` hardcodes `stream: true` (the proxy always drives the upstream provider in streaming mode), and the whole translation pipeline emits Claude SSE. To serve non-streaming clients, `ComposedHandler.handle()` buffers the already-translated SSE back into one Anthropic message via `collectAnthropicSseToMessage()` (`handlers/shared/collect-sse-message.ts`):
+
+- The trigger mirrors `request-logger.ts`'s `stream` definition exactly: `wantsStreaming = payload?.stream === true`. Anything else → buffer to JSON.
+- `NativeHandler` (Anthropic-direct/Opus) already honored `stream: false` natively — that is why `/compact` worked on Opus but failed on every proxied/composed model. This closes the same gap for ComposedHandler (and therefore FallbackHandler, which delegates to it).
+- The collector **never throws** (never-hang-priority): a broken/empty stream degrades to a well-formed message with an empty text block. It reuses the full pipeline (all stream formats, web-tool interception, empty-response classification) verbatim — it just collapses the SSE into a message at the end.
+- Regression tests: `handlers/shared/collect-sse-message.test.ts` (text, tool_use, mixed thinking/text order, empty body, malformed lines, unparseable tool JSON).
+
+## Inline system message handling
+
+Claude Code v2.1.153+ injects `role: "system"` messages inline (e.g. system-reminders). Anthropic-compatible providers (Z.AI, MiniMax, Kimi) reject these — only "user"/"assistant" accepted. The fix:
+
+- `composed-handler.ts`: strips inline system messages from `requestPayload.messages` for `anthropic-sse` transport, merges into top-level `system` field
+- `openai-messages.ts`: same strip for the OpenAI format path
+
+## Diagnostic body capture
+
+Set `CLAUDISH_CAPTURE_DIR` env var to enable full request body capture for offline reproduction of hangs or malformed responses. Disabled by default (no-op when unset). Files written as JSON with metadata (timestamp, source IP, model, PID, machine header).
+
+In the Docker deployment, `CLAUDISH_CAPTURE_DIR=/captures` is bind-mounted to `D:\claudish-captures` on the host, so captures persist across container recreates. Compacted nightly to 7z, then backed up to GDrive (see `capture-retention.md` memory). Capture format and analysis: `docs/reference/traffic-analysis.md`.
+
+## Debug logging
+
+Debug logging is behind the `--debug` flag and outputs to the `logs/` directory. It's disabled by default.
+
+Keep full debug logging (including empty chunks, raw deltas) in log files — needed to understand real model streaming behavior. Suppress noise at the registration/initialization level (e.g., conditional middleware), not at the streaming data level.
+
+### Raw SSE capture (v5.14.0+)
+
+When `--debug` is active, both stream parsers log raw SSE events:
+
+- `[SSE:openai] {...}` — every OpenAI SSE data line
+- `[SSE:anthropic] {...}` — every Anthropic SSE data line
+
+These are greppable and extractable into test fixtures for regression testing.
+
+## Debugging failed model translations
+
+When a model produces wrong output (0 bytes, garbled, wrong format), use this workflow:
+
+### 1. Reproduce with --debug
+
+```bash
+claudish --model minimax-m2.5 --debug "say hello"
+# Debug log written to logs/claudish_YYYY-MM-DD_HH-MM-SS.log
+```
+
+### 2. Verify wiring with --probe
+
+```bash
+claudish --probe minimax-m2.5
+# Shows: transport, format adapter, model translator, stream format, overrides
+```
+
+### 3. Analyze the debug log
+
+Use the `/debug-logs` slash command in Claude Code:
+
+```
+/debug-logs logs/claudish_2026-03-17_09-41-32.log
+```
+
+This command:
+
+1. Reads the log and counts text chunks, tool calls, HTTP errors, fallback chains
+2. Diagnoses the failure mode (no SSE content, text but 0 stdout, wrong parser, etc.)
+3. Extracts SSE fixtures from `[SSE:*]` lines using `test-fixtures/extract-sse-from-log.ts`
+4. Adds a regression test to `format-translation.test.ts`
+5. Runs tests to confirm the regression is captured
+
+### 4. Extract fixtures manually (alternative)
+
+```bash
+bun run packages/cli/src/test-fixtures/extract-sse-from-log.ts logs/claudish_*.log
+# Creates: test-fixtures/sse-responses/<model>-<format>-turn<N>.sse
+```
+
+### 5. Run format translation tests
+
+```bash
+bun test packages/cli/src/format-translation.test.ts
+```
+
+## Format translation test harness
+
+`packages/cli/src/format-translation.test.ts` — SSE replay tests for the full translation pipeline.
+
+**Fixture-based**: Each `.sse` file in `test-fixtures/sse-responses/` is a captured SSE stream from a real provider response. Tests replay fixtures through the stream parser and assert correct Claude SSE output.
+
+**Helpers**: `parseClaudeSseStream()`, `extractText()`, `extractToolNames()`, `extractStopReason()`, `fixtureToResponse()`
+
+**Adding regression tests**: After extracting fixtures from a debug log, add a `describe("Regression: <model>")` block. Template is at the bottom of the test file.
+
+---
+
+## `omitReasoningContent` and the structural no-op on the OpenAI wire
+
+Merged from `CLAUDE.md` on 2026-08-23. Source: `810aeb4`, `7681f11`.
+
+`omitReasoningContent` is an optional custom-endpoint field (default `false`) that drops
+`reasoning_content` from outbound assistant messages. Set it for backends that validate their request
+body strictly.
+
+**Why it has to exist at all.** The OpenAI-format converter emits `reasoning_content` whenever a
+thinking block is present in history (`processAssistantMessage`, gated on `hasThinking`) —
+**independent of any opt-in** — because the consumers disagree with each other:
+
+| Backend | Requirement |
+|---|---|
+| DeepSeek | *Requires* it echoed back; a thinking-mode conversation whose recent assistant messages lack the field is rejected with HTTP 400. |
+| Kimi K2.5 | Requires it from turn 2 onward, without opting into `preserveThinkingInHistory()`. |
+| GLM | Ignores it. |
+| Mistral | Rejects it: `HTTP 422 extra_forbidden` on `body.messages[N].assistant.reasoning_content`, failing **every** turn of a real thinking-mode session. |
+
+**Why the existing strip cannot handle it.** `ComposedHandler` filters `type:"thinking"` blocks out of
+message content arrays — but that strip runs *after* `convertMessages`, by which point the OpenAI
+conversion has already flattened content to a string and hoisted the reasoning into a sibling scalar.
+On the OpenAI wire the block filter is a **structural no-op**: it can never reach the field. Hence a
+separate pass, `stripReasoningContent()` in `openai-messages.ts`, applied to the *converted* messages.
+
+### Production incident, 2026-08-20
+
+Mistral was promoted to step 0 of the sonnet cascade while the GLM nominal was walled, so 100% of
+sonnet traffic hit it: **28 of 32 requests failed (87%)**. Compounding it, the hub image predated
+`6bd6f7a`, so the non-quota 422 surfaced to clients instead of failing forward to the next step, and
+the fleet stalled.
+
+Two independent causes, each necessary: the field should not have been sent, **and** a sick
+intermediate step should have degraded rather than blocked. Interactive sessions had to be resumed by
+hand on each machine — a 422 is a hard 4xx and Claude Code does not auto-retry it; only scheduled
+agents self-recovered.
+
+Measured the same day: Mistral's `zai-glm-5-2` emits **no** reasoning traces at all (0 thinking
+blocks, 0 `reasoning_content` in its SSE) — it reasons in plain text inside the answer. So nothing is
+lost by stripping, and that step is `degraded`, not `lateral`: a non-thinking GLM 5.2 standing in for
+a thinking nominal.
+
+---
+
+## Effort mapping onto an endpoint's own depth knob (#667)
+
+Claude Code sends its thinking level as `output_config.effort`
+(`low | medium | high | xhigh | max`) next to `thinking: {type: "adaptive"}`. Before #667 the field
+was read in exactly one place (`minimax-model-dialect.ts`, to overwrite it under an operator
+`effort:<level>` policy) — every OpenAI-wire route dropped it, so the local vLLM engine serving the
+haiku role (Swift) applied its own default instead of the level the user picked.
+
+The fix is per-endpoint and declarative: `effortTarget` on the custom-endpoint schema
+(`config-schema.ts`), threaded by `custom-endpoints-loader.ts` into `ComposedHandlerOptions`, applied
+in `ComposedHandler` after the adapters' `prepareRequest` (last writer before the wire), OpenAI wire
+only. Only target today: vLLM's **top-level** `chat_template_kwargs.reasoning_effort` (levels
+`low | medium | xhigh`; the engine applies `medium` when the field is absent) — never under
+`extra_body`, existing `chat_template_kwargs` keys preserved.
+
+**The fixed, monotonic ladder** (`EFFORT_TARGET_LADDER`, 5 client levels → the target's 3):
+
+| Client `output_config.effort` | Wire `chat_template_kwargs.reasoning_effort` |
+|---|---|
+| `low` | `low` |
+| `medium` | `medium` |
+| `high` | `xhigh` |
+| `xhigh` | `xhigh` |
+| `max` | `xhigh` |
+
+`high` lands on `xhigh`, not `medium`, on purpose: `medium` is what the engine applies when NOT
+asked, so mapping the client's explicit `high` onto it would make the most common client level
+(haiku-5-5 sends `high` by default) a no-op — and the target ladder has no `high`, so the next step
+up is the only faithful direction. `max` clamps to the top. Monotone: a higher client level never
+maps lower.
+
+Behavior rules: absent client effort → nothing written (the engine's own default keeps applying);
+unknown or malformed value → dropped with a `[Effort] … dropped` debug log, never thrown, request
+served; every mapped request logs one greppable line
+`[Effort] <client level> -> chat_template_kwargs.reasoning_effort=<value> (<endpoint>)`. Opt-in:
+an endpoint without `effortTarget` sends exactly what it sends today. Pins:
+`composed-handler-effort-mapping.test.ts` (AC1 inert-by-default, AC2 top-level + siblings, AC3 one
+assertion per level, AC4 absent-stays-absent, AC5 never-throw).
+
+---
+
+## Responses overload after `response.created`
+
+The OpenAI Responses backend can acknowledge a request with `response.created` and then emit
+`server_is_overloaded` before any text or tool block. This shape bypasses the start-of-stream peek:
+`response.created` deliberately classifies the stream as healthy because a later error may follow
+client-visible output. It must instead be retried inside `openai-responses-sse.ts`, where the parser
+can prove that `nextBlockIndex === 0` and therefore reissue the request without duplicating output.
+
+Use the patient overload budget (5/10/20/40/80/150 seconds plus jitter), not the two quick retries
+used for isolated `server_error`. If all six attempts fail, the parser still emits a complete terminal
+Anthropic stream with the API error; it must never leave the client hanging. Regression coverage lives
+in `openai-responses-sse.test.ts` for both recovery and bounded exhaustion.
+
+A rejected `reader.read()` is a separate failure channel from a provider SSE `error` event. A socket
+close before the first client-visible text or tool block uses the fast transparent retry budget
+(1/3 seconds plus jitter). Once a block has been emitted, retrying could duplicate text or execute a
+tool twice, so the parser preserves partial output and emits a friendly terminal interruption with
+`message_stop` instead. Exhausted retries terminate the same way. Runtime-specific diagnostics such
+as Bun's `pass verbose: true` advice remain in proxy logs and never become conversation content. This
+does not add a whole-stream timeout: healthy long responses remain unrestricted after headers.
+
+---
+
+## Admission census over declared context windows (#565)
+
+Measured 2026-10-20: a 1 205-message `/compact` turn (~1.1M estimated tokens, 4.4 MB body) reached the
+hub on the haiku role, the nominal (MiniMax) answered `400 Input too large`, and the client surfaced
+provider jargon — the diagnosing lane spent a thread hunting a remap that did not exist. Every lane in
+the fleet has a window an order of magnitude smaller, so the request was doomed before it left.
+
+`handleWithCascade` now runs `decideContextAdmission(payload, windows)` **before the loop and before
+any handler exists**, in both ingresses (`/v1/messages` and the translated `/v1/chat/completions`):
+
+- **Census**: the nominal target plus every cascade step's provider is looked up in the runtime
+  registry that `loadCustomEndpoints` populates with declared `contextLimit`s. Only DECLARED bounds
+  count — a provider that declares nothing is not assumed unbounded, it is invisible, and a path with
+  **any** undeclared candidate falls open to today's behaviour (every built-in provider, today). The
+  census refuses only when EVERY candidate declares a window and the request clears the largest. The
+  largest declared window is the one weighed: a 32k step on the path must not refuse a prompt a 262k
+  sibling can take (`K22`). A `role:<r>` delegation step is weighed as its target's **whole path** —
+  the target's nominal plus its own steps, recursively (acyclic at load) — never as the concrete its
+  `target` was last refreshed to (`K26`/`K26b`). The refusal text says "no DECLARED window", never "no
+  candidate can serve".
+- **Why any undeclared candidate stands it down** (hub 2026-10-22): the first cut weighed the declared
+  SUBSET, and called omitting a `role:` step "fail-open by construction". It was not — an omitted
+  candidate can only *remove* a window that might have taken the request. On the haiku path
+  `MiniMax (nothing) > vllm-myia (262 144) > role:sonnet > ds@deepseek-flash (nothing)`, swift alone
+  refused every request over 262k — a CoursIA-2 session's `/compact` at ~270k included, so the session
+  could never condense its way out — while the nominal and the PAYG terminator could have served it
+  (`K25`). The trade-off is accepted: on a mixed path an oversized request pays one doomed round-trip
+  again, and the #79 recovery turn still answers it.
+- **Native nominal**: a bare (non-`@`, non-`/`) nominal is the native lane, whose 1M window declares
+  nothing — it is an undeclared candidate like any other, so a smaller substitute step never vetoes the
+  model the client actually named (`K24`).
+- **Estimate**: `estimateClampTokens`, the media-aware #441 estimator (a 1 MB screenshot scores ~1.6k,
+  not ~750k). For a refusal an inflated estimate is a false refusal, so the `/4` overflow estimator is
+  the wrong instrument here.
+- **Margin**: the refusal must clear the largest window by `contextLimitMarginTokens(est)` — a request
+  merely NEAR a window belongs to the #441 clamp and the learned cap.
+- **Answer**: the #79 recoverable turn (`buildOverflowRecoveryStream` / `buildOverflowRecoveryMessage`),
+  HTTP 200 with the real `input_tokens`, so the client's own compaction fires. A bare 400 would
+  reproduce the `/compact` retry loop #79 closed. The wording must never match `isQuotaExhaustion`
+  (pinned) — a context refusal is not a wall and must not arm a cascade.
+
+Kill switch `CLAUDISH_CONTEXT_ADMISSION=0` (read per request, compose-injected). Pins:
+`handlers/shared/context-admission.test.ts` (decision, wording, knob) and `K20/K20b/K20c/K22/K23/K24` in
+`proxy-server-step-skip-route.test.ts`, each with a mutation proof (`n1`–`n4`); `K20c` runs the
+translated OpenAI ingress end-to-end (a run, not a reading).
+
+Boundary note: #441's "the clamp stands down when the prompt leaves no output budget" stays reachable
+only in the band `window − margin − 4096 < est ≤ window + margin`; above it the admission census has
+already answered. `K15` case 5 was moved into that band.
+
+## Exact counting at the wall (#674)
+
+Measured 2026-10-25, from inside the hub container against the shipping vLLM (`swift-1.5-27b`,
+window 262 144): `POST {root}/tokenize` → `200 {"count":…, "max_model_len": 262144}`. The
+`{model, messages}` shape is accepted and the chat template is applied **server-side** — `hello
+world` counts 12 tokens as messages against 2 as a raw prompt, so the `prompt` shape would
+under-count every real request. `/v1/tokenize` is a 404 on the same engine; the transport derives
+the root URL by stripping the completions suffixes and a trailing `/v1`
+(`OpenAIProviderTransport.tokenizeUrl`).
+
+Why a probe at all: the engine admits on the **prompt alone** (reqN=11724, prompt 262 126 of 262
+144, served with `output_tokens: 18`; reqN=931, prompt 262 145, `400 Input too large`), and the
+`/4` estimate spans **0.57–3.18×** of the real count over 1 111 served responses (p50 ×1.068, p95
+×1.118, p99 ×1.196). Consequences measured the same day: a cap learned from one refusal
+short-circuited served prompts (the [cap, window) band, closed by #676's corroboration), while
+`est ≥ window` almost never fired on genuinely over-window prompts (their estimate tops out near
+242k) — each paying one doomed round-trip before #431 skipped it.
+
+The rule that replaces both: **in the band, the estimate may only NOMINATE; the engine's own
+count decides.**
+
+- Band: `est >= window / CLAUDISH_EXACT_COUNT_BAND` (default 1.15, clamped to [1, 2]; 262 144 →
+  nominates from 227 952). One-sided because below it even the worst measured over-count cannot
+  reach the window; at/above the window the probe replaces the estimate's old refusal.
+- Probe: `ProviderTransport.countPromptTokens(messages)` — optional capability, implemented on the
+  OpenAI transport only. Bounded (`AbortSignal.timeout(3s)`), never through the concurrency
+  limiter (the probe never enters the generation queue), never throws. A 404/405 memorises the
+  URL **for the process** (`tokenizeUnsupportedUrls`, module-level — the proxy rebuilds
+  transports), so a non-vLLM endpoint pays exactly one probe, then behaves as if the capability
+  were absent.
+- Decision (derived-window branch of `ComposedHandler.handle`, both ingresses share it):
+  `exact >= window` → the #79 recoverable turn locally, `exact` in the text ("exact count from
+  the provider's tokenizer", no `~`) and in the `x-claudish-step-skip` detail (`est=… exact=…
+  cap=…`) — zero upstream calls; `exact < window` → upstream decides, even when `est >= window`
+  (the ×3.18 over-count direction pre-#674 refused on the estimate alone). Probe null → exactly
+  the pre-#674 behavior.
+- `max_model_len` from the probe is **advisory**: logged when it disagrees with the derived
+  window, never written into the learned-cap store (a refusal-stated `statedLimit` stays the
+  only persisted window statement, #676).
+- Kill switch `CLAUDISH_EXACT_COUNT=0` (read per request): no probe, no band.
+
+Pins: `handlers/shared/exact-count.test.ts` (band math, strict parse, kill switch),
+`composed-handler.test.ts` "#674 exact counting" (5 dispatch pins — refuse-locally, fits-under,
+null-probe, below-band no-probe, kill switch) and "#739 exact counting on the LEARNED-cap branch"
+(4 pins — refuse-locally with `exact=` in the marker, fits is served, below-band no-probe,
+typed-literal never arms), `openai.test.ts` "countPromptTokens" (root URL,
+`{model, messages}` body, signal present, process-wide 404 memo across TWO transport instances,
+never throws, unreadable count → null, empty messages → no fetch), `proxy-server-step-skip-route.test.ts`
+`K31a–K31d` (live route, both ingresses: marker `exact=`/`cap=`, zero upstream calls, fits is
+served, one 404 for the process, `[DONE]`-terminated on the OpenAI wire).
+
+Boundary: the learned-cap branch keeps #676's corroboration (`stated ?? derived ?? declared`) —
+exact counting arms on **both** measured branches: the derived-window branch, and (since #739) the
+learned-cap branch when the request is over the learned cap but a MEASURED window (`stated ??
+derived`) sits above the clamp estimate, i.e. exactly the `[cap, window)` band where the cap alone
+may not refuse. Wiring it into the learned branch was necessary because that branch is an `else if`
+ahead of the derived one: the FIRST learned cap shadows the derived branch and took the tokenizer
+down with it (measured 29/10 on the haiku/swift lane — 118 of 122 context skips were provably
+post-400, `exact=` appeared zero times). A hand-typed `contextLimit` still arms **nothing** and
+never refuses locally (a stale literal must not veto what the engine serves). The probe is one
+extra round-trip per banded request on an endpoint that has a tokenizer — deliberately not cached
+beyond the 404 memo, because the prompt differs every time; paying a ~1 ms local tokenize to avoid
+a full prefill that 400s is the trade #739 measured.

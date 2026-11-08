@@ -105,8 +105,15 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Tests
         working-directory: packages/cli
-        run: bun scripts/ci-tests.ts --run idle@${{ matrix.slice }}/3 -- --reporter=junit --reporter-outfile=junit-{label}.xml
+        # Bun >= 1.4 on POSIX freezes os.homedir() at boot, so the #242 home
+        # sandbox must be PRESET by the launcher (HOME + preset mode), same
+        # mechanics as main's test job (#570).
+        run: |
+          mkdir -p "$RUNNER_TEMP/claudish-test-home"
+          HOME="$RUNNER_TEMP/claudish-test-home" bun scripts/ci-tests.ts --run idle@${{ matrix.slice }}/3 -- --reporter=junit --reporter-outfile=junit-{label}.xml
         timeout-minutes: 10
+        env:
+          CLAUDISH_TEST_PRESET_HOME: "1"
       - uses: actions/upload-artifact@v5
         if: always()
         with:
@@ -145,13 +152,22 @@ jobs:
       # boot 20 panes beside the other slices and miss their settle bounds (run 39547642291).
       - name: Tests (${{ matrix.runs }})
         working-directory: packages/cli
-        run: bun scripts/ci-tests.ts --run ${{ matrix.runs }} -- --max-concurrency=8 --reporter=junit --reporter-outfile=junit-{label}.xml
+        # Preset sandbox launcher, same as the idle job (#570/#242).
+        run: |
+          mkdir -p "$RUNNER_TEMP/claudish-test-home"
+          HOME="$RUNNER_TEMP/claudish-test-home" bun scripts/ci-tests.ts --run ${{ matrix.runs }} -- --max-concurrency=8 --reporter=junit --reporter-outfile=junit-{label}.xml
         timeout-minutes: 15
+        env:
+          CLAUDISH_TEST_PRESET_HOME: "1"
       - name: macos-bridge and script tests
         if: matrix.runner == 3
+        # Bridge tests keep the v14 launcher as-is (their bunfig carries no
+        # home sandbox); the root-level scripts tests load the root bunfig,
+        # which does — preset for those only.
         run: |
           bun run --cwd packages/macos-bridge test
-          bun test ./scripts/*.test.ts
+          mkdir -p "$RUNNER_TEMP/claudish-test-home"
+          CLAUDISH_TEST_PRESET_HOME=1 HOME="$RUNNER_TEMP/claudish-test-home" bun test ./scripts/*.test.ts
         timeout-minutes: 5
       - uses: actions/upload-artifact@v5
         if: always()
@@ -189,10 +205,13 @@ jobs:
 
       - name: Blind hook tests
         working-directory: packages/cli
-        run: bun test src/hooks/blind
+        run: |
+          mkdir -p "$RUNNER_TEMP/claudish-test-home"
+          HOME="$RUNNER_TEMP/claudish-test-home" bun test src/hooks/blind
         timeout-minutes: 15
         env:
           CLAUDISH_SKIP_LIVE_E2E: "1"
+          CLAUDISH_TEST_PRESET_HOME: "1"
 
   # S1: a user hook module (.ts type import, .ts value import through the
   # Bun.plugin virtual module, .js) loads from a `--target bun` bundle and from a
@@ -218,5 +237,11 @@ jobs:
           bun-version: latest
 
       - name: S1 hook loading (source, dist bundle, compiled binary)
-        run: bun test packages/cli/src/hooks/s1-probe/
+        # Runs from the repo root, so the root bunfig (home-sandbox preload)
+        # applies — preset the launcher HOME on POSIX (#570/#242).
+        run: |
+          mkdir -p "$RUNNER_TEMP/claudish-test-home"
+          HOME="$RUNNER_TEMP/claudish-test-home" bun test packages/cli/src/hooks/s1-probe/
         timeout-minutes: 5
+        env:
+          CLAUDISH_TEST_PRESET_HOME: "1"

@@ -1,0 +1,395 @@
+# Bound the container's stdout/stderr log files. Whether the default is
+# unbounded depends on each host's daemon config (json-file default: UNBOUNDED;
+# `local`: already rotated+compressed) — read it per machine with
+#   docker inspect <c> --format '{{.HostConfig.LogConfig.Type}}'
+# Options WITHOUT a driver line keep each machine's own driver and bound it:
+# json-file gets the cap directly, `local` re-bounds to the same ceiling.
+# On Docker Desktop (WSL2) the files live inside docker_data.vhdx, which never
+# shrinks, and stay INVISIBLE to `docker system df` (not part of the writable
+# layer it counts) — so an unbounded default has no operator-visible signal.
+# 50m x 4 caps any episode at 200 Mo per container while keeping weeks of
+# diagnostic history (busiest fleet sidecar measured ~8 Mo/day). This bounds
+# DISK, not content: debug logging stays verbose by doctrine (suppression
+# happens at registration level, never streaming-data level).
+x-logging: &default-logging
+  options:
+    max-size: "50m"
+    max-file: "4"
+
+services:
+  claudish-proxy:
+    build: .
+    container_name: ${CLAUDISH_CONTAINER_NAME:-claudish-proxy}
+    restart: unless-stopped
+    logging: *default-logging
+
+    # How long Docker waits after SIGTERM before SIGKILL — the OUTER bound.
+    #
+    # The inner bound lives in the app: `CLAUDISH_SHUTDOWN_GRACE_MS` (default
+    # 30s) plus a 250ms settlement window, added because the pre-#630 path
+    # awaited ALL open connections with no deadline of its own (measured: 482ms
+    # with no client, 21 401ms with a single half-written request). That 21s is
+    # paid with the listener already closed, so an internal bound is worth the
+    # second answer it costs — and this field is no longer the only one.
+    # (Whether a draining container can hold a WSL VM past its power-off
+    # deadline is NOT established: in the one incident checked, ai-01 on
+    # 2026-10-24, the sidecar exited 0.16s after SIGTERM.)
+    #
+    # This field still matters as the backstop when the process is wedged below
+    # the app (an unresponsive event loop cannot honour its own grace), and an
+    # operator who needs out now sends the signal twice.
+    #
+    # Docker's default is 10s. A response stream lasts E[S] ~ 18s (measured on
+    # the hub over 45.9h, M/G/inf on 95706 samples), so the default would kill
+    # the majority of them mid-body and surface client-side as the very error
+    # the graceful path exists to remove: `Connection lost mid-response`.
+    # 120s covers the distribution with margin; it is paid only at shutdown, and
+    # only for as long as streams are actually still running. Now that the app
+    # bounds itself at 30s it is never reached on a healthy process — lowering
+    # it is therefore safe, but it is a separate, announced change: a value that
+    # cuts streams mid-body is the one mistake this field can make.
+    stop_grace_period: 120s
+    ports:
+      # Host port is per-machine: 3000 is already taken on some sidecar hosts.
+      # Container side stays 3000 — see `command:` below.
+      - "${CLAUDISH_HOST_PORT:-3000}:3000"
+    volumes:
+      # Mount config from host (contains API keys, routing, profiles). Defaults to
+      # the hub (po-2023) path so the hub compose keeps working with no .env at all;
+      # a sidecar sets CLAUDISH_CONFIG_DIR to its own profile, e.g.
+      # C:\Users\<user>\.claudish
+      - type: bind
+        source: ${CLAUDISH_CONFIG_DIR:-C:\Users\jsboi\.claudish}
+        target: /root/.claudish
+        read_only: true
+      # OpenAI Codex OAuth tokens: hub-only bind, deliberately NOT here — a
+      # file-type bind whose source is absent breaks (or directory-poisons)
+      # every sidecar compose up. The hub carries it in its local
+      # docker-compose.override.yml instead (auto-merged, never committed).
+      # Persistent diagnostic capture: full request/response bodies for offline
+      # analysis. The proxy writes req-*.json / resp-*.sse here (gated by
+      # CLAUDISH_CAPTURE_DIR). Compacted nightly by ClaudishCaptureCompaction
+      # (compress-captures.ps1), then backed up to GDrive. Override
+      # CLAUDISH_CAPTURE_HOST_DIR on machines without a D: drive.
+      # Sidecars KEEP capture on: in NOMINAL mode the relay path writes nothing
+      # (the hub captures centrally), so any loose req-*/resp-* file on a sidecar
+      # is by construction an AUTONOMOUS-mode outage capture — which is exactly
+      # what reconcile-outage-captures.ps1 packs and merges back. Setting
+      # CLAUDISH_CAPTURE_DIR empty disables writing entirely; that is an escape
+      # hatch for disk-starved hosts, NOT the sidecar default, because it would
+      # silently destroy the outage-reconciliation trail.
+      # NB: CLAUDISH_CAPTURE_HOST_DIR (host bind) is deliberately NOT named
+      # CLAUDISH_CAPTURES_DIR — a one-letter delta from the container-side
+      # CLAUDISH_CAPTURE_DIR below would be a silent-misconfiguration trap.
+      - type: bind
+        source: ${CLAUDISH_CAPTURE_HOST_DIR:-D:\claudish-captures}
+        target: /captures
+      # Model-catalog disk cache. The config bind above is deliberately read-only
+      # (it carries the provider API keys), so the catalog refresh had nowhere to
+      # persist: every refresh logged `cache write skipped (EROFS)`. A named
+      # volume gives it a writable home, survives recreates, and exposes nothing
+      # on the host. Paired with CLAUDISH_MODEL_CACHE_PATH.
+      - type: volume
+        source: claudish-model-cache
+        target: /var/cache/claudish
+    environment:
+      - NODE_ENV=production
+      - CLAUDISH_PROXY_KEY=${CLAUDISH_PROXY_KEY:-}
+      # WebSearch interception endpoint. Public URL sits behind IIS Basic Auth
+      # (2026-08-19): WAN machines embed credentials in the URL userinfo
+      # (https://user:pass@search.myia.io — parsed by claudish, never logged),
+      # LAN machines point at the backend directly (no auth). Default to LAN
+      # direct so a fresh deployment works out of the box — the public URL
+      # 401s without creds. Never commit credentials here.
+      # (runbook _intercom/2026-07-18_runbook-searxng-protection-po2023.md §9-§10).
+      - SEARXNG_URL=${SEARXNG_URL:-http://192.168.0.47:8181}
+      # Empty disables capture writing (sidecar default; hub leaves it at /captures).
+      - CLAUDISH_CAPTURE_DIR=${CLAUDISH_CAPTURE_DIR-/captures}
+      # Sidecar relay (fork extension). All empty → this container is the HUB
+      # (po-2025 since the 2026-09 migration): always local, unchanged. On a
+      # sidecar machine, set these in the per-machine .env:
+      #   CLAUDISH_RELAY_UPSTREAM — hub URL (LAN http://192.168.0.50:3000, WAN https://models.myia.io)
+      #   CLAUDISH_RELAY_COMPRESS — 1 on a WAN upstream only
+      #   CLAUDISH_NO_ANTHROPIC   — 1 on every machine except ai-01 (leak-policy backstop)
+      #   CLAUDISH_RELAY_HEADER_TIMEOUT_MS — relay header budget (#320); empty = the
+      #     360s hub-contract default, NEVER 0 (Number("") trap, #310 review)
+      #   CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS — /health liveness budget; empty = the
+      #     4s LAN default. Raise it on a WAN upstream (measured 2026-10-27: a 4s
+      #     bound flapped po-2027 every ~5-8 min against an edge answering in 1-18s
+      #     and served 102 responses off-hub). Range 2s-9s; the max must stay under
+      #     the 10s tick. A recreate is needed (#310): the env is fixed at create.
+      - CLAUDISH_RELAY_UPSTREAM=${CLAUDISH_RELAY_UPSTREAM:-}
+      - CLAUDISH_RELAY_COMPRESS=${CLAUDISH_RELAY_COMPRESS:-}
+      - CLAUDISH_RELAY_HEADER_TIMEOUT_MS=${CLAUDISH_RELAY_HEADER_TIMEOUT_MS:-}
+      - CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS=${CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS:-}
+      - CLAUDISH_NO_ANTHROPIC=${CLAUDISH_NO_ANTHROPIC:-}
+      # Canonical fleet id (e.g. myia-po-2024), written into the sidecar .env by
+      # `install-sidecar.ps1 -Machine`. Attached to THIS process's own liveness
+      # probe (relay deepProbe) so hub attribution files it as the machine's
+      # traffic instead of a header-less phantom lane (#345). Empty = probes stay
+      # header-less — the hub's own case, where the relay branch (and therefore
+      # the probe) never runs. Listed here because the env file only
+      # interpolates: a name absent from this list never reaches the container.
+      - CLAUDISH_MACHINE=${CLAUDISH_MACHINE:-}
+      # Writable home for the model-catalog disk cache (volume declared below).
+      # The default points INSIDE the container on purpose: ~/.claudish is the
+      # read-only config bind, so leaving it empty would restore the
+      # `cache write skipped (EROFS)` the volume exists to fix.
+      - CLAUDISH_MODEL_CACHE_PATH=${CLAUDISH_MODEL_CACHE_PATH:-/var/cache/claudish/all-models.json}
+      # #651 — durable home for the LEARNED context caps. In memory they died
+      # with every recreate, reopening the band between the engine's real window
+      # and the reported floor until a refusal re-taught them (measured 24/10 on
+      # this hub). Same reason as the line above: the config bind is read-only,
+      # so the store lives on the writable model-cache volume. Unset = that
+      # volume path; an EXPLICIT empty (=`CLAUDISH_OVERFLOW_CAPS_PATH=` in .env,
+      # hence the `-` rather than `:-`) = memory-only, the pre-#651 behaviour.
+      - CLAUDISH_OVERFLOW_CAPS_PATH=${CLAUDISH_OVERFLOW_CAPS_PATH-/var/cache/claudish/overflow-caps.json}
+      # #660 r1 — maximum age of a RESTORED learned cap (#651). Default 24 h in
+      # the code (the effective pre-#651 lifetime: the watchdog restarts the hub
+      # nightly, so an in-memory cap never outlived it); `0` = no expiry; a
+      # stale or negative value falls back to the default. Empty = default, hence
+      # `:-` — unlike the PATH line above, empty is NOT "off" here. Listed
+      # because the env file only interpolates.
+      - CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS=${CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS:-}
+      # Deep-probe model for relay recovery (#613). Empty = the built-in
+      # role-shaped default (claude-haiku-4-5-20251001), which the hub resolves on
+      # its own haiku lane so a z.ai-only outage cannot pin a sidecar AUTONOMOUS.
+      # Set to a concrete (e.g. glm-5.3) to restore the pre-#613 behavior. Listed
+      # here because the env file only interpolates.
+      - CLAUDISH_RELAY_PROBE_MODEL=${CLAUDISH_RELAY_PROBE_MODEL:-}
+      # Second-attempt model for the deep probe (#636 review): on a hub with no
+      # modelMap the haiku-shaped id stays NATIVE, so the probe gets a 503
+      # refusal or a 401 and the sidecar would never return to NOMINAL. The
+      # same tick retries on this model, which the hub resolves on the sonnet
+      # role. Empty = the built-in glm-5.3.
+      - CLAUDISH_RELAY_PROBE_FALLBACK_MODEL=${CLAUDISH_RELAY_PROBE_FALLBACK_MODEL:-}
+      # Budget of the deep probe's FIRST attempt (#867 track 2, #868), in ms.
+      # Empty = the 10 s default; 0 = kill switch (first attempt back to the full
+      # 30 s); out of [1000, 30000] falls back to the default. Read per probe, but
+      # the name must be listed here or no value ever reaches the container (#310).
+      - CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS=${CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS:-}
+      # Native credential guard kill switch (#296): only an explicit "0" disarms;
+      # empty = guard on. Listed here because the env file only interpolates —
+      # a name absent from this list never reaches the container.
+      - CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD=${CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD:-}
+      # #218 kill switch (native model pin): same absence class as the guard
+      # above — it postdated this list, so "=0" in a .env never reached a
+      # container (#304). Only an explicit "0" disarms; empty = pin active.
+      - CLAUDISH_NATIVE_MODEL_PIN=${CLAUDISH_NATIVE_MODEL_PIN:-}
+      # #305 AC-1 instrument: "1" logs the auth header NAMES a native request
+      # carries (never values). Off when empty. Read per request, but like every
+      # name here it enters the container only at a recreate.
+      - CLAUDISH_NATIVE_HEADER_NAMES_LOG=${CLAUDISH_NATIVE_HEADER_NAMES_LOG:-}
+      # v27 (#587 instrument gap) — one `[Health] hit peer=… machine=…` line per
+      # /health arrival, so a missed sidecar heartbeat can be split into "never
+      # arrived" vs "arrived, answered slowly". Only an explicit "0" silences
+      # it; empty = marker on (~6 lines/min at a 10 s probe cadence).
+      - CLAUDISH_HEALTH_ARRIVAL_LOG=${CLAUDISH_HEALTH_ARRIVAL_LOG:-}
+      # Budget failover (fork extension). All empty → inert: no routing change,
+      # no notice, zero added bytes. Belongs on the machine that actually CALLS
+      # the models. That is the hub most of the time, but a sidecar calls them
+      # too, in AUTONOMOUS mode, which is precisely when the hub cannot help.
+      # This comment used to end "i.e. the hub, since a NOMINAL sidecar only
+      # relays". On the ai-01 sidecar these are in fact all empty.
+      # Measured on ai-01 over 5 days: 124 requests served locally, 70 done,
+      # 54 lost to one walled lane with no cascade to fall to. Arm these here
+      # too. Arming alone is not enough: roleFromModelName() matches only
+      # opus|sonnet|haiku|fable, so a bare provider id (glm-5.2) resolves to null
+      # and the cascade stays blind. Set CLAUDISH_FAILOVER_ROLE_MODELS, or
+      # have clients name roles neutrally.
+      # See CLAUDE.md § "Budget Failover".
+      - CLAUDISH_FAILOVER_OPUS=${CLAUDISH_FAILOVER_OPUS:-}
+      - CLAUDISH_FAILOVER_OPUS_LABEL=${CLAUDISH_FAILOVER_OPUS_LABEL:-}
+      - CLAUDISH_FAILOVER_OPUS_DIRECTION=${CLAUDISH_FAILOVER_OPUS_DIRECTION:-}
+      - CLAUDISH_FAILOVER_OPUS_NOTE=${CLAUDISH_FAILOVER_OPUS_NOTE:-}
+      - CLAUDISH_FAILOVER_OPUS_RESET=${CLAUDISH_FAILOVER_OPUS_RESET:-}
+      - CLAUDISH_FAILOVER_SONNET=${CLAUDISH_FAILOVER_SONNET:-}
+      - CLAUDISH_FAILOVER_SONNET_LABEL=${CLAUDISH_FAILOVER_SONNET_LABEL:-}
+      - CLAUDISH_FAILOVER_SONNET_DIRECTION=${CLAUDISH_FAILOVER_SONNET_DIRECTION:-}
+      - CLAUDISH_FAILOVER_SONNET_NOTE=${CLAUDISH_FAILOVER_SONNET_NOTE:-}
+      - CLAUDISH_FAILOVER_SONNET_RESET=${CLAUDISH_FAILOVER_SONNET_RESET:-}
+      - CLAUDISH_FAILOVER_HAIKU=${CLAUDISH_FAILOVER_HAIKU:-}
+      - CLAUDISH_FAILOVER_HAIKU_LABEL=${CLAUDISH_FAILOVER_HAIKU_LABEL:-}
+      - CLAUDISH_FAILOVER_HAIKU_DIRECTION=${CLAUDISH_FAILOVER_HAIKU_DIRECTION:-}
+      - CLAUDISH_FAILOVER_HAIKU_NOTE=${CLAUDISH_FAILOVER_HAIKU_NOTE:-}
+      - CLAUDISH_FAILOVER_HAIKU_RESET=${CLAUDISH_FAILOVER_HAIKU_RESET:-}
+      - CLAUDISH_FAILOVER_FABLE=${CLAUDISH_FAILOVER_FABLE:-}
+      - CLAUDISH_FAILOVER_FABLE_LABEL=${CLAUDISH_FAILOVER_FABLE_LABEL:-}
+      - CLAUDISH_FAILOVER_FABLE_DIRECTION=${CLAUDISH_FAILOVER_FABLE_DIRECTION:-}
+      - CLAUDISH_FAILOVER_FABLE_NOTE=${CLAUDISH_FAILOVER_FABLE_NOTE:-}
+      - CLAUDISH_FAILOVER_FABLE_RESET=${CLAUDISH_FAILOVER_FABLE_RESET:-}
+      - CLAUDISH_FAILOVER_ROLE_MODELS=${CLAUDISH_FAILOVER_ROLE_MODELS:-}
+      - CLAUDISH_FAILOVER_ACTIVE=${CLAUDISH_FAILOVER_ACTIVE:-}
+      - CLAUDISH_FAILOVER_AUTO=${CLAUDISH_FAILOVER_AUTO:-}
+      # #693 — per-machine step exclusion: "stepTarget:machine1 machine2,…"
+      # (comma separates entries; the split is at the LAST colon so a role:
+      # delegation target stays whole). One global cascade per role; a machine
+      # here subtracts the steps it must not draw on (ai-01's ~330k prompts
+      # must never spill onto the local engine when the haiku nominal walls).
+      # Startup read — a flip needs a recreate.
+      - CLAUDISH_FAILOVER_STEP_EXCLUDE=${CLAUDISH_FAILOVER_STEP_EXCLUDE:-}
+      # #685/#687 — read-per-request knobs whose compose lines were missing at
+      # merge (compose-env-coverage red on main); same allowlist rule as above.
+      - CLAUDISH_EXACT_COUNT=${CLAUDISH_EXACT_COUNT:-}
+      - CLAUDISH_EXACT_COUNT_BAND=${CLAUDISH_EXACT_COUNT_BAND:-}
+      - CLAUDISH_CLIENT_ATTRIBUTION=${CLAUDISH_CLIENT_ATTRIBUTION:-}
+      # #304 — knobs read by initFailover() that postdated the 23-name list
+      # above. The env file only interpolates: a value written for a name
+      # absent from this list never reaches the process, and the proxy runs on
+      # its defaults whatever the operator wrote. Documented (with values) in
+      # .env.sidecar.example. compose-env-coverage.test.ts pins code↔compose.
+      # NB these are STARTUP reads (initFailover), unlike the THINKING knobs
+      # below — a flip needs a recreate, not just a file edit.
+      - CLAUDISH_FAILOVER_ARM_AFTER=${CLAUDISH_FAILOVER_ARM_AFTER:-}
+      - CLAUDISH_FAILOVER_ARM_GRACE_MS=${CLAUDISH_FAILOVER_ARM_GRACE_MS:-}
+      - CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS=${CLAUDISH_FAILOVER_ARM_RETRY_AFTER_CEILING_MS:-}
+      - CLAUDISH_FAILOVER_SESSION_DWELL_MS=${CLAUDISH_FAILOVER_SESSION_DWELL_MS:-}
+      - CLAUDISH_FAILOVER_RECOVERY_GRACE_MS=${CLAUDISH_FAILOVER_RECOVERY_GRACE_MS:-}
+      # #822 — reset-TZ candidate discovery (Z.AI announces its reset in UTC+8);
+      # compose line missing at merge, compose-env-coverage red on main. Same
+      # initFailover startup read as the knobs above — a flip needs a recreate.
+      - CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES=${CLAUDISH_FAILOVER_RESET_TZ_CANDIDATES:-}
+      # #875 — a bucket wall lifts at the reset its refusal announced (shorten
+      # only). Kill switch, default on; same startup read — a flip needs a recreate.
+      - CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET=${CLAUDISH_FAILOVER_WALL_TTL_FROM_RESET:-}
+      # #299-B — one-shot overload walk kill switch. Unlike the knobs above this
+      # is a read-per-request switch (the fleet flips it mid-flight; no recreate),
+      # but a container still needs the NAME here to ever see any value at all.
+      - CLAUDISH_FAILOVER_OVERLOAD_WALK=${CLAUDISH_FAILOVER_OVERLOAD_WALK:-}
+      # #348 — overload-walk time budget (ms). Default 300000; 0 = off. Same
+      # read-per-request class as the switch above, same container rule.
+      - CLAUDISH_FAILOVER_WALK_BUDGET_MS=${CLAUDISH_FAILOVER_WALK_BUDGET_MS:-}
+      # #317 — per-session output-token ceiling (option B). Both empty → inert
+      # (no counting, no refusal, zero added bytes). Hub pose since 27/10:
+      # WARN=5000000, CEILING=20000000 — MEASURED live from the container
+      # (05/11, re-read 06/11); the values entered at that evening's
+      # PAYG-remedy recreate and no user arbitration of these specific
+      # values is on record — the values are the user's call. Read-per-
+      # request — but a container needs the NAME here to ever see a
+      # value (#304).
+      - CLAUDISH_SESSION_BUDGET_CEILING=${CLAUDISH_SESSION_BUDGET_CEILING:-}
+      - CLAUDISH_SESSION_BUDGET_WARN=${CLAUDISH_SESSION_BUDGET_WARN:-}
+      # #431 — step-skip kill switch: "0" restores the pre-#431 behavior (an
+      # overflowed/busy cascade step surfaces its recovery turn / waits
+      # unbounded instead of skipping forward). Read-per-request.
+      - CLAUDISH_FAILOVER_STEP_SKIP=${CLAUDISH_FAILOVER_STEP_SKIP:-}
+      # #747 — serving-note kill switches, read per request: "0" on REQUEST_NOTE
+      # drops the system-side substitution note; "0" on NOTICE_STRIP lets
+      # serving banners travel upstream in the history again (today's
+      # pre-#747 behavior). Unset = on.
+      - CLAUDISH_FAILOVER_REQUEST_NOTE=${CLAUDISH_FAILOVER_REQUEST_NOTE:-}
+      - CLAUDISH_FAILOVER_NOTICE_STRIP=${CLAUDISH_FAILOVER_NOTICE_STRIP:-}
+      # #431 — how long a CASCADE STEP attempt waits for an endpoint
+      # concurrency slot before skipping forward (ms). Default 2000; 0 = off
+      # (unbounded FIFO). The nominal path never reads it. Read-per-request.
+      - CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS=${CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS:-}
+      # #654 — in-flight token budget for the vllm-myia endpoint, the one this
+      # deployment actually arms (measured saturation: six ~200K bodies vs
+      # 750,747 KV tokens). The family is per-endpoint (<NAME> = endpoint name
+      # uppercased), read by template, so the repo lists the literal for the
+      # endpoint it uses and other deployments add their own line — values live
+      # in .env.sidecar.example §#654. Both empty → inert (AC1). Read-per-
+      # request; a NEW value enters a container only at its next recreate.
+      - CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA=${CLAUDISH_ENDPOINT_TOKEN_BUDGET_VLLM_MYIA:-}
+      - CLAUDISH_ENDPOINT_BIG_LIMIT_VLLM_MYIA=${CLAUDISH_ENDPOINT_BIG_LIMIT_VLLM_MYIA:-}
+      # #553 defect 2 — kill switch for the `!own` step class: "0" reverts every
+      # own-capacity step to the default (quota-sized) backoff ladder while the
+      # suffix stays parseable. Empty = own ladders ON. Read at config load.
+      - CLAUDISH_FAILOVER_OWN_BACKOFF=${CLAUDISH_FAILOVER_OWN_BACKOFF:-}
+      # #565 — admission census kill switch: "0" restores the pre-#565 behavior
+      # (a request larger than every DECLARED window pays its doomed round-trip
+      # and surfaces the provider's own 400 instead of a labeled local refusal).
+      # Empty = census ON. Read-per-request.
+      - CLAUDISH_CONTEXT_ADMISSION=${CLAUDISH_CONTEXT_ADMISSION:-}
+      # #772 — frame-coherence kill switch: "0" relays every SSE frame exactly as
+      # the upstream sent it (no event/type repair). Empty = repair ON. Read once
+      # per stream, i.e. per request.
+      - CLAUDISH_FRAME_COHERENCE=${CLAUDISH_FRAME_COHERENCE:-}
+      # #886 — Codex session-affinity kill switch: "0" restores the pre-#886
+      # wire on the cx@ lane (a fresh x-session-id per request, no session-id
+      # header, no prompt_cache_key). Empty = affinity ON. Read per request.
+      - CLAUDISH_CODEX_SESSION_AFFINITY=${CLAUDISH_CODEX_SESSION_AFFINITY:-}
+      # Anthropic-compatible wire — "0" forwards Claude Code's `defer_loading`
+      # flags untouched. Empty = flags dropped (every tool visible), because the
+      # tool_reference blocks that would load a deferred tool are stripped on this
+      # wire. Read per request.
+      - CLAUDISH_ANTHROPIC_WIRE_UNDEFER=${CLAUDISH_ANTHROPIC_WIRE_UNDEFER:-}
+      # #310 — runtime knobs the proxy reads that were never in this list
+      # (same absence class as the #304 failover knobs above: the env file only
+      # interpolates, so a value set for a name this list does not carry never
+      # reached a container). NOTE: ${VAR:-} makes each name PRESENT with value
+      # "" — every read site was verified for "" ≡ unset (review #310): 20 held
+      # by construction, 2 were fixed in that review (OVERFLOW_REPORT_FLOOR,
+      # CATALOG_URL), and compose-env-coverage.test.ts now refuses a
+      # `?? <non-empty>` read on any name this list injects. Explicit exemption
+      # list there for CLI-only names (CLAUDISH_MODEL, CLAUDISH_HOST,
+      # CLAUDISH_MCP_TOOLS, the statusline pair, the launcher TTL,
+      # CLAUDISH_TEST_*).
+      # Never-hang & recovery bounds. Re-read per request/stream INSIDE the
+      # process; a NEW value enters a container only at its next recreate.
+      - CLAUDISH_FIRST_EVENT_TIMEOUT_MS=${CLAUDISH_FIRST_EVENT_TIMEOUT_MS:-}
+      - CLAUDISH_PREVISIBLE_REFORWARD_MAX=${CLAUDISH_PREVISIBLE_REFORWARD_MAX:-}
+      - CLAUDISH_CONNECT_RETRY_MAX=${CLAUDISH_CONNECT_RETRY_MAX:-}
+      - CLAUDISH_CONNECT_RETRY_DELAYS_MS=${CLAUDISH_CONNECT_RETRY_DELAYS_MS:-}
+      - CLAUDISH_STALL_THRESHOLD_MS=${CLAUDISH_STALL_THRESHOLD_MS:-}
+      # #630 — bound on the proxy's graceful shutdown (ms), the complement of
+      # stop_grace_period above: how long shutdown() waits for consumable work
+      # (a request fully received whose response is still being written) before
+      # cutting. Read once per shutdown; must stay under stop_grace_period or
+      # the runtime kill answers first. Empty = 30000.
+      - CLAUDISH_SHUTDOWN_GRACE_MS=${CLAUDISH_SHUTDOWN_GRACE_MS:-}
+      # Auth & native lane: key-rotation overlap + #219 auto-pin.
+      - CLAUDISH_PROXY_KEY_PREVIOUS=${CLAUDISH_PROXY_KEY_PREVIOUS:-}
+      - CLAUDISH_NATIVE_PIN_AUTO=${CLAUDISH_NATIVE_PIN_AUTO:-}
+      - CLAUDISH_NATIVE_PIN_AUTO_INTERVAL_MS=${CLAUDISH_NATIVE_PIN_AUTO_INTERVAL_MS:-}
+      # Routing, catalog & capability vocabulary (#83 gate, default off).
+      - CLAUDISH_DEFAULT_PROVIDER=${CLAUDISH_DEFAULT_PROVIDER:-}
+      - CLAUDISH_CATALOG_URL=${CLAUDISH_CATALOG_URL:-}
+      - CLAUDISH_CAPABILITY_VOCAB=${CLAUDISH_CAPABILITY_VOCAB:-}
+      - CLAUDISH_CAPABILITY_QUERY_MAX_ASKS=${CLAUDISH_CAPABILITY_QUERY_MAX_ASKS:-}
+      # Local lane (lmstudio/ollama reached through the host gateway).
+      - CLAUDISH_CONTEXT_WINDOW=${CLAUDISH_CONTEXT_WINDOW:-}
+      - CLAUDISH_LOCAL_QUEUE_ENABLED=${CLAUDISH_LOCAL_QUEUE_ENABLED:-}
+      - CLAUDISH_LOCAL_MAX_PARALLEL=${CLAUDISH_LOCAL_MAX_PARALLEL:-}
+      - CLAUDISH_QWEN_NO_THINK=${CLAUDISH_QWEN_NO_THINK:-}
+      # Observability toggles (0/false/off disables).
+      - CLAUDISH_TELEMETRY=${CLAUDISH_TELEMETRY:-}
+      - CLAUDISH_STATS=${CLAUDISH_STATS:-}
+      - CLAUDISH_OVERFLOW_REPORT_FLOOR=${CLAUDISH_OVERFLOW_REPORT_FLOOR:-}
+      - CLAUDISH_SWAP_ADVISOR=${CLAUDISH_SWAP_ADVISOR:-}
+      - CLAUDISH_SWAP_ADVISOR_LOG=${CLAUDISH_SWAP_ADVISOR_LOG:-}
+      - CLAUDISH_SWAP_ADVISOR_DUMP=${CLAUDISH_SWAP_ADVISOR_DUMP:-}
+      # Qwen reasons by default and bills on output. disabled (default) |
+      # passthrough | budget:<n>. Re-read per request: flip without a restart.
+      - CLAUDISH_QWEN_THINKING=${CLAUDISH_QWEN_THINKING:-}
+      # GLM thinking is binary on the coding wire. passthrough (default) |
+      # disabled. Re-read per request: flip without a restart.
+      - CLAUDISH_GLM_THINKING=${CLAUDISH_GLM_THINKING:-}
+      # MiniMax honors the client's thinking value exactly (CC sends disabled
+      # for haiku/subagents). passthrough (default) | disabled | forced[:<n>].
+      # Re-read per request: flip without a restart.
+      - CLAUDISH_MINIMAX_THINKING=${CLAUDISH_MINIMAX_THINKING:-}
+      # DeepSeek reasons by default and PAYG bills on output tokens.
+      # passthrough (default) | disabled. Re-read per request.
+      - CLAUDISH_DEEPSEEK_THINKING=${CLAUDISH_DEEPSEEK_THINKING:-}
+      # PAYG key vault (user mandate 06/11): the raw PAYG keys live ONLY in the
+      # operator's shadow .env — never in config.json, never in the repo. The
+      # config's customEndpoints (anthropic-payg@, oai-payg@) expand them via
+      # ${...} at proxy startup; an unresolvable ${VAR} skips the endpoint with
+      # one stderr warning (validation doctrine). Addressable is NOT serving:
+      # no role, routing entry or cascade step may reference these endpoints
+      # without explicit user arbitration (doctrine 06/11 — subscriptions
+      # first, PAYG = terminal cascade rung at most). Compose lines exist so
+      # the values reach the process at all (the env file only interpolates).
+      - CLAUDISH_ANTHROPIC_PAYG_KEY=${CLAUDISH_ANTHROPIC_PAYG_KEY:-}
+      - CLAUDISH_OPENAI_PAYG_KEY=${CLAUDISH_OPENAI_PAYG_KEY:-}
+    command: ["--port", "3000", "--host", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://0.0.0.0:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  claudish-model-cache:
