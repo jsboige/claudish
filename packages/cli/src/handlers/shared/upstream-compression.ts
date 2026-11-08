@@ -77,6 +77,7 @@ export function compressUpstreamRequestBody(
   const originalBytes = Buffer.byteLength(body, "utf-8");
   if (originalBytes < upstreamCompressionMinBytes()) return body;
   try {
+    const compressStartedAt = performance.now();
     const compressed = gzipSync(Buffer.from(body, "utf-8"));
     // Incompressible payload (base64 media, already-compressed blobs): gzip
     // can make the body LARGER. Sending the plain body costs less than
@@ -84,8 +85,12 @@ export function compressUpstreamRequestBody(
     if (compressed.length >= originalBytes) return body;
     headers["content-encoding"] = "gzip";
     const ratio = ((compressed.length / originalBytes) * 100).toFixed(1);
+    // #909 follow-up: the CPU cost next to the byte gain — hub measurements
+    // (ai-01, #587 loop) put gzipSync at ~8 ms p50 for ~900 KB bodies; AC-4's
+    // week-of-traffic report reads this column beside the saving.
+    const ms = (performance.now() - compressStartedAt).toFixed(1);
     logStderr(
-      `[UpstreamCompress] ${label} in=${originalBytes}B wire=${compressed.length}B (${ratio}%)`
+      `[UpstreamCompress] ${label} in=${originalBytes}B wire=${compressed.length}B (${ratio}%) ms=${ms}`
     );
     return compressed;
   } catch (e) {
