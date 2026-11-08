@@ -2498,6 +2498,14 @@ export interface ServedStepRecord {
   role: FailoverRole;
   step: FailoverStep;
   stepIndex: number;
+  /** #681: set when the serve came through ANOTHER role's cascade (a context
+   * re-route jumped the request mid-walk). The notice must name the serving
+   * cascade's rung — or, when stepIndex is -1, the TARGET role's NOMINAL (the
+   * loop synthesizes that record; nothing else can produce a -1 with a step) —
+   * under the role the CLIENT asked for, and must never slice the ORIGIN role's
+   * steps for the "ahead of it" clause: the indexes belong to different
+   * cascades. */
+  via?: FailoverRole;
 }
 
 /**
@@ -2510,15 +2518,20 @@ export interface ServedStepRecord {
  */
 const servedStepRecords = new WeakMap<object, ServedStepRecord>();
 
-/** Loop-side record: the step whose response goes back to the client. No-op without one. */
+/** Loop-side record: the step whose response goes back to the client. No-op
+ * without one — EXCEPT a #681 nominal serve (`via` set, stepIndex -1), which
+ * must still be announced: a haiku request answered by the sonnet subscription
+ * is a substitution, and doctrine says every substitution is announced. */
 export function recordServedStepForNotices(
   c: object,
   role: FailoverRole,
   step: FailoverStep | null | undefined,
-  stepIndex: number
+  stepIndex: number,
+  via?: FailoverRole
 ): void {
-  if (!step || stepIndex < 0) return;
-  servedStepRecords.set(c, { role, step, stepIndex });
+  if (!step && !via) return;
+  if (stepIndex < 0 && !via) return;
+  servedStepRecords.set(c, { role, step: step as FailoverStep, stepIndex, via });
 }
 
 /** Notice-side read: this request's served step, when it reports `role` (else undefined). */
@@ -2547,7 +2560,7 @@ export function buildFailoverNotice(
   bucket?: string,
   served?: ServedStepRecord
 ): string | null {
-  const active: (ResolvedFailover & { bucket: string })[] = [];
+  const active: (ResolvedFailover & { bucket: string; via?: FailoverRole })[] = [];
   if (role) {
     // One session, one (role, bucket): only ITS OWN bucket's diversion is "the
     // model actually serving you" — a sibling bucket's wall is someone else's
@@ -2557,9 +2570,22 @@ export function buildFailoverNotice(
     // from for THIS request. When present it wins over the general resolver,
     // which cannot see request-local skips: a turn served by the SUCCESSOR
     // after a skipped step otherwise announced the skipped step's name.
+    // #681: a jumped serve records the CLIENT's role with the TARGET cascade's
+    // step (or its nominal) — the record survives the jump and the banner names
+    // what actually answered, never the origin role's refusing rung.
     const servedRec = served && served.role === role ? served : undefined;
-    const { step, stepIndex } = servedRec ?? resolveFailoverTarget(role, bucket);
-    if (step) active.push({ role, step, stepIndex, bucket: bucket ?? LEGACY_ROLE_WIDE_BUCKET });
+    if (servedRec) {
+      active.push({
+        role,
+        step: servedRec.step,
+        stepIndex: servedRec.stepIndex,
+        bucket: bucket ?? LEGACY_ROLE_WIDE_BUCKET,
+        via: servedRec.via,
+      });
+    } else {
+      const { step, stepIndex } = resolveFailoverTarget(role, bucket);
+      if (step) active.push({ role, step, stepIndex, bucket: bucket ?? LEGACY_ROLE_WIDE_BUCKET });
+    }
   } else {
     active.push(...getActiveFailovers());
   }
@@ -2569,7 +2595,17 @@ export function buildFailoverNotice(
   const lines: string[] = [];
   for (const a of active) {
     const { role, step, stepIndex } = a;
-    const ahead = stepIndex > 0
+    // #681: a jumped serve names the serving cascade — and never slices the
+    // ORIGIN role's steps for the "ahead of it" clause (the stepIndex belongs
+    // to the TARGET cascade; the names would come from the wrong list). A -1
+    // index on a via-record is the TARGET role's NOMINAL (the synthesized #681
+    // record), not a fallback rung.
+    const suffix = a.via && a.via !== a.role
+      ? stepIndex < 0
+        ? `the \`${a.via}\` nominal (context re-route #681)`
+        : `the ${ordinal(stepIndex)} fallback of the \`${a.via}\` cascade (context re-route #681)`
+      : `the ${ordinal(stepIndex)} fallback`;
+    const ahead = !a.via && stepIndex > 0
       ? ` (${rules
           .get(role)!
           .steps.slice(0, stepIndex)
@@ -2577,9 +2613,7 @@ export function buildFailoverNotice(
           .join(", ")} ahead of it ${stepIndex === 1 ? "is" : "are"} also exhausted)`
       : "";
     const bits = [
-      `- \`${role}\` is being served by **${step.label}** (\`${step.target}\`) — the ${ordinal(
-        stepIndex
-      )} fallback${ahead}, ${DIRECTION_TEXT[step.direction]}.`,
+      `- \`${role}\` is being served by **${step.label}** (\`${step.target}\`) — ${suffix}${ahead}, ${DIRECTION_TEXT[step.direction]}.`,
     ];
     if (step.note) bits.push(`  ${step.note}`);
     lines.push(bits.join("\n"));
