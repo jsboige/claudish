@@ -1464,6 +1464,12 @@ export async function createProxyServer(
     // below), and every subsequent resolution must key on the TARGET role's
     // arm, buckets and bounds, not the client's original role.
     let role = roleFromModelName(requestedModel);
+    // #681: the role the CLIENT asked for — the notices key. `role` above is
+    // re-keyed to the jump target mid-request; a served-step record filed under
+    // the target role is invisible to the notice reader (it asks for the
+    // client's role), and the banner falls back to the generic resolver, which
+    // names the step that REFUSED (measured in the #932 review).
+    const clientRole = role;
     let rule = role ? getFailoverRule(role) : undefined;
     // #275: the provider bucket THIS request's nominal draws on. Computed once
     // (the routing consult is in-memory but not free) and threaded through every
@@ -1615,6 +1621,11 @@ export async function createProxyServer(
     // into the handler construction so the swap and this loop resolve the SAME
     // role for every post-jump attempt.
     let cascadeRoleJumped = false;
+    // #681: the target role's mapped nominal, captured at the jump — the only
+    // label a post-jump NOMINAL serve can be announced under (an unarmed jump
+    // records no cascade rung; without this the recorder no-ops and the banner
+    // names the refusing origin step).
+    let jumpNominal: string | undefined;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // #609: an override attempt serves the walk's concrete verbatim (the
       // #299-B forceTarget seam) and reads no failover state — the walk chose
@@ -2065,6 +2076,7 @@ export async function createProxyServer(
               skippedSteps.clear(); // haiku/opus indexes must not filter sonnet's steps
               role = "sonnet";
               rule = sonnetRule;
+              jumpNominal = sonnetNominal;
               // #367 class: sonnet's nominal is already concrete — classify it,
               // never run the request-side mapping (the walls arm on the bucket
               // the nominal ACTUALLY draws on).
@@ -2105,7 +2117,27 @@ export async function createProxyServer(
           // successor-served turn announced the SKIPPED step's name. No-op on
           // the nominal (stepIndex -1 / undefined step), and cleared-by-design
           // per request (WeakMap on the Context).
-          recordServedStepForNotices(c, role, resolved.step, stepIndex);
+          // #681: the record is keyed on the role the CLIENT asked for
+          // (clientRole — `role` is the jump target now), and a post-jump
+          // NOMINAL serve records a synthesized step so the banner names the
+          // sonnet subscription instead of the refusing origin rung.
+          if (cascadeRoleJumped && !resolved.step && jumpNominal) {
+            recordServedStepForNotices(
+              c,
+              clientRole ?? role,
+              { target: jumpNominal, label: jumpNominal, direction: "improved" },
+              -1,
+              role
+            );
+          } else {
+            recordServedStepForNotices(
+              c,
+              clientRole ?? role,
+              resolved.step,
+              stepIndex,
+              cascadeRoleJumped ? role : undefined
+            );
+          }
           if (stepIndex === -1) onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
           else resetStepSuccess(role, stepIndex);
           // #274: the concrete model succeeded — clear the OWNING side too,

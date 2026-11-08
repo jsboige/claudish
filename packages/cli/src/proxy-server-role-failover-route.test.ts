@@ -175,6 +175,17 @@ async function postMessage(model: string): Promise<Response> {
   });
 }
 
+/** #681: the assistant text of a collected (stream:false) response — the armed
+ * failover notice rides block 0, so the "served by **…**" anchor is asserted
+ * here exactly the way K1 does (proxy-server-step-skip-route.test.ts:479). */
+async function responseText(r: Response): Promise<string> {
+  const body = (await r.json()) as { content?: { type?: string; text?: string }[] };
+  return (body?.content ?? [])
+    .filter((b) => b?.type === "text")
+    .map((b) => b.text ?? "")
+    .join("");
+}
+
 beforeEach(() => {
   calls = { nm: 0, s0: 0, s1: 0, or: 0, mm: 0, native: 0, h0: 0, ds: 0, hn: 0 };
   wallLog = [];
@@ -844,6 +855,11 @@ describe("#681 — a context-skip jumps the request into the sonnet cascade", ()
     expect(calls.native).toBe(0);
     // The countable operational marker (#681).
     expect(wallLog.some((l) => l.includes("ROLE-JUMP sonnet") && l.includes("#681"))).toBe(true);
+    // CR (#932 review): the banner names the server that actually answered —
+    // the refusing h0 is never named as the server (K1's anchor shape).
+    const text1 = await responseText(r);
+    expect(text1).toContain("served by **s0-ep@fake-s0**");
+    expect(text1).not.toContain("served by **h0-ep@fake-h0**");
   }, 30_000);
 
   test("J2 (AC1b): sonnet UNARMED → the jump serves the sonnet NOMINAL (the subscription)", async () => {
@@ -868,6 +884,12 @@ describe("#681 — a context-skip jumps the request into the sonnet cascade", ()
     expect(calls.hn).toBe(0); // armed: no haiku nominal detour
     expect(calls.ds).toBe(0);
     expect(wallLog.some((l) => l.includes("ROLE-JUMP sonnet") && l.includes("#681"))).toBe(true);
+    // CR (#932 review): a haiku request answered by the sonnet subscription is
+    // still a substitution — the banner must NAME the sonnet nominal.
+    const text2 = await responseText(r);
+    expect(text2).toContain("served by **nom-ep@fake-nom**");
+    expect(text2).toContain("the `sonnet` nominal (context re-route #681)");
+    expect(text2).not.toContain("served by **h0-ep@fake-h0**");
   }, 30_000);
 
   test("J3 (single jump): a context-refusing sonnet step ADVANCES inside sonnet — no ping-pong", async () => {
@@ -895,5 +917,11 @@ describe("#681 — a context-skip jumps the request into the sonnet cascade", ()
     expect(calls.s1).toBe(1); // served
     expect(calls.ds).toBe(0); // still never the PAYG escape
     expect(wallLog.filter((l) => l.includes("ROLE-JUMP sonnet")).length).toBe(1); // single jump
+    // CR (#932 review): the banner names s1 (the server); neither refusing
+    // rung — the cross-role h0 nor the in-cascade s0 — is named as the server.
+    const text3 = await responseText(r);
+    expect(text3).toContain("served by **s1-ep@fake-s1**");
+    expect(text3).not.toContain("served by **h0-ep@fake-h0**");
+    expect(text3).not.toContain("served by **s0-ep@fake-s0**");
   }, 30_000);
 });
