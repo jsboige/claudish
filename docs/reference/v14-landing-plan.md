@@ -55,6 +55,31 @@ single integration. Order of operations:
    and their SHAs, `Closes #641`. Full CI matrix must pass (the known
    `hermetic · macOS` `team-liveness-exited-slot` flake is rerun, never fixed in
    the diff — port-map §Known CI flake).
+
+   Two measured blockers found by the step-1 sync (#919) — resolved in this
+   order, none may hold at the landing PR:
+
+   1. **`controller.error()` in production sources** (never-hang constraint,
+      #656 / G4a-2a). The main-arrival gate finds **9 call sites in v14-only
+      seam sources** that main never scans (line pins as measured on the sync,
+      `6fcaec00`): `hooks/seam-transform.ts:760`, `hooks/raw.ts:676` and
+      `:964`, `hooks/seam-tap.ts:114`,
+      `handlers/shared/stream-head-sniffer.ts:132`,
+      `handlers/shared/stream-parsers/upstream-cancel.ts:97`,
+      `handlers/shared/call-context.ts:217`,
+      `handlers/shared/devin-stream-head-sniffer.ts:163`,
+      `handlers/advisor-decorator.ts:510`. The gate runs green through the
+      line-pinned `V14_SEAM_SITES` allowlist in
+      `prod-no-controller-error.test.ts` — **the allowlist must be emptied by
+      the port: the landing PR cannot merge while one site remains.**
+   2. **`native-credential-guard` (×12) + `native-passthrough-strip` (×1)**
+      (#296/#305/#410). Measured on the synced branch: a foreign Bearer beside
+      a valid `x-proxy-key` is **served 200 where main refuses 403** — the
+      foreign token reaches the upstream. The guard was never ported, so this
+      is not a merge regression, but it is security-relevant: the shared shape
+      predicate must be ported before the tree unifies. The skips live in the
+      two test files with written reasons.
+
 4. **Coordinator merges** (worker never merges).
 
 ## Blocking criteria (do not land while any holds)
