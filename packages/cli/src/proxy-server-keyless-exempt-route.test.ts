@@ -278,7 +278,19 @@ async function post(
 ): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", ...auth },
+    // #921 third flake: Bun's fetch pools keep-alive sockets per origin. The
+    // previous test's server destroyed its side at shutdown (closeIdleConnections),
+    // but the client pool still holds the socket as idle — the next post() can
+    // REUSE that zombie (measured: ECONNRESET errno 0 in 1.86 ms, zero server-side
+    // markers — the request never reached a handler, run 42455745915 attempt 4).
+    // Connection: close keeps every request on a socket that cannot outlive the
+    // server generation that served it.
+    headers: {
+      "Content-Type": "application/json",
+      "anthropic-version": "2023-06-01",
+      connection: "close",
+      ...auth,
+    },
     body: JSON.stringify({
       model,
       max_tokens: 16,
@@ -475,7 +487,9 @@ describe("#416 T6 — the counting path carries the same invariant", () => {
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // Same #921 third-flake cause as post(): never hand the pool a socket
+      // across a server generation boundary.
+      headers: { "Content-Type": "application/json", connection: "close" },
       body: JSON.stringify({
         model: SONNET,
         max_tokens: 16,
