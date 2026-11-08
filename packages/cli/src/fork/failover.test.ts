@@ -52,8 +52,10 @@ import {
   earliestWalledReprobeAt,
   machineArmBucket,
   NATIVE_BUCKET,
+  recordServedStepForNotices,
+  servedStepForNotices,
 } from "./failover.js";
-import type { DelegationOwner } from "./failover.js";
+import type { DelegationOwner, FailoverStep } from "./failover.js";
 import { route } from "../providers/routing-rules.js";
 import { DEFAULT_ROUTING_RULES } from "../providers/default-routing-rules.js";
 
@@ -3720,5 +3722,63 @@ describe("#274 re-review — dwell pin on role-steps + nested delegation owner",
     // Mutation (failover.ts:622 recursion disabled): the owner comes back as
     // the INTERMEDIATE {opus, 0} with the unresolved placeholder concrete —
     // both asserts go red.
+  });
+});
+
+// ── #681: the recorder's drop is no longer silent ────────────────────────────
+// `recordServedStepForNotices` is the ONE chokepoint deciding whether the
+// notice builders see the rung that actually served. Two of its three exits
+// used to be bare `return`s. One is the normal nominal path — every unarmed
+// request — and must stay quiet. The other, a STEP with no index, can never be
+// legitimate (the loop reads `step` and `stepIndex` from the same `resolved`),
+// and dropping it silently handed the banner to the generic resolver, which
+// names a rung that did not serve: the exact mis-naming #431 CR B1 ended.
+describe("#681 — NOTICE-RECORD DROP is visible, the nominal path stays silent", () => {
+  function captureStderr<T>(fn: () => T): { result: T; lines: string[] } {
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as any).write = (chunk: any) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      return { result: fn(), lines };
+    } finally {
+      (process.stderr as any).write = realWrite;
+    }
+  }
+
+  const STEP: FailoverStep = { target: "kimi@kimi-k3", label: "kimi", direction: "improved" };
+
+  it("a step served with a negative index is dropped AND reported", () => {
+    const ctx = {};
+    const { lines } = captureStderr(() => recordServedStepForNotices(ctx, "opus", STEP, -1));
+    // Behaviour unchanged: still no record, so no banner is rewritten.
+    expect(servedStepForNotices(ctx, "opus")).toBeUndefined();
+    // Mutation: restore the bare `return` at failover.ts:2533 and this goes red
+    // while the plain-nominal pin below stays green.
+    expect(lines.join("")).toContain("NOTICE-RECORD DROP");
+    expect(lines.join("")).toContain("kimi@kimi-k3");
+  });
+
+  it("the plain nominal serve (no step, no via) stays silent — nothing to announce", () => {
+    const ctx = {};
+    const { lines } = captureStderr(() => recordServedStepForNotices(ctx, "sonnet", undefined, -1));
+    expect(lines.join("")).toBe("");
+    expect(servedStepForNotices(ctx, "sonnet")).toBeUndefined();
+  });
+
+  it("a #681 post-jump nominal serve still records and stays silent — the substitution is announced, not dropped", () => {
+    const ctx = {};
+    const { lines } = captureStderr(() =>
+      recordServedStepForNotices(ctx, "haiku", STEP, -1, "sonnet")
+    );
+    expect(lines.join("")).toBe("");
+    const rec = servedStepForNotices(ctx, "haiku");
+    expect(rec).toBeDefined();
+    expect(rec!.via).toBe("sonnet");
+    expect(rec!.stepIndex).toBe(-1);
+    // The read is keyed on the client's role: asking as sonnet finds nothing.
+    expect(servedStepForNotices(ctx, "sonnet")).toBeUndefined();
   });
 });
