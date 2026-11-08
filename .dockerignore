@@ -10,5 +10,6 @@ test-fixtures
 *.md
 !packages/cli/README.md
 .startup-shortcut-created
+worktrees
 Dockerfile
 docker-compose.yml
