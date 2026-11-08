@@ -334,6 +334,12 @@ services:
       - CLAUDISH_CONNECT_RETRY_LINK=${CLAUDISH_CONNECT_RETRY_LINK:-}
       - CLAUDISH_CONNECT_RETRY_LINK_MAX=${CLAUDISH_CONNECT_RETRY_LINK_MAX:-}
       - CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS=${CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS:-}
+      # #909 — gzip REQUEST bodies toward providers whose ingress decodes them
+      # (capability is per-transport, probed; anthropic native lane only for
+      # now). Kill switch (0 = off everywhere) and size floor in bytes
+      # (default 16384). Responses are never gzipped — never-hang.
+      - CLAUDISH_UPSTREAM_COMPRESS=${CLAUDISH_UPSTREAM_COMPRESS:-}
+      - CLAUDISH_UPSTREAM_COMPRESS_MIN_BYTES=${CLAUDISH_UPSTREAM_COMPRESS_MIN_BYTES:-}
       - CLAUDISH_STALL_THRESHOLD_MS=${CLAUDISH_STALL_THRESHOLD_MS:-}
       # #630 — bound on the proxy's graceful shutdown (ms), the complement of
       # stop_grace_period above: how long shutdown() waits for consumable work

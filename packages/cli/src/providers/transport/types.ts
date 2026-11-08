@@ -56,6 +56,14 @@ export interface ProviderTransport {
    */
   readonly clientAttribution?: boolean;
 
+  /**
+   * #909 — this provider's ingress decodes gzipped REQUEST bodies. Set only
+   * on profiles whose ingress was probed (matrix on #909); undefined means
+   * the body always goes out plain. Governed by CLAUDISH_UPSTREAM_COMPRESS
+   * (kill switch) and CLAUDISH_UPSTREAM_COMPRESS_MIN_BYTES (size floor).
+   */
+  readonly requestCompression?: "gzip";
+
   /** Get the full API endpoint URL for a request */
   getEndpoint(model?: string): string;
 
