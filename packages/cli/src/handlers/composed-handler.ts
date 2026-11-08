@@ -98,8 +98,9 @@ import {
 import {
   buildConnectionErrorMessage,
   classifyConnectionError,
-  connectRetryDelaysMs,
-  connectRetryMax,
+  connectRetryPolicy,
+  type ConnectionErrorKind,
+  type ConnectRetryPolicy,
 } from "./shared/connection-error.js";
 import { peekStreamStart } from "./shared/stream-peek.js";
 import { matchesProxyKey } from "./shared/proxy-keys.js";
@@ -189,32 +190,35 @@ export const STRIPPED_IMAGE_PLACEHOLDER =
   "[An image was present in the original request but was removed by the proxy: this model is not flagged as accepting image input.]";
 
 /**
- * Bounded same-provider retry for a transient "closed" connect failure
- * (#251). Returns the recovered Response, or null when the ladder is
+ * Bounded same-provider retry for a transient connect failure (#251, widened
+ * 2026-11-06 to the link classes dns/refused/unreachable — see
+ * `connectRetryPolicy` for why the old "stable conditions" premise was
+ * disproved). Returns the recovered Response, or null when the ladder is
  * exhausted or the error changed shape — the caller then falls back to the
  * original 400 connection_error contract.
  */
-async function retryClosedConnect(
+async function retryConnectError(
   providerDisplayName: string,
   bareModelName: string,
+  kind: ConnectionErrorKind,
+  policy: ConnectRetryPolicy,
   refetch: () => Promise<Response>,
   firstError: unknown
 ): Promise<Response | null> {
-  const maxRetries = connectRetryMax();
-  const delays = connectRetryDelaysMs();
+  const { max: maxRetries, delaysMs: delays } = policy;
   let lastError = firstError;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const delayMs = delays[Math.min(attempt - 1, delays.length - 1)] ?? 1200;
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     const code = classifyConnectionError(lastError)?.code ?? "?";
     logStderr(
-      `[ConnectRetry] ${providerDisplayName} ${bareModelName} closed before response (code=${code}) — retry ${attempt}/${maxRetries}`
+      `[ConnectRetry] ${providerDisplayName} ${bareModelName} ${kind} before response (code=${code}) — retry ${attempt}/${maxRetries}`
     );
     try {
       return await refetch();
     } catch (error: any) {
       lastError = error;
-      if (classifyConnectionError(error)?.kind !== "closed") return null;
+      if (classifyConnectionError(error)?.kind !== kind) return null;
     }
   }
   return null;
@@ -417,6 +421,7 @@ export class ComposedHandler implements ModelHandler {
   private readonly sessionInputSeeds = new Map<string, number>();
   /** Full routed model string (e.g. "zai@glm-4.7"). Used for provider routing and display echo. */
   private targetModel: string;
+
   /**
    * Bare model name (e.g. "glm-4.7"), provider prefix stripped. Used for model identity:
    * dialect selection, catalog lookup, middleware routing, context tracking. Never contains '@'.
@@ -1225,20 +1230,36 @@ export class ComposedHandler implements ModelHandler {
       // actionable message so Claude Code shows "can't reach host — check your
       // network/DNS" instead of a mystifying 500.
       //
-      // #251: "closed" alone (reached, then dropped before any byte —
+      // #251: "closed" (reached, then dropped before any byte —
       // ECONNRESET/EPIPE/socket closed) is transient, and in mono-candidate
       // routing no FallbackHandler exists to absorb it: the 400 below reached
       // Claude Code verbatim and killed the turn (z.ai reset, 2026-09-24). A
       // bounded same-provider retry runs FIRST; it also keeps a chain's
       // preferred provider (and its prompt cache) instead of skipping it on a
-      // blip. dns/refused/unreachable stay unretried — stable conditions the
-      // chain's other hosts cover. Pre-headers only, so never-hang is
-      // unaffected; bounded worst case ≈ +1.6 s.
+      // blip. Since 2026-11-06 the SAME ladder covers dns/refused/unreachable
+      // on remote endpoints — measured on a roaming WAN seat, those classes
+      // are seconds-long bursts, not stable conditions, and each blip killed a
+      // turn 26 times in one morning. A loopback endpoint keeps the single
+      // attempt: "refused on localhost" really is stable, and the user needs
+      // the honest message now. Pre-headers only, so never-hang is unaffected;
+      // bounded worst case ≈ +1.6 s (closed) / +7.5 s of sleeps (link), PLUS
+      // each failed attempt's own connect time — for the timeout classes
+      // (ETIMEDOUT / UND_ERR_CONNECT_TIMEOUT) that is up to 1+MAX full connect
+      // timeouts, not one. The link ladder's default scope is the relay
+      // sidecar only (CR #906, second round): on the hub, a cascade-backed
+      // role's nominal comes back here as a SOLO handler, but its connect 400
+      // is walk-class (#299 B) and handleWithCascade serves the next step —
+      // a ladder would stack sleeps in front of a walk that already recovers
+      // the turn. CLAUDISH_CONNECT_RETRY_LINK="1" forces it on anyway.
+      const connKind = classifyConnectionError(error)?.kind ?? null;
+      const retryPolicy = connKind ? connectRetryPolicy(connKind, endpoint) : null;
       const recovered =
-        classifyConnectionError(error)?.kind === "closed"
-          ? await retryClosedConnect(
+        connKind && retryPolicy && retryPolicy.max > 0
+          ? await retryConnectError(
               this.provider.displayName,
               this.bareModelName,
+              connKind,
+              retryPolicy,
               this.provider.enqueueRequest
                 ? () => this.provider.enqueueRequest!(doFetch)
                 : doFetch,

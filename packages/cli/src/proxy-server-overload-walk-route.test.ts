@@ -96,6 +96,11 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_FAILOVER_AUTO", "CLAUDISH_FAILOVER_ARM_AFTER",
   "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
+  // #906 CR pin: the link ladder's scope is decided by these, so a value
+  // leaking in from the host shell would silently arm it inside the walk tests.
+  "CLAUDISH_RELAY_UPSTREAM", "CLAUDISH_CONNECT_RETRY_LINK",
+  "CLAUDISH_CONNECT_RETRY_LINK_MAX", "CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS",
+  "CLAUDISH_CONNECT_RETRY_MAX", "CLAUDISH_CONNECT_RETRY_DELAYS_MS",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -122,6 +127,12 @@ let burst429: Record<string, boolean> = {};
 /** W33: when set to a bucket, the next `tr` hit walls it BEFORE answering —
  *  a concurrent request changing the delegation owner mid-attempt. */
 let wallOnTrHit: string | null = null;
+/** W34 (#906 CR): the nominal lives on a REMOTE host and its fetch THROWS
+ *  ECONNREFUSED — the connect-blip shape the link ladder answers to. A
+ *  loopback nominal could not pin the scope gate (the loopback guard alone
+ *  nulls the policy), so the pin below needs a non-loopback URL. */
+const REMOTE_NOM_BASE = "https://remote-nom.connect.test";
+let nomRefused = false;
 
 function healthySSE(): Response {
   const chunk = (delta: any, finish_reason: string | null = null) =>
@@ -226,7 +237,7 @@ function resetWalk(extra: Record<string, string> = {}): void {
 /** The three fake custom endpoints every test gets. Module scope so a test can
  *  rewrite the config BEFORE spin() with extra top-level fields — routing rules
  *  and endpoints both load at proxy startup, not per request (W17). */
-function writeTestConfig(extra: Record<string, unknown> = {}): void {
+function writeTestConfig(extra: Record<string, unknown> = {}, remoteNominal = false): void {
   const ep = (name: string) => ({
     kind: "simple",
     url: `${UPSTREAM_BASE}/${name}/v1`,
@@ -237,7 +248,11 @@ function writeTestConfig(extra: Record<string, unknown> = {}): void {
     REAL_CONFIG_PATH,
     JSON.stringify({
       customEndpoints: {
-        "nom-ep": ep("nm"),
+        // W34 (#906 CR): a REMOTE nominal, so the link-ladder scope gate —
+        // not the loopback guard — is what the pin exercises.
+        "nom-ep": remoteNominal
+          ? { kind: "simple", url: `${REMOTE_NOM_BASE}/v1`, format: "openai", apiKey: "test-key" }
+          : ep("nm"),
         "s0-ep": ep("s0"),
         "s1-ep": ep("s1"),
         // W20: the TARGET side of a `role:opus` delegation (opus's nominal
@@ -286,6 +301,7 @@ beforeEach(() => {
   endpointDelay = {};
   burst429 = {};
   wallOnTrHit = null;
+  nomRefused = false;
   configExisted = existsSync(REAL_CONFIG_PATH);
   configBackup = configExisted ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
   mkdirSync(CONFIG_DIR, { recursive: true });
@@ -301,6 +317,17 @@ beforeEach(() => {
     if (url.startsWith("https://api.anthropic.com/")) {
       calls.native = (calls.native ?? 0) + 1;
       return overload529();
+    }
+    // W34 (#906 CR): the REMOTE nominal's host is refused at connect time —
+    // the shape the link ladder answers to, on a non-loopback endpoint.
+    if (url.startsWith(`${REMOTE_NOM_BASE}/`)) {
+      calls.nm = (calls.nm ?? 0) + 1;
+      if (nomRefused) {
+        throw Object.assign(new Error("connect ECONNREFUSED 203.0.113.9:443"), {
+          code: "ECONNREFUSED",
+        });
+      }
+      return healthySSE();
     }
     // W17/W18 delegation targets: prefix matches, not the 2-char which-code.
     for (const key of ["tr", "t2"] as const) {
@@ -556,6 +583,51 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
     expect(calls.s0).toBe(1);
     expect(isFailoverActive("sonnet")).toBe(false);
     expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("400"))).toBe(true);
+  }, 30_000);
+
+  // ─── #906 CR (second round) — the link ladder stays OFF the hub ────────────
+  //
+  // The hub shape ai-01 asked to pin: no CLAUDISH_RELAY_UPSTREAM, a cascade
+  // rule with one step, and the nominal's host REFUSED at connect time. The
+  // first #906 cut armed the link ladder for "mono-candidate" (solo) handlers
+  // — which is exactly what a cascade-backed role's nominal is (an explicit
+  // provider@model comes back as a solo ComposedHandler). But the 400 that
+  // synthesized is walk-class (#299 B, P5) and the walk serves the step in the
+  // SAME request: the ladder only stacked up to 7.5 s of sleeps in front of a
+  // walk that already recovers the turn, on every role, every time. The solo
+  // arm is gone; these two pins are its tombstone.
+  test("W34a (#906 CR): hub shape — a REFUSED remote nominal pays ONE fetch, the walk serves the step, no ladder", async () => {
+    writeTestConfig({}, true); // nom-ep URL → REMOTE_NOM_BASE (non-loopback)
+    await spin();
+    resetWalk();
+    nomRefused = true; // the nominal's host throws ECONNREFUSED on every fetch
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200); // the STEP served, not the connect 400
+    expect(await r1.text()).toContain("Hello from the cascade.");
+    expect(calls.nm).toBe(1); // THE PIN: one fetch — no 1+3 ladder on the hub
+    expect(calls.s0).toBe(1); // the walk's one attempt served
+    // Still no plan state: a connect blip is transport, not a wall (#299 B).
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
+    expect(failoverLog.some((l) => l.includes("[Failover] WALK sonnet one-shot") && l.includes("400"))).toBe(true);
+  }, 30_000);
+
+  // The exact behavior a RE-ADDED scope arm would produce, produced here
+  // through the operator force: 1 + LINK_MAX fetches at the refused nominal
+  // before the walk even sees the 400. Delays zeroed so the pin costs no
+  // sleep — the count is the assertion, not the wall clock.
+  test("W34b (#906 CR): with CLAUDISH_CONNECT_RETRY_LINK=1 the same shape reads 4 fetches — the mutation the gate blocks", async () => {
+    writeTestConfig({}, true);
+    process.env.CLAUDISH_CONNECT_RETRY_LINK = "1";
+    process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS = "0,0,0";
+    await spin();
+    resetWalk();
+    nomRefused = true;
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(200); // the walk still recovers the turn…
+    expect(calls.nm).toBe(4); // …but after 1 + LINK_MAX (3) refused fetches
+    expect(calls.s0).toBe(1);
+    expect(isFailoverActive("sonnet")).toBe(false);
   }, 30_000);
 
   test("W10: step 0 already in per-step backoff → the walk serves the FIRST SERVABLE step (s1)", async () => {
