@@ -35,11 +35,11 @@ jobs:
       # measured, see test-preload.ts). The home sandbox must therefore be
       # set by the LAUNCHER, before bun boots: preset HOME + the preload's
       # preset mode accept it as the sandbox (#570).
-      # Non-gating while the suite is not green on the runner (#570): the
-      # failure count is reported in the log and the step summary; flip this
-      # to gating (drop continue-on-error) once a run is green.
+      # Gating since #921 grain 2: the two flake fixes (completedAt owned by
+      # the exit event; per-file catalog warm reset) held 20/20 consecutive
+      # green runs on the runner (PR #923 comment 6719044375), so the
+      # non-gating era documented in #570 ends here.
       - name: Run test suite (packages/cli)
-        continue-on-error: true
         env:
           CLAUDISH_TEST_PRESET_HOME: "1"
         run: |
@@ -52,7 +52,7 @@ jobs:
         run: |
           {
             echo "### Test suite (packages/cli, bun 1.4.0, ubuntu-latest)"
-            echo "**Non-gating:** the job concludes success even when tests fail (continue-on-error) — a green check here is NOT a green suite. Read the counts below (#570)."
+            echo "**Gating:** a failed suite fails the job (continue-on-error removed, #921 grain 2). The counts below are the suite's own summary."
             echo '```'
             grep -E '^ *[0-9]+ (pass|fail|skip)|^Ran [0-9]+ test' test-output.txt || echo "(no summary lines captured — see the test step log)"
             echo '```'
