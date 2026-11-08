@@ -1148,7 +1148,16 @@ export async function createProxyServer(
      * per role, per-machine subtractions. Null/undefined keeps the global
      * walk (every machine-blind caller unchanged).
      */
-    machine?: string | null
+    machine?: string | null,
+    /**
+     * #681: when the cascade loop has jumped this request into ANOTHER role's
+     * cascade (a context-skipped oversized request enters `sonnet` instead of
+     * walking its own role toward the PAYG terminator), every resolution of
+     * the post-jump attempts must derive THAT role — the nominal mapping, the
+     * role keyword, and therefore the 2a swap. Undefined for every non-loop
+     * caller: the role still comes from what the CLIENT asked for.
+     */
+    roleOverride?: FailoverRole
   ): Promise<ModelHandler> => {
     // 1. Monitor Mode Override
     if (monitorMode) return nativeHandler;
@@ -1161,7 +1170,10 @@ export async function createProxyServer(
     } else {
       // 2. Resolve target model based on mappings or defaults
       // Priority: role mappings > default model (--model) > requested model (native)
-      const { target: mappedTarget, mapped } = resolveNominalTarget(requestedModel);
+      // #681: a jumped request nominal-maps through the TARGET role — unarmed,
+      // it must serve the sonnet nominal (the subscription), not the walled
+      // role's own.
+      const { target: mappedTarget, mapped } = resolveNominalTarget(roleOverride ?? requestedModel);
       target = mappedTarget;
       wasFromModelMap = mapped;
     }
@@ -1172,7 +1184,10 @@ export async function createProxyServer(
     // one. Single definition in failover.roleFromModelName (role keywords +
     // CLAUDISH_FAILOVER_ROLE_MODELS aliases) so the swap and the cascade loop
     // can never drift.
-    const role = roleFromModelName(requestedModel);
+    // #681: a jumped attempt (roleOverride) derives the TARGET role here, so
+    // the 2a swap below — and the nominal mapping above — cannot drift back to
+    // the client's original role between two resolutions of the same attempt.
+    const role = roleOverride ?? roleFromModelName(requestedModel);
 
     // 2a. Budget failover — a whole role is served from a cascade of substitute
     // pools because its nominal plan is exhausted or being conserved. Sits AFTER
@@ -1444,13 +1459,17 @@ export async function createProxyServer(
     // retry ladder + patient backoff + its own latency) counts against it,
     // because that is what the client already waited before the walk fires.
     const cascadeStartedAtMs = Date.now();
-    const role = roleFromModelName(requestedModel);
-    const rule = role ? getFailoverRule(role) : undefined;
+    // #681: role/rule/bucket/maxAttempts are `let` — a context-skip can JUMP the
+    // whole loop into the sonnet cascade mid-request (see the #431 consumer
+    // below), and every subsequent resolution must key on the TARGET role's
+    // arm, buckets and bounds, not the client's original role.
+    let role = roleFromModelName(requestedModel);
+    let rule = role ? getFailoverRule(role) : undefined;
     // #275: the provider bucket THIS request's nominal draws on. Computed once
     // (the routing consult is in-memory but not free) and threaded through every
     // failover decision below — the arm, the resolution and the success callback
     // must all key on the same bucket or the diversion test lies.
-    const bucket =
+    let bucket =
       nominalBucket ?? (rule ? await nominalBucketOfModel(requestedModel) : undefined);
     // ── #565 — admission census over DECLARED windows ──────────────────────
     // Placed HERE, before the loop and before any handler is built, because the
@@ -1546,7 +1565,7 @@ export async function createProxyServer(
     // early return is the guard, it is observable (it emits the countable
     // marker) and it is pinned (T3/T4); this line is subtraction, not a new
     // promise.
-    const maxAttempts = rule ? rule.steps.length + 1 : 1; // nominal + each step
+    let maxAttempts = rule ? rule.steps.length + 1 : 1; // nominal + each step
     const armGraceMs = getArmGraceMs();
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
     // #317: the machine half of the budget key — same attribution header the
@@ -1589,6 +1608,13 @@ export async function createProxyServer(
     // successor exists. Writes NO fleet state — no markStepFailed, no bucket
     // wall, no arm — the step is healthy, the request just does not fit.
     const skippedSteps = new Set<number>();
+    // #681: set when a context-skip has JUMPED this request into the sonnet
+    // cascade. Single jump per request by construction (the target role is
+    // always "sonnet", and the jump predicate excludes an already-sonnet walk),
+    // so no ping-pong between cascades is possible. Threaded as roleOverride
+    // into the handler construction so the swap and this loop resolve the SAME
+    // role for every post-jump attempt.
+    let cascadeRoleJumped = false;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       // #609: an override attempt serves the walk's concrete verbatim (the
       // #299-B forceTarget seam) and reads no failover state — the walk chose
@@ -1664,7 +1690,11 @@ export async function createProxyServer(
               undefined,
               keylessNative,
               skippedSteps,
-              machineHeader
+              machineHeader,
+              // #681: post-jump attempts are sonnet attempts end to end — the
+              // nominal mapping and the 2a swap must resolve the TARGET role.
+              // (role cannot be null here once jumped — the jump assigned it.)
+              cascadeRoleJumped && role ? role : undefined
             );
       } catch (err) {
         if (!(err instanceof RoutingError) || !role || stepIndex < 0 || !rule) throw err;
@@ -2010,6 +2040,48 @@ export async function createProxyServer(
           attempt + 1 < maxAttempts &&
           !stepSkipDisabled()
         ) {
+          // ── #681 — context-skip → enter the SONNET cascade ────────────────
+          // A context overflow on a NON-sonnet walk means this request's size
+          // class outruns the remaining rungs of its own role (they trend
+          // narrower, ending at a PAYG terminator that will refuse the same
+          // size). User arbitration 25/10: the oversized request should be
+          // RE-ROUTED to the sonnet role — deepseek stays its LAST rung, tried
+          // only when sonnet's own path is exhausted. Single jump per request
+          // by construction: the target is always "sonnet" and the predicate
+          // below excludes an already-sonnet walk, so no ping-pong between
+          // cascades. busy/media skips keep today's local advance (#431).
+          if (stepSkip.reason === "context" && role !== "sonnet") {
+            const sonnetRule = getFailoverRule("sonnet");
+            // The unarmed-jump nominal needs modelMap["sonnet"]: without a
+            // mapped nominal, a post-jump unarmed resolution would target the
+            // literal "sonnet" and die at routing (RoutingError, attempt 0 of
+            // the sonnet loop) — worse than the local advance it replaced.
+            const sonnetNominal = modelMap?.sonnet;
+            if (sonnetRule && sonnetRule.steps.length > 0 && sonnetNominal) {
+              log(
+                `[Failover] SKIP ${role}[${stepIndex}] reason=context → ROLE-JUMP sonnet[0..] (#681) (${attemptConcreteNow ?? resolved.step?.target ?? "?"}) — entering the sonnet cascade at its first servable step; deepseek stays its last rung`,
+                true // forceConsole — operational event (#681, countable marker)
+              );
+              skippedSteps.clear(); // haiku/opus indexes must not filter sonnet's steps
+              role = "sonnet";
+              rule = sonnetRule;
+              // #367 class: sonnet's nominal is already concrete — classify it,
+              // never run the request-side mapping (the walls arm on the bucket
+              // the nominal ACTUALLY draws on).
+              bucket = await concreteStepBucketOf(sonnetNominal);
+              maxAttempts = sonnetRule.steps.length + 1;
+              attempt = -1; // restart the bounded loop for the sonnet phase
+              cascadeRoleJumped = true;
+              try {
+                await response.body?.cancel();
+              } catch {
+                // already gone — nothing to drain
+              }
+              continue;
+            }
+            // No sonnet lane here (no rule, no steps, or no mapped nominal):
+            // fall through to today's local advance.
+          }
           log(
             `[Failover] SKIP ${role}[${stepIndex}] reason=${stepSkip.reason}` +
               (stepSkip.detail ? ` ${stepSkip.detail}` : "") +
@@ -2192,6 +2264,11 @@ export async function createProxyServer(
             // (#299 B). The failure is returned CLASSIFIED — the step's own
             // wire shape decides whether the walk may advance, and only its
             // body carries it.
+            // #681: `role` is a `let` (it may have been jumped to "sonnet"
+            // mid-request) — narrowing does not survive the closure boundary
+            // below, so capture the walk-time role as a const the closure can
+            // trust. Same value: any jump predates a walk this far down.
+            const walkRole: FailoverRole = role;
             const attemptWalkStep = async (
               target: NonNullable<typeof walk>
             ): Promise<
@@ -2243,7 +2320,7 @@ export async function createProxyServer(
               // the guard also closes `main`'s residual window between
               // resolution and the call.
               const targetDelegation = target.step.roleRef
-                ? resolveDelegationOwner(role, target.step)
+                ? resolveDelegationOwner(walkRole, target.step)
                 : null;
               try {
                 const targetHandler = await getHandlerForRequest(
@@ -2261,7 +2338,7 @@ export async function createProxyServer(
                   // The step proved itself — mirror the loop's success
                   // bookkeeping (a success resets a step's failure count; it
                   // never arms).
-                  if (!target.step.roleRef) resetStepSuccess(role, target.stepIndex);
+                  if (!target.step.roleRef) resetStepSuccess(walkRole, target.stepIndex);
                   // Only credit the owner that actually served: a delegation
                   // resolved to a different concrete (or to null ⇒ cannot
                   // serve) during the round-trip must not lift a wall or reset

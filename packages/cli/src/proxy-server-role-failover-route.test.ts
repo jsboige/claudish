@@ -73,9 +73,33 @@ const savedEnv: Record<string, string | undefined> = {};
 let activeProxy: ProxyServer | null = null;
 const realFetch = globalThis.fetch;
 let calls: Record<string, number> = {};
-/** Wall log lines captured off stderr for the S4 single-increment pin. */
+/** Wall log lines captured off stderr for the S4 single-increment pin.
+ * #681: also captures console.log — the operational skip/jump markers are
+ * forceConsole (log(..., true)), which never touches stderr. */
 let wallLog: string[] = [];
 const realStderrWrite = process.stderr.write.bind(process.stderr);
+const realConsoleLog = console.log.bind(console.log);
+
+/** #681 — per-test upstream behaviors, keyed by endpoint tag, checked BEFORE
+ * the wallEndpoints set. Default: the wall/healthy dichotomy. */
+let upstreamAnswer: Record<string, () => Response | Promise<Response>> = {};
+
+/** #681/#431 — the vLLM context-overflow 400, verbatim family (Swift v0.31):
+ * counts prompt + max_tokens against --max-model-len and never trims. Same
+ * body as proxy-server-step-skip-route.test.ts's fixture. */
+function vllmContextOverflow400(): Response {
+  return new Response(
+    JSON.stringify({
+      object: "error",
+      message:
+        "This model's maximum context length is 262144 tokens. However, you requested 294816 tokens (294816 in the prompt and 0 in the completion), which exceeds the maximum context length.",
+      type: "BadRequestError",
+      param: null,
+      code: 400,
+    }),
+    { status: 400, headers: { "content-type": "application/json" } }
+  );
+}
 
 /** `nom` walls by default (S1/S4); `s0` walls by default (S2). Flipped per test. */
 let wallEndpoints: Set<string> = new Set(["nom"]);
@@ -152,8 +176,9 @@ async function postMessage(model: string): Promise<Response> {
 }
 
 beforeEach(() => {
-  calls = { nm: 0, s0: 0, s1: 0, or: 0, mm: 0, native: 0 };
+  calls = { nm: 0, s0: 0, s1: 0, or: 0, mm: 0, native: 0, h0: 0, ds: 0, hn: 0 };
   wallLog = [];
+  upstreamAnswer = {};
   wallEndpoints = new Set(["nm"]);
   configExisted = existsSync(REAL_CONFIG_PATH);
   configBackup = configExisted ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
@@ -174,6 +199,11 @@ beforeEach(() => {
         "or-ep": ep("or"),
         // #367: the `--model` default's bucket -- never called, only bucketed.
         "mm-ep": ep("mm"),
+        // #681: the haiku cascade (h0 context-refuses; ds = the PAYG terminator
+        // that must stay LAST), and the haiku nominal.
+        "h0-ep": ep("h0"),
+        "ds-ep": ep("ds"),
+        "hn-ep": ep("hn"),
       },
     }),
     "utf-8"
@@ -193,6 +223,10 @@ beforeEach(() => {
     if (!url.startsWith(UPSTREAM_BASE)) return realFetch(input, init);
     const which = url.slice(UPSTREAM_BASE.length + 1, UPSTREAM_BASE.length + 3);
     calls[which] = (calls[which] ?? 0) + 1;
+    // #681: a per-endpoint scripted answer wins over the wall/healthy default
+    // (the context-overflow 400 is neither).
+    const scripted = upstreamAnswer[which];
+    if (scripted) return scripted();
     if (wallEndpoints.has(which)) return quotaWall();
     return healthySSE();
   }) as typeof fetch;
@@ -207,10 +241,21 @@ beforeEach(() => {
     }
     return realStderrWrite(chunk, ...rest);
   }) as any;
+  // #681: the SKIP/ROLE-JUMP markers are forceConsole — capture them too.
+  console.log = ((...args: unknown[]) => {
+    for (const a of args) {
+      const text = typeof a === "string" ? a : String(a);
+      for (const line of text.split("\n")) {
+        if (line.includes("[Failover]")) wallLog.push(line);
+      }
+    }
+    return realConsoleLog(...args);
+  }) as typeof console.log;
 });
 
 afterEach(async () => {
   (process.stderr as any).write = realStderrWrite;
+  console.log = realConsoleLog;
   globalThis.fetch = realFetch;
   if (activeProxy) {
     await activeProxy.shutdown();
@@ -751,5 +796,104 @@ describe("#367 — owner-side buckets of concrete delegation targets", () => {
     expect(r3.status).toBe(200);
     expect(calls.s0).toBe(2);
     expect(calls.nm).toBe(1); // the walled request-side bucket is never re-paid
+  }, 30_000);
+});
+
+// ── #681 — context-skip enters the SONNET cascade, not the PAYG rung ──────────
+// User arbitration 25/10: an oversized request context-skipped on a NON-sonnet
+// cascade must be re-routed to the sonnet ROLE (its cascade, deepseek as its
+// last rung) — not advance locally toward its own role's PAYG terminator,
+// which will refuse the same size class. The jump is single by construction
+// (target always "sonnet", predicate excludes an already-sonnet walk).
+describe("#681 — a context-skip jumps the request into the sonnet cascade", () => {
+  /** The incident shape: haiku walks h0→ds; sonnet walks s0→s1→ds (deepseek
+   * LAST, exactly the arbitration's wording). ds is shared so the pins can
+   * assert it is NEVER reached. */
+  const HAIKU_CASCADE = "h0-ep@fake-h0>ds-ep@fake-ds";
+  const SONNET_CASCADE = "s0-ep@fake-s0>s1-ep@fake-s1>ds-ep@fake-ds";
+  const HAIKU_NOMINAL = "hn-ep@fake-hn";
+  const ROLE_MAP: Record<string, string> = {
+    sonnet: SONNET_NOMINAL,
+    haiku: HAIKU_NOMINAL,
+  };
+
+  test("J1 (AC1a): haiku[0] context-refuses → served by sonnet[0]; ds NEVER called", async () => {
+    // Both roles armed from the start: attempt 0 IS step 0, the exact
+    // incident shape — no nominal detour.
+    await spin(undefined, ROLE_MAP);
+    resetDelegation(
+      {
+        CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+        CLAUDISH_FAILOVER_SONNET: SONNET_CASCADE,
+        CLAUDISH_FAILOVER_ACTIVE: "haiku,sonnet",
+      },
+      ROLE_MAP
+    );
+    wallEndpoints = new Set(); // nothing walls: the skip, not a wall, drives this
+    upstreamAnswer.h0 = vllmContextOverflow400;
+
+    const r = await postMessage("claude-haiku-5");
+
+    // THE PIN: the request lands on sonnet's FIRST step, not haiku's ds.
+    expect(r.status).toBe(200);
+    expect(calls.h0).toBe(1); // paid exactly once, refused on size
+    expect(calls.s0).toBe(1); // the jump target — sonnet's first servable step
+    expect(calls.ds).toBe(0); // deepseek stays sonnet's LAST rung, never the haiku escape
+    expect(calls.s1).toBe(0);
+    expect(calls.hn).toBe(0); // armed: no nominal detour
+    expect(calls.native).toBe(0);
+    // The countable operational marker (#681).
+    expect(wallLog.some((l) => l.includes("ROLE-JUMP sonnet") && l.includes("#681"))).toBe(true);
+  }, 30_000);
+
+  test("J2 (AC1b): sonnet UNARMED → the jump serves the sonnet NOMINAL (the subscription)", async () => {
+    // ONLY haiku is armed; sonnet stays unarmed — an unarmed jump must serve
+    // sonnet's mapped nominal, matching the user's routing intent.
+    await spin(undefined, ROLE_MAP);
+    resetFailoverForTests({
+      CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+      CLAUDISH_FAILOVER_SONNET: SONNET_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "haiku",
+    });
+    setRoleNominalResolver((r) => ROLE_MAP[r]);
+    wallEndpoints = new Set(); // nothing walls: the armed walk starts at h0
+    upstreamAnswer.h0 = vllmContextOverflow400;
+
+    const r = await postMessage("claude-haiku-5");
+
+    expect(r.status).toBe(200);
+    expect(calls.h0).toBe(1); // the size refusal
+    expect(calls.nm).toBe(1); // THE PIN: sonnet's NOMINAL served the jump
+    expect(calls.s0).toBe(0); // unarmed sonnet: no cascade walk
+    expect(calls.hn).toBe(0); // armed: no haiku nominal detour
+    expect(calls.ds).toBe(0);
+    expect(wallLog.some((l) => l.includes("ROLE-JUMP sonnet") && l.includes("#681"))).toBe(true);
+  }, 30_000);
+
+  test("J3 (single jump): a context-refusing sonnet step ADVANCES inside sonnet — no ping-pong", async () => {
+    // s0 ALSO context-refuses: the walk is sonnet now (role === "sonnet"), so
+    // the second skip is today's #431 local advance to s1 — never a second
+    // jump, never a fall-through to haiku's ds.
+    await spin(undefined, ROLE_MAP);
+    resetDelegation(
+      {
+        CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+        CLAUDISH_FAILOVER_SONNET: SONNET_CASCADE,
+        CLAUDISH_FAILOVER_ACTIVE: "haiku,sonnet",
+      },
+      ROLE_MAP
+    );
+    wallEndpoints = new Set();
+    upstreamAnswer.h0 = vllmContextOverflow400;
+    upstreamAnswer.s0 = vllmContextOverflow400;
+
+    const r = await postMessage("claude-haiku-5");
+
+    expect(r.status).toBe(200);
+    expect(calls.h0).toBe(1);
+    expect(calls.s0).toBe(1); // refused on size, advanced locally
+    expect(calls.s1).toBe(1); // served
+    expect(calls.ds).toBe(0); // still never the PAYG escape
+    expect(wallLog.filter((l) => l.includes("ROLE-JUMP sonnet")).length).toBe(1); // single jump
   }, 30_000);
 });
