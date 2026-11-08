@@ -15,6 +15,11 @@ function isolatedEnv(home: string): Record<string, string> {
   const sessionDir = resolve(home, ".claudish/sessions/w3-test-session");
   return {
     HOME: home,
+    // The child's tmpdir() must resolve to the parent's, or main's #242 preset
+    // guard (loaded by the child `bun test` through the bunfig union, sync #919)
+    // sees a HOME that is "neither under" ITS tmpdir nor RUNNER_TEMP (macOS
+    // per-process TMPDIR: /var/folders/... in the parent, /tmp in the child).
+    ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
     PATH: process.env.PATH ?? "",
     CLAUDISH_DISABLE_KEYCHAIN: "1",
     CLAUDISH_DISABLE_OP: "1",
