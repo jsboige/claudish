@@ -469,6 +469,24 @@ try {
     Write-Warn "probe failed: $($_.Exception.Message) — if the hub is reachable this needs investigation"
 }
 
+# ── 6b. Outage-capture reconciliation task (#912 arbitrage a) ──────
+# On a sidecar, ANY loose capture file is by construction an AUTONOMOUS-mode
+# outage capture; without the hourly reconcile task that traffic never reaches
+# the central corpus (measured 06/11: a whole outage window invisible to every
+# hub instrument, #912). Registration is per-user, RunLevel Limited — no
+# elevation — and NEVER fatal to the install.
+$reconcileScript = Join-Path $RepoDir 'scripts\reconcile-outage-captures.ps1'
+if (Test-Path -LiteralPath $reconcileScript) {
+    try {
+        & $reconcileScript -Register 2>&1 | ForEach-Object { Write-Host "   $_" }
+        Write-Ok "hourly outage-capture reconciliation task registered (loose captures now reach the central corpus)"
+    } catch {
+        Write-Warn "reconcile task registration failed (install continues; run scripts\reconcile-outage-captures.ps1 -Register by hand): $($_.Exception.Message)"
+    }
+} else {
+    Write-Warn "reconcile-outage-captures.ps1 not found at $reconcileScript — outage captures on this seat stay invisible to the central corpus (#912)"
+}
+
 # ── 7. Repoint instruction ──────────────────────────────────────────
 Write-Host ""
 Write-Host "SIDECAR INSTALLED for $Machine" -ForegroundColor Green

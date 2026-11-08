@@ -43,16 +43,28 @@
 .PARAMETER WhatIf
   Show what would be archived/copied/deleted without changing anything.
 
+.PARAMETER Register
+  #912 (arbitrage a): register the hourly per-seat reconciliation task
+  'ClaudishReconcileOutageCaptures' and exit. The task runs THIS script (no
+  -Register) under the CURRENT operator account, RunLevel Limited — a per-user
+  task needs no elevation, which the registering run itself proves (it must
+  never raise a UAC prompt). Remove the task with:
+
+    Unregister-ScheduledTask -TaskName 'ClaudishReconcileOutageCaptures' -Confirm:$false
+
 .NOTES
   Schedule on each sidecar (Task Scheduler), e.g. hourly or a few minutes after a
   watchdog-detected recovery. Idempotent: with no loose captures it is a no-op.
+  install-sidecar.ps1 registers the task as part of a sidecar install (-Register);
+  on a seat installed before that, run this script once with -Register.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
   [string]$CaptureDir = "D:\claudish-captures",
   [string]$Machine    = "",
   [string]$SevenZip   = "D:\Apps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe",
-  [string]$GDriveDir  = "G:\Mon Drive\MyIA\backups\claudish-captures"
+  [string]$GDriveDir  = "G:\Mon Drive\MyIA\backups\claudish-captures",
+  [switch]$Register
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,6 +75,41 @@ function Log([string]$msg) {
   $line = "{0:yyyy-MM-ddTHH:mm:ssZ} {1}" -f (Get-Date).ToUniversalTime(), $msg
   Write-Host $line
   try { Add-Content -LiteralPath $logFile -Value $line -Encoding utf8 } catch {}
+}
+
+# --- -Register: create the per-seat task, then exit (#912 arbitrage a) --------
+# Never elevated, never a service principal: the task runs as the installing
+# operator, RunLevel Limited. Registering a per-user task under one's own
+# account requires no UAC consent — the non-elevated registering run is itself
+# the proof the grain asks for.
+if ($Register) {
+    $self = $PSCommandPath
+    if (-not $self) { Write-Host "FATAL: -Register needs the script file path (not dot-sourced)"; exit 2 }
+    # pwsh 7 where installed (the fleet's scheduled interpreter), powershell.exe
+    # 5.1 otherwise — this script is 5.1-clean on purpose (#requires 5.1) and
+    # both interpreters must stay able to run it (test:scripts + :win51).
+    $pwsh7 = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+    $exe   = if (Test-Path -LiteralPath $pwsh7) { $pwsh7 } else { "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
+    $action  = New-ScheduledTaskAction -Execute $exe `
+        -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $self)
+    # Hourly repetition, first run a few minutes out. The job is an idempotent
+    # no-op while the sidecar stays NOMINAL, so hourly costs one directory
+    # listing — and StartWhenAvailable catches suspended-hours misses.
+    # RepetitionDuration: a large-but-VALID bound, never [TimeSpan]::MaxValue —
+    # MaxValue serializes to PT99999999DT23H59M59S, which Task Scheduler rejects
+    # as out-of-range XML ("valeur incorrectement formatée ou hors limites",
+    # caught by the non-elevated registering run). 10 years is indefinite enough.
+    $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(5)) `
+        -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $set     = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
+    $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+        -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName 'ClaudishReconcileOutageCaptures' `
+        -Action $action -Trigger $trigger -Settings $set -Principal $princ -Force | Out-Null
+    Write-Host ("OK  task ClaudishReconcileOutageCaptures registered: hourly, as {0}\{1}, RunLevel Limited (no elevation)" -f $env:USERDOMAIN, $env:USERNAME)
+    exit 0
 }
 
 # --- preconditions -----------------------------------------------------------
