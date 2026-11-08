@@ -164,7 +164,7 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
       method: "POST",
-      headers: INBOUND_HEADERS,
+      headers: { ...INBOUND_HEADERS, "connection": "close" },
       body: MESSAGES_BODY,
     });
     expect(res.status).toBe(200);
@@ -177,7 +177,7 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
       method: "POST",
-      headers: INBOUND_HEADERS,
+      headers: { ...INBOUND_HEADERS, "connection": "close" },
       body: MESSAGES_BODY,
     });
     expect(res.status).toBe(503);
@@ -200,7 +200,7 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
       method: "POST",
-      headers: INBOUND_HEADERS,
+      headers: { ...INBOUND_HEADERS, "connection": "close" },
       body: MESSAGES_BODY,
     });
     expect(res.status).toBe(200);
@@ -214,7 +214,7 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
       method: "POST",
-      headers: INBOUND_HEADERS,
+      headers: { ...INBOUND_HEADERS, "connection": "close" },
       body: MESSAGES_BODY,
     });
     expect(res.status).toBe(200);
@@ -226,7 +226,7 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
       method: "POST",
-      headers: INBOUND_HEADERS,
+      headers: { ...INBOUND_HEADERS, "connection": "close" },
       body: MESSAGES_BODY,
     });
     expect(res.status).toBe(200);
@@ -236,21 +236,21 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     writeConsent();
     writeFlag();
     await spin();
-    const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } });
     expect(res.status).toBe(200);
     const body: any = await res.json();
     expect(body.admissionFreeze).toBe("flag");
     // And the unfrozen reason is observable too — the drain distinguishes
     // "no-consent" (home/mount mismatch) from "expired" (VM clock skew) from it.
     rmSync(FLAG_PATH);
-    const res2 = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    const res2 = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } });
     const body2: any = await res2.json();
     expect(body2.admissionFreeze).toBe("no-flag");
   });
 
   test("default /health reports no-consent when nothing is set up", async () => {
     await spin();
-    const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } });
     const body: any = await res.json();
     expect(body.admissionFreeze).toBe("no-consent");
   });
@@ -261,7 +261,7 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages/count_tokens`, {
       method: "POST",
-      headers: INBOUND_HEADERS,
+      headers: { ...INBOUND_HEADERS, "connection": "close" },
       body: JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: "ok" }] }),
     });
     expect(res.status).toBe(503);
@@ -275,7 +275,7 @@ describe("#306 — opt-in admission freeze (drain's final pre-restart window)", 
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "connection": "close" },
       body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "ok" }] }),
     });
     expect(res.status).toBe(503);

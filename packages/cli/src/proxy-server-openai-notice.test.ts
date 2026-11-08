@@ -180,7 +180,7 @@ async function spinArmed(): Promise<void> {
 async function askOpenAI(stream: boolean, user?: string): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "connection": "close" },
     body: JSON.stringify({
       model: "claude-sonnet-5",
       stream,
@@ -240,7 +240,7 @@ describe("#229 — the notice header survives to the CLIENT on the OpenAI ingres
     // null — no notice, no header, and the same translations run on the body.
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "connection": "close" },
       body: JSON.stringify({
         model: STEP_MODEL,
         stream: false,

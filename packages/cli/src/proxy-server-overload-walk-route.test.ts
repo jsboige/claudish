@@ -281,6 +281,7 @@ async function postMessage(
     method: "POST",
     signal,
     headers: {
+      "connection": "close",
       "Content-Type": "application/json",
       "anthropic-version": "2023-06-01",
       ...extraHeaders,
