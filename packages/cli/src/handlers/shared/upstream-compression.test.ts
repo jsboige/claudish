@@ -37,14 +37,31 @@ import {
 const ENV_NAMES = ["CLAUDISH_UPSTREAM_COMPRESS", "CLAUDISH_UPSTREAM_COMPRESS_MIN_BYTES"] as const;
 const savedEnv: Record<string, string | undefined> = {};
 let restoreFetch: (() => void) | null = null;
+// File-level capture isolation (2026-11-08 hermeticity): the openai-lane wire
+// describe below calls ComposedHandler directly — its 401s append to
+// upstream-errors.log wherever CLAUDISH_CAPTURE_DIR points. Under an ambient
+// env (a seat's ops shell exports the sidecar's real capture dir) that was
+// the REAL dir — measured, three 401 lines landed there at 12:37Z. The
+// native describe keeps its own nested isolation; this top-level one covers
+// every other describe and any future one.
+let capDir: string;
+let prevCapture: string | undefined;
 
 beforeEach(() => {
   for (const name of ENV_NAMES) savedEnv[name] = process.env[name];
+  capDir = join(tmpdir(), `claudish-909-capture-${process.pid}-${Date.now()}`);
+  prevCapture = process.env.CLAUDISH_CAPTURE_DIR;
+  process.env.CLAUDISH_CAPTURE_DIR = capDir;
 });
 
 afterEach(() => {
   if (restoreFetch) restoreFetch();
   restoreFetch = null;
+  if (prevCapture === undefined) Reflect.deleteProperty(process.env, "CLAUDISH_CAPTURE_DIR");
+  else process.env.CLAUDISH_CAPTURE_DIR = prevCapture;
+  try {
+    rmSync(capDir, { recursive: true, force: true });
+  } catch {}
   for (const name of ENV_NAMES) {
     // Reflect.deleteProperty, NOT `= undefined`: on bun, assigning undefined
     // to a process.env key stores the STRING "undefined" (measured,

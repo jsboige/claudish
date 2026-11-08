@@ -1,4 +1,7 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Hono } from "hono";
 import type { ProviderTransport } from "../providers/transport/types.js";
 import {
@@ -32,6 +35,29 @@ function makeFakeTransport(): ProviderTransport {
     getHeaders: () => ({}),
   } as unknown as ProviderTransport;
 }
+
+// Capture isolation (2026-11-08 hermeticity): every request this file pushes
+// through its Hono app writes a resp-*.sse (and 401s append to
+// upstream-errors.log) wherever CLAUDISH_CAPTURE_DIR points — 281 capture
+// files per run under a seat's ambient ops-shell env. Point every test at a
+// throwaway tmp dir instead (suite-wide backstop: the preload's capture
+// hermeticity guard).
+let capDir: string;
+let prevCapture: string | undefined;
+
+beforeEach(() => {
+  capDir = join(tmpdir(), `claudish-ch-capture-${process.pid}-${Date.now()}`);
+  prevCapture = process.env.CLAUDISH_CAPTURE_DIR;
+  process.env.CLAUDISH_CAPTURE_DIR = capDir;
+});
+
+afterEach(() => {
+  if (prevCapture === undefined) Reflect.deleteProperty(process.env, "CLAUDISH_CAPTURE_DIR");
+  else process.env.CLAUDISH_CAPTURE_DIR = prevCapture;
+  try {
+    rmSync(capDir, { recursive: true, force: true });
+  } catch {}
+});
 
 // ---------------------------------------------------------------------------
 // Context-overflow interception (#79 — incident 2026-09-10/11)
