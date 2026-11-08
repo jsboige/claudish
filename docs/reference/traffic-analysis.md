@@ -250,12 +250,13 @@ A hub corpus contains only **nominal** captures: a sidecar's relayed request is 
 
 Since #933 the three hub-corpus readers (`traffic-consumption.py`, `native-consumption.py`, `billed-attrib.py`) declare the blind spot via one shared helper (`scripts/lib/blind_spot.py` — one copy, three readers):
 
-- **fleet** = `--fleet m1,m2` (the caller knows its fleet) ∪ machines named by a `reconcile/outage-<machine>-*.7z` archive present (an archive proves a sidecar). No full-corpus scan.
+- **fleet** = `--fleet m1,m2` (the caller knows its fleet) ∪ machines named by an `outage-<machine>-*.7z` archive present (an archive proves a sidecar). No full-corpus scan.
+- **archives** live where `reconcile-outage-captures.ps1` puts them — the **GDrive `reconcile/` folder**, not the corpus (#940: the hub corpus has no local `reconcile/`, so looking there only ever measured zero). `--reconcile-dir <path>` overrides; the default is that GDrive folder (env `CLAUDISH_RECONCILE_DIR` overrides it — tests pin this to stay seat-independent), and `<corpus>/reconcile` (a seat's local staging, which keeps its copy after the GDrive upload) is read as an **additional** source, deduplicated by filename.
 - **BLIND** = fleet machine with **0** nominal requests and **0** outage archives overlapping the window. The line names the unknown — `no capture from <machine> in this window, outage traffic may not be reconciled yet` — never "no traffic".
 - Every fleet machine seen in the window prints its two counters (`nominal N req, archives outage M`), so presence is visible too. In `traffic-consumption.py --json` the same data rides the `blind_spot` key.
 - `native-consumption.py` prints the section **before** its `Aucune capture native` early return — a window with zero native captures is precisely the blind case.
 
-Reading rules: the "nominal" counter means *hub-side captured*; pointed at a **seat's own** capture dir the loose files are that seat's autonomous captures, so the label under-counts nothing but names the origin wrong — the check is designed for the hub corpus. An empty fleet prints an inactive notice, not silence (a section that never fires hides the capability itself). Pins: `scripts/tests/test_blind_spot.py` (helper semantics + one integration pin per reader, absent-vs-present).
+Reading rules: the "nominal" counter means *hub-side captured*; pointed at a **seat's own** capture dir the loose files are that seat's autonomous captures, so the label under-counts nothing but names the origin wrong — the check is designed for the hub corpus. An empty fleet prints an inactive notice, not silence (a section that never fires hides the capability itself). Pins: `scripts/tests/test_blind_spot.py` (helper semantics + one integration pin per reader, absent-vs-present; #940: separate-dir archive lifts blindness, cross-dir dedupe, `--reconcile-dir` threading) — wired into `test:scripts:py`.
 
 ## Anthropic leak diagnostics
 

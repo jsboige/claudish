@@ -22,14 +22,20 @@ Semantique (AC #933) :
   nominal   = requetes req-*.json dans la fenetre dont l'enveloppe porte
               machine=<M> (toutes lanes confondues — tout req-* du corpus hub
               est une capture hub-side).
-  archives  = archives reconcile/outage-<M>-<start>_<end>.7z dont la fenetre
+  archives  = archives outage-<M>-<start>_<end>.7z dont la fenetre
               [start, end] (UTC, encodee dans le nom) chevauche la fenetre
-              demandee.
+              demandee. Sources (union, dedoublonnee par nom) : --reconcile-dir
+              (defaut : le dossier GDrive ou reconcile-outage-captures.ps1
+              depose les archives — le corpus hub n'a PAS de reconcile/ local,
+              #940) et <corpus>/reconcile (staging local d'un siege sidecar,
+              qui garde sa copie apres l'upload GDrive).
   BLIND     = machine de la fleet avec nominal == 0 ET archives == 0.
               La formulation nomme l'INCONNU, jamais « pas de trafic ».
 
-Charge : un listdir du repertoire + un listdir de reconcile/ + la lecture des
-tetes (400 octets) des SEULS req-*.json dans la fenetre.
+Charge : un listdir du repertoire + un listdir par repertoire d'archives + la
+lecture des tetes (400 octets) des SEULS req-*.json dans la fenetre — sauf si
+le lecteur tend deja ses comptes par machine (nominal_counts, le cas de
+traffic-consumption.py qui lit chaque tete pour l'appariement).
 """
 
 import os
@@ -49,6 +55,17 @@ OUTAGE_FN = re.compile(
 BLIND_TEXT = ("no capture from {machine} in this window, "
               "outage traffic may not be reconciled yet")
 
+# Ou reconcile-outage-captures.ps1 depose les archives ($GDriveDir + reconcile).
+# Le corpus hub n'a pas de reconcile/ local : sans ce dossier separat, le demi-
+# decompte « archives » du predicat BLIND ne mesure rien (#940 CR point 1).
+GDRIVE_RECONCILE_DIR = r"G:\Mon Drive\MyIA\backups\claudish-captures\reconcile"
+
+
+def default_reconcile_dir():
+    """Repertoire d'archives par defaut : env CLAUDISH_RECONCILE_DIR (tests,
+    siege sans G:) sinon le dossier GDrive du script de reconciliation."""
+    return os.environ.get("CLAUDISH_RECONCILE_DIR") or GDRIVE_RECONCILE_DIR
+
 
 def _parse_capture_ts(ts):
     """`2026-11-06T18-24-43-488Z` -> datetime UTC (tirets, pas de deux-points)."""
@@ -66,25 +83,35 @@ def _parse_tag(tag):
         return None
 
 
-def outage_archives(corpus_dir):
+def outage_archives(corpus_dir, reconcile_dir=None):
     """{machine: [(start_dt, end_dt, fname), ...]} — toutes fenetres confondues.
 
     Sert deux roles : source de fleet (une archive prouve un sidecar) et
-    decompte par fenetre. Un repertoire sans reconcile/ rend {} — le cas du
-    corpus hub tant que les archives ne sont pas collectees centralement.
+    decompte par fenetre. Sources = UNION dedoublonnee par nom de
+    --reconcile-dir (dossier GDrive du script de reconciliation, #940) et de
+    <corpus>/reconcile (staging local : le siege garde sa copie apres l'upload,
+    et le dossier separat absent => fallback). Un repertoire absent rend
+    simplement rien — le repertoire lui-meme est une source optionnelle, pas
+    une erreur.
     """
     out = {}
-    rdir = os.path.join(corpus_dir, "reconcile")
-    if not os.path.isdir(rdir):
-        return out
-    for fn in os.listdir(rdir):
-        m = OUTAGE_FN.match(fn)
-        if not m:
+    seen = set()
+    dirs = []
+    if reconcile_dir:
+        dirs.append(reconcile_dir)
+    dirs.append(os.path.join(corpus_dir, "reconcile"))
+    for rdir in dirs:
+        if not os.path.isdir(rdir):
             continue
-        start, end = _parse_tag(m.group("start")), _parse_tag(m.group("end"))
-        if start is None or end is None:
-            continue
-        out.setdefault(m.group("machine"), []).append((start, end, fn))
+        for fn in os.listdir(rdir):
+            m = OUTAGE_FN.match(fn)
+            if not m or fn in seen:
+                continue
+            start, end = _parse_tag(m.group("start")), _parse_tag(m.group("end"))
+            if start is None or end is None:
+                continue
+            seen.add(fn)
+            out.setdefault(m.group("machine"), []).append((start, end, fn))
     return out
 
 
@@ -118,18 +145,27 @@ def count_nominal_by_machine(corpus_dir, window_start, window_end):
     return counts
 
 
-def assess(corpus_dir, window_start, window_end, fleet_extra=()):
+def assess(corpus_dir, window_start, window_end, fleet_extra=(),
+           reconcile_dir=None, nominal_counts=None):
     """-> {machine: {"nominal": n, "archives": n, "blind": bool}}, + "" inclus.
 
     "" (direct) est rapporte mais jamais BLIND : un client direct du hub n'a
     pas de sidecar, donc pas d'angle mort. Une machine hors fleet et sans
     archive n'est pas claimee sidecar — l'absence d'une machine inconnue
     n'est pas un mensonge du corpus.
+
+    nominal_counts : comptes {machine: n} deja etablis par le lecteur sur la
+    MEME fenetre (traffic-consumption.py lit deja chaque tete req-* pour
+    l'appariement — lui faire relire est le cout releve mesure sur UNC, #940).
+    None -> census locale (tetes 400 o des seuls req-* dans la fenetre).
     """
-    archives = outage_archives(corpus_dir)
+    archives = outage_archives(corpus_dir, reconcile_dir)
     fleet = set(m for m in fleet_extra if m)
     fleet |= set(archives)
-    nominal = count_nominal_by_machine(corpus_dir, window_start, window_end)
+    if nominal_counts is None:
+        nominal = count_nominal_by_machine(corpus_dir, window_start, window_end)
+    else:
+        nominal = dict(nominal_counts)
     res = {}
     for machine in sorted(fleet | set(nominal)):
         n_arch = sum(
@@ -144,14 +180,19 @@ def assess(corpus_dir, window_start, window_end, fleet_extra=()):
     return res
 
 
-def render(corpus_dir, window_start, window_end, fleet_extra=()):
+def render(corpus_dir, window_start, window_end, fleet_extra=(),
+           reconcile_dir=None, res=None):
     """-> liste de lignes a imprimer (section complete, vide = rien a dire).
 
     Fleet vide -> UNE ligne d'inactivite (une section silencieuse cacherait la
     capacite elle-meme). Chaque machine de la fenetre (fleet ou vue) est
     listee avec ses deux compteurs ; les BLIND ajoutent la formulation AC3.
+    res : verdict assess() DEJA calcule (evite le double passage du lecteur
+    qui appelle assess pour le JSON puis render pour le texte).
     """
-    res = assess(corpus_dir, window_start, window_end, fleet_extra)
+    if res is None:
+        res = assess(corpus_dir, window_start, window_end, fleet_extra,
+                     reconcile_dir=reconcile_dir)
     if not res:
         return [
             "angle mort AUTONOMOUS: aucune machine flotte declaree "
@@ -168,9 +209,11 @@ def render(corpus_dir, window_start, window_end, fleet_extra=()):
     return lines
 
 
-def section(corpus_dir, window_start, window_end, fleet_extra=()):
+def section(corpus_dir, window_start, window_end, fleet_extra=(),
+            reconcile_dir=None):
     """-> lignes pretes a imprimer, en-tete de section inclus."""
-    body = render(corpus_dir, window_start, window_end, fleet_extra)
+    body = render(corpus_dir, window_start, window_end, fleet_extra,
+                  reconcile_dir=reconcile_dir)
     head = ("== angle mort AUTONOMOUS (nominal 0 = peut-etre autonome "
             "non reconcile, pas forcement absence de trafic) ==")
     return [head] + body

@@ -71,6 +71,12 @@ def main():
         if i + 1 < len(argv):
             fleet = [m.strip() for m in argv[i + 1].split(',') if m.strip()]
             del argv[i:i + 2]
+    reconcile_dir = ''
+    if '--reconcile-dir' in argv:
+        i = argv.index('--reconcile-dir')
+        if i + 1 < len(argv):
+            reconcile_dir = argv[i + 1]
+            del argv[i:i + 2]
     days = argv[0].split(',') if argv else ['2026-09-14']
     AFTER = datetime.strptime(argv[1], '%Y-%m-%dT%H:%M:%S') if len(argv) > 1 else None
 
@@ -93,15 +99,19 @@ def main():
     print(f'jours={days} | {len(reqs)} cles req | {len(resps)} resp natives')
 
     # #933 — l'angle mort AUTONOMOUS se declare : une machine de la fleet sans
-    # requete nominale NI archive reconcile/ dans la fenetre des jours demandes
+    # requete nominale NI archive outage dans la fenetre des jours demandes
     # est BLIND, pas "sans trafic". Fenetre = [min jour 00:00, max jour + 1 j)
-    # en UTC (les stamps de capture sont UTC). --fleet m1,m2 declare la flotte.
+    # en UTC (les stamps de capture sont UTC). --fleet m1,m2 declare la flotte ;
+    # --reconcile-dir le dossier des archives (defaut : GDrive du script de
+    # reconciliation, #940 — le corpus hub n'a pas de reconcile/ local).
     from datetime import timezone as _tz
     try:
         _day_dts = [datetime.strptime(d[:10], '%Y-%m-%d') for d in days]
         w_start = min(_day_dts).replace(tzinfo=_tz.utc)
         w_end = (max(_day_dts) + timedelta(days=1)).replace(tzinfo=_tz.utc)
-        for _line in _load_blind_spot().render(D, w_start, w_end, fleet):
+        _bs = _load_blind_spot()
+        _rdir = reconcile_dir or _bs.default_reconcile_dir()
+        for _line in _bs.render(D, w_start, w_end, fleet, reconcile_dir=_rdir):
             print(_line)
         print()
     except ValueError:

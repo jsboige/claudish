@@ -48,7 +48,7 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 REQ_FN = re.compile(r"^req-(\d+)-(\d+)-(.+)\.json$")
 RESP_FN = re.compile(r"^resp-\d+-r\d+-(\d{4}-\d{2}-\d{2}T[\d-]+Z)-(.+)\.sse$")
@@ -257,6 +257,10 @@ def main():
     ap.add_argument("--fleet", default="",
                     help="machines sidecar attendues (separees par des virgules) — "
                          "active l'avertissement d'angle mort AUTONOMOUS (#933)")
+    ap.add_argument("--reconcile-dir", default="",
+                    help="dossier des archives outage-*.7z (defaut : GDrive du "
+                         "script de reconciliation, env CLAUDISH_RECONCILE_DIR ; "
+                         "<corpus>/reconcile reste source additionnelle, #940)")
     args = ap.parse_args()
 
     cutoff = datetime.now(timezone.utc).timestamp() - args.hours * 3600
@@ -320,12 +324,18 @@ def main():
     span_h = ((last_dt - first_dt).total_seconds() / 3600) if (first_dt and last_dt and last_dt > first_dt) else args.hours
 
     # #933 — l'angle mort AUTONOMOUS se declare, il ne se lit pas comme un 0 :
-    # fleet declaree (+ archives reconcile/) avec 0 nominal et 0 archive dans la
-    # fenetre = BLIND. Coram la fenetre DEMANDEE (cutoff -> maintenant).
+    # fleet declaree (+ archives outage, dossier GDrive du script de
+    # reconciliation) avec 0 nominal et 0 archive dans la fenetre = BLIND.
+    # Coram la fenetre DEMANDEE (cutoff -> maintenant). Les comptes nominaux
+    # viennent de load_requests (il a deja lu chaque tete req-* pour
+    # l'appariement) — pas de relecture (#940).
     fleet = [m.strip() for m in args.fleet.split(",") if m.strip()]
     now_dt = datetime.now(timezone.utc)
     bs = _load_blind_spot()
-    blind = bs.assess(args.dir, cutoff_dt, now_dt, fleet)
+    _rdir = args.reconcile_dir or bs.default_reconcile_dir()
+    _nominal = Counter(v["machine"] for lst in reqs.values() for v in lst)
+    blind = bs.assess(args.dir, cutoff_dt, now_dt, fleet,
+                      reconcile_dir=_rdir, nominal_counts=_nominal)
 
     if args.json:
         print(json.dumps({
@@ -378,7 +388,8 @@ def main():
     # #933 : la section se render meme sans --machines — une absence lue comme
     # un 0 est le mensonge que ce rapport existe pour empecher.
     print()
-    for line in bs.render(args.dir, cutoff_dt, now_dt, fleet):
+    for line in bs.render(args.dir, cutoff_dt, now_dt, fleet,
+                          reconcile_dir=_rdir, res=blind):
         print(line)
 
     print(f"\ntotal out_tok fenetre: {fmt_int(total_out)} | debit moyen out: {fmt_int(int(total_out / span_h))}/h")

@@ -94,6 +94,10 @@ def parse_args():
     ap.add_argument("--fleet", default="",
                     help="machines sidecar attendues (separees par des virgules) — "
                          "active l'avertissement d'angle mort AUTONOMOUS (#933)")
+    ap.add_argument("--reconcile-dir", default="",
+                    help="dossier des archives outage-*.7z (defaut : GDrive du "
+                         "script de reconciliation, env CLAUDISH_RECONCILE_DIR ; "
+                         "<corpus>/reconcile reste source additionnelle, #940)")
     ap.add_argument("--selftest", action="store_true",
                     help="run the fname_dt parsing checks and exit")
     return ap.parse_args()
@@ -205,7 +209,10 @@ def main():
     _fallback_start = (resps[0][0] if resps else _now - timedelta(hours=24))
     w_start = (since if since else _fallback_start).replace(tzinfo=_tz.utc)
     w_end = (until if until else _now).replace(tzinfo=_tz.utc)
-    for line in _load_blind_spot().render(a.captures_dir, w_start, w_end, fleet):
+    _bs = _load_blind_spot()
+    _rdir = a.reconcile_dir or _bs.default_reconcile_dir()
+    for line in _bs.render(a.captures_dir, w_start, w_end, fleet,
+                           reconcile_dir=_rdir):
         print(line)
     print()
 
