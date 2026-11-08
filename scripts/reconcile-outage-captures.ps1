@@ -40,6 +40,20 @@
   subfolder. Empty = skip GDrive (local staging only; loose files are then KEPT,
   never deleted without an off-site copy).
 
+.PARAMETER SevenZip
+  7z binary. Empty (the default) = resolve from the built-in candidate list plus
+  the PATH (#214 port, measured 08/11): the historical hardcoded default exists
+  on no seat of this family and the first armed-task run on po-2024 died on it.
+  An explicit value that exists is used as-is; one that does not exist is warned
+  about and the candidates are tried instead.
+
+.PARAMETER SevenZipCandidates
+  Extra 7z candidates, appended AFTER the built-ins (fallback of last resort).
+
+.PARAMETER NoSevenZipFallback
+  Kill the candidate fallback: an explicit (or absent) 7z that cannot be
+  resolved is then a hard FATAL.
+
 .PARAMETER WhatIf
   Show what would be archived/copied/deleted without changing anything.
 
@@ -62,7 +76,9 @@
 param(
   [string]$CaptureDir = "D:\claudish-captures",
   [string]$Machine    = "",
-  [string]$SevenZip   = "D:\Apps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe",
+  [string]$SevenZip   = "",
+  [string[]]$SevenZipCandidates = @(),
+  [switch]$NoSevenZipFallback,
   [string]$GDriveDir  = "G:\Mon Drive\MyIA\backups\claudish-captures",
   [switch]$Register
 )
@@ -113,8 +129,32 @@ if ($Register) {
 }
 
 # --- preconditions -----------------------------------------------------------
-if (-not (Test-Path -LiteralPath $SevenZip))   { Log "FATAL: 7z not found at $SevenZip"; exit 2 }
 if (-not (Test-Path -LiteralPath $CaptureDir)) { Log "FATAL: capture dir not found: $CaptureDir"; exit 2 }
+
+# 7z resolution (#214 port, measured 08/11 on po-2024): never a single hardcoded
+# path. All four built-in candidates are absent on this seat family AND '7z' is
+# not on PATH - only the winget '7zr' is - so the first armed-task run died on
+# the old hardcoded portable-apps default (see the 10:42:35Z FATAL in
+# reconcile.log). Same fix class as compress-captures.ps1 (#214): candidate
+# list + PATH probes. 7zr is 7z-format-only, which is exactly what this script
+# creates and tests (-t7z), so it is a fully valid resolver here. The PATH probe
+# covers BOTH names because compress-captures' 'Get-Command 7z' alone resolves
+# nothing on po-2024.
+Import-Module (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1') -Force -DisableNameChecking
+$candidates = @(Get-SevenZipCandidates -Extra $SevenZipCandidates)
+foreach ($bin in '7z', '7zr') {
+  $onPath = Get-Command $bin -ErrorAction SilentlyContinue
+  if ($onPath -and $onPath.Source) { $candidates += $onPath.Source }
+}
+$sevenZipResolved = Resolve-SevenZipPath -Explicit $SevenZip -Candidates $candidates -NoFallback:$NoSevenZipFallback
+if (-not $sevenZipResolved.Path) {
+  Log ("FATAL: 7z not found - tried: {0}" -f (($sevenZipResolved.Tried) -join '; ')); exit 2
+}
+if ($sevenZipResolved.ExplicitMissing) {
+  Log ("WARN  -SevenZip '{0}' does not exist -> resolved to {1}" -f $SevenZip, $sevenZipResolved.Path)
+}
+$SevenZip = $sevenZipResolved.Path
+Log ("SEVENZIP {0} (source={1})" -f $SevenZip, $sevenZipResolved.Source)
 
 # --- enumerate loose captures (outage captures by construction on a sidecar) --
 $rx = '^(req|resp)-.*?(?<d>\d{4}-\d{2}-\d{2})T(?<t>\d{2}-\d{2}-\d{2})'

@@ -67,6 +67,34 @@ Describe 'reconcile-outage-captures -Register (task shape)' {
     }
 }
 
+Describe '7z resolution (#214 port: the first armed-task run died on the hardcoded default)' {
+    It 'default SevenZip is EMPTY - resolve from candidates, never a hardcoded path' {
+        $script:ReconcileText | Should -Match '(?m)^\s*\[string\]\$SevenZip\s*=\s*""\s*,?\s*$'
+        $script:ReconcileText | Should -Not -Match 'D:\\Apps\\PortableApps'
+    }
+
+    It 'resolves via the engine helpers with BOTH PATH names probed (7z AND 7zr)' {
+        # Measured 08/11 on po-2024: all four built-in candidates absent, 7z not
+        # on PATH - only the winget 7zr resolves. compress-captures' probe of
+        # 'Get-Command 7z' ALONE would still die here.
+        $script:ReconcileText | Should -Match 'claudish-engine\.psm1'
+        $script:ReconcileText | Should -Match 'Get-SevenZipCandidates'
+        $script:ReconcileText | Should -Match 'Resolve-SevenZipPath'
+        $script:ReconcileText | Should -Match 'Get-Command\s+\$bin'
+        $script:ReconcileText | Should -Match "'7z',\s*'7zr'"
+    }
+
+    It 'a failed resolution NAMES every path probed, not the single-path FATAL' {
+        $script:ReconcileText | Should -Not -Match 'FATAL: 7z not found at \$SevenZip'
+        $script:ReconcileText | Should -Match 'FATAL: 7z not found - tried:'
+    }
+
+    It 'declares -NoSevenZipFallback and -SevenZipCandidates (parity with compress-captures)' {
+        $script:ReconcileText | Should -Match '(?m)^\s*\[switch\]\$NoSevenZipFallback\s*,?\s*$'
+        $script:ReconcileText | Should -Match '(?m)^\s*\[string\[\]\]\$SevenZipCandidates\s*=\s*@\(\)\s*,?\s*$'
+    }
+}
+
 Describe 'install-sidecar wires the registration (#912: installed means reconciled)' {
     It 'invokes reconcile-outage-captures.ps1 -Register as part of the install' {
         $script:InstallerText | Should -Match 'reconcile-outage-captures\.ps1'
