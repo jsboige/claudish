@@ -230,7 +230,7 @@ async function postMessage(
 ): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", "connection": "close" },
     body: JSON.stringify({
       model: opts.model ?? "claude-sonnet-5",
       max_tokens: opts.maxTokens ?? 64,
@@ -1095,7 +1095,7 @@ describe("#565 — a request no declared window can take is refused at admission
     // but never RUN for the OpenAI wire — review 21/10, non-blocking 3.
     const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "connection": "close" },
       body: JSON.stringify({
         model: "ctx-ep@fake-ctx",
         stream: true,
@@ -1204,7 +1204,7 @@ describe("#587 — /health publishes time-localized event-loop lag (gate instrum
   test("H1: a fresh server exposes eventLoopMax60sMs/BlockedMs5m/Max as non-negative numbers beside instanceId, with no upstream configured", async () => {
     await spin();
     resetCascade();
-    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } });
     expect(r.status).toBe(200); // not stalled — the health surface is otherwise unchanged
     const body: any = await r.json();
     expect(typeof body.instanceId).toBe("string"); // the #156 identity field is still there
@@ -1229,7 +1229,7 @@ describe("#587 — /health publishes time-localized event-loop lag (gate instrum
     // must not be the very first post-spin event. Production readers poll
     // at 4 s+ and always see the recorded block; this mirrors that.
     await new Promise((r) => setTimeout(r, 120));
-    const after: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
+    const after: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } })).json();
     expect(after.eventLoopMax60sMs).toBeGreaterThanOrEqual(20); // ≥ one resolution bucket
     expect(after.eventLoopBlockedMs5m).toBeGreaterThanOrEqual(20); // the block, above the 50 ms floor
     // The cumulative high-water mark dominates any windowed read of the
@@ -1252,13 +1252,13 @@ describe("#587 — /health publishes time-localized event-loop lag (gate instrum
         /* spin the loop — one ~100 ms sample, above the 50 ms block floor */
       }
       await new Promise((r) => setTimeout(r, 120));
-      const inside: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
+      const inside: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } })).json();
       expect(inside.eventLoopMax60sMs).toBeGreaterThanOrEqual(50); // the block, not jitter
       expect(inside.eventLoopBlockedMs5m).toBeGreaterThanOrEqual(50);
       // Wait past the shortened window: the sample is older than the edge
       // now, the backwards walk stops before reaching it.
       await new Promise((r) => setTimeout(r, 2_000));
-      const retired: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`)).json();
+      const retired: any = await (await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } })).json();
       // Sub-floor jitter may keep fresh 1-3 ms samples inside the window —
       // what must be gone is anything BLOCK-SIZED. The blocked sum floors
       // at 50 ms, so an empty window reads exactly 0.
@@ -1324,7 +1324,7 @@ describe("v27 — /health arrival marker", () => {
     await spin();
     resetCascade();
     const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, {
-      headers: { "x-claudish-machine": "myia-ai-01" },
+      headers: { "x-claudish-machine": "myia-ai-01", "connection": "close" },
     });
     expect(r.status).toBe(200);
     const lines = hits();
@@ -1341,7 +1341,7 @@ describe("v27 — /health arrival marker", () => {
     await spin();
     resetCascade();
     const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, {
-      headers: { "x-claudish-machine": "myia-ai-01" },
+      headers: { "x-claudish-machine": "myia-ai-01", "connection": "close" },
     });
     expect(r.status).toBe(200);
     const body: any = await r.json();
@@ -1352,7 +1352,7 @@ describe("v27 — /health arrival marker", () => {
   test("A3: a probe that identifies nothing still logs — attribution degrades, it never throws", async () => {
     await spin();
     resetCascade();
-    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+    const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } });
     expect(r.status).toBe(200);
     const lines = hits();
     expect(lines).toHaveLength(1);
@@ -1904,7 +1904,7 @@ describe("#674 — exact counting at the wall (both ingresses)", () => {
 
     const r = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "connection": "close" },
       body: JSON.stringify({
         model: "drv-ep@fake-drv",
         stream: true,
