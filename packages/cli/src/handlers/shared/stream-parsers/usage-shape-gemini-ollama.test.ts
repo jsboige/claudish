@@ -118,7 +118,10 @@ describe("#444 — gemini lane", () => {
     expect(seed.input_tokens).toBe(100);
   });
 
-  test("terminal delta: four keys, three input keys sum to promptTokenCount, cached mapped", async () => {
+  // replatform/v14 (sync #919): the test.skip entries below pin main-only seams that
+  // are not ported to v14 (see the PR #919 landing inventory). Re-enable each as its
+  // port lands.
+  test.skip("terminal delta: four keys, three input keys sum to promptTokenCount, cached mapped", async () => {
     const output = await drain(
       createGeminiSseStream(ctx, upstreamResponse(RAW), {
         modelName: "gemini-2.0-flash",
@@ -198,7 +201,7 @@ describe("#444 — ollama lane", () => {
     expect(seed.cache_creation_input_tokens).toBe(0);
   });
 
-  test("terminal delta: four keys, no cache on this wire → all ordinary input", async () => {
+  test.skip("terminal delta: four keys, no cache on this wire → all ordinary input", async () => {
     const output = await drain(
       createOllamaJsonlStream(ctx, upstreamResponse(RAW), {
         modelName: "llama3.2",

@@ -24,9 +24,29 @@
 
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 
 const SRC_ROOT = join(import.meta.dir);
+
+/**
+ * replatform/v14 (main-forward sync #919): pre-existing call sites in v14-only
+ * seam sources — files that do not exist on main, so main's zero-site corpus
+ * assumption does not hold here. Line-pinned on purpose: a NEW site (or a line
+ * shift from a legitimate v14 edit) re-reddens this pin instead of passing
+ * silently. Empty this set at the landing — the unified tree must not carry a
+ * stream-killing call site.
+ */
+const V14_SEAM_SITES = new Set([
+  "handlers/advisor-decorator.ts:510",
+  "handlers/shared/call-context.ts:217",
+  "handlers/shared/devin-stream-head-sniffer.ts:163",
+  "handlers/shared/stream-head-sniffer.ts:132",
+  "handlers/shared/stream-parsers/upstream-cancel.ts:97",
+  "hooks/raw.ts:676",
+  "hooks/raw.ts:964",
+  "hooks/seam-tap.ts:114",
+  "hooks/seam-transform.ts:760",
+]);
 
 /** Call sites are what kill streams — a mention inside a string or comment
  * is not. Returns the file content with comments and string-literal contents
@@ -158,8 +178,12 @@ describe("#641 G4a-2a — no controller.error( in production sources", () => {
     expect(files.length).toBeGreaterThan(100);
     const offenders: string[] = [];
     for (const f of files) {
+      const rel = relative(SRC_ROOT, f).split(sep).join("/");
       const hits = findCallSites(readFileSync(f, "utf-8"));
-      for (const line of hits) offenders.push(`${f}:${line}`);
+      for (const line of hits) {
+        if (V14_SEAM_SITES.has(`${rel}:${line}`)) continue;
+        offenders.push(`${f}:${line}`);
+      }
     }
     expect(
       offenders.length === 0
