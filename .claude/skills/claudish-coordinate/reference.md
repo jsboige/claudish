@@ -501,6 +501,7 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 - Comparer `main` local à `origin/main` : le pair merge de son côté, un diff contre une ref non fetchée est un diff contre le passé.
 - **Chercher les collisions** : tous les agents poussent sous `jsboige`. Deux PRs qui touchent les mêmes fichiers = doublon probable (cas #63/#64, 27-28/08). Comparer les `files`, pas les titres.
 - **Avant tout merge/review** : lire le body complet, tous les commentaires, toutes les reviews avec leur `state`, et le diff. Ne pas merger sur un `CHANGES_REQUESTED` non adressé. Il n'y a **aucun gate CI** sur ce dépôt (le seul check est un no-op) : « en attente de CI » est un faux bloqueur, les tests locaux font foi.
+- **Mise à jour 08/11 (#921, #934)** : la phrase ci-dessus est périmée. Le job `test` du workflow `Test` est **bloquant** depuis #934 (`continue-on-error` retiré, `test ${PIPESTATUS[0]} -eq 0` derrière le `tee`) : un fail rend le check rouge, donc sa conclusion fait foi pour « 0 fail » sur une PR basée sur `main`. Avant #934, le badge était `success` même avec des échecs (07/11 : #906 à 2980 pass / 1 fail sous un check vert). Le compteur reste utile pour une chose : vérifier qu'un nouveau pin est **compté** (2997 → 3000 sur #932). Piège : chaque PR tire **deux** workflows, et `claude-code` (Claude Code PR Assistant) conclut `success` même sur un commit rouge. Sélectionner par nom de check ou par `--workflow Test`, jamais par SHA seul.
 
 ### Phase 4c — Dispatch : une file de grains par worker (mandat user 04/10)
 

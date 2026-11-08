@@ -147,7 +147,7 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 - **Collisions** : tous poussent sous `jsboige`, donc comparer les `files`, pas les titres.
 - **Avant review ou merge** :
   - vérifier `Closes #NN` dans le body **et** dans les commits de branche (`git log origin/main..<branche>`) ;
-  - rejouer en local ; le job CI `test` peut sortir « success » avec des échecs : lire ses compteurs ;
+  - rejouer en local ; le check `test` (workflow `Test`) bloque depuis #934 et fait foi, `claude-code` jamais ;
   - faire tourner une mutation sur chaque garde ajoutée.
   - Pas de merge sur un CR non adressé. Mes CR sont des **commentaires** : écrire « attend TON push » dans
     la file du worker.
