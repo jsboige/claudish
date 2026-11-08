@@ -175,6 +175,21 @@ async function postMessage(model: string): Promise<Response> {
   });
 }
 
+/** #939 — same shape, caller-sized content: the admission census estimates
+ * ~1 token per 4 chars, so 1.2M chars ≈ 300k tokens (the #565 convention). */
+async function postMessageBig(model: string, content: string): Promise<Response> {
+  return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", "connection": "close" },
+    body: JSON.stringify({
+      model,
+      max_tokens: 64,
+      stream: false,
+      messages: [{ role: "user", content }],
+    }),
+  });
+}
+
 /** #681: the assistant text of a collected (stream:false) response — the armed
  * failover notice rides block 0, so the "served by **…**" anchor is asserted
  * here exactly the way K1 does (proxy-server-step-skip-route.test.ts:479). */
@@ -187,18 +202,19 @@ async function responseText(r: Response): Promise<string> {
 }
 
 beforeEach(() => {
-  calls = { nm: 0, s0: 0, s1: 0, or: 0, mm: 0, native: 0, h0: 0, ds: 0, hn: 0 };
+  calls = { nm: 0, s0: 0, s1: 0, or: 0, mm: 0, native: 0, h0: 0, ds: 0, hn: 0, c0: 0, cd: 0, ch: 0, cs: 0, cn: 0 };
   wallLog = [];
   upstreamAnswer = {};
   wallEndpoints = new Set(["nm"]);
   configExisted = existsSync(REAL_CONFIG_PATH);
   configBackup = configExisted ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
   mkdirSync(CONFIG_DIR, { recursive: true });
-  const ep = (name: string) => ({
+  const ep = (name: string, extra: Record<string, unknown> = {}) => ({
     kind: "simple",
     url: `${UPSTREAM_BASE}/${name}/v1`,
     format: "openai",
     apiKey: "test-key",
+    ...extra,
   });
   writeFileSync(
     REAL_CONFIG_PATH,
@@ -215,6 +231,18 @@ beforeEach(() => {
         "h0-ep": ep("h0"),
         "ds-ep": ep("ds"),
         "hn-ep": ep("hn"),
+        // #939: DEDICATED endpoints for the admission-census pins. Declared
+        // windows on the #681 endpoints would contaminate the J pins (the
+        // #441 guard corroborates the scripted 400s and learns caps, which
+        // short-circuits later steps non-deterministically — measured: J1's
+        // vllm 400 taught cap=214 on s0, and C1's s0 never got its fetch).
+        // Fresh prefixes carry no learned caps: the DECLARED windows drive
+        // the whole shape on their own.
+        "ch-ep": ep("ch", { contextLimit: 100_000 }), // haiku nominal
+        "c0-ep": ep("c0", { contextLimit: 100_000 }), // haiku step 0
+        "cd-ep": ep("cd", { contextLimit: 128_000 }), // haiku last step
+        "cs-ep": ep("cs", { contextLimit: 400_000 }), // sonnet step 0
+        "cn-ep": ep("cn", { contextLimit: 400_000 }), // sonnet nominal
       },
     }),
     "utf-8"
@@ -253,11 +281,12 @@ beforeEach(() => {
     return realStderrWrite(chunk, ...rest);
   }) as any;
   // #681: the SKIP/ROLE-JUMP markers are forceConsole — capture them too.
+  // #939: the [ContextAdmission] REFUSE marker is forceConsole as well.
   console.log = ((...args: unknown[]) => {
     for (const a of args) {
       const text = typeof a === "string" ? a : String(a);
       for (const line of text.split("\n")) {
-        if (line.includes("[Failover]")) wallLog.push(line);
+        if (line.includes("[Failover]") || line.includes("[ContextAdmission]")) wallLog.push(line);
       }
     }
     return realConsoleLog(...args);
@@ -923,5 +952,96 @@ describe("#681 — a context-skip jumps the request into the sonnet cascade", ()
     expect(text3).toContain("served by **s1-ep@fake-s1**");
     expect(text3).not.toContain("served by **h0-ep@fake-h0**");
     expect(text3).not.toContain("served by **s0-ep@fake-s0**");
+  }, 30_000);
+});
+
+// ── #939 — the admission census weighs the sonnet path when the #681 jump
+// could fire ─────────────────────────────────────────────────────────────────
+// Decision (a) on the issue: when sonnetJumpTarget() holds for this request
+// (non-sonnet walk + sonnet rule with ≥1 step + mapped nominal — the SAME
+// predicate the loop consults at its first context skip, one helper for both
+// sites), the #565 census also weighs resolveNominalTarget(sonnetNominal) plus
+// collectSteps("sonnet"). Only candidates are added, never removed, so with no
+// jump target the census is exactly #565's conservative refusal. Mutation
+// proofs: drop the sonnet-weighing block ⇒ C1 red (the request is refused at
+// admission naming 128000 and never reaches the jump); drop the shared
+// predicate's step/nominal conditions at the census site only ⇒ C2 stays green
+// but C1's shape no longer matches the loop's (drift — the reason the predicate
+// is one helper).
+describe("#939 — census + jump: an all-declared origin path narrower than the sonnet path no longer refuses", () => {
+  /** The issue's repro with numbers, on the DEDICATED c*-ep endpoints: the
+   * haiku path is ALL-declared (ch 100k, c0 100k, cd 128k) and the request
+   * is ~300k — doomed on every haiku candidate. The sonnet path (cn 400k,
+   * cs 400k) fits it, one #681 jump away. Est ≈ 300k: above 128k, below
+   * 400k — the exact bracket. The DECLARED windows are census metadata; the
+   * size refusal comes from the upstream (scripted vLLM 400, J1's family —
+   * a fresh prefix carries no learned cap, so the #441 guard does not
+   * short-circuit it). */
+  const BIG = "x".repeat(1_200_000); // est ≈ 300k tokens
+  const MAP: Record<string, string> = { sonnet: "cn-ep@fake-cn", haiku: "ch-ep@fake-ch" };
+  const HAIKU_CASCADE = "c0-ep@fake-c0>cd-ep@fake-cd";
+
+  test("C1: origin all-declared-and-smaller + jump target fits → ADMITTED, served by the jump", async () => {
+    await spin(undefined, MAP);
+    resetDelegation(
+      {
+        CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+        CLAUDISH_FAILOVER_SONNET: "cs-ep@fake-cs",
+        CLAUDISH_FAILOVER_ACTIVE: "haiku,sonnet",
+      },
+      MAP
+    );
+    wallEndpoints = new Set(); // nothing walls: the skip, not a wall, drives this
+    // The declared 100k on c0 is CENSUS metadata; the refusal itself comes
+    // from the upstream (the vLLM 400, same family as J1) — a fresh prefix
+    // carries no learned cap, so the #441 guard would not short-circuit it.
+    upstreamAnswer.c0 = vllmContextOverflow400;
+
+    const r = await postMessageBig("claude-haiku-5", BIG);
+
+    // THE PIN: admitted (the sonnet windows are weighed), then the #681 jump
+    // serves it — the very path the pre-#939 census used to refuse naming
+    // 128000 while a 400k window sat one jump away.
+    expect(r.status).toBe(200);
+    const text = await responseText(r);
+    expect(text).not.toContain("exceeds every declared context window");
+    expect(text).toContain("served by **cs-ep@fake-cs**"); // the jump target served
+    expect(calls.c0).toBe(1); // paid exactly once, refused on size
+    expect(calls.cs).toBe(1); // sonnet[0], the jump's first servable step — SERVES
+    expect(calls.cd).toBe(0); // the narrower rungs are never paid
+    expect(calls.ch).toBe(0); // armed: no nominal detour
+    expect(calls.cn).toBe(0); // armed sonnet: the step, not the nominal
+    expect(wallLog.some((l) => l.includes("ROLE-JUMP sonnet"))).toBe(true);
+    expect(wallLog.some((l) => l.includes("[ContextAdmission] REFUSE"))).toBe(false);
+  }, 30_000);
+
+  test("C2: same shape, NO sonnet rule (jump disabled) → the census refuses AS TODAY", async () => {
+    // The shared predicate is the gate: with no sonnet rule there is no jump
+    // target, the census must weigh the haiku path alone, and the #565
+    // conservative refusal stands — the number it names is the largest
+    // declared window on the ORIGIN path (128000), zero upstream calls.
+    await spin(undefined, MAP);
+    resetDelegation(
+      {
+        CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+        CLAUDISH_FAILOVER_SONNET: "", // no sonnet rule: the jump cannot fire
+        CLAUDISH_FAILOVER_ACTIVE: "haiku",
+      },
+      MAP // sonnet nominal still MAPPED — mapping alone must not weigh
+    );
+    wallEndpoints = new Set();
+
+    const r = await postMessageBig("claude-haiku-5", BIG);
+
+    expect(r.status).toBe(200); // the recoverable turn, never a bare 400 (#79)
+    const text = await responseText(r);
+    expect(text).toContain("exceeds every declared context window");
+    expect(text).toContain("128000"); // the largest window on the origin path
+    expect(calls.c0).toBe(0); // not one round-trip, on any candidate
+    expect(calls.cd).toBe(0);
+    expect(calls.ch).toBe(0);
+    expect(calls.cs).toBe(0);
+    expect(wallLog.some((l) => l.includes("[ContextAdmission] REFUSE"))).toBe(true);
+    expect(wallLog.some((l) => l.includes("ROLE-JUMP sonnet"))).toBe(false);
   }, 30_000);
 });

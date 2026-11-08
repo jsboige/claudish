@@ -122,6 +122,7 @@ import {
   stripServingNoticesFromRequestBody,
   buildServingNoteForRequest,
   type FailoverRole,
+  type FailoverRule,
 } from "./fork/failover.js";
 import {
   admitSessionBudget,
@@ -467,6 +468,32 @@ export type RoleModelMap = {
  */
 export function isNativeTarget(target: string): boolean {
   return !target.includes("/") && !target.includes("@");
+}
+
+/**
+ * #681/#939 — the ONE predicate for "can a NON-sonnet walk JUMP into the sonnet
+ * cascade", shared by the two call sites that must never drift apart:
+ * the loop's context-skip jump (#681) and the #565 admission census (#939 — the
+ * census may only weigh the sonnet path when the jump could actually fire for
+ * this request). Conditions, verbatim from the arbitration: the walk's role is
+ * defined and not already `sonnet` (single jump by construction), a sonnet rule
+ * exists with at least one step, and sonnet has a mapped nominal — without one,
+ * an unarmed post-jump resolution would target the literal "sonnet" and die at
+ * routing, which is worse than the local advance it replaced.
+ *
+ * The loop additionally requires an actual `reason=context` skip on a non-last
+ * step inside the #431 guard — that part is per-attempt state, not a property
+ * of the path, so it stays at the loop.
+ */
+export function sonnetJumpTarget(
+  fromRole: FailoverRole | null | undefined,
+  modelMap: RoleModelMap | undefined
+): { rule: FailoverRule; nominal: string } | undefined {
+  if (!fromRole || fromRole === "sonnet") return undefined;
+  const rule = getFailoverRule("sonnet");
+  if (!rule || rule.steps.length === 0) return undefined;
+  const nominal = modelMap?.sonnet;
+  return nominal ? { rule, nominal } : undefined;
 }
 
 /**
@@ -1536,6 +1563,25 @@ export async function createProxyServer(
         seen.add(role);
         collectSteps(role);
       }
+      // #939: when the #681 jump could actually fire for this request — the
+      // SAME predicate the loop will consult at its first context skip, one
+      // helper for both sites so they cannot drift — the census also weighs
+      // the SONNET path. An all-declared origin path whose every window is
+      // smaller than the request would otherwise refuse with the #565 numbers
+      // text while the sonnet cascade (armed or nominal) has a declared window
+      // that fits: the request never reaches the skip that would jump it. Only
+      // candidates are ADDED, never removed, so #565's conservative refusal
+      // story is preserved for every request with no jump target — and
+      // fall-open stays global: an undeclared candidate on the sonnet path
+      // stands the whole census down, exactly as on the origin path. `seen`
+      // guards the (already-covered) case of an origin cascade that reaches
+      // sonnet via a `role:` step — its windows are already counted, and
+      // double-weighing a rung would inflate the undeclared tally.
+      const jump = sonnetJumpTarget(role, modelMap);
+      if (jump && !seen.has("sonnet")) {
+        collectWindow(resolveNominalTarget(jump.nominal).target);
+        collectSteps("sonnet");
+      }
       const admission: ContextAdmissionDecision = decideContextAdmission(body, windows, undeclared);
       if (admission.refuse && admission.largest) {
         const text = contextAdmissionRefusalText(admission.estTokens, admission.largest);
@@ -2061,27 +2107,27 @@ export async function createProxyServer(
           // by construction: the target is always "sonnet" and the predicate
           // below excludes an already-sonnet walk, so no ping-pong between
           // cascades. busy/media skips keep today's local advance (#431).
-          if (stepSkip.reason === "context" && role !== "sonnet") {
-            const sonnetRule = getFailoverRule("sonnet");
-            // The unarmed-jump nominal needs modelMap["sonnet"]: without a
-            // mapped nominal, a post-jump unarmed resolution would target the
-            // literal "sonnet" and die at routing (RoutingError, attempt 0 of
-            // the sonnet loop) — worse than the local advance it replaced.
-            const sonnetNominal = modelMap?.sonnet;
-            if (sonnetRule && sonnetRule.steps.length > 0 && sonnetNominal) {
+          if (stepSkip.reason === "context") {
+            // #939: the jump predicate lives in sonnetJumpTarget — ONE helper,
+            // shared with the #565 admission census, so the two sites cannot
+            // drift (the census weighs the sonnet path exactly when this jump
+            // could fire). The `reason=context` part is per-attempt state and
+            // stays here.
+            const jump = sonnetJumpTarget(role, modelMap);
+            if (jump) {
               log(
                 `[Failover] SKIP ${role}[${stepIndex}] reason=context → ROLE-JUMP sonnet[0..] (#681) (${attemptConcreteNow ?? resolved.step?.target ?? "?"}) — entering the sonnet cascade at its first servable step; deepseek stays its last rung`,
                 true // forceConsole — operational event (#681, countable marker)
               );
               skippedSteps.clear(); // haiku/opus indexes must not filter sonnet's steps
               role = "sonnet";
-              rule = sonnetRule;
-              jumpNominal = sonnetNominal;
+              rule = jump.rule;
+              jumpNominal = jump.nominal;
               // #367 class: sonnet's nominal is already concrete — classify it,
               // never run the request-side mapping (the walls arm on the bucket
               // the nominal ACTUALLY draws on).
-              bucket = await concreteStepBucketOf(sonnetNominal);
-              maxAttempts = sonnetRule.steps.length + 1;
+              bucket = await concreteStepBucketOf(jump.nominal);
+              maxAttempts = jump.rule.steps.length + 1;
               attempt = -1; // restart the bounded loop for the sonnet phase
               cascadeRoleJumped = true;
               try {
