@@ -208,8 +208,15 @@ export class SessionManager {
           }
         }, KILL_GRACE_MS);
 
+        // completedAt is deliberately NOT written here. It is the "session is
+        // over" fact and belongs to the process's own exit event: writing it
+        // at kill-SEND made the state claim the child was gone while the OS
+        // was still tearing it down — #533's signal-0 probe flaked exactly
+        // there (~1s after the kill, #921), because the poll landed inside
+        // the kill→exit gap. The exit handler sets it (and writes meta.json)
+        // the moment the PID is actually gone; SIGKILL at KILL_GRACE_MS
+        // bounds how long that can take.
         entry.info.status = "timeout";
-        entry.info.completedAt = new Date().toISOString();
         watcher.forceState("failed", `Timeout after ${timeout}s`);
       }
     }, timeout * 1000);
@@ -279,8 +286,11 @@ export class SessionManager {
     if (entry.timeoutHandle) clearTimeout(entry.timeoutHandle);
     if (entry.killHandle) clearTimeout(entry.killHandle);
 
+    // Same ownership rule as the timeout path: completedAt is the exit event's
+    // to write, not the kill-sender's (see the timeout handler above). The
+    // status/watcher transition is immediate; the "over" timestamp waits for
+    // the PID to actually disappear.
     entry.info.status = "cancelled";
-    entry.info.completedAt = new Date().toISOString();
     entry.watcher.forceState("cancelled", "Session cancelled");
 
     if (!entry.process.killed) {

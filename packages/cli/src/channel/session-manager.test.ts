@@ -371,8 +371,10 @@ describe("SessionManager", () => {
     await waitUntil(
       () => {
         const info = manager.getSession(id);
-        // completedAt is set in the timeout handler (line 208 of session-manager.ts)
-        // before forceState is called, so it's a reliable signal that timeout fired.
+        // completedAt is written by the process's exit event (NOT by the
+        // timeout handler — #921 made exit the single owner), so non-null
+        // here means the kill has actually landed: status said "failed" as
+        // soon as the timeout fired, but "over" is an OS fact.
         return info.completedAt !== null;
       },
       4000,
@@ -380,7 +382,7 @@ describe("SessionManager", () => {
     );
 
     const info = manager.getSession(id);
-    // completedAt was set by the timeout handler
+    // completedAt was set by the exit event (the timeout handler only kills)
     expect(info.completedAt).not.toBeNull();
     // Process was killed: status is "failed" (watcher overrides the transient "timeout")
     expect(["failed", "timeout"]).toContain(info.status);
