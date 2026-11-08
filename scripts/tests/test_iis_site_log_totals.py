@@ -97,6 +97,10 @@ pin("old file never invents machines", t_old["machines"] == {"-": 7}, f"machines
 print("3. MISMATCH_SKIP")
 pin("bad-token line skipped, good lines counted",
     t_bad["requests"] == 7 and t_bad["s5xx"] == 2, f"totals={t_bad}")
+pin("skipped visible in totals", t_bad["skipped"] == 1, f"skipped={t_bad.get('skipped')}")
+pin("clean files skip nothing",
+    t_old["skipped"] == 0 and t_x["skipped"] == 0,
+    f"old={t_old.get('skipped')} x={t_x.get('skipped')}")
 
 print("4. FIELD_ORDER")
 reordered = ["date", "time", "sc-status", "cs-method"]  # status moved to 3rd

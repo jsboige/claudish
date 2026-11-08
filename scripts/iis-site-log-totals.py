@@ -21,8 +21,13 @@ from collections import Counter
 CUSTOM_MACHINE_FIELD = "X-Claudish-Machine"
 
 
-def iter_w3c(path):
-    """Yield {fieldName: value} dicts, anchored on the file's own #Fields line."""
+def iter_w3c(path, stats=None):
+    """Yield {fieldName: value} dicts, anchored on the file's own #Fields line.
+
+    Lines whose token count disagrees with the header are skipped and counted
+    into stats['skipped'] when a stats dict is provided (a silent skip hides
+    data loss from both sides of a reconciliation).
+    """
     fields = None
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -35,6 +40,8 @@ def iter_w3c(path):
             else:
                 parts = line.split()
                 if len(parts) != len(fields):
+                    if stats is not None:
+                        stats["skipped"] += 1
                     continue  # token/field mismatch: skip, never misread
                 yield dict(zip(fields, parts))
 
@@ -42,10 +49,11 @@ def iter_w3c(path):
 def totals(paths):
     """Aggregate one or more W3C files. Returns a plain dict."""
     req = s4 = s5 = 0
+    stats = {"skipped": 0}
     machines = Counter()
     machine_fail = Counter()
     for path in paths:
-        for row in iter_w3c(path):
+        for row in iter_w3c(path, stats):
             req += 1
             status = row.get("sc-status", "")
             m = row.get(CUSTOM_MACHINE_FIELD, "-") or "-"
@@ -55,7 +63,7 @@ def totals(paths):
                 machine_fail[m] += 1
             elif status >= "400":
                 s4 += 1
-    return {"requests": req, "s4xx": s4, "s5xx": s5,
+    return {"requests": req, "s4xx": s4, "s5xx": s5, "skipped": stats["skipped"],
             "machines": dict(machines), "machine_fail": dict(machine_fail)}
 
 
@@ -64,7 +72,7 @@ def main(argv):
         print(__doc__)
         return 2
     t = totals(argv[1:])
-    print(f"requests={t['requests']} 4xx={t['s4xx']} 5xx={t['s5xx']}")
+    print(f"requests={t['requests']} 4xx={t['s4xx']} 5xx={t['s5xx']} skipped={t['skipped']}")
     for m, n in sorted(t["machines"].items(), key=lambda kv: -kv[1]):
         rate = 100 * t["machine_fail"].get(m, 0) / max(n, 1)
         print(f"{m:24s} {n:8d} {t['machine_fail'].get(m, 0):6d} {rate:6.2f}%")
