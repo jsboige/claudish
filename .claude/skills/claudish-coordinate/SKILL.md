@@ -70,6 +70,7 @@ seul le user ou un pair la voit.
 roosync_dashboard(action:"read", type:"workspace", section:"all")   # jamais section:"status" seul
 roosync_messages(action:"inbox", status:"unread", from:":claudish", limit:20)   # DMs des lanes claudish
 roosync_messages(action:"inbox", status:"unread", priority:"URGENT", limit:20)  # filet : URGENT de toute lane
+roosync_messages(action:"inbox", status:"unread", priority:"HIGH", limit:30)    # filet : HIGH d'une AUTRE lane adressé à `:claudish` (colonne À)
 ```
 
 - Lire l'inbox **avant** d'écrire une attente : un go attendu peut y dormir.
