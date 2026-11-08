@@ -49,25 +49,28 @@ services:
     # it is therefore safe, but it is a separate, announced change: a value that
     # cuts streams mid-body is the one mistake this field can make.
     stop_grace_period: 120s
-    # Host bounds (#303, Maintenance bounds mandate 2026-11-07). These three were
-    # ALREADY in force on the running container, applied by `docker update` —
-    # measured po-2028 07/11: Memory=1073741824, MemorySwap=1073741824,
+    # Host bounds (#303, Maintenance bounds mandate 2026-11-07). On po-2028 these
+    # three were ALREADY in force on the running container, applied by `docker
+    # update` — measured 07/11: Memory=1073741824, MemorySwap=1073741824,
     # PidsLimit=512 — while appearing NOWHERE in this file (`git log -S mem_limit`
     # on it: never present) and with no override file (`com.docker.compose.
     # project.config_files` names this file alone). A `docker update` dies at the
     # next recreate, so the bound was one deploy away from reverting silently:
-    # this file is the durable source, and these values EQUAL the measured runtime
-    # state, so the next recreate changes nothing.
+    # this file is the durable source, and for THAT seat the values equal what
+    # already ran, so its next recreate changes nothing.
+    # Sizing evidence (cgroup v2, po-2028, window = the process's whole current
+    # life 15:35Z 07/11 →, i.e. its busiest day — 6 AUTONOMOUS episodes, 45%
+    # local serving): memory.peak = 249.7 MiB, pids.peak = 40, OOMKilled=false —
+    # 1g/512 covers that seat with 4x margin. This measurement covers po-2028
+    # ONLY: other seats are sized from the per-consumer table in #917, and the
+    # HUB's measured peak is what decides whether this default is safe for it.
     # Doctrine: memswap_limit = mem_limit (no swap escape hatch — on these hosts
-    # swap imitates a wedge), pids_limit in 512..4096 and >= 4x the measured PID
-    # count, both above measured usage with margin — 98.95 MiB / 1 GiB and
-    # 31 / 512 pids measured 07/11, OOMKilled=false over the container's life.
-    #
-    # Per-seat overridable on purpose: this one file builds the hub AND every
-    # sidecar, and the hub relays for the whole fleet — a seat that needs more
-    # raises CLAUDISH_MEM_LIMIT / CLAUDISH_PIDS_LIMIT in ITS OWN env file rather
-    # than editing a shared file. The same variable feeds limit and swap, so the
-    # two can never diverge.
+    # swap imitates a wedge), pids_limit in 512..4096 and >= 4x the measured
+    # peak. Per-seat overridable on purpose: this one file builds the hub AND
+    # every sidecar, and the hub relays for the whole fleet — a seat that needs
+    # more raises CLAUDISH_MEM_LIMIT / CLAUDISH_PIDS_LIMIT in ITS OWN env file
+    # rather than editing a shared file. The same variable feeds limit and swap,
+    # so the two can never diverge.
     mem_limit: ${CLAUDISH_MEM_LIMIT:-1g}
     memswap_limit: ${CLAUDISH_MEM_LIMIT:-1g}
     pids_limit: ${CLAUDISH_PIDS_LIMIT:-512}
