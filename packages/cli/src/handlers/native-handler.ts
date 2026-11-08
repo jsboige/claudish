@@ -2,6 +2,7 @@ import type { Context } from "hono";
 import type { ModelHandler } from "./types.js";
 import { log, maskCredential } from "../logger.js";
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
+import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { createResponseCapture, appendUpstreamError } from "./shared/response-capture.js";
 import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
@@ -310,12 +311,23 @@ export class NativeHandler implements ModelHandler {
     // Execute fetch
     // #780: the abort controller reaches the fetch so a client cancel can end
     // the upstream turn instead of letting it run (and bill) to completion.
+    // #909 — gzip the request body toward api.anthropic.com (capability proven:
+    // Claude Code itself sends gzipped bodies in production — anthropics/
+    // claude-code#103218; our credential-free probe showed no regression: the
+    // 401 auth answer is identical plain vs gzipped). Kill switch and floor
+    // live in upstream-compression.ts.
     const upstreamAbort = new AbortController();
     try {
+      const wireBody = compressUpstreamRequestBody({
+        capability: "gzip",
+        headers,
+        body: JSON.stringify(payload),
+        label: `Anthropic-native ${String(payload?.model ?? "claude")}`,
+      });
       const anthropicResponse = await fetch(`${this.baseUrl}/v1/messages`, {
         method: "POST",
         headers,
-        body: JSON.stringify(payload),
+        body: wireBody,
         signal: upstreamAbort.signal,
       });
 

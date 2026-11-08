@@ -27,6 +27,7 @@ import { MiddlewareManager, GeminiThoughtSignatureMiddleware } from "../middlewa
 import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
 import { clientRequestedThinking } from "./shared/client-thinking.js";
 import { clientAttributionEnabled, clientAttributionHeaders } from "./shared/client-attribution.js";
+import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { filterIdentity } from "./shared/openai-compat.js";
 import { stripReasoningContent } from "./shared/format/openai-messages.js";
@@ -1189,11 +1190,19 @@ export class ComposedHandler implements ModelHandler {
 
     // Merge provider-specific fetch options (e.g., undici dispatcher, abort signal)
     const requestInit = this.provider.getRequestInit?.() || {};
+    // #909 — gzip the request body when this transport declared the capability
+    // and the body clears the floor. Returns the plain string otherwise; never throws.
+    const wireBody = compressUpstreamRequestBody({
+      capability: this.provider.requestCompression,
+      headers,
+      body: JSON.stringify(requestPayload),
+      label: `${this.provider.displayName} ${this.targetModel}`,
+    });
     const doFetch = () =>
       fetch(endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify(requestPayload),
+        body: wireBody,
         ...requestInit,
       });
 
@@ -1432,10 +1441,17 @@ export class ComposedHandler implements ModelHandler {
           this.applyClientAttribution(c, retryHeaders);
           retryHeaders["Content-Type"] = "application/json";
           const retryInit = this.provider.getRequestInit?.() || {};
+          // #909 — fresh headers, so the body must be (re)compressed to match.
+          const retryBody = compressUpstreamRequestBody({
+            capability: this.provider.requestCompression,
+            headers: retryHeaders,
+            body: JSON.stringify(requestPayload),
+            label: `${this.provider.displayName} ${this.targetModel}`,
+          });
           const retryResp = await fetch(endpoint, {
             method: "POST",
             headers: retryHeaders,
-            body: JSON.stringify(requestPayload),
+            body: retryBody,
             ...retryInit,
           });
           if (retryResp.ok) {
