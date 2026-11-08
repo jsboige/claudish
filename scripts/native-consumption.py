@@ -91,6 +91,9 @@ def parse_args():
                          "2026-10-15T23:00:00Z (UTC, truncated to the hour, inclusive)")
     ap.add_argument("--until", default="", help="same shapes as --since, exclusive")
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument("--fleet", default="",
+                    help="machines sidecar attendues (separees par des virgules) — "
+                         "active l'avertissement d'angle mort AUTONOMOUS (#933)")
     ap.add_argument("--selftest", action="store_true",
                     help="run the fname_dt parsing checks and exit")
     return ap.parse_args()
@@ -148,6 +151,19 @@ def workspace_of(body_text):
     return best if counts[best] >= 3 else "(inconnu)"
 
 
+def _load_blind_spot():
+    """Declaration de l'angle mort AUTONOMOUS (#933) — lib partagee avec
+    traffic-consumption.py et billed-attrib.py, une seule copie."""
+    import importlib.util
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / "blind_spot.py"
+    spec = importlib.util.spec_from_file_location("blind_spot", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main():
     a = parse_args()
     if a.selftest:
@@ -176,6 +192,23 @@ def main():
                 if until and dt >= until:
                     continue
                 resps.append((dt, m.group(1), e.path))
+    # #933 — l'angle mort AUTONOMOUS se declare AVANT tout verdict lane : le
+    # check est corpus-level, il ne depend pas des captures natives. Une fenetre
+    # sans AUCUNE capture native est precisement le cas outillage-aveugle — le
+    # early-return ci-dessous ne doit pas l'avaler. Fenetre : since/until
+    # declares, sinon l'etendue des resps vues -> maintenant ; sans resps,
+    # since ou 24h en arriere. Les bornes fname_dt sont naives (captures UTC) :
+    # tz-aware pour la lib.
+    from datetime import timezone as _tz
+    fleet = [m.strip() for m in a.fleet.split(",") if m.strip()]
+    _now = datetime.now(_tz.utc)
+    _fallback_start = (resps[0][0] if resps else _now - timedelta(hours=24))
+    w_start = (since if since else _fallback_start).replace(tzinfo=_tz.utc)
+    w_end = (until if until else _now).replace(tzinfo=_tz.utc)
+    for line in _load_blind_spot().render(a.captures_dir, w_start, w_end, fleet):
+        print(line)
+    print()
+
     if not resps:
         print("Aucune capture native dans la fenetre.", file=sys.stderr)
         return 1
