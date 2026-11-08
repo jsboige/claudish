@@ -255,7 +255,7 @@ async function post(
 ): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", ...auth },
+    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", ...auth, "connection": "close" },
     body: JSON.stringify({
       model,
       max_tokens: 16,
@@ -266,7 +266,7 @@ async function post(
 }
 
 async function health(): Promise<any> {
-  const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`);
+  const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/health`, { headers: { connection: "close" } });
   return res.json();
 }
 
@@ -378,7 +378,7 @@ describe("#439 R4/R5 — native passthrough counted exactly once (mark prevents 
     // proxy-server's own swap: same mark, same exactly-once.
     const r5 = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages/count_tokens`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", ...auth },
+      headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", ...auth, "connection": "close" },
       body: JSON.stringify({ model: OPUS, messages: [{ role: "user", content: "hi" }] }),
     });
     expect(r5.status).toBe(200);
