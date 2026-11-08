@@ -187,6 +187,27 @@ export function setMemCatalogForTests(entries: SlimModelEntry[] | null): void {
 let _warmPromise: Promise<void> | null = null;
 
 /**
+ * Test-only reset of BOTH module-level warm slots (same convention as
+ * resetStatsForTests / resetFailoverForTests). The CI suite runs every test
+ * file in ONE process (`bun test --cwd packages/cli`), so `_warmPromise` —
+ * single-flight state — survives across files: a warm started by an earlier
+ * file (proxy-server route tests spin the proxy without stubbing fetch, so
+ * their background warm is a REAL network fetch with an 8s abort budget) can
+ * still be in flight when a later, hermetic file starts. That file's
+ * ensureReady() then races the foreign promise against its own timer and
+ * burns its whole catalog budget waiting on a fetch it never made and cannot
+ * see — measured on CI as the or@ count_tokens route dying at the test's own
+ * 5s default (5025-5033ms), 3/20 runs of main (#921). A file that installs
+ * its own fetch universe calls this in beforeEach so its first resolution
+ * starts cold against ITS stub. `setMemCatalogForTests` alone does not
+ * suffice: it clears the cache but leaves the warm slot occupied.
+ */
+export function resetOpenRouterCatalogForTests(): void {
+  _warmPromise = null;
+  _memCache = null;
+}
+
+/**
  * Resolution chain for OpenRouter model names, powered by Firebase model catalog.
  *
  * 1. Exact match on modelId           (e.g., "grok-4.20" → sources["openrouter-api"].externalId)

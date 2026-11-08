@@ -29,6 +29,7 @@ import { Hono } from "hono";
 import { createProxyServer } from "./proxy-server.js";
 import { parseModelSpec } from "./providers/model-parser.js";
 import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
+import { resetOpenRouterCatalogForTests } from "./providers/catalog-resolvers/openrouter.js";
 import { installStubFetch } from "./test-support/stub-fetch.js";
 import type { ProxyServer } from "./types.js";
 
@@ -148,6 +149,13 @@ let restoreFetch: (() => void) | null = null;
 
 beforeEach(() => {
   sandbox();
+  // #921 — the CI suite runs every file in ONE process, and the catalog's
+  // warm slot is module-level single-flight state: without this reset, a warm
+  // started by an earlier file (real network fetch, 8s abort budget) can
+  // still be in flight here, and every ensureCatalogReady(5000) below races
+  // that foreign promise instead of this file's own stub — the or@ test then
+  // burns its whole 5s default budget on a fetch it never made.
+  resetOpenRouterCatalogForTests();
   egress.length = 0;
   restoreFetch = installStubFetch((req) => {
     if (/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/)/.test(req.url)) {
