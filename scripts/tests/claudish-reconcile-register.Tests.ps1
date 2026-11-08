@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
     reconcile-outage-captures.ps1 -Register (#912 arbitrage a).
 
