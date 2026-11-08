@@ -66,6 +66,15 @@
 
     Unregister-ScheduledTask -TaskName 'ClaudishReconcileOutageCaptures' -Confirm:$false
 
+  CAVEAT — LogonType Interactive: the task fires ONLY while the registering
+  operator is logged on. A logged-off seat does NOT reconcile (no run, no
+  error, no backlog processing until the next logon — StartWhenAvailable
+  catches up at most one missed run). The outage captures themselves are safe:
+  they are written the moment they happen and stay loose until a logged-on run
+  archives them. But every hub-corpus reader is blind for that seat and window
+  in the meantime — which is exactly why the readers declare their blind spot
+  (#933, scripts/lib/blind_spot.py) instead of printing a bare 0.
+
 .NOTES
   Schedule on each sidecar (Task Scheduler), e.g. hourly or a few minutes after a
   watchdog-detected recovery. Idempotent: with no loose captures it is a no-op.
