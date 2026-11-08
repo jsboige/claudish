@@ -1,0 +1,1141 @@
+﻿# Claudish Watchdog — detects tool-call stream hangs and auto-restarts
+#
+# The proxy hangs on tool_call paths (WebSearch, GLM tool_use), not simple text.
+# This watchdog tests the EXACT code path that degrades:
+#   1. A streaming request WITH tools defined (triggers tool_use in the model)
+#   2. Checks that the stream completes within timeout
+#   3. Also checks container uptime — proactive restart at 11h before degradation
+#
+# Every ambiguous stop logs one DIAG[...] line (Write-DiagLine): is the published
+# port actually bound, and does the host have commit headroom. The 02/09 outage
+# (host commit exhaustion — nothing listened on :3000, docker.exe would not
+# launch) had to be reconstructed from the Windows event log after the fact;
+# those two facts now self-classify the incident as it happens.
+#
+# Install (run as admin):
+#   schtasks /create /tn "ClaudishWatchdog" /tr "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File D:\Dev\claudish\scripts\claudish-watchdog.ps1" /sc minute /mo 15 /ru SYSTEM /rl HIGHEST /f
+#
+# On a machine whose operator is not `jsboi`, append the home to that -File
+# argument:  -File D:\Dev\claudish\scripts\claudish-watchdog.ps1 -ClaudishHome C:\Users\<op>\.claudish
+#
+# Logs to: <ClaudishHome>\watchdog.log
+
+param(
+    # Root of the .claudish directory this watchdog logs and checkpoints into.
+    #
+    # It cannot be derived at runtime: the scheduled task runs as SYSTEM, whose
+    # $env:USERPROFILE is the system profile, where no .claudish exists. So the
+    # install line passes it, and the default is the hub operator's home — which
+    # leaves every existing install byte-identical.
+    [string]$ClaudishHome = "C:\Users\jsboi\.claudish"
+)
+
+$ErrorActionPreference = "Stop"
+
+# Fail loudly rather than log nowhere. With $ErrorActionPreference = "Stop" an
+# unwritable log path kills this script at its first Add-Content, before it can
+# say why — which on a scheduled task is indistinguishable from "the
+# watchdog is fine and quiet". This one line is the difference between a
+# diagnosable install and a silent one.
+if (-not (Test-Path $ClaudishHome)) {
+    throw "ClaudishHome '$ClaudishHome' does not exist. Pass -ClaudishHome <path> in the scheduled-task command line."
+}
+
+Import-Module (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1') -Force
+
+$LogPath = "$ClaudishHome\watchdog.log"
+$ProxyPort = 3000
+# The probe URL is the SERVING path, which is not always the loopback path.
+#
+# On 2026-09-20 the Docker Desktop loopback forwarder (`wslrelay`, which owns
+# [::1]:3000 alone) wedged while com.docker.backend's [::]:3000 wildcard kept
+# serving 127.0.0.1, the LAN and the ARR throughout. A watchdog probing the dead
+# door concluded the proxy was down and restarted the container 13 times over
+# 6h47 — every one of them useless, because the process boots fine and the pipe
+# does not. Probing the surviving path makes the watchdog agree with reality.
+#
+# Resolution is per-machine and opt-in through <ClaudishHome>\base-url.txt. No
+# file = localhost = byte-identical behaviour to before, on every other machine.
+#
+# The 27/10 mirror image of that incident, also on po-2023: `wslrelay` owned BOTH
+# loopback families and answered with a reset, while the container served the
+# wildcard (LAN) fine. Probing the dead door alone restarted the healthy
+# container every ~30 min. So the cycle probes the FIRST door that answers, and
+# says so when that is not the first candidate — a shadowed door is not a hung
+# container. Cost where nothing is wrong: one bounded /health request.
+$ProxyCandidates = Get-ClaudishProbeCandidates -ClaudishHome $ClaudishHome -Port $ProxyPort
+$ProxyUrl = Select-ClaudishProbeUrl -Candidates $ProxyCandidates -TimeoutSec 5
+$ContainerName = "claudish-proxy"
+$StreamTimeoutSec = 90
+# Every docker CLI call is bounded by this. Unbounded was the real failure on
+# 2026-09-02 (see Invoke-DockerBounded).
+$DockerTimeoutSec = 20
+$ProactiveRestartHours = 11
+# A restart kills every in-flight SSE stream mid-body; the client reports
+# "Connection lost mid-response" and the agent turn is lost. So: drain first,
+# never restart for a cause a restart cannot fix, and confirm before acting.
+# Two budgets, because the two restarts are not the same situation. A proactive
+# restart is elective: it can afford to hunt for a quiet moment. A hang recovery
+# is not — the proxy is already serving nobody, so waiting only extends the
+# outage.
+$DrainMaxWaitProactiveSec = 300
+$DrainMaxWaitHangSec = 120
+$StateFile = "$ClaudishHome\watchdog-state.json"
+$QuietHourStart = 3             # local hour; proactive restarts only in [start,end)
+$QuietHourEnd = 6
+
+function Write-Log($msg) {
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts] $msg"
+    Add-Content -Path $LogPath -Value $line -Encoding UTF8
+    Write-Host $line
+}
+
+function Test-ProxyWithTools {
+    param([string]$Url, [int]$TimeoutSec)
+
+    # This payload mimics a real Claude Code request WITH tools.
+    # GLM will respond with tool_use or text — either way the stream must complete.
+    # This exercises the exact code path (openai-sse tool_call handling) that hangs.
+    $body = @{
+        model = "glm-5.2"
+        max_tokens = 100
+        stream = $true
+        tools = @(
+            @{
+                name = "Bash"
+                description = "Run a bash command"
+                input_schema = @{
+                    type = "object"
+                    properties = @{
+                        command = @{ type = "string"; description = "The command" }
+                    }
+                    required = @("command")
+                }
+            },
+            @{
+                name = "Read"
+                description = "Read a file"
+                input_schema = @{
+                    type = "object"
+                    properties = @{
+                        file_path = @{ type = "string"; description = "Path" }
+                    }
+                    required = @("file_path")
+                }
+            }
+        )
+        messages = @(
+            @{
+                role = "user"
+                content = "List the current directory using Bash. Do it now."
+            }
+        )
+    } | ConvertTo-Json -Depth 10
+
+    # The hub authenticates /v1/messages with the cluster proxy key. Read it at
+    # runtime from the deployment .env — never hardcode it here (the script is
+    # committed). Absolute path: the scheduled task runs as SYSTEM, where
+    # $env:USERPROFILE points at the wrong profile.
+    $proxyKey = $null
+    try {
+        $envLine = Select-String -Path "D:\Dev\claudish\.env" -Pattern '^\s*CLAUDISH_PROXY_KEY\s*=\s*(.+)\s*$' | Select-Object -First 1
+        if ($envLine) { $proxyKey = $envLine.Matches[0].Groups[1].Value.Trim('"', "'") }
+    } catch {}
+    $headers = @{}
+    if ($proxyKey) { $headers["x-proxy-key"] = $proxyKey }
+    # #345: identify this probe to the hub so central attribution files it under
+    # THIS machine instead of a header-less phantom lane. COMPUTERNAME is
+    # 'MYIA-PO-2023'; Get-ClaudishMachineName normalizes it to the canonical
+    # roster id. $null -> send nothing at all, never a wrong id (a wrong one
+    # forks attribution, which is worse than a missing one).
+    $machineId = Get-ClaudishMachineName $env:COMPUTERNAME
+    if ($machineId) { $headers["X-Claudish-Machine"] = $machineId }
+
+    # Wall-clock bound — and why this is NOT `Invoke-WebRequest -TimeoutSec`.
+    # That parameter bounds only *establishing* the response; it does not bound
+    # reading a streaming body. The proxy sends headers immediately and then
+    # streams, so against a wedged pipeline the cmdlet blocks in the body read
+    # with no timer running at all. On 2026-09-02 that is exactly what happened:
+    # ten consecutive 15-minute probes entered here and none ever returned, so
+    # the HANG SIGNAL 1/2 -> HANG CONFIRMED 2/2 -> restart path was never reached
+    # during a 2h27 fleet-wide outage. A watchdog that cannot conclude is not a
+    # watchdog.
+    #
+    # HttpClient.Timeout covers the whole operation, content read included
+    # (SendAsync defaults to HttpCompletionOption.ResponseContentRead), and the
+    # hard Wait() ceiling below guarantees this function returns even if that
+    # timer itself fails to fire.
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+    $client = $null
+    try {
+        $client = [System.Net.Http.HttpClient]::new()
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+
+        $req = [System.Net.Http.HttpRequestMessage]::new(
+            [System.Net.Http.HttpMethod]::Post, "$Url/v1/messages")
+        $req.Content = [System.Net.Http.StringContent]::new(
+            $body, [System.Text.Encoding]::UTF8, "application/json")
+        foreach ($k in $headers.Keys) {
+            [void]$req.Headers.TryAddWithoutValidation($k, $headers[$k])
+        }
+
+        $sendTask = $client.SendAsync($req)
+        if (-not $sendTask.Wait(($TimeoutSec + 15) * 1000)) {
+            # The ceiling fired, so the client's own timer did not. Reporting a
+            # hang beats blocking here forever, which is the failure being fixed.
+            return @{ Ok = $false; Hang = $true; Detail = "TIMEOUT after ${TimeoutSec}s (hard ceiling) - stream hung" }
+        }
+        $response = $sendTask.Result
+        $status = [int]$response.StatusCode
+
+        # HttpClient does not throw on a non-2xx (Invoke-WebRequest did), so the
+        # wall/wiring verdicts are decided inline instead of in a catch. Same
+        # verdicts, same reasoning: when every cascade step is walled the proxy
+        # correctly answers 429/402, and GLM walls ~2x/day (median 57 min).
+        # Restarting the container cannot lift an upstream quota wall - it only
+        # drops every agent mid-stream.
+        if ($status -ge 400) {
+            if ($status -eq 402 -or $status -eq 429 -or $status -eq 529) {
+                return @{ Ok = $false; Hang = $false; Detail = "upstream wall HTTP $status - not a hang, no restart" }
+            }
+            if ($status -lt 500) {
+                return @{ Ok = $false; Hang = $false; Detail = "client/wiring error HTTP $status - a restart would not fix it" }
+            }
+            return @{ Ok = $false; Hang = $true; Detail = "HTTP error $status" }
+        }
+
+        # Already fully buffered by ResponseContentRead, so this does not block.
+        $content = $response.Content.ReadAsStringAsync().Result
+        if ($null -eq $content) { $content = "" }
+
+        # Stream must contain a terminal event
+        if ($content -match "message_stop") {
+            $hasToolUse = $content -match "tool_use"
+            $type = if ($hasToolUse) { "tool_use+end" } else { "text+end" }
+            return @{ Ok = $true; Hang = $false; Detail = "stream OK ($type, $($content.Length) bytes)" }
+        } elseif ($content.Length -gt 100) {
+            # Got data but no message_stop - suspicious but not fatal
+            return @{ Ok = $false; Hang = $true; Detail = "stream incomplete ($($content.Length) bytes, no message_stop)" }
+        } elseif ($content.Length -gt 0) {
+            return @{ Ok = $false; Hang = $true; Detail = "short response ($($content.Length) bytes): $($content.Substring(0, [Math]::Min(200, $content.Length)))" }
+        } else {
+            return @{ Ok = $false; Hang = $true; Detail = "EMPTY response - stream hung" }
+        }
+    }
+    catch {
+        # The real cause is buried: PS wraps a failing .Wait()/.Result in a
+        # MethodInvocationException, around an AggregateException, around the
+        # TaskCanceledException a timeout actually raises. So walk the whole
+        # chain, and decide on the TYPE - the message is localized (PS 5.1 on a
+        # French host says "Une ou plusieurs erreurs se sont produites") and
+        # would never match an English "timeout".
+        $chain = @()
+        $ex = $_.Exception
+        while ($ex -and $chain.Count -lt 10) {
+            $chain += $ex
+            if ($ex -is [System.AggregateException] -and $ex.InnerExceptions.Count -ge 1) {
+                $ex = $ex.InnerExceptions[0]
+            } else {
+                $ex = $ex.InnerException
+            }
+        }
+        $timedOut = $false
+        foreach ($e in $chain) { if ($e -is [System.OperationCanceledException]) { $timedOut = $true } }
+        $msg = $chain[$chain.Count - 1].Message   # innermost: the informative one
+        if ($timedOut -or $msg -match "timed? ?out" -or $msg -match "timeout") {
+            return @{ Ok = $false; Hang = $true; Detail = "TIMEOUT after ${TimeoutSec}s - stream hung" }
+        }
+        # Connection refused / socket reset land here: the proxy is not answering
+        # at all, which a restart CAN fix.
+        return @{ Ok = $false; Hang = $true; Detail = "error: $msg" }
+    }
+    finally {
+        if ($client) { $client.Dispose() }
+    }
+}
+
+# The drain logic is shared with any other scheduled restart (ClaudishDailyRestart
+# calls the same file standalone), so it lives in one place rather than being
+# copied here.
+#
+# EVERY parameter drain.ps1 declares lands in this scope with ITS default. Keep
+# the originals and restore them below — and when adding a parameter to
+# drain.ps1, check this list.
+$__watchdogHome = $ClaudishHome
+. "$PSScriptRoot\claudish-drain.ps1"
+
+# Dot-sourcing executes drain.ps1's param() DEFAULTS in this scope, which
+# reassigns $LogPath to ...\.claudish\drain.log — silently misdirecting this
+# script's log when run as the user, and fatally (missing dir + Stop) when run
+# by the SYSTEM scheduled task (2026-08-30: exit 1, no log). Re-pin it.
+#
+# $ClaudishHome is clobbered the same way, and more quietly: drain.ps1 defaults
+# it to $env:USERPROFILE\.claudish, so -ClaudishHome was honoured for the state
+# file (computed before this line) and IGNORED for the log (computed after).
+# Measured 2026-09-20 with a sandbox home: state went to the sandbox, two log
+# lines went to the production log — a "sandboxed" run that was not sandboxed.
+# Restore the home FIRST, since $LogPath is derived from it.
+$ClaudishHome = $__watchdogHome
+$LogPath = "$ClaudishHome\watchdog.log"
+$StateFile = "$ClaudishHome\watchdog-state.json"
+
+function Get-State {
+    if (Test-Path $StateFile) {
+        try { return Get-Content $StateFile -Raw | ConvertFrom-Json } catch {}
+    }
+    return [PSCustomObject]@{ consecutiveHangs = 0 }
+}
+
+function Set-State {
+    # Merges into the existing state instead of replacing it.
+    #
+    # The previous shape wrote a fresh object with exactly one field, so any
+    # caller that set the hang counter silently erased everything else. That is
+    # fine while there is one counter and fatal the moment there are two: the
+    # wedge counter would reset on every healthy cycle that touched hangs, and a
+    # confirmation counter that cannot survive a cycle never confirms anything.
+    param(
+        [Nullable[int]]$ConsecutiveHangs = $null,
+        [Nullable[int]]$ConsecutiveWedge = $null,
+        [Nullable[int]]$ConsecutiveGuiZombie = $null,
+        # #530 gap 2: consecutive engine-FATAL cycles. Persisted in the same
+        # file as the other counters because a threshold that cannot survive a
+        # cycle can never confirm anything (see the merge rationale below).
+        [Nullable[int]]$ConsecutiveEngineFatal = $null,
+        # #185: UTC yyyy-MM-dd of the last MEASURED relaunch-preflight verdict.
+        # '' (the default) leaves the stored value untouched — strings cannot
+        # use the Nullable trick, and '' is never a valid stored date.
+        [string]$RelaunchProbeDate = ''
+    )
+    $cur = Get-State
+    $obj = @{
+        consecutiveHangs     = [int](Get-StateField $cur 'consecutiveHangs' 0)
+        consecutiveWedge     = [int](Get-StateField $cur 'consecutiveWedge' 0)
+        consecutiveGuiZombie = [int](Get-StateField $cur 'consecutiveGuiZombie' 0)
+        consecutiveEngineFatal = [int](Get-StateField $cur 'consecutiveEngineFatal' 0)
+    }
+    if ($null -ne $ConsecutiveHangs)     { $obj.consecutiveHangs = [int]$ConsecutiveHangs }
+    if ($null -ne $ConsecutiveWedge)     { $obj.consecutiveWedge = [int]$ConsecutiveWedge }
+    if ($null -ne $ConsecutiveGuiZombie) { $obj.consecutiveGuiZombie = [int]$ConsecutiveGuiZombie }
+    if ($null -ne $ConsecutiveEngineFatal) { $obj.consecutiveEngineFatal = [int]$ConsecutiveEngineFatal }
+    $prevProbe = [string](Get-StateField $cur 'relaunchProbeDate' '')
+    if ($prevProbe) { $obj.relaunchProbeDate = $prevProbe }
+    if (-not [string]::IsNullOrEmpty($RelaunchProbeDate)) { $obj.relaunchProbeDate = $RelaunchProbeDate }
+
+    $dir = Split-Path $StateFile -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $obj | ConvertTo-Json | Set-Content -Path $StateFile -Encoding UTF8
+}
+
+function Get-StateField {
+    # Reads a field from a state object that may predate it. Every state file
+    # already on a fleet machine carries only consecutiveHangs, so a direct
+    # property read returns $null and an [int] cast of $null is 0 — correct by
+    # luck for ints, wrong for the timestamp. Name the default instead.
+    param($StateObj, [string]$Name, $Default)
+    if ($null -eq $StateObj) { return $Default }
+    $p = $StateObj.PSObject.Properties[$Name]
+    if ($null -eq $p -or $null -eq $p.Value) { return $Default }
+    return $p.Value
+}
+
+function Invoke-DockerBounded {
+    # Runs a docker command with a hard wall-clock bound.
+    #
+    # Why. On 2026-09-02 ten consecutive runs wrote "=== Watchdog check ===" and
+    # then nothing at all - for 2h30, across the whole outage. Nothing else can
+    # produce that trace: the very next statement is Step 1's `docker inspect`,
+    # and every branch after it logs. So the CLI itself never answered, and the
+    # stream probe below - however carefully bounded - was never reached. A
+    # watchdog is only as bounded as its FIRST unbounded call.
+    #
+    # Output goes to files, not pipes: a redirected pipe that fills would block
+    # the child before it exits, reintroducing the same hang through the back
+    # door. The commands here emit a few bytes, but the failure being fixed is
+    # precisely the one nobody expected.
+    param([string[]]$DockerArgs, [int]$TimeoutSec = $DockerTimeoutSec)
+
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath "docker" -ArgumentList $DockerArgs -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        # Touching .Handle caches the process handle. Without it, -PassThru hands
+        # back an object whose .ExitCode stays $null after WaitForExit, so every
+        # successful call would read as a failure - and Step 1 would "recover" an
+        # engine that was fine, on every cycle. Caught only by running it.
+        $null = $p.Handle
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch {}
+            return @{ Ok = $false; TimedOut = $true; Code = -1; Out = "" }
+        }
+        $out = ""
+        try { $out = (Get-Content $outFile -Raw -ErrorAction SilentlyContinue) } catch {}
+        if ($null -eq $out) { $out = "" }
+        return @{ Ok = ($p.ExitCode -eq 0); TimedOut = $false; Code = $p.ExitCode; Out = $out.Trim() }
+    }
+    catch {
+        # Start-Process itself failed: docker.exe never launched. That is the
+        # 02/09 signature — under host commit exhaustion the CLI cannot start,
+        # which is how ten runs wrote a banner and nothing else.
+        return @{ Ok = $false; TimedOut = $false; Code = -1; Out = ""; Error = $_.Exception.Message; LaunchFail = $true }
+    }
+    finally {
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-PortListen {
+    param([string]$HostName = "localhost", [int]$Port = 3000, [int]$TimeoutMs = 3000)
+
+    # TcpClient + a bounded Wait, not Test-NetConnection: TNC takes seconds,
+    # writes progress records, and does its own allocations — all bad in a
+    # watchdog that must conclude, possibly on a starved host. Everything is
+    # guarded: with $ErrorActionPreference = Stop a throwing probe would kill
+    # the cycle, and a probe that cannot run on a sick host is worthless.
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $tcp.ConnectAsync($HostName, $Port)
+            try {
+                if (-not $connect.Wait($TimeoutMs)) {
+                    # No answer within budget: black-holed, not merely absent.
+                    return @{ Listening = $false; Detail = "no-answer ${TimeoutMs}ms" }
+                }
+            }
+            catch [System.AggregateException] {
+                # Task.Wait() rethrows the task's own fault. A fast refusal is
+                # the healthy "nothing is bound here" answer — SocketException
+                # in the chain means refused/reset, not a probe failure.
+                $refused = $false
+                $ex = $_.Exception
+                while ($ex) {
+                    if ($ex -is [System.Net.Sockets.SocketException]) { $refused = $true }
+                    if ($ex -is [System.AggregateException] -and $ex.InnerExceptions.Count -ge 1) { $ex = $ex.InnerExceptions[0] } else { $ex = $ex.InnerException }
+                }
+                if ($refused) { return @{ Listening = $false; Detail = "refused" } }
+                return @{ Listening = $false; Detail = "connect error: $($_.Exception.InnerException.Message)" }
+            }
+            if ($tcp.Connected) { return @{ Listening = $true } }
+            return @{ Listening = $false; Detail = "completed but not connected" }
+        }
+        finally { $tcp.Dispose() }
+    }
+    catch {
+        return @{ Listening = $false; Detail = "error: $($_.Exception.Message)" }
+    }
+}
+
+function Get-HostCommit {
+    # Commit charge vs commit limit — the Id 26 "insufficient virtual memory"
+    # early-warning, read in-process (no child process to launch; launching is
+    # exactly what dies under commit exhaustion). Win32_OperatingSystem's
+    # "virtual memory" IS the commit charge pair.
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem `
+            -Property @("TotalVirtualMemorySize", "FreeVirtualMemory") -ErrorAction Stop
+        $limitKB = [double]$os.TotalVirtualMemorySize
+        $freeKB = [double]$os.FreeVirtualMemory
+        if ($limitKB -gt 0) {
+            return @{
+                Ok      = $true
+                UsedPct = [Math]::Round((($limitKB - $freeKB) / $limitKB) * 100, 1)
+                UsedGB  = [Math]::Round(($limitKB - $freeKB) / 1MB, 1)
+                LimitGB = [Math]::Round($limitKB / 1MB, 1)
+            }
+        }
+    }
+    catch {}
+    return @{ Ok = $false }
+}
+
+function Write-DiagLine {
+    # One line at every ambiguous stop, naming both facts the 02/09 postmortem
+    # had to reconstruct after the fact: is the published port bound, and does
+    # the host have commit headroom. Together they self-classify the incident:
+    #   deaf + commit >= 95%  -> host commit exhaustion (container restart useless)
+    #   deaf + headroom       -> engine/port-forwarder, not the container
+    #   listening             -> wiring is fine; suspect the pipeline/upstream
+    param([string]$Tag)
+
+    $port = 3000
+    try { $port = ([uri]$ProxyUrl).Port } catch {}
+    $p = Test-PortListen -Port $port
+    $c = Get-HostCommit
+
+    $portTxt = if ($p.Listening) { "port ${port} LISTENING" } else { "port ${port} DEAF ($($p.Detail))" }
+    $commitTxt = if ($c.Ok) { "commit $($c.UsedPct)% ($($c.UsedGB)/$($c.LimitGB) GB)" } else { "commit n/a" }
+    $verdict = if (-not $p.Listening -and $c.Ok -and $c.UsedPct -ge 95) {
+        "-> host commit exhaustion signature: container restart is useless"
+    }
+    elseif (-not $p.Listening) {
+        "-> port deaf with commit headroom: engine/port-forwarder, not the container"
+    }
+    else {
+        "-> port answers: wiring fine, suspect pipeline/upstream"
+    }
+    Write-Log "DIAG[$Tag]: $portTxt, $commitTxt $verdict"
+}
+
+function Test-HealthAnswers {
+    # Does this exact address answer /health with a 200?
+    param([string]$Url, [int]$TimeoutSec = 5)
+    try {
+        return ((Invoke-WebRequest -Uri "$Url/health" -TimeoutSec $TimeoutSec -UseBasicParsing).StatusCode -eq 200)
+    } catch { return $false }
+}
+
+function Invoke-LoopbackWedgeWatch {
+    <#
+        Tells the Docker Desktop loopback-forwarder wedge apart from a hub hang,
+        and says so. DETECTION ONLY — there is no actuator here, by mandate
+        (jsboige/claudish#172 AC4) and because none would help.
+
+        The wedge signature, confirmed three times on 2026-09-20: something is
+        LISTENING on [::1]:<port> but never answers HTTP, while 127.0.0.1 and
+        the LAN keep serving real tool-call streams. From an operator's seat
+        that is indistinguishable from a hub hang, which is exactly why the
+        container was restarted 13 times in 6h47 — every restart useless (the
+        process boots fine; the pipe does not), and every restart cutting live
+        SSE on every relaying machine. The fleet-wide turn loss that day came
+        from the remediation, not from the wedge.
+
+        So the defect is a DETECTION defect, and the fix is three probes that
+        disagree in a diagnostic way:
+
+            [::1] dead + (127.0.0.1 or LAN) alive -> forwarder wedge
+            all three dead                        -> the hub; the hang path owns it
+            [::1] alive                           -> healthy
+
+        The terminal verdict is ESCALATE: log a greppable label and let a human
+        decide. Only a host reboot rebuilds the forwarder, and an engine
+        teardown is what turned a wedge into a host with no engine at 13:18.
+
+        This function must never throw. It runs after a successful health check,
+        and a watchdog that turns a healthy cycle into a crash is worse than one
+        that misses a wedge.
+    #>
+    # The probes are injectable so every branch can be exercised from
+    # scripts/tests without a real wedge and without touching the host. Defaults
+    # are the live implementations, so production behaviour is unchanged by the
+    # seam. There is deliberately no action parameter: nothing to inject, because
+    # nothing is actuated.
+    param(
+        [bool]$ServingHealthy,
+        [scriptblock]$HealthProbe = $null,
+        [scriptblock]$ListenerProbe = $null
+    )
+
+    # Test-HttpAlive, NOT Test-HealthAnswers: a wedge is "no HTTP answer at
+    # all", and requiring a 200 made this fire on a healthy machine under the
+    # production interpreter (5.1 gets HTTP 400 from [::1] where pwsh 7 gets
+    # 200 — a formatting difference, not a health signal).
+    if (-not $HealthProbe)   { $HealthProbe   = { param($u) Test-HttpAlive -Url $u } }
+    if (-not $ListenerProbe) { $ListenerProbe = { param($p) Test-LoopbackListener -Port $p } }
+
+    try {
+        # AC5: gated, off by default. Checked before any probe runs, so a machine
+        # that never opted in is not even measured.
+        $optIn = Test-WedgeWatchOptIn -ClaudishHome $ClaudishHome
+        if (-not $optIn) { return }
+
+        $st = Get-State
+        $loopbackV6 = Get-LoopbackProbeUrl -Port $ProxyPort
+        $loopbackV4 = "http://127.0.0.1:$ProxyPort"
+
+        # AC1: every probe names its address family explicitly. `localhost` may
+        # never appear here — .NET 5+ falls back IPv6->IPv4 fast enough to report
+        # healthy straight through the very outage this exists to catch.
+        $decision = Get-WedgeDecision `
+            -LoopbackV6Healthy ([bool](& $HealthProbe $loopbackV6)) `
+            -LoopbackV4Healthy ([bool](& $HealthProbe $loopbackV4)) `
+            -ServingHealthy    $ServingHealthy `
+            -LoopbackListening ([bool](& $ListenerProbe $ProxyPort)) `
+            -ConsecutiveWedge  ([int](Get-StateField $st 'consecutiveWedge' 0)) `
+            -OptIn             $optIn
+
+        $where = "[v6=$loopbackV6 v4=$loopbackV4 serving=$ProxyUrl]"
+
+        switch ($decision.Action) {
+            'none' {
+                if ([int](Get-StateField $st 'consecutiveWedge' 0) -gt 0) {
+                    Write-Log "LOOPBACK-WATCH: cleared ($($decision.Reason))"
+                }
+                Set-State -ConsecutiveWedge 0
+            }
+            'arm' {
+                # AC2: one greppable label for the signature, countable over time.
+                Write-Log "FORWARDER-WEDGE $($decision.Reason) $where"
+                Set-State -ConsecutiveWedge $decision.Wedge
+            }
+            'escalate' {
+                Write-Log "FORWARDER-WEDGE $($decision.Reason) $where"
+                Write-Log "FORWARDER-WEDGE ESCALATE: operator action required — do NOT restart the container; only a host reboot rebuilds the forwarder"
+                Write-DiagLine "forwarder-wedge"
+                Set-State -ConsecutiveWedge $decision.Wedge
+            }
+        }
+    } catch {
+        # Swallow deliberately: see the header. Log, never propagate.
+        Write-Log "LOOPBACK-WATCH: internal error, ignored ($($_.Exception.Message))"
+    }
+}
+
+function Invoke-RelaunchPreflightWatch {
+    <#
+        Exercises Test-EngineRelaunchReady during a HEALTHY cycle (#185).
+
+        The #181 execute probe — invoke the just-registered relaunch task and
+        read LastTaskResult back — was structurally unreachable in production:
+        its only call site sat behind `if (-not (Get-Process 'Docker Desktop'))`,
+        i.e. the branch that runs when the GUI is DOWN. The probe's
+        precondition is the GUI being UP. The two are mutually exclusive, so
+        "the rebuild half is proven while nothing is wrong" was never actually
+        tested anywhere (an AC1 blind spot in the review, not a defect in the
+        probe — see #185). This is the closure of the #173 lesson: the rebuild
+        half gets proven on a day when nothing is wrong, not on the day it is
+        needed.
+
+        When this runs the engine is serving, so the probe is free: registering
+        the task is an idempotent overwrite of our own ClaudishEngineRelaunch
+        task. The EXECUTE half follows the #205 arbitration: while the GUI is
+        running, invoking is a single-instance FORWARD that exercises nothing
+        and returns a false 0 (measured po-2025, 2026-09-21) — so the preflight
+        skips without invoking, and the invocation that actually measures the
+        rebuild path happens on the first cycle where the GUI is ABSENT, i.e.
+        exactly when a relaunch might be needed. A skip is free and does NOT
+        consume the day (AC3, #205); only a measured verdict does.
+
+        Consent (AC2b, review of #188): DEFAULT-OFF, on its own
+        <ClaudishHome>\relaunch-preflight.enabled file, checked before anything
+        else — merging this changes nothing on any machine until an operator
+        creates the file. Separate from the wedge watch's file on purpose: that
+        consent covers HTTP GETs, this one registers a task and launches a
+        process, and one consent must not silently carry the other.
+
+        Rate limit (AC2), NAMED: one measured verdict per UTC day. The events
+        that can invalidate the rebuild path between reboots — a Docker
+        Desktop upgrade, a Windows update changing task-registration behaviour
+        — are weeks apart, so a daily probe catches drift within a day, long
+        before the rebuild is needed, while bounding task churn to one
+        invocation/day (every-15-min would be 96/day of pure churn). A
+        measured verdict, pass or fail, consumes the day: a failed probe
+        escalated 96 times a day is noise, and tomorrow's probe is the retry.
+
+        AC4: a failing verdict is LOGGED and ESCALATED, never acted on. This
+        whole feature family is detection-only (#172 AC4): a not-proven
+        rebuild path must change an operator's TODO list, not the machine.
+
+        AC5: this function must never throw and never block a cycle. A throw
+        degrades to "not measured" — NOT to "not ready", which would read as a
+        fault — and leaves the day unconsumed so a transient failure retries
+        next cycle.
+
+        AC3: no teardown, no engine action, on every branch — enforced by a
+        static AST guard with a positive control (claudish-engine.Tests.ps1).
+    #>
+    # Injectable so the wiring (rate limit, verdict handling, state) is testable
+    # without registering a real task. Default is the live call, so production
+    # behaviour carries no seam.
+    param([scriptblock]$Preflight = $null)
+    if (-not $Preflight) { $Preflight = { Test-EngineRelaunchReady } }
+
+    try {
+        # AC2b (review of #188): default-OFF, on its OWN file, checked BEFORE the
+        # rate-limit state is even read — so a machine that never opted in is not
+        # measured, not counted and not written to. The asymmetry the reviewer
+        # measured: Invoke-LoopbackWedgeWatch gates before its probes for a watch
+        # that only issues HTTP GETs; this one registers a scheduled task and
+        # invokes it (an elevated Docker Desktop in the operator's session), so
+        # it cannot be the ungated one. Merging this changes nothing anywhere
+        # until an operator creates the file deliberately.
+        $optIn = Test-RelaunchPreflightOptIn -ClaudishHome $ClaudishHome
+        if (-not $optIn) { return }
+
+        $st = Get-State
+        $last = [string](Get-StateField $st 'relaunchProbeDate' '')
+        $today = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+
+        if ($last -eq $today) { return }
+
+        $lastTxt = $last
+        if (-not $lastTxt) { $lastTxt = 'never' }
+        Write-Log "RELAUNCH-PREFLIGHT: due (last=$lastTxt, policy=1/day UTC)"
+
+        # AC5: any throw from here lands in the catch as "not measured".
+        $verdict = & $Preflight
+
+        if ($null -eq $verdict) {
+            # A preflight that returns nothing did not measure; say so and
+            # retry next cycle rather than manufacturing a verdict.
+            Write-Log "RELAUNCH-PREFLIGHT: not measured this cycle (preflight returned no verdict) — no action taken"
+            return
+        }
+
+        # #205 AC3: a gui-running SKIP is a free look at the process table — it
+        # measured nothing, so it must not consume the day. It ranks with the
+        # THROW branch, not the measured one: on a GUI-autostart machine, a
+        # skip that stamped relaunchProbeDate daily would have the state
+        # certify a daily probe that never measured anything — the same false
+        # green the guard exists to remove, one level up.
+        $isSkip = ($null -ne $verdict.PSObject.Properties['Skipped']) -and [bool]$verdict.Skipped
+        if ($isSkip) {
+            $checks = (@($verdict.Checks) -join ',')
+            Write-Log "RELAUNCH-PREFLIGHT: SKIPPED (gui-running) — $($verdict.Reason) checks=[$checks] (day NOT consumed; the first GUI-absent cycle performs the measurement)"
+            return
+        }
+
+        # Measured, so the day is consumed — pass or fail (see header: a failed
+        # probe retried every cycle would escalate 96 times/day).
+        Set-State -RelaunchProbeDate $today
+
+        $checks = (@($verdict.Checks) -join ',')
+        if ($verdict.Ready) {
+            # AC1: one line per probe, verdict + checks, countable over time.
+            Write-Log "RELAUNCH-PREFLIGHT: OK — $($verdict.Reason) checks=[$checks]"
+        } else {
+            # AC4: escalate as a log line only — detection-only mandate. The
+            # SKIPPED variant never lands here (it reports Ready=$true), so a
+            # FAILED verdict always names the broken stage.
+            Write-Log "RELAUNCH-PREFLIGHT: FAILED — $($verdict.Reason) checks=[$checks]"
+            Write-Log "RELAUNCH-PREFLIGHT ESCALATE: the engine-rebuild path is NOT proven — operator attention required; NO action taken (detection only)"
+        }
+    } catch {
+        # AC5: "not measured", never "not ready" — and the day is NOT consumed.
+        # Test-EngineRelaunchReady is built not to throw; reaching here means
+        # something truly unexpected, and the cycle's own verdict stands.
+        Write-Log "RELAUNCH-PREFLIGHT: not measured this cycle ($($_.Exception.Message)) — no action taken"
+    }
+}
+
+# Step 0: Engine recovery. After a reboot the Docker Desktop backend can die
+# outright ("backend process exited") — docker CLI then fails with rc 28/125 and
+# `docker start` is useless. Observed 2026-08-29: the first reboot of the hub
+# machine came back with no container for exactly this reason, and a human had
+# to reboot a second time. Start the service, then launch Docker Desktop in the
+# interactive user session via a helper task (SYSTEM cannot own the GUI app),
+# then wait, bounded, for the engine to answer.
+function Test-DockerEngine {
+    return (Invoke-DockerBounded @("version")).Ok
+}
+
+function Start-DockerEngine {
+    # Gap 3 of #530: this glue (engine-down -> GUI absent -> relaunch ready ->
+    # task start -> bounded recovery wait) had no seam of any kind — the only
+    # way to execute its logic was a real engine-down on the production hub,
+    # which is exactly the situation where nobody wants to discover a wiring
+    # bug. Same idiom as the wedge/preflight watches above: every probe and
+    # actuator is a scriptblock parameter defaulting to the LIVE call, so
+    # production behaviour is byte-identical, and
+    # scripts/tests/claudish-watchdog-relaunch.Tests.ps1 exercises the matrix
+    # with spies — never Docker, never the service manager, never the real
+    # task scheduler.
+    param(
+        [scriptblock]$EngineProbe = $null,
+        [scriptblock]$ServiceStarter = $null,
+        [scriptblock]$GuiProcessProbe = $null,
+        [scriptblock]$RelaunchReady = $null,
+        [scriptblock]$TaskStarter = $null,
+        [scriptblock]$RecoveryTick = $null
+    )
+    if (-not $EngineProbe)     { $EngineProbe     = { Test-DockerEngine } }
+    if (-not $ServiceStarter)  { $ServiceStarter  = { try { Start-Service com.docker.service -ErrorAction SilentlyContinue } catch {} } }
+    if (-not $GuiProcessProbe) { $GuiProcessProbe = { Get-Process "Docker Desktop" -ErrorAction SilentlyContinue } }
+    if (-not $RelaunchReady)   { $RelaunchReady   = { Test-EngineRelaunchReady } }
+    if (-not $TaskStarter)     { $TaskStarter     = { param($n) Start-ScheduledTask -TaskName $n } }
+    if (-not $RecoveryTick)    { $RecoveryTick    = { Start-Sleep -Seconds 10 } }
+
+    if (& $EngineProbe) { return $true }
+    Write-Log "ENGINE-DOWN: docker CLI cannot reach the engine — recovering"
+    Write-DiagLine "engine-down"
+    & $ServiceStarter
+    if (-not (& $GuiProcessProbe)) {
+        # This relaunch had NEVER worked on any machine until 2026-09-20.
+        #
+        # The call here used to be
+        #     Register-ScheduledTask -TaskName $h -Action $a `
+        #         -User "$env:COMPUTERNAME\jsboige" -LogonType Interactive ...
+        # and Register-ScheduledTask has no -LogonType parameter — it belongs to
+        # New-ScheduledTaskPrincipal. So it threw ParameterBindingException on
+        # every single invocation, its own catch swallowed the error, and the
+        # only trace was "could not launch Docker Desktop". That is almost
+        # certainly why the hub came back from its 2026-08-29 reboot with no
+        # container and a human had to reboot a second time; and it is exactly
+        # what turned a loopback wedge into a host with no engine at 13:18 on
+        # 2026-09-20, because a teardown ran ahead of a rebuild nobody had tried.
+        #
+        # Test-EngineRelaunchReady performs the registration AND reads the task
+        # back, so "can we relaunch?" is answered by doing it, not by assuming.
+        # Pinned by scripts/tests/claudish-engine.Tests.ps1 (AST check: no script
+        # may pass -LogonType to Register-ScheduledTask).
+        $ready = & $RelaunchReady
+        if ($ready.Ready) {
+            try {
+                & $TaskStarter "ClaudishDockerDesktopStart"
+                Write-Log "ENGINE: Docker Desktop launch requested in user session (relaunch path proven: $($ready.Checks -join ','))"
+            } catch {
+                Write-Log "ENGINE: relaunch task proven but would not start ($($_.Exception.Message))"
+            }
+        } else {
+            Write-Log "ENGINE: cannot launch Docker Desktop — relaunch path NOT proven ($($ready.Reason)); checks=$($ready.Checks -join ',')"
+        }
+    }
+    for ($i = 1; $i -le 12; $i++) {
+        & $RecoveryTick
+        if (& $EngineProbe) {
+            Write-Log "ENGINE: recovered after $($i * 10)s"
+            return $true
+        }
+    }
+    Write-Log "ENGINE: still down after 120s — FATAL this cycle (next run retries)"
+    return $false
+}
+
+# Gap 1 of #530: name the zombie-GUI state — engine down while the Docker
+# Desktop GUI process is PRESENT, persisting across cycles. Until this watch,
+# that state was invisible: the GUI's existence suppresses the relaunch path
+# (Start-DockerEngine above), so the cycle just logs ENGINE-DOWN and FATALs,
+# again and again, and nothing distinguishes "recovering" from "held dead by a
+# zombie GUI" (the 2026-08-29 shape, where a human had to reboot twice).
+#
+# Detection is DEFAULT-ON and pure-read (one bounded docker probe + one
+# process-table look). The kill half is behind its OWN consent file
+# (gui-zombie-kill.enabled, Test-GuiZombieKillOptIn) because killing a
+# user-session GUI from a SYSTEM scheduled task is invasive and must never be
+# a default. Even armed, the kill touches ONLY the GUI process — never
+# com.docker.service, never docker — so the proven GUI-absent relaunch path
+# fires on the next cycle and performs the actual recovery.
+#
+# Same seam idiom as the watches above: every probe is a scriptblock
+# defaulting to the LIVE call, pinned by the gap-1 Describe of
+# scripts/tests/claudish-watchdog-relaunch.Tests.ps1.
+function Invoke-EngineZombieWatch {
+    param(
+        [scriptblock]$EngineProbe = $null,
+        [scriptblock]$GuiProcessProbe = $null,
+        [scriptblock]$GuiKiller = $null
+    )
+    if (-not $EngineProbe)     { $EngineProbe = { Test-DockerEngine } }
+    if (-not $GuiProcessProbe) { $GuiProcessProbe = { Get-Process "Docker Desktop" -ErrorAction SilentlyContinue } }
+    if (-not $GuiKiller)       { $GuiKiller = { Stop-Process -Name "Docker Desktop" -ErrorAction SilentlyContinue } }
+
+    try {
+        # Consent read BEFORE anything could act on it: an unarmed machine
+        # gets the detection (free, names the state) but never even constructs
+        # a kill verdict.
+        $killArmed = Test-GuiZombieKillOptIn -ClaudishHome $ClaudishHome
+
+        $st = Get-State
+        $decision = Get-EngineZombieDecision `
+            -EngineUp   ([bool](& $EngineProbe)) `
+            -GuiPresent ([bool](& $GuiProcessProbe)) `
+            -ConsecutiveZombie ([int](Get-StateField $st 'consecutiveGuiZombie' 0)) `
+            -KillArmed  $killArmed
+
+        Set-State -ConsecutiveGuiZombie $decision.Streak
+
+        switch ($decision.Action) {
+            'arm' {
+                Write-Log "ENGINE-ZOMBIE: $($decision.Reason)"
+            }
+            'escalate' {
+                Write-Log "ENGINE: GUI zombie suspected (streak=$($decision.Streak)) — $($decision.Reason)"
+                Write-Log "ENGINE: GUI zombie ESCALATE: operator attention required — the GUI holds the relaunch path dead; a kill (if consented) only hands recovery to the next cycle"
+                Write-DiagLine "gui-zombie"
+                if ($decision.Kill) {
+                    try {
+                        & $GuiKiller
+                        Write-Log "ENGINE: GUI zombie kill requested (consent gui-zombie-kill.enabled) — the GUI-absent relaunch path fires next cycle"
+                    } catch {
+                        Write-Log "ENGINE: GUI zombie kill failed ($($_.Exception.Message)) — detection stands, no further action this cycle"
+                    }
+                }
+            }
+            'none' { }
+        }
+    } catch {
+        # Same discipline as the wedge watch: a watch that can kill a cycle is
+        # strictly worse than one that logs its own failure.
+        Write-Log "ENGINE-ZOMBIE-WATCH: internal error, ignored ($($_.Exception.Message))"
+    }
+}
+
+# Gap 2 of #530: a FATAL line used to be log-only. Four of them across the
+# 73-min outage of 2026-10-18 stayed silent seat-side — the fleet learned about
+# the dead hub from relay heartbeats before the hub seat produced any signal.
+# The watchdog cannot open a network channel from a SYSTEM scheduled task (that
+# is an architecture ask, not a patch), so past a streak threshold it writes a
+# MARKER journal under ~/.claudish/ — the same shape as the model-version and
+# session-watch journals the worker cycle already relays with watermark
+# discipline. Escalation therefore arrives at the worker cadence (<=5 h), never
+# inside the outage: the same-cycle rule binds the organ that DETECTS, and
+# today that organ is the relay heartbeat.
+#
+# One line per CROSSING, not per cycle (Get-EngineFatalStreakDecision owns that
+# rule): an engine stuck for hours must not rewrite the journal every 15 min.
+function Register-EngineFatal {
+    param([string]$Reason = 'engine fatal')
+
+    try {
+        $st = Get-State
+        $prev = [int](Get-StateField $st 'consecutiveEngineFatal' 0)
+        $decision = Get-EngineFatalStreakDecision -ConsecutiveFatal $prev
+        Set-State -ConsecutiveEngineFatal $decision.Streak
+
+        Write-Log "ENGINE-FATAL-STREAK: $($decision.Streak) consecutive FATAL cycle(s) — $Reason"
+        if ($decision.Action -ne 'escalate') { return }
+
+        if ($decision.WriteMarker) { $markerNote = Get-EngineFatalStreakMarkerName } else { $markerNote = 'already written' }
+        Write-Log "ENGINE-FATAL-ESCALATE: $($decision.Reason). Marker '$markerNote' for the worker-cycle relay"
+        Write-DiagLine 'engine-fatal-streak'
+        if (-not $decision.WriteMarker) { return }
+
+        $marker = Join-Path $ClaudishHome (Get-EngineFatalStreakMarkerName)
+        $line = '{0} streak={1} reason={2}' -f ([DateTimeOffset]::UtcNow.ToString('o')), $decision.Streak, $Reason
+        # No BOM, no PS7-only parameter: the scheduled tasks run Windows
+        # PowerShell 5.1, where `Add-Content -Encoding UTF8` writes a BOM and a
+        # BOM'd journal breaks naive parsers downstream.
+        [System.IO.File]::AppendAllText($marker, $line + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        # Same discipline as the zombie watch: an escalation helper that can
+        # kill the cycle is strictly worse than one that logs its own failure.
+        # The FATAL exit still happens at the call site.
+        Write-Log "ENGINE-FATAL-STREAK: internal error, ignored ($($_.Exception.Message))"
+    }
+}
+
+# The reset half. Recovery is not a failure decision, so it lives here and not
+# in the pure function: it must also clear the journal, and leaving a marker
+# behind after recovery would make the relay report an outage that ended.
+function Reset-EngineFatalStreak {
+    try {
+        $st = Get-State
+        $prev = [int](Get-StateField $st 'consecutiveEngineFatal' 0)
+        if ($prev -eq 0) { return }
+        Set-State -ConsecutiveEngineFatal 0
+        $marker = Join-Path $ClaudishHome (Get-EngineFatalStreakMarkerName)
+        if (Test-Path $marker) {
+            # Named marker file only — never a wildcard, never a directory.
+            Remove-Item -Path $marker -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log "ENGINE-FATAL-STREAK: reset after an engine-healthy cycle (was $prev)"
+    } catch {
+        Write-Log "ENGINE-FATAL-STREAK: reset failed, ignored ($($_.Exception.Message))"
+    }
+}
+
+# --- Main ---
+# Dot-sourcing this file loads its functions without running a cycle, the same
+# idiom claudish-drain.ps1 already uses (its standalone block is guarded by the
+# same test). That is what lets scripts/tests exercise the wedge glue —
+# Invoke-LoopbackWedgeWatch's branches — against injected probes instead of
+# against a real wedge on the production hub. The previous attempt at this
+# feature had no such seam: the only way to run its logic was to ship it.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+Write-Log "=== Watchdog check ==="
+if ($ProxyCandidates.Count -gt 1 -and $ProxyUrl -ne $ProxyCandidates[0]) {
+    Write-Log "PROBE-SHADOW: $($ProxyCandidates[0]) did not answer /health — probing $ProxyUrl instead (same published port; a shadowed door is not a hung container)"
+}
+
+# Name the artifact that is actually executing, once per cycle.
+#
+# The scheduled tasks run these scripts DIRECTLY from a git working tree, so an
+# edit is in production at the next tick with no deployment step and no review
+# gate (measured across the fleet 2026-09-20: po-2025 runs this file from
+# D:\Dev\claudish\scripts\ every 15 min; po-2023 runs compress-captures.ps1 from
+# the same kind of tree nightly). That is how the remediation which took a host's
+# engine down reached production — by being edited, not by being deployed.
+#
+# Answering "what is armed here?" previously required an elevated session and
+# two instruments that are both blind (a non-elevated Get-ScheduledTask cannot
+# see a SYSTEM task; watchdog.log is hardcoded to an operator path that does not
+# exist on every machine). One line per cycle makes it a grep instead.
+#
+# Wrapped because this is observability, not function: a watchdog that dies on
+# its own provenance line is strictly worse than one that does not print it.
+try {
+    $prov = Get-ScriptProvenance -ScriptRoot $PSScriptRoot
+    Write-Log $prov.Summary
+}
+catch {
+    Write-Log "PROVENANCE: unavailable ($($_.Exception.Message))"
+}
+
+# #530 gap 1: one zombie-GUI read per cycle, right after provenance and before
+# the container steps. On a healthy cycle this costs one bounded docker probe
+# and a streak reset; on a zombie cycle it names the state that used to be
+# invisible between "ENGINE-DOWN" and "FATAL". It never repairs anything
+# itself — killing (consented) only hands the machine to the proven relaunch
+# path one cycle earlier.
+Invoke-EngineZombieWatch
+
+# Step 1: Container running?
+$inspect = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")
+if ($inspect.TimedOut) {
+    # The 2026-09-02 signature, now named instead of deduced from an absence.
+    # No answer at all is an engine fault, which the recovery path can act on.
+    Write-Log "DOCKER-TIMEOUT: inspect did not answer within ${DockerTimeoutSec}s — engine not responding"
+    Write-DiagLine "docker-timeout"
+    if (-not (Start-DockerEngine)) {
+        Register-EngineFatal "inspect timed out and the engine did not recover within 120s"
+        exit 1
+    }
+    $inspect = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")
+    if ($inspect.TimedOut) {
+        Write-Log "FATAL: docker still not answering after engine recovery"
+        Register-EngineFatal "docker still not answering after engine recovery"
+        exit 1
+    }
+}
+$containerStatus = $inspect.Out
+if (-not $inspect.Ok -or $containerStatus -ne "running") {
+    if ($inspect.LaunchFail) {
+        # Distinguished from a CLI error: the process never started at all.
+        # On 02/09 this fired 3x (docker.exe) and 6x (cmd.exe) silently.
+        Write-Log "DOCKER-LAUNCH-FAIL: docker.exe would not start ($($inspect.Error)) — commit-exhaustion signature"
+        Write-DiagLine "docker-launch-fail"
+    }
+    if (-not $inspect.Ok) {
+        # CLI answered but failed — engine down, not just the container.
+        if (-not (Start-DockerEngine)) {
+            Register-EngineFatal "docker CLI answered but the engine was down and did not recover within 120s"
+            exit 1
+        }
+    }
+    Write-Log "CRITICAL: Container not running (status=$containerStatus). Starting..."
+    # A start can legitimately take a while; bound it well above that, not at 20s.
+    [void](Invoke-DockerBounded @("start", $ContainerName) -TimeoutSec 120)
+    Start-Sleep -Seconds 15
+    $recheck = (Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.Status}}")).Out
+    if ($recheck -eq "running") {
+        Write-Log "RECOVERED: Container started"
+        # The engine answered and the container is up — the FATAL streak is over.
+        Reset-EngineFatalStreak
+    } else {
+        Write-Log "FATAL: Container won't start (status=$recheck)"
+        # Same escalation organ as an engine FATAL: a container that will not
+        # start is a serving outage of the same class, and the reason string
+        # keeps the two distinguishable in the journal.
+        Register-EngineFatal "container would not start (status=$recheck)"
+        exit 1
+    }
+    exit 0
+}
+
+# The engine answered and the container is running: whatever FATAL streak the
+# state file carries is over, and the escalation marker (if any) must not
+# survive into a healthy fleet view. This ONE reset covers every later path of
+# the cycle (proactive, healthy, degraded, hang): none of them can recover the
+# ENGINE mid-cycle — inspect just confirmed it answers — so no branch below
+# resets again (#618 review: the per-branch resets were no-ops, always seeing
+# prev=0 after this line). The RECOVERED reset above stays load-bearing: that
+# path exits before this line. Both sites are pinned by the Main-wiring AST
+# guard in claudish-watchdog-fatal-streak.Tests.ps1.
+if ($inspect.Ok -and $containerStatus -eq "running") { Reset-EngineFatalStreak }
+
+# Step 2: Uptime check
+$startedAtRes = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{.State.StartedAt}}")
+if (-not $startedAtRes.Ok) {
+    Write-Log "DOCKER: uptime unreadable (timedOut=$($startedAtRes.TimedOut) code=$($startedAtRes.Code)) — skipping the proactive branch this cycle"
+    $startedAtRes.Out = [DateTimeOffset]::UtcNow.ToString("o")
+}
+$startedAt = $startedAtRes.Out
+$startTime = [DateTimeOffset]::Parse($startedAt)
+$uptime = [DateTimeOffset]::UtcNow - $startTime
+$uptimeHours = [Math]::Round($uptime.TotalHours, 1)
+
+# Step 2b: Failover cascade gate. A bare `docker compose up` (no --env-file)
+# interpolates every ${CLAUDISH_FAILOVER_*:-} to EMPTY — the container boots
+# green and /health stays OK, but no role can ever arm (measured 2026-09-07 and
+# 2026-09-17 13:45Z: 3h17 serving with voided cascades, agents grinding against
+# upstream 429s with nowhere to fall). Warn on EVERY cycle until fixed: the
+# repeating banner is the signal. No restart here — a plain restart PRESERVES the
+# voided env; the fix is a recreate WITH the real env file.
+$envRes = Invoke-DockerBounded @("inspect", $ContainerName, "--format", "{{range .Config.Env}}{{println .}}{{end}}")
+if ($envRes.Ok) {
+    $voided = @()
+    foreach ($var in @("CLAUDISH_FAILOVER_OPUS", "CLAUDISH_FAILOVER_SONNET",
+                       "CLAUDISH_FAILOVER_HAIKU", "VLLM_API_KEY")) {
+        $m = [regex]::Match($envRes.Out, "(?m)^${var}=(.*)$")
+        if (-not $m.Success -or $m.Groups[1].Value.Trim().Length -eq 0) { $voided += $var }
+    }
+    if ($voided.Count -gt 0) {
+        Write-Log "FAILOVER-CONFIG-VOID: empty/missing env for $($voided -join ',') — a bare 'docker compose up' voided the env; fix = recreate WITH the real .env (claudish-drain.ps1 -Recreate -EnvFile <path>), NOT a restart"
+    }
+}
+
+# Step 3: Proactive restart if uptime > threshold (prevent degradation BEFORE it happens)
+# An uptime THRESHOLD drifts through the clock: an 11h period restarts at 09:00,
+# then 20:00, then 07:00... landing mid-workday roughly every other time. Gate it
+# on a quiet local window instead, so the one unavoidable daily restart never
+# happens while the fleet is working.
+$nowHour = (Get-Date).Hour
+$inQuietWindow = ($nowHour -ge $QuietHourStart -and $nowHour -lt $QuietHourEnd)
+if ($uptimeHours -ge $ProactiveRestartHours) {
+    if (-not $inQuietWindow) {
+        Write-Log "PROACTIVE: uptime ${uptimeHours}h >= ${ProactiveRestartHours}h but outside the quiet window ${QuietHourStart}h-${QuietHourEnd}h — deferring (a healthy proxy is not an emergency)"
+    } else {
+        Write-Log "PROACTIVE: uptime ${uptimeHours}h >= ${ProactiveRestartHours}h, quiet window — draining then restarting..."
+        Invoke-ClaudishDrainedRestart -Reason "proactive uptime ${uptimeHours}h" -Container $ContainerName -Url $ProxyUrl -MaxWait $DrainMaxWaitProactiveSec
+        $result = Test-ProxyWithTools -Url $ProxyUrl -TimeoutSec 60
+        Write-Log "After proactive restart: $($result.Detail)"
+        Set-State -ConsecutiveHangs 0
+        # No engine-FATAL reset here: the early reset on the running path
+        # already cleared it — the engine answered all cycle (#618 review).
+        exit $(if ($result.Ok) { 0 } else { 1 })
+    }
+}
+
+# Step 4: Real tool-call streaming test
+$result = Test-ProxyWithTools -Url $ProxyUrl -TimeoutSec $StreamTimeoutSec
+
+$state = Get-State
+$consecutive = [int]$state.consecutiveHangs
+
+if ($result.Ok) {
+    Write-Log "OK (uptime=${uptimeHours}h). $($result.Detail)"
+    Set-State -ConsecutiveHangs 0
+    Invoke-LoopbackWedgeWatch -ServingHealthy $true
+    # #185: the healthy cycle is the only moment the execute probe of the
+    # relaunch preflight CAN run — it needs the Desktop GUI up, the exact
+    # opposite of the recovery path that used to be its only call site.
+    # Rate-limited and fault-isolated inside Invoke-RelaunchPreflightWatch.
+    Invoke-RelaunchPreflightWatch
+    exit 0
+}
+
+if (-not $result.Hang) {
+    # Real failure, wrong remedy. Log it loudly and leave the container alone.
+    Write-Log "DEGRADED (uptime=${uptimeHours}h): $($result.Detail) — NO restart (a restart cannot fix this)"
+    Set-State -ConsecutiveHangs 0
+    # No engine-FATAL accounting: the engine answered (inspect + a real
+    # streaming probe reached the proxy) — the early reset already ran.
+    exit 0
+}
+
+# Hang signal. One failed 90s probe is not proof: the proxy may simply be under
+# load. Require two consecutive cycles (~15 min apart), mirroring the relay's own
+# failover hysteresis, before paying the cost of dropping every live stream.
+$consecutive = $consecutive + 1
+if ($consecutive -lt 2) {
+    Write-Log "HANG SIGNAL 1/2 (uptime=${uptimeHours}h): $($result.Detail) — waiting for confirmation next cycle, NO restart"
+    Write-DiagLine "hang-signal"
+    Set-State -ConsecutiveHangs $consecutive
+    exit 0
+}
+
+Write-Log "HANG CONFIRMED 2/2 (uptime=${uptimeHours}h): $($result.Detail)"
+Write-DiagLine "hang-confirmed"
+Invoke-ClaudishDrainedRestart -Reason "confirmed hang" -Container $ContainerName -Url $ProxyUrl -MaxWait $DrainMaxWaitHangSec
+Set-State -ConsecutiveHangs 0
+
+$result2 = Test-ProxyWithTools -Url $ProxyUrl -TimeoutSec 60
+if ($result2.Ok) {
+    Write-Log "RECOVERED: $($result2.Detail)"
+} else {
+    Write-Log "CRITICAL: Still broken after restart: $($result2.Detail)"
+    Write-DiagLine "post-restart-fail"
+    exit 1
+}

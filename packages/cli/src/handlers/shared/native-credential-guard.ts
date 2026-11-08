@@ -1,0 +1,219 @@
+/**
+ * #296 — native-lane credential guard (forms A and B).
+ *
+ * The native passthrough used to forward whatever credential state the swap
+ * left behind, and the hub holds no Anthropic credential, so two request
+ * shapes reached api.anthropic.com with no chance of success:
+ *
+ *  - **A — no credential at all.** The client's token matched a proxy key, the
+ *    swap deleted both auth headers, and with no stored `apiKey` to substitute
+ *    the request left unauthenticated. The client saw the upstream's opaque
+ *    401 and both WAN reporters spent a diagnosis cycle on their own token
+ *    (measured 30/09–01/10: 40 × `Invalid Bearer <redacted>`).
+ *  - **B — a foreign credential.** The client passes the gate on a valid
+ *    `x-proxy-key` and also sends a Bearer that belongs to another party
+ *    (another provider's key, a pre-rotation cluster key). The swap does not
+ *    match it, so it was forwarded verbatim — a third party received a token
+ *    it should never see, on every request. Same class as #282, closed for
+ *    `x-proxy-key` but not for the client's own foreign Bearer.
+ *
+ * Both shapes are refused locally, labeled, with zero upstream fetch. The
+ * marker carries NOTHING derived from the token — no prefix, no length, no
+ * fingerprint — the shape letter is the whole diagnosis.
+ *
+ * Deliberately out of scope ("must not change", #296):
+ *  - an `sk-ant-*` credential (OAuth Bearer or API key — the ai-01
+ *    passthrough) forwards untouched;
+ *  - the swap when a stored `apiKey` exists — the substituted credential is
+ *    the operator's own choice;
+ *  - the `CLAUDISH_NO_ANTHROPIC` reroute, which resolves before the handler.
+ *
+ * Shared by `NativeHandler.handle` AND the native `count_tokens` path in
+ * proxy-server.ts, same contract as `stripProxyOwnHeaders`.
+ */
+
+import { wrapAnthropicError } from "./anthropic-error.js";
+
+/**
+ * Kill switch: `CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD=0`, read per request
+ * (mirrors `CLAUDISH_NATIVE_MODEL_PIN`). Only an explicit "0" disarms — if
+ * Anthropic ever changes its credential prefix, the labeled refusal makes the
+ * breakage visible on the first request and this switch restores the
+ * passthrough without a deploy.
+ */
+function guardDisabled(): boolean {
+  return process.env.CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD === "0";
+}
+
+/**
+ * The Anthropic-shape predicate, extracted (#315) so every site that must ask
+ * "is this credential Anthropic's?" shares ONE answer instead of carrying
+ * copies that drift. The native refusal (#296 B), the mixed strip (#305) and
+ * the vision fallback (#315) all branch on this single prefix.
+ *
+ * Takes the TOKEN (Bearer already unwrapped on the caller's side).
+ */
+export function isAnthropicShapedCredential(value: string): boolean {
+  return value.startsWith("sk-ant-");
+}
+
+/**
+ * Which refusal shape (if any) the post-swap credential state represents.
+ *
+ * @param postSwapHeaders       headers as they would leave for api.anthropic.com
+ *                              (after the hop-by-hop filter, the #282 strip and
+ *                              the proxy-key swap)
+ * @param credentialSubstituted whether the swap substituted a stored `apiKey`
+ */
+export function nativeCredentialRefusalShape(
+  postSwapHeaders: Record<string, string>,
+  credentialSubstituted: boolean
+): "A" | "B" | null {
+  if (guardDisabled()) return null;
+  // The substituted credential is the operator's stored key — the
+  // swap-with-apiKey path is explicitly exempt.
+  if (credentialSubstituted) return null;
+  const auth = postSwapHeaders.authorization ?? "";
+  const apiKey = postSwapHeaders["x-api-key"] ?? "";
+  const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  const hasCredential = bearerToken.length > 0 || apiKey.length > 0;
+  const anthropicShaped =
+    isAnthropicShapedCredential(bearerToken) || isAnthropicShapedCredential(apiKey);
+  if (!hasCredential) return "A";
+  if (!anthropicShaped) return "B";
+  return null;
+}
+
+/**
+ * The labeled refusal body. 403 `permission_error` fits: the proxy key IS
+ * valid — the lane is what is not served (and 401 would push Claude Code
+ * toward its own re-auth flow, which is the reporters' dead end).
+ *
+ * ⚠ The wording is load-bearing: `isQuotaExhaustion` (fork/failover.ts) arms
+ * the role cascade on a 403 body naming a quota wall ("usage limit",
+ * "quota exceeded", "insufficient balance"…). None of those words may ever
+ * appear here — a wiring refusal must not arm anything. Pinned by test
+ * against the real predicate, not a copied keyword list.
+ */
+export function nativeCredentialRefusalResponse(model: string): Response {
+  // #410 companion (measured 2026-11-01 on the hub, #783): a family-unknown
+  // bare name ("swift-1.5-27b-no-thinking") defaults to the native lane in
+  // parseModelSpec, so on a proxy without an Anthropic credential it dies
+  // HERE — and the old wording told the client it had asked for a "native
+  // model", which is not what it sent (the reporter read an allowlist
+  // refusal into it; the allowlist never fired). A claude-* name really is a
+  // native request; anything else on this lane is far more likely a name
+  // that resolved nowhere. The wording names the actual cause per shape.
+  const message = model.startsWith("claude-")
+    ? `claudish: native model ${model} is not served on this proxy (no Anthropic credential to send) — use a role alias or a non-native model`
+    : `claudish: unknown model ${model} — not found in any provider catalog or routing map (it was defaulted to the native lane, which this proxy cannot serve: no Anthropic credential) — use provider@model or a configured alias`;
+  return new Response(JSON.stringify(wrapAnthropicError(403, message, "permission_error")), {
+    status: 403,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * #305 — mixed-credential strip: a FOREIGN credential riding BESIDE an
+ * Anthropic-shaped one is removed instead of forwarded.
+ *
+ * The #296/#303 refusal predicate is an OR (`bearerToken.startsWith("sk-ant-")
+ * || apiKey.startsWith("sk-ant-")`), so a request carrying one `sk-ant-`
+ * credential and one foreign one passed, and the foreign one still reached
+ * api.anthropic.com with it — the exact class #296 B exists to close.
+ *
+ * The fix STRIPS rather than refuses: whether the authorized client ever
+ * sends both headers is unmeasured (#305 AC 1 — the captures carry no
+ * headers), and a refusal could cut the only authorized Opus lane. Stripping
+ * the foreign sibling is safe under either answer: the `sk-ant-` credential
+ * still authenticates, and the foreign token never leaves. Same pattern as
+ * the relay dropping a stale client `x-api-key` (#282's regression: "clients
+ * may still carry a stale x-api-key from an older settings.json").
+ *
+ * Only the MIXED case strips. Neither shaped → the shape-B refusal owns the
+ * request. Both shaped → both are Anthropic's, forwarded as today. Governed
+ * by the same kill switch as the refusal (one switch, one policy).
+ *
+ * Mutates `headers` in place; returns the names it removed (for the marker —
+ * a header NAME, never anything derived from its value).
+ */
+export function stripForeignCredentialBesideAnthropic(headers: Record<string, string>): string[] {
+  if (guardDisabled()) return [];
+  const auth = headers.authorization ?? "";
+  const apiKey = headers["x-api-key"] ?? "";
+  const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  const authShaped = isAnthropicShapedCredential(bearerToken);
+  const keyShaped = isAnthropicShapedCredential(apiKey);
+  const stripped: string[] = [];
+  if (authShaped && !keyShaped && apiKey.length > 0) {
+    delete headers["x-api-key"];
+    stripped.push("x-api-key");
+  }
+  if (keyShaped && !authShaped && bearerToken.length > 0) {
+    delete headers.authorization;
+    stripped.push("authorization");
+  }
+  return stripped;
+}
+
+/**
+ * #305 AC 1 — the measurement instrument: does the authorized client ever
+ * send BOTH auth headers on its native requests?
+ *
+ * Gated by `CLAUDISH_NATIVE_HEADER_NAMES_LOG=1` (default off, zero
+ * production overhead): logs the header NAMES present (`authorization`,
+ * `x-api-key`, both, or none) on every native request. The captures carry no
+ * headers, so this marker is the only way to measure the client's shape —
+ * meant to run on the hub, where the authorized native traffic lands.
+ *
+ * Names ONLY. Never a value, prefix, length or fingerprint.
+ */
+export function nativeHeaderNamesLogEnabled(): boolean {
+  return process.env.CLAUDISH_NATIVE_HEADER_NAMES_LOG === "1";
+}
+
+/** The auth header names present, as a compact string. Names only. */
+export function nativeAuthHeaderNames(headers: Record<string, string>): string {
+  const names: string[] = [];
+  if ((headers.authorization ?? "").length > 0) names.push("authorization");
+  if ((headers["x-api-key"] ?? "").length > 0) names.push("x-api-key");
+  return names.length ? names.join("+") : "(none)";
+}
+
+/**
+ * #315 — vision-path form B: drop a client `x-api-key` that is NOT
+ * Anthropic-shaped before the image-description call leaves for
+ * api.anthropic.com.
+ *
+ * The vision fallback's sanitizer (#289) swaps a MATCHING proxy key; what
+ * passes through is the client's own credential, and until now it flowed
+ * verbatim whatever its shape — a third party's key (another provider's, a
+ * pre-rotation cluster key) handed to Anthropic on every described image.
+ * This is the #296 shape-B class on a third call site: since #303 the native
+ * lane refuses that shape locally; the vision path strips instead (there is
+ * no client turn to refuse — the fallback's own contract is to degrade).
+ *
+ * After the drop the description call runs with NO credential and degrades
+ * exactly like the already-existing missing-credential case: Anthropic 401 →
+ * `describeImage` returns null → the caller strips the images and the turn
+ * continues (never-hang holds). An `sk-ant-*` key — api or oat — passes
+ * unchanged: that is this path's purpose.
+ *
+ * Only the client-controlled header is touched; the `authorization` the #289
+ * swap substitutes is the operator's stored key, never dropped here. Governed
+ * by the same kill switch as the native refusal (one switch, one policy —
+ * #305 precedent), read per call.
+ *
+ * Mutates `auth` in place; returns whether it dropped (for the marker — the
+ * header NAME is the whole diagnosis, nothing derived from the value).
+ */
+export function stripForeignVisionApiKey(auth: {
+  "x-api-key"?: string;
+  authorization?: string;
+}): boolean {
+  if (guardDisabled()) return false;
+  const key = auth["x-api-key"];
+  if (!key || isAnthropicShapedCredential(key)) return false;
+  delete auth["x-api-key"];
+  return true;
+}

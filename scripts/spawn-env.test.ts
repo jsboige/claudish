@@ -14,7 +14,31 @@ import { type AllowlistEntry, scanRepo, scanSource } from "./spawn-env-scan.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 
-const ALLOWLIST: AllowlistEntry[] = [];
+const ALLOWLIST: AllowlistEntry[] = [
+  // main-authored test code, arrived in the main-forward sync (#919): upstream's
+  // own suite spawns without env and is not ours to rewrite — the v14 rule
+  // applies to v14-authored test code. Revisit when the trees unify at landing.
+  {
+    file: "packages/cli/src/test-support/decision-refs.test.ts",
+    text: 'const probe = spawnSync(bin, ["-c", "print(1)"], { encoding: "utf8" });',
+    reason: "main-authored probe of interpreter availability (arrived #919)",
+  },
+  {
+    file: "packages/cli/src/test-support/decision-refs.test.ts",
+    text: 'const r = spawnSync(findPython(), ["-I", SCRIPT, ...args], { encoding: "utf8", cwd: REPO });',
+    reason: "main-authored decision-refs runner (arrived #919)",
+  },
+  {
+    file: "packages/cli/src/test-support/strict-runner.test.ts",
+    text: 'for (const d of tmpDirs.splice(0)) spawnSync("cmd", ["/c", "rmdir", "/s", "/q", d]);',
+    reason: "main-authored win32 scratch-dir cleanup (arrived #919)",
+  },
+  {
+    file: "packages/cli/src/test-support/strict-runner.test.ts",
+    text: 'const r = spawnSync(process.execPath, ["test", treeDir, "--timeout", "5000"], {',
+    reason: "main-authored strict-runner child (arrived #919)",
+  },
+];
 
 describe("spawn env rule", () => {
   test("every Bun.spawn / node:child_process spawn in test code passes env", () => {

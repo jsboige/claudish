@@ -15,6 +15,11 @@ function isolatedEnv(home: string): Record<string, string> {
   const sessionDir = resolve(home, ".claudish/sessions/w3-test-session");
   return {
     HOME: home,
+    // The child's tmpdir() must resolve to the parent's, or main's #242 preset
+    // guard (loaded by the child `bun test` through the bunfig union, sync #919)
+    // sees a HOME that is "neither under" ITS tmpdir nor RUNNER_TEMP (macOS
+    // per-process TMPDIR: /var/folders/... in the parent, /tmp in the child).
+    ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
     PATH: process.env.PATH ?? "",
     CLAUDISH_DISABLE_KEYCHAIN: "1",
     CLAUDISH_DISABLE_OP: "1",
@@ -30,7 +35,10 @@ function isolatedEnv(home: string): Record<string, string> {
 }
 
 function withHome(check: (home: string) => void): void {
-  const home = mkdtempSync(resolve(tmpdir(), "w3-session-env-"));
+  // claudish-test-home-* on purpose: the child `bun test` runs load main's #242
+  // sandbox preload (bunfig union, sync #919), whose preset regime refuses a
+  // HOME that does not look like a throwaway test sandbox outside CI.
+  const home = mkdtempSync(resolve(tmpdir(), "claudish-test-home-"));
   try {
     mkdirSync(resolve(home, ".claudish/sessions/w3-test-session"), { recursive: true });
     check(home);
@@ -152,9 +160,14 @@ describe("R5 session environment isolation", () => {
           }, 1_000);
         `
         );
+        // The bunfig union loads main's #242 sandbox preload in this child; on
+        // bun >= 1.4 POSIX homedir() is frozen at boot, so the inherited-HOME
+        // regime the guard accepts on seats is refused on CI. Enter in the
+        // preset regime instead — the v14 session scrub under test runs first
+        // in the union and CLAUDISH_TEST_PRESET_HOME is not a session var.
         const child = Bun.spawnSync([process.execPath, "test", checkPath], {
           cwd,
-          env: { ...env, HOME: home },
+          env: { ...env, HOME: home, CLAUDISH_TEST_PRESET_HOME: "1" },
           stdout: "pipe",
           stderr: "pipe",
           timeout: 8_000,

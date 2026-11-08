@@ -1,0 +1,176 @@
+/**
+ * Loud environment gate for test classes whose prerequisites are absent on
+ * the running machine (issue: "test suite: partition the environment-dependent
+ * failures and make the dependency LOUD").
+ *
+ * Doctrine (learned the hard way): a SILENT skip is worse than a missing test —
+ * it fabricates a green line. Every gated class announces itself when its host
+ * file finishes, naming each skipped test, with its reason and its activation
+ * condition, visible in the output. No test disappears unnamed.
+ *
+ * Usage:
+ *   import { envDescribe } from "../test-support/env-gate";
+ *   envDescribe({
+ *     id: "posix-path-shim",
+ *     active: process.platform !== "win32",
+ *     reason: "win32 cannot execute the #!/bin/sh PATH shim",
+ *     activation: "run on a POSIX host, or port the shim to a .cmd file",
+ *   })((test) => {
+ *     test("...", () => { ... });   // scoped `test`, counted by the manifest
+ *   });
+ *
+ * Strict mode (CI): CLAUDISH_TEST_ENV_STRICT=1 turns every inactive class into
+ * a FAILING test (so "all green" can never hide a machine that quietly skipped
+ * its way to zero), unless the class is allowlisted in CLAUDISH_TEST_ENV_ALLOW
+ * (comma-separated ids).
+ */
+import { afterAll, test as bunTest, describe, expect } from "bun:test";
+import { writeSync } from "node:fs";
+
+export interface EnvGateClass {
+  /** stable kebab-case id, allowlistable via CLAUDISH_TEST_ENV_ALLOW */
+  id: string;
+  /** measured condition — must be a real probe, never a constant */
+  active: boolean;
+  /** why the class cannot run here (stated as fact, machine-level) */
+  reason: string;
+  /** what would make it run */
+  activation: string;
+  /**
+   * "budget": the class is inactive BY OPERATOR CHOICE, not because the
+   * machine is missing a prerequisite — each run costs real money, so a
+   * complete machine deliberately does NOT run it by default (#385 review).
+   * Consequences: the manifest footer states that (not "a complete machine
+   * runs them all", which would be false), and strict mode never fails it —
+   * CLAUDISH_TEST_ENV_STRICT=1 exists to catch machines that quietly skip
+   * their way to zero, not to mandate spend.
+   */
+  kind?: "budget";
+}
+
+interface GateEntry {
+  cls: EnvGateClass;
+  testNames: string[];
+}
+
+// Registry on globalThis: bun runs all test files in one process, and a module
+// imported from several files must share one registry for the exit manifest.
+const G = globalThis as typeof globalThis & { __claudishEnvGate?: GateEntry[] };
+G.__claudishEnvGate ??= [];
+const registry: GateEntry[] = G.__claudishEnvGate;
+
+/**
+ * Pure strict-mode decision, shared by the host selection and both scoped
+ * variants (it was three copies of the same condition before #385's review
+ * follow-up — a budget exemption added to two of them would have drifted).
+ * `strict` is a parameter, not read from env, so the exemption is testable
+ * without spawning a process.
+ */
+export function strictFailsClass(cls: EnvGateClass, strict: boolean, allow: string[]): boolean {
+  return strict && !cls.active && !allow.includes(cls.id) && cls.kind !== "budget";
+}
+
+/**
+ * Opening of the budget footer, exported as the ONE source both sides read.
+ *
+ * The strict-runner's consolidated block only ever sees the PRINTED manifest —
+ * never the EnvGateClass — so recognising a budget class from the text is the
+ * only way it can stop claiming a failure mode strict mode does not have. #385
+ * corrected the per-class footer here; the runner's consolidated footer kept
+ * asserting "CLAUDISH_TEST_ENV_STRICT=1 fails them instead" for every class,
+ * budget included. Sharing the marker keeps the producer's wording and the
+ * consumer's detector from drifting apart (the failure mode this file's own
+ * comment warns about for the three copies of the strict condition).
+ */
+export const BUDGET_FOOTER_MARKER = "(opt-in budget class";
+
+/** The manifest footer line, switched on the class kind (see EnvGateClass.kind). */
+export function manifestFooter(cls: EnvGateClass): string {
+  if (cls.kind === "budget") {
+    return (
+      `${BUDGET_FOOTER_MARKER}: each run costs real money, so a complete machine does NOT run these by default; ` +
+      "CLAUDISH_TEST_ENV_STRICT=1 never fails a budget class — activation is an operator choice, not a machine property)"
+    );
+  }
+  return "(expected on machines missing prerequisites; a complete machine runs them all; CLAUDISH_TEST_ENV_STRICT=1 fails them instead)";
+}
+
+export function envDescribe(cls: EnvGateClass, label = "") {
+  const strict = process.env.CLAUDISH_TEST_ENV_STRICT === "1";
+  const allow = (process.env.CLAUDISH_TEST_ENV_ALLOW ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const entry: GateEntry = { cls, testNames: [] };
+  registry.push(entry);
+  // Manifest timing: `bun test` does NOT run process-exit handlers (measured:
+  // writeSync(2) in an exit hook prints under `bun -e`, never under `bun test`)
+  // — so each gated class announces itself in an afterAll of its host file.
+  // Loud, named, counted, with reason and activation condition — that is the
+  // doctrine; a consolidated single end-of-run block is impossible under bun.
+  afterAll(() => {
+    if (!cls.active) printEntry(entry);
+  });
+
+  const host = strictFailsClass(cls, strict, allow)
+    ? describe // strict: inactive classes REGISTER (and their tests FAIL below)
+    : cls.active
+      ? describe
+      : describe.skip;
+
+  return (fn: (test: typeof bunTest) => void) => {
+    host(label ? `[env:${cls.id}] ${label}` : `[env:${cls.id}]`, () => {
+      // Loud by failing — the manifest explains the rest. Shared by scoped()
+      // and scoped.skipIf(): under strict mode EVERY registered test of an
+      // inactive class fails, whatever its own skip condition.
+      const strictFail = () => () => {
+        expect.unreachable(
+          `[env-gate:${cls.id}] prerequisite absent on this machine — ${cls.reason} (activation: ${cls.activation}). ` +
+            `Allow explicitly via CLAUDISH_TEST_ENV_ALLOW=${cls.id} or run on a machine that meets the condition.`
+        );
+      };
+      const scoped = Object.assign(
+        (name: string, fn?: any, timeout?: number) => {
+          entry.testNames.push(name);
+          if (strictFailsClass(cls, strict, allow)) {
+            return bunTest(name, strictFail(), timeout);
+          }
+          return bunTest(name, fn, timeout);
+        },
+        {
+          // scoped.skipIf(cond) keeps bun's named-skip semantics for a test
+          // that carries its OWN condition (e.g. a missing API key) inside a
+          // gated class — but the name still registers, so a gated class's
+          // manifest counts every test it owns: no test disappears unnamed
+          // (#175 Group 2 test 3, OPENROUTER_API_KEY-guarded).
+          skipIf: (cond: boolean) => (name: string, fn?: any, timeout?: number) => {
+            entry.testNames.push(name);
+            if (strictFailsClass(cls, strict, allow)) {
+              return bunTest(name, strictFail(), timeout);
+            }
+            return bunTest.skipIf(cond)(name, fn, timeout);
+          },
+        }
+      ) as typeof bunTest;
+      fn(scoped);
+    });
+  };
+}
+
+function printEntry(entry: GateEntry): void {
+  // fs.writeSync(2): synchronous fd write, immune to stream teardown — the
+  // reliable channel for a message that must survive the reporter.
+  const out = (line: string) => {
+    try {
+      writeSync(2, `\x1b[33m${line}\x1b[0m\n`);
+    } catch {
+      /* never let the manifest break a run */
+    }
+  };
+  out("");
+  out(`[ENV-GATE] ${entry.testNames.length} test(s) NOT executed — class '${entry.cls.id}':`);
+  for (const name of entry.testNames) out(`[ENV-GATE]   · ${name}`);
+  out(`[ENV-GATE]   reason: ${entry.cls.reason}`);
+  out(`[ENV-GATE]   activation: ${entry.cls.activation}`);
+  out(`[ENV-GATE]   ${manifestFooter(entry.cls)}`);
+}
