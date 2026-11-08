@@ -47,6 +47,7 @@ import {
 import { API_KEY_MAP } from "./providers/api-key-map.js";
 import {
   probeLink,
+  resolveProbeProxyKey,
   describeProbeState,
   type ProbeResult,
 } from "./providers/probe-live.js";
@@ -1345,6 +1346,9 @@ async function probeModelRouting(
         liveProxy = null;
       }
     }
+    // #930 — the probe proxy enforces the seat's proxyKeys; the probe must
+    // authenticate like a local client or it 401s itself on every rung.
+    const probeProxyKey = resolveProbeProxyKey(process.env, loadConfig());
 
     try {
       const results: ChainProbe[] = [];
@@ -1368,7 +1372,8 @@ async function probeModelRouting(
               hasCredentials: directHasCreds,
               credentialHint: directKeyInfo?.envVar,
             },
-            options.timeoutMs
+            options.timeoutMs,
+            probeProxyKey
           ).catch((e) => ({
             state: "error" as const,
             latencyMs: 0,
@@ -1391,7 +1396,8 @@ async function probeModelRouting(
                   hasCredentials: link.hasCredentials,
                   credentialHint: link.credentialHint,
                 },
-                options.timeoutMs
+                options.timeoutMs,
+                probeProxyKey
               ).catch((e) => ({
                 state: "error" as const,
                 latencyMs: 0,
@@ -1486,6 +1492,9 @@ async function probeModelRouting(
         liveProxy = null;
       }
     }
+    // #930 — same resolution as the JSON path: the probe proxy enforces the
+    // seat's proxyKeys, so the probe authenticates like a local client.
+    const probeProxyKey = resolveProbeProxyKey(process.env, loadConfig());
 
     // Step 4: Build chains + credential checks
     addStep("Resolving routing chains", "running");
@@ -1581,7 +1590,8 @@ async function probeModelRouting(
             hasCredentials: link.hasCredentials,
             credentialHint: link.credentialHint,
           },
-          options.timeoutMs
+          options.timeoutMs,
+          probeProxyKey
         ).catch((e): ProbeResult => ({
           state: "error",
           latencyMs: 0,
