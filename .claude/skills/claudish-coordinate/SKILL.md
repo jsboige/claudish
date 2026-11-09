@@ -149,7 +149,9 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 - **Collisions** : tous poussent sous `jsboige`, donc comparer les `files`, pas les titres.
 - **Avant review ou merge** :
   - vérifier `Closes #NN` dans le body **et** dans les commits de branche (`git log origin/main..<branche>`) ;
-  - rejouer en local ; le check `test` (workflow `Test`) bloque depuis #934 et fait foi, `claude-code` jamais ;
+  - rejouer en local ; le check `test` (workflow `Test`) bloque depuis #934 et fait foi **pour la suite bun
+    seule** (ni Pester, ni `test:scripts:py`, ni typecheck : `scripts/` se rejoue ici, sous pwsh 7 et 5.1),
+    `claude-code` jamais ; PR sans run `pull_request` → `gh workflow run test.yml --ref <branche>` ;
   - faire tourner une mutation sur chaque garde ajoutée.
   - Pas de merge sur un CR non adressé. Mes CR sont des **commentaires** : écrire « attend TON push » dans
     la file du worker.
