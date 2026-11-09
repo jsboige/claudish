@@ -375,7 +375,8 @@ foreach ($day in $daysToArchive) {
                   $manifestPath = Get-ShaManifestPath -GDriveDir $GDriveDir -MachineTag $MachineTag
                   $null = Update-ShaManifest -Path $manifestPath -Archive (Split-Path $archivePath -Leaf) `
                            -Sha256 $shaDest -Bytes $archBytes `
-                           -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                           -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) `
+                           -Extra @{ source = 'deposit' }
                   Log ("GDRIVE {0}: uploaded ({1:N1} MB, sha256 {2}.. recorded)" -f $day, ($archBytes/1MB), $shaDest.Substring(0,8))
                 }
               } else {
@@ -523,7 +524,8 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
           $manifestPath = Get-ShaManifestPath -GDriveDir $GDriveDir -MachineTag $MachineTag
           $null = Update-ShaManifest -Path $manifestPath -Archive $arch.Name `
                    -Sha256 $shaDest -Bytes $arch.Length `
-                   -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                   -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) `
+                   -Extra @{ source = 'deposit' }
           Log ("GDRIVE {0}: re-uploaded ({1:N1} MB, was missing, sha256 {2}.. recorded)" -f $arch.BaseName, ($arch.Length/1MB), $shaDest.Substring(0,8))
         }
       } else {

@@ -825,6 +825,79 @@ Describe 'off-site sha256 manifest (#389) — engine functions' {
         } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
     }
 
+    It 'a four-argument call still writes exactly the four legacy fields, byte for byte (#872)' {
+        # -Extra is optional for a reason: every line already sitting in a fleet
+        # manifest was written by a four-argument call. Adding the parameter must
+        # not reshape that history, or next Sunday's re-read becomes a migration.
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            $null = Update-ShaManifest -Path $p -Archive 'captures-2026-10-05-po-2024.7z' -Sha256 ('A' * 64) -Bytes 6 -RecordedUtc '2026-10-06T02:47:11Z'
+            # @() matters: on a one-line file Get-Content returns a single string,
+            # and [0] on a string is its first CHARACTER, not its first line.
+            $raw = @(Get-Content -LiteralPath $p)[0]
+            $raw | Should -BeExactly ('{"archive":"captures-2026-10-05-po-2024.7z","sha256":"' + ('A' * 64) + '","bytes":6,"recorded":"2026-10-06T02:47:11Z"}')
+            @(($raw | ConvertFrom-Json).PSObject.Properties.Name).Count | Should -Be 4
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'carries extras through a round-trip, after the four base fields and sorted by name (#872)' {
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            $null = Update-ShaManifest -Path $p -Archive 'a.7z' -Sha256 ('b' * 64) -Bytes 7 -RecordedUtc '2026-10-06T02:47:11Z' `
+                     -Extra @{ source = 'deposit'; previous_sha = ('c' * 64); motif = 'drift' }
+            $raw = @(Get-Content -LiteralPath $p)[0]
+            $o = $raw | ConvertFrom-Json
+            $o.archive      | Should -Be 'a.7z'
+            $o.source       | Should -Be 'deposit'
+            $o.previous_sha | Should -Be ('c' * 64)
+            $o.motif        | Should -Be 'drift'
+            # Order is asserted on the RAW line, not on the parsed object: 5.1's
+            # ConvertFrom-Json does not promise to keep document order, so a
+            # parsed-order pin would be measuring the instrument.
+            $iRec = $raw.IndexOf('"recorded"')
+            $iMot = $raw.IndexOf('"motif"')
+            $iPre = $raw.IndexOf('"previous_sha"')
+            $iSrc = $raw.IndexOf('"source"')
+            $iRec | Should -BeLessThan $iMot          # extras never split the base four
+            $iMot | Should -BeLessThan $iPre          # sorted: motif < previous_sha < source
+            $iPre | Should -BeLessThan $iSrc          # a hashtable enumerates in no order, the writer must
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'upserting one archive leaves the extras of its siblings intact (#872)' {
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            $null = Update-ShaManifest -Path $p -Archive 'a.7z' -Sha256 ('a' * 64) -Bytes 1 -RecordedUtc 't1' `
+                     -Extra @{ source = 'deposit'; motif = 'drift' }
+            $null = Update-ShaManifest -Path $p -Archive 'b.7z' -Sha256 ('b' * 64) -Bytes 2 -RecordedUtc 't2' `
+                     -Extra @{ source = 'rotate'; previous_sha = ('9' * 64) }
+            $beforeB = @(Get-Content -LiteralPath $p)[1]
+            # a retried night re-deposits A with a narrower extras set
+            $null = Update-ShaManifest -Path $p -Archive 'a.7z' -Sha256 ('d' * 64) -Bytes 1 -RecordedUtc 't3' `
+                     -Extra @{ source = 'deposit' }
+            $m = Read-ShaManifest -Path $p
+            $m.Entries.Count | Should -Be 2
+            $m.Entries['a.7z'].sha256 | Should -Be ('d' * 64)
+            $m.Entries['a.7z'].source | Should -Be 'deposit'
+            # an upsert REPLACES its own record: the dropped extra is gone, not merged in
+            @($m.Entries['a.7z'].PSObject.Properties.Name) -contains 'motif' | Should -BeFalse
+            # the sibling keeps every extra, and its line is byte-identical (same position, same bytes)
+            $m.Entries['b.7z'].sha256       | Should -Be ('b' * 64)
+            $m.Entries['b.7z'].source       | Should -Be 'rotate'
+            $m.Entries['b.7z'].previous_sha | Should -Be ('9' * 64)
+            @(Get-Content -LiteralPath $p)[1] | Should -BeExactly $beforeB
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'refuses an extra that would overwrite a base field, before touching the file (#872)' {
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            { Update-ShaManifest -Path $p -Archive 'a.7z' -Sha256 ('a' * 64) -Bytes 1 -RecordedUtc 't1' `
+                -Extra @{ sha256 = 'deadbeef' } } | Should -Throw '*overwrite a base manifest field*'
+            Test-Path -LiteralPath $p | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
     It 'skips a torn manifest line and counts it, without blinding the rest' {
         $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
         try {
@@ -1290,6 +1363,9 @@ exit /b 0
             $rec.bytes | Should -Be 6
             # the reference is the hash of what the DESTINATION holds, not a wish
             $rec.sha256 | Should -Be ((Get-FileHash -LiteralPath (Join-Path $gd "captures-$($day)-testbox.7z") -Algorithm SHA256).Hash)
+            # #872: the record says where it came from, so the next reader does not
+            # have to infer a deposit from a hash diff.
+            $rec.source | Should -Be 'deposit'
         } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
@@ -1361,5 +1437,13 @@ exit /b 0
         # 2 deposits (fresh + re-upload) + 2 readers (the nightly re-check, and the
         # #418 quarantine purge, which reuses the deposit record as its proof).
         @([regex]::Matches($text, 'Get-ShaManifestPath')).Count | Should -Be 4
+    }
+
+    It 'wiring: BOTH deposit sites declare source=deposit (#872)' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        # Textual on purpose: the re-upload site is only reached on a repair night,
+        # so an end-to-end night cannot pin it without simulating a missing copy.
+        @([regex]::Matches($text, 'Update-ShaManifest')).Count | Should -Be 2
+        @([regex]::Matches($text, "-Extra @\{ source = 'deposit' \}")).Count | Should -Be 2
     }
 }
