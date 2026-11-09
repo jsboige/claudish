@@ -19,9 +19,11 @@ import {
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
 import { addSigningSecrets, credentialValuesFromRequest } from "./shared/call-context.js";
 import {
+  nativeCredentialFromAuthority,
   nativeCredentialRefusalResponse,
   nativeCredentialRefusalShape,
   stripForeignCredentialBesideAnthropic,
+  writeNativeCredential,
 } from "./shared/native-credential-guard.js";
 import { noteProxyKeyAuthentication } from "./shared/proxy-key-rotation.js";
 import { matchesProxyKey } from "./shared/proxy-keys.js";
@@ -190,12 +192,9 @@ export class NativeHandler implements ModelHandler {
         delete headers["x-api-key"];
         delete headers.authorization;
         if (this.apiKey) {
-          credentialSubstituted = true;
-          if (this.apiKey.startsWith("sk-ant-oat")) {
-            headers.authorization = `Bearer ${this.apiKey}`;
-          } else {
-            headers["x-api-key"] = this.apiKey;
-          }
+          // Same shape predicate as every other credential write on this lane
+          // (#641 step 4 centralized it in writeNativeCredential).
+          credentialSubstituted = writeNativeCredential(headers, this.apiKey);
         }
       }
     }
@@ -207,18 +206,19 @@ export class NativeHandler implements ModelHandler {
     if (!originalHeaders.authorization && !originalHeaders["x-api-key"]) {
       // No inbound auth → fall back to the construction-time key, else resolve
       // ANTHROPIC_API_KEY through the credential authority (env → config → op://),
-      // so even the native fallback is sourced from the single layer.
+      // so even the native fallback is sourced from the single layer. Either
+      // source then goes through the SAME shape predicate as the swap above
+      // (#641 step 4): an oat token writes `authorization: Bearer`, never
+      // x-api-key.
       let fallbackKey = this.apiKey;
       if (!fallbackKey) {
         const auth = await credentials.getRequestAuth("native-anthropic", { model: target });
-        fallbackKey = auth.headers["x-api-key"];
+        // The authority shapes the credential — read BOTH header forms.
+        fallbackKey = nativeCredentialFromAuthority(auth.headers) ?? "";
       }
-      if (fallbackKey) {
-        headers["x-api-key"] = fallbackKey;
-        // The stored key is trusted on the same basis as a swap substitution,
-        // so the #296 refusal exempts it.
-        credentialSubstituted = true;
-      }
+      // The stored key is trusted on the same basis as a swap substitution,
+      // so the #296 refusal exempts it.
+      credentialSubstituted = writeNativeCredential(headers, fallbackKey);
     }
 
     // #296 — the credential state that would now leave for api.anthropic.com

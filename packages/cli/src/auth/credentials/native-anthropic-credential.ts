@@ -56,6 +56,18 @@ export class NativeAnthropicCredentialProvider implements CredentialProvider {
 
   async getRequestAuth(_ctx: RequestAuthContext): Promise<RequestAuth> {
     const key = await this.resolveKey();
-    return key ? { headers: { "x-api-key": key } } : { headers: {} };
+    if (!key) return { headers: {} };
+    // #641 step 4 — shape the header here, main's swap predicate verbatim: an
+    // OAuth token (sk-ant-oat*, the ANTHROPIC_AUTH_TOKEN case — exactly what
+    // this provider resolves as a fallback) signs with `authorization: Bearer`,
+    // an API key with `x-api-key`. Emitting x-api-key unconditionally put OAuth
+    // tokens on the wrong header name at every consumer of this authority
+    // (main's equivalent swap sites have been shape-aware since #282/#439).
+    // The scheme decision lives in the authority, per the centralization rule
+    // at the top of api-key-credential.ts — consumers must not re-inline it.
+    if (key.startsWith("sk-ant-oat")) {
+      return { headers: { authorization: `Bearer ${key}` } };
+    }
+    return { headers: { "x-api-key": key } };
   }
 }
