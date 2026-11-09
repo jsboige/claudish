@@ -187,6 +187,17 @@ l'impasse — le 30/08, c'est le user qui a dit « réarme ton cron ». Ne jamai
 pour rattraper une perte de cron : elle rattrape une perte *pendant* un cycle, pas la perte du
 déclencheur. La seule parade réelle est que le user ou un pair le remarque.
 
+**Cycle manuel avec un tir déjà en attente : recréer le job retire ce tir (#445, mesuré 09/11).**
+Le cycle précédent a tourné de 22:31 à ~00:50 locale, à cheval sur le créneau 00:37. Le user a demandé
+un nouveau cycle à 00:57 ; `CronList` affichait alors `next run Nov 9 1:06am`, soit un tir servi en retard
+pour le créneau de 00:37. Sans geste, ce tir serait arrivé ~9 min après le début du cycle manuel : un
+second cycle Opus sur une fenêtre qui n'a pas bougé. `CronDelete` + `CronCreate` avec la même expression
+et le même prompt : `CronList` affiche ensuite `next run Nov 9 9:07am`, prochain créneau normal. Les
+heures listées portent ~30 min de décalage sur `:37` (01:06, 09:07) : c'est le décalage du harnais, pas
+une autre expression. Ce qui est mesuré, c'est l'heure affichée par `CronList`. L'absence du tir de 01:06 se
+confirme au cycle suivant, par l'absence d'un cycle entre la fin de celui-ci et 09:07. Ne s'applique pas
+quand aucun tir n'est en attente : recréer le job ne change alors rien.
+
 ### Phase 1 — Contexte
 
 ```
