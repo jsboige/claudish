@@ -103,6 +103,12 @@ export async function probeLink(
       headers: {
         "Content-Type": "application/json",
         ...(proxyKey ? { "x-proxy-key": proxyKey } : {}),
+        // #928 class: a probe is a one-shot liveness POST into the seat's own
+        // proxy. Leaving the connection in the global keep-alive pool hands
+        // the next probe — and any test that runs after it — a socket the
+        // proxy may already have closed (the socket-zombie flake behind
+        // #416 T6). Ask for a fresh connection, closed after the response.
+        "Connection": "close",
       },
       body: JSON.stringify({
         model: link.modelSpec,

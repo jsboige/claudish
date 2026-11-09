@@ -25,13 +25,17 @@
  *     in probeLink ⇒ P1 red (auth-failed instead of live) while P2 stays
  *     green — the pin bites on exactly the defect, not on the middleware.
  *
- * Same harness contract as proxy-key-rotation-route.test.ts: the real
+ * Harness contract (CR on #938, #928 class): ONE proxy allocation for the
+ * whole file — `beforeAll` / `afterAll`, never one per test — and every
+ * request asks for `Connection: close`, so a rerun (`--rerun-each 3`) cannot
+ * inherit a socket the previous run left in the keep-alive pool. Otherwise
+ * this is proxy-key-rotation-route.test.ts's shape: the real
  * createProxyServer in-process on a fixed port, the real middleware, the
  * upstream stubbed by URL dispatch (local proxy URL passes through to the
  * real fetch; the provider call gets a healthy OpenAI SSE stream).
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -39,7 +43,8 @@ import { createProxyServer } from "./proxy-server.js";
 import { probeLink, resolveProbeProxyKey } from "./providers/probe-live.js";
 import type { ProxyServer } from "./types.js";
 
-// One allocation per file; the scan in test-support/port-allocation.test.ts
+// One allocation per FILE (CR on #938): a port bound and released once per
+// test is the flake itself. The scan in test-support/port-allocation.test.ts
 // is the authority on what is already claimed (19993 is free as of this
 // writing — verified against declaredPortClaims).
 const PROXY_PORT = 19993;
@@ -96,7 +101,7 @@ function deepseekSse(): Response {
   });
 }
 
-beforeEach(() => {
+beforeAll(async () => {
   configExisted = existsSync(REAL_CONFIG_PATH);
   configBackup = configExisted ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
   mkdirSync(CONFIG_DIR, { recursive: true });
@@ -117,14 +122,25 @@ beforeEach(() => {
     if (url.includes("deepseek")) return deepseekSse();
     return realFetch(input, init);
   }) as typeof fetch;
+  // The proxy is created ONCE, here, after the sandbox is in place; both P
+  // tests and every rerun share it.
+  activeProxy = await createProxyServer(
+    PROXY_PORT,
+    process.env.OPENROUTER_API_KEY,
+    undefined,
+    false,
+    process.env.ANTHROPIC_API_KEY,
+    undefined,
+    { quiet: true }
+  );
 });
 
-afterEach(async () => {
-  globalThis.fetch = realFetch;
+afterAll(async () => {
   if (activeProxy) {
     await activeProxy.shutdown();
     activeProxy = null;
   }
+  globalThis.fetch = realFetch;
   for (const k of SANDBOX_ENV_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
@@ -155,18 +171,6 @@ describe("resolveProbeProxyKey (#930)", () => {
 });
 
 describe("probeLink against a key-enforcing proxy (#930)", () => {
-  beforeEach(async () => {
-    activeProxy = await createProxyServer(
-      PROXY_PORT,
-      process.env.OPENROUTER_API_KEY,
-      undefined,
-      false,
-      process.env.ANTHROPIC_API_KEY,
-      undefined,
-      { quiet: true }
-    );
-  });
-
   test("P1 — probe with the resolved key is LIVE, not auth-failed", async () => {
     const result = await probeLink(PROXY_BASE, { ...LINK }, 15000, PROXY_KEY);
     expect(result.state).toBe("live");
