@@ -36,6 +36,13 @@ if (process.env[childKey] !== "1") {
   globalThis.fetch = (() => {
     throw new Error("T1 forbids network");
   }) as unknown as typeof fetch;
+  // This file pins the LEASE/REDACTION machinery, not the credential guard:
+  // its fixtures deliberately carry opaque non-sk-ant tokens (G2/G3 assert the
+  // exact value the handler registers on the signing lease). Disarm the #296
+  // refusal for the whole child so the fixtures keep flowing verbatim; the
+  // guard itself is pinned by native-credential-guard.test.ts, kill switch
+  // included.
+  process.env.CLAUDISH_NATIVE_FOREIGN_TOKEN_GUARD = "0";
   const { Hono } = await import("hono");
   const { NativeHandler, redactSseErrorEvent } = await import("./native-handler.js");
   const { acquireSigningLease, redactSigningValues } = await import("../redact.js");
