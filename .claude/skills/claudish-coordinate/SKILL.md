@@ -7,7 +7,7 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8
 
 > **Cœur opératoire.** Mesures, incidents et historiques : [`reference.md`](reference.md) — verbatim du
 > runbook au 12/10 (`45622fc6`), **non chargé** ; le lire par section pour justifier ou étendre une règle.
-> **Budget de ce fichier : ≤ 15 Ko** (EPIC #445) : un ajout = une ligne ici + son détail dans `reference.md`.
+> **Budget de ce fichier : ≤ 16 Kio** (EPIC #445, gate `harness-budget.test.ts`) : un ajout = une ligne ici + son détail dans `reference.md`.
 
 ## Cadence et mandats
 
@@ -19,6 +19,8 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8
   geste (la Phase 0 réarme à la valeur écrite ici).
 - Armé juste après un créneau, le cron **tire en rattrapage** (pas un double-fire) : mener ce cycle
   économiquement et le dire au bilan.
+- Cycle manuel du user avec un tir déjà en attente (`CronList` : prochain tir < 30 min) : `CronDelete` +
+  `CronCreate` à l'identique retire ce tir, un cycle Opus économisé (#445, mesure : reference.md § Phase 0).
 
 **Mandat coordinateur (user, 18/09 — verbatim : reference.md § Cadence)** — endosser le rôle : faire avancer
 les issues en dispatchant du travail aux workers, avec des reviews et merges exigeants. À tenir chaque
