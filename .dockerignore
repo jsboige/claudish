@@ -11,5 +11,10 @@ test-fixtures
 !packages/cli/README.md
 .startup-shortcut-created
 worktrees
+.worktrees
+# Agent scratch is never a build input (v51 grain 4). Measured on po-2028,
+# 09/11: 45 files / 1,4 MB sent on every build; it is gitignored anyway, so
+# the context should agree with git.
+.tmp
 Dockerfile
 docker-compose.yml
