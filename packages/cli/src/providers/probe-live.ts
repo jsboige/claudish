@@ -52,10 +52,37 @@ export interface ProbeLinkInput {
   credentialHint?: string;
 }
 
+/**
+ * #930 — the key a probe should authenticate with, resolved the same way
+ * `createProxyServer` resolves the proxyKeys it enforces: env first, config
+ * second, primary before previous. The PRIMARY is sent — any accepted key
+ * passes the middleware, and the primary is the one that outlives a rotation
+ * window. Dependencies are passed in so this module stays a leaf.
+ */
+export function resolveProbeProxyKey(
+  env: Record<string, string | undefined>,
+  config: { proxyKey?: string; proxyKeyPrevious?: string }
+): string | undefined {
+  const primary = env.CLAUDISH_PROXY_KEY || config.proxyKey;
+  const previous = env.CLAUDISH_PROXY_KEY_PREVIOUS || config.proxyKeyPrevious;
+  const keys = [primary, previous].filter((k): k is string => !!k && k.length > 0);
+  return keys[0];
+}
+
 export async function probeLink(
   proxyUrl: string,
   link: ProbeLinkInput,
-  timeoutMs: number
+  timeoutMs: number,
+  /**
+   * #930 — the proxy key the target proxy enforces, resolved by the caller
+   * exactly like a local client (CLAUDISH_PROXY_KEY || config proxyKey, the
+   * primary first). The probe proxy composes the real ingress middlewares, so
+   * on a key-enforcing seat an unauthenticated liveness POST is 401'd by the
+   * instrument itself ("invalid proxy authentication") and every rung reads
+   * dead. Optional: absent or unmatched, the request simply takes the 401 —
+   * the middleware semantics are unchanged for real strangers.
+   */
+  proxyKey?: string
 ): Promise<ProbeResult> {
   const isOAuth = OAUTH_PROVIDERS.has(link.provider);
 
@@ -75,6 +102,13 @@ export async function probeLink(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        ...(proxyKey ? { "x-proxy-key": proxyKey } : {}),
+        // #928 class: a probe is a one-shot liveness POST into the seat's own
+        // proxy. Leaving the connection in the global keep-alive pool hands
+        // the next probe — and any test that runs after it — a socket the
+        // proxy may already have closed (the socket-zombie flake behind
+        // #416 T6). Ask for a fresh connection, closed after the response.
+        "Connection": "close",
       },
       body: JSON.stringify({
         model: link.modelSpec,
