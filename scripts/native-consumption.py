@@ -187,11 +187,20 @@ def leak_policy(resps, req_index, opus_home):
     Le verdict est REFUSE (retour 3) si un Opus tombe dans le seau sans
     machine ou reste non apparie : c'est ce controle, et lui seul, qui rend le
     verdict valide malgre l'angle mort du relais (qui preserve l'en-tete
-    machine sans jamais le poser)."""
+    machine sans jamais le poser).
+
+    Exception declaree, pas refusee : une reponse sans requete dont la fenetre
+    de 35 min commence AVANT la premiere requete du corpus vivant. La
+    compaction nocturne archive les req de la veille (live 09/11 : resp a
+    00:00:08Z, reqN=2506, sa req du 08/11 partie dans l'archive) — l'instrument
+    ne peut pas la voir, il le dit, comme la ligne BLIND de #933."""
     rows = collections.defaultdict(lambda: {
         "nat": 0, "opus": 0, "sub": 0, "dev": collections.Counter(),
         "hours": collections.Counter()})
     unp = {"nat": 0, "opus": 0}
+    trunc = {"nat": 0, "opus": 0}
+    corpus_start = min((c[0] for lst in req_index.values() for c in lst),
+                       default=None)
     for ts, _pid, path in resps:
         try:
             head = open(path, encoding="utf-8", errors="replace").read(400)
@@ -206,6 +215,10 @@ def leak_policy(resps, req_index, opus_home):
             (c for c in req_index.get((hdr_pid, int(reqN)), [])
              if c[0] <= ts and ts - c[0] <= timedelta(minutes=35)))
         if not cands:
+            if corpus_start and ts - timedelta(minutes=35) < corpus_start:
+                trunc["nat"] += 1
+                trunc["opus"] += is_opus
+                continue
             unp["nat"] += 1
             unp["opus"] += is_opus
             continue
@@ -246,6 +259,11 @@ def leak_policy(resps, req_index, opus_home):
         print(f"  {machine:18s} {r['nat']:7d} {r['opus']:5d}  {detail}")
     empty_opus = rows[NO_MACHINE]["opus"] if NO_MACHINE in rows else 0
     print(f"Non appariees : natives={unp['nat']} opus={unp['opus']}")
+    if trunc["nat"]:
+        print(f"Fenetre tronquee (req avant le debut du corpus vivant "
+              f"{corpus_start:%Y-%m-%dT%H:%M:%S}Z, archivee par la compaction) : "
+              f"natives={trunc['nat']} opus={trunc['opus']} — non attribuees, "
+              "hors verdict")
     if empty_opus or unp["opus"]:
         print(f"VERDICT REFUSE : {empty_opus} Opus sans machine, {unp['opus']} Opus "
               "non apparie(s) — l'attribution ne couvre pas tout l'Opus servi")

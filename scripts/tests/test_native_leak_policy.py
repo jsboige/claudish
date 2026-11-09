@@ -17,7 +17,10 @@ Pinned on a synthetic corpus:
   5. a clean corpus gives exit 0, splits natives from Opus per machine, and
      details off-home Opus (device, sub-agent in both capture forms, hour);
   6. --since excludes earlier responses;
-  7. a zero-padded request counter (req-1-0100-..., header reqN=100) pairs.
+  7. a zero-padded request counter (req-1-0100-..., header reqN=100) pairs;
+  8. an unpaired response whose 35 min window starts before the first live
+     request (the nightly compaction archived its request) is declared
+     apart, outside the verdict -- but only inside that window.
 
 Run: python scripts/tests/test_native_leak_policy.py
 """
@@ -58,6 +61,12 @@ def _run(d, *extra):
     return p.returncode, p.stdout + p.stderr
 
 
+def _anchor(d):
+    # an early unrelated request, so the corpus starts well before the pairs
+    # under test and the compaction-truncated exception (8) cannot mask them
+    _req(d, 9, 1, "2026-11-09T01-00-00-000Z", "myia-ai-01")
+
+
 def _row(out, machine):
     # only the leak-policy table: the #933 blind-spot section above it also
     # starts lines with machine names
@@ -70,6 +79,7 @@ def _row(out, machine):
 
 def test_clean_corpus_header_pairing_and_restart():
     d = tempfile.mkdtemp(prefix="leak-ok-")
+    _anchor(d)
     # ai-01 Opus: filename rank r900 != header reqN 7 (trap 3)
     _req(d, 1, 7, "2026-11-09T06-00-00-000Z", "myia-ai-01")
     _resp(d, 1, 900, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 7)
@@ -103,6 +113,7 @@ def test_clean_corpus_header_pairing_and_restart():
     assert "sub=2/2" in po, f"sub-agent forms not both detected: {po}"
     assert "dev=0b9b0d8c:2" in po and "09 06h:1" in po and "09 07h:1" in po, po
     assert "Non appariees : natives=0 opus=0" in out, out
+    assert "Fenetre tronquee" not in out, out
 
 
 def test_opus_without_machine_refuses():
@@ -126,11 +137,39 @@ def test_unpaired_opus_refuses():
 def test_padded_request_counter_pairs():
     # live corpus 09/11: req-1-0100-... on disk, reqN=100 in the resp header
     d = tempfile.mkdtemp(prefix="leak-pad-")
+    _anchor(d)
     _req(d, 1, "0007", "2026-11-09T06-00-00-000Z", "myia-ai-01")
     _resp(d, 1, "0007", "2026-11-09T06-00-02-000Z", "claude-opus-5-5", 7)
     code, out = _run(d, "--since", "2026-11-09T00")
     assert code == 0, f"padded counter left unpaired: {code}\n{out}"
     assert "Non appariees : natives=0 opus=0" in out, out
+    assert "Fenetre tronquee" not in out, out
+
+
+def test_compaction_truncated_window_declared():
+    # live 09/11: resp at 00:00:08Z, reqN=2506, its req filed on 08/11 and
+    # archived by the nightly compaction; the first live req is 00:00:00Z
+    d = tempfile.mkdtemp(prefix="leak-trunc-")
+    _req(d, 1, 2510, "2026-11-09T00-00-00-032Z", "myia-ai-01")
+    _resp(d, 1, 2510, "2026-11-09T00-00-02-000Z", "claude-opus-5-5", 2510)
+    _resp(d, 1, 2499, "2026-11-09T00-00-08-349Z", "claude-opus-5-5", 2506)
+    # 40 min after the corpus start the window is whole again: this one refuses
+    _resp(d, 1, 2600, "2026-11-09T00-40-00-000Z", "claude-opus-5-5", 2599)
+    code, out = _run(d, "--since", "2026-11-09T00")
+    assert code == 3, f"a whole-window unpaired Opus must still refuse: {code}\n{out}"
+    assert "Non appariees : natives=1 opus=1" in out, out
+    assert "Fenetre tronquee" in out and "natives=1 opus=1 " in out.split("Fenetre tronquee", 1)[1], out
+
+
+def test_compaction_truncated_alone_keeps_verdict():
+    d = tempfile.mkdtemp(prefix="leak-trunc2-")
+    _req(d, 1, 2510, "2026-11-09T00-00-00-032Z", "myia-ai-01")
+    _resp(d, 1, 2510, "2026-11-09T00-00-02-000Z", "claude-opus-5-5", 2510)
+    _resp(d, 1, 2499, "2026-11-09T00-00-08-349Z", "claude-opus-5-5", 2506)
+    code, out = _run(d, "--since", "2026-11-09T00")
+    assert code == 0, f"compaction boundary refused the verdict: {code}\n{out}"
+    assert "Non appariees : natives=0 opus=0" in out, out
+    assert "Fenetre tronquee" in out, out
 
 
 def test_since_excludes_earlier():
