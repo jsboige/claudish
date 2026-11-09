@@ -1,4 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Context } from "hono";
 import type { ProviderTransport } from "../providers/transport/types.js";
 import { ComposedHandler } from "./composed-handler.js";
@@ -31,7 +34,27 @@ import { wrapAnthropicError } from "./shared/anthropic-error.js";
  */
 
 const realFetch = globalThis.fetch;
+
+// Capture isolation (2026-11-08 hermeticity): this file's 401s append to
+// upstream-errors.log and its connect failures to connection-errors.log
+// wherever CLAUDISH_CAPTURE_DIR points — under a seat's ambient ops-shell env
+// that was the REAL capture dir (measured: 2 resp-*.sse + both logs landed
+// there at 06:35Z). Point every test at a throwaway tmp dir instead.
+let capDir: string;
+let prevCapture: string | undefined;
+
+beforeEach(() => {
+  capDir = join(tmpdir(), `claudish-che-capture-${process.pid}-${Date.now()}`);
+  prevCapture = process.env.CLAUDISH_CAPTURE_DIR;
+  process.env.CLAUDISH_CAPTURE_DIR = capDir;
+});
+
 afterEach(() => {
+  if (prevCapture === undefined) Reflect.deleteProperty(process.env, "CLAUDISH_CAPTURE_DIR");
+  else process.env.CLAUDISH_CAPTURE_DIR = prevCapture;
+  try {
+    rmSync(capDir, { recursive: true, force: true });
+  } catch {}
   globalThis.fetch = realFetch;
   delete process.env.CLAUDISH_CONNECT_RETRY_MAX;
   delete process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS;
