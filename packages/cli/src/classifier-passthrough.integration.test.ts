@@ -84,7 +84,7 @@ describe("classifier passthrough (HTTP)", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: "Bearer test-oauth-token",
+        authorization: "Bearer sk-ant-oat01-test-oauth-token",
         "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
         "anthropic-version": "2023-06-01",
       },
@@ -103,7 +103,7 @@ describe("classifier passthrough (HTTP)", () => {
     // system array forwarded VERBATIM, including the x-anthropic-billing-header block.
     expect(fwd.body.system).toEqual(CLASSIFIER_BODY.system);
     // Inbound Claude Max OAuth + anthropic-beta forwarded to Anthropic.
-    expect(fwd.headers.authorization).toBe("Bearer test-oauth-token");
+    expect(fwd.headers.authorization).toBe("Bearer sk-ant-oat01-test-oauth-token");
     expect(fwd.headers["anthropic-beta"]).toContain("claude-code-20250219");
   });
 
@@ -123,7 +123,10 @@ describe("classifier passthrough (HTTP)", () => {
     };
     const res = await realFetch(`${proxy.url}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-oauth-token" },
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer sk-ant-oat01-test-oauth-token",
+      },
       body: JSON.stringify(normalBody),
     });
 
@@ -142,7 +145,10 @@ describe("classifier passthrough (HTTP)", () => {
 
     const res = await realFetch(`${proxy.url}/v1/messages`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer test-oauth-token" },
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer sk-ant-oat01-test-oauth-token",
+      },
       body: JSON.stringify(CLASSIFIER_BODY),
     });
 

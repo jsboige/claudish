@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { isEffortLevel } from "./adapters/base-api-format.js";
+import { credentials } from "./auth/credentials/authority.js";
 import {
   isAutoModeClassifierRequest,
   rewriteClassifierForNative,
@@ -97,7 +98,11 @@ import {
   createAdvisorPanelGateway,
 } from "./handlers/advisor-panel-gateway.js";
 import { shutdownAdvisorChains } from "./handlers/advisor-route-plan.js";
-import { isConnectionWalkClass, isOverloadWalkClass } from "./handlers/composed-handler.js";
+import {
+  isConnectionWalkClass,
+  isOverloadWalkClass,
+  setVisionAuthPolicy,
+} from "./handlers/composed-handler.js";
 import type { ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
@@ -148,7 +153,16 @@ import { resolveInboundKeys } from "./handlers/shared/inbound-keys.js";
 // (proxy-auth + relay); this grain wires the RESOLUTION half that refuses a
 // keyless request landing anywhere but the native passthrough.
 import { isKeylessExempt, keylessRefusalMessage } from "./handlers/shared/keyless-exempt.js";
-import { resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
+import {
+  nativeAuthHeaderNames,
+  nativeCredentialRefusalResponse,
+  nativeCredentialRefusalShape,
+  nativeHeaderNamesLogEnabled,
+  stripForeignCredentialBesideAnthropic,
+  stripProxyOwnHeaders,
+} from "./handlers/shared/native-credential-guard.js";
+import { noteProxyKeyAuthentication } from "./handlers/shared/proxy-key-rotation.js";
+import { matchesProxyKey, resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
 import { isContextOverflowError } from "./handlers/shared/request-shape.js";
 import {
   encodeStepSkipHeader,
@@ -566,12 +580,26 @@ export async function createProxyServer(
   const withRequestHooks = (handler: ModelHandler): ModelHandler =>
     hookEngine ? withHooks(handler, hookEngine) : handler;
 
+  // Resolved BEFORE the handlers are built: NativeHandler needs the accepted
+  // proxy keys to swap a cluster-key client credential for the stored
+  // Anthropic one (#282/#296/#305 — same wiring as the fork, #641 étape 3).
+  const proxyKeys = resolveProxyKeys(
+    process.env.CLAUDISH_PROXY_KEY ?? configSnapshot?.proxyKey,
+    process.env.CLAUDISH_PROXY_KEY_PREVIOUS
+  );
+
   // Define handlers for different roles
   const nativeHandler = new NativeHandler(
     anthropicApiKey,
     options.advisorModels,
-    options.advisorCollector
+    options.advisorCollector,
+    proxyKeys
   );
+
+  // #289/#315 — arm the vision fallback's credential sanitizer with the same
+  // policy the native lanes use (proxy key swap + foreign-key drop). Unset,
+  // NO key can match and an inbound proxy-shaped key would be forwarded.
+  setVisionAuthPolicy({ proxyKeys, anthropicApiKey });
 
   /**
    * The advisor for ANY main model. `withAdvisorSwap` is applied to the RESULT
@@ -1110,10 +1138,7 @@ export async function createProxyServer(
   // which the auth's native-exemption branch now sets). GET and health routes
   // stay exempt inside the middleware. Registered only when a proxy key
   // exists — a keyless deployment keeps serving everything, as on the fork.
-  const proxyKeys = resolveProxyKeys(
-    process.env.CLAUDISH_PROXY_KEY ?? configSnapshot?.proxyKey,
-    process.env.CLAUDISH_PROXY_KEY_PREVIOUS
-  );
+  // (proxyKeys is resolved above, before the handlers are built.)
   const inboundKeys = configSnapshot ? resolveInboundKeys(configSnapshot, proxyKeys) : [];
   const routedBareNames = configSnapshot
     ? collectRoutedBareNames(configSnapshot)
@@ -2706,12 +2731,98 @@ export async function createProxyServer(
         // pin as the serving loop, applied to the body sent upstream.
         const pinnedModel = resolveNativeModelPin(body.model, modelMap);
         if (pinnedModel) body.model = pinnedModel;
-        const headers: any = { "Content-Type": "application/json" };
-        if (anthropicApiKey) headers["x-api-key"] = anthropicApiKey;
+        // Same forward shape as main (#641 étape 3): the client's own headers
+        // travel (anthropic-version, beta, …), minus the hop-by-hop set and
+        // minus the proxy's own (#282).
+        const HOP_BY_HOP = new Set([
+          "host",
+          "connection",
+          "keep-alive",
+          "transfer-encoding",
+          "te",
+          "trailer",
+          "upgrade",
+          "content-length",
+        ]);
+        const reqHeaders: Record<string, string> = { "Content-Type": "application/json" };
+        for (const [key, value] of Object.entries(c.req.header())) {
+          if (HOP_BY_HOP.has(key.toLowerCase()) || typeof value !== "string") continue;
+          reqHeaders[key] = value;
+        }
+        // #282 — same strip as NativeHandler.handle: the proxy's own headers
+        // (cluster key, attribution, hop list) never reach api.anthropic.com.
+        stripProxyOwnHeaders(reqHeaders);
+        // Proxy key override (same logic as NativeHandler).
+        let credentialSubstituted = false;
+        if (proxyKeys.length > 0) {
+          const authHeader = c.req.header("authorization");
+          const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
+          const clientAuthToken = c.req.header("x-api-key") || bearerToken;
+          if (matchesProxyKey(clientAuthToken, proxyKeys)) {
+            // #439 — this swap is one of the sites that ACCEPT a proxy key:
+            // count it when it is the retiring one (no-op outside a window).
+            // The middleware's mark on c.req.raw (exemption branch, which
+            // count_tokens crosses — /v1/*) keeps one request = one count.
+            noteProxyKeyAuthentication(clientAuthToken, c.req.header(), c.req.raw);
+            delete reqHeaders["x-api-key"];
+            delete reqHeaders.authorization;
+            if (anthropicApiKey) {
+              credentialSubstituted = true;
+              if (anthropicApiKey.startsWith("sk-ant-oat")) {
+                reqHeaders.authorization = `Bearer ${anthropicApiKey}`;
+              } else {
+                reqHeaders["x-api-key"] = anthropicApiKey;
+              }
+            }
+          }
+        } else if (!reqHeaders.authorization && !reqHeaders["x-api-key"]) {
+          // No inbound auth and no proxy keys configured: mirror the serving
+          // lane's fallback (NativeHandler.handle) — construction-time key
+          // first, else resolve through the credential authority AT REQUEST
+          // TIME (env → config → op://), so an ANTHROPIC_API_KEY set after
+          // boot is honoured and --probe's counting path is not refused as
+          // shape A by our own admission.
+          let fallbackKey = anthropicApiKey;
+          if (!fallbackKey) {
+            const auth = await credentials.getRequestAuth("native-anthropic", {
+              model: body.model,
+            });
+            fallbackKey = auth.headers["x-api-key"];
+          }
+          if (fallbackKey) {
+            reqHeaders["x-api-key"] = fallbackKey;
+            credentialSubstituted = true;
+          }
+        }
+
+        // #296 — same credential guard as NativeHandler.handle: refuse locally
+        // when the post-swap credential is absent (shape A) or foreign
+        // (shape B), instead of forwarding to api.anthropic.com.
+        const refusalShape = nativeCredentialRefusalShape(reqHeaders, credentialSubstituted);
+        if (refusalShape) {
+          log(
+            `[Native] refused — no Anthropic credential to send (shape=${refusalShape}, model=${body.model}, path=count_tokens)`,
+            true
+          );
+          return nativeCredentialRefusalResponse(body.model);
+        }
+
+        // #305 — same mixed-credential strip as NativeHandler.handle.
+        const strippedForeign = stripForeignCredentialBesideAnthropic(reqHeaders);
+        if (strippedForeign.length > 0) {
+          log(
+            `[Native] stripped foreign credential beside Anthropic credential (header=${strippedForeign.join(",")}, model=${body.model}, path=count_tokens)`,
+            true
+          );
+        }
+        // #305 AC 1 — same measurement instrument (names only, OFF by default).
+        if (nativeHeaderNamesLogEnabled()) {
+          log(`[Native][hdr-names] ${nativeAuthHeaderNames(c.req.header())} (count_tokens)`, true);
+        }
 
         const res = await fetch("https://api.anthropic.com/v1/messages/count_tokens", {
           method: "POST",
-          headers,
+          headers: reqHeaders,
           body: JSON.stringify(body),
         });
         return c.json(await res.json());

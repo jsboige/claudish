@@ -35,7 +35,7 @@ function captureFetch(): { bodies: any[] } {
 function fakeContext(): any {
   const vars = new Map<string, unknown>();
   return {
-    req: { header: () => ({ "x-api-key": "sk-test" }) },
+    req: { header: () => ({ "x-api-key": "sk-ant-api03-test" }) },
     json: (body: unknown, init?: { status?: number } | number) =>
       new Response(JSON.stringify(body), {
         status: typeof init === "number" ? init : (init?.status ?? 200),

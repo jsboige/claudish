@@ -18,6 +18,13 @@ import {
 } from "./native-handler-advisor.js";
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
 import { addSigningSecrets, credentialValuesFromRequest } from "./shared/call-context.js";
+import {
+  nativeCredentialRefusalResponse,
+  nativeCredentialRefusalShape,
+  stripForeignCredentialBesideAnthropic,
+} from "./shared/native-credential-guard.js";
+import { noteProxyKeyAuthentication } from "./shared/proxy-key-rotation.js";
+import { matchesProxyKey } from "./shared/proxy-keys.js";
 import { appendUpstreamError, createResponseCapture } from "./shared/response-capture.js";
 import {
   type UpstreamReaderSlot,
@@ -82,13 +89,20 @@ export class NativeHandler implements ModelHandler {
   private baseUrl: string;
   private advisorModels?: string[];
   private advisorCollector?: string | null;
+  private proxyKeys?: string[];
 
-  constructor(apiKey?: string, advisorModels?: string[], advisorCollector?: string | null) {
+  constructor(
+    apiKey?: string,
+    advisorModels?: string[],
+    advisorCollector?: string | null,
+    proxyKeys?: string[]
+  ) {
     this.apiKey = apiKey;
     // Always forward to real Anthropic API (the origin the advisor's Claude call uses too)
     this.baseUrl = ANTHROPIC_API_ORIGIN;
     this.advisorModels = advisorModels;
     this.advisorCollector = advisorCollector;
+    this.proxyKeys = proxyKeys;
   }
 
   async handle(c: Context, incoming: any): Promise<Response> {
@@ -156,6 +170,40 @@ export class NativeHandler implements ModelHandler {
     if (originalHeaders["x-api-key"]) {
       headers["x-api-key"] = originalHeaders["x-api-key"];
     }
+
+    // #282/#296/#305 — the credential that would leave for api.anthropic.com.
+    // A client authenticating with the CLUSTER key (x-api-key, or a Bearer
+    // carrying it) is swapped for the key this handler holds, exactly as main
+    // does: the proxy key must never be handed to Anthropic, and with no stored
+    // key the request is refused below rather than forwarded unauthenticated.
+    let credentialSubstituted = false;
+    if (this.proxyKeys?.length) {
+      const bearerToken = originalHeaders.authorization?.startsWith("Bearer ")
+        ? originalHeaders.authorization.slice(7)
+        : originalHeaders.authorization;
+      const clientAuthToken = originalHeaders["x-api-key"] || bearerToken;
+      if (matchesProxyKey(clientAuthToken, this.proxyKeys)) {
+        // #439 — count the swap when it is the retiring key (no-op outside a
+        // rotation window); the middleware's raw-request mark keeps one
+        // request = one count.
+        noteProxyKeyAuthentication(clientAuthToken, originalHeaders, c.req.raw);
+        delete headers["x-api-key"];
+        delete headers.authorization;
+        if (this.apiKey) {
+          credentialSubstituted = true;
+          if (this.apiKey.startsWith("sk-ant-oat")) {
+            headers.authorization = `Bearer ${this.apiKey}`;
+          } else {
+            headers["x-api-key"] = this.apiKey;
+          }
+        }
+      }
+    }
+
+    // Pass through auth headers as-is. If the incoming request carries NO auth
+    // (e.g. the --probe client, which doesn't replicate Claude Code's injected
+    // key) fall back to the api key this handler was constructed with, so the
+    // native passthrough can still authenticate against api.anthropic.com.
     if (!originalHeaders.authorization && !originalHeaders["x-api-key"]) {
       // No inbound auth → fall back to the construction-time key, else resolve
       // ANTHROPIC_API_KEY through the credential authority (env → config → op://),
@@ -167,8 +215,39 @@ export class NativeHandler implements ModelHandler {
       }
       if (fallbackKey) {
         headers["x-api-key"] = fallbackKey;
+        // The stored key is trusted on the same basis as a swap substitution,
+        // so the #296 refusal exempts it.
+        credentialSubstituted = true;
       }
     }
+
+    // #296 — the credential state that would now leave for api.anthropic.com
+    // is either absent (shape A: the swap removed the client's token and there
+    // is no stored key to substitute) or foreign (shape B: a Bearer belonging
+    // to another party, about to be handed to a third party). Refuse locally,
+    // labeled, zero upstream fetch. An sk-ant-* credential and the
+    // substituted-key paths stay untouched.
+    const refusalShape = nativeCredentialRefusalShape(headers, credentialSubstituted);
+    if (refusalShape) {
+      log(
+        `[Native] refused — no Anthropic credential to send (shape=${refusalShape}, model=${target})`,
+        true
+      );
+      return nativeCredentialRefusalResponse(target);
+    }
+
+    // #305 — mixed credentials: a FOREIGN credential riding beside an
+    // Anthropic-shaped one is stripped, never forwarded. The sk-ant-
+    // credential still authenticates, so the authorized lane survives
+    // whatever AC 1 measures; the foreign token never leaves.
+    const strippedForeign = stripForeignCredentialBesideAnthropic(headers);
+    if (strippedForeign.length > 0) {
+      log(
+        `[Native] stripped foreign credential beside Anthropic credential (header=${strippedForeign.join(",")}, model=${target})`,
+        true
+      );
+    }
+
     if (originalHeaders["anthropic-beta"]) {
       const incomingBeta = originalHeaders["anthropic-beta"];
       if (advisorSwapped) {
