@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "#892 — the ONE authored home for the builtin providers' probe surface.",
+    "Two readers: packages/cli/src/providers/provider-definitions.ts (imports it, so the",
+    "base URL a request is sent to and the base URL the watcher probes cannot drift), and",
+    "scripts/lib/claudish-model-version.psm1 (Get-BuiltinProbeSurfaces, so gc@/ds@/mmc@ get a",
+    "real [probe] line instead of 'no probe surface declared in config').",
+    "A missing or unparsable file degrades the watcher to that same honest reason — it never",
+    "throws and never invents a URL.",
+    "Order of providers is irrelevant; the key is the SHORTEST prefix (the spelling routing and",
+    "cascades actually use). apiPath is the chat path: the probe derives /models from it with",
+    "the same rule the proxy uses (providers/context-limit-derivation.ts)."
+  ],
+  "providers": {
+    "gc": {
+      "name": "glm-coding",
+      "baseUrl": "https://api.z.ai",
+      "apiPath": "/api/coding/paas/v4/chat/completions",
+      "authScheme": "bearer",
+      "keyEnv": "GLM_CODING_API_KEY",
+      "keyEnvAliases": ["ZAI_CODING_API_KEY"]
+    },
+    "ds": {
+      "name": "deepseek",
+      "baseUrl": "https://api.deepseek.com",
+      "apiPath": "/v1/chat/completions",
+      "authScheme": "bearer",
+      "keyEnv": "DEEPSEEK_API_KEY",
+      "keyEnvAliases": []
+    },
+    "mmc": {
+      "name": "minimax-coding",
+      "baseUrl": "https://api.minimax.io",
+      "apiPath": "/anthropic/v1/messages",
+      "authScheme": "bearer",
+      "keyEnv": "MINIMAX_CODING_API_KEY",
+      "keyEnvAliases": []
+    }
+  }
+}
