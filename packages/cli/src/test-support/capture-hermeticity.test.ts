@@ -8,14 +8,24 @@
  * guard is inert by design, so the pin asserts the inert regime instead.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CAPTURE_SANDBOX_PREFIX,
   captureFilesOfProcess,
   detectOwnPidCaptures,
-  foreignCaptureFiles,
+  disposeCaptureSandbox,
+  ownPidCaptureFiles,
+  sweepStaleCaptureSandboxes,
 } from "./capture-hermeticity";
 
 describe("capture hermeticity — pid attribution (filter)", () => {
@@ -30,7 +40,7 @@ describe("capture hermeticity — pid attribution (filter)", () => {
       `resp-${pid}-r0000-2026-11-08T06-31-04-212Z-native-claude-stub-opus.sse`,
       `resp-${pid}-r0001-2026-11-08T06-31-04-216Z-native-claude-stub-opus.sse`,
     ];
-    expect(foreignCaptureFiles(names, pid)).toHaveLength(2);
+    expect(ownPidCaptureFiles(names, pid)).toHaveLength(2);
   });
 
   test("a live sidecar sharing the host dir (other pid) is NOT a leak", () => {
@@ -40,7 +50,7 @@ describe("capture hermeticity — pid attribution (filter)", () => {
       "resp-12-r0000-2026-11-08T06-30-00-000Z-openai-glm-5.3.sse",
       `resp-${pid + 1}-r0000-2026-11-08T06-30-00-000Z-openai-glm-5.3.sse`,
     ];
-    expect(foreignCaptureFiles(names, pid)).toHaveLength(0);
+    expect(ownPidCaptureFiles(names, pid)).toHaveLength(0);
   });
 
   test("non-capture names and non-sse pid files are not leaks", () => {
@@ -52,7 +62,7 @@ describe("capture hermeticity — pid attribution (filter)", () => {
       `resp-${pid}-r0000-2026-11-08T06-31-04-212Z.sse.tmp`,
       "notes.txt",
     ];
-    expect(foreignCaptureFiles(names, pid)).toHaveLength(0);
+    expect(ownPidCaptureFiles(names, pid)).toHaveLength(0);
   });
 });
 
@@ -102,5 +112,65 @@ describe("capture hermeticity — preload wiring (regime pin)", () => {
       // CI regime: nothing to guard.
       expect(sandbox).toBeUndefined();
     }
+  });
+});
+
+/**
+ * Review B1 on #936: the run that fills the sandbox is precisely the leaky run
+ * the guard exists for — leaving it in %TEMP% grows unbounded on a seat that
+ * runs the suite a few times a day (measured: 289 files in one run of a
+ * non-isolated composed-handler.test.ts).
+ */
+describe("capture hermeticity — sandbox disposal", () => {
+  test("a run that filled its sandbox leaves nothing behind after cleanup", () => {
+    const sandbox = join(tmpdir(), `${CAPTURE_SANDBOX_PREFIX}${process.pid}-${Date.now()}-pin`);
+    mkdirSync(sandbox, { recursive: true });
+    writeFileSync(
+      join(sandbox, `resp-${process.pid}-r0000-2026-11-08T06-31-04-212Z-openai-fugu-ultra.sse`),
+      "x"
+    );
+    // The pid-less append-only log lands there too — the dir goes, all of it.
+    writeFileSync(join(sandbox, "upstream-errors.log"), "x");
+    expect(readdirSync(sandbox)).toHaveLength(2);
+
+    disposeCaptureSandbox(sandbox);
+
+    expect(existsSync(sandbox)).toBe(false);
+  });
+
+  test("dispose is idempotent — a missing dir is a no-op, never a throw", () => {
+    const absent = join(tmpdir(), `${CAPTURE_SANDBOX_PREFIX}no-such-dir-pin`);
+    expect(() => disposeCaptureSandbox(absent)).not.toThrow();
+  });
+});
+
+/** A killed run never reaches its afterAll: the preload-start sweep is its net. */
+describe("capture hermeticity — stale-sandbox sweep", () => {
+  test("an old sandbox is swept; a fresh one and unrelated names are spared", () => {
+    const root = mkdtempSync(join(tmpdir(), "claudish-herm-pin-"));
+    try {
+      const oldName = `${CAPTURE_SANDBOX_PREFIX}111-1700000000000`;
+      const freshName = `${CAPTURE_SANDBOX_PREFIX}222-${Date.now()}`;
+      const otherName = "claudish-test-home-pin";
+      for (const n of [oldName, freshName, otherName])
+        mkdirSync(join(root, n), { recursive: true });
+      const old = new Date(Date.now() - 7 * 60 * 60 * 1000);
+      utimesSync(join(root, oldName), old, old);
+
+      const removed = sweepStaleCaptureSandboxes(root);
+
+      expect(removed).toEqual([oldName]);
+      expect(existsSync(join(root, oldName))).toBe(false);
+      // A run still in flight must never be a target, and the home sandbox
+      // has its own (24 h) sweep — this one does not touch it.
+      expect(existsSync(join(root, freshName))).toBe(true);
+      expect(existsSync(join(root, otherName))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable/missing root is not a failure", () => {
+    expect(sweepStaleCaptureSandboxes(join(tmpdir(), "claudish-no-such-root-xyz"))).toEqual([]);
   });
 });
