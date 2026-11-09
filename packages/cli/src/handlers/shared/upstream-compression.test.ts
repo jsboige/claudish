@@ -193,6 +193,125 @@ describe("#909 unit — env readers", () => {
   });
 });
 
+/**
+ * Collect the `[claudish] …` lines this process writes to stderr while `run`
+ * executes. Synchronous on purpose: the helper under test is synchronous, so
+ * nothing (bun's own reporter included) can interleave between the swap and
+ * the restore.
+ */
+function captureStderrLines(run: () => void): string[] {
+  const lines: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((
+    chunk: string | Uint8Array,
+    _encodingOrCallback?: unknown,
+    _callback?: unknown
+  ) => {
+    lines.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
+    return true;
+  }) as unknown as typeof process.stderr.write;
+  try {
+    run();
+  } finally {
+    process.stderr.write = original;
+  }
+  return lines;
+}
+
+/**
+ * #909 follow-up — the CPU column.
+ *
+ * `ms=` exists so a week of hub traffic can be read as a COST beside the byte
+ * saving (AC-4). Three properties make the column worth reading, and each is
+ * pinned here because each has a plausible wrong implementation:
+ *
+ *   1. SHAPE — the bytes-then-ratio prefix is unchanged and `ms=` is appended
+ *      last, one decimal place. A reader that greps the older shape keeps
+ *      working; a reader that splits on the ratio keeps working.
+ *   2. MEASURED, NOT LITERAL — a multi-megabyte body reports a non-zero cost.
+ *      A hardcoded `0.0` (the tempting "it's never the bottleneck" shortcut)
+ *      passes every shape check and dies here.
+ *   3. BRACKETED BY ITS OWN CALL — ms never exceeds the wall time of the
+ *      compression. A timestamp captured at module load, or a multiplier,
+ *      exceeds it and dies here.
+ */
+describe("#909 follow-up — ms= on the compression line", () => {
+  // `sakana fugu-ultra` carries the SPACE real call sites produce
+  // (`provider model`), so the label shape is pinned where production has it.
+  const LINE =
+    /^\[claudish\] \[UpstreamCompress\] sakana fugu-ultra in=(\d+)B wire=(\d+)B \((\d+\.\d)%\) ms=(\d+\.\d)\n$/;
+
+  test("the saving line keeps in=/wire=/ratio and APPENDS a one-decimal ms=", () => {
+    const headers: Record<string, string> = {};
+    const body = bigBody();
+    const lines = captureStderrLines(() => {
+      compressUpstreamRequestBody({
+        capability: "gzip",
+        headers,
+        body,
+        label: "sakana fugu-ultra",
+      });
+    });
+    const emitted = lines.filter((l) => l.includes("[UpstreamCompress]"));
+    expect(emitted.length).toBe(1);
+
+    const m = LINE.exec(emitted[0]);
+    expect(m).not.toBeNull();
+    // in= is the PRE-compression size (what a plain lane would have paid),
+    // wire= what actually ships — swappable, so both are anchored.
+    expect(Number(m![1])).toBe(Buffer.byteLength(body, "utf-8"));
+    expect(Number(m![2])).toBeLessThan(Number(m![1]));
+    expect(Number(m![3])).toBeGreaterThan(0);
+    expect(Number(m![3])).toBeLessThan(100);
+    expect(Number.isFinite(Number(m![4]))).toBe(true);
+  });
+
+  test("ms= is a real timing: a 4 MB body reports a non-zero, call-bracketed cost", () => {
+    const headers: Record<string, string> = {};
+    const body = JSON.stringify({
+      model: "fugu-ultra",
+      messages: [{ role: "user", content: "x".repeat(4_000_000) }],
+    });
+    const startedAt = performance.now();
+    const lines = captureStderrLines(() => {
+      compressUpstreamRequestBody({
+        capability: "gzip",
+        headers,
+        body,
+        label: "sakana fugu-ultra",
+      });
+    });
+    const wallMs = performance.now() - startedAt;
+
+    const m = LINE.exec(lines.find((l) => l.includes("[UpstreamCompress]")) ?? "");
+    expect(m).not.toBeNull();
+    const ms = Number(m![4]);
+    // A literal (e.g. `const ms = "0.0"`) is not a measurement.
+    expect(ms).toBeGreaterThan(0);
+    // Deflating 4 MB cannot outlast the call that performed it. The bound is
+    // TIGHT on purpose (0.05 ms = the most `toFixed(1)` can round up): both
+    // readings come from the same monotonic clock, so a value measured inside
+    // the call is never above the wall around it. A timestamp taken elsewhere
+    // (module load, process start) exceeds it even when only by a few ms —
+    // a generous slack would silently admit exactly that bug.
+    expect(ms).toBeLessThanOrEqual(wallMs + 0.05);
+  });
+
+  test("nothing compressed → no saving line at all (the column never reports a non-event)", () => {
+    const headers: Record<string, string> = {};
+    const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
+    const lines = captureStderrLines(() => {
+      compressUpstreamRequestBody({
+        capability: "gzip",
+        headers,
+        body,
+        label: "sakana fugu-ultra",
+      });
+    });
+    expect(lines.some((l) => l.includes("[UpstreamCompress]"))).toBe(false);
+  });
+});
+
 /** Minimal Hono Context capturing c.json() (pattern of composed-handler-error.test.ts). */
 function makeContext(): { c: Context; status: number } {
   let status = 0;
