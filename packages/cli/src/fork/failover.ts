@@ -2529,8 +2529,25 @@ export function recordServedStepForNotices(
   stepIndex: number,
   via?: FailoverRole
 ): void {
+  // No step, no via: the plain nominal produced this response. That is the
+  // normal path of every unarmed request — nothing to announce, silent on
+  // purpose (#431 CR B1).
   if (!step && !via) return;
-  if (stepIndex < 0 && !via) return;
+  // Past the guard above, `!via` means a STEP arrived with no index. That pair
+  // is never legitimate: a step serve always carries its index (the loop reads
+  // both from the same `resolved`), and -1 is the NOMINAL's coordinate. Dropping
+  // it silently — the pre-#681 behaviour — left the notice builders falling back
+  // to the GENERIC resolver (`resolveFailoverTarget`), which cannot see
+  // request-local skips or the session pin: it names a rung that did not serve,
+  // with no trace of why the record went missing. The very mis-naming #431 CR B1
+  // was written to end. Say it out loud instead; the behaviour is unchanged
+  // (no record, no banner) so no nominal path moves.
+  if (stepIndex < 0 && !via) {
+    logStderr(
+      `[Failover] NOTICE-RECORD DROP: step '${step?.target ?? "?"}' served with stepIndex ${stepIndex} and no via — no record written, the banner falls back to the generic resolver (#681)`
+    );
+    return;
+  }
   servedStepRecords.set(c, { role, step: step as FailoverStep, stepIndex, via });
 }
 
