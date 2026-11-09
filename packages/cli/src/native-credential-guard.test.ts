@@ -307,18 +307,13 @@ describe("#410 — unknown bare name: the refusal says unknown, not native", () 
 // ---- route-level: /v1/messages ---------------------------------------------------
 
 describe("#296 — /v1/messages native lane", () => {
-  // replatform/v14 (main-forward sync, #919): the #296 foreign-token guard is
-  // not ported here — measured: v14 serves 200 where main refuses 403. The
-  // token reaches a third party's endpoint. LANDING BLOCKER, security-relevant;
-  // re-enable when the guard lands on v14.
-  test.skip("shape A (proxy-key token swapped away, nothing to substitute) → 403, 0 upstream calls", async () => {
+  test("shape A (proxy-key token swapped away, nothing to substitute) → 403, 0 upstream calls", async () => {
     await spin(); // no stored anthropicApiKey
     const res = await post("/v1/messages", headers({ "x-api-key": PROXY_KEY }), NATIVE_BODY);
     await expectRefused(res, "claude-opus-5-5");
   }, 30_000);
 
-  // replatform/v14 (main-forward sync, #919): same #296 guard gap — see above.
-  test.skip("shape B (valid x-proxy-key + foreign Bearer) → 403, 0 upstream calls — the token is never handed to a third party", async () => {
+  test("shape B (valid x-proxy-key + foreign Bearer) → 403, 0 upstream calls — the token is never handed to a third party", async () => {
     await spin();
     const res = await post(
       "/v1/messages",
@@ -328,8 +323,7 @@ describe("#296 — /v1/messages native lane", () => {
     await expectRefused(res, "claude-opus-5-5");
   }, 30_000);
 
-  // replatform/v14 (main-forward sync, #919): same #296 guard gap — see above.
-  test.skip("shape B with stream:true → the JSON error arrives before any stream starts", async () => {
+  test("shape B with stream:true → the JSON error arrives before any stream starts", async () => {
     await spin();
     const res = await post(
       "/v1/messages",
@@ -371,10 +365,7 @@ describe("#296 — /v1/messages native lane", () => {
 
 // ---- route-level: count_tokens ---------------------------------------------------
 
-// replatform/v14 (main-forward sync, #919): the whole count_tokens native
-// branch diverges — v14's count_tokens lane has neither the #296 refusal nor
-// the OAuth passthrough shape of main. LANDING BLOCKER; re-enable whole.
-describe.skip("#296 — count_tokens native branch", () => {
+describe("#296 — count_tokens native branch", () => {
   test("shape A → 403, 0 upstream calls", async () => {
     await spin();
     const res = await post("/v1/messages/count_tokens", headers({ "x-api-key": PROXY_KEY }), {
@@ -473,9 +464,7 @@ describe("#305 unit — nativeAuthHeaderNames (the AC-1 instrument, names only)"
   });
 });
 
-// replatform/v14 (main-forward sync, #919): main's mixed-pair strip (#305) is
-// not ported here. LANDING BLOCKER, security-relevant; re-enable when it lands.
-describe.skip("#305 — /v1/messages mixed shapes", () => {
+describe("#305 — /v1/messages mixed shapes", () => {
   test("sk-ant Bearer + foreign x-api-key → 1 call, authorization forwarded, x-api-key NOT", async () => {
     await spin();
     const res = await post(
@@ -505,8 +494,7 @@ describe.skip("#305 — /v1/messages mixed shapes", () => {
   }, 30_000);
 });
 
-// replatform/v14 (main-forward sync, #919): same #305 gap — see above.
-describe.skip("#305 — count_tokens mixed shapes", () => {
+describe("#305 — count_tokens mixed shapes", () => {
   test("sk-ant Bearer + foreign x-api-key → 1 call, authorization only", async () => {
     await spin();
     const res = await post(

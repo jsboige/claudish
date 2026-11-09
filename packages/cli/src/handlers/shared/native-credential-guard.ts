@@ -217,3 +217,24 @@ export function stripForeignVisionApiKey(auth: {
   delete auth["x-api-key"];
   return true;
 }
+
+/**
+ * #282 — the proxy's own headers never reach api.anthropic.com: the cluster
+ * key, the attribution/hop headers and anything else `x-claudish-*` name the
+ * proxy, not the client. Shared by the serving lane, the count_tokens lane and
+ * the vision fallback, so all three strip the same set.
+ *
+ * Lives HERE rather than in native-handler (where main keeps it) because the
+ * macOS-bridge typecheck includes the cli sources WITHOUT the DOM lib: an
+ * import edge from composed-handler to native-handler pulls the node stream
+ * typings into that program and breaks `advisor-decorator.ts`'s
+ * `ReadableStreamDefaultReader` (measured: TS2345 at advisor-decorator:500).
+ * This module is already imported by both sides, so hosting it here adds no
+ * program membership.
+ */
+export function stripProxyOwnHeaders(headers: Record<string, string>): void {
+  delete headers["x-proxy-key"];
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase().startsWith("x-claudish-")) delete headers[key];
+  }
+}
