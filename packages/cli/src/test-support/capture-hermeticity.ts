@@ -132,6 +132,15 @@ export function sweepStaleCaptureSandboxes(
   return removed;
 }
 
+/** What the preload saw, for the regime pin. Module state, not env: a name
+ *  read by the code would owe a docker-compose entry under #310's rule, and
+ *  this is harness bookkeeping no container will ever need. */
+let armed: { real: string; sandbox: string } | null = null;
+
+export function captureRegime(): { real: string; sandbox: string } | null {
+  return armed;
+}
+
 /**
  * Arm the guard. Call exactly once, at preload top level. Returns the sandbox
  * path (or null when no ambient env was set — nothing to guard, CI regime).
@@ -145,9 +154,7 @@ export function armCaptureHermeticity(): string | null {
 
   const sandbox = join(tmpdir(), `${CAPTURE_SANDBOX_PREFIX}${process.pid}-${Date.now()}`);
   process.env.CLAUDISH_CAPTURE_DIR = sandbox;
-  // For tests that must assert the swap happened (sandbox value ≠ ambient).
-  process.env.CLAUDISH_TEST_CAPTURE_REAL = ambient;
-  process.env.CLAUDISH_TEST_CAPTURE_SANDBOX = sandbox;
+  armed = { real: ambient, sandbox };
 
   afterAll(() => {
     // Give a racing finalize a moment, then read once. Bounded, best effort —

@@ -22,6 +22,7 @@ import { join } from "node:path";
 import {
   CAPTURE_SANDBOX_PREFIX,
   captureFilesOfProcess,
+  captureRegime,
   detectOwnPidCaptures,
   disposeCaptureSandbox,
   ownPidCaptureFiles,
@@ -99,18 +100,17 @@ describe("capture hermeticity — detection scan", () => {
 
 describe("capture hermeticity — preload wiring (regime pin)", () => {
   test("ambient set ⇒ swapped to the sandbox before any test ran; unset ⇒ inert", () => {
-    const real = process.env.CLAUDISH_TEST_CAPTURE_REAL;
-    const sandbox = process.env.CLAUDISH_TEST_CAPTURE_SANDBOX;
-    if (real !== undefined) {
+    const regime = captureRegime();
+    if (regime !== null) {
       // Seat regime: the swap happened at preload time, and no test since
       // then left the env pointing anywhere but the sandbox.
-      expect(sandbox).toBeDefined();
-      expect(sandbox).toContain(CAPTURE_SANDBOX_PREFIX);
-      expect(process.env.CLAUDISH_CAPTURE_DIR).toBe(sandbox);
-      expect(sandbox).not.toBe(real);
+      expect(regime.sandbox).toContain(CAPTURE_SANDBOX_PREFIX);
+      expect(process.env.CLAUDISH_CAPTURE_DIR).toBe(regime.sandbox);
+      expect(regime.sandbox).not.toBe(regime.real);
     } else {
-      // CI regime: nothing to guard.
-      expect(sandbox).toBeUndefined();
+      // CI regime: nothing to guard, and nothing swapped.
+      const current = process.env.CLAUDISH_CAPTURE_DIR;
+      expect(current === undefined || !current.includes(CAPTURE_SANDBOX_PREFIX)).toBe(true);
     }
   });
 });
