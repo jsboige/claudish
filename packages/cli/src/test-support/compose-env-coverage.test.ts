@@ -459,12 +459,26 @@ describe("#310 compose env coverage (all CLAUDISH_*)", () => {
 
   test("every env name the code reads is injected or exempted (#310 AC1)", () => {
     const gaps = coverageGaps(scan, composeNames);
-    expect(gaps).toEqual([]);
+    // The message goes in expect()'s 2nd arg — measured on bun 1.3.13, a 2nd
+    // toEqual argument is never printed, so this diagnostic lived nowhere until
+    // #310's CR moved it here.
+    const detail = gaps.map((g) => {
+      const where = scan.staticReads.get(g) ?? ["(dynamic role-family read)"];
+      const exempt = EXEMPT.find((e) => e.name === g);
+      return `  ${g} — read at ${where.join(", ")}${exempt ? ` (exempt: ${exempt.why})` : ""}`;
+    });
+    expect(
+      gaps,
+      `names read in code but absent from docker-compose.yml environment:\n${detail.join("\n")}\n(the env file only interpolates — these never reach a container; add them to compose or to EXEMPT with a reason)`
+    ).toEqual([]);
   });
 
   test("every CLAUDISH_* compose entry is read by the code (no dead knobs)", () => {
     const dead = deadComposeEntries(scan, composeNames);
-    expect(dead).toEqual([]);
+    expect(
+      dead,
+      "compose entries the code never reads (renamed knob? stale line?):\n  " + dead.join("\n  ")
+    ).toEqual([]);
   });
 
   test("no stale exemptions — every EXEMPT name is still read somewhere", () => {
@@ -472,7 +486,11 @@ describe("#310 compose env coverage (all CLAUDISH_*)", () => {
     // hides: the name would be skipped forever for a reason that no longer
     // exists. Each must anchor to a live read.
     const stale = EXEMPT.filter((e) => !scan.staticReads.has(e.name));
-    expect(stale.map((e) => e.name)).toEqual([]);
+    expect(
+      stale.map((e) => e.name),
+      "exemptions whose read disappeared (rename? deletion?) — remove them:\n" +
+        stale.map((e) => `  ${e.name} — ${e.why}`).join("\n")
+    ).toEqual([]);
   });
 
   test("empty-string safety: no compose-injected name is read with `?? <non-empty>` (#310 review)", () => {
@@ -481,7 +499,11 @@ describe("#310 compose env coverage (all CLAUDISH_*)", () => {
     // First real catch (pre-fix tree, this PR): openrouter.ts:21
     // CLAUDISH_CATALOG_URL ?? FIREBASE_CATALOG_URL ?? "https://…cloudfunctions…".
     const traps = emptyUnsafeNullishReads(files, composeNames);
-    expect(traps).toEqual([]);
+    expect(
+      traps,
+      'compose injects these names as "" — a ?? whose effective RHS is not "" makes "" a live value:\n' +
+        traps.map((t) => `  ${t.name} — ?? ${t.rhs} (${t.where})`).join("\n")
+    ).toEqual([]);
   });
 
   test("positive control: the empty-string trap detector fires on the pre-fix openrouter shape", () => {
