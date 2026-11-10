@@ -94,7 +94,7 @@ export function App() {
   const [mode, setMode] = useState<Mode>("browse");
   const [inputValue, setInputValue] = useState("");
   const [routingPattern, setRoutingPattern] = useState("");
-  const [routingChain, setRoutingChain] = useState("");
+  const [, setRoutingChain] = useState("");
   const [chainSelected, setChainSelected] = useState<Set<string>>(new Set());
   const [chainOrder, setChainOrder] = useState<string[]>([]);
   const [chainCursor, setChainCursor] = useState(0);

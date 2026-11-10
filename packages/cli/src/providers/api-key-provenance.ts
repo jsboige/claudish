@@ -44,7 +44,6 @@ function maskKey(key: string | undefined | null): string | null {
  */
 export function resolveApiKeyProvenance(envVar: string, aliases?: string[]): KeyProvenance {
   const layers: KeyLayer[] = [];
-  const effectiveValue = process.env[envVar] || null;
   let effectiveSource = "not set";
 
   // Check all env var names (primary + aliases)

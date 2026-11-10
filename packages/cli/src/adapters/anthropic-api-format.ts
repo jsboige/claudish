@@ -23,7 +23,7 @@ export class AnthropicAPIFormat extends BaseAPIFormat {
     };
   }
 
-  shouldHandle(modelId: string): boolean {
+  shouldHandle(_modelId: string): boolean {
     return false; // Not auto-selected; always explicitly passed
   }
 

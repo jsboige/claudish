@@ -15,7 +15,6 @@ import { BaseAPIFormat, type AdapterResult } from "./base-api-format.js";
 import { DialectManager } from "./dialect-manager.js";
 import { mapToolChoiceToOpenAI } from "../handlers/shared/format/openai-tools.js";
 import { removeUriFormat } from "../transform.js";
-import { log } from "../logger.js";
 
 export class OpenRouterAPIFormat extends BaseAPIFormat {
   private innerAdapter: BaseAPIFormat;
@@ -46,7 +45,7 @@ export class OpenRouterAPIFormat extends BaseAPIFormat {
     return this.innerAdapter.processTextContent(textContent, accumulatedText);
   }
 
-  shouldHandle(modelId: string): boolean {
+  shouldHandle(_modelId: string): boolean {
     return true; // Always used explicitly
   }
 
@@ -96,7 +95,7 @@ export class OpenRouterAPIFormat extends BaseAPIFormat {
 
   // ─── Tool conversion with uri format removal ──────────────────────
 
-  override convertTools(claudeRequest: any, summarize = false): any[] {
+  override convertTools(claudeRequest: any, _summarize = false): any[] {
     // Convert to OpenAI format, but strip uri format from schemas
     return (
       claudeRequest.tools?.map((tool: any) => ({

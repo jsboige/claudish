@@ -29,7 +29,7 @@ function readGlmThinkingPolicy(): GlmThinkingPolicy {
 }
 
 export class GLMModelDialect extends BaseAPIFormat {
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     return {
       cleanedText: textContent,
       extractedToolCalls: [],

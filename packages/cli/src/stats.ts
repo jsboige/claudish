@@ -105,7 +105,7 @@ export function resetStatsForTests(): void {
  * Initialize the stats module. Called once at process startup after config loads.
  * Synchronous and fast (< 1ms). No network calls.
  */
-export function initStats(config: ClaudishConfig): void {
+export function initStats(_config: ClaudishConfig): void {
   try {
     if (initialized) return;
     initialized = true;

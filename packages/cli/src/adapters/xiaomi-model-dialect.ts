@@ -11,7 +11,7 @@ import { BaseAPIFormat, AdapterResult, matchesModelFamily } from "./base-api-for
 import { log } from "../logger.js";
 
 export class XiaomiModelDialect extends BaseAPIFormat {
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     return {
       cleanedText: textContent,
       extractedToolCalls: [],

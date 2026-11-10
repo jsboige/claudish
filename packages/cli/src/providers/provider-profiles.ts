@@ -15,7 +15,6 @@
 
 import type { ComposedHandlerOptions } from "../handlers/composed-handler.js";
 import type { RemoteProvider } from "../handlers/shared/remote-provider-types.js";
-import type { ProviderTransport } from "./transport/types.js";
 import type { BaseAPIFormat } from "../adapters/base-api-format.js";
 // Alias for readability within this file
 type BaseModelAdapter = BaseAPIFormat;
@@ -35,7 +34,6 @@ import { LiteLLMAPIFormat } from "../adapters/litellm-api-format.js";
 import { CodexAPIFormat } from "../adapters/codex-api-format.js";
 import { VertexProviderTransport, parseVertexModel } from "./transport/vertex-oauth.js";
 import { DefaultAPIFormat } from "../adapters/base-api-format.js";
-import { OpenRouterProvider } from "./transport/openrouter.js";
 import { getRegisteredRemoteProviders } from "./remote-provider-registry.js";
 import { getRuntimeProfiles } from "./runtime-providers.js";
 import { loadConfig } from "../profile-config.js";
