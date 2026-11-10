@@ -93,7 +93,7 @@ async function testAnthropic(
 ): Promise<TestResult> {
   const url = `${baseUrl}/anthropic/v1/messages`;
   const signal = AbortSignal.timeout(TIMEOUT_MS);
-  const authHeader =
+  const authHeader: Record<string, string> =
     authScheme === "bearer" ? { Authorization: `Bearer ${apiKey}` } : { "x-api-key": apiKey };
 
   try {

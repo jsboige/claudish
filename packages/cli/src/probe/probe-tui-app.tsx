@@ -154,7 +154,8 @@ function Banner() {
       {ishLine !== null && (
         <>
           <text>{ishPad}</text>
-          <text><span fg={ishGreen} bold>{ishLine}</span></text>
+          {/* opentui TextNode has no `bold` prop — the attribute was inert */}
+          <text><span fg={ishGreen}>{ishLine}</span></text>
         </>
       )}
     </box>
@@ -307,7 +308,7 @@ function ModelGroup({
         <text>{"  "}</text>
         <box backgroundColor="#1e3a5f">
           <text>
-            <span fg="#ffffff" bold>
+            <span fg="#ffffff">
               {headerText}
             </span>
           </text>

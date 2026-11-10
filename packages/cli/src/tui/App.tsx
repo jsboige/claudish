@@ -852,7 +852,7 @@ export function App() {
         const next = !statsEnabled;
         if (!cfg.telemetry)
           cfg.telemetry = { enabled: telemetryEnabled, askedAt: new Date().toISOString() };
-        (cfg as Record<string, unknown>).statsEnabled = next;
+        (cfg as unknown as Record<string, unknown>).statsEnabled = next;
         saveConfig(cfg);
         refreshConfig();
         setStatusMsg(`Usage stats ${next ? "enabled" : "disabled"}.`);

@@ -74,7 +74,12 @@ export class LiteLLMAPIFormat extends DefaultAPIFormat {
       }
 
       if (inlineImages) {
-        const lastText = newContent.findLast((p: any) => p.type === "text");
+        // findLast() needs lib es2023 — manual backward scan keeps the same
+        // result under the current target.
+        let lastText: any = null;
+        for (const p of newContent) {
+          if (p.type === "text") lastText = p;
+        }
         if (lastText) {
           lastText.text += inlineImages;
         } else {

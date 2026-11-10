@@ -355,7 +355,7 @@ export function createResponsesStreamHandler(
         if (!retryResp?.ok || !retryResp.body) return false;
 
         try {
-          await reader.cancel();
+          await reader?.cancel();
         } catch {
           // old upstream body — best-effort release
         }
@@ -405,9 +405,11 @@ export function createResponsesStreamHandler(
       try {
         // readLoop: a transparent retry swaps the upstream reader and restarts here.
         readLoop: while (true) {
-          let readResult: ReadableStreamReadResult<Uint8Array>;
+          // ReadableStreamReadResult isn't declared under the current lib —
+          // the structural shape is identical.
+          let readResult: { done: boolean; value?: Uint8Array };
           try {
-            readResult = await reader.read();
+            readResult = await reader!.read();
           } catch (readError) {
             const classified = classifyStreamReadError(readError);
             if (

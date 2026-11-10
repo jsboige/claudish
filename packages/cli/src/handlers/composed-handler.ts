@@ -1040,8 +1040,7 @@ export class ComposedHandler implements ModelHandler {
           estimateClampTokens(claudeRequest) >= knownWindow;
         if (corroborated) {
           logStderr(
-            `[ContextGuard] short-circuit provider=${this.provider.displayName} model=${this.targetModel} est=${est} cap=${overflowCap}${knownWindow !== undefined && knownWindow > 0 && overflowCap < knownWindow ? ` window=${knownWindow} (corroborated)` : " (learned)"} — no upstream call`,
-            true
+            `[ContextGuard] short-circuit provider=${this.provider.displayName} model=${this.targetModel} est=${est} cap=${overflowCap}${knownWindow !== undefined && knownWindow > 0 && overflowCap < knownWindow ? ` window=${knownWindow} (corroborated)` : " (learned)"} — no upstream call`
           );
           return this.buildOverflowRecoveryResponse(c, payload, est, undefined, overflowCap);
         }
@@ -1677,8 +1676,7 @@ export class ComposedHandler implements ModelHandler {
         // (2026-06-25 patient-backoff.)
         if (isTransientOverload(response.status, errorText)) {
           logStderr(
-            `[Overload] [${this.provider.displayName}] HTTP ${response.status} transient overload → returning 529 overloaded_error (patient ~5min backoff exhausted)`,
-            true // forceConsole — operational event
+            `[Overload] [${this.provider.displayName}] HTTP ${response.status} transient overload → returning 529 overloaded_error (patient ~5min backoff exhausted)`
           );
           c.header("Retry-After", "5");
           const overloaded = c.json(
@@ -1729,8 +1727,7 @@ export class ComposedHandler implements ModelHandler {
           const floor = overflowReportFloor();
           const reported = overflowReportedTokens(overflow.used, est, floor);
           logStderr(
-            `[ContextGuard] overflow provider=${this.provider.displayName} model=${this.targetModel} used=${overflow.used ?? "?"} est=${est} floor=${floor} reported=${reported} synthetic=${reported > (overflow.used ?? 0)}`,
-            true // forceConsole — operational event
+            `[ContextGuard] overflow provider=${this.provider.displayName} model=${this.targetModel} used=${overflow.used ?? "?"} est=${est} floor=${floor} reported=${reported} synthetic=${reported > (overflow.used ?? 0)}`
           );
           return this.buildOverflowRecoveryResponse(c, payload, est, overflow.used, overflow.limit);
         }
@@ -1754,8 +1751,7 @@ export class ComposedHandler implements ModelHandler {
           logStderr(
             `[MediaCap] provider=${this.provider.displayName} model=${this.targetModel} ` +
               `cap=${mediaCap.max ?? "?"} images=${carried} param=${mediaCap.param ?? "?"} — ` +
-              `request-shape incapacity, not a step failure`,
-            true // forceConsole — operational event
+              `request-shape incapacity, not a step failure`
           );
           const out = c.json(
             wrapAnthropicError(400, mediaCapRefusalText(mediaCap.max, carried), "invalid_request_error"),
