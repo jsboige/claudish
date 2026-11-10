@@ -1,15 +1,16 @@
 # Pins for scripts/iis49-retention.ps1 — ACK ai-01 10/11 00:09Z (policy + cadence (a)).
 # Guards: (1) today/yesterday never in the purge lot, by NAME; (2) 7z t failure refuses;
-# (3) a drive copy that does not verify refuses; (4) a path outside W3SVC49 refuses.
-# Plus: -WhatIf writes nothing; happy path (stub 7z) archives, manifests and purges;
-#       a re-run never overwrites an existing drive archive.
+# (3) a drive copy that does not verify refuses; (4) a path outside W3SVC49 refuses;
+# (5) per-file membership proof (CR #965) — a purged name missing from the drive
+#     archive's `7z l -slt` listing, or archived at the wrong size, refuses the
+#     ENTIRE purge (7z t + sha prove the archive is sound, not that it is complete).
 # The script runs as a CHILD process (the repo pattern, see claudish-capture-archive.Tests.ps1);
 # exit codes are asserted from the value Invoke-Retention RETURNS ($LASTEXITCODE does not
 # survive the function boundary).
 # 7z is stubbed with .cmd files — the stub finds its archive path as the ONE arg
 # ending in ".7z". NOT "first non-dash arg": cmd's `for %%A in (%*)` splits on "="
 # as a delimiter, so `-mx=5` yields a bare `5` token which would win that race
-# (measured: stub built "5" as the archive path). Both a and t pass exactly one .7z.
+# (measured: stub built "5" as the archive path). a, t and l each pass exactly one .7z.
 
 BeforeAll {
     $script:ScriptPath = (Resolve-Path (Join-Path $PSScriptRoot '..\iis49-retention.ps1')).ProviderPath
@@ -43,8 +44,19 @@ BeforeAll {
     }
 
     function New-Stub7z {
-        param([Parameter(Mandatory)][string]$Dir, [ValidateSet('ok','t-fails','t-mangles')][string]$Mode)
+        # HONEST stub (CR #965): `a` records `name|size` for every .log argument
+        # (minus the optional omission/shrink), `l` renders them as 7z -slt
+        # blocks, `t` keeps its three verdict modes. The archive file is plain
+        # text — the script never opens it as real 7z, it reads the LISTING.
+        param(
+            [Parameter(Mandatory)][string]$Dir,
+            [ValidateSet('ok','t-fails','t-mangles')][string]$Mode = 'ok',
+            [string]$OmitName = '',      # a-mode skips this file (membership hole)
+            [string]$ShrinkName = ''     # a-mode records size 1 for this file (size gap)
+        )
         $stub = Join-Path $Dir 'stub-7z.cmd'
+        $omit   = if ($OmitName)   { $OmitName }   else { '@@no-omit@@' }
+        $shrink = if ($ShrinkName) { $ShrinkName } else { '@@no-shrink@@' }
         $body = @(
             '@echo off',
             'setlocal enabledelayedexpansion',
@@ -55,7 +67,29 @@ BeforeAll {
             '  if "!arg:~-3!"==".7z" set "arch=!arg!"',
             ')',
             'if "%verb%"=="a" (',
-            '  echo ARCHIVE-BODY> "!arch!"',
+            '  del "!arch!" 2>nul',
+            '  for %%A in (%*) do (',
+            '    set "arg=%%A"',
+            '    if "!arg:~-4!"==".log" (',
+            '      for %%Z in ("!arg!") do (',
+            '        set "skip=0"',
+            ('        if /I "%%~nxZ"=="' + $omit + '" set "skip=1"'),
+            '        if "!skip!"=="0" (',
+            ('          if /I "%%~nxZ"=="' + $shrink + '" (set "sz=1") else (set "sz=%%~zZ")'),
+            '          echo %%~nxZ^|!sz!>> "!arch!"',
+            '        )',
+            '      )',
+            '    )',
+            '  )',
+            '  exit /b 0',
+            ')',
+            'if "%verb%"=="l" (',
+            '  for /f "usebackq delims=" %%L in ("!arch!") do (',
+            '    for /f "tokens=1,2 delims=|" %%N in ("%%L") do (',
+            '      echo Path = %%N',
+            '      echo Size = %%O',
+            '    )',
+            '  )',
             '  exit /b 0',
             ')',
             'if "%verb%"=="t" ('
@@ -223,6 +257,9 @@ Describe 'iis49-retention' {
                 Test-Path (Join-Path $f.Site ('u_ex{0:yyMMdd}.log' -f [DateTime]::Now.Date.AddDays(-33))) | Should -BeFalse
                 Test-Path (Join-Path $f.Site ('u_ex{0:yyMMdd}_x.log' -f [DateTime]::Now.Date.AddDays(-40))) | Should -BeFalse
                 Test-Path (Join-Path $f.Site 'u_ex260230.log') | Should -BeTrue
+                # staging cleanup (CR #965, non-blocking): the drive copy is the
+                # artifact of record, the staging archive is gone by explicit name.
+                Test-Path (Join-Path $f.Root 'stage\iis49-t5.7z') | Should -BeFalse
             } finally { Remove-Item -LiteralPath $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
         }
 
@@ -240,6 +277,45 @@ Describe 'iis49-retention' {
                 $code | Should -Not -Be 0
                 (@($out) -join "`n") | Should -Match 'already exists'
                 [System.IO.File]::ReadAllText($pre) | Should -Be 'PRE-EXISTING'
+                @(Get-ChildItem -LiteralPath $f.Site -File -Filter '*.log').Count | Should -Be 9
+            } finally { Remove-Item -LiteralPath $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    Context 'guard: per-file membership proof refuses before purge (CR #965)' {
+        It 'a purged file MISSING from the drive archive listing refuses the entire purge, naming it' {
+            $f = New-FakeSite
+            $out = $null
+            $omitted = 'u_ex{0:yyMMdd}.log' -f [DateTime]::Now.Date.AddDays(-35)
+            try {
+                $stub = New-Stub7z -Dir $f.Root -Mode 'ok' -OmitName $omitted
+                $code = Invoke-Retention @{
+                    SourceDir = $f.Site; DriveDir = $f.Drive; StagingDir = (Join-Path $f.Root 'stage')
+                    SevenZip = $stub; ArchiveName = 'iis49-t7.7z'
+                } -Out ([ref]$out)
+                $code | Should -Not -Be 0
+                (@($out) -join "`n") | Should -Match ('drive archive is MISSING ' + [regex]::Escape($omitted))
+                # evidence kept, sources kept, nothing recorded, nothing purged
+                Test-Path (Join-Path $f.Drive 'iis49-t7.7z') | Should -BeTrue
+                Test-Path (Join-Path $f.Drive 'iis49-sha256.jsonl') | Should -BeFalse
+                @(Get-ChildItem -LiteralPath $f.Site -File -Filter '*.log').Count | Should -Be 9
+            } finally { Remove-Item -LiteralPath $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        It 'a purged file archived at the WRONG SIZE refuses the entire purge' {
+            $f = New-FakeSite
+            $out = $null
+            $shrunk = 'u_ex{0:yyMMdd}.log' -f [DateTime]::Now.Date.AddDays(-33)
+            try {
+                $stub = New-Stub7z -Dir $f.Root -Mode 'ok' -ShrinkName $shrunk
+                $code = Invoke-Retention @{
+                    SourceDir = $f.Site; DriveDir = $f.Drive; StagingDir = (Join-Path $f.Root 'stage')
+                    SevenZip = $stub; ArchiveName = 'iis49-t8.7z'
+                } -Out ([ref]$out)
+                $code | Should -Not -Be 0
+                (@($out) -join "`n") | Should -Match 'archived at 1 bytes but the source holds'
+                Test-Path (Join-Path $f.Drive 'iis49-t8.7z') | Should -BeTrue
+                Test-Path (Join-Path $f.Drive 'iis49-sha256.jsonl') | Should -BeFalse
                 @(Get-ChildItem -LiteralPath $f.Site -File -Filter '*.log').Count | Should -Be 9
             } finally { Remove-Item -LiteralPath $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
         }

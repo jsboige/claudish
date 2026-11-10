@@ -14,9 +14,13 @@
       Unparseable names are ignored and listed, never touched.
     - Pipeline, in order: 7z a (explicit names, staged locally) -> copy to the
       Drive dir -> `7z t` ON THE DRIVE COPY (the artifact of record) -> verify
-      size equality + sha256 x2 concordant + staging==drive -> append the
-      manifest via Update-ShaManifest -Extra (source=iis49-retention) -> purge
-      by explicit name, one Remove-Item -LiteralPath at a time.
+      size equality + sha256 x2 concordant + staging==drive -> `7z l -slt`
+      membership proof (every purged name must be IN the drive archive at its
+      exact source size; one miss or one size gap refuses the ENTIRE purge) ->
+      append the manifest via Update-ShaManifest -Extra (source=iis49-retention)
+      -> purge by explicit name, one Remove-Item -LiteralPath at a time. The
+      staging archive is deleted by explicit name once the drive copy is the
+      artifact of record.
     - Never overwrites an existing archive on the Drive (re-run safety).
     - Never purges anything on the Drive. No other W3SVC site is touched.
 
@@ -163,7 +167,36 @@ if (-not (Confirm-Iis49Copy -StagingPath $stagingPath -DrivePath $drivePath)) {
 $finalHash  = (Get-FileHash -LiteralPath $drivePath -Algorithm SHA256).Hash
 $finalBytes = (Get-Item -LiteralPath $drivePath).Length
 
-# --- 5. manifest append (provenance extras; never purged on the Drive) ---
+# --- 5. per-file membership proof: 7z t + sha prove the drive copy is a SOUND
+# archive, not that it CONTAINS every purged file — a truncated `7z a` file
+# list would sail through both (CR #965, M7). Every purged name must appear in
+# `7z l -slt` at its exact source size; one miss refuses the whole purge.
+if (-not $PSCmdlet.ShouldProcess($drivePath, '7z l -slt (per-file membership proof)')) { exit 0 }
+$listing = @(& $SevenZip l -slt -- $drivePath)
+if ($LASTEXITCODE -ne 0) { throw "refusing: 7z l failed with exit $LASTEXITCODE on the drive copy — nothing purged" }
+# Parse the -slt blocks: `Path = <name>` then the first `Size = <n>` of the block.
+# The archive's own header block (Path = <archive.7z>, no plain Size) never
+# collides with a purged u_ex*.log name, so it is inert here.
+$inArchive = @{}
+$curName = $null
+foreach ($l in $listing) {
+    if    ($l -match '^Path = (.+)$') { $curName = $Matches[1].Trim() }
+    elseif ($l -match '^Size = (\d+)$' -and $null -ne $curName) {
+        if (-not $inArchive.ContainsKey($curName)) { $inArchive[$curName] = [long]$Matches[1] }
+        $curName = $null
+    }
+}
+foreach ($p in $purge) {
+    if (-not $inArchive.ContainsKey($p.File.Name)) {
+        throw ("refusing: purge aborted — the drive archive is MISSING {0} (drive copy kept, sources kept)" -f $p.File.Name)
+    }
+    $archivedSize = [long]$inArchive[$p.File.Name]
+    if ($archivedSize -ne [long]$p.File.Length) {
+        throw ("refusing: purge aborted — {0} archived at {1} bytes but the source holds {2} (drive copy kept, sources kept)" -f $p.File.Name, $archivedSize, $p.File.Length)
+    }
+}
+
+# --- 6. manifest append (provenance extras; never purged on the Drive) ---
 $manifest = Join-Path $DriveDir 'iis49-sha256.jsonl'
 Import-Module (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1') -Force
 if (-not $PSCmdlet.ShouldProcess($manifest, 'append manifest entry')) { exit 0 }
@@ -181,7 +214,7 @@ $null = Update-ShaManifest -Path $manifest -Archive $ArchiveName -Sha256 $finalH
         cutoff_days   = $CutoffDays
     }
 
-# --- 6. purge by explicit name ---
+# --- 7. purge by explicit name ---
 $purged = 0
 foreach ($p in $purge) {
     if (-not $PSCmdlet.ShouldProcess($p.File.FullName, 'purge (retention)')) { break }
@@ -190,4 +223,7 @@ foreach ($p in $purge) {
 }
 Write-Output ("DONE archive={0} purged={1}/{2} freed={3:N1} MB sha256={4}" -f `
     $drivePath, $purged, $purge.Count, ($purgeSize / 1MB), $finalHash)
+# the staging copy is disposable once the drive copy is the artifact of record —
+# removed by explicit name (never a wildcard), best-effort.
+Remove-Item -LiteralPath $stagingPath -Force -ErrorAction SilentlyContinue
 exit 0
