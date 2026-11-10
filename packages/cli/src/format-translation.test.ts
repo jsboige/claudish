@@ -12,7 +12,7 @@
  */
 
 import { describe, test, expect, spyOn } from "bun:test";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -880,7 +880,7 @@ describe("ProviderProfile table completeness", () => {
   test("each profile has a createHandler function", async () => {
     const { PROVIDER_PROFILES } = await import("./providers/provider-profiles.js");
 
-    for (const [name, profile] of Object.entries(PROVIDER_PROFILES)) {
+    for (const [, profile] of Object.entries(PROVIDER_PROFILES)) {
       expect(typeof profile.createHandler).toBe("function");
     }
   });

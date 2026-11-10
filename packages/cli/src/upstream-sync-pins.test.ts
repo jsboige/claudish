@@ -79,6 +79,7 @@ describe("upstream-sync S1 pins (#731)", () => {
   it.each(PINS)("row #%row% (%cls%) sits at its triaged path: %path%", (pin) => {
     // The presence pin. A cut that moves or deletes this path without
     // repointing the list above fails here — that is the entire point.
-    expect(existsSync(join(REPO_ROOT, pin.path))).toBe(true);
+    const { path } = pin as (typeof PINS)[number];
+    expect(existsSync(join(REPO_ROOT, path))).toBe(true);
   });
 });

@@ -42,7 +42,7 @@ import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "../../proxy-server.js";
-import { createRelayState, heartbeat } from "./relay.js";
+import { createRelayState } from "./relay.js";
 import type { ProxyServer } from "../../types.js";
 
 // Distinct range from the other in-process route tests

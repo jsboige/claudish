@@ -9,7 +9,7 @@
 
 import { describe, test, expect } from "bun:test";
 import { parseModelSpec } from "./model-parser.js";
-import { BUILTIN_PROVIDERS, getShortcuts } from "./provider-definitions.js";
+import { BUILTIN_PROVIDERS } from "./provider-definitions.js";
 import { DialectManager } from "../adapters/dialect-manager.js";
 import { GrokModelDialect } from "../adapters/grok-model-dialect.js";
 import { GeminiAPIFormat } from "../adapters/gemini-api-format.js";
@@ -21,7 +21,7 @@ import { XiaomiModelDialect } from "../adapters/xiaomi-model-dialect.js";
 import { CodexAPIFormat } from "../adapters/codex-api-format.js";
 import { OpenAIAPIFormat } from "../adapters/openai-api-format.js";
 import { DefaultAPIFormat } from "../adapters/base-api-format.js";
-import { PROVIDER_PROFILES, createHandlerForProvider } from "./provider-profiles.js";
+import { PROVIDER_PROFILES } from "./provider-profiles.js";
 import { OpenAIProviderTransport } from "./transport/openai.js";
 
 // ---------------------------------------------------------------------------
@@ -29,8 +29,6 @@ import { OpenAIProviderTransport } from "./transport/openai.js";
 // ---------------------------------------------------------------------------
 
 describe("parseModelSpec — shortcut resolution", () => {
-  const shortcuts = getShortcuts();
-
   test("every shortcut in BUILTIN_PROVIDERS resolves to the correct provider", () => {
     for (const def of BUILTIN_PROVIDERS) {
       for (const shortcut of def.shortcuts) {
