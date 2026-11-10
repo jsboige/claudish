@@ -1,19 +1,21 @@
 # v14 → main landing plan (#641)
 
-Status: **document, not execution** (grain v45-5). Written now that the port map
-is 9/9 (8 merged, #900 in review — the last row). This is the plan the
-coordinator executes; a worker does not run it.
+Status: **document, not execution** (grain v45-5; refreshed 10/11 after #952/#957
+landed). Written when the port map reached 9/9 (8 merged, #900 the last row —
+since merged). This is the plan the coordinator executes; a worker does not run
+it.
 
 ## Where things stand
 
-- Base: `replatform/v14` (= `09f8e03b` at map-write; advanced by the 8 merges
-  below). Target: `main`.
+- Base: `replatform/v14` (= `09f8e03b` at map-write; now `9cf299b7` — advanced
+  by the 8 port-map merges, the #919 main sync, and #952/#957 below). Target:
+  `main`.
 - Port map 9/9 — `docs/reference/v14-port-map.md`. Rows and their landing PRs
   into `replatform/v14`:
 
   | row | what | PR into v14 | state |
   |---|---|---|---|
-  | 1 | #565 context-admission census | **#900** | **OPEN (in review)** |
+  | 1 | #565 context-admission census | **#900** | **merged 06/11** (`6a5ac674`) |
   | 2 | #654 endpoint token budget | (two parts) | merged |
   | 3 | #218 native-lane version pin | #889 | merged |
   | 4 | #693 machine-scoped arm | #896 | merged |
@@ -24,17 +26,19 @@ coordinator executes; a worker does not run it.
   | 8 | #306 drain-freeze gate (proxy half) | #865 | merged |
   | 9 | billing-strip family | #885 | merged |
 
-- **#900 is the only open PR targeting replatform/v14.** When it merges, the
-  port map is complete and this plan's precondition is met.
+- Post-map merges into the branch: **#919** (main sync, `b18fb317` + docs #922),
+  **#952** (native credential guard, `6a5ac674`), **#957** (oat Bearer shaping,
+  `9cf299b7`). **Zero open PR targets replatform/v14** (checked 10/11).
 
 ## Precondition (blocking)
 
-1. **#900 merged into replatform/v14**, CI green on the merge commit.
+1. **#900 merged into replatform/v14**, CI green on the merge commit —
+   **satisfied 06/11** (`6a5ac674`).
 2. The #641 G4 never-hang audit (`docs/reference/v14-never-hang-audit.md`)
    reviewed — it certifies no `controller.error()` on the client plane, which is
    the constraint a landing could silently break.
 3. No open PR left targeting replatform/v14 (a stacked PR would be orphaned by
-   the landing).
+   the landing) — **satisfied 10/11** (zero open).
 
 ## Landing order
 
@@ -56,11 +60,12 @@ single integration. Order of operations:
    `hermetic · macOS` `team-liveness-exited-slot` flake is rerun, never fixed in
    the diff — port-map §Known CI flake).
 
-   Two measured blockers found by the step-1 sync (#919) — resolved in this
-   order, none may hold at the landing PR:
+   Two measured blockers found by the step-1 sync (#919) — one still open, one
+   resolved since; none may hold at the landing PR:
 
    1. **`controller.error()` in production sources** (never-hang constraint,
-      #656 / G4a-2a). The main-arrival gate finds **9 call sites in v14-only
+      #656 / G4a-2a). **Still open at `9cf299b7`** (allowlist verified 10/11 —
+      all 9 sites present): **9 call sites in v14-only
       seam sources** that main never scans (line pins as measured on the sync,
       `6fcaec00`): `hooks/seam-transform.ts:760`, `hooks/raw.ts:676` and
       `:964`, `hooks/seam-tap.ts:114`,
@@ -72,13 +77,13 @@ single integration. Order of operations:
       line-pinned `V14_SEAM_SITES` allowlist in
       `prod-no-controller-error.test.ts` — **the allowlist must be emptied by
       the port: the landing PR cannot merge while one site remains.**
-   2. **`native-credential-guard` (×12) + `native-passthrough-strip` (×1)**
-      (#296/#305/#410). Measured on the synced branch: a foreign Bearer beside
-      a valid `x-proxy-key` is **served 200 where main refuses 403** — the
-      foreign token reaches the upstream. The guard was never ported, so this
-      is not a merge regression, but it is security-relevant: the shared shape
-      predicate must be ported before the tree unifies. The skips live in the
-      two test files with written reasons.
+   2. ~~**`native-credential-guard` (×12) + `native-passthrough-strip` (×1)**
+      (#296/#305/#410)~~ — **RESOLVED by #952** (`6a5ac674`: swap + #296
+      refusal + #305 strip + vision sanitizer, skips re-enabled) **and #957**
+      (`9cf299b7`: oat tokens leave as `authorization: Bearer`, one predicate
+      at five write sites). Recorded for history: on the pre-#952 branch a
+      foreign Bearer beside a valid `x-proxy-key` was served 200 where main
+      refuses 403.
 
 4. **Coordinator merges** (worker never merges).
 
@@ -103,6 +108,35 @@ These files exist on **main only** and were deliberately NOT recreated on v14
 
 The reverse trap (v14-only files) is `fork/middleware/proxy-auth-before-relay.test.ts`
 — keep it; it is a pin main lacks.
+
+## Known silent-deletion surface (#641 étape 5, measured 10/11)
+
+The add/add list above is NOT the whole conflict surface. **27 files sit at the
+main↔v14 merge base, were never modified by the fork, and are absent from
+`replatform/v14`** — upstream restructured around them (channel → mcp-session,
+middleware → hooks, TUI panels → components, catalog → catalog-client, Gemini
+code-assist → antigravity). At the landing merge, git takes their deletion
+**without a conflict** — a silent loss the step-1 sync must pass in review.
+
+Per-file disposition lives on #641 (comment of 10/11, refs `3d955d64` vs
+`9cf299b7`): **16 are renamed-covered** (v14 answers under a new path — accept
+the deletion, the new path is cited per file), **11 need an explicit
+keep-vs-drop** before the landing PR opens:
+
+- 4 TUI panels with no v14 equivalent (`ApiKeysPanel`, `ConfigViewPanel`,
+  `StatsPanel`, `TelemetryPanel`) — the fork-TUI/upstream-TUI parity family the
+  Epic body leaves unarbitrated → **C5, user call**;
+- `channel/diagnostics.ts` (the `CLAUDISH_CHANNEL_TRACE` instrumentation
+  documented in CLAUDE.md §Channel Mode) — dropped, and deleting it silently
+  leaves `mcp-session/trace-gate.test.ts` gating on a dead feature;
+- 4 `channel/test-helpers/*` — follow `diagnostics.ts`'s verdict;
+- 2 at-base test files whose coverage would vanish (`mcp-server.test.ts`,
+  `team-timeout-repro.test.ts`) — re-add explicitly at the landing if wanted.
+
+Five more files are fork-modified AND absent (modify/delete or rename/modify
+conflicts — loud, handled in the landing PR): `middleware/gemini-thought-signature.ts`,
+`providers/catalog-resolvers/openrouter.ts` + test, `providers/model-catalog-resolver.ts`,
+`config-command.ts`.
 
 ## Rollback
 
