@@ -396,7 +396,7 @@ describe.skipIf(SKIP_REAL_API)("Group 3: Real API — MiniMax E2E", () => {
     });
 
     expect(response.status).toBe(200);
-    const data = await response.json();
+    const data = (await response.json()) as { content: any[] };
     expect(data.content).toBeDefined();
     expect(data.content.length).toBeGreaterThan(0);
     const textBlock = data.content.find((b: any) => b.type === "text");
@@ -431,7 +431,7 @@ describe.skipIf(SKIP_REAL_API)("Group 3: Real API — MiniMax E2E", () => {
     });
 
     expect(response.status).toBe(200);
-    const data = await response.json();
+    const data = (await response.json()) as { content: any[] };
     expect(data.content).toBeDefined();
     expect(data.content.length).toBeGreaterThan(0);
   }, 30000);
@@ -485,7 +485,7 @@ describe.skipIf(SKIP_REAL_API)("Group 3: Real API — MiniMax E2E", () => {
     });
 
     expect(response.status).toBe(200);
-    const data = await response.json();
+    const data = (await response.json()) as { content: any[] };
     expect(data.content).toBeDefined();
 
     // M2.7 returns thinking blocks by default

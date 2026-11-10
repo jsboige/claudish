@@ -406,7 +406,7 @@ describe("#439 R7 — remapped bare claude-* counted in the exemption branch", (
     expect(res.status).toBe(200);
 
     // Served by the BUDGET lane (remapped), not the native passthrough.
-    const body = await res.json();
+    const body = (await res.json()) as { content?: Array<{ text?: string }> };
     const text = (body.content ?? []).map((b: any) => b.text ?? "").join("");
     expect(text).toContain("ok-budget");
 

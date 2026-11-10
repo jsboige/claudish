@@ -17,11 +17,9 @@ import {
   isLocalTransport,
   isDirectApiProvider,
   toRemoteProvider,
-  getAllProviders,
   getShortestPrefix,
   getApiKeyEnvVars,
   isProviderAvailable,
-  type ProviderDefinition,
 } from "./provider-definitions.js";
 
 // ---------------------------------------------------------------------------

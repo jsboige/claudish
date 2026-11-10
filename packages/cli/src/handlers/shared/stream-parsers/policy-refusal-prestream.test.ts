@@ -282,7 +282,12 @@ describe("ComposedHandler — pre-stream refusal surfacing (#155)", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
-    const msg = await res.json();
+    const msg = (await res.json()) as {
+      role: string;
+      stop_reason: string;
+      content: Array<{ type: string; text: string }>;
+      usage: { input_tokens: number };
+    };
     expect(msg.role).toBe("assistant");
     expect(msg.stop_reason).toBe("end_turn");
     expect(msg.content[0].type).toBe("text");
