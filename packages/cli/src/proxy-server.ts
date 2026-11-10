@@ -155,11 +155,13 @@ import { resolveInboundKeys } from "./handlers/shared/inbound-keys.js";
 import { isKeylessExempt, keylessRefusalMessage } from "./handlers/shared/keyless-exempt.js";
 import {
   nativeAuthHeaderNames,
+  nativeCredentialFromAuthority,
   nativeCredentialRefusalResponse,
   nativeCredentialRefusalShape,
   nativeHeaderNamesLogEnabled,
   stripForeignCredentialBesideAnthropic,
   stripProxyOwnHeaders,
+  writeNativeCredential,
 } from "./handlers/shared/native-credential-guard.js";
 import { noteProxyKeyAuthentication } from "./handlers/shared/proxy-key-rotation.js";
 import { matchesProxyKey, resolveProxyKeys } from "./handlers/shared/proxy-keys.js";
@@ -2767,12 +2769,9 @@ export async function createProxyServer(
             delete reqHeaders["x-api-key"];
             delete reqHeaders.authorization;
             if (anthropicApiKey) {
-              credentialSubstituted = true;
-              if (anthropicApiKey.startsWith("sk-ant-oat")) {
-                reqHeaders.authorization = `Bearer ${anthropicApiKey}`;
-              } else {
-                reqHeaders["x-api-key"] = anthropicApiKey;
-              }
+              // Same shape predicate as every other credential write on this
+              // lane (#641 step 4 centralized it in writeNativeCredential).
+              credentialSubstituted = writeNativeCredential(reqHeaders, anthropicApiKey);
             }
           }
         } else if (!reqHeaders.authorization && !reqHeaders["x-api-key"]) {
@@ -2781,18 +2780,17 @@ export async function createProxyServer(
           // first, else resolve through the credential authority AT REQUEST
           // TIME (env → config → op://), so an ANTHROPIC_API_KEY set after
           // boot is honoured and --probe's counting path is not refused as
-          // shape A by our own admission.
+          // shape A by our own admission. #641 step 4: the authority shapes
+          // the credential — an OAuth token comes back as a Bearer and leaves
+          // as one, never under x-api-key.
           let fallbackKey = anthropicApiKey;
           if (!fallbackKey) {
             const auth = await credentials.getRequestAuth("native-anthropic", {
               model: body.model,
             });
-            fallbackKey = auth.headers["x-api-key"];
+            fallbackKey = nativeCredentialFromAuthority(auth.headers) ?? "";
           }
-          if (fallbackKey) {
-            reqHeaders["x-api-key"] = fallbackKey;
-            credentialSubstituted = true;
-          }
+          credentialSubstituted = writeNativeCredential(reqHeaders, fallbackKey);
         }
 
         // #296 — same credential guard as NativeHandler.handle: refuse locally

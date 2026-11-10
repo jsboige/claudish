@@ -238,3 +238,40 @@ export function stripProxyOwnHeaders(headers: Record<string, string>): void {
     if (key.toLowerCase().startsWith("x-claudish-")) delete headers[key];
   }
 }
+
+/**
+ * #641 step 4 — write a stored/authority-resolved credential onto outbound
+ * native headers using main's swap predicate, verbatim: an OAuth token
+ * (`sk-ant-oat*`, the ANTHROPIC_AUTH_TOKEN case) signs with
+ * `authorization: Bearer`, any other key with `x-api-key`. Returns whether a
+ * credential was written.
+ *
+ * Before this, every fallback site wrote `x-api-key` unconditionally, so an
+ * OAuth token resolved by the credential authority reached api.anthropic.com
+ * under the wrong header name — main's two swap sites have been shape-aware
+ * since #282/#439; v14's authority path was not. One predicate, four sites
+ * (serving swap, serving fallback, count_tokens swap, count_tokens fallback).
+ */
+export function writeNativeCredential(headers: Record<string, string>, key: string): boolean {
+  if (!key) return false;
+  if (key.startsWith("sk-ant-oat")) headers.authorization = `Bearer ${key}`;
+  else headers["x-api-key"] = key;
+  return true;
+}
+
+/**
+ * Read back the credential the authority shaped — `x-api-key`, or the token of
+ * an `authorization: Bearer` (lower- or upper-case A: the generic
+ * ApiKeyCredentialProvider emits `Authorization`, the native provider
+ * `authorization`). Returns undefined when the authority resolved nothing, so
+ * callers fall through to the #296 refusal instead of sending an empty header.
+ */
+export function nativeCredentialFromAuthority(
+  authHeaders: Record<string, string>
+): string | undefined {
+  const apiKey = authHeaders["x-api-key"];
+  if (apiKey) return apiKey;
+  const auth = authHeaders.authorization ?? authHeaders.Authorization;
+  if (auth?.startsWith("Bearer ")) return auth.slice(7);
+  return undefined;
+}

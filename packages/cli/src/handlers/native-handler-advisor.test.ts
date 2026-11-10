@@ -1,5 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { credentials } from "../auth/credentials/authority.js";
 import { parseAdvisorFlag } from "../cli.js";
+import { getConfigFileOverride, setConfigFileOverride } from "../config-override.js";
 import {
   _debug_getTrackedAdvisorIds,
   _debug_resetTrackedAdvisorIds,
@@ -8,6 +12,7 @@ import {
   findPendingAdvisorToolResults,
   loadAdvisorSwapConfig,
   recordAdvisorEventsFromChunk,
+  resolveAdvisorCredential,
   rewriteAdvisorToolResults,
   stripAdvisorBeta,
   stubAdvisorAdvice,
@@ -463,5 +468,56 @@ describe("convertToOpenAIMessages", () => {
     const result = convertToOpenAIMessages(messages);
     expect(result).toHaveLength(1);
     expect(result[0].content).toBe("real content");
+  });
+});
+
+describe("resolveAdvisorCredential (anthropic) — x-api-key read after #641 step 4", () => {
+  // The advisor's anthropic branch reads the authority's x-api-key half only.
+  // Since the provider shapes its credential (oat → `authorization: Bearer`),
+  // what that read sees changed: an oat now reads undefined. `credentials` is
+  // a process-wide singleton — invalidate in BOTH hooks or another file's
+  // memoized key signs for us (measured in the #957 review round).
+  const ENV_KEYS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] as const;
+  const saved: Record<string, string | undefined> = {};
+  const HERMETIC_CONFIG = join(
+    tmpdir(),
+    `claudish-advisor-anthropic-${process.pid}-does-not-exist.json`
+  );
+  let savedConfigOverride: string | null;
+
+  beforeEach(() => {
+    for (const k of ENV_KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    savedConfigOverride = getConfigFileOverride();
+    // A missing override file resolves as an empty config — the real machine's
+    // config must never leak a key into these pins.
+    setConfigFileOverride(HERMETIC_CONFIG);
+    credentials.invalidate("native-anthropic");
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    setConfigFileOverride(savedConfigOverride);
+    credentials.invalidate("native-anthropic");
+  });
+
+  it("a real API key resolves — the x-api-key read still sees it", async () => {
+    process.env.ANTHROPIC_API_KEY = "sk-ant-api03-advisor-test-key";
+    expect(await resolveAdvisorCredential("anthropic")).toBe("sk-ant-api03-advisor-test-key");
+  });
+
+  it("an oat-shaped API key reports no credential — the provider signs it as a Bearer", async () => {
+    process.env.ANTHROPIC_API_KEY = "sk-ant-oat01-advisor-test-oat";
+    expect(await resolveAdvisorCredential("anthropic")).toBeUndefined();
+  });
+
+  it("a NON-oat AUTH_TOKEN is dropped by the equality check, not handed out as an API key", async () => {
+    process.env.ANTHROPIC_AUTH_TOKEN = "sk-ant-api03-advisor-test-auth-token";
+    expect(await resolveAdvisorCredential("anthropic")).toBeUndefined();
   });
 });

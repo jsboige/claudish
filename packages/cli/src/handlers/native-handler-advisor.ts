@@ -1522,8 +1522,10 @@ export interface AdvisorRoute {
 
 /**
  * The credential-authority provider each advisor credential resolves through.
- * `anthropic` is `native-anthropic`, which resolves exactly ANTHROPIC_API_KEY
- * (env → config → keychain → op://) and never the Claude Code OAuth token.
+ * `anthropic` is `native-anthropic`, which resolves ANTHROPIC_API_KEY, then
+ * ANTHROPIC_AUTH_TOKEN, then config/op:// — the AUTH_TOKEN fallback is exactly
+ * why the collector below drops that value explicitly instead of trusting the
+ * provider name to filter it.
  */
 export const ADVISOR_AUTHORITY_PROVIDER: Readonly<Record<AdvisorRouteKind, string>> = Object.freeze(
   {
@@ -1564,12 +1566,18 @@ export function isPlaceholderAnthropicKey(key: string): boolean {
  * therefore never reads, stays a last-resort env fallback because the advisor
  * always accepted it.
  *
- * anthropic (collector only): ANTHROPIC_API_KEY as the authority resolves it,
- * never claudish's placeholder and never ANTHROPIC_AUTH_TOKEN — which the
- * native-anthropic provider would otherwise hand out as an `x-api-key`, and
- * which is the subscription arm's OAuth token. Claude Code's inbound
- * `authorization` bearer is not visible here at all; the runtime's own
- * inbound-`x-api-key` preference lives at its call site.
+ * anthropic (collector only): a true API key as the authority resolves it,
+ * never claudish's placeholder and never ANTHROPIC_AUTH_TOKEN. Since the
+ * provider shapes its credential (#641 step 4), this x-api-key read only ever
+ * sees API keys: an oat token — ANTHROPIC_AUTH_TOKEN, or an oat-shaped
+ * ANTHROPIC_API_KEY — is signed `authorization: Bearer` by the provider and
+ * reads undefined here, so the advisor reports no anthropic credential for
+ * it. That is the honest answer for a subscription token the collector cannot
+ * spend. The AUTH_TOKEN equality check below still earns its place: a NON-oat
+ * AUTH_TOKEN (an API-key-shaped value stored in the bearer variable) is still
+ * signed x-api-key, and without the check it would pass as a spendable key.
+ * Claude Code's inbound `authorization` bearer is not visible here at all;
+ * the runtime's own inbound-`x-api-key` preference lives at its call site.
  *
  * Returns the secret, so a caller that needs presence only (the startup check)
  * must test it and drop it — never log or print it.
@@ -1580,6 +1588,10 @@ export async function resolveAdvisorCredential(
   const fromAuthority = async (provider: string, header: "any" | "x-api-key") => {
     try {
       const auth = await credentials.getRequestAuth(provider, { model: "" });
+      // NB: reads `Authorization` (capital A) only. The native-anthropic
+      // provider emits lowercase `authorization` for oat (#641 step 4), so a
+      // branch that ever asks for the bearer here must extend this read —
+      // otherwise it silently misses that header.
       const bearer = auth.headers.Authorization?.replace(/^Bearer\s+/i, "").trim();
       const apiKey = auth.headers["x-api-key"]?.trim();
       return (header === "x-api-key" ? apiKey : bearer || apiKey) || undefined;

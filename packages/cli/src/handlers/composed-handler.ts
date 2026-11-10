@@ -156,6 +156,7 @@ import { hasActionableLink, hasModelUnsupportedWording } from "./shared/model-un
 import {
   stripForeignVisionApiKey,
   stripProxyOwnHeaders,
+  writeNativeCredential,
 } from "./shared/native-credential-guard.js";
 import { filterIdentity } from "./shared/openai-compat.js";
 import { matchesProxyKey } from "./shared/proxy-keys.js";
@@ -306,11 +307,9 @@ export function sanitizeVisionAuthHeaders(auth: VisionProxyAuthHeaders): void {
     matchesProxyKey(auth["x-api-key"], visionAuthPolicy.proxyKeys)
   ) {
     delete auth["x-api-key"];
-    const stored = visionAuthPolicy.anthropicApiKey;
-    if (stored) {
-      if (stored.startsWith("sk-ant-oat")) auth.authorization = `Bearer ${stored}`;
-      else auth["x-api-key"] = stored;
-    }
+    // Same shape predicate as every other credential write on the native
+    // family (#641 step 4 centralized it in writeNativeCredential).
+    writeNativeCredential(auth as Record<string, string>, visionAuthPolicy.anthropicApiKey ?? "");
     return; // swapped or dropped — the operator's own choice, nothing left to check
   }
   if (stripForeignVisionApiKey(auth)) {
