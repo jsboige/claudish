@@ -1849,7 +1849,7 @@ export async function createProxyServer(
         ? evaluateEndpointTokenBudget(
             budgetPrefix,
             body,
-            { machine: machineHeader, session: sessionKey },
+            { machine: machineHeader ?? undefined, session: sessionKey ?? undefined },
             process.env,
             Date.now(),
             (info) => logStderr(info)
@@ -2276,7 +2276,7 @@ export async function createProxyServer(
                 ? evaluateEndpointTokenBudget(
                     walkBudgetPrefix,
                     body,
-                    { machine: machineHeader, session: sessionKey },
+                    { machine: machineHeader ?? undefined, session: sessionKey ?? undefined },
                     process.env,
                     Date.now(),
                     (info) => logStderr(info)
@@ -3486,13 +3486,13 @@ export async function createProxyServer(
   });
 
   const server = serve({
-    fetch(req, env, ctx) {
+    fetch(req: Request, env: any, ctx?: { remoteAddress?: { address?: string } }): Response | Promise<Response> {
       if (!req.headers.get("x-forwarded-for") && !req.headers.get("x-real-ip")) {
-        // @ts-expect-error — Bun injects remoteAddress on the server info object
-        const addr = ctx?.remoteAddress?.address as string | undefined;
+        const addr = ctx?.remoteAddress?.address;
         if (addr) hostnameConfig.remoteAddrMap.set(req, addr);
       }
-      return app.fetch(req, env, ctx);
+      // @ts-expect-error — Bun's third argument is the server-info object, not a Fetch ExecutionContext
+      return app.fetch(req, env, ctx) as Response | Promise<Response>;
     },
     port,
     hostname: hostnameConfig.hostname,
@@ -3591,14 +3591,14 @@ export async function createProxyServer(
       const parsedGrace = Number(rawGrace);
       const graceMs = !rawGrace || !Number.isFinite(parsedGrace) || parsedGrace < 0 ? 30_000 : parsedGrace;
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
-      server.closeIdleConnections?.();
+      (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
       const deadline = Date.now() + graceMs;
       let consumable = consumableInFlight();
       while ((consumable > 0 || streamTracker.getActiveStreams() > 0) && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 25));
         consumable = consumableInFlight();
       }
-      server.closeAllConnections?.();
+      (server as { closeAllConnections?: () => void }).closeAllConnections?.();
       // The cut above does not reach a connection still being PARSED — Bun's
       // compat leaves a half-written request out of the connection registry, so
       // the close callback would wait for that client forever (measured: still
