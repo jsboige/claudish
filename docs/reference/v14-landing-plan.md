@@ -113,62 +113,108 @@ The reverse trap (v14-only files) is `fork/middleware/proxy-auth-before-relay.te
 ## Known silent-deletion surface (#641 étape 5 + #968 review, measured 10/11)
 
 The add/add list above is NOT the whole conflict surface, and the surface must
-be measured with git's own instrument, not by a file predicate. **Instrument**
-(run at the landing; the base moves with every sync — since #919 it is
+be measured with git's own instrument, not by a file predicate — the first
+revision of this section classified files by history ("main modified it after
+the fork point") and produced lists git's output contradicts. **Instrument**
+(run at the landing and at every sync; the base moves — since #919 it is
 `95a3608f`, a commit ON main, so any fork edit older than that sync is base
 content now):
 
 ```sh
-TREE=$(git merge-tree --write-tree --name-only origin/main origin/replatform/v14 | head -1)
-# rule: a main file absent from the merged tree AND not in the CONFLICT lines
-# is a SILENT deletion — git takes it without asking.
+# one instrument, two partitions
+git merge-tree --write-tree origin/main origin/replatform/v14 > /tmp/mt.txt
+TREE=$(head -1 /tmp/mt.txt)
+# LOUD — the modify/delete CONFLICT lines, verbatim (git keeps main's version in the tree)
+grep 'CONFLICT (modify/delete)' /tmp/mt.txt
+# SILENT — main files absent from the merged tree, in no CONFLICT line, not rename-carried
+git ls-tree -r --name-only origin/main -- packages/cli/src | sort > /tmp/main.txt
+git ls-tree -r --name-only $TREE -- packages/cli/src | sort > /tmp/tree.txt
+comm -23 /tmp/main.txt /tmp/tree.txt > /tmp/absent.txt
+git diff --name-status -M origin/main $TREE -- packages/cli/src | grep '^R' | cut -f2 > /tmp/renamed.txt
+grep -v -F -x -f /tmp/renamed.txt /tmp/absent.txt
 ```
 
-Measured at `3d955d64` vs `9cf299b7`: under `packages/cli/src` the merged tree
-drops **58 files** of main, none of them conflicted — **6 renames git detects**
-(content carried), so **52 silent deletions**. `grep '^CONFLICT'` also yields
-**12 loud deletions**, in two shapes: **2 modify/delete** (git keeps main's
-version in the tree) and **10 add/add** where v14's side is the deletion (the
-base blob exists, main modified it, v14 removed it).
+Measured at `a89a8a5b` (main, post-#974) vs `9cf299b7` (v14 head): git emits
+**34 `CONFLICT (content)`**, **13 `CONFLICT (modify/delete)`** and **zero
+add/add** — that shape does not occur at this merge (the port-map "add/add
+surfaces" above are a port-time trap, not something this merge outputs); an
+earlier revision of this section described a 2+10 split into modify/delete +
+add/add that git never printed.
 
-The 12 loud (all appear in the CONFLICT lines; they need an explicit
-resolution, never a blind one):
+The 13 loud deletions (each needs an explicit resolution, never a blind one;
+all deleted in v14, modified in main, main's version left in tree):
 
-- modify/delete: `providers/catalog-resolvers/openrouter.ts`,
-  `fork/failover.test.ts`;
-- add/add (v14 side deleted): `middleware/gemini-thought-signature.ts`,
-  `providers/model-catalog-resolver.ts`, `providers/catalog-resolvers/openrouter.test.ts`,
-  `config-command.ts`, `tui/test-provider.ts`, `mcp-server.test.ts`,
-  `team-timeout-repro.test.ts`, `channel/diagnostics.ts`,
-  `channel/signal-watcher.ts`, `channel/signal-watcher.test.ts`.
+- `channel/session-manager.ts`, `channel/session-manager.test.ts`
+- `fork/failover.test.ts`, `fork/server/relay-hub-death.test.ts`
+- `handlers/shared/stream-parsers/policy-refusal-prestream.test.ts`
+- `providers/catalog-resolvers/openrouter.ts`
+- `proxy-key-rotation-route.test.ts`
+- `proxy-server-{dwell-pin-route,neverhang-wire,openai-notice,routing-error,step-skip-route}.test.ts`
+- `tui/test-provider.ts` — was silent at `3d955d64`; #974 touched it on main,
+  which promotes it into the loud set. This is the "re-run at every sync" rule
+  working: any main commit under `packages/cli/src` can move a file between
+  partitions.
 
-The 52 silent include the rest of the restructured families (channel →
-mcp-session survivors, middleware → hooks, TUI panels → components,
-gemini → antigravity, the `channel/test-helpers/*` four, and the 10
-`channel/` → `mcp-session/` relocations git does not flag — rename detection
-finds only 2 of them, the other 8 disappear without a word).
+The silent set: **57** main files absent from the merged tree with no CONFLICT
+line — **6 rename-carried** (git detects the `channel/` → `mcp-session/` move
+for `scrollback-buffer.{ts,test.ts}`, `write-json-atomic.{ts,test.ts}`,
+`trace-gate.test.ts`, `progress-regression-mock.ts`; content lives on at the
+v14 path) leaving **51 pure silent deletions**:
+
+- `adapters/`: `deepseek-model-dialect.test.ts`, `glm-model-dialect.test.ts`,
+  `minimax-model-dialect.test.ts`, `openai-api-format.test.ts`
+- `auth/gemini-oauth.ts`, `deepseek-adapter.test.ts`, `profile-config.test.ts`
+- `channel/`: `channel-wire-format.test.ts`, `diagnostics.ts`,
+  `e2e-channel.test.ts`, `index.ts`, `signal-watcher.ts`,
+  `signal-watcher.test.ts`, `types.ts`, `test-helpers/{channel-diagnostic,
+  claudish-mock,client-diagnostic,fake-claudish}.ts`
+- `config-command.ts`, `mcp-server.test.ts`, `team-timeout-repro.test.ts`,
+  `team-failure-details.test.ts`, `team-grid-failure-details.test.ts`
+- `middleware/`: `gemini-thought-signature.ts`, `index.ts`, `manager.ts`, `types.ts`
+- `handlers/`: `composed-handler-tool-name-map.test.ts`,
+  `shared/context-overflow.test.ts`, `shared/format/tool-result-images.test.ts`,
+  `shared/overflow-caps-store.test.ts`,
+  `shared/stream-parsers/{contentless-turn-s4b,ending-taxonomy-s4b,
+  usage-cache-split-s4c}.test.ts`
+- `providers/`: `catalog-resolvers/openrouter.test.ts`,
+  `context-limit-derivation.ts`, `context-limit-derivation.test.ts`,
+  `default-routing-rules.ts`, `default-routing-rules.test.ts`,
+  `model-catalog-resolver.ts`, `runtime-providers.test.ts`,
+  `transport/codex-session-affinity.test.ts`, `transport/gemini-codeassist.ts`
+- `proxy-server-role-map.test.ts`
+- `tui/panels/`: `ApiKeysPanel.tsx`, `ConfigViewPanel.tsx`, `ProfilesPanel.tsx`,
+  `ProvidersPanel.tsx`, `RoutingPanel.tsx`, `StatsPanel.tsx`, `TelemetryPanel.tsx`
+
+**`providers/context-limit-derivation.{ts,test.ts}` is in the silent set, not
+a survivor** — the earlier revision filed it under "survives without conflict",
+which it does not. Both exist at the base `95a3608f`, are absent from v14, and
+vanish from the merged tree with no CONFLICT line. v14 carries
+`registerDeclaredContextLimit` (the config literal) but **no derivation
+probe**: dropping the pair silently re-opens the exact defect #651 closed —
+every declared window on the landed tree is again a number a human typed
+(#660's admission census included). Disposition recorded on #641: **keep +
+wire** the three callsites (`custom-endpoints-loader.ts`, `proxy-server.ts`,
+`builtin-probe-surfaces.json`) at the step-1 sync — opt-in flag, zero default
+wire bytes, fails soft.
 
 **Destination rule**: a disposition table exists per file on #641 (comment of
-10/11 — 16 of the silent are renamed-covered, v14 path cited per file; 11 need
-an explicit keep-vs-drop: the 4 TUI panels `ApiKeysPanel`/`ConfigViewPanel`/
-`StatsPanel`/`TelemetryPanel` → **C5, user call**; `channel/diagnostics.ts`
-(the `CLAUDISH_CHANNEL_TRACE` instrumentation documented in CLAUDE.md §Channel
-Mode) + its 4 `channel/test-helpers/*`; `mcp-server.test.ts` and
-`team-timeout-repro.test.ts` — the last four appear in the loud set, the
-question is the same). The step-1 sync must pass every silent deletion in
-review; nothing in this section is a license to let the merge decide.
+10/11). The keep-vs-drop questions that remain user- or coordinator-level: the
+4 TUI panels `ApiKeysPanel`/`ConfigViewPanel`/`StatsPanel`/`TelemetryPanel` →
+**C5, user call**; `channel/diagnostics.ts` (the `CLAUDISH_CHANNEL_TRACE`
+instrumentation documented in CLAUDE.md §Channel Mode) + its 4
+`channel/test-helpers/*`; `mcp-server.test.ts`, `team-timeout-repro.test.ts`,
+`config-command.ts`, `gemini-thought-signature.ts`, `model-catalog-resolver.ts`
+— all silent now, same question as before. The step-1 sync must pass every
+silent deletion in review; nothing in this section is a license to let the
+merge decide.
 
-**16 fork-only files survive the merge without conflict** (added or last
-modified on main after the base, not in the CONFLICT lines): the 6 routes
-`proxy-key-rotation-route.test.ts` and `proxy-server-{dwell-pin,neverhang-wire,
-openai-notice,routing-error,step-skip-route}.test.ts`, the
-`handlers/shared/upstream-compression.{ts,test.ts}` pair (#909),
-`test-support/capture-hermeticity.{ts,test.ts}` (#445),
-`providers/builtin-probe-surfaces.json`, `probe-live-auth.test.ts`,
-`policy-refusal-prestream.test.ts`, `fork/server/relay-hub-death.test.ts`, and
-`providers/context-limit-derivation.{ts,test.ts}` (the #651/#660 surfaces this
-plan keeps OUT of scope). Their per-file disposition (« couverture différée » —
-module present on v14, pins main-only) lives on #641.
+**6 fork-only files survive the merge without conflict** (added on main after
+the base, never present on v14 — the merge keeps them): the
+`handlers/shared/upstream-compression.{ts,test.ts}` pair (#909), the
+`test-support/capture-hermeticity.{ts,test.ts}` pair (#445),
+`providers/builtin-probe-surfaces.json`, `probe-live-auth.test.ts`. Their
+per-file disposition (« couverture différée » — module present on v14, pins
+main-only) lives on #641.
 
 ## Rollback
 
