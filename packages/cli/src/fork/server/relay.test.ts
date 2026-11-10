@@ -1433,7 +1433,7 @@ describe("deep probe: quota wall vs hub death", () => {
       expect(fetchCalls.length).toBe(2);
     });
 
-    it("a timed-out first attempt NAMES its budget on the line the operator greps", async () => {
+    it("a timed-out first attempt NAMES elapsed and budget on the line the operator greps", async () => {
       const lines: string[] = [];
       const origLog = console.log;
       console.log = (...a: unknown[]) => {
@@ -1450,13 +1450,85 @@ describe("deep probe: quota wall vs hub death", () => {
         console.log = origLog;
       }
       // The two budgets now differ; an unlabeled "TimeoutError" cannot say
-      // WHICH bound expired. The before/after measurement of #867 (AC3) greps
-      // this line, so it must carry the number.
-      expect(
-        lines.some((l) =>
-          l.includes("first attempt on claude-haiku-4-5-20251001 failed (timed out after 1000ms")
-        )
-      ).toBe(true);
+      // WHICH bound expired, and the reason alone cannot say WHAT IT COST.
+      // #867 AC3's before/after measurement greps this line, so it carries
+      // both numbers. Elapsed: LOWER BOUND ONLY — an upper bound is how a
+      // timing assertion flakes on a slow runner (cf. #968). The floor is 998,
+      // not 1000: the abort cannot fire before 1000 ms, but the two Date.now()
+      // reads can each round 1 ms against the delta (observed once in six
+      // runs as a 999 — measured, not theorized).
+      const line = lines.find((l) =>
+        l.includes("first attempt on claude-haiku-4-5-20251001 failed")
+      );
+      expect(line).toBeDefined();
+      expect(line).toContain("budget 1000ms");
+      const m = line ? line.match(/failed after (\d+)ms/) : null;
+      expect(m).not.toBeNull();
+      expect(Number(m && m[1])).toBeGreaterThanOrEqual(998);
+      // the fallback decided, in the same tick — the line says so
+      expect(line).toContain("second attempt on glm-5.3 in the same tick");
+    });
+
+    it("kill switch '0': the failure line prints the FULL budget — 30000ms — with zero waiting", async () => {
+      const lines: string[] = [];
+      const origLog = console.log;
+      console.log = (...a: unknown[]) => {
+        lines.push(a.join(" "));
+      };
+      try {
+        // First attempt fails FAST (503, not a hang): the budget on the line is
+        // what resolveProbeFirstAttemptTimeoutMs() returned, readable without
+        // ever paying 30 s of wall clock in the test.
+        let n = 0;
+        fetchImpl = async () =>
+          n++ === 0
+            ? Promise.resolve(new Response("native lane refused", { status: 503 }))
+            : Promise.resolve(okStream());
+        await withBudget("0", async () => {
+          expect(await deepProbe(state())).toBe(true);
+        });
+      } finally {
+        console.log = origLog;
+      }
+      // The resolver half is pinned above ('0' -> DEEP_PROBE_TIMEOUT_MS); this
+      // is the wire half — the budget the line PRINTS is the one that was paid.
+      const line = lines.find((l) =>
+        l.includes("first attempt on claude-haiku-4-5-20251001 failed")
+      );
+      expect(line).toBeDefined();
+      expect(line).toContain("budget 30000ms");
+    });
+
+    it("the success lines name WHICH attempt served — 1/2 or 2/2", async () => {
+      const lines: string[] = [];
+      const origLog = console.log;
+      console.log = (...a: unknown[]) => {
+        lines.push(a.join(" "));
+      };
+      try {
+        // probe 1: the nominal passes on its own -> attempt 1/2
+        fetchImpl = async () => Promise.resolve(okStream());
+        await withBudget("1000", async () => {
+          expect(await deepProbe(state())).toBe(true);
+        });
+        // probe 2: the nominal 503s, the fallback passes -> attempt 2/2
+        let n = 0;
+        fetchImpl = async () =>
+          n++ === 0
+            ? Promise.resolve(new Response("down", { status: 503 }))
+            : Promise.resolve(okStream());
+        await withBudget("1000", async () => {
+          expect(await deepProbe(state())).toBe(true);
+        });
+      } finally {
+        console.log = origLog;
+      }
+      // The model name already disambiguates for who knows the pairing; the
+      // attempt number says it for everyone else (#867: "which attempt served").
+      const oks = lines.filter((l) => l.includes("[Relay] deep probe OK"));
+      expect(oks.length).toBe(2);
+      expect(oks[0]).toContain("attempt 1/2");
+      expect(oks[1]).toContain("attempt 2/2");
     });
   });
 });

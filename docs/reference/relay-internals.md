@@ -250,7 +250,10 @@ window:
   `CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS=0` restores the pre-#867 behavior byte for byte (first
   attempt at the full 30 s `DEEP_PROBE_TIMEOUT_MS`) without a code change (`relay.ts:285-287`;
   otherwise legal range [1_000, DEEP_PROBE_TIMEOUT_MS], out-of-range falls back to the 10 s
-  default). **A reader quoting
+  default). The failure line carries what the attempt cost — `failed after <n>ms (budget <B>ms,
+  <reason>)` — and every success line (`deep probe OK`, the quota-liveness return) names the
+  attempt that served (`attempt 1/2` / `2/2`), so the per-flip before/after greps one line per
+  decision instead of reassembling it (#867). **A reader quoting
   raw `DOWN → NOMINAL` durations over-states every episode by the protocol's own floor**; the
   subtraction is what tells a 70 s heartbeat blip from a 150 s outage.
 - **The probe's first attempt is intermittent within one seat, so a fixed order is not the fix.**
