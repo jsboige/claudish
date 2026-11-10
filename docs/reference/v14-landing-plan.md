@@ -15,7 +15,7 @@ it.
 
   | row | what | PR into v14 | state |
   |---|---|---|---|
-  | 1 | #565 context-admission census | **#900** | **merged 06/11** (`6a5ac674`) |
+  | 1 | #565 context-admission census | **#900** | **merged 06/11** (`aeb1b60a`) |
   | 2 | #654 endpoint token budget | (two parts) | merged |
   | 3 | #218 native-lane version pin | #889 | merged |
   | 4 | #693 machine-scoped arm | #896 | merged |
@@ -26,14 +26,15 @@ it.
   | 8 | #306 drain-freeze gate (proxy half) | #865 | merged |
   | 9 | billing-strip family | #885 | merged |
 
-- Post-map merges into the branch: **#919** (main sync, `b18fb317` + docs #922),
-  **#952** (native credential guard, `6a5ac674`), **#957** (oat Bearer shaping,
-  `9cf299b7`). **Zero open PR targets replatform/v14** (checked 10/11).
+- Post-map merges into the branch: **#919** (main sync, `35c27ff6` + docs #922
+  `b18fb317`), **#952** (native credential guard, `6a5ac674`), **#957** (oat
+  Bearer shaping, `9cf299b7`). **Zero open PR targets replatform/v14** (checked
+  10/11).
 
 ## Precondition (blocking)
 
 1. **#900 merged into replatform/v14**, CI green on the merge commit —
-   **satisfied 06/11** (`6a5ac674`).
+   **satisfied 06/11** (`aeb1b60a`).
 2. The #641 G4 never-hang audit (`docs/reference/v14-never-hang-audit.md`)
    reviewed — it certifies no `controller.error()` on the client plane, which is
    the constraint a landing could silently break.
@@ -109,34 +110,65 @@ These files exist on **main only** and were deliberately NOT recreated on v14
 The reverse trap (v14-only files) is `fork/middleware/proxy-auth-before-relay.test.ts`
 — keep it; it is a pin main lacks.
 
-## Known silent-deletion surface (#641 étape 5, measured 10/11)
+## Known silent-deletion surface (#641 étape 5 + #968 review, measured 10/11)
 
-The add/add list above is NOT the whole conflict surface. **27 files sit at the
-main↔v14 merge base, were never modified by the fork, and are absent from
-`replatform/v14`** — upstream restructured around them (channel → mcp-session,
-middleware → hooks, TUI panels → components, catalog → catalog-client, Gemini
-code-assist → antigravity). At the landing merge, git takes their deletion
-**without a conflict** — a silent loss the step-1 sync must pass in review.
+The add/add list above is NOT the whole conflict surface, and the surface must
+be measured with git's own instrument, not by a file predicate. **Instrument**
+(run at the landing; the base moves with every sync — since #919 it is
+`95a3608f`, a commit ON main, so any fork edit older than that sync is base
+content now):
 
-Per-file disposition lives on #641 (comment of 10/11, refs `3d955d64` vs
-`9cf299b7`): **16 are renamed-covered** (v14 answers under a new path — accept
-the deletion, the new path is cited per file), **11 need an explicit
-keep-vs-drop** before the landing PR opens:
+```sh
+TREE=$(git merge-tree --write-tree --name-only origin/main origin/replatform/v14 | head -1)
+# rule: a main file absent from the merged tree AND not in the CONFLICT lines
+# is a SILENT deletion — git takes it without asking.
+```
 
-- 4 TUI panels with no v14 equivalent (`ApiKeysPanel`, `ConfigViewPanel`,
-  `StatsPanel`, `TelemetryPanel`) — the fork-TUI/upstream-TUI parity family the
-  Epic body leaves unarbitrated → **C5, user call**;
-- `channel/diagnostics.ts` (the `CLAUDISH_CHANNEL_TRACE` instrumentation
-  documented in CLAUDE.md §Channel Mode) — dropped, and deleting it silently
-  leaves `mcp-session/trace-gate.test.ts` gating on a dead feature;
-- 4 `channel/test-helpers/*` — follow `diagnostics.ts`'s verdict;
-- 2 at-base test files whose coverage would vanish (`mcp-server.test.ts`,
-  `team-timeout-repro.test.ts`) — re-add explicitly at the landing if wanted.
+Measured at `3d955d64` vs `9cf299b7`: under `packages/cli/src` the merged tree
+drops **58 files** of main, none of them conflicted — **6 renames git detects**
+(content carried), so **52 silent deletions**. `grep '^CONFLICT'` also yields
+**12 loud deletions**, in two shapes: **2 modify/delete** (git keeps main's
+version in the tree) and **10 add/add** where v14's side is the deletion (the
+base blob exists, main modified it, v14 removed it).
 
-Five more files are fork-modified AND absent (modify/delete or rename/modify
-conflicts — loud, handled in the landing PR): `middleware/gemini-thought-signature.ts`,
-`providers/catalog-resolvers/openrouter.ts` + test, `providers/model-catalog-resolver.ts`,
-`config-command.ts`.
+The 12 loud (all appear in the CONFLICT lines; they need an explicit
+resolution, never a blind one):
+
+- modify/delete: `providers/catalog-resolvers/openrouter.ts`,
+  `fork/failover.test.ts`;
+- add/add (v14 side deleted): `middleware/gemini-thought-signature.ts`,
+  `providers/model-catalog-resolver.ts`, `providers/catalog-resolvers/openrouter.test.ts`,
+  `config-command.ts`, `tui/test-provider.ts`, `mcp-server.test.ts`,
+  `team-timeout-repro.test.ts`, `channel/diagnostics.ts`,
+  `channel/signal-watcher.ts`, `channel/signal-watcher.test.ts`.
+
+The 52 silent include the rest of the restructured families (channel →
+mcp-session survivors, middleware → hooks, TUI panels → components,
+gemini → antigravity, the `channel/test-helpers/*` four, and the 10
+`channel/` → `mcp-session/` relocations git does not flag — rename detection
+finds only 2 of them, the other 8 disappear without a word).
+
+**Destination rule**: a disposition table exists per file on #641 (comment of
+10/11 — 16 of the silent are renamed-covered, v14 path cited per file; 11 need
+an explicit keep-vs-drop: the 4 TUI panels `ApiKeysPanel`/`ConfigViewPanel`/
+`StatsPanel`/`TelemetryPanel` → **C5, user call**; `channel/diagnostics.ts`
+(the `CLAUDISH_CHANNEL_TRACE` instrumentation documented in CLAUDE.md §Channel
+Mode) + its 4 `channel/test-helpers/*`; `mcp-server.test.ts` and
+`team-timeout-repro.test.ts` — the last four appear in the loud set, the
+question is the same). The step-1 sync must pass every silent deletion in
+review; nothing in this section is a license to let the merge decide.
+
+**16 fork-only files survive the merge without conflict** (added or last
+modified on main after the base, not in the CONFLICT lines): the 6 routes
+`proxy-key-rotation-route.test.ts` and `proxy-server-{dwell-pin,neverhang-wire,
+openai-notice,routing-error,step-skip-route}.test.ts`, the
+`handlers/shared/upstream-compression.{ts,test.ts}` pair (#909),
+`test-support/capture-hermeticity.{ts,test.ts}` (#445),
+`providers/builtin-probe-surfaces.json`, `probe-live-auth.test.ts`,
+`policy-refusal-prestream.test.ts`, `fork/server/relay-hub-death.test.ts`, and
+`providers/context-limit-derivation.{ts,test.ts}` (the #651/#660 surfaces this
+plan keeps OUT of scope). Their per-file disposition (« couverture différée » —
+module present on v14, pins main-only) lives on #641.
 
 ## Rollback
 
