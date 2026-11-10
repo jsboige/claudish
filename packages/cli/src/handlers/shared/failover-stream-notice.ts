@@ -266,7 +266,10 @@ export async function applyFailoverNotices(
     }
     if (response.body) {
       try {
-        const wrapped = prependNoticeToAnthropicStream(response.body, text);
+        const wrapped = prependNoticeToAnthropicStream(
+          response.body as ReadableStream<Uint8Array>,
+          text
+        );
         const headers = new Headers(response.headers);
         return new Response(wrapped as any, {
           status: response.status,

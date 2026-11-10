@@ -130,7 +130,7 @@ async function loadAllModels(forceRefresh = false): Promise<any[]> {
   try {
     const response = await fetch("https://openrouter.ai/api/v1/models");
     if (!response.ok) throw new Error(`API returned ${response.status}`);
-    const data = await response.json();
+    const data = (await response.json()) as { data?: string[] };
     const models = data.data || [];
     mkdirSync(dirname(cachePath), { recursive: true });
     writeFileSync(

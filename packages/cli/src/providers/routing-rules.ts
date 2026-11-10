@@ -61,7 +61,8 @@ export interface RoutingRuleSources {
  * they stay opt-out.
  */
 export function loadRoutingRules(sources?: RoutingRuleSources): RoutingRules {
-  return mergeRoutingRules(DEFAULT_ROUTING_RULES, loadUserRoutingRules(sources));
+  const { localRules: local, globalRules: global_ } = sources ?? loadRoutingRuleSources();
+  return mergeRoutingRules(DEFAULT_ROUTING_RULES, global_, local);
 }
 
 /** Read the user's two rule files off disk, before merging. */
