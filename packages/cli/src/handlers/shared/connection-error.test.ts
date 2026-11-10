@@ -178,8 +178,22 @@ describe("connectRetryPolicy — which connect failures get a bounded retry", ()
     // 400 is walk-class and handleWithCascade serves the next step — the
     // ladder only added up to 7.5 s of sleeps in front of that walk. The arm
     // is gone; this is the pin against re-adding it scoped on handler shape.
-    for (const kind of ["dns", "refused", "unreachable"] as const) {
-      expect(connectRetryPolicy(kind, REMOTE)).toBeNull();
+    //
+    // Env-hermetic: bun auto-loads the repo-root .env into process.env before
+    // tests run, and on a relay-sidecar seat that file sets
+    // CLAUDISH_RELAY_UPSTREAM — the inherited value would arm the ladder this
+    // pin asserts away (#966 side-finding). Clear both knobs, restore after.
+    const savedUpstream = process.env.CLAUDISH_RELAY_UPSTREAM;
+    const savedLink = process.env.CLAUDISH_CONNECT_RETRY_LINK;
+    delete process.env.CLAUDISH_RELAY_UPSTREAM;
+    delete process.env.CLAUDISH_CONNECT_RETRY_LINK;
+    try {
+      for (const kind of ["dns", "refused", "unreachable"] as const) {
+        expect(connectRetryPolicy(kind, REMOTE)).toBeNull();
+      }
+    } finally {
+      if (savedUpstream !== undefined) process.env.CLAUDISH_RELAY_UPSTREAM = savedUpstream;
+      if (savedLink !== undefined) process.env.CLAUDISH_CONNECT_RETRY_LINK = savedLink;
     }
   });
 
