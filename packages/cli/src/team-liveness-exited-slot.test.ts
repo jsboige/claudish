@@ -88,7 +88,21 @@ describe.skipIf(!MAGMUX)("team slot liveness", () => {
     const slow = rows.find((r) => r.slot === slowSlot);
     expect(fast).toMatchObject({ state: "COMPLETED", idle_seconds: null, activity: null });
     expect(slow?.state).toBe("RUNNING");
-    expect(slow?.idle_seconds).toBeGreaterThanOrEqual(1);
+    // The idle clock ticks for a live slot, but WHEN the pane last emitted is
+    // the child's business: idle_seconds is floor((now - lastActivityAt)/1000)
+    // (pane/slot-row.ts), so any pane output inside the test's sleep window
+    // resets the clock to 0 and flaked this line on slow runners (macOS CI,
+    // red 1/3 on #968: expected >= 1, received 0). Waiting for the clock to
+    // cross 1s keeps the property — a live slot's idle clock does tick —
+    // without betting that 1.1s of wall-clock implies 1s of idleness.
+    await waitUntil(
+      () =>
+        ((teamRunRow(sessionPath)?.slots ?? []).find((r) => r.slot === slowSlot)?.idle_seconds ??
+          -1) >= 1,
+      "the slow slot's idle clock to reach 1s"
+    );
+    const slowSettled = (teamRunRow(sessionPath)?.slots ?? []).find((r) => r.slot === slowSlot);
+    expect(slowSettled?.idle_seconds).toBeGreaterThanOrEqual(1);
     expect(slow?.activity).toBe("thinking");
   }, 30_000);
 });
