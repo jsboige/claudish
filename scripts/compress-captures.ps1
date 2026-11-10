@@ -569,8 +569,22 @@ if ($GDriveDir -and (Test-Path -LiteralPath $GDriveDir) -and $ShaCheckCount -gt 
       }
       $liveSha = (Get-FileHash -LiteralPath $live -Algorithm SHA256).Hash
       if ($liveSha -ne $rec.sha256) {
+        # #872 step 2: a SEEDED record is allowed to be older than its file — the
+        # seed never observed those bytes, so the drive may legitimately have been
+        # rewritten afterwards. Name the case: SEED MISMATCH is the honest class,
+        # CONTENT DRIFT stays reserved for a deposit the recorder itself observed.
+        # Same severity either way (loud ERROR, non-zero night, read-only verdict).
+        $class = 'CONTENT DRIFT'
+        if ($rec.source -eq 'reseed') {
+          try {
+            # recorded is a DateTime under pwsh 7 (ConvertFrom-Json) but a raw string
+            # under PS 5.1. Use -f: formats a DateTime ISO, passes a string through.
+            $recTime = [DateTimeOffset]::ParseExact(('{0:yyyy-MM-ddTHH:mm:ssZ}' -f $rec.recorded), 'yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+            if ((Get-Item -LiteralPath $live).LastWriteTimeUtc -gt $recTime.UtcDateTime) { $class = 'SEED MISMATCH' }
+          } catch { }   # unparseable recorded: stay on the conservative CONTENT DRIFT
+        }
         $errors++
-        Log ("ERROR SHA-CHECK {0}: CONTENT DRIFT at destination (recorded {1}.., live {2}.., {3} bytes recorded vs {4} live) - equal-size drift is invisible to every other guard" -f $name, $rec.sha256.Substring(0,8), $liveSha.Substring(0,8), $rec.bytes, (Get-Item -LiteralPath $live).Length)
+        Log ("ERROR SHA-CHECK {0}: $class at destination (recorded {1}.., live {2}.., {3} bytes recorded vs {4} live) - equal-size drift is invisible to every other guard" -f $name, $rec.sha256.Substring(0,8), $liveSha.Substring(0,8), $rec.bytes, (Get-Item -LiteralPath $live).Length)
       } else {
         Log ("SHA-CHECK {0}: OK (matches deposit hash {1}..)" -f $name, $liveSha.Substring(0,8))
       }
