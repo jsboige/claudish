@@ -90,7 +90,6 @@ import { forwardToUpstream, readRequestBody, relayHealthFields, requestLoopedBac
 import { getInstanceId } from "./instance-id.js";
 import {
   initFailover,
-  isFailoverActive,
   isQuotaExhaustion,
   isWiringError,
   roleFromModelName,
@@ -204,7 +203,7 @@ function readWalkBudgetMs(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : WALK_BUDGET_DEFAULT_MS;
 }
 
-async function interceptWebTools(c: any, body: any): Promise<Response | null> {
+async function interceptWebTools(_c: any, body: any): Promise<Response | null> {
   const messages = body.messages || [];
   const isStreaming = body.stream === true;
 
@@ -331,99 +330,6 @@ function buildTextResponse(model: string, text: string, streaming: boolean): Res
         type: "content_block_delta",
         index: 0,
         delta: { type: "text_delta", text },
-      }));
-
-      controller.enqueue(send("content_block_stop", {
-        type: "content_block_stop",
-        index: 0,
-      }));
-
-      controller.enqueue(send("message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null },
-        usage: { input_tokens: 0, output_tokens: 0 },
-      }));
-
-      controller.enqueue(send("message_stop", { type: "message_stop" }));
-      controller.close();
-    },
-  });
-
-  return new Response(stream, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      "anthropic-version": "2023-06-01",
-    },
-  });
-}
-
-/**
- * Build an assistant response with web tool results as text blocks.
- *
- * IMPORTANT: We must NOT use tool_result blocks here. In the Anthropic API,
- * tool_result blocks are only valid in messages with role: "user". Returning
- * them in an assistant message (role: "assistant") causes the client to store
- * malformed conversation history, leading to 400 errors on subsequent requests:
- *   "tool_result blocks can only be in user messages"
- *
- * Instead, we inject the search/fetch results as a text block in a normal
- * assistant response — the same approach used by openai-sse.ts suppression.
- */
-function buildToolResultResponse(model: string, toolResults: any[], streaming: boolean): Response {
-  const encoder = new TextEncoder();
-  const send = (event: string, data: any) =>
-    encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-
-  // Combine all tool results into a single text block
-  const combinedText = toolResults.map((tr) => tr.content).join("\n\n");
-
-  if (!streaming) {
-    return new Response(JSON.stringify({
-      id: `msg_webtools_${Date.now()}`,
-      type: "message",
-      role: "assistant",
-      model,
-      content: [{ type: "text", text: combinedText }],
-      stop_reason: "end_turn",
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
-    }), {
-      headers: {
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-      },
-    });
-  }
-
-  // Streaming SSE response — emit results as a text content block
-  const stream = new ReadableStream({
-    start(controller) {
-      controller.enqueue(send("message_start", {
-        type: "message_start",
-        message: {
-          id: `msg_webtools_${Date.now()}`,
-          type: "message",
-          role: "assistant",
-          model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-      }));
-
-      controller.enqueue(send("content_block_start", {
-        type: "content_block_start",
-        index: 0,
-        content_block: { type: "text", text: "" },
-      }));
-
-      controller.enqueue(send("content_block_delta", {
-        type: "content_block_delta",
-        index: 0,
-        delta: { type: "text_delta", text: combinedText },
       }));
 
       controller.enqueue(send("content_block_stop", {

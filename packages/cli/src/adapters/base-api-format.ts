@@ -187,7 +187,7 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
    * @param ctx - Optional wire-format context (see PrepareRequestContext)
    * @returns The modified request payload
    */
-  prepareRequest(request: any, originalRequest: any, ctx?: PrepareRequestContext): any {
+  prepareRequest(request: any, _originalRequest: any, _ctx?: PrepareRequestContext): any {
     // Tool-name encoding lives in the TEMPLATE, not in a subclass hook, so
     // every adapter gets it exactly once and no subclass can lose it by
     // overriding prepareRequest without calling super — which is how it came
@@ -407,7 +407,7 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
  * Default format/dialect that does no transformation
  */
 export class DefaultAPIFormat extends BaseAPIFormat {
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     return {
       cleanedText: textContent,
       extractedToolCalls: [],
@@ -415,7 +415,7 @@ export class DefaultAPIFormat extends BaseAPIFormat {
     };
   }
 
-  shouldHandle(modelId: string): boolean {
+  shouldHandle(_modelId: string): boolean {
     return false; // Default is fallback
   }
 

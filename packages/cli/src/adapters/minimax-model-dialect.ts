@@ -73,7 +73,7 @@ function readThinkingPolicy(): MiniMaxThinkingPolicy {
 }
 
 export class MiniMaxModelDialect extends BaseAPIFormat {
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     // MiniMax interleaved thinking is handled by the model
     return {
       cleanedText: textContent,

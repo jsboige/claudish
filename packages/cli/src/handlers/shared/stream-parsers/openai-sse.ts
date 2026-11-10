@@ -13,7 +13,6 @@ import { log, logStderr } from "../../../logger.js";
 const SEARXNG_AVAILABLE = !!process.env.SEARXNG_URL;
 import {
   validateAndRepairToolCall,
-  inferMissingParameters,
   extractToolCallsFromText,
   hasExtractableFunctionTag,
   type ToolSchema,

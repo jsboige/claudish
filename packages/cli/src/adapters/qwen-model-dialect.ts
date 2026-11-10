@@ -43,7 +43,7 @@ const QWEN_SPECIAL_TOKENS = [
 ];
 
 export class QwenModelDialect extends BaseAPIFormat {
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     // Strip Qwen special tokens that may leak through
     // This can happen when the model gets confused and outputs its chat template
     let cleanedText = textContent;

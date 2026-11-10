@@ -43,7 +43,7 @@ export class LocalModelAdapter extends BaseAPIFormat {
     return this.innerAdapter.processTextContent(textContent, accumulatedText);
   }
 
-  shouldHandle(modelId: string): boolean {
+  shouldHandle(_modelId: string): boolean {
     return true; // Always used explicitly
   }
 

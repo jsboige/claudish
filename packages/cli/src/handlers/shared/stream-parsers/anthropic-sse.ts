@@ -22,7 +22,6 @@ import {
   logPolicyRefusal,
   policyRefusalNotice,
   POLICY_RETRY_BACKOFF_MS,
-  type PolicyRetryOpts,
 } from "./policy-refusal.js";
 
 /**

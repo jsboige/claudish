@@ -17,7 +17,7 @@ import { lookupModel } from "./model-catalog.js";
 export class GrokModelDialect extends BaseAPIFormat {
   private xmlBuffer: string = "";
 
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     // Accumulate text to handle XML split across multiple chunks
     this.xmlBuffer += textContent;
 

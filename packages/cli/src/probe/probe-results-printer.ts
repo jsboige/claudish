@@ -144,13 +144,7 @@ function summaryColor(live: number, total: number): string {
   return pc.yellow;
 }
 
-function statusColor(state: string): string {
-  if (state === "live") return pc.green;
-  if (state === "key-missing") return pc.dim + pc.red;
-  return pc.red;
-}
-
-function shortStatusLabel(probe: ProbeResult | undefined, hasCreds: boolean, hint?: string): string {
+function shortStatusLabel(probe: ProbeResult | undefined, hasCreds: boolean, _hint?: string): string {
   if (!probe) {
     if (hasCreds) return `${pc.green}● ready${pc.reset}`;
     return `${pc.dim}${pc.red}○ missing${pc.reset}`;
@@ -429,7 +423,7 @@ function computeColumnWidths(rows: RowData[]): number[] {
  * can safely render.
  */
 function computeCardWidth(
-  rows: RowData[],
+  _rows: RowData[],
   widths: number[],
   topTitleVis: number,
   topSummaryVis: number,

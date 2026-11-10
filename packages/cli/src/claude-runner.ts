@@ -2,7 +2,7 @@ import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { writeFileSync, unlinkSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join, basename } from "node:path";
+import { join } from "node:path";
 import { ENV } from "./config.js";
 import type { ClaudishConfig } from "./types.js";
 import { parseModelSpec } from "./providers/model-parser.js";
@@ -183,7 +183,7 @@ process.stdin.on('end', () => {
  * file watcher trying to watch socket files in /tmp (which causes UNKNOWN errors)
  */
 function createTempSettingsFile(
-  modelDisplay: string,
+  _modelDisplay: string,
   port: string,
   proxyAuthMode: boolean
 ): { path: string; statusLine: { type: string; command: string; padding: number } } {

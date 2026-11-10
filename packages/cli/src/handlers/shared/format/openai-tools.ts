@@ -282,7 +282,7 @@ function summarizeToolParameters(schema: any): any {
 
   // Summarize property descriptions
   if (summarized.properties) {
-    for (const [key, prop] of Object.entries(summarized.properties)) {
+    for (const [, prop] of Object.entries(summarized.properties)) {
       const p = prop as any;
       if (p.description && p.description.length > 80) {
         // Keep first sentence or truncate
