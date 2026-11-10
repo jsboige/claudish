@@ -25,7 +25,7 @@ import { createStreamingResponseHandler } from "./openai-sse.js";
 
 const SSE_HEADERS: Record<string, string> = { "Content-Type": "text/event-stream" };
 
-function mockContext() {
+function mockContext(): any {
   return { req: {}, body: (stream: ReadableStream, init?: any) => new Response(stream, init) };
 }
 

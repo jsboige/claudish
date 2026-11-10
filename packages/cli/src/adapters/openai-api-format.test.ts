@@ -50,7 +50,7 @@ function builtPayload(modelId: string, claudeRequest: any): any {
   // otherwise inject fields after the build).
   const messages = [{ role: "user", content: "Reponds exactement: ok" }];
   const payload = adapter.buildPayload(claudeRequest, messages, []);
-  adapter.prepareRequest(payload, claudeRequest, { wireFormat: "openai-sse" as const });
+  adapter.prepareRequest(payload, claudeRequest);
   return payload;
 }
 

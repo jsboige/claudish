@@ -25,11 +25,11 @@ function buildApp(
 }
 
 function post(app: Hono, headers: Record<string, string> = {}, model = "gpt-4o"): Promise<Response> {
-  return app.request("/v1/messages", {
+  return Promise.resolve(app.request("/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify({ model }),
-  });
+  }));
 }
 
 describe("resolveProxyKeys", () => {
@@ -430,11 +430,11 @@ describe("proxy-auth middleware — gzipped body (#717 fix)", () => {
     headers: Record<string, string>,
     model: string
   ): Promise<Response> =>
-    app.request("/v1/messages", {
+    Promise.resolve(app.request("/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json", "content-encoding": "gzip", ...headers },
       body: gzBody(model),
-    });
+    }));
 
   it("a gzipped body reaches the ROUTE parseable — the auth peek must not poison it", async () => {
     const app = new Hono();

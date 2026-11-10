@@ -457,7 +457,7 @@ describe("ComposedHandler — modelName invariant (#102 structural fix)", () => 
 // message non-empty so the request can never hit that 400 again.
 describe("stripImageBlocksFromMessages — empty-content regression", () => {
   test("images-only message becomes the placeholder, not empty string", () => {
-    const messages = [
+    const messages: any[] = [
       {
         role: "user",
         content: [
@@ -472,7 +472,7 @@ describe("stripImageBlocksFromMessages — empty-content regression", () => {
   });
 
   test("single remaining text block with NOTHING stripped still collapses to a plain string", () => {
-    const messages = [
+    const messages: any[] = [
       {
         role: "user",
         content: [{ type: "text", text: "hello" }],
@@ -843,7 +843,7 @@ describe("ComposedHandler — message_start seed is per-session (#518)", () => {
       new Response(script[i++], {
         status: 200,
         headers: { "content-type": "text/event-stream" },
-      })) as typeof fetch;
+      })) as unknown as typeof fetch;
     try {
       // ONE handler for every request: that is the production shape (handlers
       // cached per model) and the precondition of the leak.
@@ -886,7 +886,7 @@ describe("#518 seed map guards (coordinator probe)", () => {
   }
   function harness(next: () => string) {
     const original = (globalThis as any).fetch;
-    (globalThis as any).fetch = (async () => new Response(next(), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch;
+    (globalThis as any).fetch = (async () => new Response(next(), { status: 200, headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch;
     const handler = new ComposedHandler(overflowTransport(), "glm-5.3", "glm-5.3", 8468, {});
     const app = new Hono();
     app.post("/v1/messages", async (c: any) => handler.handle(c, JSON.parse(await c.req.text())));

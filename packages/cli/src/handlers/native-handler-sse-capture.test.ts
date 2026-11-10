@@ -142,7 +142,7 @@ function buildApp(): Hono {
 }
 
 function post(app: Hono): Promise<Response> {
-  return app.request("/v1/messages", {
+  return Promise.resolve(app.request("/v1/messages", {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -155,7 +155,7 @@ function post(app: Hono): Promise<Response> {
       max_tokens: 64,
       messages: [{ role: "user", content: "ping" }],
     }),
-  });
+  }));
 }
 
 async function waitForCapture(dir: string, timeoutMs = 3000): Promise<string | null> {

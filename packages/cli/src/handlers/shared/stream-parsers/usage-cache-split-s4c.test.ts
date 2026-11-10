@@ -54,7 +54,7 @@ const FIXTURES_DIR = join(import.meta.dir, "../../../test-fixtures/sse-responses
 
 const SSE_HEADERS: Record<string, string> = { "Content-Type": "text/event-stream" };
 
-function mockContext() {
+function mockContext(): any {
   return { req: {}, body: (stream: ReadableStream, init?: any) => new Response(stream, init) };
 }
 

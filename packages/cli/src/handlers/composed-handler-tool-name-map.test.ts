@@ -20,7 +20,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { Hono } from "hono";
-import type { ProviderTransport } from "../../providers/transport/types.js";
+import type { ProviderTransport } from "../providers/transport/types.js";
 import { ComposedHandler } from "./composed-handler.js";
 
 function makeTransport(streamFormat: string): ProviderTransport {

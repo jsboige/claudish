@@ -38,7 +38,7 @@ describe("port allocation across in-process test suites", () => {
   });
 
   test("no port is claimed by two different test files", () => {
-    const byPort = new Map<number, Declaration[]>();
+    const byPort = new Map<number, ReturnType<typeof declaredPorts>>();
     for (const row of rows) {
       const owners = byPort.get(row.port) ?? [];
       owners.push(row);

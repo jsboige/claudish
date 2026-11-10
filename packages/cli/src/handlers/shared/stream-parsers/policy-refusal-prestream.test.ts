@@ -9,7 +9,7 @@
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { Hono } from "hono";
-import type { ProviderTransport } from "../../../../providers/transport/types.js";
+import type { ProviderTransport } from "../../../providers/transport/types.js";
 import { ComposedHandler } from "../../composed-handler.js";
 import {
   preStreamPolicyRefusal,
@@ -77,13 +77,13 @@ function jsonRes(status: number, body: string): () => Response {
 }
 
 /** Sequential fetch stub: one factory per expected call (fresh Response each). */
-function seqFetch(factories: (() => Response)[]): { impl: typeof fetch; getCalls: () => number } {
+function seqFetch(factories: (() => Response)[]): { impl: () => Promise<Response>; getCalls: () => number } {
   let calls = 0;
-  const impl = (async () => {
+  const impl = async () => {
     const mk = factories[Math.min(calls, factories.length - 1)];
     calls++;
     return mk();
-  }) as typeof fetch;
+  };
   return { impl, getCalls: () => calls };
 }
 
@@ -112,7 +112,7 @@ function healthyOpenAiSse(): () => Response {
 async function runHandle(
   transport: ProviderTransport,
   payload: any,
-  fetchImpl: typeof fetch
+  fetchImpl: () => Promise<Response>
 ): Promise<Response> {
   const original = (globalThis as any).fetch;
   (globalThis as any).fetch = fetchImpl;
@@ -222,11 +222,11 @@ describe("preStreamPolicyRetry — bounded identical-body retry", () => {
 
   test("thrown retry → loop continues, refusal still surfaces as null", async () => {
     let calls = 0;
-    const impl = (async () => {
+    const impl: () => Promise<Response> = async () => {
       calls++;
       if (calls === 1) throw new Error("socket reset mid-retry");
       return jsonRes(400, OPENAI_REFUSAL_BODY)();
-    }) as typeof fetch;
+    };
     const out = await preStreamPolicyRetry(impl, { lane: "openai", model: "m", backoffMs: [1, 1] });
     expect(out.response).toBeNull();
     expect(calls).toBe(2); // throw did not abort the attempt sequence
