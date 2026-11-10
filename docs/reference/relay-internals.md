@@ -231,7 +231,12 @@ window:
   after its tick (`t` = `CLAUDISH_RELAY_HEARTBEAT_TIMEOUT_MS`, default `HEARTBEAT_TIMEOUT_MS =
   4_000`), so the first tick past the cooldown is the seventh and `window − probe = 70 − t` —
   66 s on the 4 s default, **61,9 s on po-2023's first 2026-11-04 flip** at 9 s (po-2027
-  measured the same 61 s at 9 s, #867). Only a flip stamped off-tick (`forward-connect`,
+  measured the same 61 s at 9 s, #867). **`t` is legal only in [2_000, 9_000]** — the MIN
+  (`MIN_RELAY_HEARTBEAT_TIMEOUT_MS = 2_000`, `relay.ts:128`) stops a hand-edit from turning the
+  prober into a coin flip on ordinary latency, and the MAX (`relay.ts:129` =
+  `HEARTBEAT_INTERVAL_MS − 1_000`) keeps a heartbeat from overrunning the next 10 s tick;
+  out-of-range values fall back to the 4 s default. A reader checking a quoted `t` can rule on
+  legality before any arithmetic. Only a flip stamped off-tick (`forward-connect`,
   `forward-http-*`) draws its alignment anywhere in [60, 70] s. Quoting one seat's 66 s as *the*
   floor mis-states a seat on another heartbeat timeout by the difference. **It is a floor
   measured from `markFail`, not an expected duration**: the seventh tick only opens the door if
@@ -241,7 +246,11 @@ window:
   147,24 s − 1 218 ms = **146,0 s** on the same arithmetic — the day po-2025's *host* rebooted
   at 13:44:56Z, the cooldown expired while the hub was still down and the probe waited for its
   hearing. On a first-attempt probe timeout, add the full first budget (30 s default; 10 s under
-  `CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS`, #868) plus the fallback attempt. **A reader quoting
+  `CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS`, #868) plus the fallback attempt. **Kill switch**:
+  `CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS=0` restores the pre-#867 behavior byte for byte (first
+  attempt at the full 30 s `DEEP_PROBE_TIMEOUT_MS`) without a code change (`relay.ts:285-287`;
+  otherwise legal range [1_000, DEEP_PROBE_TIMEOUT_MS], out-of-range falls back to the 10 s
+  default). **A reader quoting
   raw `DOWN → NOMINAL` durations over-states every episode by the protocol's own floor**; the
   subtraction is what tells a 70 s heartbeat blip from a 150 s outage.
 - **The probe's first attempt is intermittent within one seat, so a fixed order is not the fix.**
