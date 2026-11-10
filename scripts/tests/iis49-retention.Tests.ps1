@@ -1,4 +1,4 @@
-# Pins for scripts/iis49-retention.ps1 — ACK ai-01 10/11 00:09Z (policy + cadence (a)).
+﻿# Pins for scripts/iis49-retention.ps1 — ACK ai-01 10/11 00:09Z (policy + cadence (a)).
 # Guards: (1) today/yesterday never in the purge lot, by NAME; (2) 7z t failure refuses;
 # (3) a drive copy that does not verify refuses; (4) a path outside W3SVC49 refuses;
 # (5) per-file membership proof (CR #965) — a purged name missing from the drive
