@@ -1422,6 +1422,86 @@ exit /b 0
         } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
+    # #872 step 2: on a seeded record, LastWriteTime < recorded means the bytes
+    # predate the hash (the entry does not describe this file) -> SEED MISMATCH.
+    # A rewrite AFTER recording is real drift (the re-seed read the bytes twice)
+    # -> CONTENT DRIFT, and a deposit never earns the seed label whatever its
+    # file mtime. All three stay loud ERROR + non-zero; only the class differs.
+    It 'reseed + file whose bytes predate the recorded hash is named SEED MISMATCH, not CONTENT DRIFT' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd   # night 1: upload + deposit record
+            $name = "captures-$($day)-testbox.7z"
+            # Rewrite the deposit record as a seeded one, recorded NOW.
+            $rec = [ordered]@{
+                archive = $name
+                sha256 = (Get-FileHash -LiteralPath (Join-Path $gd $name) -Algorithm SHA256).Hash
+                bytes = (Get-Item -LiteralPath (Join-Path $gd $name)).Length
+                recorded = ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                source = 'reseed'
+            }
+            [System.IO.File]::WriteAllText((Join-Path $gd 'captures-sha256-testbox.jsonl'), ($rec | ConvertTo-Json -Compress) + "`n", (New-Object System.Text.UTF8Encoding($false)))
+            # The drift: different bytes, LastWriteTimeUtc pushed BEFORE the recorded
+            # instant (the honest construction of "the bytes predate the hash").
+            [System.IO.File]::WriteAllText((Join-Path $gd $name), 'DRIFT!')
+            (Get-Item -LiteralPath (Join-Path $gd $name)).LastWriteTimeUtc = [datetime]::UtcNow.AddDays(-2)
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd   # night 2: re-check runs
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0
+            $log | Should -Match 'SEED MISMATCH'
+            $log | Should -Not -Match 'CONTENT DRIFT'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'reseed + file rewritten after the recorded instant stays CONTENT DRIFT (the re-seed read those bytes)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $name = "captures-$($day)-testbox.7z"
+            $rec = [ordered]@{
+                archive = $name
+                sha256 = (Get-FileHash -LiteralPath (Join-Path $gd $name) -Algorithm SHA256).Hash
+                bytes = (Get-Item -LiteralPath (Join-Path $gd $name)).Length
+                recorded = ((Get-Date).ToUniversalTime().AddDays(-1).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                source = 'reseed'
+            }
+            [System.IO.File]::WriteAllText((Join-Path $gd 'captures-sha256-testbox.jsonl'), ($rec | ConvertTo-Json -Compress) + "`n", (New-Object System.Text.UTF8Encoding($false)))
+            # Rewrite NOW: LastWriteTimeUtc > recorded by construction.
+            [System.IO.File]::WriteAllText((Join-Path $gd $name), 'DRIFT!')
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0
+            $log | Should -Match 'CONTENT DRIFT'
+            $log | Should -Not -Match 'SEED MISMATCH'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'deposit + file older than its record stays CONTENT DRIFT (the seed label is reserved to source=reseed)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd   # deposit record (source=deposit)
+            $name = "captures-$($day)-testbox.7z"
+            # Drifted bytes with an mtime pushed before the recorded instant: the
+            # deposit guard must keep CONTENT DRIFT regardless of the file mtime.
+            [System.IO.File]::WriteAllText((Join-Path $gd $name), 'DRIFT!')
+            (Get-Item -LiteralPath (Join-Path $gd $name)).LastWriteTimeUtc = [datetime]::UtcNow.AddDays(-2)
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0
+            $log | Should -Match 'CONTENT DRIFT'
+            $log | Should -Not -Match 'SEED MISMATCH'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
     It 'wiring: the re-check block sits between the re-upload pass and the retention purge' {
         $text = Get-Content -LiteralPath $script:ScriptPath -Raw
         $reup   = $text.IndexOf('re-upload pass')
