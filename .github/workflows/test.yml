@@ -70,10 +70,12 @@ jobs:
           retention-days: 14
 
   # #956: typecheck gating from the first run (ACK c.6772628044 — no
-  # continue-on-error: a red job must read red). Runs the same commands the
-  # seats run, un-chained: the root `bun run typecheck` stops at the first
-  # failing package (`&&`), so each package gets its own step and the combined
-  # status decides — both are counted even on a red run.
+  # continue-on-error: a red job must read red). Runs the SAME command the
+  # seats run: the root `bun run typecheck`. As of this PR that command gates
+  # on packages/cli — the macos-bridge half (`bun --cwd X run typecheck`)
+  # is a silent no-op on bun >= 1.4 (usage dump, exit 0), and when actually
+  # run the bridge is red on main (TS6306 reference + 155 TS6059 rootDir).
+  # Follow-up tracked separately; bridge gating lands with that fix.
   typecheck:
     runs-on: ubuntu-latest
     env:
@@ -86,20 +88,10 @@ jobs:
       - name: Install dependencies (frozen)
         run: bun install --frozen-lockfile
 
-      - name: Typecheck (packages/cli + packages/macos-bridge)
+      - name: Typecheck (root script, gates on packages/cli)
         run: |
-          set +e
-          bun run --cwd packages/cli typecheck > typecheck-cli.txt 2>&1
-          cli_status=$?
-          bun --cwd packages/macos-bridge run typecheck > typecheck-bridge.txt 2>&1
-          bridge_status=$?
-          set -e
-          cat typecheck-cli.txt typecheck-bridge.txt > typecheck-output.txt
-          cat typecheck-output.txt
-          if [ "$cli_status" -ne 0 ] || [ "$bridge_status" -ne 0 ]; then
-            echo "typecheck failed (packages/cli=$cli_status, packages/macos-bridge=$bridge_status)"
-            exit 1
-          fi
+          bun run typecheck 2>&1 | tee typecheck-output.txt
+          test ${PIPESTATUS[0]} -eq 0
 
       - name: Summary (total / sources / tests)
         if: always()
