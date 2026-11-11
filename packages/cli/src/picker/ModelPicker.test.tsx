@@ -265,6 +265,12 @@ describe("the dialog", () => {
       expect(joined(d.text).split("▶").length - 1).toBe(1);
       await d.press(["a"]);
       await d.until(listPainted);
+      // #984 — the CONDITION ASSERTED, not the header: the cursor row arrives
+      // with the list rows, and the detail block grows a beat later when the
+      // descriptions land (useModelDescriptions is deliberately last). A
+      // `listPainted` wait alone can resolve on the rows-only frame, one paint
+      // before the ▶ the assertion counts. Poll the predicate itself.
+      await d.until((t) => joined(t).split("▶").length - 1 === 1);
       expect(joined(d.recapture().text).split("▶").length - 1).toBe(1);
     } finally {
       d.destroy();
@@ -1096,6 +1102,9 @@ describe("entering a provider loads THAT provider, on demand", () => {
     try {
       await d.press(["RETURN"]);
       await d.until(listPainted);
+      // #984 — same class as the one-cursor pin above: the asserted CONTENT
+      // (the padded id row) is what we wait for, not just the list header.
+      await d.until((t) => t.some((l) => /gpt-6-astra\s{2,}/.test(l)));
       // ONE LIST ROW. The provider column is no longer drawn inside a provider — it
       // said `OpenRouter` 49 times under a dialog titled `OpenRouter` — so the row is
       // identified by its padded id cell instead: the id followed by the gap before
