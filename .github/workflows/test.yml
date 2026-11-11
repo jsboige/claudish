@@ -71,11 +71,12 @@ jobs:
 
   # #956: typecheck gating from the first run (ACK c.6772628044 — no
   # continue-on-error: a red job must read red). Runs the SAME command the
-  # seats run: the root `bun run typecheck`. As of this PR that command gates
-  # on packages/cli — the macos-bridge half (`bun --cwd X run typecheck`)
-  # is a silent no-op on bun >= 1.4 (usage dump, exit 0), and when actually
-  # run the bridge is red on main (TS6306 reference + 155 TS6059 rootDir).
-  # Follow-up tracked in #981; bridge gating lands with that fix.
+  # seats run: the root `bun run typecheck`. Since #981 that command gates on
+  # BOTH packages — the macos-bridge half was previously a silent no-op
+  # (`bun --cwd X run typecheck`, usage dump exit 0 on bun >= 1.3) and is now
+  # the working form `bun run --cwd packages/macos-bridge typecheck`; the
+  # bridge's tsconfig was restructured (rootDir + cli reference removed) and
+  # its real type errors fixed so the half actually runs green.
   typecheck:
     runs-on: ubuntu-latest
     env:
@@ -88,7 +89,7 @@ jobs:
       - name: Install dependencies (frozen)
         run: bun install --frozen-lockfile
 
-      - name: Typecheck (root script, gates on packages/cli)
+      - name: Typecheck (root script, gates on packages/cli + packages/macos-bridge)
         run: |
           bun run typecheck 2>&1 | tee typecheck-output.txt
           test ${PIPESTATUS[0]} -eq 0
@@ -102,7 +103,7 @@ jobs:
           TESTS=$(grep -E 'error TS[0-9]+' typecheck-output.txt | grep -cE '\.test\.ts\(|/test-support/' || true)
           SRC=$((TOTAL - TESTS))
           {
-            echo "### Typecheck (tsc --noEmit, packages/cli, gating — macos-bridge pending #981)"
+            echo "### Typecheck (tsc --noEmit, packages/cli + packages/macos-bridge, gating)"
             echo "| total | sources | tests |"
             echo "|---|---|---|"
             echo "| $TOTAL | $SRC | $TESTS |"

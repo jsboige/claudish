@@ -999,7 +999,16 @@ export class CONNECTHandler {
       }
 
       // Parse the JSON response
-      let conversationData: { chat_messages?: unknown[]; [key: string]: unknown };
+      // A chat message carries at least these fields (both server-returned and
+      // injected messages); typed loosely so map/sort/property access typechecks.
+      type ChatMessage = {
+        uuid?: string;
+        index?: number;
+        sender?: string;
+        parent_message_uuid?: string;
+        [key: string]: unknown;
+      };
+      let conversationData: { chat_messages?: ChatMessage[]; [key: string]: unknown };
       try {
         conversationData = JSON.parse(response.body);
       } catch {
@@ -1115,7 +1124,7 @@ export class CONNECTHandler {
    */
   private buildHTTPResponse(
     status: number,
-    headers: Record<string, string>,
+    headers: Record<string, string | string[]>,
     body: string
   ): string {
     const statusText = status === 200 ? "OK" : status === 404 ? "Not Found" : "Error";
@@ -1124,7 +1133,9 @@ export class CONNECTHandler {
     for (const [key, value] of Object.entries(headers)) {
       // Skip transfer-encoding as we're sending full body
       if (key.toLowerCase() === "transfer-encoding") continue;
-      response += `${key}: ${value}\r\n`;
+      // CycleTLS header values may be string[] (one per repeated header line).
+      const rendered = Array.isArray(value) ? value.join(", ") : value;
+      response += `${key}: ${rendered}\r\n`;
     }
 
     response += "\r\n";
@@ -1699,7 +1710,7 @@ export class CONNECTHandler {
       const response = await this.callProviderAPI(targetModel, anthropicRequest);
 
       // Transform and stream response back to client, passing conversation ID for sync support
-      await this.streamTransformedResponse(tlsSocket, response, targetModel, claudeDesktopRequest, conversationId);
+      await this.streamTransformedResponse(tlsSocket, response, targetModel, claudeDesktopRequest, conversationId, startTime, sourceModel);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error("[CONNECTHandler] Interception failed:", errorMsg);
@@ -1938,7 +1949,9 @@ export class CONNECTHandler {
     providerResponse: Response,
     targetModel: string,
     originalRequest?: { parent_message_uuid?: string; prompt?: string },
-    conversationId?: string
+    conversationId?: string,
+    startTime?: number,
+    sourceModel?: string
   ): Promise<void> {
     // Write HTTP response headers
     tlsSocket.write(
@@ -2289,10 +2302,10 @@ export class CONNECTHandler {
         timestamp: new Date().toISOString(),
         app: "Claude Desktop",
         confidence: 1.0,
-        requestedModel: sourceModel,
+        requestedModel: sourceModel ?? "unknown",
         targetModel: targetModel,
         status: 200,
-        latency: Date.now() - startTime,
+        latency: Date.now() - (startTime ?? Date.now()),
         inputTokens: usage?.prompt_tokens || 0,
         outputTokens: usage?.completion_tokens || 0,
         cost: 0, // TODO: compute cost based on model pricing
@@ -2306,25 +2319,6 @@ export class CONNECTHandler {
       writeEvent("error", { type: "error", error: { type: "api_error", message: String(err) } });
       tlsSocket.write("0\r\n\r\n");
     }
-  }
-
-  /**
-   * Write error response to client
-   */
-  private writeErrorResponse(tlsSocket: tls.TLSSocket, err: unknown): void {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    const response = JSON.stringify({
-      type: "error",
-      error: {
-        type: "api_error",
-        message: errorMsg,
-      },
-    });
-
-    tlsSocket.write(
-      `HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(response)}\r\nConnection: close\r\n\r\n${response}`
-    );
-    tlsSocket.end();
   }
 
   /**

@@ -76,13 +76,14 @@ export class CycleTLSManager {
 			const response = await this.cycleTLS(
 				url,
 				{
-					method: options.method,
+					// `method` is NOT a CycleTLSRequestOptions field — the verb rides the
+					// 3rd argument (options.method.toLowerCase() below). Dropping it here.
 					headers: options.headers,
 					body: options.body,
 					ja3: this.CHROME_JA3,
 					userAgent: this.CHROME_USER_AGENT,
 				},
-				options.method.toLowerCase(),
+				options.method.toLowerCase() as "get" | "post" | "put" | "delete" | "head" | "options" | "patch",
 			);
 
 			console.error(
@@ -123,11 +124,10 @@ export class CycleTLSManager {
 				// Text response
 				body = await response.text();
 				console.error(`[CycleTLSManager] Using response.text()`);
-			} else if (response.body) {
-				// Fallback to body
-				body = response.body;
-				console.error(`[CycleTLSManager] Using response.body`);
 			}
+			// CycleTLSResponse has NO `.body` field — the body lives in `.data`
+			// (handled above) or `.text()`. The old `else if (response.body)` fallback
+			// read a non-existent property (always undefined); removed.
 
 			// Update Content-Length to match actual body size
 			const headers = { ...response.headers };
@@ -165,23 +165,32 @@ export class CycleTLSManager {
 				const retryResponse = await this.cycleTLS(
 					url,
 					{
-						method: options.method,
 						headers: options.headers,
 						body: options.body,
 						ja3: this.CHROME_JA3,
 						userAgent: this.CHROME_USER_AGENT,
 					},
-					options.method.toLowerCase(),
+					options.method.toLowerCase() as "get" | "post" | "put" | "delete" | "head" | "options" | "patch",
 				);
 
 				console.error(
 					`[CycleTLSManager] Retry successful: ${retryResponse.status}`,
 				);
 
+				// Body comes from `.data`/`.text()` (no `.body` on CycleTLSResponse).
+				let retryBody = '';
+				if (retryResponse.data !== undefined && retryResponse.data !== null) {
+					retryBody = typeof retryResponse.data === 'string'
+						? retryResponse.data
+						: JSON.stringify(retryResponse.data);
+				} else if (typeof retryResponse.text === 'function') {
+					retryBody = await retryResponse.text();
+				}
+
 				return {
 					status: retryResponse.status,
 					headers: retryResponse.headers,
-					body: retryResponse.body || '',
+					body: retryBody,
 				};
 			} catch (retryErr) {
 				console.error(
