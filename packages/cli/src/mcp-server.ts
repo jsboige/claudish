@@ -524,10 +524,11 @@ function defineTools(sessionManager: SessionManager): ToolDefinition[] {
     group: "low-level",
     handler: async () => {
       try {
-        // #993 review: no initFailover() here — it would un-wall every bucket
-        // the in-process proxy learned. claudishStatusHandler reads state
-        // without resetting it; when this process's proxy never started, it
-        // says so instead of defaulting `diverted: false`.
+        // #993 review: the failover init/wipe must NOT run here — it would
+        // un-wall every bucket the in-process proxy learned.
+        // claudishStatusHandler reads state without resetting it; when this
+        // process's proxy never started, it says so instead of defaulting
+        // `diverted: false`.
         const payload = claudishStatusHandler({
           proxyStarted: proxyInstance !== null || proxyStarting !== null,
         });
