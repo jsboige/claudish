@@ -42,6 +42,20 @@ import {
   type RecommendedModelGroup,
 } from "./model-loader.js";
 import { BUILTIN_PROVIDERS } from "./providers/provider-definitions.js";
+import {
+  FAILOVER_ROLES,
+  getFailoverRule,
+  getActiveFailovers,
+  isFailoverActive,
+  earliestWalledReprobeAt,
+  initFailover,
+} from "./fork/failover.js";
+import { getModelMapping, loadConfig } from "./profile-config.js";
+import {
+  getDeclaredContextLimit,
+  getDerivedContextLimit,
+} from "./providers/runtime-providers.js";
+import { renderStatus, renderCapabilities } from "./mcp-status-tools.js";
 // One cache path for the whole binary: a local constant here would drift from
 // the proxy the day CLAUDISH_MODEL_CACHE_PATH is set, and the MCP tool would
 // list a different catalog than the router resolves against.
@@ -500,6 +514,119 @@ function defineTools(sessionManager: SessionManager): ToolDefinition[] {
       }
 
       return { content: [{ type: "text" as const, text: output }] };
+    },
+  });
+
+  // ── Read-only introspection (#985) ────────────────────────────────────
+  // claudish_status / claudish_capabilities: the READ half of the negotiated
+  // capability surface. No side effects, no writes — the hub stays arbiter; a
+  // status read reports, it does not requisition. Both handlers go through
+  // mcp-status-tools.ts, which deep-scrubs anything credential-shaped before
+  // it reaches the wire (no secrets in the MCP surface).
+
+  tools.push({
+    name: "claudish_status",
+    description:
+      "Read-only: the effective tier→provider mapping, armed failover steps, configured/auto state and reset clocks. Reports what the hub is serving — never requisitions.",
+    inputSchema: { type: "object" },
+    group: "low-level",
+    handler: async () => {
+      try {
+        initFailover();
+        const cfg = loadConfig();
+        const mapping = getModelMapping(cfg.defaultProfile);
+        const active = getActiveFailovers();
+        const roles = FAILOVER_ROLES.map((role) => {
+          const rule = getFailoverRule(role);
+          const serving = active.find((a) => a.role === role);
+          const resetAt = earliestWalledReprobeAt(role);
+          return {
+            role: role as string,
+            nominal: mapping[role],
+            configuredSteps: rule ? rule.steps.map((s) => s.target) : [],
+            activeStep: serving
+              ? { target: serving.step.target, stepIndex: serving.stepIndex, bucket: serving.bucket }
+              : null,
+            auto: isFailoverActive(role) || (rule !== undefined && rule.steps.length > 0),
+            resetAt: resetAt ? resetAt.toISOString() : null,
+          };
+        });
+        const payload = renderStatus({ profile: cfg.defaultProfile, roles });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [
+            { type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  });
+
+  tools.push({
+    name: "claudish_capabilities",
+    description:
+      "Read-only: what the current provider actually supports — vision yes/no, the real context window (measured > declared > catalog), tool-use, thinking. Check a capability before the task, not after the 400.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        model: {
+          type: "string",
+          description:
+            "Model to introspect (e.g. 'glm-5.3', 'gc@glm-5.3', 'claude-sonnet-5-5'). Omit to report the effective sonnet mapping.",
+        },
+      },
+    },
+    group: "low-level",
+    handler: async (args) => {
+      try {
+        const cfg = loadConfig();
+        const mapping = getModelMapping(cfg.defaultProfile);
+        const requested = (args.model as string | undefined) || mapping.sonnet || "unknown";
+        // Split an explicit provider prefix (gc@, cx@, or@, …) from the model id.
+        const provider = requested.includes("@") ? requested.split("@")[0] : undefined;
+        const bareModel = requested.includes("@") ? requested.slice(requested.indexOf("@") + 1) : requested;
+
+        // Catalog lookup (best-effort; absence = unknown, never a guess).
+        let catalog: { vision?: boolean; toolUse?: boolean; thinking?: boolean; context?: string | number } | null = null;
+        try {
+          const doc = await getRecommendedModels();
+          const entry = (doc.models || []).find(
+            (m: { id?: string; name?: string }) => m.id === bareModel || m.name === bareModel || m.id === requested
+          );
+          if (entry) {
+            catalog = {
+              vision: entry.supportsVision,
+              toolUse: entry.supportsTools,
+              thinking: entry.supportsReasoning,
+              context: entry.context,
+            };
+          }
+        } catch {
+          // catalog unavailable → leave null; the window still reports declared/derived.
+        }
+
+        const payload = renderCapabilities({
+          model: bareModel,
+          provider,
+          catalog,
+          declaredContextLimit: provider ? getDeclaredContextLimit(provider) : undefined,
+          derivedContextLimit: provider ? getDerivedContextLimit(provider) : undefined,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [
+            { type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` },
+          ],
+          isError: true,
+        };
+      }
     },
   });
 
