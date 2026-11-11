@@ -1210,7 +1210,7 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
   // fallback below keeps the full budget: it is the attempt that carries the
   // verdict when the first expires, so it must never be the one cut short.
   const firstBudget = resolveProbeFirstAttemptTimeoutMs();
-  const firstResult = await probeAttempt(state, first, firstBudget);
+  const firstResult = await probeAttempt(state, first, firstBudget, 1);
   // #867 AC2: record each attempt's latency for the recovery line proberTick
   // emits on success. Overwritten per call (a failed probe's attempts are
   // visible through their own failure lines; only the winning probe's record
@@ -1220,12 +1220,17 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
   ];
   if (firstResult.ok) return true;
   const fallback = probeFallbackModel();
+  // #867: elapsed AND budget on the line — the timeout reason names what
+  // expired, not what it cost or under which bound. AC3's before/after
+  // measurement greps these numbers; the elapsed is the operator's only
+  // evidence of how much of the recovery gate the first attempt burned.
   log(
-    `[Relay] deep probe: first attempt on ${first} failed (${firstResult.reason}) — ` +
+    `[Relay] deep probe: first attempt on ${first} failed after ${firstResult.ms}ms ` +
+      `(budget ${firstBudget}ms, ${firstResult.reason}) — ` +
       `second attempt on ${fallback} in the same tick`,
     true
   );
-  const secondResult = await probeAttempt(state, fallback);
+  const secondResult = await probeAttempt(state, fallback, DEEP_PROBE_TIMEOUT_MS, 2);
   state.probeAttempts.push({
     model: fallback,
     ms: secondResult.ms,
@@ -1247,11 +1252,14 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
 /** One deep-probe request. No logging of the verdict — the caller owns it.
  * `timeoutMs` bounds THIS attempt's fetch and body read; the first attempt
  * passes the short #867 budget, the fallback the full one. `ms` is the attempt's
- * own latency (#867 AC2) — what the recovery line reports per attempt. */
+ * own latency (#867 AC2) — what the recovery line reports per attempt.
+ * `attemptNo` (1 = nominal, 2 = fallback) lands on the success lines, so a
+ * grep says WHICH attempt served without knowing the model pairing (#867). */
 async function probeAttempt(
   state: RelayState,
   model: string,
-  timeoutMs = DEEP_PROBE_TIMEOUT_MS
+  timeoutMs = DEEP_PROBE_TIMEOUT_MS,
+  attemptNo = 1
 ): Promise<{ ok: boolean; reason: string; ms: number }> {
   // Above the try on purpose: the catch computes the attempt's latency too
   // (#867 AC2), and a `const` born inside the try is not visible there.
@@ -1302,7 +1310,8 @@ async function probeAttempt(
       if (isQuotaExhaustion(res.status, errBody)) {
         log(
           `[Relay] deep probe: upstream answered ${res.status} naming a quota/plan wall — ` +
-            `that IS liveness (it routed the request to answer), returning to NOMINAL (model=${model})`,
+            `that IS liveness (it routed the request to answer), returning to NOMINAL ` +
+            `(model=${model}, attempt ${attemptNo}/2)`,
           true
         );
         return { ok: true, reason: "quota wall = liveness", ms: Date.now() - startedAt };
@@ -1328,7 +1337,7 @@ async function probeAttempt(
         // probe, on the deep-probe path only — never per heartbeat.
         const ms = Date.now() - startedAt;
         log(
-          `[Relay] deep probe OK — message_stop after ${ms}ms (model=${model})`,
+          `[Relay] deep probe OK — message_stop after ${ms}ms (model=${model}, attempt ${attemptNo}/2)`,
           true
         );
         try {
