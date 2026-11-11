@@ -68,3 +68,51 @@ jobs:
           name: test-output-${{ github.run_id }}
           path: test-output.txt
           retention-days: 14
+
+  # #956: typecheck gating from the first run (ACK c.6772628044 — no
+  # continue-on-error: a red job must read red). Runs the SAME command the
+  # seats run: the root `bun run typecheck`. As of this PR that command gates
+  # on packages/cli — the macos-bridge half (`bun --cwd X run typecheck`)
+  # is a silent no-op on bun >= 1.4 (usage dump, exit 0), and when actually
+  # run the bridge is red on main (TS6306 reference + 155 TS6059 rootDir).
+  # Follow-up tracked in #981; bridge gating lands with that fix.
+  typecheck:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0  # same pin as `test` — commensurable counts
+      - name: Install dependencies (frozen)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (root script, gates on packages/cli)
+        run: |
+          bun run typecheck 2>&1 | tee typecheck-output.txt
+          test ${PIPESTATUS[0]} -eq 0
+
+      - name: Summary (total / sources / tests)
+        if: always()
+        run: |
+          # grep -c exits 1 on zero matches — under bash -e that would turn a
+          # GREEN run's summary red; || true keeps the count honest at 0.
+          TOTAL=$(grep -cE 'error TS[0-9]+' typecheck-output.txt || true)
+          TESTS=$(grep -E 'error TS[0-9]+' typecheck-output.txt | grep -cE '\.test\.ts\(|/test-support/' || true)
+          SRC=$((TOTAL - TESTS))
+          {
+            echo "### Typecheck (tsc --noEmit, packages/cli, gating — macos-bridge pending #981)"
+            echo "| total | sources | tests |"
+            echo "|---|---|---|"
+            echo "| $TOTAL | $SRC | $TESTS |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload typecheck output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typecheck-output-${{ github.run_id }}
+          path: typecheck-output.txt
+          retention-days: 14
+
