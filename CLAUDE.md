@@ -139,14 +139,7 @@ Substitutes the *model itself* for a whole **role** (`opus`/`sonnet`/`haiku`/`fa
 - **A failover target must resolve on the machine that calls the models** — arm sidecars too. ⚠ Count armed state **by VALUE** (`grep -cE '^CLAUDISH_FAILOVER_[A-Z0-9_]+=.+'`), never by name; `roleFromModelName()` matches only the four role keywords — set `CLAUDISH_FAILOVER_ROLE_MODELS` for bare provider ids.
 - ⚠ **In a compose-deployed container the environment is fixed at create time (#310)** — a name absent from `docker-compose.yml`'s `environment:` never reaches the process (`compose-env-coverage.test.ts` cross-checks); a NEW value enters only at the next **recreate**.
 - **A session's UPSTREAM output tokens can be capped (#317 B, `fork/session-budget.ts`)** — per `(X-Claudish-Machine, session_id)`, 24 h sliding. `CLAUDISH_SESSION_BUDGET_CEILING` refuses locally (labeled 429, before any upstream is paid; the wording is load-bearing, no quota-class word) and `CLAUDISH_SESSION_BUDGET_WARN` only marks; both inert without env. **The hub's WARN 5M / CEILING 20M were never user-arbitrated: the user's call** — an agent never arms or moves them alone.
-
-### `CLAUDISH_QWEN_THINKING`
-
-`disabled` (default) · `passthrough` · `budget:<n>`. **Unset is not neutral** — Qwen reasons by default and the Token Plan bills on **output**; re-read per request. **Two switches on two wires** (OpenAI: `enable_thinking` + `thinking_budget`; Anthropic: the native `thinking` object) — each ignores the other's form.
-
-### `CLAUDISH_GLM_THINKING`
-
-`passthrough` (default) · `disabled`. GLM's switch is **binary** on the OpenAI wire (`thinking: {"type":"enabled"|"disabled"}`), no budget control; only an explicit `disabled` sets the field on the unprobed `zai@` anthropic wire. Re-read per request.
+- **The thinking switches are re-read per request**: `CLAUDISH_QWEN_THINKING` (`disabled` default · `passthrough` · `budget:<n>`, and **unset is not neutral**: Qwen reasons by default and the Token Plan bills on output) and `CLAUDISH_GLM_THINKING` (`passthrough` default · `disabled`). Qwen's switch has a different form on each wire and each wire ignores the other's, GLM's is binary and only an explicit `disabled` touches the unprobed `zai@` wire: `docs/reference/budget-failover.md` §`CLAUDISH_QWEN_THINKING` / §`CLAUDISH_GLM_THINKING`.
 
 ## OpenAI-Compatible Ingress (v7.2+)
 

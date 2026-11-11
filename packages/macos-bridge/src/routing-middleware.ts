@@ -90,7 +90,7 @@ export class RoutingMiddleware {
       if (!openaiConfig) throw new Error("OpenAI provider not found in registry");
       const modelName = model.slice(4);
       const provider = new OpenAIProvider(openaiConfig, modelName, apiKey);
-      const adapter = new OpenAIAPIFormat(modelName, openaiConfig.capabilities);
+      const adapter = new OpenAIAPIFormat(modelName);
       return new ComposedHandler(provider, model, modelName, this.bridgePort, {
         adapter, tokenStrategy: "delta-aware",
       }) as unknown as Handler;
@@ -131,7 +131,7 @@ export class RoutingMiddleware {
       const prefix = model.startsWith("glm/") ? 4 : 6;
       const modelName = model.slice(prefix);
       const provider = new OpenAIProvider(glmConfig, modelName, apiKey);
-      const adapter = new OpenAIAPIFormat(modelName, glmConfig.capabilities);
+      const adapter = new OpenAIAPIFormat(modelName);
       return new ComposedHandler(provider, model, modelName, this.bridgePort, {
         adapter, tokenStrategy: "delta-aware",
       }) as unknown as Handler;
@@ -141,7 +141,7 @@ export class RoutingMiddleware {
     const localResolved = resolveProvider(model);
     if (localResolved) {
       const transport = new LocalTransport(localResolved.provider, localResolved.modelName);
-      const adapter = new LocalModelAdapter(localResolved.provider, localResolved.modelName);
+      const adapter = new LocalModelAdapter(localResolved.modelName, localResolved.provider.name);
       return new ComposedHandler(transport, model, localResolved.modelName, this.bridgePort, {
         adapter, tokenStrategy: "local",
       }) as unknown as Handler;

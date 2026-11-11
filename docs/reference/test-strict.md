@@ -23,3 +23,11 @@ Same trap, load-death flavor (#794, measured 2026-10-31): under bun **1.4.0** th
 Original closing pointer of the Debugging & Tests section (kept verbatim here for the #445 preservation proof; the live section now merges it with the strict-runner pointer):
 
 Detail: `docs/reference/proxy-pipeline-notes.md`.
+
+## CI gating — "exit 0 + zero errors" does not prove a check ran (#981)
+
+A green CI step is only as honest as the command it ran. **A command that exits 0 having done nothing reads exactly like a command that passed.** Measured 2026-11-11 (#981): the root `bun run typecheck`'s bridge half was `bun --cwd packages/macos-bridge run typecheck` — on bun ≥ 1.3 that form prints a usage dump and exits 0 without running anything, so every seat's typecheck covered `packages/cli` only while the summary implied both. The bridge, when actually executed (`bun run --cwd packages/macos-bridge typecheck`), was red (TS6306 + 28 real type errors the dead check had been hiding). Consequences:
+
+- **Verify the check ran, not just its exit code**: the instrument must show the sub-command's own output (here, two `tsc --noEmit` passes), not a usage dump. A `grep -c 'error TS'`-style counter reads 0 both for "clean" and for "never executed" — count the *expected* evidence lines, not just the absence of error lines.
+- **The fix is a measured red/green cycle on the target that was silently skipped**, not on the wrapper: prove the previously-dead half goes red on the unfixed tree and green after, so the gate demonstrably gates the new surface.
+- Same family: a workflow that pipes `bun test | tee` hides a per-file load death behind the job's `success` conclusion badge (see the #794 trap above) — read the fail counter in the job log, never the badge.
