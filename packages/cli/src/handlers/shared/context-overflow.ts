@@ -17,14 +17,23 @@
  * here would reproduce the `/compact` retry loop — the client resends the
  * identical body forever (the #79 incident on main).
  *
- * SCOPE ON THIS BASE: only the #565 half of main's `context-overflow.ts` is
- * ported (row 1) — the census, its refusal text, the kill switch, and the
- * recovery-turn constructors the refusal answer needs. The #79 upstream-refusal
- * classifier (`classifyContextOverflow`) and the learned provider cap are a
- * LATER row (main's step-skip producers); `countMediaBlocks` already lives in
- * `media-cap.ts` here and stays separate until that row lands, per the port
- * map's row-7a note. Provenance: main #573 (a774f817) + #610 (8bb52c70).
+ * SCOPE ON THIS BASE: the #565 census (row 1), its refusal text, the kill
+ * switch, the recovery-turn constructors, AND the learned provider cap block
+ * (#651/#660, v14 learned-caps row — maps, persistence, TTL, purge-by-provider)
+ * now live here. The #79 upstream-refusal classifier (`classifyContextOverflow`)
+ * and the HANDLER-side cap consumption (learned short-circuit, stated-window
+ * corroboration) remain a later row (main's step-skip producers);
+ * `countMediaBlocks` already lives in `media-cap.ts` here and stays separate
+ * until that row lands, per the port map's row-7a note. Provenance: main #573
+ * (a774f817) + #610 (8bb52c70) + #651/#660 (caps block).
  */
+
+import {
+  overflowCapsPath,
+  readOverflowCapsFile,
+  writeOverflowCapsFile,
+  type OverflowCapRecord,
+} from "./overflow-caps-store.js";
 
 /**
  * #441/#442 — fixed token allocation charged for ONE image/document block
@@ -116,6 +125,174 @@ export const CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS = 2048;
 export function contextLimitMarginTokens(est: number): number {
   return Math.max(CONTEXT_LIMIT_SAFETY_MARGIN_TOKENS, Math.ceil(est / 64));
 }
+
+// ── Learned provider cap ──────────────────────────────────────────────────────
+// providerKey → last rejected estimate. In-memory only (cleared on restart): the
+// first oversized request after a restart pays one round-trip to relearn, which is
+// the unavoidable cost of not hardcoding a variable provider limit.
+
+const overflowCaps = new Map<string, number>();
+/** Durable side: same keys, plus when/why each cap was learned (#651). */
+const overflowCapRecords = new Map<string, OverflowCapRecord>();
+/**
+ * #674 — the window a refusal STATED ("maximum context length is N"), keyed
+ * like the caps. Same trust class as a `deriveContextLimit` probe but observed
+ * on live traffic: feeds the #676 corroboration (and nothing else — never a
+ * refusal path of its own), rides the cap's TTL/purge/reset lifecycle.
+ */
+const overflowStatedLimits = new Map<string, number>();
+/** Armed by `initOverflowCapsPersistence()`; undefined = memory only. */
+let overflowCapsStorePath: string | undefined;
+
+/**
+ * #651 - restore the caps learned by a previous process and arm write-through.
+ *
+ * Called once at proxy startup. Returns what it did so the caller can log it: a
+ * silent restore is indistinguishable from a store that was never read. A
+ * missing or corrupt file restores nothing and disarms nothing - the next
+ * refusal re-learns, which is exactly today's behaviour.
+ *
+ * #660 r1 - a restored cap is bounded in time (`CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS`,
+ * default 24 h, `0` = never). Before the TTL, a persisted cap lived until
+ * somebody deleted the file, and since the learned branch is checked BEFORE the
+ * derived window in `handle()`, a stale cap kept refusing requests even with
+ * `deriveContextLimit: true` set - a claim outliving the measurement that
+ * contradicts it. A record whose `at` cannot be parsed is NOT restored: its age
+ * cannot be bounded, and the cost of not restoring is one relearning round-trip
+ * (the pre-#651 behaviour), never a refused request.
+ */
+export function initOverflowCapsPersistence(
+  path: string | undefined = overflowCapsPath(),
+  opts: { now?: () => number; env?: NodeJS.ProcessEnv } = {}
+): { path?: string; loaded: number; expired: number } {
+  overflowCapsStorePath = path;
+  if (!path) return { loaded: 0, expired: 0 };
+  const maxAgeMs = overflowCapsMaxAgeMs(opts.env);
+  const now = opts.now?.() ?? Date.now();
+  let loaded = 0;
+  let expired = 0;
+  for (const [key, record] of readOverflowCapsFile(path)) {
+    if (maxAgeMs > 0) {
+      const atMs = Date.parse(record.at);
+      if (!Number.isFinite(atMs) || now - atMs > maxAgeMs) {
+        expired++;
+        continue;
+      }
+    }
+    overflowCaps.set(key, record.cap);
+    overflowCapRecords.set(key, record);
+    if (record.statedLimit !== undefined && record.statedLimit > 0) {
+      overflowStatedLimits.set(key, record.statedLimit);
+    }
+    loaded++;
+  }
+  return { path, loaded, expired };
+}
+
+/**
+ * #660 r1 - `CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS`, the maximum age of a restored
+ * learned cap. Default 24 h (the effective pre-#651 lifetime: the watchdog
+ * restarts the hub nightly, so an in-memory cap never outlived it). `0` means
+ * no expiry. Unparsable or negative values fall back to the default rather
+ * than silently disarming the bound.
+ */
+export function overflowCapsMaxAgeMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = (env.CLAUDISH_OVERFLOW_CAPS_MAX_AGE_MS ?? "").trim();
+  if (raw.length === 0) return DEFAULT_OVERFLOW_CAPS_MAX_AGE_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_OVERFLOW_CAPS_MAX_AGE_MS;
+  return Math.floor(n);
+}
+
+const DEFAULT_OVERFLOW_CAPS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * #660 r1 - drop every learned cap of one provider (the `customEndpoints` key).
+ * Called when derivation SUCCEEDS for that provider at startup: the measured
+ * window replaces the learned value instead of sitting behind it - the learned
+ * branch is checked first in `handle()`, so without this purge a stale cap
+ * would keep refusing what the fresh measurement just allowed. Rewrites the
+ * durable store when one is armed. Returns how many entries were dropped.
+ */
+export function forgetOverflowCapsForProvider(providerName: string): number {
+  const prefix = `${providerName}::`;
+  let purged = 0;
+  for (const key of [...overflowCaps.keys()]) {
+    if (!key.startsWith(prefix)) continue;
+    overflowCaps.delete(key);
+    overflowCapRecords.delete(key);
+    overflowStatedLimits.delete(key);
+    purged++;
+  }
+  if (purged > 0 && overflowCapsStorePath) {
+    writeOverflowCapsFile(overflowCapsStorePath, overflowCapRecords);
+  }
+  return purged;
+}
+
+/** Test/teardown hook: forget the armed path without touching the caps. */
+export function disarmOverflowCapsPersistence(): void {
+  overflowCapsStorePath = undefined;
+}
+
+export function rememberOverflowCap(
+  providerName: string,
+  model: string,
+  tokens: number,
+  evidence?: string,
+  statedLimit?: number
+): void {
+  if (!Number.isFinite(tokens) || tokens <= 0) return;
+  const key = `${providerName}::${model}`;
+  const cap = Math.floor(tokens);
+  overflowCaps.set(key, cap);
+  // #674 — a stated window is accepted only as a finite positive number, and
+  // an ABSENT statement never erases a previous one (a wording change in one
+  // refusal is not evidence the window moved).
+  if (Number.isFinite(statedLimit) && statedLimit! > 0) {
+    overflowStatedLimits.set(key, Math.floor(statedLimit!));
+  }
+  // #651 - write-through only when a durable store is armed: a unit test or a
+  // dev launcher (no env) keeps this module strictly in-memory.
+  if (overflowCapsStorePath) {
+    overflowCapRecords.set(key, {
+      cap,
+      at: new Date().toISOString(),
+      evidence,
+      ...(overflowStatedLimits.has(key)
+        ? { statedLimit: overflowStatedLimits.get(key) }
+        : {}),
+    });
+    writeOverflowCapsFile(overflowCapsStorePath, overflowCapRecords);
+  }
+}
+
+export function getOverflowCap(providerName: string, model: string): number | undefined {
+  return overflowCaps.get(`${providerName}::${model}`);
+}
+
+/**
+ * #674 — the window the latest overflow refusal for this (provider, model)
+ * stated in its own body, when it stated one. An ENGINE number, not an
+ * estimate: the corroboration compares it in clamp units. `undefined` when no
+ * refusal ever stated a window (most providers) — callers must treat that as
+ * "no evidence", exactly like an absent `derivedContextLimit`.
+ */
+export function getStatedContextLimit(providerName: string, model: string): number | undefined {
+  return overflowStatedLimits.get(`${providerName}::${model}`);
+}
+
+export function resetOverflowCapsForTests(): void {
+  overflowCaps.clear();
+  overflowCapRecords.clear();
+  overflowStatedLimits.clear();
+  overflowCapsStorePath = undefined;
+}
+
+// The reported-usage floor lives in its own leaf module: the Responses parser needs
+// it too, and it is the module this one imports — re-exported here so callers keep a
+// single import site.
+export { overflowReportFloor, overflowReportedTokens } from "./overflow-report-floor.js";
 
 /** One candidate window on the request's resolved path. */
 export interface DeclaredWindow {

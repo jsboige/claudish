@@ -187,7 +187,7 @@ import {
   resolveTargetForCatalog,
   warmCatalog,
 } from "./providers/catalog-client.js";
-import { deriveContextLimits } from "./providers/context-limit-derivation.js";
+import { deriveContextLimits, purgeCapsReplacedByDerivation } from "./providers/context-limit-derivation.js";
 import { getEndpointUnavailableReason } from "./providers/endpoint-diagnostics.js";
 import {
   ensureEndpointsRegistered,
@@ -567,6 +567,15 @@ export async function createProxyServer(
         log(
           `[ContextLimit] derivation: ${derived.filter((d) => d.derived).length}/${derived.length} endpoint(s) derived from /v1/models`
         );
+      }
+      // #660 (v14 learned-caps row) — a restored cap learned under the OLD
+      // window must not outlive the measurement that contradicts it: the
+      // learned branch is checked before the derived window on main, so a
+      // stale cap would keep refusing what the fresh derivation just allowed.
+      // The loop lives in purgeCapsReplacedByDerivation (shared with the pin).
+      const capsPurged = purgeCapsReplacedByDerivation(derived);
+      if (capsPurged > 0) {
+        log(`[ContextLimit] derivation replaced ${capsPurged} restored learned cap(s) with the measured window`);
       }
     } catch (err) {
       // Belt and braces: deriveContextLimits swallows per-endpoint failures, and
