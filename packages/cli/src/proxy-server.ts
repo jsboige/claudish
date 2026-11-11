@@ -187,6 +187,7 @@ import {
   resolveTargetForCatalog,
   warmCatalog,
 } from "./providers/catalog-client.js";
+import { deriveContextLimits } from "./providers/context-limit-derivation.js";
 import { getEndpointUnavailableReason } from "./providers/endpoint-diagnostics.js";
 import {
   ensureEndpointsRegistered,
@@ -552,6 +553,27 @@ export async function createProxyServer(
     const customEpResult = getCustomEndpointResult();
     if (customEpResult.registered > 0) {
       log(`[Proxy] Registered ${customEpResult.registered} custom endpoint(s) from config`);
+    }
+    // #651 (v14 port, landing-gap row 2) — the DECLARED window, derived from the
+    // endpoint's own `/v1/models` when it opts in (`deriveContextLimit: true`).
+    // Runs AFTER registration so the measured window OVERWRITES the config
+    // literal the loader just recorded — the #565 admission census below then
+    // weighs what the engine will actually accept. Bounded per endpoint, never
+    // throws, and inert when nothing opts in — an endpoint that says nothing
+    // boots byte-identically, with zero probes on the wire.
+    try {
+      const derived = await deriveContextLimits(config);
+      if (derived.length > 0) {
+        log(
+          `[ContextLimit] derivation: ${derived.filter((d) => d.derived).length}/${derived.length} endpoint(s) derived from /v1/models`
+        );
+      }
+    } catch (err) {
+      // Belt and braces: deriveContextLimits swallows per-endpoint failures, and
+      // a probe must never be able to keep the proxy from booting.
+      logStderr(
+        `[ContextLimit] derivation skipped: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   } catch (err) {
     // Config read failure should not crash the proxy — the rest of startup
