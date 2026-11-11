@@ -10,17 +10,19 @@ useBlackboxEnv();
 let layout: TempLayout;
 let server: McpServer;
 
+// 30_000: hook budget covering a real server boot/close (bun's default hook timeout
+// is 5000 ms, and the initialize handshake can exceed it on a loaded shard runner).
 beforeEach(async () => {
   layout = makeTempLayout("bbresize");
   server = await McpServer.start({ env: serverEnv(layout), cwd: layout.cwd });
-});
+}, 30_000);
 
 afterEach(async () => {
   await server.close();
   const report = await paneOrphans(layout);
   layout.cleanup();
   expect(report).toEqual({ processes: [], files: [] });
-});
+}, 30_000);
 
 describe("resize verbs: contract error codes without a pane", () => {
   const cases: Array<{

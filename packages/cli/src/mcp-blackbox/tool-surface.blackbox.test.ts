@@ -77,10 +77,14 @@ let layout: TempLayout;
 let server: McpServer;
 
 function useStandardServer(): void {
+  // 30_000: the hook budget must cover a real server boot. A hook with no explicit
+  // timeout gets bun's 5000 ms default even when the test body declares 30_000 — on a
+  // loaded macOS shard runner the initialize handshake can exceed it, and bun kills
+  // the fresh server mid-handshake (run 42895835116, attempt 1, pane-6of6).
   beforeEach(async () => {
     layout = makeTempLayout("bbsurface");
     server = await McpServer.start({ env: serverEnv(layout), cwd: layout.cwd });
-  });
+  }, 30_000);
 
   afterEach(async () => {
     await server.close();
@@ -91,7 +95,7 @@ function useStandardServer(): void {
     expect(server.notifications.filter((n) => n.method === "notifications/claude/channel")).toEqual(
       []
     );
-  });
+  }, 30_000);
 }
 
 function contractError(r: ToolResult, code: string): void {

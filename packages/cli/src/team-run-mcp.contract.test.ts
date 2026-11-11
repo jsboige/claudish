@@ -53,13 +53,13 @@ beforeEach(async () => {
     env: serverEnv(layout),
     cwd: layout.cwd,
   });
-});
+}, 30_000);
 afterEach(async () => {
   await server.close();
   const report = await paneOrphans(layout);
   layout.cleanup();
   expect(report).toEqual({ processes: [], files: [] });
-});
+}, 30_000);
 
 async function run(input: string): Promise<string> {
   const r = await teamCall(server, "run", { path: teamDir, models: MODELS, input });

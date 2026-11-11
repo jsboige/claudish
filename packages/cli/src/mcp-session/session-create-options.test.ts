@@ -63,7 +63,7 @@ describe.skipIf(!MAGMUX)(
       killLeftovers({ sockRoot: t.sockRoot });
       t.cleanup();
       expect(report).toEqual({ processes: [], files: [] });
-    });
+    }, 30_000);
 
     function makeManager(): SessionManager {
       const manager = new SessionManager({

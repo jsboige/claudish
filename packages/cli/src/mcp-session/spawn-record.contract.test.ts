@@ -56,7 +56,7 @@ if (!MAGMUX_AVAILABLE) console.warn(NO_MAGMUX_MESSAGE);
 
 beforeEach(() => {
   layout = makeTempLayout("spawn");
-});
+}, 30_000);
 afterEach(async () => {
   for (const s of servers.splice(0)) await s.close();
   const report = await paneOrphans(layout);

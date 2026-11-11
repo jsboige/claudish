@@ -123,7 +123,7 @@ describe.skipIf(!RESIZE_AVAILABLE)("pane resize through MCP (requires magmux res
       env: serverEnv(layout, { CONTRACT_FAKE_MAX_MS: "120000" }),
       cwd: layout.cwd,
     });
-  });
+  }, 30_000);
   afterEach(async () => {
     try {
       await server?.close();
@@ -133,7 +133,7 @@ describe.skipIf(!RESIZE_AVAILABLE)("pane resize through MCP (requires magmux res
       server = undefined;
       expect(report).toEqual({ processes: [], files: [] });
     }
-  });
+  }, 30_000);
 
   async function call(name: string, args: Json): Promise<Json> {
     return ok(await (server as McpServer).callTool(name, args));

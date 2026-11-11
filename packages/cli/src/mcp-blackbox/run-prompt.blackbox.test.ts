@@ -177,6 +177,8 @@ beforeEach(() => {
   providerRequests = [];
 });
 
+// 30_000: hook budget covering a real server close plus the orphan sweep (bun's
+// default hook timeout is 5000 ms — smaller than this hook's own worst case).
 afterEach(async () => {
   // Cleanup is deliberately after assertions, so it cannot make the cancel test pass.
   try {
@@ -199,7 +201,7 @@ afterEach(async () => {
       layout.cleanup();
     }
   }
-});
+}, 30_000);
 
 describe("run_prompt Claude print contract", () => {
   test(
