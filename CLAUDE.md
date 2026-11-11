@@ -152,10 +152,10 @@ Substitutes the *model itself* for a whole **role** (`opus`/`sonnet`/`haiku`/`fa
 
 `/v1/messages` is the **native** ingress; `POST /v1/chat/completions` is a **translated** one — converted to Anthropic shape, run through the **same** `getHandlerForRequest` → `ComposedHandler.handle` pipeline, then translated back. An OpenAI client inherits the routing cascade, budget failover, accounting and leak policy for free, by changing `base_url` alone. Detail: `docs/reference/openai-ingress.md`.
 
-- **Never-hang holds here too**: a malformed stream degrades to a single terminal chunk + `data: [DONE]`; `thinking` blocks surface as `reasoning_content`; `stop_reason` maps to `finish_reason`.
+- **Never-hang holds here too**: a malformed stream degrades to a single terminal chunk + `data: [DONE]` (block and stop-reason mapping: reference §Response translators).
 - **A failover notice never rides the content here (#229)** — it arrives in the `x-claudish-failover-notice` response header (base64 UTF-8), streaming and JSON alike. The gate is the route (`noticePolicyForIngress`), never a user-agent. `/v1/messages` keeps the in-content block 0 for the Claude Code agent loop.
-- **Request-side thinking controls are mapped (#435)** — `enable_thinking` / `reasoning_effort` land on the house `thinking` object; an enabled block is always legal (≥1024, `< max_tokens`), clamped against a client `max_tokens` and *raising* our own 4096 placeholder.
-- **A reasoning model can return no text (`content: null`) with `finish_reason:"length"` here** — `reasoning_content` shares the `max_tokens` budget and can consume it all before any text; a `content` consumer gets no answer and no error. Raise the budget, disable thinking (`enable_thinking:false`, #435), or use `/v1/messages`.
+- **Request-side thinking controls are mapped (#435)** — `enable_thinking` / `reasoning_effort` land on the house `thinking` object, always as a legal block (budget rules: reference §Request-side thinking controls).
+- **`content: null` + `finish_reason:"length"` is a reasoning model that spent `max_tokens` before any text** — no error is raised. Raise the budget, send `enable_thinking:false` (#435), or use `/v1/messages`.
 - **The relay is path-aware** — a sidecar forwards to the same route the client hit; the deep liveness probe stays on `/v1/messages`.
 
 ## Traffic Analysis & Anthropic Policy
