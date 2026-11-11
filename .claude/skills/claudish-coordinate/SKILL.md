@@ -12,7 +12,7 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8
 ## Cadence et mandats
 
 - **Cron `37 */8 * * *`** (heure locale : 00:37, 08:37, 16:37 — user 04/11, « passe stp sur un cycle de 8h pour
-  économiser les tokens Anthropic » ; 6 h depuis le 24/10), **sous Opus**. Le cron hérite du modèle de la
+  économiser les tokens Anthropic »), **sous Opus**. Le cron hérite du modèle de la
   session qui l'arme : vérifier le modèle avant tout réarmement.
 - **La cadence appartient au user** (arbitrage de dépense — historique complet : reference.md § en-tête).
   Ne jamais la changer seul. Quand il la change : `CronCreate` **et** patch de ce fichier dans le même
@@ -132,7 +132,7 @@ Sonnet/GLM ou Haiku/MiniMax ; une 6ᵉ lane n'est pas une faute d'office, mais e
   Opus. Boucle de détection : reference.md § Phase 3.
 - **Inter-machines (user 20/10)** : aucune restriction en dur, chaque machine s'authentifie elle-même ; Opus
   hors ai-01 reste exceptionnel (durable : CoursIA-3 seul ; po-2025 20/10 = temporaire autorisé, suivi jusqu'au retour). Signaler un Opus qui **dure** hors ai-01, pas
-  un usage ponctuel. Sous-agent : `cc_is_subagent=true`, dans le corps de la requête.
+  un usage ponctuel.
 
 **Burst ou mur** : lire `D:\claudish-captures\upstream-errors.log`. Le code `1308` est un mur (il arme la
 cascade), `1302` un burst (il ne l'arme pas). Rapporter « N requêtes rendues en 429 », pas « N agents
@@ -149,9 +149,12 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 - **Collisions** : tous poussent sous `jsboige`, donc comparer les `files`, pas les titres.
 - **Avant review ou merge** :
   - vérifier `Closes #NN` dans le body **et** dans les commits de branche (`git log origin/main..<branche>`) ;
-  - rejouer en local ; le check `test` (workflow `Test`) bloque depuis #934 et fait foi **pour la suite bun
-    seule** (ni Pester, ni `test:scripts:py`, ni typecheck : `scripts/` se rejoue ici, sous pwsh 7 et 5.1),
-    `claude-code` jamais ; PR sans run `pull_request` → `gh workflow run test.yml --ref <branche>` ;
+  - rejouer en local ; les checks `test` (#934) et `typecheck` (#982, packages/cli seul, bridge : #981) du
+    workflow `Test` bloquent et font foi **pour la suite bun et le typecheck cli** (ni Pester, ni
+    `test:scripts:py` : `scripts/` se rejoue ici, sous pwsh 7 et 5.1), `claude-code` jamais ; PR sans run
+    `pull_request` → `gh workflow run test.yml --ref <branche>` ;
+  - un AC « N runs verts » compte les exécutions par `started_at` : un rerun des jobs en échec recopie le
+    vert des autres (reference.md § Phase 4) ;
   - faire tourner une mutation sur chaque garde ajoutée.
   - Pas de merge sur un CR non adressé. Mes CR sont des **commentaires** : écrire « attend TON push » dans
     la file du worker.
@@ -186,9 +189,8 @@ Détail et pièges (ctx.pages, réauthentification, périodes) : reference.md §
 
 ### Phase 5 — Arbitrages au user
 
-Registre `memory/open-questions-ledger.md`. Toute question non bloquante y vit, au format : ce qui se
-passe · ce qui est demandé · ce qui arrive sans réponse · la reco · l'échéance. Elle n'en sort **que sur
-réponse du user** et se représente en Phase 6. On n'attend jamais une réponse pour exécuter.
+Registre `memory/open-questions-ledger.md` (règles et format : CLAUDE.md global § User Arbitration),
+représenté en Phase 6.
 
 ### Phase 5b — Contrôle des gestes (mandat user 07/09)
 
@@ -197,8 +199,6 @@ réponse du user** et se représente en Phase 6. On n'attend jamais une réponse
   exactes, rayon d'impact, rollback, état attendu — puis attend mon `[ACK]` (il suffit, user 23/09 ; le
   plan d'exécution reste un artefact obligatoire). **Chaque cycle : scanner et trancher les `[PROPOSAL]`
   en attente.**
-- **Infra d'un autre workspace** : demander, ne pas appliquer. En urgence : agir, puis poster excuse et
-  explication sur le dashboard du propriétaire dans le même cycle.
 - **Urgence** (flotte à l'arrêt) : agir, `[INCIDENT]` + post-mortem ≤ 1 h, validation ex-post.
 - **Preuves post-restart du hub (≤ 15 min)** : la ligne `[Failover] configured=N auto=on`, `/health`,
   `test -f` sur chaque bind fichier, et le relais NOMINAL.
@@ -230,7 +230,6 @@ s'endormir sans cron, ni écrire « garanti jusqu'au prochain cycle ».
 - La section « status » du dashboard est une synthèse, et sa condensation fabrique des faits : vérifier à la
   source.
 - Silence ≠ DOWN ; un code retour n'est pas un diagnostic ; un label de log n'est pas une taxonomie.
-- En NOMINAL, un sidecar sert ~0 requête locale : un zéro n'est pas un script cassé.
 - `codebase_search` : aucune collection pour `d:/claudish` → grounding technique + conversationnel.
 - Sessions précédentes : dizaines de Mo → `conversation_browser` avec `smart_truncation` et des bornes.
 
