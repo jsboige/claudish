@@ -1530,6 +1530,46 @@ describe("deep probe: quota wall vs hub death", () => {
       expect(oks[0]).toContain("attempt 1/2");
       expect(oks[1]).toContain("attempt 2/2");
     });
+
+    it("the QUOTA-WALL success line names its attempt too — the OK-line pin cannot see it", async () => {
+      const lines: string[] = [];
+      const origLog = console.log;
+      console.log = (...a: unknown[]) => {
+        lines.push(a.join(" "));
+      };
+      try {
+        // probe 1: the nominal itself answers 402 — quota exhaustion IS
+        // liveness, the fallback is never attempted.
+        fetchImpl = async () =>
+          Promise.resolve(new Response("payment required", { status: 402 }));
+        await withBudget("1000", async () => {
+          expect(await deepProbe(state())).toBe(true);
+        });
+        // probe 2: nominal 503s, the FALLBACK answers 402 — same wall line,
+        // different attempt number.
+        let n = 0;
+        fetchImpl = async () =>
+          n++ === 0
+            ? Promise.resolve(new Response("native lane refused", { status: 503 }))
+            : Promise.resolve(new Response("payment required", { status: 402 }));
+        await withBudget("1000", async () => {
+          expect(await deepProbe(state())).toBe(true);
+        });
+      } finally {
+        console.log = origLog;
+      }
+      // The quota-wall return is the OTHER success line: it declares NOMINAL
+      // without a message_stop, so the OK-line pin above never filters it.
+      // Measured gap (ai-01, 10/11): dropping the marker from this line left
+      // the whole suite green. This pin closes it, per attempt NUMBER — not
+      // merely present.
+      const wallLines = lines.filter((l) =>
+        l.includes("naming a quota/plan wall")
+      );
+      expect(wallLines.length).toBe(2);
+      expect(wallLines[0]).toContain("attempt 1/2");
+      expect(wallLines[1]).toContain("attempt 2/2");
+    });
   });
 });
 
