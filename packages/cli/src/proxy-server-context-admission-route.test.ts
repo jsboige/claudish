@@ -25,7 +25,11 @@
  * countable event, the same wire the fleet greps).
  */
 
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { setConfigFileOverride } from "./config-override.js";
 import { resetFailoverForTests } from "./fork/failover.js";
 import type { ClaudishProfileConfig } from "./profile-config.js";
 import { ensureEndpointsRegistered } from "./providers/endpoint-registration.js";
@@ -179,6 +183,19 @@ beforeEach(() => {
       // Background warmers (pricing / catalog / recommended) and anything else.
       return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     }
+    // #651 (K30) — the boot derivation probe. Answered for every endpoint (the
+    // stub cannot know which opted in); it counts under the SAME drv tag as the
+    // endpoint's chat leg, so the K30 pin's `calls.drv === 1` means "exactly
+    // one probe, zero chat round-trip" in one number — the mutation (boot call
+    // removed) makes the pin fail on TWO counts: no probe AND a chat call.
+    if (url.endsWith("/v1/models")) {
+      const tag = url.slice("http://fake.invalid/".length).split("/")[0].slice(0, 4);
+      calls[tag] = (calls[tag] ?? 0) + 1;
+      return new Response(JSON.stringify({ data: [{ id: "fake-drv", max_model_len: 2000 }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     const which = url.slice("http://fake.invalid/".length).split("/")[0].slice(0, 4);
     calls[which] = (calls[which] ?? 0) + 1;
     return healthySSE();
@@ -205,6 +222,9 @@ afterEach(async () => {
   }
   resetFailoverForTests();
   clearRuntimeRegistry();
+  // K30: the config override is per-test state too — a leaked one would feed the
+  // next test a drv/nodrv file instead of the shape its own spin() registered.
+  setConfigFileOverride(null);
 });
 
 /** Spin the real proxy, then arm the cascade for it (the module reads failover
@@ -349,6 +369,99 @@ describe("#565 — admission census through the real /v1/messages route", () => 
     expect(r.status).toBe(200);
     expect(calls.nm).toBe(1); // the nominal pays the round-trip the census would have saved
     expect(markerLog.some((l) => l.includes("[ContextAdmission] REFUSE"))).toBe(false);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// #651 (v14 port of main's K30) — a window derived from the endpoint's OWN
+// /v1/models catalog acts at admission, and the probe runs exactly once at boot.
+//
+// Main's K30 lives in proxy-server-step-skip-route.test.ts (a file the landing
+// plan lists as a 13-loud modify/delete) and pins the handler-level derived
+// short-circuit plus its #431 skip header. v14 has NO such short-circuit yet
+// (`getDerivedContextLimit` has no consumer — that is the learned-caps row):
+// the derived value acts through the #565 CENSUS, which reads the DECLARED
+// registry entry the derivation overwrote (proxy-server.ts collectWindow).
+// Same measurement, different seam — this file is where that seam is pinned.
+//
+// AC (ai-01 c.6790783245): an opt-in endpoint + an undeclared witness, exactly
+// one /v1/models probe after createProxyServer; mutation — the
+// deriveContextLimits(config) call in createProxyServer removed → RED,
+// restored → GREEN. The census refusal rides the derived number, so removing
+// the derivation un-refuses the oversized body and flips the whole pin.
+// ---------------------------------------------------------------------------
+
+describe("#651 (K30 v14) — a derived window acts at admission; one boot probe per opt-in endpoint", () => {
+  /** Boot the real proxy against an override config file (never the machine's
+   *  ~/.claudish/config.json) carrying one opt-in endpoint and one witness that
+   *  declares nothing. loadConfig() is a real read inside createProxyServer —
+   *  the only seam that makes the probe count honest. */
+  async function spinWithDerivedConfig(): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), "claudish-k30-config-"));
+    const file = join(dir, "config.json");
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: "1.0.0",
+        defaultProfile: "default",
+        profiles: {},
+        customEndpoints: {
+          "drv-ep": {
+            kind: "simple",
+            url: "http://fake.invalid/drv/v1",
+            format: "openai",
+            apiKey: "test-key",
+            deriveContextLimit: true,
+          },
+          "nodrv-ep": {
+            kind: "simple",
+            url: "http://fake.invalid/ndr/v1",
+            format: "openai",
+            apiKey: "test-key",
+          },
+        },
+      }),
+      "utf-8"
+    );
+    setConfigFileOverride(file);
+    // The stub's default branch counts the drv/ndr tags from the URL prefix,
+    // exactly like nm/s0/s1 above — no extra plumbing for the chat legs.
+    activeProxy = await createProxyServer(0, undefined, undefined, false, undefined, undefined, {
+      quiet: true,
+    });
+    // No cascade armed: a bare provider@model nominal IS its own census path.
+    resetFailoverForTests({});
+  }
+
+  test("K30: one probe at boot; the derived window refuses the oversized body with zero chat round-trip; the witness serves", async () => {
+    await spinWithDerivedConfig();
+
+    // Exactly one endpoint opted in → exactly one /v1/models probe at startup.
+    // Mutating the boot call away flips this to 0 — the ai-01 AC.
+    expect(calls.drv).toBe(1);
+
+    // est ≈ 10k tokens against the 2 000-token window the stub's catalog states
+    // (answered by the local stub below): over the largest (only) declared
+    // window by far more than the census margin → refuse at admission.
+    const big = "x".repeat(40_000);
+    const r = await postMessage({ model: "drv-ep@fake-drv", content: big });
+    expect(r.status).toBe(200); // the recoverable turn, never a bare 400
+    const text = await responseText(r);
+    expect(text).toContain("exceeds every declared context window");
+    expect(text).toContain("2000"); // the DERIVED number, not a config literal
+    // The second probe count stays 1 — the refusal paid no new catalog call.
+    expect(calls.drv).toBe(1);
+    expect(markerLog.some((l) => l.includes("[ContextAdmission] REFUSE"))).toBe(true);
+
+    // Witness: the same oversized body on the endpoint that declares nothing
+    // falls open and reaches upstream — the derived window is a measurement on
+    // one endpoint, never a policy on the route.
+    const r2 = await postMessage({ model: "nodrv-ep@fake-ndr", content: big });
+    expect(r2.status).toBe(200);
+    expect(await responseText(r2)).not.toContain("exceeds every declared context window");
+    expect(calls.ndr).toBeGreaterThanOrEqual(1);
+    // The witness never opted in: still exactly ONE probe in the whole run.
+    expect(calls.drv).toBe(1);
   }, 30_000);
 });
 
