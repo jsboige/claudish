@@ -87,7 +87,7 @@ describe("writeJsonAtomic (atomicity, through the fs seam)", () => {
         return nodeFs.renameSync(from, to);
       },
       unlinkSync: (p: string) => nodeFs.unlinkSync(p),
-    };
+    } as any;
 
     writeJsonAtomic(target, { ok: true }, seam);
 
@@ -132,7 +132,7 @@ describe("writeJsonAtomic (atomicity, through the fs seam)", () => {
         throw Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
       },
       unlinkSync: nodeFs.unlinkSync.bind(nodeFs),
-    };
+    } as any;
 
     expect(() => writeJsonAtomic(target, { s: 2 }, seam)).toThrow(/ENOSPC/);
     // the temp file was still cleaned up

@@ -76,10 +76,14 @@ describe("upstream-sync S1 pins (#731)", () => {
     }
   });
 
-  it.each(PINS)("row #%row% (%cls%) sits at its triaged path: %path%", (pin) => {
-    // The presence pin. A cut that moves or deletes this path without
-    // repointing the list above fails here — that is the entire point.
-    const { path } = pin as (typeof PINS)[number];
-    expect(existsSync(join(REPO_ROOT, path))).toBe(true);
-  });
+  // it.each with %row%-style placeholders was the original shape here, but
+  // bun:test's it.each typing rejects the named placeholders (TS2769), so the
+  // loop is spelled out. PINS' own element type flows through `pin` — no cast.
+  for (const pin of PINS) {
+    it(`row ${pin.row} (${pin.cls}) sits at its triaged path: ${pin.path}`, () => {
+      // The presence pin. A cut that moves or deletes this path without
+      // repointing the list above fails here — that is the entire point.
+      expect(existsSync(join(REPO_ROOT, pin.path))).toBe(true);
+    });
+  }
 });

@@ -119,7 +119,7 @@ describe("S4-b lot C: think-tag splitter unit (d4cba87)", () => {
 
 const SSE_HEADERS: Record<string, string> = { "Content-Type": "text/event-stream" };
 
-function mockContext() {
+function mockContext(): any {
   return { req: {}, body: (stream: ReadableStream, init?: any) => new Response(stream, init) };
 }
 

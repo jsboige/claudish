@@ -76,7 +76,7 @@ describe("stripUnsignedThinkingBlocks", () => {
   });
 
   test("strips the exact CoursIA whitespace-only block without losing sibling content", () => {
-    const messages = Array.from({ length: 41 }, (_, i) => ({
+    const messages: any[] = Array.from({ length: 41 }, (_, i) => ({
       role: i % 2 === 0 ? "assistant" : "user",
       content: [{ type: "text", text: `m${i}` }],
     }));

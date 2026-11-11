@@ -2,13 +2,11 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { OpenAIProviderTransport, resetTokenizerMemoForTests } from "./openai.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
 
-const mockProvider: RemoteProvider = {
+const mockProvider = {
   name: "opencode-zen",
-  displayName: "Zen",
   baseUrl: "https://opencode.ai/zen",
   apiPath: "/v1/chat/completions",
-  transport: "openai",
-};
+} as RemoteProvider;
 
 describe("OpenAIProviderTransport 429 retry (#66)", () => {
   test("retries on 429 with exponential backoff", async () => {

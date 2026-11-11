@@ -274,7 +274,7 @@ describe("matchUserRoutingOverride", () => {
     process.env.OPENAI_API_KEY = "oai-test";
     const rules: RoutingRules = mergeRoutingRules(DEFAULT_ROUTING_RULES, {
       "local-coding": ["openai"],
-    });
+    }, {});
     const plan = route("local-coding", rules);
     expect(plan.kind).toBe("ok");
     if (plan.kind !== "ok") return;

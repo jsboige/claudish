@@ -168,7 +168,7 @@ describe("Group 5: Dead agent code removed", () => {
     // This validates that the dead code (agent?: string) has been removed from types.ts
     // If config.agent were defined, TypeScript would allow this access.
     // We check at runtime that the property is absent from the returned object.
-    expect((config as Record<string, unknown>)["agent"]).toBeUndefined();
+    expect((config as unknown as Record<string, unknown>)["agent"]).toBeUndefined();
 
     // Also verify the config object's own keys do not include 'agent'
     const keys = Object.keys(config);

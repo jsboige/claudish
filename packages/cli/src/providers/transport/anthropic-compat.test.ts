@@ -260,13 +260,11 @@ describe("AnthropicProviderTransport 429 backoff releases the concurrency slot",
   // these providers (Z.AI, MiniMax, Kimi) share ONE key across the cluster, so
   // they throttle in synchronized bursts — exactly when holding a slot through
   // the backoff blocks the most traffic.
-  const provider: RemoteProvider = {
+  const provider = {
     name: "glm",
-    displayName: "GLM",
     baseUrl: "https://api.z.ai",
     apiPath: "/api/anthropic/v1/messages",
-    transport: "anthropic",
-  };
+  } as RemoteProvider;
 
   test("a request in 429 backoff does not block another request to the same provider", async () => {
     const transport = new AnthropicProviderTransport(provider, TEST_API_KEY, 1);
@@ -366,13 +364,12 @@ describe("AnthropicProviderTransport busy bound applies to the first admission o
 });
 
 describe("AnthropicProviderTransport 429 quota-wall short-circuit", () => {
-  const provider: RemoteProvider = {
+  const provider = {
     name: "minimax-coding",
     baseUrl: "https://api.minimaxi.com",
     apiPath: "/anthropic/v1/messages",
-    transport: "anthropic",
     authScheme: "bearer",
-  };
+  } as RemoteProvider;
   // MiniMax counts down to its reset; the word that arms the predicate is "quota".
   const WALL = '{"error":{"message":"Your quota has been exhausted, resets in 3h"}}';
   const BURST = '{"error":{"message":"too many requests, retry shortly"}}';
