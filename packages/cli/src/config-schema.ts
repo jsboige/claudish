@@ -163,9 +163,26 @@ export const CustomEndpointSimpleSchema = z
      * An absent entry means "declares nothing" — never "unbounded": a path
      * with ANY undeclared candidate falls open, so adding this field can only
      * refuse, never widen. (On main this field also feeds the #441 dynamic
-     * clamp and the #651 derivation — later rows, not ported here.)
+     * clamp — a later row, not ported here. The #651 derivation IS ported:
+     * `deriveContextLimit` below.)
      */
     contextLimit: z.number().int().min(1).optional(),
+    /**
+     * #651 — read the endpoint's real window from its OWN `/v1/models` at startup
+     * (`max_model_len` on vLLM) instead of trusting the hand-typed `contextLimit`.
+     *
+     * Measured 2026-10-24 (hub): the declared 262 144 agreed with the engine by
+     * coincidence — nothing in the proxy ever read `max_model_len`, so swapping
+     * the served model or rebuilding the engine with a smaller `--max-model-len`
+     * would have left the admission census (#565) working from a number a human
+     * typed, silently and in the dangerous direction. Opt-in per endpoint:
+     * absent = today's behavior, byte for byte.
+     *
+     * A FAILED probe reports "not derived" and falls back to `contextLimit` — it
+     * never substitutes a default: an absent measurement coerced into a number is
+     * invented evidence (same class as the missing-sample rule).
+     */
+    deriveContextLimit: z.boolean().optional(),
     wire: CustomEndpointWireSchema.optional(),
   })
   .superRefine((ep, ctx) => {
@@ -192,6 +209,8 @@ export const CustomEndpointComplexSchema = z
     models: z.array(z.string()).optional(),
     /** See CustomEndpointSimpleSchema.contextLimit (#565 admission census). */
     contextLimit: z.number().int().min(1).optional(),
+    /** See CustomEndpointSimpleSchema.deriveContextLimit (#651 derivation). */
+    deriveContextLimit: z.boolean().optional(),
     wire: CustomEndpointWireSchema.optional(),
   })
   .superRefine((ep, ctx) => {

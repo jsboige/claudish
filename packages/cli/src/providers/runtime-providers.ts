@@ -20,6 +20,7 @@ import type { ProviderProfile } from "./provider-profiles.js";
 const _runtimeProviders = new Map<string, ProviderDefinition>();
 const _runtimeProfiles = new Map<string, ProviderProfile>();
 const _declaredContextLimits = new Map<string, number>();
+const _derivedContextLimits = new Map<string, number>();
 
 /**
  * #565 — the DECLARED total window of a registered provider, when it has one.
@@ -29,8 +30,7 @@ const _declaredContextLimits = new Map<string, number>();
  * path (nominal + cascade steps), including steps this request will never
  * resolve. Only an operator-declared `contextLimit` lands in this map — an
  * absent entry means "declared nothing", never "unbounded": the census falls
- * open rather than guess. (v14 port, row 1: the #651 derived twin on main is a
- * later row and deliberately absent.)
+ * open rather than guess. (v14 port, row 1.)
  */
 export function registerDeclaredContextLimit(
   providerName: string,
@@ -42,6 +42,34 @@ export function registerDeclaredContextLimit(
 
 export function getDeclaredContextLimit(providerName: string): number | undefined {
   return _declaredContextLimits.get(providerName);
+}
+
+/**
+ * #651 (v14 port, row 2 — the derived twin main documents here) — the MEASURED
+ * total window, from the endpoint's own `/v1/models` `max_model_len` via
+ * `deriveContextLimits` (an opt-in startup probe).
+ *
+ * Kept apart from the declared one on purpose. A declared `contextLimit` is a
+ * CLAIM (a human typed it, and the issue measured it agreeing with the engine by
+ * coincidence); a derived one is a MEASUREMENT of what the engine will actually
+ * accept. Only the measurement is allowed to pre-seed the learned cap and refuse
+ * a request locally on its own authority — a stale claim would refuse requests
+ * the engine would have served, which is the opposite failure the census was
+ * built to avoid.
+ *
+ * The write side ships with the derivation probe; the read side
+ * (`getDerivedContextLimit`) has no consumer on v14 yet — the learned-cap
+ * seam that consumes it on main is a later landing-gap row. It exists so the
+ * probe is observable the day that row lands, and so the module ports over
+ * byte-faithfully rather than growing a v14-only shape.
+ */
+export function registerDerivedContextLimit(providerName: string, limit: number | undefined): void {
+  if (limit === undefined || !Number.isFinite(limit) || limit <= 0) return;
+  _derivedContextLimits.set(providerName, Math.floor(limit));
+}
+
+export function getDerivedContextLimit(providerName: string): number | undefined {
+  return _derivedContextLimits.get(providerName);
 }
 
 /**
@@ -83,4 +111,5 @@ export function clearRuntimeRegistry(): void {
   _runtimeProviders.clear();
   _runtimeProfiles.clear();
   _declaredContextLimits.clear();
+  _derivedContextLimits.clear();
 }
