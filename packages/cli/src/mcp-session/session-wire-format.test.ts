@@ -20,7 +20,7 @@ afterEach(async () => {
     layout.cleanup();
     expect(report).toEqual({ processes: [], files: [] });
   }
-});
+}, 30_000);
 
 describe("MCP capability declaration", () => {
   async function initializeCapabilities(

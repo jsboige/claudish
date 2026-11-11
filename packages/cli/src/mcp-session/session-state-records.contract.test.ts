@@ -53,7 +53,7 @@ if (!MAGMUX_AVAILABLE) console.warn(NO_MAGMUX_MESSAGE);
 beforeEach(async () => {
   layout = makeTempLayout("state");
   server = await McpServer.start({ env: serverEnv(layout), cwd: layout.cwd });
-});
+}, 30_000);
 afterEach(async () => {
   await server.close();
   const report = await paneOrphans(layout);

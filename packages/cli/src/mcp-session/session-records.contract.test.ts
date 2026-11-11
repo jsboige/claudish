@@ -186,7 +186,7 @@ describe.skipIf(!MAGMUX_AVAILABLE)("live records", () => {
   beforeEach(async () => {
     layout = makeTempLayout("records");
     server = await McpServer.start({ env: serverEnv(layout), cwd: layout.cwd });
-  });
+  }, 30_000);
   afterEach(async () => {
     await server.close();
     const report = await paneOrphans(layout);
