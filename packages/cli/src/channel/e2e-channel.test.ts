@@ -63,11 +63,13 @@ describe("Group 1: MCP Protocol — channel capability", () => {
     expect(instructions).toContain("completed");
   });
 
-  test("lists all 11 tools (6 existing + 5 channel)", async () => {
+  test("lists all 13 tools (8 existing + 5 channel)", async () => {
     const result = await client.listTools();
     const names = result.tools.map((t) => t.name).sort();
     expect(names).toEqual([
       "cancel_session",
+      "claudish_capabilities",
+      "claudish_status",
       "compare_models",
       "create_session",
       "get_output",
@@ -248,10 +250,17 @@ describe("Group 1b: MCP Protocol — low-level-only tools", () => {
     } catch {}
   });
 
-  test("lists only the 4 low-level tools when CLAUDISH_MCP_TOOLS=low-level", async () => {
+  test("lists only the 6 low-level tools when CLAUDISH_MCP_TOOLS=low-level", async () => {
     const result = await client.listTools();
     const names = result.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["compare_models", "list_models", "run_prompt", "search_models"]);
+    expect(names).toEqual([
+      "claudish_capabilities",
+      "claudish_status",
+      "compare_models",
+      "list_models",
+      "run_prompt",
+      "search_models",
+    ]);
   });
 });
 
