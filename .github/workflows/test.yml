@@ -75,7 +75,7 @@ jobs:
   # on packages/cli — the macos-bridge half (`bun --cwd X run typecheck`)
   # is a silent no-op on bun >= 1.4 (usage dump, exit 0), and when actually
   # run the bridge is red on main (TS6306 reference + 155 TS6059 rootDir).
-  # Follow-up tracked separately; bridge gating lands with that fix.
+  # Follow-up tracked in #981; bridge gating lands with that fix.
   typecheck:
     runs-on: ubuntu-latest
     env:
@@ -102,7 +102,7 @@ jobs:
           TESTS=$(grep -E 'error TS[0-9]+' typecheck-output.txt | grep -cE '\.test\.ts\(|/test-support/' || true)
           SRC=$((TOTAL - TESTS))
           {
-            echo "### Typecheck (tsc --noEmit, both packages, gating)"
+            echo "### Typecheck (tsc --noEmit, packages/cli, gating — macos-bridge pending #981)"
             echo "| total | sources | tests |"
             echo "|---|---|---|"
             echo "| $TOTAL | $SRC | $TESTS |"
