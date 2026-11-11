@@ -143,8 +143,15 @@ interface Drawn {
   text: string[];
   frame: CapturedFrame;
   press: (keys: string[]) => Promise<void>;
-  /** Re-render until the frame satisfies `pred`, or give up and let the assert speak. */
-  until: (pred: (text: string[]) => boolean) => Promise<void>;
+  /**
+   * Re-render until the frame satisfies `pred`, then return THAT frame: the
+   * assertions read the frame the predicate validated, never a fresh
+   * `recapture()` — #984: the paint that satisfies the predicate and the next
+   * capture are two frames, and the second can be blank mid-repaint. Throws on
+   * deadline: a silent give-up used to surface as a misleading assert on an
+   * empty frame instead of naming the wait that never held.
+   */
+  until: (pred: (text: string[]) => boolean) => Promise<{ text: string[]; frame: CapturedFrame }>;
   recapture: () => { text: string[]; frame: CapturedFrame };
   destroy: () => void;
 }
@@ -182,10 +189,12 @@ async function draw(node: ReactNode, width = 80, height = 24, settleMs = 30): Pr
      */
     until: async (pred) => {
       for (let i = 0; i < 40; i++) {
-        if (pred(captureCharFrame().split("\n"))) return;
+        const text = captureCharFrame().split("\n");
+        if (pred(text)) return { text, frame: captureSpans() };
         await new Promise((r) => setTimeout(r, 25));
         await renderOnce();
       }
+      throw new Error("until: predicate never held after 1s");
     },
     recapture,
     destroy: () => renderer.destroy(),
@@ -270,8 +279,8 @@ describe("the dialog", () => {
       // descriptions land (useModelDescriptions is deliberately last). A
       // `listPainted` wait alone can resolve on the rows-only frame, one paint
       // before the ▶ the assertion counts. Poll the predicate itself.
-      await d.until((t) => joined(t).split("▶").length - 1 === 1);
-      expect(joined(d.recapture().text).split("▶").length - 1).toBe(1);
+      const settled = await d.until((t) => joined(t).split("▶").length - 1 === 1);
+      expect(joined(settled.text).split("▶").length - 1).toBe(1);
     } finally {
       d.destroy();
     }
@@ -295,8 +304,7 @@ describe("the dialog", () => {
     );
     try {
       await d.press(["a"]);
-      await d.until(listPainted);
-      const rows = d.recapture().text.filter((l) => /\ba\b|\bb\b/.test(l));
+      const rows = (await d.until(listPainted)).text.filter((l) => /\ba\b|\bb\b/.test(l));
       expect(rows.length).toBeGreaterThan(0);
       for (const row of rows) expect(row).not.toMatch(/[█▓▒░╌]/);
     } finally {
@@ -316,10 +324,10 @@ describe("the dialog", () => {
           over: [],
         });
         await d.press(["a"]);
-        await d.until(listPainted);
+        const settled = await d.until(listPainted);
         expect({
           width,
-          over: d.recapture().text.filter((l) => l.length > width),
+          over: settled.text.filter((l) => l.length > width),
         }).toEqual({ width, over: [] });
       } finally {
         d.destroy();
@@ -347,9 +355,9 @@ describe("the dialog", () => {
       }
       expect(footer()).not.toContain("move");
       await d.press(["a"]);
-      await d.until(listPainted);
+      const listFooter = painted((await d.until(listPainted)).text).at(-2) ?? "";
       for (const hint of ["move", "select", "filter", "custom", "back"]) {
-        expect(footer()).toContain(hint);
+        expect(listFooter).toContain(hint);
       }
     } finally {
       d.destroy();
@@ -376,8 +384,7 @@ describe("the dialog", () => {
     try {
       await d.until(providerListPainted);
       await d.press(["RETURN"]);
-      await d.until(listPainted);
-      const footer = painted(d.recapture().text).at(-2) ?? "";
+      const footer = painted((await d.until(listPainted)).text).at(-2) ?? "";
       // `r retry` proves this really is the six-pill row and not the five-pill one.
       for (const hint of ["move", "select", "filter", "retry", "custom", "back"]) {
         expect({ hint, footer, present: footer.includes(hint) }).toEqual({
@@ -456,8 +463,7 @@ describe("the billing and prefix CHIPS", () => {
     // case and is chipped — see the two tests below.)
     const d = await draw(<ModelPicker source={fakeSource({ providerList })} onDone={() => {}} />);
     try {
-      await d.until(providerListPainted);
-      const f = d.recapture().frame;
+      const f = (await d.until(providerListPainted)).frame;
       for (const token of ["cx@", "or@"]) {
         const spans = spansOf(f).filter((sp) => sp.text.includes(token));
         expect({ token, found: spans.length > 0 }).toEqual({ token, found: true });
@@ -484,8 +490,7 @@ describe("the billing and prefix CHIPS", () => {
     // healthy metered row. Hence both assertions, on the spans.
     const d = await draw(<ModelPicker source={fakeSource({ providerList })} onDone={() => {}} />);
     try {
-      await d.until(providerListPainted);
-      const f = d.recapture().frame;
+      const f = (await d.until(providerListPainted)).frame;
       const dollars = labelled(f, "$$$");
       expect(dollars.length).toBeGreaterThan(0);
       // And the label it REPLACED is gone from the column rather than merely joined
@@ -518,8 +523,7 @@ describe("the billing and prefix CHIPS", () => {
     // the opposite of a failure.
     const d = await draw(<ModelPicker source={fakeSource({ providerList })} onDone={() => {}} />);
     try {
-      await d.until(providerListPainted);
-      const chips = labelled(d.recapture().frame, "SUB");
+      const chips = labelled((await d.until(providerListPainted)).frame, "SUB");
       expect(chips.length).toBeGreaterThan(0);
       for (const chip of chips) {
         expect(bgOf(chip)).toBe(rgb(C.pillKeyBg));
@@ -545,8 +549,7 @@ describe("the billing and prefix CHIPS", () => {
     // unbroken rectangle. The surplus is a plain filler span outside `bg`.
     const d = await draw(<ModelPicker source={fakeSource({ providerList })} onDone={() => {}} />);
     try {
-      await d.until(providerListPainted);
-      const f = d.recapture().frame;
+      const f = (await d.until(providerListPainted)).frame;
       const status = spansOf(f).filter(
         (sp) => bgOf(sp) === rgb(C.pillKeyBg) || bgOf(sp) === rgb(C.pillCostBg)
       );
@@ -589,8 +592,7 @@ describe("the billing and prefix CHIPS", () => {
     // one object or two — which is why this asserts the two segments touch.
     const d = await draw(<ModelPicker source={fakeSource({ providerList })} onDone={() => {}} />);
     try {
-      await d.until(providerListPainted);
-      const f = d.recapture().frame;
+      const f = (await d.until(providerListPainted)).frame;
       const caps = labelled(f, "esc");
       expect(caps.length).toBeGreaterThan(0);
       for (const cap of caps) {
@@ -644,8 +646,7 @@ describe("the billing and prefix CHIPS", () => {
     );
     try {
       await d.press(["RETURN"]);
-      await d.until(listPainted);
-      const shot = d.recapture();
+      const shot = await d.until(listPainted);
       // Every row says SUB in words…
       expect(shot.text.filter((l) => /\bm-\d\b/.test(l) && l.includes("SUB")).length).toBe(8);
       // …and not one of them carries a FILL, so there is no column to fuse.
@@ -673,8 +674,7 @@ describe("the billing and prefix CHIPS", () => {
     );
     try {
       await d.press(["RETURN"]);
-      await d.until(listPainted);
-      const scoped = d.recapture().text;
+      const scoped = (await d.until(listPainted)).text;
       const header = scoped.find((l) => l.includes("ctx") && l.includes("$/1M")) ?? "";
       expect(header).not.toContain("provider");
       expect(scoped.filter((l) => /gpt-6-astra\s{2,}/.test(l) && l.includes("OpenRouter"))).toEqual(
@@ -684,8 +684,7 @@ describe("the billing and prefix CHIPS", () => {
       await d.press(["ESCAPE"]);
       await d.until(providerListPainted);
       await d.press(["a"]);
-      await d.until(listPainted);
-      const flat = d.recapture().text;
+      const flat = (await d.until(listPainted)).text;
       expect(flat.find((l) => l.includes("ctx") && l.includes("$/1M")) ?? "").toContain("provider");
     } finally {
       d.destroy();
@@ -850,8 +849,7 @@ describe("`k` reveals BOTH kinds of unavailable provider, each with its own reas
       />
     );
     try {
-      await d.until(providerListPainted);
-      const before = joined(d.recapture().text);
+      const before = joined((await d.until(providerListPainted)).text);
       expect(before).not.toContain("more need a key");
       expect(before).not.toContain("not enabled in your config");
       // And the rows themselves are still hidden, which is what the lines described.
@@ -876,8 +874,7 @@ describe("`k` reveals BOTH kinds of unavailable provider, each with its own reas
     try {
       await d.until(providerListPainted);
       await d.press(["k"]);
-      await d.until((t) => t.join("").includes("Ollama"));
-      const after = joined(d.recapture().text);
+      const after = joined((await d.until((t) => t.join("").includes("Ollama"))).text);
       // A cloud provider names the credential — the actionable fact.
       expect(after).toContain("Kimi Coding");
       expect(after).toContain("MOONSHOT_API_KEY");
@@ -909,8 +906,7 @@ describe("the PROVIDER list filters as you type", () => {
   test("typing NARROWS the list, and the count on the right follows it", async () => {
     const d = await draw(<ModelPicker source={fakeSource({ providerList })} onDone={() => {}} />);
     try {
-      await d.until(providerListPainted);
-      expect(joined(d.recapture().text)).toContain("OpenRouter");
+      expect(joined((await d.until(providerListPainted)).text)).toContain("OpenRouter");
 
       // `im`, not `kimi`: `k` is a COMMAND while the filter is empty (see the test
       // below), so a bare `k` would toggle the hidden providers instead of typing.
@@ -993,10 +989,10 @@ describe("the PROVIDER list filters as you type", () => {
       expect(joined(d.recapture().text)).not.toContain("OpenRouter");
 
       await d.press(["ESCAPE"]);
-      await d.until((t) => t.join("").includes("OpenRouter"));
+      const settled = await d.until((t) => t.join("").includes("OpenRouter"));
       // Cleared, NOT cancelled: the whole list is back and the picker is still open.
       expect(got).toBeUndefined();
-      const cleared = joined(d.recapture().text);
+      const cleared = joined(settled.text);
       expect(cleared).toContain("OpenRouter");
       expect(cleared).toContain("Google Gemini");
 
@@ -1038,8 +1034,7 @@ describe("the PROVIDER list filters as you type", () => {
       await d.until(providerListPainted);
       await d.press(["i", "m"]);
       await d.press(["RETURN"]);
-      await d.until(listPainted);
-      const after = joined(d.recapture().text);
+      const after = joined((await d.until(listPainted)).text);
       expect(after).toContain("kimi-k3");
       expect(after).not.toContain("no model matches");
       // `newest first` is the model list's idle caption — it is only drawn when the
@@ -1071,9 +1066,9 @@ describe("entering a provider loads THAT provider, on demand", () => {
     try {
       await d.press(["ARROW_DOWN"]);
       await d.press(["RETURN"]);
-      await d.until(listPainted);
+      const settled = await d.until(listPainted);
       expect(source.calls.discover).toEqual(["devin"]);
-      const all = joined(d.recapture().text);
+      const all = joined(settled.text);
       expect(all).toContain("Devin");
       expect(all).toContain("devin-1");
     } finally {
@@ -1104,13 +1099,13 @@ describe("entering a provider loads THAT provider, on demand", () => {
       await d.until(listPainted);
       // #984 — same class as the one-cursor pin above: the asserted CONTENT
       // (the padded id row) is what we wait for, not just the list header.
-      await d.until((t) => t.some((l) => /gpt-6-astra\s{2,}/.test(l)));
+      const settled = await d.until((t) => t.some((l) => /gpt-6-astra\s{2,}/.test(l)));
       // ONE LIST ROW. The provider column is no longer drawn inside a provider — it
       // said `OpenRouter` 49 times under a dialog titled `OpenRouter` — so the row is
       // identified by its padded id cell instead: the id followed by the gap before
       // `ctx`. The detail line below prints `openrouter@gpt-6-astra · tools`, one
       // space and a `·`, and is not counted by that shape.
-      const rows = d.recapture().text.filter((l) => /gpt-6-astra\s{2,}/.test(l));
+      const rows = settled.text.filter((l) => /gpt-6-astra\s{2,}/.test(l));
       expect(rows.length).toBe(1);
     } finally {
       d.destroy();
@@ -1136,8 +1131,7 @@ describe("entering a provider loads THAT provider, on demand", () => {
       // after that timeout is what makes a bare Escape observable in a test — a
       // real keyboard gets the same delay and nobody notices.
       await d.press([]);
-      await d.until(providerListPainted);
-      expect(joined(d.recapture().text)).toContain("choose a provider");
+      expect(joined((await d.until(providerListPainted)).text)).toContain("choose a provider");
       expect(got).toBeUndefined();
     } finally {
       d.destroy();
@@ -1258,8 +1252,7 @@ describe("`a` opens the cross-provider list", () => {
     const d = await draw(<ModelPicker source={source} onDone={() => {}} />);
     try {
       await d.press(["a"]);
-      await d.until(listPainted);
-      const all = joined(d.recapture().text);
+      const all = joined((await d.until(listPainted)).text);
       expect(all).toContain("all models");
       expect(all).toContain("glm-5.3-flash");
       expect(all).toContain("kimi-k3");
@@ -1291,8 +1284,7 @@ describe("`a` opens the cross-provider list", () => {
     );
     try {
       await d.press(["a"]);
-      await d.until(listPainted);
-      const all = joined(d.recapture().text);
+      const all = joined((await d.until(listPainted)).text);
       expect(all).toContain("1 models · 2 routes");
       expect(all).toContain("OpenRouter");
       expect(all).toContain("Kimi Coding");
@@ -1317,8 +1309,7 @@ describe("`a` opens the cross-provider list", () => {
     );
     try {
       await d.press(["a"]);
-      await d.until(listPainted);
-      const all = joined(d.recapture().text);
+      const all = joined((await d.until(listPainted)).text);
       expect(all).toContain("glm-5.3-flash");
       expect(all).not.toContain("kimi-k3");
       // The absence is EXPLAINED, in the title, rather than silent.
@@ -1425,8 +1416,7 @@ describe("a fallback list says it is a fallback — and that it may not work", (
       height
     );
     await d.press(["RETURN"]);
-    await d.until(listPainted);
-    return { ...d, ...d.recapture() };
+    return { ...d, ...(await d.until(listPainted)) };
   }
 
   test("the title, the per-row mark and the banner all say it", async () => {
@@ -1547,8 +1537,7 @@ describe("the loading states", () => {
       await d.press(["ESCAPE"]);
       await new Promise((resolve) => setTimeout(resolve, 600));
       await d.press(["a"]);
-      await d.until(listPainted);
-      const frame = d.recapture().text;
+      const frame = (await d.until(listPainted)).text;
       expect(joined(frame)).not.toContain("fetching");
       expect(source.calls.catalog).toBe(1);
       expect(flat(frame)).toContain("A sentence about model a.");
