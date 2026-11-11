@@ -6,7 +6,7 @@ Claudish isn't just a CLI. It's also an MCP server that exposes external AI mode
 
 Claude can call Grok, GPT-5, or Gemini mid-conversation to get a second opinion, run a comparison, or delegate specialized tasks. With channel mode, it can also spawn full async sessions — complete with push notifications and interactive input.
 
-The server exposes **11 tools** across three groups: low-level (4), agentic (2), and channel (5).
+The server exposes **13 tools** across three groups: low-level (6), agentic (2), and channel (5).
 
 ---
 
@@ -448,11 +448,11 @@ export OPENROUTER_API_KEY='sk-or-v1-...'
 **Check if MCP server starts:**
 ```bash
 OPENROUTER_API_KEY=sk-or-v1-... claudish --mcp
-# Should output: [claudish] MCP server started (tools: all, 11 tools)
+# Should output: [claudish] MCP server started (tools: all, 13 tools)
 ```
 
 **Test the tools:**
-Use Claude Code and ask it to list available MCP tools. You should see all 11: `run_prompt`, `list_models`, `search_models`, `compare_models`, `team`, `report_error`, `create_session`, `send_input`, `get_output`, `cancel_session`, and `list_sessions`.
+Use Claude Code and ask it to list available MCP tools. You should see all 13: `run_prompt`, `list_models`, `search_models`, `compare_models`, `claudish_status`, `claudish_capabilities`, `team`, `report_error`, `create_session`, `send_input`, `get_output`, `cancel_session`, and `list_sessions`.
 
 **Check which tool group is active:**
 ```bash

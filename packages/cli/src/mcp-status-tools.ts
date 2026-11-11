@@ -16,7 +16,21 @@
  *  - capabilities: the recommended-model catalog entry (`getRecommendedModels`),
  *    cross-checked with `getDeclaredContextLimit`/`getDerivedContextLimit`
  *    (providers/runtime-providers.ts) for the REAL window vs the claimed one.
+ *
+ * #993 review: the live-facts gathering for `claudish_status` moved here too
+ * (`claudishStatusHandler`) so the "a read never resets what it reads"
+ * invariant is unit-testable without booting the stdio MCP server.
  */
+
+import {
+  FAILOVER_ROLES,
+  earliestWalledReprobeAt,
+  ensureFailoverRulesLoaded,
+  getActiveFailovers,
+  getFailoverRule,
+  isAutoArmEnabled,
+} from "./fork/failover.js";
+import { getModelMapping, loadConfig } from "./profile-config.js";
 
 // A value is never rendered verbatim if it looks like a credential. The read
 // surface is additive (status + capabilities); it has no legitimate reason to
@@ -28,7 +42,14 @@ const SECRET_SHAPES: RegExp[] = [
   /\bBearer\s+[A-Za-z0-9._-]{8,}\b/i,
   /\bkey-[A-Za-z0-9_-]{8,}\b/i,
   /\b[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{24,}\b/, // JWT
-  /\b(x-api-key|x-proxy-key|authorization|api[_-]?key|proxy[_-]?key)\b/i, // field names naming a credential
+  /\b[0-9a-f]{20,}\.[0-9a-f]{10,}\b/i, // z.ai console key: long-hex id "." long-hex secret
+];
+
+// KEY-name shapes are matched by CONTAINMENT, not word boundaries: `_` is a word
+// character, so `\bapi…` never fires inside `OPENAI_API_KEY` (#993 review). A key
+// whose name merely CONTAINS a credential word carries no value out, whatever it.
+const SECRET_KEY_NAME_SHAPES: RegExp[] = [
+  /x-api-key|x-proxy-key|authorization|api[_-]?key|proxy[_-]?key|token|secret|credential/i,
 ];
 
 /**
@@ -58,7 +79,7 @@ export function scrubForWire<T>(value: T): T {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       // A credential-named key never carries its value out, whatever the value.
-      if (SECRET_SHAPES.some((re) => re.test(k))) {
+      if (SECRET_KEY_NAME_SHAPES.some((re) => re.test(k))) {
         out[k] = "[redacted]";
       } else {
         out[k] = scrubForWire(v);
@@ -79,13 +100,23 @@ export interface StatusRoleInput {
   configuredSteps: string[];
   /** Currently-serving failover step, when the role is diverted. */
   activeStep?: { target: string; stepIndex: number; bucket: string } | null;
-  /** Whether auto-arming is on for this role's cascade. */
+  /**
+   * Whether this process holds LIVE serving state. False when the in-process
+   * proxy never started: the walls/diversions maps were never populated here,
+   * so `diverted: false` would be a default, not an answer (#993 review).
+   */
+  servingKnown: boolean;
+  /** Machine-readable reason when servingKnown is false. */
+  servingUnknownReason?: string;
+  /** Whether auto-arming (CLAUDISH_FAILOVER_AUTO) is on — the REAL flag. */
   auto: boolean;
   /** Next reprobe/reset instant, ISO, if a wall or reset is declared. */
   resetAt?: string | null;
 }
 
 export interface StatusInput {
+  /** Whose state this is — the status reports a PROCESS, never "the hub". */
+  scope: string;
   /** The effective profile name, if known. */
   profile?: string;
   roles: StatusRoleInput[];
@@ -94,7 +125,16 @@ export interface StatusInput {
 export interface StatusRoleOutput {
   role: string;
   effective: string | null;
-  serving: { target: string | null; stepIndex?: number; bucket?: string; diverted: boolean };
+  /**
+   * Null (with `servingNote`) when this process has no live serving state —
+   * never a defaulted `diverted: false`.
+   */
+  serving:
+    | { target: string; stepIndex: number; bucket: string; diverted: true }
+    | { target: string | null; diverted: false }
+    | null;
+  /** Set exactly when serving is null — why there is no live state here. */
+  servingNote: string | null;
   configured: string[];
   auto: boolean;
   resetAt: string | null;
@@ -102,6 +142,7 @@ export interface StatusRoleOutput {
 
 export interface StatusOutput {
   surface: string;
+  scope: string;
   profile: string | null;
   roles: StatusRoleOutput[];
 }
@@ -114,23 +155,67 @@ export function renderStatus(input: StatusInput): StatusOutput {
   const roles = input.roles.map((r) => ({
     role: r.role,
     effective: r.nominal ?? null,
-    serving: r.activeStep
-      ? {
-          target: r.activeStep.target,
-          stepIndex: r.activeStep.stepIndex,
-          bucket: r.activeStep.bucket,
-          diverted: true,
-        }
-      : { target: r.nominal ?? null, diverted: false },
+    serving: r.servingKnown
+      ? r.activeStep
+        ? {
+            target: r.activeStep.target,
+            stepIndex: r.activeStep.stepIndex,
+            bucket: r.activeStep.bucket,
+            diverted: true as const,
+          }
+        : { target: r.nominal ?? null, diverted: false as const }
+      : null,
+    servingNote: r.servingKnown ? null : (r.servingUnknownReason ?? "unknown"),
     configured: r.configuredSteps,
     auto: r.auto,
     resetAt: r.resetAt ?? null,
   }));
   return scrubForWire({
     surface: "claudish_status",
+    scope: input.scope,
     profile: input.profile ?? null,
     roles,
   });
+}
+
+/**
+ * Gather + render the `claudish_status` payload from THIS process's live state.
+ *
+ * #993 review contract, load-bearing:
+ *  - NEVER calls `initFailover()` — that clears `walled`/`stepFailures`/`dwellPins`
+ *    and would un-wall every bucket the in-process proxy (`getProxy()`,
+ *    mcp-server.ts) had learned. Rules are parsed read-only through
+ *    `ensureFailoverRulesLoaded()` when they were never loaded here; a read must
+ *    never reset the thing it reads.
+ *  - `scope` names whose state this is: the MCP server's own in-process proxy —
+ *    NOT the hub's. When that proxy never started (`proxyStarted: false`),
+ *    `serving` is null with a reason, never a defaulted `diverted: false`.
+ *  - `auto` comes from the real auto-arm flag (`CLAUDISH_FAILOVER_AUTO`), not
+ *    from step counts — a configured cascade is not an auto-arm.
+ */
+export function claudishStatusHandler(opts: { proxyStarted: boolean }): StatusOutput {
+  ensureFailoverRulesLoaded();
+  const cfg = loadConfig();
+  const mapping = getModelMapping(cfg.defaultProfile);
+  const active = getActiveFailovers();
+  const roles: StatusRoleInput[] = FAILOVER_ROLES.map((role) => {
+    const rule = getFailoverRule(role);
+    const serving = active.find((a) => a.role === role);
+    const resetAt = earliestWalledReprobeAt(role);
+    return {
+      role: role as string,
+      nominal: mapping[role],
+      configuredSteps: rule ? rule.steps.map((s) => s.target) : [],
+      activeStep: serving
+        ? { target: serving.step.target, stepIndex: serving.stepIndex, bucket: serving.bucket }
+        : null,
+      servingKnown: opts.proxyStarted,
+      servingUnknownReason: opts.proxyStarted ? undefined : "proxy-not-started-in-this-process",
+      auto: isAutoArmEnabled(),
+      resetAt: resetAt ? resetAt.toISOString() : null,
+    };
+  });
+  return renderStatus({ scope: "mcp-process-proxy", profile: cfg.defaultProfile, roles });
 }
 
 // ─── claudish_capabilities ───────────────────────────────────────────────────

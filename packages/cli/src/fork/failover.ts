@@ -182,6 +182,12 @@ interface RecoveryState {
 /** Parsed once at module load; re-read only by resetFailoverForTests(). */
 let rules = new Map<FailoverRole, FailoverRule>();
 let autoArmEnabled = false;
+/**
+ * True once initFailover() (or the read-only ensureFailoverRulesLoaded()) has
+ * parsed the environment in this process. Lets the #985 status surface answer
+ * "were the cascade rules ever loaded here?" without poking `rules` internals.
+ */
+let rulesLoaded = false;
 
 // ─── #275: per-model maxing, provider-scoped contagion ─────────────────────────
 // Walls used to be keyed by ROLE: any member's refusal (Sol's weekly wall, a native
@@ -606,6 +612,7 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   }
   roleAliases = parseRoleAliases(env.CLAUDISH_FAILOVER_ROLE_MODELS || "");
   autoArmEnabled = /^(1|true|yes|on)$/i.test((env.CLAUDISH_FAILOVER_AUTO || "").trim());
+  rulesLoaded = true;
   walled.clear();
   configArmedRoles.clear();
   configArmedMachines.clear();
@@ -773,6 +780,46 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
 function describeResolved(role: FailoverRole): string {
   const { step } = resolveFailoverTarget(role);
   return step ? step.label : "nominal";
+}
+
+/**
+ * The REAL auto-arm flag (CLAUDISH_FAILOVER_AUTO), as this process parsed it.
+ * A configured cascade is not an auto-arm — CLAUDE.md is explicit that
+ * configuring a target does not activate it. Read surface (#985) reads this
+ * instead of inferring "auto" from step counts or armed state.
+ */
+export function isAutoArmEnabled(): boolean {
+  return autoArmEnabled;
+}
+
+/**
+ * Read-only rules warm-up (#993 CR): parse the cascade rules, role aliases and
+ * the auto flag from the environment WITHOUT touching any live state — unlike
+ * initFailover(), which clears `walled`/`stepFailures`/`dwellPins`/… on the
+ * grounds that in-memory state does not survive a restart.
+ *
+ * Why this exists: the MCP server runs a real proxy in this same process
+ * (`getProxy()`, mcp-server.ts), and that proxy's boot already called
+ * initFailover(). A status read that called initFailover() again would un-wall
+ * every bucket the in-process proxy had learned — a read must never reset the
+ * thing it reads. If the proxy never started here, this parses the rules so the
+ * status surface can still report configured steps and the auto flag; the
+ * runtime state (walls, serving) is reported as unknown instead of "nominal".
+ *
+ * Deliberately does NOT parse CLAUDISH_FAILOVER_ACTIVE (config arming is a
+ * write-path gesture owned by proxy boot) — only what the read surface needs.
+ */
+export function ensureFailoverRulesLoaded(env: NodeJS.ProcessEnv = process.env): void {
+  if (rulesLoaded) return;
+  rules = loadRules(env);
+  roleAliases = parseRoleAliases(env.CLAUDISH_FAILOVER_ROLE_MODELS || "");
+  autoArmEnabled = /^(1|true|yes|on)$/i.test((env.CLAUDISH_FAILOVER_AUTO || "").trim());
+  rulesLoaded = true;
+}
+
+/** Test/read seam: were the cascade rules ever parsed in this process? */
+export function areFailoverRulesLoaded(): boolean {
+  return rulesLoaded;
 }
 
 /**
@@ -2969,6 +3016,7 @@ export function resetFailoverForTests(env?: NodeJS.ProcessEnv): void {
     rules = new Map();
     roleAliases = [];
     autoArmEnabled = false;
+    rulesLoaded = false;
     walled.clear();
     configArmedRoles.clear();
     configArmedMachines.clear();

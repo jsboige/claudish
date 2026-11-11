@@ -42,20 +42,12 @@ import {
   type RecommendedModelGroup,
 } from "./model-loader.js";
 import { BUILTIN_PROVIDERS } from "./providers/provider-definitions.js";
-import {
-  FAILOVER_ROLES,
-  getFailoverRule,
-  getActiveFailovers,
-  isFailoverActive,
-  earliestWalledReprobeAt,
-  initFailover,
-} from "./fork/failover.js";
 import { getModelMapping, loadConfig } from "./profile-config.js";
 import {
   getDeclaredContextLimit,
   getDerivedContextLimit,
 } from "./providers/runtime-providers.js";
-import { renderStatus, renderCapabilities } from "./mcp-status-tools.js";
+import { claudishStatusHandler, renderCapabilities } from "./mcp-status-tools.js";
 // One cache path for the whole binary: a local constant here would drift from
 // the proxy the day CLAUDISH_MODEL_CACHE_PATH is set, and the MCP tool would
 // list a different catalog than the router resolves against.
@@ -527,31 +519,18 @@ function defineTools(sessionManager: SessionManager): ToolDefinition[] {
   tools.push({
     name: "claudish_status",
     description:
-      "Read-only: the effective tier→provider mapping, armed failover steps, configured/auto state and reset clocks. Reports what the hub is serving — never requisitions.",
+      "Read-only: effective tier→provider mapping, armed failover steps, configured/auto state and reset clocks — as seen by THIS MCP server's own in-process proxy (scope: mcp-process-proxy), NOT the hub's live state. When that proxy has not started, serving is reported unknown, never defaulted. Never requisitions.",
     inputSchema: { type: "object" },
     group: "low-level",
     handler: async () => {
       try {
-        initFailover();
-        const cfg = loadConfig();
-        const mapping = getModelMapping(cfg.defaultProfile);
-        const active = getActiveFailovers();
-        const roles = FAILOVER_ROLES.map((role) => {
-          const rule = getFailoverRule(role);
-          const serving = active.find((a) => a.role === role);
-          const resetAt = earliestWalledReprobeAt(role);
-          return {
-            role: role as string,
-            nominal: mapping[role],
-            configuredSteps: rule ? rule.steps.map((s) => s.target) : [],
-            activeStep: serving
-              ? { target: serving.step.target, stepIndex: serving.stepIndex, bucket: serving.bucket }
-              : null,
-            auto: isFailoverActive(role) || (rule !== undefined && rule.steps.length > 0),
-            resetAt: resetAt ? resetAt.toISOString() : null,
-          };
+        // #993 review: no initFailover() here — it would un-wall every bucket
+        // the in-process proxy learned. claudishStatusHandler reads state
+        // without resetting it; when this process's proxy never started, it
+        // says so instead of defaulting `diverted: false`.
+        const payload = claudishStatusHandler({
+          proxyStarted: proxyInstance !== null || proxyStarting !== null,
         });
-        const payload = renderStatus({ profile: cfg.defaultProfile, roles });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
         };
