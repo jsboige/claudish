@@ -10,6 +10,13 @@
  * apart, failed probes inventing nothing).
  */
 import { beforeEach, describe, expect, test } from "bun:test";
+import type { CustomEndpoint } from "../config-schema.js";
+import {
+  getOverflowCap,
+  rememberOverflowCap,
+  resetOverflowCapsForTests,
+} from "../handlers/shared/context-overflow.js";
+import type { RemoteProvider } from "../handlers/shared/remote-provider-types.js";
 import {
   deriveContextLimits,
   modelsUrlFor,
@@ -17,21 +24,14 @@ import {
   pickMaxModelLen,
   purgeCapsReplacedByDerivation,
 } from "./context-limit-derivation.js";
+import { customEndpointCapKey, loadCustomEndpoints } from "./custom-endpoints-loader.js";
 import {
   clearRuntimeRegistry,
   getDeclaredContextLimit,
   getDerivedContextLimit,
   registerDeclaredContextLimit,
 } from "./runtime-providers.js";
-import { customEndpointCapKey, loadCustomEndpoints } from "./custom-endpoints-loader.js";
 import { OpenAIProviderTransport } from "./transport/openai.js";
-import type { RemoteProvider } from "../handlers/shared/remote-provider-types.js";
-import type { CustomEndpoint } from "../config-schema.js";
-import {
-  getOverflowCap,
-  rememberOverflowCap,
-  resetOverflowCapsForTests,
-} from "../handlers/shared/context-overflow.js";
 
 function stubFetch(answer: (url: string) => Response | Promise<Response>) {
   const calls: string[] = [];
@@ -440,7 +440,13 @@ describe("purgeCapsReplacedByDerivation — the call-site key (#660 r2)", () => 
       deriveContextLimit: true,
     };
     const transport = new OpenAIProviderTransport(
-      { name: "ep", baseUrl: "http://h/v1", apiPath: "/chat/completions", apiKeyEnvVar: "X", prefixes: [] },
+      {
+        name: "ep",
+        baseUrl: "http://h/v1",
+        apiPath: "/chat/completions",
+        apiKeyEnvVar: "X",
+        prefixes: [],
+      },
       "m",
       "k"
     );

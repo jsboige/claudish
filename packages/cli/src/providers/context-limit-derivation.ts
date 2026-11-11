@@ -37,10 +37,10 @@
  */
 
 import { type CustomEndpoint, CustomEndpointSchema } from "../config-schema.js";
+import { forgetOverflowCapsForProvider } from "../handlers/shared/context-overflow.js";
 import { log, logStderr } from "../logger.js";
 import type { ClaudishProfileConfig } from "../profile-config.js";
 import { customEndpointCapKey, resolveCustomEndpointApiKey } from "./custom-endpoints-loader.js";
-import { forgetOverflowCapsForProvider } from "../handlers/shared/context-overflow.js";
 import { registerDeclaredContextLimit, registerDerivedContextLimit } from "./runtime-providers.js";
 
 /** One entry of a `/v1/models` answer, as far as this module cares. */

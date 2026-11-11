@@ -29,10 +29,10 @@
  */
 
 import {
+  type OverflowCapRecord,
   overflowCapsPath,
   readOverflowCapsFile,
   writeOverflowCapsFile,
-  type OverflowCapRecord,
 } from "./overflow-caps-store.js";
 
 /**
@@ -259,9 +259,7 @@ export function rememberOverflowCap(
       cap,
       at: new Date().toISOString(),
       evidence,
-      ...(overflowStatedLimits.has(key)
-        ? { statedLimit: overflowStatedLimits.get(key) }
-        : {}),
+      ...(overflowStatedLimits.has(key) ? { statedLimit: overflowStatedLimits.get(key) } : {}),
     });
     writeOverflowCapsFile(overflowCapsStorePath, overflowCapRecords);
   }

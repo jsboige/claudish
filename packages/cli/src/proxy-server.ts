@@ -187,7 +187,10 @@ import {
   resolveTargetForCatalog,
   warmCatalog,
 } from "./providers/catalog-client.js";
-import { deriveContextLimits, purgeCapsReplacedByDerivation } from "./providers/context-limit-derivation.js";
+import {
+  deriveContextLimits,
+  purgeCapsReplacedByDerivation,
+} from "./providers/context-limit-derivation.js";
 import { getEndpointUnavailableReason } from "./providers/endpoint-diagnostics.js";
 import {
   ensureEndpointsRegistered,
@@ -575,7 +578,9 @@ export async function createProxyServer(
       // The loop lives in purgeCapsReplacedByDerivation (shared with the pin).
       const capsPurged = purgeCapsReplacedByDerivation(derived);
       if (capsPurged > 0) {
-        log(`[ContextLimit] derivation replaced ${capsPurged} restored learned cap(s) with the measured window`);
+        log(
+          `[ContextLimit] derivation replaced ${capsPurged} restored learned cap(s) with the measured window`
+        );
       }
     } catch (err) {
       // Belt and braces: deriveContextLimits swallows per-endpoint failures, and
