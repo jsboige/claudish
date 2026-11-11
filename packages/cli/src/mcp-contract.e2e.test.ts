@@ -79,6 +79,8 @@ let server: McpServer;
 
 if (!MAGMUX_AVAILABLE) console.warn(NO_MAGMUX_MESSAGE);
 
+// 30_000: hook budget covering a real server boot/close (bun's default hook timeout
+// is 5000 ms, and the initialize handshake can exceed it on a loaded shard runner).
 beforeEach(async () => {
   layout = makeTempLayout("mcpcontract");
   server = await McpServer.start({
@@ -86,13 +88,13 @@ beforeEach(async () => {
     env: serverEnv(layout, { CONTRACT_FAKE_MAX_MS: "60000" }),
     cwd: layout.cwd,
   });
-});
+}, 30_000);
 afterEach(async () => {
   await server.close();
   const report = await paneOrphans(layout);
   layout.cleanup();
   expect(report).toEqual({ processes: [], files: [] });
-});
+}, 30_000);
 
 function ok(r: ToolResult): Json {
   expect(r.isError).toBe(false);

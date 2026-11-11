@@ -109,20 +109,22 @@ let server: McpServer;
 
 if (!MAGMUX_AVAILABLE) console.warn(NO_MAGMUX_MESSAGE);
 
+// 30_000: hook budget covering a real server boot/close plus the 15 s orphan sweep
+// (bun's default hook timeout is 5000 ms — smaller than this hook's own worst case).
 beforeEach(async () => {
   layout = makeTempLayout("bbchan");
   server = await McpServer.start({
     env: serverEnv(layout, { CONTRACT_FAKE_MAX_MS: "80000" }),
     cwd: layout.cwd,
   });
-});
+}, 30_000);
 
 afterEach(async () => {
   await server.close();
   const report = await paneOrphans(layout, 15_000);
   layout.cleanup();
   expect(report).toEqual({ processes: [], files: [] });
-});
+}, 30_000);
 
 function ok(r: ToolResult): Json {
   if (r.isError) throw new Error(`expected success, got error: ${r.text}`);
