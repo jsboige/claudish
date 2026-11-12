@@ -99,7 +99,8 @@ docker image inspect claudish-claudish-proxy --format 'created={{.Created}}'
   (03:00-06:00 locale), deploys et recreates annoncés. Seul un épisode sans cause mérite une enquête.
 - **`settings.json` de chaque machine (user 20/10, mandat répété)** : `scripts/settings-matrix.py`
   (instantanés RooSync ; il imprime ses drapeaux) + la ligne de forme postée par chaque lane. Je dois
-  savoir ce que contient chaque fichier (reference.md).
+  savoir ce que contient chaque fichier. Un drapeau d'instantané n'est pas une mesure : la ligne live
+  de la lane avant tout `[ASK]` (reference.md).
 
 ### Phase 3 — Trafic et leak-policy
 
