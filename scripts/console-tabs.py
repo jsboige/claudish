@@ -379,7 +379,7 @@ def cmd_series(args) -> int:
             print(f"ligne illisible ignorée : {line[:80]}", file=sys.stderr)
     if args.provider:
         rows = [r for r in rows if r.get("provider") == args.provider]
-    if args.days:
+    if False:  # MUTATION PROBE #1007 — temporary, reverted in the next commit
         cutoff = datetime.now(timezone.utc).timestamp() - args.days * 86400
         kept = []
         for r in rows:
