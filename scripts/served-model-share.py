@@ -23,6 +23,13 @@ Traps this script avoids
 3. A failover BANNER count is an EPISODE marker, not a per-turn counter
    (measured 12/11 on po-2027: 2 banners for 4 180 served turns). Never use it
    as an occurrence count.
+4. `isApiErrorMessage` sits at the TOP level of the entry, next to
+   `requestRef`, not inside `message` (CR #1005: with the wrong nesting the
+   error column reads 0 on every day, and the error turns land in `served`
+   as `<synthetic>` — 9 over 30 days on ai-01). Both nestings are read.
+5. Serving runs are built PER SESSION (`sessionId`). Sorting every entry of
+   the project mixes sessions: two live sessions on two models read as a
+   stream of n=1 runs that looks like flapping.
 
 Read-only: opens jsonl files under ~/.claude/projects, writes nothing.
 
@@ -78,13 +85,15 @@ def parse_ts(value: str):
 def collect(paths: list[str], since: datetime):
     """Return per-day served/requested counts, api-error counts, and serving runs.
 
-    A run is a maximal sequence of deduped turns served by the same model whose
-    consecutive timestamps are closer than `gap_min` minutes.
+    `events` holds `(ts, sessionId, served_model)` tuples, deduped by
+    `requestRef`. A run is a maximal sequence of deduped turns of ONE session
+    served by the same model whose consecutive timestamps are closer than
+    `gap_min` minutes; runs never span sessions.
     """
     served = defaultdict(lambda: defaultdict(int))
     requested = defaultdict(lambda: defaultdict(int))
     apierr = defaultdict(int)
-    events = []  # (ts, served_model) after requestRef dedup, chronologically within each file
+    events = []
     seen_refs = set()
 
     for proj in paths:
@@ -109,7 +118,7 @@ def collect(paths: list[str], since: datetime):
                         continue
                     msg = d.get("message") or {}
                     day = dt.strftime("%Y-%m-%d")
-                    if msg.get("isApiErrorMessage"):
+                    if d.get("isApiErrorMessage") or msg.get("isApiErrorMessage"):
                         apierr[day] += 1
                         continue
                     if msg.get("role") != "assistant" and d.get("type") != "assistant":
@@ -122,24 +131,35 @@ def collect(paths: list[str], since: datetime):
                     served[day][model] += 1
                     asked = d.get("requestedModel") or "?"
                     requested[day][asked] += 1
-                    events.append((dt, model))
+                    events.append((dt, d.get("sessionId") or "?", model))
     events.sort(key=lambda e: e[0])
     return served, requested, apierr, events
 
 
 def build_runs(events, gap_min: int):
+    """Runs per session: (start, end, model, turns, sessionId).
+
+    The session split is not cosmetic. Sorting the whole project's entries
+    interleaves two live sessions, and a session pinned to a fallback next to
+    a session on the nominal reads as n=1 runs flapping every few seconds.
+    """
+    per_session = defaultdict(list)
+    for dt, sid, model in events:
+        per_session[sid].append((dt, model))
     runs = []
-    cur = None
-    for dt, model in events:
-        if cur and cur[2] == model and (dt - cur[1]).total_seconds() <= gap_min * 60:
-            cur[1] = dt
-            cur[3] += 1
-        else:
-            if cur:
-                runs.append(cur)
-            cur = [dt, dt, model, 1]
-    if cur:
-        runs.append(cur)
+    for sid in sorted(per_session):
+        cur = None
+        for dt, model in sorted(per_session[sid], key=lambda e: e[0]):
+            if cur and cur[2] == model and (dt - cur[1]).total_seconds() <= gap_min * 60:
+                cur[1] = dt
+                cur[3] += 1
+            else:
+                if cur:
+                    runs.append(cur)
+                cur = [dt, dt, model, 1, sid]
+        if cur:
+            runs.append(cur)
+    runs.sort(key=lambda r: r[0])
     return runs
 
 
@@ -201,6 +221,7 @@ def main() -> int:
                     "end": r[1].isoformat(),
                     "model": r[2],
                     "turns": r[3],
+                    "session": r[4],
                 }
                 for r in runs
             ],
@@ -247,10 +268,10 @@ def main() -> int:
         print(f"  {k:36} {v:>6}")
 
     if runs:
-        print(f"\nserving runs (split at gaps > {args.gap_min} min):")
-        for st, en, model, n in runs:
+        print(f"\nserving runs (split at gaps > {args.gap_min} min, never across sessions):")
+        for st, en, model, n, sid in runs:
             span = int((en - st).total_seconds())
-            print(f"  {st.strftime('%m-%d %H:%M:%S')}Z -> {en.strftime('%H:%M:%S')}Z  {model:30} n={n:>4} span={span}s")
+            print(f"  {st.strftime('%m-%d %H:%M:%S')}Z -> {en.strftime('%H:%M:%S')}Z  {model:22} n={n:>4} span={span}s  {sid[:8]}")
     return 0
 
 
