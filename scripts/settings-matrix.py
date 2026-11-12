@@ -194,8 +194,9 @@ def age_hours(iso, now):
 # A flag read from a STALE snapshot is not a measurement of the seat (Refs #291).
 # On 11-12/11 the coordinator's bilans published 330000 (ai-01, po-2023) and
 # 250000 (po-2028) as "off canon", read from RooSync snapshots older than the
-# live settings.json files -- all six seats were actually AT canon (po-2027
-# applied it 10:22Z on 12/11). A snapshot's value can only testify about the
+# live settings.json files. Read live, those seats were AT canon; the one real
+# gap was po-2027 (330000 until it applied the canon at 10:20Z on 12/11). A
+# snapshot's value can only testify about the
 # seat at `collectedAt`; past a threshold the matrix must send the reader to
 # the live file, never render the gap as an observed off-canon.
 CANON_STALE_HOURS_DEFAULT = 24.0
