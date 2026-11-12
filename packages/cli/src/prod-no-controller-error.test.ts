@@ -29,23 +29,34 @@ import { join, relative, sep } from "node:path";
 const SRC_ROOT = join(import.meta.dir);
 
 /**
- * replatform/v14 (main-forward sync #919): pre-existing call sites in v14-only
- * seam sources — files that do not exist on main, so main's zero-site corpus
- * assumption does not hold here. Line-pinned on purpose: a NEW site (or a line
- * shift from a legitimate v14 edit) re-reddens this pin instead of passing
- * silently. Empty this set at the landing — the unified tree must not carry a
- * stream-killing call site.
+ * #641 landing, étape 7 (coordinator GO 12/11): the ONLY surviving
+ * `controller.error(` call sites — the two stream-head sniffers, whose
+ * replayed stream feeds a PARSER, never the client directly; a rejection
+ * there is the parser's own error handling running (the conversion), not a
+ * killed client stream. Every other former site (seam-tap, seam-transform,
+ * raw's replay and fallback, the advisor tee, the two lease wrappers) now
+ * terminates with a synthetic labeled terminal + close, or release + close
+ * (#663 r1) — pinned in seam-neverhang-pins.test.ts.
+ *
+ * Each entry names its conversion pin BY TEST NAME: the pin seeds a rejection
+ * in the upstream body after the sniffer's clean verdict and asserts a
+ * labeled error terminal on the client side, through the real consumer
+ * chain — responses: responses-leg.ts `{kind:"stream-error"}` →
+ * responses-turn.ts `sink.endWithError/endWithText`; devin:
+ * devin-connect.ts `finalize("error")` (an SSE `error` frame). The liveness
+ * test below refuses an entry whose pin is gone from that file. Line-pinned
+ * on purpose: a NEW site (or a line shift from a legitimate edit)
+ * re-reddens this pin instead of passing silently.
  */
-const V14_SEAM_SITES = new Set([
-  "handlers/advisor-decorator.ts:510",
-  "handlers/shared/call-context.ts:217",
-  "handlers/shared/devin-stream-head-sniffer.ts:163",
-  "handlers/shared/stream-head-sniffer.ts:132",
-  "handlers/shared/stream-parsers/upstream-cancel.ts:97",
-  "hooks/raw.ts:676",
-  "hooks/raw.ts:964",
-  "hooks/seam-tap.ts:114",
-  "hooks/seam-transform.ts:760",
+const V14_SEAM_SITES = new Map<string, string>([
+  [
+    "handlers/shared/stream-head-sniffer.ts:132",
+    "responses sniffer: a replayed rejection ends as a labeled error terminal through the Responses chain",
+  ],
+  [
+    "handlers/shared/devin-stream-head-sniffer.ts:163",
+    "devin sniffer: a replayed rejection ends as a labeled error frame through the Devin chain",
+  ],
 ]);
 
 /** Call sites are what kill streams — a mention inside a string or comment
@@ -190,5 +201,19 @@ describe("#641 G4a-2a — no controller.error( in production sources", () => {
         ? "no controller.error( call sites in production sources"
         : `controller.error( found at:\n  ${offenders.join("\n  ")}`
     ).toBe("no controller.error( call sites in production sources");
+  });
+
+  test("every surviving site names a conversion pin that exists", () => {
+    // An allowlist entry without its pin is an unpinned rejection: the entry
+    // would keep certifying a site nobody proves converted. The pin file is
+    // read from disk, so deleting the test (not just failing it) reddens
+    // here too.
+    const pinFile = readFileSync(join(SRC_ROOT, "seam-neverhang-pins.test.ts"), "utf-8");
+    for (const [site, pin] of V14_SEAM_SITES) {
+      expect(
+        pinFile.includes(pin),
+        `${site} names pin "${pin}" — present in seam-neverhang-pins.test.ts?`
+      ).toBe(true);
+    }
   });
 });

@@ -709,7 +709,7 @@ describe("fail open", () => {
     expect(out).toBe(input.join(""));
   });
 
-  it("an upstream read error forwards what was held, then errors the stream", async () => {
+  it("an upstream read error forwards what was held, then ends with the synthetic labeled terminal", async () => {
     const { engine } = engineWith([rewriteHook("rw", () => [])]);
     const res = await applyResponseSeam(
       sse([messageStart(), start(0, { type: "text", text: "" }), textDelta(0, "partial")], {
@@ -717,21 +717,12 @@ describe("fail open", () => {
       }),
       await scopeOf(engine)
     );
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let seen = "";
-    let error: unknown;
-    try {
-      for (;;) {
-        const r = await reader.read();
-        if (r.done) break;
-        seen += decoder.decode(r.value);
-      }
-    } catch (err) {
-      error = err;
-    }
-    expect(String(error)).toContain("upstream socket dropped");
-    expect(seen).toContain('"text":"partial"');
+    // Never-hang (#641 family B): the client never sees a broken pipe — the
+    // seam appends the labeled terminal and closes.
+    const text = await readAll(res);
+    expect(text).toContain('"text":"partial"');
+    expect(text).toContain("[Upstream stream error: upstream socket dropped]");
+    expect((text.match(/event: message_stop/g) ?? []).length).toBe(1);
   });
 });
 
@@ -996,7 +987,12 @@ describe("observe tap", () => {
       await scopeOf(engine),
       { sink: new InboxFileSink(path), req: "e8" }
     );
-    await expect(readAll(res)).rejects.toThrow("upstream socket dropped");
+    // Never-hang (#641 family B): a rejection after message_stop never
+    // breaks the pipe and adds no second terminal pair — the inbox ordering
+    // below is the point of this test.
+    const text = await readAll(res);
+    expect((text.match(/event: message_stop/g) ?? []).length).toBe(1);
+    expect(text).not.toContain("[Upstream stream error");
     await until(() => inboxLines(path).some((l) => l.kind === "end"), 3_000);
     await Bun.sleep(300);
     expect(inboxLines(path)).toEqual([

@@ -47,6 +47,7 @@ import type { Context } from "hono";
 // session-events/index.ts, which takes the metadata object instead.
 import type { ChildAuthControl } from "../child-auth-types.js";
 import { extractSessionId } from "../hooks/harness.js";
+import { TerminalSniffer, encodeSyntheticErrorTail } from "../hooks/synthetic-terminal.js";
 import { log, logStderr } from "../logger.js";
 import type { AdvisorPanelGateway } from "./advisor-route-plan.js";
 import {
@@ -498,6 +499,8 @@ function tapAdvisorResponse(
   const clientReader = toClient.getReader();
   const scanReader = toScan.getReader();
   void drainScanBranch(scanReader, kind, cfg, sessionId);
+  // Terminal state of the bytes already forwarded, for the error tail (#641).
+  const terminal = new TerminalSniffer();
 
   const passthrough = new ReadableStream<Uint8Array>(
     {
@@ -505,9 +508,22 @@ function tapAdvisorResponse(
         try {
           const { done, value } = await clientReader.read();
           if (done) controller.close();
-          else controller.enqueue(value);
+          else {
+            terminal.feed(value);
+            controller.enqueue(value);
+          }
         } catch (err) {
-          controller.error(err);
+          // Never-hang (#641 family B): the tee's client branch is the
+          // client-facing body — a read failure must not break the pipe. On
+          // SSE, append the synthetic labeled terminal (empty after the real
+          // `message_stop`: no second terminal pair, S4-a) and close; on
+          // JSON, close only — SSE frames would corrupt the truncated body
+          // either way, but a terminated stream is what a JSON parser can
+          // report on, not a broken pipe.
+          if (kind === "sse") {
+            for (const f of encodeSyntheticErrorTail(terminal, String(err))) controller.enqueue(f);
+          }
+          controller.close();
         }
       },
       cancel(reason) {
