@@ -36,7 +36,13 @@ export interface ResolvedDefaultProvider {
 
 export interface ResolveOptions {
   cliFlag?: string;
-  config: ClaudishProfileConfig;
+  /**
+   * Optional on purpose: a caller whose config READ failed (`effectiveDefaultProvider`
+   * degrades a throwing `loadConfig` to this) passes none, and the chain falls
+   * through to the env/key defaults — the same answer a machine with no config
+   * file gets, rather than a crash on every bare-name route.
+   */
+  config?: ClaudishProfileConfig;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -72,8 +78,9 @@ export function resolveDefaultProvider(opts: ResolveOptions): ResolvedDefaultPro
   }
 
   // `typeof`, not `!== undefined`: the config is hand-edited JSON, and a `null`
-  // there is not a provider name.
-  const configured = opts.config.defaultProvider;
+  // there is not a provider name. No config at all (a failed read) falls
+  // through the same way.
+  const configured = opts.config?.defaultProvider;
   if (typeof configured === "string") {
     return { provider: configured, source: "config-file", legacyAutoPromoted: false };
   }
