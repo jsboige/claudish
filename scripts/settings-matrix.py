@@ -25,7 +25,7 @@ Artifact/Workflow deny on any machine" off this matrix, while ai-01, po-2024
 and po-2028 each carried all four entries in their live settings.json. The
 script now says so on every run (`permission_lines`/`permission_flags`).
 
-Usage: settings-matrix.py [--shared DIR] [--stale-hours 48] [machine ...]
+Usage: settings-matrix.py [--shared DIR] [--stale-hours 48] [--canon-stale-hours 24] [machine ...]
 """
 import argparse
 import datetime as dt
@@ -191,6 +191,38 @@ def age_hours(iso, now):
     return (now - then).total_seconds() / 3600
 
 
+# A flag read from a STALE snapshot is not a measurement of the seat (Refs #291).
+# On 11-12/11 the coordinator's bilans published 330000 (ai-01, po-2023) and
+# 250000 (po-2028) as "off canon", read from RooSync snapshots older than the
+# live settings.json files. Read live, those seats were AT canon; the one real
+# gap was po-2027 (330000 until it applied the canon at 10:20Z on 12/11). A
+# snapshot's value can only testify about the
+# seat at `collectedAt`; past a threshold the matrix must send the reader to
+# the live file, never render the gap as an observed off-canon.
+CANON_STALE_HOURS_DEFAULT = 24.0
+
+
+def canon_flag(machine, key, actual, expected, age, threshold):
+    """One CANON flag, qualified by the age of the snapshot it was read from.
+
+    Within `threshold` hours the flag is a measured divergence (and still says
+    its age). Beyond it -- or when `collectedAt` cannot be parsed, so the
+    snapshot cannot be dated at all -- the flag reports an expired reading and
+    points at the live file; it must NOT read as an off-canon measurement.
+    """
+    age_txt = "age unknown" if age is None else f"age {age:.1f}h"
+    if age is None or age > threshold:
+        return (
+            f"{machine}: {key} = {json.dumps(actual)} -- snapshot STALE ({age_txt}, "
+            f"threshold {threshold:g}h): re-read live, not a measured divergence "
+            f"(canon {json.dumps(expected)})"
+        )
+    return (
+        f"{machine}: {key} = {json.dumps(actual)} off canon "
+        f"(expected {json.dumps(expected)}; snapshot {age_txt})"
+    )
+
+
 def label_lines(harmonization):
     """Printable inventory of the display-label keys. None of them is secret.
 
@@ -299,6 +331,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--shared", default=os.environ.get("ROOSYNC_SHARED_PATH", ""))
     ap.add_argument("--stale-hours", type=float, default=48.0)
+    ap.add_argument(
+        "--canon-stale-hours", type=float, default=CANON_STALE_HOURS_DEFAULT,
+        help="age in hours past which an off-canon reading is reported as an "
+             "expired snapshot to re-read live, never as a measured off-canon "
+             "(default 24, Refs #291)",
+    )
     ap.add_argument("machines", nargs="*", default=DEFAULT_MACHINES)
     args = ap.parse_args()
     if not args.shared:
@@ -343,7 +381,8 @@ def main():
             expected = canon.get(machine, canon["*"])
             actual = harmonization.get(key)
             if actual != expected:
-                flags.append(f"{machine}: {key} = {json.dumps(actual)} off canon (expected {json.dumps(expected)})")
+                flags.append(canon_flag(
+                    machine, key, actual, expected, hours, args.canon_stale_hours))
         for line in label_lines(harmonization):
             print(line)
         flags.extend(
