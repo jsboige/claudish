@@ -67,21 +67,17 @@ import type { ProxyServer } from "./types.js";
 if (process.env[childKey] !== "1") {
   /* ─────────────── parent: one spawn, one exit-code pin ─────────────── */
 
-  test(
-    "the config-error pin holds in its own process (self-respawn)",
-    () => {
-      const result = Bun.spawnSync([process.execPath, "test", import.meta.path], {
-        env: { ...process.env, [childKey]: "1" },
-        timeout: 90_000,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const output = result.stdout.toString() + result.stderr.toString();
-      console.log(output);
-      expect(result.exitCode, output).toBe(0);
-    },
-    120_000
-  );
+  test("the config-error pin holds in its own process (self-respawn)", () => {
+    const result = Bun.spawnSync([process.execPath, "test", import.meta.path], {
+      env: { ...process.env, [childKey]: "1" },
+      timeout: 90_000,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = result.stdout.toString() + result.stderr.toString();
+    console.log(output);
+    expect(result.exitCode, output).toBe(0);
+  }, 120_000);
 } else {
   /* ─────────────── child: the real pin, alone in this process ─────────────── */
 
