@@ -193,8 +193,6 @@ Failed-translation workflow: `claudish --model X --debug "say hello"` → `claud
 ## Learned Preferences
 
 ### Tools & Commands
-<!-- learned: 2026-03-28 session: 03cd7cc5 source: repeated_pattern -->
-- Use `bun` for all package management and scripts (`bun run build`, `bun test`, etc.) — not npm or yarn
 <!-- learned: 2026-04-06 session: df311293 source: repeated_pattern -->
 - Use Grep/grep tool for code investigation instead of mnemex — prefer built-in search tools during investigation phases
 
