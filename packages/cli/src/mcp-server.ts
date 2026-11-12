@@ -42,6 +42,12 @@ import {
   type RecommendedModelGroup,
 } from "./model-loader.js";
 import { BUILTIN_PROVIDERS } from "./providers/provider-definitions.js";
+import { getModelMapping, loadConfig } from "./profile-config.js";
+import {
+  getDeclaredContextLimit,
+  getDerivedContextLimit,
+} from "./providers/runtime-providers.js";
+import { claudishStatusHandler, renderCapabilities } from "./mcp-status-tools.js";
 // One cache path for the whole binary: a local constant here would drift from
 // the proxy the day CLAUDISH_MODEL_CACHE_PATH is set, and the MCP tool would
 // list a different catalog than the router resolves against.
@@ -500,6 +506,107 @@ function defineTools(sessionManager: SessionManager): ToolDefinition[] {
       }
 
       return { content: [{ type: "text" as const, text: output }] };
+    },
+  });
+
+  // ── Read-only introspection (#985) ────────────────────────────────────
+  // claudish_status / claudish_capabilities: the READ half of the negotiated
+  // capability surface. No side effects, no writes — the hub stays arbiter; a
+  // status read reports, it does not requisition. Both handlers go through
+  // mcp-status-tools.ts, which deep-scrubs anything credential-shaped before
+  // it reaches the wire (no secrets in the MCP surface).
+
+  tools.push({
+    name: "claudish_status",
+    description:
+      "Read-only: effective tier→provider mapping, armed failover steps, configured/auto state and reset clocks — as seen by THIS MCP server's own in-process proxy (scope: mcp-process-proxy), NOT the hub's live state. When that proxy has not started, serving is reported unknown, never defaulted. Never requisitions.",
+    inputSchema: { type: "object" },
+    group: "low-level",
+    handler: async () => {
+      try {
+        // #993 review: the failover init/wipe must NOT run here — it would
+        // un-wall every bucket the in-process proxy learned.
+        // claudishStatusHandler reads state without resetting it; when this
+        // process's proxy never started, it says so instead of defaulting
+        // `diverted: false`.
+        const payload = claudishStatusHandler({
+          proxyStarted: proxyInstance !== null || proxyStarting !== null,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [
+            { type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  });
+
+  tools.push({
+    name: "claudish_capabilities",
+    description:
+      "Read-only: what the current provider actually supports — vision yes/no, the real context window (measured > declared > catalog), tool-use, thinking. Check a capability before the task, not after the 400.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        model: {
+          type: "string",
+          description:
+            "Model to introspect (e.g. 'glm-5.3', 'gc@glm-5.3', 'claude-sonnet-5-5'). Omit to report the effective sonnet mapping.",
+        },
+      },
+    },
+    group: "low-level",
+    handler: async (args) => {
+      try {
+        const cfg = loadConfig();
+        const mapping = getModelMapping(cfg.defaultProfile);
+        const requested = (args.model as string | undefined) || mapping.sonnet || "unknown";
+        // Split an explicit provider prefix (gc@, cx@, or@, …) from the model id.
+        const provider = requested.includes("@") ? requested.split("@")[0] : undefined;
+        const bareModel = requested.includes("@") ? requested.slice(requested.indexOf("@") + 1) : requested;
+
+        // Catalog lookup (best-effort; absence = unknown, never a guess).
+        let catalog: { vision?: boolean; toolUse?: boolean; thinking?: boolean; context?: string | number } | null = null;
+        try {
+          const doc = await getRecommendedModels();
+          const entry = (doc.models || []).find(
+            (m: { id?: string; name?: string }) => m.id === bareModel || m.name === bareModel || m.id === requested
+          );
+          if (entry) {
+            catalog = {
+              vision: entry.supportsVision,
+              toolUse: entry.supportsTools,
+              thinking: entry.supportsReasoning,
+              context: entry.context,
+            };
+          }
+        } catch {
+          // catalog unavailable → leave null; the window still reports declared/derived.
+        }
+
+        const payload = renderCapabilities({
+          model: bareModel,
+          provider,
+          catalog,
+          declaredContextLimit: provider ? getDeclaredContextLimit(provider) : undefined,
+          derivedContextLimit: provider ? getDerivedContextLimit(provider) : undefined,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [
+            { type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` },
+          ],
+          isError: true,
+        };
+      }
     },
   });
 

@@ -168,7 +168,7 @@ Capture format, archive/GDrive retention, device-id attribution, exact commands:
 
 ## Channel Mode (MCP, v6.4.0+)
 
-Async model sessions with push notifications, on the low-level `Server` class declaring `experimental: { 'claude/channel': {} }`. 11 tools, gated by `CLAUDISH_MCP_TOOLS` (`all` default · `low-level` · `agentic` · `channel`). Wire contract pinned by `channel-wire-format.test.ts`.
+Async model sessions with push notifications, on the low-level `Server` class declaring `experimental: { 'claude/channel': {} }`. 13 tools, gated by `CLAUDISH_MCP_TOOLS` (`all` default · `low-level` · `agentic` · `channel`). Wire contract pinned by `channel-wire-format.test.ts`.
 
 - **`meta` keys must match `[a-zA-Z0-9_]+`** — Claude Code **silently drops** keys with hyphens or other characters. Keep new `extraMeta` keys underscore-only.
 - **Emitting a correct frame is not enough.** Rendering is gated client-side: CC ≥ v2.1.80; Anthropic auth via claude.ai or Console key; an **interactive** session (`-p` mode drops frames silently); the server declared in `.mcp.json` / `~/.claude.json` (**`--mcp-config` is not consulted**); and the server **named in `--channels`** or `--dangerously-load-development-channels`.
