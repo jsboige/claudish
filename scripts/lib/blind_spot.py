@@ -40,6 +40,7 @@ traffic-consumption.py qui lit chaque tete pour l'appariement).
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 # Champ d'enveloppe #98 — la machine vit en tete du fichier req-*.
@@ -65,6 +66,44 @@ def default_reconcile_dir():
     """Repertoire d'archives par defaut : env CLAUDISH_RECONCILE_DIR (tests,
     siege sans G:) sinon le dossier GDrive du script de reconciliation."""
     return os.environ.get("CLAUDISH_RECONCILE_DIR") or GDRIVE_RECONCILE_DIR
+
+
+# #997 — les tete-lectures passent en pool BORNE. Sur UNC, chaque ouverture
+# coute ~95 ms (mesure ai-01 : 150 ouvertures = 14,27 s) : la passe serie du
+# census et des verdicts depassait 30 min sur une fenetre de 8 h (exit 124
+# avant tout verdict). Le plafond sert a diviser la LATENCE reseau, pas a
+# ouvrir le corpus a 10 000 threads simultanes.
+DEFAULT_HEAD_WORKERS = 16
+
+
+def read_head(path, size=400):
+    """Premiers `size` octets de `path` (tout le fichier si size=None),
+    decode utf-8/replace, ou None sur OSError — le chemin serie faisait
+    try/except + continue ; le None porte le meme sens, l'appelant decide.
+
+    Lecture BINAIRE puis decode : equivalent au mode texte errors=replace
+    pour les en-tetes ASCII parses ici (les regex ne voient pas \r\n), et
+    `size` compte des octets, pas des caracteres.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return (fh.read() if size is None else fh.read(size)).decode(
+                "utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def read_heads(paths, size=400, workers=DEFAULT_HEAD_WORKERS):
+    """Tetes de `paths` -> liste dans L'ORDRE DES ENTREES, quel que soit
+    l'ordre de completion (ex.map) : la sortie reste deterministe, identique
+    a la passe serie. workers <= 1 -> chemin exactement serie, SANS pool :
+    `--workers 1` est le temoin d'equivalence, pas un pool a un thread.
+    Une OSError rend None a sa place (voir read_head).
+    """
+    if workers <= 1 or len(paths) <= 1:
+        return [read_head(p, size) for p in paths]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(lambda p: read_head(p, size), paths))
 
 
 def _parse_capture_ts(ts):
@@ -115,18 +154,24 @@ def outage_archives(corpus_dir, reconcile_dir=None):
     return out
 
 
-def count_nominal_by_machine(corpus_dir, window_start, window_end):
+def count_nominal_by_machine(corpus_dir, window_start, window_end,
+                             workers=DEFAULT_HEAD_WORKERS):
     """{machine: n} des req-*.json dans la fenetre, par champ d'enveloppe.
 
     Tete de 400 octets : le champ machine vit en debut d'enveloppe (#98),
     avant le body. machine absente -> "" (trafic direct du hub, compte a part
     mais jamais BLIND : un client direct n'a pas de mode autonome).
+
+    #997 : les tetes passent par read_heads (pool borne, `workers` threads).
+    Le resultat est identique a la passe serie — aggregation par cle, une
+    tete illisible (None) vaut le `continue` de l'OSError serie.
     """
     counts = {}
     try:
         names = os.listdir(corpus_dir)
     except OSError:
         return counts
+    jobs = []
     for fn in names:
         m = REQ_FN.match(fn)
         if not m:
@@ -134,10 +179,9 @@ def count_nominal_by_machine(corpus_dir, window_start, window_end):
         dt = _parse_capture_ts(m.group(1))
         if dt is None or dt < window_start or dt >= window_end:
             continue
-        try:
-            with open(os.path.join(corpus_dir, fn), "rb") as fh:
-                head = fh.read(400).decode("utf-8", errors="replace")
-        except OSError:
+        jobs.append(os.path.join(corpus_dir, fn))
+    for head in read_heads(jobs, size=400, workers=workers):
+        if head is None:
             continue
         mm = MACHINE_FIELD.search(head)
         machine = mm.group(1) if mm else ""
@@ -146,7 +190,8 @@ def count_nominal_by_machine(corpus_dir, window_start, window_end):
 
 
 def assess(corpus_dir, window_start, window_end, fleet_extra=(),
-           reconcile_dir=None, nominal_counts=None):
+           reconcile_dir=None, nominal_counts=None,
+           workers=DEFAULT_HEAD_WORKERS):
     """-> {machine: {"nominal": n, "archives": n, "blind": bool}}, + "" inclus.
 
     "" (direct) est rapporte mais jamais BLIND : un client direct du hub n'a
@@ -163,7 +208,8 @@ def assess(corpus_dir, window_start, window_end, fleet_extra=(),
     fleet = set(m for m in fleet_extra if m)
     fleet |= set(archives)
     if nominal_counts is None:
-        nominal = count_nominal_by_machine(corpus_dir, window_start, window_end)
+        nominal = count_nominal_by_machine(corpus_dir, window_start, window_end,
+                                           workers=workers)
     else:
         nominal = dict(nominal_counts)
     res = {}
@@ -181,7 +227,7 @@ def assess(corpus_dir, window_start, window_end, fleet_extra=(),
 
 
 def render(corpus_dir, window_start, window_end, fleet_extra=(),
-           reconcile_dir=None, res=None):
+           reconcile_dir=None, res=None, workers=DEFAULT_HEAD_WORKERS):
     """-> liste de lignes a imprimer (section complete, vide = rien a dire).
 
     Fleet vide -> UNE ligne d'inactivite (une section silencieuse cacherait la
@@ -192,7 +238,7 @@ def render(corpus_dir, window_start, window_end, fleet_extra=(),
     """
     if res is None:
         res = assess(corpus_dir, window_start, window_end, fleet_extra,
-                     reconcile_dir=reconcile_dir)
+                     reconcile_dir=reconcile_dir, workers=workers)
     if not res:
         return [
             "angle mort AUTONOMOUS: aucune machine flotte declaree "
@@ -210,10 +256,10 @@ def render(corpus_dir, window_start, window_end, fleet_extra=(),
 
 
 def section(corpus_dir, window_start, window_end, fleet_extra=(),
-            reconcile_dir=None):
+            reconcile_dir=None, workers=DEFAULT_HEAD_WORKERS):
     """-> lignes pretes a imprimer, en-tete de section inclus."""
     body = render(corpus_dir, window_start, window_end, fleet_extra,
-                  reconcile_dir=reconcile_dir)
+                  reconcile_dir=reconcile_dir, workers=workers)
     head = ("== angle mort AUTONOMOUS (nominal 0 = peut-etre autonome "
             "non reconcile, pas forcement absence de trafic) ==")
     return [head] + body

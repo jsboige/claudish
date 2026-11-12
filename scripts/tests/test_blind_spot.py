@@ -186,6 +186,57 @@ if _saved_rdir is None:
           bs.default_reconcile_dir() == bs.GDRIVE_RECONCILE_DIR,
           bs.default_reconcile_dir())
 
+print("lib — #997 : read_heads rend les resultats dans l'ordre des entrees")
+with tempfile.TemporaryDirectory() as td:
+    paths = []
+    for i in range(6):
+        p = os.path.join(td, f"f{i}.txt")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(f"content-{i}")
+        paths.append(p)
+    got = bs.read_heads(paths, workers=8)
+    check("pool preserves input order",
+          got == [f"content-{i}" for i in range(6)], repr(got))
+    check("workers=1 is the exact serial path",
+          bs.read_heads(paths, workers=1) == got, "")
+    check("OSError -> None at its place (skip, pas crash)",
+          bs.read_heads([os.path.join(td, "nope.json")], workers=8) == [None],
+          "")
+    check("full body when size=None",
+          bs.read_heads(paths, size=None, workers=8) == got, "")
+
+print("lib — #997 : census identique serie vs pool borne")
+with tempfile.TemporaryDirectory() as td:
+    # 60 tetes dans la fenetre : 2 machines nommees + seau "" (champ absent)
+    # + 1 hors fenetre (ignoree) — un fichier liste puis illisible vaut None
+    # -> skip, comme l'OSError serie.
+    make_corpus(td, ["seat-a"] * 20 + ["seat-b"] * 10)
+    for i in range(30):  # pid 9 : enveloppes SANS champ machine
+        with open(os.path.join(
+                td, f"req-9-{i:04d}-2026-11-08T11-00-00-000Z-direct.json"),
+                "w", encoding="utf-8") as fh:
+            fh.write('{"ts":"2026-11-08T11:00:00Z","src":"direct"}')
+    with open(os.path.join(  # hors fenetre : jamais lue
+            td, "req-1-9999-2026-11-01T10-00-00-000Z-direct.json"),
+            "w", encoding="utf-8") as fh:
+        fh.write('{"machine":"seat-z"}')
+    serial = bs.count_nominal_by_machine(td, W_START, W_END, workers=1)
+    pooled = bs.count_nominal_by_machine(td, W_START, W_END, workers=8)
+    expected = {"seat-a": 20, "seat-b": 10, "": 30}
+    check("serial counts (machine, seau vide)",
+          serial == expected, repr(serial))
+    check("pool == serial, comptes identiques",
+          pooled == serial, f"{pooled!r} vs {serial!r}")
+    res_s = bs.assess(td, W_START, W_END, ["seat-a", "seat-b"], workers=1)
+    res_p = bs.assess(td, W_START, W_END, ["seat-a", "seat-b"], workers=8)
+    check("assess verdict identique serie vs pool",
+          res_s == res_p and res_p.get("seat-b", {}).get("nominal") == 10,
+          f"{res_p!r}")
+    lines_s = bs.render(td, W_START, W_END, ["seat-a", "seat-b"], workers=1)
+    lines_p = bs.render(td, W_START, W_END, ["seat-a", "seat-b"], workers=8)
+    check("render byte-identique serie vs pool",
+          lines_s == lines_p, "\n".join(lines_p))
+
 print()
 # Hermetisme (#940) : les lecteurs appliquent default_reconcile_dir() quand le
 # flag est absent — sans epingle, le defaut depend du siege (po-2024 a 9 vraies

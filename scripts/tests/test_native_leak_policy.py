@@ -182,6 +182,60 @@ def test_since_excludes_earlier():
     assert code == 0, f"pre-window Opus leaked into the verdict: {code}\n{out}"
 
 
+def _equivalence(d, *extra):
+    """#997 : trois invocations (workers=1 serie, pool 8, defaut 16) ->
+    (code, stdout) IDENTIQUES. Le temoin serie n'est pas un pool a 1 thread :
+    read_heads prend le chemin sans ThreadPoolExecutor."""
+    runs = []
+    for w in ("1", "8", None):
+        args = [d, *extra] if w is None else [d, "--workers", w, *extra]
+        code, out = _run(*args)
+        runs.append((code, out))
+    assert runs[0] == runs[1], \
+        f"pool 8 diverged from serial:\n--- serial ---\n{runs[0][1]}\n--- pool 8 ---\n{runs[1][1]}"
+    assert runs[0] == runs[2], \
+        f"default (16) diverged from serial:\n{runs[0][1]}\n---\n{runs[2][1]}"
+    return runs[0]
+
+
+def test_pool_equivalence_clean_corpus():
+    # #997 : meme verdict, meme tableau, sortie byte-a-byte identique — y
+    # compris l'enveloppe PARTAGEE (deux resps citent reqN=20 : la dedup de
+    # la phase 3 ne doit compter qu'une lecture mais deux natives).
+    d = tempfile.mkdtemp(prefix="leak-eq-")
+    _anchor(d)
+    _req(d, 1, 20, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"metadata": {"cc_is_subagent": True}, "messages": []})
+    _resp(d, 1, 1, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 20)
+    _resp(d, 1, 2, "2026-11-09T06-00-09-000Z", "claude-opus-5-5", 20)  # meme req
+    _req(d, 1, 21, "2026-11-09T06-30-00-000Z", "myia-ai-01")
+    _resp(d, 1, 3, "2026-11-09T06-30-04-000Z", "claude-opus-5-5", 21)
+    _req(d, 1, 22, "2026-11-09T07-00-00-000Z", "myia-po-2027",
+         model="claude-sonnet-5-5")
+    _resp(d, 1, 4, "2026-11-09T07-00-03-000Z", "claude-sonnet-5-5", 22)
+    code, out = _equivalence(d, "--since", "2026-11-09T00")
+    assert code == 0, f"expected exit 0, got {code}\n{out}"
+    po = _row(out, "myia-po-2024")
+    assert po.split()[1:3] == ["2", "2"], f"shared envelope miscounted: {po}\n{out}"
+    assert "sub=2/2" in po and "dev=0b9b0d8c:2" in po, po
+    assert "Non appariees : natives=0 opus=0" in out, out
+
+
+def test_pool_equivalence_refused_verdict():
+    # le verdict REFUS (exit 3) doit tomber identique en serie et en pool :
+    # un pool qui perdrait une non-appariee consacrerait un verdict invalide.
+    d = tempfile.mkdtemp(prefix="leak-eqr-")
+    _anchor(d)
+    _req(d, 1, 1, "2026-11-09T05-00-00-000Z", "myia-ai-01")  # 60 min avant
+    _resp(d, 1, 1, "2026-11-09T06-00-00-000Z", "claude-opus-5-5", 1)
+    _req(d, 1, 2, "2026-11-09T06-10-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"metadata": {"cc_is_subagent": True}, "messages": []})
+    _resp(d, 1, 2, "2026-11-09T06-10-04-000Z", "claude-opus-5-5", 2)
+    code, out = _equivalence(d, "--since", "2026-11-09T00")
+    assert code == 3, f"expected exit 3, got {code}\n{out}"
+    assert "Non appariees : natives=1 opus=1" in out, out
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

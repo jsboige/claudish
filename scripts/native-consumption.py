@@ -112,6 +112,11 @@ def parse_args():
                          "verdict refuse (Opus sans machine ou non apparie)")
     ap.add_argument("--opus-home", default="myia-ai-01",
                     help="machine dont l'Opus n'est pas detaille (defaut myia-ai-01)")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="taille du pool des tete-lectures (#997) : 95 ms par "
+                         "ouverture sur UNC rendaient les verdicts serie >30 min ; "
+                         "plafond de threads, pas un objectif. 1 = passe "
+                         "exactement serie, sans pool (temoin d'equivalence)")
     return ap.parse_args()
 
 
@@ -175,7 +180,7 @@ SUB_ANY_RE = re.compile(r'cc_is_subagent(?:"\s*:\s*|=)true')
 NO_MACHINE = "(sans machine)"
 
 
-def leak_policy(resps, req_index, opus_home):
+def leak_policy(resps, req_index, opus_home, workers=16):
     """Verdict leak-policy (#445) en tetes seulement.
 
     Meme appariement que le mode complet (piege 3 : reqN + pid lus dans
@@ -183,6 +188,18 @@ def leak_policy(resps, req_index, opus_home):
     rang rNNNN du nom de fichier n'est jamais une cle. Machine et device lus
     dans les ~1 Ko de tete de l'enveloppe req ; le corps entier n'est lu que
     pour un Opus servi hors `opus_home` (signature sous-agent).
+
+    #997 : chaque lecture passe par le pool borne de la lib blind_spot
+    (`workers` threads, defaut 16 — sur UNC une ouverture coute ~95 ms et la
+    passe serie depassait 30 min). Decoupage en PHASES : toutes les tetes de
+    reponse, puis toutes les tetes d'enveloppe des apparies (dedupliquees par
+    chemin : deux retries d'une meme req ne paient qu'une lecture), puis les
+    corps des Opus hors home (rares, dedupliques). L'AGREGATION reste dans
+    l'ordre serie des reponses : la sortie est identique a workers=1, et une
+    lecture en echec (None) vaut exactement l'OSError de la passe serie.
+    Le corpus est append-only pendant la lecture : deux reponses citant la
+    meme enveloppe voient le meme contenu, ce que le serie garantissait
+    seulement de fait.
 
     Le verdict est REFUSE (retour 3) si un Opus tombe dans le seau sans
     machine ou reste non apparie : c'est ce controle, et lui seul, qui rend le
@@ -201,10 +218,16 @@ def leak_policy(resps, req_index, opus_home):
     trunc = {"nat": 0, "opus": 0}
     corpus_start = min((c[0] for lst in req_index.values() for c in lst),
                        default=None)
-    for ts, _pid, path in resps:
-        try:
-            head = open(path, encoding="utf-8", errors="replace").read(400)
-        except OSError:
+    bs = _load_blind_spot()  # read_heads / read_head : pool borne #997
+
+    # Phase 1 (#997) — tetes de TOUTES les reponses en pool borne, ordre
+    # preserve. None = l'OSError du serie : la reponse est sautee.
+    heads = bs.read_heads([p for (_ts, _pid, p) in resps], 400, workers)
+    # Phase 2 — decisions d'appariement (CPU, serie) ; les compteurs des non-
+    # appariees sont increments ICI, dans l'ordre serie.
+    planned = []  # (ts, is_opus, req_path) — une entree par reponse appariee
+    for (ts, _pid, path), head in zip(resps, heads):
+        if head is None:
             continue
         h = HDR_RE.search(head)
         if not h:
@@ -222,10 +245,19 @@ def leak_policy(resps, req_index, opus_home):
             unp["nat"] += 1
             unp["opus"] += is_opus
             continue
-        req_path = cands[-1][1]
-        try:
-            env_head = open(req_path, encoding="utf-8", errors="replace").read(1024)
-        except OSError:
+        planned.append((ts, is_opus, cands[-1][1]))
+
+    # Phase 3 (#997) — tetes d'enveloppe des apparies, pool borne, DEDUPLI-
+    # QUEES par chemin. Une enveloppe illisible vaut pour CHACUNE des
+    # reponses qui la citent : non appariee, comme l'OSError du serie.
+    req_paths = sorted({p for (_ts, _op, p) in planned})
+    env_heads = dict(zip(req_paths, bs.read_heads(req_paths, 1024, workers)))
+    # Phase 4 — agregation, ordre serie des reponses. Les Opus hors home
+    # reportent leur lecture de CORPS en phase 5.
+    off_home = []  # (machine, req_path) — corps entier a relire
+    for ts, is_opus, req_path in planned:
+        env_head = env_heads.get(req_path)
+        if env_head is None:
             unp["nat"] += 1
             unp["opus"] += is_opus
             continue
@@ -241,11 +273,16 @@ def leak_policy(resps, req_index, opus_home):
         dv = ENV_DEVICE8_RE.search(env_head)
         r["dev"][dv.group(1) if dv else "?"] += 1
         r["hours"][ts.strftime("%d %Hh")] += 1
-        try:
-            if SUB_ANY_RE.search(open(req_path, encoding="utf-8", errors="replace").read()):
-                r["sub"] += 1
-        except OSError:
-            pass
+        off_home.append((machine, req_path))
+    # Phase 5 (#997) — corps des Opus hors home : lecture ENTIERE, pool
+    # borne, dedupliquee ; le serie relisait le fichier a chaque reponse.
+    # Un corps illisible ne compte pas (le serie faisait except OSError: pass).
+    sub_paths = sorted({p for (_m, p) in off_home})
+    bodies = dict(zip(sub_paths, bs.read_heads(sub_paths, None, workers)))
+    for machine, req_path in off_home:
+        body = bodies.get(req_path)
+        if body is not None and SUB_ANY_RE.search(body):
+            rows[machine]["sub"] += 1
 
     print("Leak-policy (#445) — reponses natives par machine "
           "(enveloppe req, appariement en-tete reqN+pid) :")
@@ -333,7 +370,7 @@ def main():
     _bs = _load_blind_spot()
     _rdir = a.reconcile_dir or _bs.default_reconcile_dir()
     for line in _bs.render(a.captures_dir, w_start, w_end, fleet,
-                           reconcile_dir=_rdir):
+                           reconcile_dir=_rdir, workers=a.workers):
         print(line)
     print()
 
@@ -342,7 +379,7 @@ def main():
         return 1
     resps.sort()
     if a.leak_policy:
-        return leak_policy(resps, req_index, a.opus_home)
+        return leak_policy(resps, req_index, a.opus_home, workers=a.workers)
 
     ws = collections.defaultdict(lambda: {
         "n": 0, "out": 0, "in": 0, "cr": 0, "cc": 0,
