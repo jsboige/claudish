@@ -186,7 +186,7 @@ représenté en Phase 6.
   onboarding provider, probe qui consomme du budget) passe par un `[PROPOSAL]` — objectif, commandes
   exactes, rayon d'impact, rollback, état attendu — puis attend mon `[ACK]` (il suffit, user 23/09 ; le
   plan d'exécution reste un artefact obligatoire). **Chaque cycle : scanner et trancher les `[PROPOSAL]`
-  en attente.**
+  en attente**, par `roosync_dashboard` read et l'inbox : le fichier GDrive du dashboard retarde (reference.md).
 - **Urgence** (flotte à l'arrêt) : agir, `[INCIDENT]` + post-mortem ≤ 1 h, validation ex-post.
 - **Preuves post-restart du hub (≤ 15 min)** : la ligne `[Failover] configured=N auto=on`, `/health`,
   `test -f` sur chaque bind fichier, et le relais NOMINAL.
