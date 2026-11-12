@@ -122,8 +122,18 @@ def test_paths_are_sorted_so_the_label_is_stable():
 # --------------------------------------------------------------------------
 
 def test_label_of_a_lone_untagged_archive_is_byte_identical_to_the_legacy_one():
-    """An existing store must not re-ingest its whole history on upgrade."""
-    label = lm.archive_source_label([r"G:\share\captures-2026-08-10.7z"])
+    """An existing store must not re-ingest its whole history on upgrade.
+
+    The legacy label held the bare archive NAME: `archive_source_label` strips
+    whatever THIS platform calls a directory. The pin used a literal
+    `G:\\share\\...` path and so passed only on a Windows seat -- on the ubuntu
+    runner `os.path.basename` keeps the whole backslashed string, and the new
+    #1007 CI job read a red that was the test's platform assumption, not the
+    reader's behaviour. Building the path with os.path.join pins the contract on
+    both platforms.
+    """
+    legacy = os.path.join("srv", "share", "captures-2026-08-10.7z")
+    label = lm.archive_source_label([legacy])
     assert label == "archive:captures-2026-08-10.7z"
 
 
