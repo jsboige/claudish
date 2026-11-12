@@ -214,7 +214,11 @@ if (process.env[childKey] !== "1") {
         ),
         () => lease.release()
       );
-      await expect(failed.text()).rejects.toThrow("T1 source failed");
+      // #1002 contract: this wrapper's only job is the lease — the client-facing
+      // body RESOLVES on a source error (empty: the error preceded any chunk, and
+      // an inner layer owns the terminal frames), never a broken pipe.
+      expect(await failed.text()).toBe("");
+      // Resolved body ⇒ released lease ⇒ the token signs again.
       expect(redactSigningValues(token)).toBe(token);
       const emptyLease = leaseFor(token);
       releaseWhenBodyEnds(new Response(null, { status: 204 }), () => emptyLease.release());
