@@ -117,3 +117,45 @@ jobs:
           path: typecheck-output.txt
           retention-days: 14
 
+  # #1007: `scripts/tests/` is the repo's Python instrument suite (traffic
+  # readers, settings matrix, blind-spot, leak-policy, console series...), and
+  # no job ran it — a broken reader could merge green (the #1001 fixture rot
+  # was found by hand on a seat, not by CI).
+  #
+  # TWO steps on purpose: one instrument does not see everything.
+  #   - pytest collects the 270 function-style pins (8.5 s measured on a seat);
+  #   - 17 files run their checks at MODULE level with their own runner and
+  #     define no `test_*` function: pytest imports them (a module-level
+  #     failure raises SystemExit -> collection error) but reports 0 tests,
+  #     and four of them gate nothing at import time at all
+  #     (test_extract_complete, test_lane_out_trend, test_minimax_chain_pairing,
+  #     test_turn_autopsy) — only their own runner executes them. So every
+  #     file is also run as a script, the semantics the seats use.
+  #
+  # py7zr is a real dependency of scripts/weekly-drift.py (loaded by its test
+  # via importlib), not a convenience install.
+  #
+  # Mutation AC (issue #1007): reverting the --days filter at
+  # scripts/console-tabs.py:382 must turn this job red.
+  scripts-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install instrument dependencies
+        run: python -m pip install --quiet pytest py7zr
+
+      - name: pytest (function-style pins)
+        run: python -m pytest scripts/tests -q
+
+      - name: every file by its own runner (module-level pins)
+        run: |
+          for f in scripts/tests/test_*.py; do
+            echo "== $f"
+            python "$f" || exit 1
+          done
+
