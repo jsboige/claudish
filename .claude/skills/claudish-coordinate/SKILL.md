@@ -92,18 +92,11 @@ docker ps --format '{{.Names}}\t{{.Status}}'
 docker image inspect claudish-claudish-proxy --format 'created={{.Created}}'
 ```
 
-- `uptimeSec` ≈ 0 = restart ; s'il recule sans repartir de zéro, c'est un pas NTP.
-- **Un restart se diagnostique à l'échelle de l'hôte** :
-  `docker ps -q | xargs -r docker inspect --format '{{.State.StartedAt}}  {{.Name}}' | sort` — départs
-  groupés = daemon ou hôte (`LastBootUpTime`, System 41/6008/1074, `nvlddmkm`) ; un départ isolé seul rend
-  la question « qui ? » sensée.
-- **Une capture locale ne prouve pas une bascule** (un repli `[1/2]` en écrit aussi) : compter les épisodes
-  `\[Relay\] (upstream|forward failed)` de `docker logs claudish-sidecar --tail 800 --timestamps`, fenêtre
-  bornée. Une bascule mesure la joignabilité, pas la vie : sans preuve hub-side, « attribution hub non établie ».
-- Causes à écarter d'abord : compaction nocturne du hub (`compaction.log`, ~00:47Z → 02-03Z) ; restart
-  proactif du watchdog (03:00-06:00 locale) ; deploys et recreates annoncés.
-
-  Seul un épisode sans cause mérite une enquête.
+- `uptimeSec` ≈ 0 = restart (recul sans zéro = pas NTP). **Un restart se diagnostique à l'échelle de
+  l'hôte** (départs groupés = daemon ou hôte) ; **une capture locale ne prouve pas une bascule** (compter les
+  épisodes `[Relay]`, sans preuve hub-side « attribution hub non établie ») — commandes : reference.md § Phase 2.
+- Causes à écarter d'abord : compaction nocturne du hub (~00:47Z → 02-03Z), restart proactif du watchdog
+  (03:00-06:00 locale), deploys et recreates annoncés. Seul un épisode sans cause mérite une enquête.
 - **`settings.json` de chaque machine (user 20/10, mandat répété)** : `scripts/settings-matrix.py`
   (instantanés RooSync ; il imprime ses drapeaux) + la ligne de forme postée par chaque lane. Je dois
   savoir ce que contient chaque fichier (reference.md).
@@ -176,16 +169,10 @@ contexte et mesures : reference.md § Phase 4c, enquête #328.
 
 ### Phase 4b — Consoles fournisseurs (1 relevé/jour suffit)
 
-Onglets ouverts par le user dans le Playwright Edge d'ai-01 ; URLs verbatim dans
-`C:\Users\MYIA\.claudish-browser\provider-consoles-urls.json` (ne jamais les deviner ni les modifier).
-- Lancer `C:\Users\MYIA\.claudish-browser\provider-consoles-reader.py` **détaché** (hors dépôt, propre à
-  ai-01). Relevé valide seulement si `read` = 11 dans `readings\_pass.txt`. Puis
-  `python scripts/console-tabs.py publish` (copie Drive lue par les autres sièges, user 04/11).
-- Chiffres d'usage seulement, **dashboard interne seulement** (jamais GitHub — seuls des ratios dérivés
-  vont en #405) ; aucun clic dans les fenêtres du user ; lire la période de chaque console avant toute
-  addition.
-
-Détail et pièges (ctx.pages, réauthentification, périodes) : reference.md § Phase 4b.
+`C:\Users\MYIA\.claudish-browser\provider-consoles-reader.py` lancé **détaché** ; relevé valide seulement si
+`read` = 11 dans `readings\_pass.txt`, puis `python scripts/console-tabs.py publish` (copie Drive, user 04/11).
+Chiffres d'usage, **dashboard interne seulement** (ratios dérivés seuls en #405) ; jamais une URL devinée ni
+un clic dans les fenêtres du user. URLs, `ctx.pages`, réauthentification, périodes : reference.md § Phase 4b.
 
 ### Phase 5 — Arbitrages au user
 
