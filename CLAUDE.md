@@ -18,6 +18,9 @@ Planned-but-unimplemented work lives in `ROADMAP.md`, each item with an explicit
 | OpenAI-compatible ingress (`/v1/chat/completions`) translation | `docs/reference/openai-ingress.md` |
 | Delegating a grain to a cloud agent or a worker — read before writing a work order or accepting its pull request | `docs/reference/delegation-protocol.md` · `.github/ISSUE_TEMPLATE/grain.md` |
 | Ops runbook — watchdog, drain/recreate, events, compaction, archive | `docs/reference/ops-scripts.md` |
+| Review / test / merge protocol — read before reviewing, merging or closing an issue | `docs/reference/review-protocol.md` |
+| Measurement protocol — read before a number or a verdict leaves the session | `docs/reference/measurement-protocol.md` |
+| Relay / hub diagnosis protocol — read before naming a mode, an outage or a validated change | `docs/reference/relay-diagnosis-protocol.md` |
 
 ## Fleet-Rollout Verification (hard rule, mandate 2026-09-12)
 
