@@ -160,7 +160,8 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 ### Phase 4c — Dispatch : file profonde par worker
 
 Mandats user 04/10 (plusieurs grains par worker et par cycle) et 05/10 (deep queues, passage à 12 h) —
-contexte et mesures : reference.md § Phase 4c, enquête #328.
+contexte et mesures : reference.md § Phase 4c, enquête #328. Ce qui entre dans la file (objectifs, grain
+de consolidation, commentaire de tenue d'une issue) : `docs/reference/coordination-program.md`.
 
 - **~10 grains ordonnés par worker** :
   - 6-7 principaux : retours de review d'abord, puis sa zone par priorité ;
