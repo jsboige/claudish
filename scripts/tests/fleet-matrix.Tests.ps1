@@ -257,7 +257,13 @@ Describe 'fleet-matrix' {
             $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
             $listener.Stop()
             $r = Invoke-Matrix -LanHub ("127.0.0.1:{0}" -f $port)
-            $r.Out | Should -Match '\| unreachable \|'
+            # Anchor at end of row: the LAN cell is the LAST column, while the
+            # /health cell also renders 'unreachable' under -HealthPort 1 and
+            # would satisfy an unanchored match (vacant pin found in review).
+            # Both measured forms are accepted: a released loopback port
+            # refuses fast on some hosts ('unreachable') and sits out the 2 s
+            # bound on others ('unreachable (timeout)') - measured po-2027.
+            $r.Out | Should -Match '\| unreachable( \(timeout\))? \|\s*$'
             $r.Code | Should -Be 0
         }
 
