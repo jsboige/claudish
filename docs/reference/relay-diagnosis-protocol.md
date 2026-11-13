@@ -33,6 +33,8 @@ Any non-2xx verdict is discarded, not interpreted — including a 4xx that "look
 docker logs --since 6h claudish-sidecar 2>&1 | grep -c '\[ttft\]'
 ```
 
+A `0` from this command is not yet an absence: after a log rotation Docker has served the old file. Cross-check with `docker logs --tail 800`, and if both read 0, report "no line read", not "no traffic" (`.claude/skills/claudish-coordinate/SKILL.md` §Phase 3).
+
 ## Reading health
 
 ### A healthcheck answers "this process is alive", not "the engine works"
@@ -89,7 +91,7 @@ docker logs --since 6h claudish-sidecar 2>&1 | grep -c '\[ttft\]'
 
 **Why.** On 2026-09-11 a mandate to amortize the provider "yoyo" described it as a budget-failover problem. Two layers exist: budget failover arms on a single qualifying 429 and disarms on a short fixed timer (10 min on the first rung); the relay's hysteresis flips NOMINAL→AUTONOMOUS after **2 consecutive `/health` failures at a 10 s interval** — ~20 s of unreachability. Measured that day at 10:36Z on ai-01: a **98 s** relay episode while the hub was alive without interruption; the request flipped, met a `[GLM Coding] 429` on the local path, and the client retried 8 times in 74.8 s without succeeding — the turn lost, from the layer the ticket did not describe. The same layer costs money: over a 5 h window, the traffic of the machines pointed at the relay was served during AUTONOMOUS windows by a local cascade descending to PAYG — **494 `ds@` requests, 80.5 M input tokens in 3.3 h** — against **80 forward failures in 5 h** on a hub answering 200 in 4 ms.
 
-**Apply.** When a flap is to be amortized, name the layer the loss came from (a `[Relay] … → AUTONOMOUS` line, or a `[Failover]` arm/wall line) before touching a knob, and do not let a fix on one layer close the issue. And arm the sidecar: a role with no armed step does not degrade, it **closes** — 100 % of that role's requests fail, with no next step to walk.
+**Apply.** When a flap is to be amortized, name the layer the loss came from (a `[Relay] … → AUTONOMOUS` line, or a `[Failover]` arm/wall line) before touching a knob, and do not let a fix on one layer close the issue. And arm the sidecar: a role with no armed step does not degrade, it **closes** — 100 % of that role's requests fail, with no next step to walk (`docs/reference/budget-failover.md` §Failover targets on sidecars; armed state by value).
 
 ### A capture trail records your decision, never the peer's state — and it is a lower bound, so qualify the series before publishing it
 

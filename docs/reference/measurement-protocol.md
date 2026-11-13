@@ -21,7 +21,7 @@ Rules are grouped by the moment they apply: choosing and proving an instrument, 
 
 ### Put the probe at the first point the client's bytes reach
 
-**Why.** 02/10, review of #308: the coordinator's AC 1 of #305 asked to log which credential the authorised client sends, at the native handler on the hub. That client reaches the hub through its sidecar, and the relay deletes `x-api-key` on every forward (`packages/cli/src/fork/server/relay.ts`) — and a NOMINAL relay never enters `NativeHandler` at all. Anywhere on the hub, the probe could only ever report `authorization` or `(none)`, whatever the client sent.
+**Why.** 02/10, review of #308: the coordinator's AC 1 of #305 asked to log which credential the authorised client sends, at the native handler on the hub. That client reaches the hub through its sidecar, and the relay deletes `x-api-key` on a keyed forward (`packages/cli/src/fork/server/relay.ts`; since #412 the keyless-exempt branch keeps the client's own) — and a NOMINAL relay never enters `NativeHandler` at all. Anywhere on the hub, the probe could only ever report `authorization` or `(none)`, whatever the client sent.
 
 **Apply.** Trace the real path (client base URL, each hop, what it strips or adds) and place the measure at the first entry point the client reaches, before any branch that rewrites. If the measurement no longer decides anything, say so and re-scope the AC in writing rather than let it be believed done.
 
@@ -67,7 +67,7 @@ Rules are grouped by the moment they apply: choosing and proving an instrument, 
 
 ### Read the code that writes the label before counting by label
 
-**Why.** 23/08, `[Relay] forward failed (connect: AbortError…) → this request served LOCALLY` looked like "all failures at connection phase"; `connect:` is a label written by `logFallthrough` (`packages/cli/src/fork/server/relay.ts`) that covers every pre-stream failure, the forward header deadline included, and the error text was a timer abort, not a refused connection. Those aborts were then read as proof of hub freezes while the relay's own heartbeat — two consecutive failures trip AUTONOMOUS — showed the hub answering `/health` in ~4.5 ms during 31 of 33.
+**Why.** 23/08, `[Relay] forward failed (connect: AbortError…) → this request served LOCALLY` looked like "all failures at connection phase"; `connect:` was then a label written by `logFallthrough` (`packages/cli/src/fork/server/relay.ts`) that covered every pre-stream failure, the forward header deadline included (the code has since split it: `connect:`, `header-timeout after <ms>ms`, `aborted-on-autonomous`), and the error text was a timer abort, not a refused connection. Those aborts were then read as proof of hub freezes while the relay's own heartbeat — two consecutive failures trip AUTONOMOUS — showed the hub answering `/health` in ~4.5 ms during 31 of 33.
 
 **Apply.** Find the writer (grep the label string), read every branch that reaches it, and list the states the label covers; if there is more than one, it is not a category. An error label that cites a URL or a host testifies about the environment of the process that emitted it, never about the disk: identify which process failed and who launched it before concluding the configuration is wrong.
 
@@ -131,7 +131,7 @@ Rules are grouped by the moment they apply: choosing and proving an instrument, 
 
 ### Absence is a claim about a window and a base rate; silence is not DOWN
 
-**Why.** 12/08, the coordinator reported a worker "DOWN" across six coordination fires while it was running an interactive session and shipped a `[DONE]`. 24/08, "the hub never exceeds 1 s" rested on 179 minutes with nothing above 1.03 s; nine hours later `/health` reached 7.8 s at zero charge. Two episodes 4 h 36 apart produced a "period", and the next point missed by ×15.
+**Why.** 12/08, the coordinator reported a worker "DOWN" across six coordination fires while it was running an interactive session and shipped a `[DONE]`. 24/08, "the hub never exceeds 1 s" rested on 179 minutes with nothing above 1.03 s; nine hours later `/health` reached 7.8 s at zero load. Two episodes 4 h 36 apart produced a "period", and the next point missed by ×15.
 
 **Apply.** State the window and the base rate in the same sentence ("on 179 min between 15:35 and 01:45, nothing above 1.03 s"). DOWN means no activity of any kind — message, worker report, capture; "no reply to me" is not DOWN. Wait for a second exemplar before characterising frequency, and never derive a period or a threshold from n points with n ≤ k+1. Test one out-of-sample point, with the tolerance announced first, before offering a model as an instrument to someone else.
 
