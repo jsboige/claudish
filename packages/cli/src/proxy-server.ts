@@ -485,12 +485,16 @@ export function resolveNativeModelPin(
   if (env.CLAUDISH_NATIVE_MODEL_PIN === "0") return undefined;
   if (requestedModel.includes("@") || requestedModel.includes("/")) return undefined;
   const roleTarget = resolveRoleMappedModel(requestedModel.toLowerCase(), modelMap);
-  if (!roleTarget || roleTarget === requestedModel) return undefined;
-  if (!roleTarget.startsWith("claude-")) return undefined;
+  if (!roleTarget || !roleTarget.startsWith("claude-")) return undefined;
   // #219: an adopted catalog override (CLAUDISH_NATIVE_PIN_AUTO=on) replaces
   // the version within the same family. Inert — byte-identical pass-through —
   // unless the watch resolved and adopted a newer id.
-  return applyNativePinOverride(roleTarget);
+  // #1017: the no-op comparison runs on the OVERRIDDEN target. Comparing the
+  // configured one first made the adoption unreachable for the clients that
+  // matter most — those asking for exactly the configured version (the whole
+  // fleet sent `claude-fable-5-1` against a hub pinned `claude-fable-5-1`).
+  const pinned = applyNativePinOverride(roleTarget);
+  return pinned === requestedModel ? undefined : pinned;
 }
 
 export interface ProxyServerOptions {
