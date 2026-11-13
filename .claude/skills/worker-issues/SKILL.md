@@ -13,7 +13,8 @@ cycle générale + périmètre hub) : ici, le cœur du cycle est l'avancement de
 ## Où vivent les dispatchs
 
 **Le dispatch est conversationnel, jamais GitHub** (mesuré 16/09 : 26 issues ouvertes,
-0 label, 0 assignee — les champs ne portent rien). Sources, dans l'ordre :
+0 label, 0 assignee — les champs ne portent rien, à une exception près : le label
+`cloud-ready`, étape 1 du cycle). Sources, dans l'ordre :
 
 1. `roosync_dashboard(action:"read", type:"workspace", section:"all")` — section Status
    « En cours » → pattern packet `machine=#issue` (ex. EPIC #116 : `po-203=#115`).

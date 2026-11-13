@@ -62,7 +62,7 @@ Use the issue template `.github/ISSUE_TEMPLATE/grain.md`. Each field is there be
 
 Write for a reader who has the repository and nothing else. If a sentence needs a dashboard to be understood, the grain is not ready.
 
-The web form applies the template's title prefix and its `grain` label. `gh issue create` does not: pass `--label grain` yourself. `--template grain` gives the template as starting body text; a caller that files with `--body-file` copies the template's sections into its body file.
+The web form applies the template's title prefix and its `grain` label. `gh issue create` does not: pass `--label grain` yourself, and copy the template's sections into the file given to `--body-file`.
 
 Filing an issue, or commenting on one, also starts the inherited `Issue Triage` workflow (`.github/workflows/issue-triage.yml`). Its last eight runs on this fork all failed (read 13/11). A red `Issue Triage` run next to a new grain is that workflow, not the grain.
 
@@ -87,7 +87,7 @@ The deadline is the coordinator's choice: far enough for the user to start a ses
 Keep at most **three** grains `cloud-ready` at a time. That number too is a starting value. Two things bound the flow, and neither is how fast sessions can open pull requests:
 
 - **Review.** One coordinator cycle absorbs a few pull requests, not a few dozen. On a neighbouring repository of the same fleet, a cloud marathon opened pull requests faster than CI and review absorbed them (reported 12/11).
-- **CI.** The runners are shared with the account's other repositories. On 13/11 the three test jobs of one pull request here were created at 10:04Z and were still queued, not started, at 10:24Z.
+- **CI.** On 13/11 the three test jobs of one pull request here were created at 10:04Z and the first of them started at 10:24Z: twenty minutes in the queue. The cause was not measured. GitHub counts concurrent jobs per account, so the account's other repositories can fill that queue.
 
 A pull request on `main` here shows four checks. Three of them test: `test`, `typecheck`, `scripts-tests`, all on Linux. The fourth, `claude-code`, went green in twelve seconds on #1020 (read 13/11): the fork carries no API secret, so it reviews nothing. A green column is three jobs, not a review.
 
