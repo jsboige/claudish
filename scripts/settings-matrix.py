@@ -373,7 +373,9 @@ def main():
             flags.append(f"{machine}: settings state={snap.get('state')}")
         harmonization = snap.get("harmonization", {})
         for key, value in sorted(harmonization.items()):
-            print(f"  {key} = {json.dumps(value, ensure_ascii=False)}")
+            # Display labels are rendered below, including missing-key coverage.
+            if key not in LABEL_KEYS:
+                print(f"  {key} = {json.dumps(value, ensure_ascii=False)}")
         for key in COMPARED:
             if key in harmonization:
                 seen[key].setdefault(json.dumps(harmonization[key], ensure_ascii=False), []).append(machine)
