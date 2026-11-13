@@ -304,7 +304,7 @@ describe("#1019 synthetic message_start seeds, by structure", () => {
       "  },",
       "});",
     ];
-    const expected = [{ line: 2, problem: "keyless-seed" }];
+    const expected: Finding[] = [{ line: 2, problem: "keyless-seed" }];
     expect(scanSource(keysOnlyInTrailingComment.join("\n")).findings).toEqual(expected);
     // The CRLF checkout of this repository on Windows.
     expect(scanSource(keysOnlyInTrailingComment.join("\r\n")).findings).toEqual(expected);
