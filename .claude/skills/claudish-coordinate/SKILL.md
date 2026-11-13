@@ -52,6 +52,9 @@ silence : la corriger dans le geste qui la rend fausse.
 
 ## Le cycle
 
+Protocoles (règles payées par incident, à lire au moment d'agir) : review/merge → `docs/reference/review-protocol.md` ·
+chiffre ou verdict → `docs/reference/measurement-protocol.md` · relais/hub → `docs/reference/relay-diagnosis-protocol.md`.
+
 ### Phase 0 — Cron (entrée)
 
 `CronList`. Si le job est absent, le réarmer **immédiatement** :
