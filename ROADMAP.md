@@ -213,6 +213,27 @@ Docker deployments that mount `/root/.claudish` read-only make every catalog ref
 
 ---
 
+## Catalog refresh on a running proxy — a bare name keeps the chain it was first given (#893)
+
+Status: not started. Parked on 13/11 by the coordinator's arbitration of #893. The design carried there (routing-miss trigger, two-class TTL, `stale` state in the version watch) is not adopted as written; the reasons are in the arbitration comment and its correction.
+
+What the code does today:
+
+- The container proxy (`standalone-proxy.ts`) loads the model catalogue at startup, then refreshes it on a timer: the native-pin watch calls `refreshCatalog` every 6 hours (`CLAUDISH_NATIVE_PIN_AUTO_INTERVAL_MS`). A refresh that fails keeps the catalogue in memory and waits for the next tick. An id published upstream is therefore unknown to a running proxy for up to one interval, longer while refreshes fail. A proxy started by the CLI has no such timer and keeps the catalogue it started with.
+- An explicit `or@…` target is resolved again on every request, so it picks a new id up at the next refresh.
+- A bare name does not. The provider chain built for it on its first request is cached for the life of the process (`fallbackHandlerCache` in `proxy-server.ts`), with the OpenRouter id as the catalogue resolved it at that moment. A bare name whose chain has an OpenRouter hop, first requested before the catalogue knew it, keeps that hop unresolved until the next restart, whatever the catalogue has learnt since.
+- The resolver is consulted for `openrouter` targets only. An explicit `kc@…` or `qwen-token-plan@…` step never reaches it, which is why nothing here would have caught the two manual re-pins that motivated #635.
+
+What would be built: a refresh that changes the catalogue drops the cached chains, so the next request for a bare name is routed against the catalogue in memory. Resolution stays synchronous and the request in flight keeps its path. Optional second step, only if one interval is measured as too long: on a resolver miss, one background `refreshCatalog`, single-flight, behind a global cooldown, and never again for the same id on the same catalogue (an id legitimately outside it would otherwise fetch forever). No new TTL: three already read the cache file (launcher, interactive picker, MCP server).
+
+**Trigger condition**: a request is measured leaving for OpenRouter with an unresolved bare id while the live catalogue already listed that id, on a proxy that had not restarted since the id appeared.
+
+**Effort**: small — invalidate one map from the refresh's success path, and one pin per guard (a changed catalogue rebuilds the chain, an unchanged one does not, a failed refresh keeps both the catalogue and the chains).
+
+**Reference**: #893 (the design, the arbitration comment of 13/11 and its correction, with the code locations).
+
+---
+
 ## Adding a new roadmap item
 
 Each item should follow the structure above:
