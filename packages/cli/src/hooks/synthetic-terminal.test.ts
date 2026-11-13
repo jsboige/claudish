@@ -89,6 +89,22 @@ describe("#641 — encodeSyntheticErrorTail wire shape", () => {
     expect(() => JSON.parse(payload.split("data: ")[1] as string)).not.toThrow();
   });
 
+  test("#1014 — the synthetic message_start seeds both cache counters (#179 b)", () => {
+    const sniffer = new TerminalSniffer();
+    const out = decode(encodeSyntheticErrorTail(sniffer, "boom before start"));
+    const startFrame = out.split("\n\n").find((f) => f.includes("event: message_start")) as string;
+    const { message } = JSON.parse(startFrame.split("data: ")[1] as string) as {
+      message: { usage: Record<string, number> };
+    };
+    // The client sums the three input counters raw; an absent seed key
+    // survives the delta merge as undefined and the sum turns NaN.
+    expect(message.usage.cache_read_input_tokens).toBe(0);
+    expect(message.usage.cache_creation_input_tokens).toBe(0);
+    // The seam sits below the parser: no prior count exists, so the seed
+    // carries the genuinely-unknown fallback, not a 0-that-looks-empty.
+    expect(message.usage.input_tokens).toBe(100);
+  });
+
   test("start seen, block open: closed at its real index, notice at index+1", () => {
     const sniffer = new TerminalSniffer();
     sniffer.feed(encodeUtf8(messageStart() + blockStart(1)));
