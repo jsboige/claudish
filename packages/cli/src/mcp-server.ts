@@ -51,7 +51,7 @@ import { claudishStatusHandler, renderCapabilities } from "./mcp-status-tools.js
 // One cache path for the whole binary: a local constant here would drift from
 // the proxy the day CLAUDISH_MODEL_CACHE_PATH is set, and the MCP tool would
 // list a different catalog than the router resolves against.
-import { loadAllModels } from "./providers/mcp-models-list.js";
+import { loadMcpModelsList } from "./providers/mcp-models-list.js";
 
 // Load environment variables. quiet is load-bearing here, not cosmetic: this
 // process speaks MCP JSON-RPC over STDOUT, and dotenv 17.x prints its
@@ -587,7 +587,7 @@ function defineTools(sessionManager: SessionManager): ToolDefinition[] {
     handler: async (args) => {
       const query = args.query as string;
       const maxResults = (args.limit as number) || 10;
-      const allModels = await loadAllModels();
+      const allModels = await loadMcpModelsList();
       if (allModels.length === 0) {
         return {
           content: [

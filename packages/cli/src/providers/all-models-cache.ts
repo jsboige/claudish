@@ -1,11 +1,13 @@
 /**
  * Shared helpers for ~/.claudish/all-models.json
  *
- * This file is written and read by four independent consumers:
+ * This file is written and read by three independent consumers:
  *   - providers/catalog-resolvers/openrouter.ts (v2 authoritative — Firebase slim catalog)
  *   - cli.ts (fetchRemoteModels + printAllModels)
- *   - mcp-server.ts (loadAllModels)
  *   - model-selector.ts (fetchAllModels + shouldRefreshForFreeModels)
+ *
+ * (mcp-server.ts's search_models used to be a fourth, v1-shape writer; since
+ * #1028 it reads and writes its own list file — providers/mcp-models-list.ts.)
  *
  * Historically each consumer wrote its own v1-shape `{lastUpdated, models}` blob,
  * clobbering the v2 `entries` array that the OpenRouter catalog resolver relies on.
@@ -51,7 +53,7 @@ export interface SlimModelEntry {
 /**
  * Disk cache format (version 2).
  * Contains both the slim Firebase data (for resolver) and a backward-compatible
- * models array (for existing consumers in cli.ts/mcp-server.ts that expect {id: string}).
+ * models array (for existing consumers in cli.ts that expect {id: string}).
  */
 export interface DiskCacheV2 {
   version: 2;
