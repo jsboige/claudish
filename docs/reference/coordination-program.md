@@ -6,14 +6,14 @@ This page is a map and a set of rules. It holds no state: what is done, what is 
 
 ## The mandates this program answers
 
-All from the user. The original words are French and are quoted in the issues named here.
+All from the user. The original words are French; where an issue quotes them, it is named here.
 
 | Date | What was asked | Where it is carried |
 |---|---|---|
 | 26/10 | Act against the inflation of consumption across the fleet | #700 |
-| 07/11 | Every machine consolidates, with good practices, guards and bounds, the containers and the workflows it supports | Objective 8 below |
+| 07/11 | Every machine consolidates, with good practices, guards and bounds, the containers and the workflows it supports | Objective 8 below (the words are quoted in `jsboige/Maintenance#303`) |
 | 11/11 | Managing and aligning the configurations stays in the fleet's mandate; every machine must be resilient | #711, #764, #291 |
-| 13/11 | Protocols that let the fleet move forward with or without cloud assistance; the durable work is in git | `docs/reference/delegation-protocol.md` and the three protocol pages next to it |
+| 13/11 | Protocols that let the fleet move forward with or without cloud assistance; the durable work is in git | `docs/reference/delegation-protocol.md`, `docs/reference/review-protocol.md`, `docs/reference/measurement-protocol.md`, `docs/reference/relay-diagnosis-protocol.md` |
 | 13/11 | Every claudish workspace and sidecar is wired for the Fable role | `docs/deployment/fleet-state.md` §Fable role |
 | 13/11 | Correct and complete the issues, keep the coordinator seat and the workers productive on strategic objectives for the coming weeks, finish the consolidation missions, extend the gestures of the rationalisation issues, and see with the Open WebUI lane how access to claudish can be governed by its accounts | This page, and #1031 |
 
@@ -25,14 +25,14 @@ An objective ends on the last column, not on a count of merged pull requests.
 |---|---|---|---|
 | 1 | **The Fable role, proven per consumer** | No issue: the table in `docs/deployment/fleet-state.md` §Fable role | Every row of that table carries its three readings (what the client sends, what the hub served, what the sidecar does alone) |
 | 2 | **Land the v14 re-platform, then keep upstream close** | #641 (re-platform), #897 and #731 (convergence and sync), #29 (features re-engineered for upstream) | `main` is the re-platformed base, and taking an upstream release is a matter of days |
-| 3 | **Every machine resilient, configurations aligned** | #711 and #764 (cascades, by value, per machine), #291 (relay and sidecar matrix), #81 (direct keys), #905, #908, #587 (transport faults), #948, #1013 (host and archive residue) | Every seat's cascade is read by value and equals the canon or carries a recorded deviation, and every seat has a fallback that has been exercised |
+| 3 | **Every machine resilient, configurations aligned** | #711 and #764 (cascades, by value, per machine), #291 (relay and sidecar matrix), #81 (direct keys), #905, #908 (transport faults), #587 (hub health isolation), #948 (host resource exhaustion), #1013 (archive residue) | Every seat's cascade is read by value and equals the canon or carries a recorded deviation, and every seat has a fallback that has been exercised |
 | 4 | **Sobriety and token productivity** (the "rationalisation" family) | #700 (program and register of levers), #445 (tokens read, turns, output), #23 and #99 (harness weight), #640 (shared prefix), #328 (coordination regime), #21 (cost-aware routing), #82 (signature routing, design only) | Each lever of the #700 register has a measured before and after, and the weekly figures of #445 hold |
-| 5 | **Observability and cost** | #116 (datastudy and dashboard, which absorbed #41), #405 (what one euro buys per provider), #362 (session surveillance), #995 (a subscription fallback chosen on measured value) | The user sees the dashboard without asking for it, and the cost register is dated and reproducible |
+| 5 | **Observability and cost** | #116 (datastudy and dashboard; it took over the remnants of #41 when #41 closed), #405 (what one euro buys per provider), #362 (session surveillance), #995 (a subscription fallback chosen on measured value) | The user sees the dashboard without asking for it, and the cost register is dated and reproducible |
 | 6 | **Never-hang** | #1030 (first-event watchdog), plus the open grain issues | It does not end: it is a standing constraint. It is healthy when each rule of `CLAUDE.md` §Never-Hang Constraints has a pin and no open issue names an unbounded wait |
 | 7 | **A service a school can run, with governed access** | #943 (usage and harness part of the dossier), #1031 (access governed by Open WebUI accounts) | The dossier's part is delivered or closed on its own clause, and the access design is chosen by the user and cut into grains |
-| 8 | **Consolidation, with guards and bounds** | The Maintenance tracker's bounds issue (one measured line per seat), #1032 (workflow timeouts), and one consolidation grain in every queue | See the next section |
+| 8 | **Consolidation, with guards and bounds** | `jsboige/Maintenance#303`, an issue in the fleet's Maintenance repository, outside this one (one measured line per seat; a session that only has this repository takes #1032 instead), #1032 (workflow timeouts), and one consolidation grain in every queue | See the next section |
 
-Ready work that needs no arbitration is listed by `gh issue list --label grain`. That list, not this page, says what a worker or a cloud session can take today.
+Ready work that needs no arbitration is listed by `gh issue list --label grain`. Entries still carrying the `cloud-ready` label are held for a cloud session first (`docs/reference/delegation-protocol.md`); a worker takes the rest. That list, not this page, says what a worker or a cloud session can take today.
 
 ## Consolidation: what "finished" means
 
@@ -82,7 +82,7 @@ Rules:
 The cycle's mechanics are in the coordinator skill (`.claude/skills/claudish-coordinate/SKILL.md`, dispatch phase). These rules say what goes in.
 
 - **Depth.** About ten ordered grains per seat, of which three or four are fallback grains that depend on no merge and no window. A worker with an empty queue is a dispatch fault.
-- **Order.** A repair first. Then the verification of a fleet rollout in progress. Then review returns. Then the seat's grains on the objectives above. Then consolidation. Then fallback.
+- **Order.** A repair, then the verification of a fleet rollout in progress, pre-empt the queue: they are not ordinary grains. Inside the queue the skill's order holds: review returns first, then the seat's grains on the objectives above, then consolidation, then fallback.
 - **One consolidation grain per seat, at least,** chosen by the coordinator, with the step it asks for.
 - **Every grain names** the issue it decrements, the proof expected (a command, an artifact, a measured line) and its size.
 - **A decision the issue was waiting for is written in the issue before the queue is posted.** A grain that needs an arbitration nobody made is not a grain.
@@ -99,15 +99,17 @@ Details and current values: `docs/deployment/fleet-state.md`. This table is only
 | Hub (po-2025) | The hub's corpus and logs, the canonical cascade by value, the request-level attribution of every seat that relays |
 | Relay (po-2023) | The relay path and its tunnel, the hub's `/health` as a relay sees it |
 | Sidecar seats (po-2024, po-2027, po-2028) | Their own container (environment by value, bounds, image date), their client settings, what AUTONOMOUS serves on that machine. po-2027 reaches the hub over the WAN, so it is the seat that reads that path |
-| Coordinator (ai-01) | Reviews, merges and arbitrations; its own sidecar; the provider consoles through the console reader; the question registry for the user |
+| Coordinator (ai-01) | Reviews, merges and arbitrations; its own sidecar; the provider consoles through the console reader (`.claude/skills/claudish-coordinate/SKILL.md`, Phase 4b); the question registry for the user |
 
 A seat reports what it read on its own machine. A figure about another seat is quoted from that seat, with its date.
 
+po-2026 has its own section in the fleet-state page (a sidecar bypassed by its own client, on a host that page records as down); it has no queue, and it re-enters the table when the host returns.
+
 ## What only the user decides
 
-The coordinator prepares these and never settles them. They go to the coordinator's question registry and are restated at the end of each session; they are never a blocking question in an issue thread.
+The coordinator prepares these and never settles them. They go to the coordinator's question registry — a file in the coordinator seat's local memory, outside this repository — and its open entries are restated on the dashboard at the end of each session; they are never a blocking question in an issue thread.
 
-- Which plan sits at which rung of a cascade, when the change moves what is paid: the arbitrations recorded in `CLAUDE.md` §Budget Failover are the user's. Aligning a seat on the hub's canon is the fleet's own mandate.
+- Any change of rung in a cascade needs the user's explicit agreement (a rule of 28/10, restated in #700); aligning a seat on the hub's canon is the fleet's own mandate.
 - Any threshold of the session budget (same section).
 - Any spend that is not already running: a paid probe against a provider, a cloud session (`docs/reference/delegation-protocol.md`).
 - The rotation or retirement of a shared key (#81).
@@ -121,4 +123,4 @@ Everything else is decided by the coordinator, written in the issue, and reversi
 
 - An objective changes here when its carrying issues change: a closed issue leaves the table, a new strategic issue enters it, in the cycle where it happens.
 - The first cycle of each week compares the table with `gh issue list --state open`. An open issue that fits no objective is either given one, or closed, or written down in `ROADMAP.md` with its trigger.
-- No date, count or percentage is added to this page. If a number seems needed here, it belongs in an issue.
+- Apart from the date the page was written and the dates of the mandates, no date, count or percentage is added to this page. If a number seems needed here, it belongs in an issue.
