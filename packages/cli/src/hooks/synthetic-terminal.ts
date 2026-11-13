@@ -27,6 +27,7 @@
  * carrying the previous chunk's tail bytes into the next search.
  */
 
+import { messageStartUsage } from "../handlers/shared/stream-parsers/message-start-usage.js";
 import { redactForClient } from "../redact.js";
 import { encodeUtf8 } from "./sse-codec.js";
 
@@ -154,8 +155,11 @@ function frame(event: string, data: unknown): Uint8Array {
 /**
  * The synthetic labeled terminal for a failed read, as SSE bytes to enqueue
  * before `close()`. Returns an empty list when the real `message_stop`
- * already passed (no second terminal pair, S4-a). Usage is 0/0: the seam
- * sits below the parser, nothing here was billed or measured.
+ * already passed (no second terminal pair, S4-a). The synthetic start seeds
+ * usage via `messageStartUsage()` (#1014 / #179 rule b): both cache counters
+ * ride at an explicit 0 because the client sums the three input counters raw.
+ * The input count itself is the genuinely-unknown fallback — the seam sits
+ * below the parser, nothing here was billed or measured.
  */
 export function encodeSyntheticErrorTail(sniffer: TerminalSniffer, message: string): Uint8Array[] {
   if (sniffer.sawStop) return [];
@@ -173,7 +177,11 @@ export function encodeSyntheticErrorTail(sniffer: TerminalSniffer, message: stri
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          // #1014 / #179 rule (b): a synthetic message_start must seed BOTH
+          // cache counters (at an explicit 0) — the client sums the three
+          // input counters raw, and an absent key makes that sum NaN. No
+          // prior count exists below the parser: the default rides.
+          usage: messageStartUsage(),
         },
       })
     );
