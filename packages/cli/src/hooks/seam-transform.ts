@@ -49,6 +49,7 @@ import {
   eventJson,
   serializeSseEvent,
 } from "./sse-codec.js";
+import { TerminalSniffer, encodeSyntheticErrorTail, errorText } from "./synthetic-terminal.js";
 import { type RewriteBlock, applyTextActions } from "./text-rewrite.js";
 
 /**
@@ -235,6 +236,7 @@ class ClosedTransform {
    * before it: `controller.error()` discards chunks still queued.
    */
   private pendingError: { err: unknown } | null = null;
+  private readonly terminal = new TerminalSniffer();
 
   // intercept
   private heldTool: HeldTool | null = null;
@@ -290,6 +292,7 @@ class ClosedTransform {
           this.push({ kind: "end" });
           return;
         }
+        this.terminal.feed(value);
         for (const ev of this.splitter.push(value)) this.push({ kind: "event", ev });
       }
     } catch (err) {
@@ -752,12 +755,21 @@ class ClosedTransform {
 
   /* ───────────── output ───────────── */
 
-  /** Error the stream once the client has drained what was queued before the error. */
+  /**
+   * Terminate the stream once the client has drained what was queued before
+   * the error. Never-hang (#641 family B): the transform's controller is the
+   * client-facing body — instead of `controller.error()`, append a synthetic
+   * labeled terminal (empty after the real `message_stop`: no second terminal
+   * pair, S4-a) and close. Direct enqueue: `stop()` already ran, so `emit()`
+   * would refuse.
+   */
   private raisePendingError(): void {
     const pending = this.pendingError;
     if (!pending || (this.controller.desiredSize ?? 0) <= 0) return;
     this.pendingError = null;
-    this.controller.error(pending.err);
+    for (const f of encodeSyntheticErrorTail(this.terminal, errorText(pending.err)))
+      this.controller.enqueue(f);
+    this.controller.close();
   }
 
   private emit(text: string): void {

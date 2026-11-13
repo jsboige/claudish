@@ -103,7 +103,7 @@ describe("ResponseRecorder", () => {
     expect(await readAll(recorder.replay().stream)).toBe("chunk-0;chunk-1;chunk-2;");
   });
 
-  it("a replay of an errored input errors after the bytes it had", async () => {
+  it("a replay of an errored input closes after the bytes it had (not marked SSE)", async () => {
     let n = 0;
     const stream = new ReadableStream<Uint8Array>({
       pull(c) {
@@ -114,7 +114,24 @@ describe("ResponseRecorder", () => {
     const recorder = new ResponseRecorder(stream);
     const reader = recorder.replay().stream.getReader();
     expect(decoder.decode((await reader.read()).value)).toBe("first");
-    await expect(reader.read()).rejects.toThrow("upstream broke");
+    // Never-hang (#641 family B): a failed recording never errors a replay.
+    // This recorder was not marked SSE, so no synthetic frames — it just ends.
+    expect((await reader.read()).done).toBe(true);
+  });
+
+  it("a replay of an errored SSE recording ends with the synthetic labeled terminal", async () => {
+    let n = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (n++ === 0) c.enqueue(encoder.encode("first"));
+        else c.error(new Error("upstream broke"));
+      },
+    });
+    const recorder = new ResponseRecorder(stream, undefined, true);
+    const text = await readAll(recorder.replay().stream);
+    expect(text).toContain("first");
+    expect(text).toContain("[Upstream stream error: upstream broke]");
+    expect(text).toContain("event: message_stop");
   });
 });
 

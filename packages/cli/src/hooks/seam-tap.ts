@@ -32,6 +32,7 @@ import { log } from "../logger.js";
 import { BlockCollector, collectorView } from "./response-blocks.js";
 import type { SeamHooks } from "./seam-hooks.js";
 import { SseSplitter, eventJson } from "./sse-codec.js";
+import { TerminalSniffer, encodeSyntheticErrorTail, errorText } from "./synthetic-terminal.js";
 
 /** A fresh id for one response's inbox lines. */
 export function newRequestId(): string {
@@ -91,6 +92,7 @@ export function observeTap(
   const splitter = new SseSplitter();
   const collector = new BlockCollector();
   const end = new EndLine(hooks, req);
+  const terminal = new TerminalSniffer();
   let parsing = true;
   let stopped = false;
 
@@ -111,7 +113,12 @@ export function observeTap(
           // After `message_stop` the response is complete and `end` belongs to
           // responseEnd, as on a cancel: a later read error must not cut it short.
           if (!stopped) end.write(true);
-          controller.error(err);
+          // Never-hang (#641 family B): the tap is the client-facing body — a
+          // read failure must not kill the stream. Append a synthetic labeled
+          // terminal (empty after the real `message_stop`: no second terminal
+          // pair, S4-a) and close.
+          for (const f of encodeSyntheticErrorTail(terminal, errorText(err))) controller.enqueue(f);
+          controller.close();
           return;
         }
         if (result.done) {
@@ -122,6 +129,7 @@ export function observeTap(
         }
 
         const chunk = result.value;
+        terminal.feed(chunk);
         let carriesStop = false;
         const completed: Array<{ name: string; id: string; args: string }> = [];
         if (parsing) {

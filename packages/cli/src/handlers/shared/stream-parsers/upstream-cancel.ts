@@ -93,8 +93,12 @@ export function notifyOnDownstreamCancel(response: Response, onCancel: () => voi
         let result: Awaited<ReturnType<typeof reader.read>>;
         try {
           result = await reader.read();
-        } catch (err) {
-          if (!cancelled) controller.error(err);
+        } catch {
+          // Never-hang (#663 r1, ported to v14): this wrapper is the
+          // client-facing body and the inner parser owns `message_stop` —
+          // close, never error: the client sees a terminated stream, not a
+          // broken pipe. After a cancel the stream is already closed (below).
+          if (!cancelled) controller.close();
           return;
         }
         // A read the cancel below woke up: this stream is already closed.

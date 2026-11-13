@@ -70,6 +70,7 @@ import type {
 } from "./public.js";
 import type { ApplicableHook, HookEventName, UpstreamFacts } from "./registry.js";
 import { HOLD_CAP_BYTES, PING_FRAME } from "./seam-transform.js";
+import { TerminalSniffer, encodeSyntheticErrorTail, errorText } from "./synthetic-terminal.js";
 
 export type RawStage = "providerRequest" | "providerChunk" | "providerStreamEnd" | "response";
 
@@ -122,10 +123,6 @@ type ByteReader = {
   read(): Promise<{ done: true; value?: unknown } | { done: false; value: Uint8Array }>;
   cancel(reason?: unknown): Promise<void>;
 };
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
   return (
@@ -598,10 +595,16 @@ export class ResponseRecorder {
   failure: unknown = undefined;
   /** Resolves when the input ends, errors or is cancelled. Never rejects. */
   readonly ended: Promise<void>;
+  /** Terminal state of the recorded bytes, for the replay-end synthetic tail. */
+  private readonly terminal = new TerminalSniffer();
 
   constructor(
     body: ReadableStream<Uint8Array>,
-    private readonly onChunk: () => void = () => {}
+    private readonly onChunk: () => void = () => {},
+    /** True when the recorded body is an SSE stream: only then may a failed
+     * recording end its replays with synthetic terminal frames (#641 family
+     * B) — into a JSON body they would corrupt the payload. */
+    private readonly terminalFrames = false
   ) {
     this.reader = body.getReader();
     this.ended = this.pump();
@@ -612,6 +615,7 @@ export class ResponseRecorder {
       for (;;) {
         const r = await this.reader.read();
         if (r.done) break;
+        this.terminal.feed(r.value);
         this.chunks.push(r.value);
         this.totalBytes += r.value.byteLength;
         this.release();
@@ -673,8 +677,17 @@ export class ResponseRecorder {
             }
             if (this.done) {
               detach();
-              if (this.failed) controller.error(this.failure);
-              else controller.close();
+              // Never-hang (#641 family B): a replay is what a hook (its
+              // view) and the client (the fallback) read — a recorded
+              // failure must not kill their streams. On an SSE recording,
+              // append the synthetic labeled terminal (empty after the real
+              // `message_stop`: no second terminal pair, S4-a) and close; on
+              // a JSON recording, close only.
+              if (this.failed && this.terminalFrames) {
+                for (const f of encodeSyntheticErrorTail(this.terminal, errorText(this.failure)))
+                  controller.enqueue(f);
+              }
+              controller.close();
               return;
             }
             await this.next();
@@ -754,6 +767,8 @@ function responseStage(
   let fallback: Replay | null = null;
   let fallbackReader: ByteReader | null = null;
   let replacementReader: ByteReader | null = null;
+  /** Terminal state of the original bytes forwarded to the client (#641). */
+  const originalTerminal = new TerminalSniffer();
 
   // Wakes the client-side pull when the state changes.
   let changed: () => void = () => {};
@@ -768,12 +783,19 @@ function responseStage(
     fire();
   };
 
-  const recorder = new ResponseRecorder(input.body, () => {
-    if (decision === null && recorder.totalBytes + heldBytes > capBytes) {
-      raw.reportFail(applicable, "response", "invalid", "buffer_cap");
-      decideOriginal();
-    }
-  });
+  const recorder = new ResponseRecorder(
+    input.body,
+    () => {
+      if (decision === null && recorder.totalBytes + heldBytes > capBytes) {
+        raw.reportFail(applicable, "response", "invalid", "buffer_cap");
+        decideOriginal();
+      }
+    },
+    // This stage sees the pipeline's output toward Claude Code: SSE when
+    // streaming, JSON otherwise — a failed recording may only grow a
+    // synthetic terminal on the SSE side.
+    !json
+  );
   const view = recorder.replay({ copy: true });
 
   function cancelReplacement(): void {
@@ -959,9 +981,21 @@ function responseStage(
             try {
               const r = await (fallbackReader as ByteReader).read();
               if (r.done) controller.close();
-              else controller.enqueue(r.value);
+              else {
+                // Defensive double cover (#641 family B): a replay failure
+                // already ends in a synthetic terminal upstream of here, but
+                // whatever else rejects on this reader must not break the
+                // client's pipe — the sniffer sees the bytes already
+                // forwarded, so a real `message_stop` yields no second pair.
+                originalTerminal.feed(r.value);
+                controller.enqueue(r.value);
+              }
             } catch (err) {
-              controller.error(err);
+              if (!json) {
+                for (const f of encodeSyntheticErrorTail(originalTerminal, errorText(err)))
+                  controller.enqueue(f);
+              }
+              controller.close();
             }
             return;
           }

@@ -211,10 +211,15 @@ export function releaseWhenBodyEnds(response: Response, release: () => void): Re
         let result: Awaited<ReturnType<typeof reader.read>>;
         try {
           result = await reader.read();
-        } catch (err) {
+        } catch {
+          // Never-hang (#663 r1, ported to v14): this wrapped body is the
+          // client-facing response and the inner layer owns `message_stop` —
+          // release the lease and CLOSE: a client reading to the end sees a
+          // terminated stream, never a broken pipe; this wrapper's only job
+          // is the lease.
           if (cancelling) return;
           release();
-          controller.error(err);
+          controller.close();
           return;
         }
         // A read the cancel below woke up: the cancel path releases, once the
