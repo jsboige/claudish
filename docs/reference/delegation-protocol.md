@@ -64,8 +64,6 @@ Write for a reader who has the repository and nothing else. If a sentence needs 
 
 The web form applies the template's title prefix and its `grain` label. `gh issue create` does not: pass `--label grain` yourself, and copy the template's sections into the file given to `--body-file`.
 
-Filing an issue, or commenting on one, also starts the inherited `Issue Triage` workflow (`.github/workflows/issue-triage.yml`). Its last eight runs on this fork all failed (read 13/11). A red `Issue Triage` run next to a new grain is that workflow, not the grain.
-
 ## Who takes it
 
 Worker dispatch stays what it is: conversational, through the dashboards (`.claude/skills/worker-issues/SKILL.md`). Two labels exist for the readers who have nothing but GitHub, the cloud sessions and the user away from a seat:

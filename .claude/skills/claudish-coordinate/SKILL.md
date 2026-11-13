@@ -12,9 +12,10 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8
 ## Cadence et mandats
 
 - **Cron `37 */8 * * *`** (heure locale : 00:37, 08:37, 16:37 — user 04/11, « passe stp sur un cycle de 8h pour
-  économiser les tokens Anthropic »). **Le modèle est le choix du user** : Fable depuis le 13/11 (session
-  sur l'id de rôle `claude-fable[1m]`, sans version), Opus du 04/11 au 13/11. Le cron hérite du modèle de la
-  session qui l'arme : vérifier le modèle avant tout réarmement.
+  économiser les tokens Anthropic »). **Le modèle est le choix du user** : Opus depuis le 13/11 vers
+  13:15Z (même session, modèle changé au sélecteur), Fable le 13/11 au matin (id de rôle `claude-fable[1m]`,
+  sans version), Opus du 04/11 au 13/11. Le cron hérite du modèle de la session qui l'arme : vérifier le
+  modèle avant tout réarmement ; un changement au sélecteur dans la même session garde le même cron.
 - **La cadence appartient au user** (arbitrage de dépense — historique complet : reference.md § en-tête).
   Ne jamais la changer seul. Quand il la change : `CronCreate` **et** patch de ce fichier dans le même
   geste (la Phase 0 réarme à la valeur écrite ici).
