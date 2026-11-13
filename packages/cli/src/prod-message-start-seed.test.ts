@@ -24,8 +24,22 @@
  * `messageStartUsage(` or as explicit keys (the Codex lane keeps an explicit
  * literal on purpose, #186). Positive controls run the same detector over
  * synthetic sources first: if it can go blind, they fail before the corpus
- * scan can certify anything. A construction written in a shape the detector
- * cannot read is reported, never skipped.
+ * scan can certify anything.
+ *
+ * What the scan covers, and what it does not:
+ *  - The corpus is `packages/cli/src`, the proxy. `packages/macos-bridge`
+ *    builds frames for another wire and is not read here.
+ *  - Two shapes it cannot read are reported, never skipped: the object
+ *    written on one line, and a frame hand-written as JSON text inside a
+ *    string. The second has one known, harmless instance, listed with its
+ *    reason in `JSON_TEXT_ALLOWED`.
+ *  - The object's extent is the brace-matched remainder of the object the
+ *    `type:` line sits in. Cache keys anywhere in that extent satisfy it, not
+ *    only inside `usage`; a type held in a variable is not seen at all. No
+ *    source does either today.
+ *  - Sources are read with either line ending: this repository is checked
+ *    out CRLF on Windows, where a `\r` left at the end of a line would stop
+ *    the trailing-comment strip from matching.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -118,7 +132,20 @@ const SRC_ROOT = join(import.meta.dir);
 const PROPERTY_LINE = /^\s*type:\s*"message_start",?\s*$/;
 /** The same construction anywhere on a line of code. */
 const ANY_CONSTRUCTION = /\btype:\s*"message_start"/;
+/** A frame hand-written as JSON text inside a string
+ * (`{"type":"message_start",…}`, quotes escaped or not). */
+const JSON_TEXT_CONSTRUCTION = /\\?"type\\?"\s*:\s*\\?"message_start\\?"/;
 const COMMENT_LINE = /^\s*(\/\/|\/\*|\*)/;
+
+/**
+ * Frames written as JSON text that are known and harmless, each with its
+ * reason. Keyed by path relative to `src`, forward slashes. An entry that no
+ * longer matches anything fails the scan: remove it with the construction.
+ */
+const JSON_TEXT_ALLOWED: Record<string, string> = {
+  "fork/server/relay-e2e.ts":
+    "canned SSE of the mock hub in the relay E2E script: a fixture the script serves to itself, never built for a client",
+};
 
 /** A code line without its trailing `// …` comment (a `//` glued to a
  * non-space character, as in a URL, is left alone). */
@@ -129,19 +156,27 @@ function code(line: string): string {
 
 interface Finding {
   line: number;
-  problem: "keyless-seed" | "unreadable-shape";
+  problem: "keyless-seed" | "unreadable-shape" | "json-text-frame";
 }
 
 /**
  * For each `message_start` construction: the rest of the object it opens (up
- * to the brace that closes it) must carry both cache counters.
+ * to the brace that closes it) must carry both cache counters. `sites` counts
+ * the object-literal constructions only.
  */
 function scanSource(content: string): { sites: number; findings: Finding[] } {
-  const lines = content.split("\n");
+  // Either line ending: a `\r` left on the line would defeat `code()`.
+  const lines = content.split(/\r?\n/);
   const findings: Finding[] = [];
   let sites = 0;
   lines.forEach((raw, idx) => {
     const line = code(raw);
+    if (JSON_TEXT_CONSTRUCTION.test(line)) {
+      // Its usage cannot be read from here. Reported; the corpus scan
+      // accepts it only from a file listed in JSON_TEXT_ALLOWED.
+      findings.push({ line: idx + 1, problem: "json-text-frame" });
+      return;
+    }
     if (!ANY_CONSTRUCTION.test(line)) return;
     sites++;
     if (!PROPERTY_LINE.test(line)) {
@@ -255,8 +290,51 @@ describe("#1019 synthetic message_start seeds, by structure", () => {
       '// type: "message_start" in a comment is not a construction',
       ' * type: "message_start" in a doc block is not one either',
       'if (event.type === "message_start") sawStart = true;',
+      'if (/"type"\\s*:\\s*"message_start"/.test(sniff)) return true;',
     ].join("\n");
     expect(scanSource(mentionsOnly)).toEqual({ sites: 0, findings: [] });
+  });
+
+  test("positive controls: a trailing comment never passes for a seed, on either line ending", () => {
+    const keysOnlyInTrailingComment = [
+      "send({",
+      '  type: "message_start",',
+      "  message: {",
+      "    usage: { input_tokens: 0, output_tokens: 0 }, // cache_read_input_tokens: 0, cache_creation_input_tokens: 0",
+      "  },",
+      "});",
+    ];
+    const expected = [{ line: 2, problem: "keyless-seed" }];
+    expect(scanSource(keysOnlyInTrailingComment.join("\n")).findings).toEqual(expected);
+    // The CRLF checkout of this repository on Windows.
+    expect(scanSource(keysOnlyInTrailingComment.join("\r\n")).findings).toEqual(expected);
+
+    // A brace in a trailing comment must not move the object's extent either.
+    const braceInTrailingComment = [
+      "send({",
+      '  type: "message_start", // }',
+      "  message: {",
+      "    usage: messageStartUsage(prior),",
+      "  },",
+      "});",
+    ];
+    expect(scanSource(braceInTrailingComment.join("\n"))).toEqual({ sites: 1, findings: [] });
+    expect(scanSource(braceInTrailingComment.join("\r\n"))).toEqual({ sites: 1, findings: [] });
+  });
+
+  test("positive controls: a frame written as JSON text is reported, quotes escaped or not", () => {
+    const plain =
+      'const CANNED = \'event: message_start\\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\\n\\n\';';
+    expect(scanSource(plain)).toEqual({
+      sites: 0,
+      findings: [{ line: 1, problem: "json-text-frame" }],
+    });
+
+    const escaped = 'const CANNED = "data: {\\"type\\":\\"message_start\\"}";';
+    expect(scanSource(escaped)).toEqual({
+      sites: 0,
+      findings: [{ line: 1, problem: "json-text-frame" }],
+    });
   });
 
   test("the scan covers the production corpus and every construction is seeded", () => {
@@ -267,22 +345,31 @@ describe("#1019 synthetic message_start seeds, by structure", () => {
 
     let sites = 0;
     const offenders: string[] = [];
+    const allowedSeen = new Set<string>();
     for (const f of files) {
+      const rel = relative(SRC_ROOT, f).replace(/\\/g, "/");
       const result = scanSource(readFileSync(f, "utf-8"));
       sites += result.sites;
       for (const finding of result.findings) {
-        offenders.push(`${relative(SRC_ROOT, f)}:${finding.line} (${finding.problem})`);
+        if (finding.problem === "json-text-frame" && rel in JSON_TEXT_ALLOWED) {
+          allowedSeen.add(rel);
+          continue;
+        }
+        offenders.push(`${rel}:${finding.line} (${finding.problem})`);
       }
     }
+    expect(
+      offenders.length === 0
+        ? "every message_start construction seeds both cache counters"
+        : `message_start constructions to fix (keyless-seed: seed via messageStartUsage(); unreadable-shape or json-text-frame: write a multi-line object literal):\n  ${offenders.join("\n  ")}`
+    ).toBe("every message_start construction seeds both cache counters");
     // Eight builders exist at #1019 (five parsers with anthropic-sse counting
     // twice, the overflow turn, the web-tools answer). Finding fewer means
     // the detector lost sight of some: lower this floor only with the site
     // that was removed in hand.
     expect(sites).toBeGreaterThanOrEqual(8);
-    expect(
-      offenders.length === 0
-        ? "every message_start construction seeds both cache counters"
-        : `message_start built without both cache counters (seed via messageStartUsage()):\n  ${offenders.join("\n  ")}`
-    ).toBe("every message_start construction seeds both cache counters");
+    // A listed exception that matches nothing is stale: it would silently
+    // excuse the next frame written in that file.
+    expect([...allowedSeen].sort()).toEqual(Object.keys(JSON_TEXT_ALLOWED).sort());
   });
 });
