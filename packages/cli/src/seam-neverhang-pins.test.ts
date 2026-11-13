@@ -177,6 +177,20 @@ describe("#641 family B — the lease wrappers release and close (#663 r1)", () 
   });
 });
 
+/**
+ * The "real chain" requirement (coordinator arbitration, 12/11): these pins
+ * must consume the parser that PRODUCTION wires for the sniffed format,
+ * never openai-sse.ts's conversion by assumption. Traced on `9cd80a8b`
+ * (13/11, B3 proof): responses — composed-handler.ts `settleResponsesStreamHead`
+ * (l.3269) returns the replayed stream on a clean verdict, and the stream
+ * dispatcher's `case "openai-responses-sse"` (l.3581) hands that stream to
+ * `createResponsesStreamHandler` — the exact constructor the pin below calls.
+ * devin — l.3361 `settleDevinStreamHead` → `case "connect-proto"` (l.3657) →
+ * `createDevinConnectStream`, same correspondence. Mutation proof (13/11,
+ * same head): degrading each sniffer's replay from `controller.error(error)`
+ * to `controller.close()` reddens exactly its own pin (9 pass / 1 fail, once
+ * per sniffer), byte-exact restore; 13 pass after.
+ */
 describe("#641 family A — a sniffer's replayed rejection is converted by the real chain", () => {
   test("responses sniffer: a replayed rejection ends as a labeled error terminal through the Responses chain", async () => {
     const preamble = 'data: {"type":"response.created"}\n\n';
