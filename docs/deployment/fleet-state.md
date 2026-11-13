@@ -74,9 +74,10 @@ version belongs in its settings: `docs/reference/model-routing.md`.
 | --- | --- | --- | --- | --- |
 | po-2025 (hub) | n/a | profile `fable = claude-fable-5-2`, `CLAUDISH_NATIVE_PIN_AUTO=on`, cascade values unchanged; drained recreate 08:34:38Z (the drain did not reach zero, 1 stream left at the gesture), instance `a7bd6df5`, image digest `5f47c9faf02a` unchanged | n/a | REPORTED po-2025 13/11 08:35Z; the served ids of the two rows below corroborate the profile |
 | ai-01 | `claude-fable` (settings `env`: `ANTHROPIC_DEFAULT_FABLE_MODEL = claude-fable[1m]`, name `Fable`; read 09:15Z) | `claude-fable-5-2`, 414 responses, 08:44:01Z → 09:12:37Z | profile `default.models.fable = claude-fable-5-2`, loaded by the drained restart of 08:41:40Z; `CLAUDISH_NO_ANTHROPIC` empty; `CLAUDISH_FAILOVER_FABLE = role:opus`; `CLAUDISH_NATIVE_PIN_AUTO` empty (read in the container 09:15Z). The path itself has not been exercised | VERIFIED 13/11 09:15Z from ai-01 (hub corpus, live settings, `docker exec`) · AUTONOMOUS path PENDING |
-| po-2024 | `claude-fable-5-1` (read in its request envelopes: settings not switched yet) | `claude-fable-5-2`, 6 responses, 09:00:35Z → 09:12:26Z | `CLAUDISH_NO_ANTHROPIC=1` at the last reading (11/11, table below): alone, the seat would answer a Fable request with its sonnet mapping | served id VERIFIED 13/11 09:12Z from ai-01 · settings and sidecar PENDING |
-| po-2023 | `claude-fable[1m]` in its settings | no native Fable request from this seat in the window | not read | settings REPORTED po-2023 13/11 08:59Z · the rest PENDING |
-| po-2027, po-2028, web1, web2 | not read | no native Fable request in the window | not read since the mandate (po-2027 carried `CLAUDISH_NO_ANTHROPIC=1` on 05/11) | PENDING |
+| po-2024 | `claude-fable-5-1` (read in its request envelopes: settings not switched yet) | `claude-fable-5-2`, 6 responses, 09:00:35Z → 09:12:26Z | `CLAUDISH_NO_ANTHROPIC=1` at the last reading (11/11, table below): alone, the seat would answer a Fable request with its sonnet mapping (inferred from `noAnthropicDecision`; the seat's profile `models.sonnet` was not re-read) | served id VERIFIED 13/11 09:12Z from ai-01 · settings and sidecar PENDING |
+| po-2023 | `claude-fable[1m]` in its settings; base URL the hub, no sidecar on the path | no native Fable request from this seat in the window | not read | settings REPORTED po-2023 13/11 08:59Z · the rest PENDING |
+| po-2028 | `claude-fable[1m]` in its settings; base URL its local sidecar | no native Fable request from this seat in the window | not read since the mandate | settings REPORTED po-2028 13/11 09:19Z · the rest PENDING |
+| po-2027, web1, web2 | not read | no native Fable request in the window | not read since the mandate (po-2027 carried `CLAUDISH_NO_ANTHROPIC=1` on 05/11) | PENDING |
 
 How the "Hub served" column was read: every `resp-*-native-*.sse` of the hub corpus from 08:34Z to
 09:12:41Z (454 files), each paired with its request envelope on `(pid, reqN)` (the latest envelope at
@@ -90,6 +91,16 @@ What remains, per seat and by its own operator (`[PROPOSAL]` → `[ACK]`, one dr
 profile's `fable` entry, the withdrawal of `CLAUDISH_NO_ANTHROPIC` (user Q56 b, 01/11:
 `docs/reference/relay-internals.md`), a `CLAUDISH_FAILOVER_FABLE` whose every step resolves on that
 seat, then the role id in the client settings. Diff by value before and after (#141).
+
+Order matters for the withdrawal. Once `CLAUDISH_NO_ANTHROPIC` is gone, a native request served by the
+seat alone needs the client's own Anthropic credential, and the native lane refuses locally without
+one (#296). So the "Hub served" cell of a seat is read first: a served native response is the proof
+that the seat's clients authenticate with their own Anthropic login. A seat with no such response
+keeps the variable until it has one.
+
+Re-read at 09:32Z, same method (790 native responses since 08:34Z): ai-01 736 responses asked
+`claude-fable` and served `claude-fable-5-2`; po-2024 20 responses asked `claude-fable-5-1` and served
+`claude-fable-5-2`; still no native Fable request from any other machine.
 
 ## po-2025 — HUB (canonical since 05/09 cutover)
 
