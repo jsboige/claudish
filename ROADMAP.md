@@ -213,6 +213,22 @@ Docker deployments that mount `/root/.claudish` read-only make every catalog ref
 
 ---
 
+## Catalog refresh on a running proxy — one background refresh on a resolver miss (#893)
+
+Status: not started. Parked on 13/11 by the coordinator's arbitration of #893. Of the design carried there (routing-miss trigger, two-class TTL, `stale` state in the version watch), only the miss trigger is kept, and rewritten: the rest has nothing in the code to rest on (reasons in the arbitration comment).
+
+A running proxy fetches its model catalogue once, at startup (`warmAllCatalogs`). After that `ensureCatalogReady` returns as soon as memory holds a catalogue, one seeded from the disk cache included, so an id published after the start stays unknown until the next restart. The resolver is consulted for `openrouter` targets only: an explicit `kc@…` or `qwen-token-plan@…` step never reaches it, which is why this would not have caught the two manual re-pins that motivated #635.
+
+What would be built: on a resolver miss, one background `refreshCatalog`, single-flight, behind a global cooldown. The request that missed keeps its present path (resolution stays synchronous); the next one sees the refreshed catalogue. An id still absent after a successful refresh does not trigger again on the same catalogue, or an id that is legitimately outside it would fetch forever. A failed refresh leaves memory as it is. One kill switch, read per request. No new TTL: three already read this file (launcher, interactive picker, MCP server).
+
+**Trigger condition**: a request is measured leaving for OpenRouter with an unresolved bare id while the live catalogue already listed that id, on a proxy that had not restarted since the id appeared.
+
+**Effort**: small — one hook at the miss, the existing single-flight slot, one pin per guard (single flight, cooldown, no repeat on the same catalogue, miss path unchanged, failed refresh keeps memory).
+
+**Reference**: #893 (the design, and the arbitration comment of 13/11 with the code locations).
+
+---
+
 ## Adding a new roadmap item
 
 Each item should follow the structure above:
