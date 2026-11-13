@@ -158,6 +158,7 @@ import {
   liftCapabilityDeclaration,
 } from "./fork/capability-vocabulary.js";
 import { executeWebSearch, executeWebFetch, isLowQualityWebContent, extractUrlFromWebContent, cleanRawWebContent } from "./handlers/shared/web-search-executor.js";
+import { messageStartUsage } from "./handlers/shared/stream-parsers/message-start-usage.js";
 import { convertOpenAIRequestToAnthropic } from "./handlers/shared/format/openai-request-to-anthropic.js";
 import { anthropicMessageToChatCompletion, createOpenAIChatStreamFromAnthropic } from "./handlers/shared/anthropic-to-openai.js";
 import {
@@ -279,7 +280,12 @@ async function interceptWebTools(_c: any, body: any): Promise<Response | null> {
   return null;
 }
 
-function buildTextResponse(model: string, text: string, streaming: boolean): Response {
+/**
+ * The locally-built answer of the web-tools interception: one text block, as
+ * a JSON message or a complete SSE turn. Exported for its pin only
+ * (`prod-message-start-seed.test.ts`).
+ */
+export function buildTextResponse(model: string, text: string, streaming: boolean): Response {
   const encoder = new TextEncoder();
   const send = (event: string, data: any) =>
     encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -316,7 +322,12 @@ function buildTextResponse(model: string, text: string, streaming: boolean): Res
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          // #1019 / #179 rule (b): the seed carries BOTH cache counters at an
+          // explicit 0 — the client sums the three input counters raw, and a
+          // key absent here and in the delta below makes that sum NaN. No
+          // prior count exists for this locally-built answer: the helper's
+          // unknown-size fallback rides, and the delta's zeros keep it.
+          usage: messageStartUsage(),
         },
       }));
 

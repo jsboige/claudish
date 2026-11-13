@@ -94,9 +94,11 @@ All `>`-separated fields are position-preserving against the step list.
 
 ### Nominal mapping and failover must not duplicate a target
 
-The nominal itself is never a cascade step. In particular, while the active profile maps Fable directly to `cx@gpt-6-astra`, keep `CLAUDISH_FAILOVER_FABLE` empty. Putting Astra in both places would make a quota wall retry the same target, consume an extra upstream round trip, and emit a misleading fallback notice.
+The nominal itself is never a cascade step. A target present both as a role's nominal and in its `CLAUDISH_FAILOVER_<ROLE>` would make a quota wall retry the same target, consume an extra upstream round trip, and emit a misleading fallback notice.
 
-The future Fable cutover is atomic: remove the direct Astra mapping so native `claude-fable-5-1` becomes nominal, and set Astra as Fable step 0 in the same configuration change. Native Anthropic Fable remains restricted to ai-01 by the fleet leak policy.
+Fable is the worked example. While the active profile mapped Fable directly to `cx@gpt-6-astra`, `CLAUDISH_FAILOVER_FABLE` had to stay empty. A cutover to native Fable has to be one configuration change: the direct Astra mapping removed so that native Fable becomes the nominal, and Astra set as Fable step 0 in the same gesture. The hub is in the post-cutover form (read in the container on 05/11: `CLAUDISH_FAILOVER_FABLE = cx@gpt-6-astra > role:opus`, `docs/deployment/fleet-state.md`), and since its recreate of 13/11 08:34:38Z its profile names `claude-fable-5-2` as the nominal.
+
+Native Anthropic Fable is not restricted to ai-01. The sentence that said so here predated two statements of the user: the policy of 20/10 (every machine authenticates its own Anthropic use, no hard per-machine restriction; `CLAUDE.md` §Traffic Analysis & Anthropic Policy) and the mandate of 13/11, verbatim: « Il faut également s'assurer que tous les workspaces claudish et les side-car sont cablés pour faire tourner la dernière version 5.2 de Fable ». What is wired and what has been measured, seat by seat: `docs/deployment/fleet-state.md` §Fable role. How a seat names the role: `docs/reference/model-routing.md` (client settings carry the role, the profile carries the version).
 
 ⚠ **Compose passes these one by one.** `_RESET` was missing from the passthrough until `ffb7f39`,
 so only the body-parsed path (Qwen) worked; Mistral's silent 402 fell back to a 10-60 min backoff and

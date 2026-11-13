@@ -61,6 +61,48 @@ VERIFIED 05/11 11:22Z by `docker exec claudish-proxy env | grep '^CLAUDISH_FAILO
 (container created 00:53:34Z, started 10:02:33Z, `instanceId` ac111998) and by parsing the bound
 `config.json` (names and `maxConcurrency` only).
 
+## Fable role — native 5.2, proof per consumer (mandate 13/11)
+
+User mandate of 13/11, verbatim: « Il faut également s'assurer que tous les workspaces claudish et les
+side-car sont cablés pour faire tourner la dernière version 5.2 de Fable ». This is a fleet rollout, so
+it is closed consumer by consumer (`CLAUDE.md` §Fleet-Rollout Verification); the hub's switch is only
+its first row. A seat is done when three things have been read: what its client sends, what the hub
+served it, and what its sidecar would do alone (AUTONOMOUS). How a seat names the role, and why no
+version belongs in its settings: `docs/reference/model-routing.md`.
+
+| Consumer | Client sends | Hub served (native lane) | Sidecar alone (AUTONOMOUS) | Status |
+| --- | --- | --- | --- | --- |
+| po-2025 (hub) | n/a | profile `fable = claude-fable-5-2`, `CLAUDISH_NATIVE_PIN_AUTO=on`, cascade values unchanged; drained recreate 08:34:38Z (the drain did not reach zero, 1 stream left at the gesture), instance `a7bd6df5`, image digest `5f47c9faf02a` unchanged | n/a | REPORTED po-2025 13/11 08:35Z; the served ids of the two rows below corroborate the profile |
+| ai-01 | `claude-fable` (settings `env`: `ANTHROPIC_DEFAULT_FABLE_MODEL = claude-fable[1m]`, name `Fable`; read 09:15Z) | `claude-fable-5-2`, 414 responses, 08:44:01Z → 09:12:37Z | profile `default.models.fable = claude-fable-5-2`, loaded by the drained restart of 08:41:40Z; `CLAUDISH_NO_ANTHROPIC` empty; `CLAUDISH_FAILOVER_FABLE = role:opus`; `CLAUDISH_NATIVE_PIN_AUTO` empty (read in the container 09:15Z). The path itself has not been exercised | VERIFIED 13/11 09:15Z from ai-01 (hub corpus, live settings, `docker exec`) · AUTONOMOUS path PENDING |
+| po-2024 | `claude-fable-5-1` (read in its request envelopes: settings not switched yet) | `claude-fable-5-2`, 6 responses, 09:00:35Z → 09:12:26Z | `CLAUDISH_NO_ANTHROPIC=1` at the last reading (11/11, table below): alone, the seat would answer a Fable request with its sonnet mapping (inferred from `noAnthropicDecision`; the seat's profile `models.sonnet` was not re-read) | served id VERIFIED 13/11 09:12Z from ai-01 · settings and sidecar PENDING |
+| po-2023 | `claude-fable[1m]` in its settings; base URL the hub, no sidecar on the path | no native Fable request from this seat in the window | not read | settings REPORTED po-2023 13/11 08:59Z · the rest PENDING |
+| po-2028 | `claude-fable[1m]` in its settings; base URL its local sidecar | no native Fable request from this seat in the window | not read since the mandate | settings REPORTED po-2028 13/11 09:19Z · the rest PENDING |
+| po-2027, web1, web2 | not read | no native Fable request in the window | not read since the mandate (po-2027 carried `CLAUDISH_NO_ANTHROPIC=1` on 05/11) | PENDING |
+
+How the "Hub served" column was read: every `resp-*-native-*.sse` of the hub corpus from 08:34Z to
+09:12:41Z (454 files), each paired with its request envelope on `(pid, reqN)` (the latest envelope at
+or before the response, as `scripts/native-consumption.py` does); the envelope gives the machine and
+the id the client asked for, the `message_start` of the response gives the id Anthropic served. Two
+limits. A request a seat served by itself in AUTONOMOUS is not in the hub corpus (#933), so "no
+request in the window" is not "the seat cannot". And **the 1M context is not measured on any seat**:
+the captures hold no request headers.
+
+What remains, per seat and by its own operator (`[PROPOSAL]` → `[ACK]`, one drained recreate): the
+profile's `fable` entry, the withdrawal of `CLAUDISH_NO_ANTHROPIC` (user Q56 b, 01/11:
+`docs/reference/relay-internals.md`), a `CLAUDISH_FAILOVER_FABLE` whose every step resolves on that
+seat, then the role id in the client settings. Diff by value before and after (#141).
+
+Order matters for the withdrawal. Once `CLAUDISH_NO_ANTHROPIC` is gone, a native request served by the
+seat alone needs an Anthropic credential, and the native lane refuses locally without one (#296).
+On this fleet that credential is the client's own: the compose deployment gives a node no stored key
+to substitute. So the "Hub served" cell of a seat is read first: a served native response is the proof
+that the seat's clients authenticate with their own Anthropic login. A seat with no such response
+keeps the variable until it has one.
+
+Re-read at 09:32Z, same method (790 native responses since 08:34Z): ai-01 736 responses asked
+`claude-fable` and served `claude-fable-5-2`; po-2024 20 responses asked `claude-fable-5-1` and served
+`claude-fable-5-2`; still no native Fable request from any other machine.
+
 ## po-2025 — HUB (canonical since 05/09 cutover)
 
 | Item | Value | Status |
@@ -112,6 +154,7 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 | Client `ANTHROPIC_BASE_URL` | `http://192.168.0.50:3000` (direct) — `settings.json`; profile template `settings.claudish.json` realigned 22:12Z | VERIFIED 07/09 22:12Z |
 | Cascade | **ARMED 23/09** — SONNET `qwen-token-plan@deepseek-v4-flash-0731 > kc@k3 > ds@deepseek-flash`, `ROLE_MODELS=glm-5.2:sonnet` (clients name `glm-5.2` bare, which `roleFromModelName()` cannot map), `AUTO=1`; **3 armed by value**; startup `[Failover] configured=1 armed=[none] auto=on`. Each step measured to resolve **on ai-01** before the gesture (throwaway HUB container on `127.0.0.1:3999`, 3/3 `message_stop`, removed after) | VERIFIED 23/09 04:16Z |
 | Role map | profile `default`: opus `claude-opus-5-5` (was `claude-opus-4-8`), sonnet `glm-5.2`, haiku `mmc@MiniMax-M3`; native pin read in-container: `claude-opus-5` and `claude-opus-4-8` → `claude-opus-5-5`, `claude-opus-5-5` and `glm-5.2` unchanged | VERIFIED 23/09 |
+| Role map, 13/11 | profile `default` as loaded by the drained restart of 08:41:40Z: opus `claude-opus-5-5`, sonnet `glm-5.3`, haiku `mmc@MiniMax-M3.1-Flash`, **fable `claude-fable-5-2`** (added 08:23Z). Supersedes the 23/09 row above for sonnet and haiku. Client: `ANTHROPIC_BASE_URL = http://127.0.0.1:3002` (the sidecar, not the hub direct as the 07/09 row says), `ANTHROPIC_DEFAULT_FABLE_MODEL = claude-fable[1m]`; Opus, Sonnet and Haiku still carry a versioned id | VERIFIED 13/11 09:15Z (`docker exec` on the bound `config.json`, role lines only; live `~/.claude/settings.json`, model keys only; `/health` `relay-nominal`, instance `dc2c38f0`, `RestartCount=0`) |
 | customEndpoints | `vllm-myia` (key rotated 06/09, fp only), `qwen-token-plan` | VERIFIED (config.json) |
 | Capture | on (outage trail) | VERIFIED |
 
@@ -154,6 +197,8 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 
 | Date (Z) | Machine | Change | Proof |
 | --- | --- | --- | --- |
+| 2026-11-13 08:41:40 | ai-01 | **Sidecar loads `fable = claude-fable-5-2`; client settings switched to the role id.** 08:23Z: one line added to the profile `default` of the bound `config.json` (`models.fable`), backup taken and fingerprinted first. 08:41:40Z: drained restart, no recreate (`claudish-drain.ps1 -ContainerName claudish-sidecar`, `OUTCOME success`, zero stream cut), env unchanged. Around 08:40Z, on the user's directive (« Tu ne devrais pas mettre de version dans nos settings, ce que sert le sélecteur, c'est le "rôle Fable" avec ses failovers »): `ANTHROPIC_DEFAULT_FABLE_MODEL` `claude-fable-5-1[1m]` → `claude-fable[1m]`, name `Fable`, description rewritten to name the role. Announced on the workspace dashboard before the restart (`[PROPOSAL]` 08:41Z) and to the settings' owner lane | `drain.log` `OUTCOME`, `/health` (`relay-nominal`, instance `dc2c38f0`), `docker exec` re-read 09:15Z, live `settings.json`, and 414 native responses served `claude-fable-5-2` for requests naming `claude-fable` (§Fable role) |
+| 2026-11-13 08:34:38 | po-2025 | **Hub recreated with `CLAUDISH_NATIVE_PIN_AUTO=on` and profile `fable = claude-fable-5-2`** (automatic adoption is the user's decision of 13/11 as carried by po-2025's `[PROPOSAL]` of 08:19Z, REPORTED, not in ai-01's own record of the user's words; coordinator ACK 08:20Z amending the proposal with the profile line, because the flag alone did not move a client asking for exactly the configured version, #1017). Same image digest `5f47c9faf02a`, cascade values unchanged against the previous collection, `configured=4`. ⚠ The drain did not reach zero within 300 s and picked a minimum of 1 stream: one interruption is possible, impact not measured. The image predates #1018, so the #1017 defect is still in it: it cannot bite a client sending the role id | REPORTED po-2025 (dashboard 08:35Z: `OUTCOME success`, `/health`, digest, cascade diff by value) · corroborated twice: po-2025 read its first native Fable capture at 08:45Z (`message.model = claude-fable-5-2`, `message_stop` present), and ai-01 paired the tally of §Fable role from the corpus |
 | 2026-11-11 ~21:40 | po-2024 | **Local sonnet cascade consecrated as the seat posture — registry Q-po2024-9 closed (b) under the user's Q76 mandate** (« la gestion et l'alignement des config restent dans votre mandat, toutes les machines doivent être résilientes », 11/11). The pose measured 09/11 ~00:24Z and re-read live 11/11 after the 10:24Z restart (unchanged): `SONNET=zai@glm-5.3>mmc@MiniMax-M3.1-Flash>ds@deepseek-flash`, 2 armed by value (`SONNET`, `AUTO`) over ~38 names present. Rungs 0-1 deviate from the 05/11 canonical block (canon: `mistral@zai-glm-5-3`, `qwen-token-plan@deepseek-v4.1-flash-1017`); rung 2 PAYG identical (fingerprint `43d909c2`). The deviation is deliberate and resilience is the criterion: every local rung holds a key on this seat and the pose served real AUTONOMOUS traffic through 08/11 down to the PAYG rung, while the canon's rungs 0-1 have never been proven resolvable here (no measured service, no key proven). In relay-nominal the local cascade stays inert — the hub decides. Reopen condition: a canon change that adds rungs proven on this seat, or the #711 closure demanding a per-seat verdict | user Q76 verbatim (11/11) + live `docker inspect` env read by value 11/11 (direct array, per the Out-String CRLF lesson) + #711 c.6729367775 (per-rung fingerprints) |
 | 2026-11-07 14:59 | po-2023 | **WAN-edge pipe launcher: `HKCU\…\Run\ClaudishRelayPo2025` → logon scheduled task `ClaudishRelayPo2025` with singleton port guard (Q65b, user answer of 01/11).** 100 % non-elevated (per-user task registration + HKCU value delete need no UAC — zero windows consumed). Action `powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\Production\claudish-relay-po2025\start-guarded.ps1` (PS 5.1-safe), trigger AtLogOn, `MultipleInstances=IgnoreNew`; the guard exits 0 with a log line when `:18182` is already held (parity with the old Run key's de-facto singleton, minus the `EADDRINUSE` exit(1) noise in task history). Dry-run (object assembly) posted as [PROPOSAL] before the gesture; entire chain run non-elevated first. The live pipe was never touched: pid 5696 held `:18182` throughout, `relay.js` unchanged; first real logon hands over from the (now removed) Run key. Rollback = recreate the Run value (one line, archived verbatim in the PROPOSAL) | `schtasks /query /tn ClaudishRelayPo2025` (state=Ready) + `Start-ScheduledTask` guard test (`LastTaskResult 0`, guard log `already held by pid 5696, exiting 0`) + `Get-NetTCPConnection` owner before/after + live `/health` |
 | 2026-11-05 11:24:27 | po-2028 | **Container `claudish-proxy` stopped (clean, `exit=0`, 0.7 s) and started again 1 s later — a targeted `docker restart`-class gesture, not a crash and not a recreate: same image `755f7edc233e`, `RestartCount=0`, no OOM, Docker engine up throughout (host-watchdog ticks 11:23:43 and 11:25:03 both `HEALTHY engine=up`), no host reboot (OS boot 01/11).** No lane announced it; the author is not established (the user was active on the machine at that minute). Impact measured at zero: the ~1 s gap is under the 2-heartbeat detection floor so the relay never left NOMINAL, no AUTONOMOUS transition, and a full-machine transcript scan over the following 24 h found **0 `isApiErrorMessage:true`** entries | `docker inspect` StartedAt/FinishedAt/ExitCode/RestartCount/OOMKilled/Image + host-watchdog log ticks + relay log transitions (`--tail 20000` scan) + transcript scan (entry-level criterion) |

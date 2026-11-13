@@ -1,6 +1,6 @@
 ---
 name: claudish-coordinate
-description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8h sous Opus) — files profondes aux workers, reviews/merges exigeants, santé hub/relais/sidecar, trafic et leak-policy Anthropic, arbitrages au user, bilan [DONE]. À invoquer au réveil du cron ou sur demande du user.
+description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8h, modèle choisi par le user) — files profondes aux workers, reviews/merges exigeants, santé hub/relais/sidecar, trafic et leak-policy Anthropic, arbitrages au user, bilan [DONE]. À invoquer au réveil du cron ou sur demande du user.
 ---
 
 # Cycle de coordination claudish — myia-ai-01
@@ -12,7 +12,8 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8
 ## Cadence et mandats
 
 - **Cron `37 */8 * * *`** (heure locale : 00:37, 08:37, 16:37 — user 04/11, « passe stp sur un cycle de 8h pour
-  économiser les tokens Anthropic »), **sous Opus**. Le cron hérite du modèle de la
+  économiser les tokens Anthropic »). **Le modèle est le choix du user** : Fable depuis le 13/11 (session
+  sur l'id de rôle `claude-fable[1m]`, sans version), Opus du 04/11 au 13/11. Le cron hérite du modèle de la
   session qui l'arme : vérifier le modèle avant tout réarmement.
 - **La cadence appartient au user** (arbitrage de dépense — historique complet : reference.md § en-tête).
   Ne jamais la changer seul. Quand il la change : `CronCreate` **et** patch de ce fichier dans le même
@@ -20,7 +21,7 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8
 - Armé juste après un créneau, le cron **tire en rattrapage** (pas un double-fire) : mener ce cycle
   économiquement et le dire au bilan.
 - Cycle manuel du user avec un tir déjà en attente (`CronList` : prochain tir < 30 min) : `CronDelete` +
-  `CronCreate` à l'identique retire ce tir, un cycle Opus économisé (#445, mesure : reference.md § Phase 0).
+  `CronCreate` à l'identique retire ce tir, un cycle économisé (#445, mesure : reference.md § Phase 0).
 
 **Mandat coordinateur (user, 18/09 — verbatim : reference.md § Cadence)** — endosser le rôle : faire avancer
 les issues en dispatchant du travail aux workers, avec des reviews et merges exigeants. À tenir chaque
