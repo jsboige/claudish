@@ -15,7 +15,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { config } from "dotenv";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 
 import { sseDataPayload } from "./handlers/shared/stream-parsers/sse-line.js";
@@ -51,7 +51,7 @@ import { claudishStatusHandler, renderCapabilities } from "./mcp-status-tools.js
 // One cache path for the whole binary: a local constant here would drift from
 // the proxy the day CLAUDISH_MODEL_CACHE_PATH is set, and the MCP tool would
 // list a different catalog than the router resolves against.
-import { allModelsCachePath } from "./providers/all-models-cache.js";
+import { loadAllModels } from "./providers/mcp-models-list.js";
 
 // Load environment variables. quiet is load-bearing here, not cosmetic: this
 // process speaks MCP JSON-RPC over STDOUT, and dotenv 17.x prints its
@@ -67,8 +67,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-
-const CACHE_MAX_AGE_DAYS = 2;
 
 /** Instructions added to Claude's system prompt when channel mode is active. */
 const INSTRUCTIONS = `Claudish MCP server provides access to external AI models (OpenRouter, Ollama, LM Studio, etc.) for coding tasks.
@@ -117,42 +115,6 @@ interface ToolDefinition {
 }
 
 // ─── Helper Functions ────────────────────────────────────────────────────────
-
-async function loadAllModels(forceRefresh = false): Promise<any[]> {
-  const cachePath = allModelsCachePath();
-  if (!forceRefresh && existsSync(cachePath)) {
-    try {
-      const cacheData = JSON.parse(readFileSync(cachePath, "utf-8"));
-      const lastUpdated = new Date(cacheData.lastUpdated);
-      const ageInDays = (Date.now() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
-      if (ageInDays <= CACHE_MAX_AGE_DAYS) {
-        return cacheData.models || [];
-      }
-    } catch {
-      // Cache invalid
-    }
-  }
-
-  try {
-    const response = await fetch("https://openrouter.ai/api/v1/models");
-    if (!response.ok) throw new Error(`API returned ${response.status}`);
-    const data = (await response.json()) as { data?: string[] };
-    const models = data.data || [];
-    mkdirSync(dirname(cachePath), { recursive: true });
-    writeFileSync(
-      cachePath,
-      JSON.stringify({ lastUpdated: new Date().toISOString(), models }),
-      "utf-8"
-    );
-    return models;
-  } catch {
-    if (existsSync(cachePath)) {
-      const cacheData = JSON.parse(readFileSync(cachePath, "utf-8"));
-      return cacheData.models || [];
-    }
-    return [];
-  }
-}
 
 // ─── Lazy Proxy Singleton ────────────────────────────────────────────────────
 // The proxy runs the same routing engine as the CLI: auto-route, fallback chains,
