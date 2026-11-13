@@ -77,8 +77,26 @@ export function loadRoutingRules(sources?: RoutingRuleSources): RoutingRules {
  * came from (`explainRoute`) reads them here and merges them itself.
  */
 export function loadRoutingRuleSources(): RoutingRuleSources {
-  const localRules = loadLocalConfig()?.routing ?? {};
-  const globalRules = loadConfig().routing ?? {};
+  // Same posture as every other config consumer: a read that throws degrades
+  // the half it was reading to "no rules" rather than taking the caller down.
+  // The proxy calls this outside any try at boot (proxy-server.ts), and the
+  // config TUI / `--probe` TUI call it per frame — a crash here is a crash on
+  // every request, the exact failure `validateRoutingRulesAgainstProviders`
+  // exists to avoid one level up. The proxy-boot half is pinned by
+  // proxy-server-learned-caps-config-error.test.ts, which boots the real
+  // proxy against a throwing `loadConfig`.
+  let localRules: RoutingRules = {};
+  try {
+    localRules = loadLocalConfig()?.routing ?? {};
+  } catch {
+    // The project config read failed: no project rules this run.
+  }
+  let globalRules: RoutingRules = {};
+  try {
+    globalRules = loadConfig().routing ?? {};
+  } catch {
+    // The global config read failed: no global rules this run.
+  }
   return { globalRules, localRules };
 }
 
@@ -847,7 +865,18 @@ export const DEFAULT_FALLBACK_PROVIDER = "openrouter";
  * `--default-provider` flag arrives through the env variable (index.ts exports it).
  */
 export function effectiveDefaultProvider(): string {
-  return resolveDefaultProvider({ config: loadConfig(), env: process.env }).provider;
+  // Same degradation as every other config consumer (`loadRoutingRuleSources`
+  // above): a config read that throws must not take the caller down — this
+  // runs at proxy boot outside any try AND on every bare-name `route()`. No
+  // config means the env-only resolution, which is also what a machine with
+  // no config file gets.
+  let config: Parameters<typeof resolveDefaultProvider>[0]["config"];
+  try {
+    config = loadConfig();
+  } catch {
+    // No config this call: the env alone decides.
+  }
+  return resolveDefaultProvider({ config, env: process.env }).provider;
 }
 
 /** A chain assembled from the catalog, plus whether a catalog could be read. */

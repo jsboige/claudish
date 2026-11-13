@@ -522,6 +522,25 @@ export async function createProxyServer(
   // shareable past its block scope — the keyless marking middleware needs the
   // same object, not a second loadConfig() racing a config edit.
   let configSnapshot: ReturnType<typeof loadConfig> | undefined;
+  // #660 r1 (learned-caps row, CR c.6801023769) + the #991 follow-up — the
+  // learned-caps restore runs FIRST in the boot order (restore → register →
+  // derive → purge) and OUTSIDE the config try below. Restore before the
+  // derivation and its purge: the restore loads persisted caps into memory
+  // (and arms the write-through), the purge then drops every cap a successful
+  // derivation contradicts — inverted, the purge would run on an empty store
+  // and every stale cap would resurface right after it (pinned end-to-end by
+  // proxy-server-learned-caps-boot.test.ts). Outside the try because the caps
+  // store has nothing to do with config.json: a config read that fails
+  // degrades the ENDPOINTS (builtin set only, the catch below), and it must
+  // not also drop the user's learned caps for the whole process lifetime —
+  // the exact skip the hoist removed (pinned by
+  // proxy-server-learned-caps-config-error.test.ts).
+  const capsRestored = initOverflowCapsPersistence();
+  log(
+    capsRestored.path
+      ? `[ContextLimit] learned caps restored n=${capsRestored.loaded} expired=${capsRestored.expired} path=${capsRestored.path}`
+      : "[ContextLimit] learned caps are memory-only (CLAUDISH_OVERFLOW_CAPS_PATH unset)"
+  );
   try {
     // ONE config read for both halves. The bundled catalog's suppression set is
     // `Object.keys(config.customEndpoints)`, so if the two halves ever read
@@ -558,18 +577,6 @@ export async function createProxyServer(
     if (customEpResult.registered > 0) {
       log(`[Proxy] Registered ${customEpResult.registered} custom endpoint(s) from config`);
     }
-    // #660 r1 (learned-caps row, CR c.6801023769) — restore BEFORE the
-    // derivation and its purge below: the restore loads persisted caps into
-    // memory (and arms the write-through), the purge then drops every cap a
-    // successful derivation contradicts. Inverted, the purge would run on an
-    // empty store and every stale cap would resurface right after it. Pinned
-    // by proxy-server-learned-caps-boot.test.ts through this very boot path.
-    const capsRestored = initOverflowCapsPersistence();
-    log(
-      capsRestored.path
-        ? `[ContextLimit] learned caps restored n=${capsRestored.loaded} expired=${capsRestored.expired} path=${capsRestored.path}`
-        : "[ContextLimit] learned caps are memory-only (CLAUDISH_OVERFLOW_CAPS_PATH unset)"
-    );
     // #651 (v14 port, landing-gap row 2) — the DECLARED window, derived from the
     // endpoint's own `/v1/models` when it opts in (`deriveContextLimit: true`).
     // Runs AFTER registration so the measured window OVERWRITES the config
