@@ -17,6 +17,9 @@ Planned-but-unimplemented work lives in `ROADMAP.md`, each item with an explicit
 | Haiku → swift debrayage — staged widening (02/11 : po-2028 in swift trial on user directive, revert if net PAYG rises; ai-01 + po-2024 excluded) | `docs/reference/haiku-swift-debrayage.md` · `ROADMAP.md` |
 | OpenAI-compatible ingress (`/v1/chat/completions`) translation | `docs/reference/openai-ingress.md` |
 | Ops runbook — watchdog, drain/recreate, events, compaction, archive | `docs/reference/ops-scripts.md` |
+| Review / test / merge protocol — read before reviewing, merging or closing an issue | `docs/reference/review-protocol.md` |
+| Measurement protocol — read before a number or a verdict leaves the session | `docs/reference/measurement-protocol.md` |
+| Relay / hub diagnosis protocol — read before naming a mode, an outage or a validated change | `docs/reference/relay-diagnosis-protocol.md` |
 
 ## Fleet-Rollout Verification (hard rule, mandate 2026-09-12)
 
