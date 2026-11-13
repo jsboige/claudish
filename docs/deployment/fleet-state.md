@@ -93,8 +93,9 @@ profile's `fable` entry, the withdrawal of `CLAUDISH_NO_ANTHROPIC` (user Q56 b, 
 seat, then the role id in the client settings. Diff by value before and after (#141).
 
 Order matters for the withdrawal. Once `CLAUDISH_NO_ANTHROPIC` is gone, a native request served by the
-seat alone needs the client's own Anthropic credential, and the native lane refuses locally without
-one (#296). So the "Hub served" cell of a seat is read first: a served native response is the proof
+seat alone needs an Anthropic credential, and the native lane refuses locally without one (#296).
+On this fleet that credential is the client's own: the compose deployment gives a node no stored key
+to substitute. So the "Hub served" cell of a seat is read first: a served native response is the proof
 that the seat's clients authenticate with their own Anthropic login. A seat with no such response
 keeps the variable until it has one.
 
