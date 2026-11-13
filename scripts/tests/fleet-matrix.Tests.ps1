@@ -18,7 +18,9 @@ The suite pins the three classes this fleet keeps paying for:
 - single-container seats (PowerShell unrolls one-element arrays: the measured
   "name [c], every cell ?" regression);
 - UNKNOWN rendered as '?', never as a blank that reads as "ok" - including
-  the docker-unreachable row, which must NOT render as "no container".
+  the docker-unreachable row, which must NOT render as "no container";
+- LAN hub reachability (#291 grain 6): ok against a live listener, a measured
+  `unreachable` that keeps exit 0, and '?' only for a malformed target.
 #>
 
 BeforeAll {
@@ -57,7 +59,15 @@ function script:docker {
     }
     return @()
 }
-& $env:FM_TARGET -SettingsPath $env:FM_SETTINGS_PATH -HealthPort 1
+# Hashtable splat, not an array of '-Name' strings: array splatting passes
+# elements POSITIONALLY (measured here: the settings path landed in
+# -HealthPort and every pin failed on an Int32 conversion).
+# -LanHub is passed only when FM_LAN_HUB is set: binding an empty string
+# would replace the script's default with a malformed target ('?') and turn
+# every pre-existing pin red for the wrong reason.
+$fmSplat = @{ SettingsPath = $env:FM_SETTINGS_PATH; HealthPort = 1 }
+if ($env:FM_LAN_HUB) { $fmSplat.LanHub = $env:FM_LAN_HUB }
+& $env:FM_TARGET @fmSplat
 # The script's `exit N` ends only the SCRIPT when it is &-invoked from here -
 # without this line the wrapper would finish normally and the child would
 # always report 0 (measured: every exit-code pin vacuously green).
@@ -80,9 +90,14 @@ exit $LASTEXITCODE
             [string]$ImageCreated = '',
             [string]$Ports = '{"3000/tcp":[{"HostIp":"","HostPort":"3000"}]}',
             [string[]]$Logs = @('2026-10-28T23:09:14.145886697Z [Relay] NOMINAL after 3 OK heartbeats'),
+            # Loopback port 1 refuses in microseconds: the LAN cell is a
+            # measured 'unreachable' in every pre-existing scenario, so no pin
+            # depends on the CI runner's LAN and no test waits 2 s.
+            [string]$LanHub = '127.0.0.1:1',
             [switch]$NoSettings
         )
         $env:FM_TARGET = $script:MatrixPath
+        $env:FM_LAN_HUB = $LanHub
         $env:FM_PS = $Ps
         $env:FM_ENV = ($EnvLines -join '@@')
         $env:FM_CREATED = $Created
@@ -108,7 +123,7 @@ Describe 'fleet-matrix' {
         # Pester 6 refuses ROOT-level teardowns, so the FM_* scaffold env vars
         # are cleared here, inside the Describe.
         Remove-Item Env:FM_PS, Env:FM_ENV, Env:FM_CREATED, Env:FM_IMAGE_CREATED, Env:FM_PORTS,
-            Env:FM_LOGS, Env:FM_DOCKER_DOWN, Env:FM_SETTINGS_PATH, Env:FM_TARGET -ErrorAction SilentlyContinue
+            Env:FM_LOGS, Env:FM_DOCKER_DOWN, Env:FM_SETTINGS_PATH, Env:FM_TARGET, Env:FM_LAN_HUB -ErrorAction SilentlyContinue
     }
 
     Context 'the full row, measured from live objects' {
@@ -187,7 +202,7 @@ Describe 'fleet-matrix' {
         It 'renders the docker-unreachable row as ?, not as "no container"' {
             $env:FM_TARGET = $script:MatrixPath
             $env:FM_PS = ''; $env:FM_ENV = ''; $env:FM_CREATED = ''; $env:FM_PORTS = ''; $env:FM_LOGS = ''
-            $env:FM_DOCKER_DOWN = '1'
+            $env:FM_DOCKER_DOWN = '1'; $env:FM_LAN_HUB = '127.0.0.1:1'
             $settingsPath = Join-Path $script:Drive 's-down.json'
             $json = @{ env = @{ ANTHROPIC_BASE_URL = 'http://localhost:3000' } } | ConvertTo-Json -Depth 4
             [System.IO.File]::WriteAllText($settingsPath, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -197,7 +212,7 @@ Describe 'fleet-matrix' {
             $out | Should -Match 'docker unreachable'
             $LASTEXITCODE | Should -Be 2
             Remove-Item Env:FM_PS, Env:FM_ENV, Env:FM_CREATED, Env:FM_PORTS, Env:FM_LOGS,
-                Env:FM_DOCKER_DOWN, Env:FM_SETTINGS_PATH, Env:FM_TARGET -ErrorAction SilentlyContinue
+                Env:FM_DOCKER_DOWN, Env:FM_SETTINGS_PATH, Env:FM_TARGET, Env:FM_LAN_HUB -ErrorAction SilentlyContinue
         }
 
         It 'renders "none" when docker is up but holds no claudish container' {
@@ -217,6 +232,38 @@ Describe 'fleet-matrix' {
             # /health stays measured (-HealthPort 1 is operator input, not docker).
             $r = Invoke-Matrix -EnvLines @() -Created '' -Ports ''
             $r.Out | Should -Match '\| claudish-sidecar \| \? \| \? \| \? \| unreachable \| http://localhost:3000 \| \? \| 1 in tail'
+            $r.Code | Should -Be 1
+        }
+    }
+
+    Context 'LAN hub reachability (#291 grain 6)' {
+        It 'renders ok against a live listener' {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+            $listener.Start()
+            try {
+                $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+                $r = Invoke-Matrix -LanHub ("127.0.0.1:{0}" -f $port)
+                $r.Out | Should -Match '\| ok \(\d+ ms\) \|'
+                $r.Code | Should -Be 0
+            } finally { $listener.Stop() }
+        }
+
+        It 'renders a refused connect as a measured unreachable, exit 0' {
+            # A port the OS just handed us and we released: connect is refused.
+            # The column is a measurement either way - an unreachable LAN path
+            # is a finding, not an unknown, so the exit code must stay 0.
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+            $listener.Start()
+            $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+            $listener.Stop()
+            $r = Invoke-Matrix -LanHub ("127.0.0.1:{0}" -f $port)
+            $r.Out | Should -Match '\| unreachable \|'
+            $r.Code | Should -Be 0
+        }
+
+        It 'renders ? and exit 1 for a malformed target (instrument fault)' {
+            $r = Invoke-Matrix -LanHub 'not-a-host-port'
+            $r.Out | Should -Match '\| \? \|\s*$'
             $r.Code | Should -Be 1
         }
     }
