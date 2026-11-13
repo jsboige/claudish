@@ -10,6 +10,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createResponsesStreamHandler, parseContextOverflow } from "./openai-responses-sse.js";
+import { collectAnthropicSseToMessage } from "../collect-sse-message.js";
 import { __resetCaptureDirMemo } from "../response-capture.js";
 
 const SSE_HEADERS: Record<string, string> = {
@@ -1062,5 +1063,237 @@ describe("#186 — three-counter usage shape on the Codex lane", () => {
     expect(usage.cache_read_input_tokens).toBe(0);
     expect(usage.cache_creation_input_tokens).toBe(0);
     expect(output).toContain("event: message_stop");
+  });
+});
+
+// ─── #1039 — multi-call arguments must reach the client ──────────────────────
+//
+// Founder (12/11, po-2028): on the `cx@` (Responses API) route a response
+// carrying THREE function calls reached the client with `input: {}` on every
+// block and ZERO `input_json_delta` — while a single-call response streamed
+// five deltas normally, and the parallel run still billed output_tokens=67.
+// The model generated the arguments; the parser lost them.
+//
+// The wire shape the provider actually sends is NOT established: the hub logs
+// event TYPES only on this lane (`[ResponsesSSE] Event: <type>` — unlike
+// openai-sse's `[SSE:openai]`, this parser never logs raw payloads), and the
+// seat's reproduction files hold the DOWNSTREAM Anthropic wire. What IS known
+// is finite: the Responses vocabulary has exactly three carriers for a
+// function call's arguments — `response.function_call_arguments.delta` (the
+// normal streaming path), `response.function_call_arguments.done` (the
+// complete string), and the `arguments` field on the item itself at
+// `response.output_item.done` / in `response.completed`'s output array — and
+// the identity fields in use are three: `call_id`, `item_id`/`item.id`, and
+// `output_index`. Main handles only carrier 1, and only two identity keys,
+// dropping everything else in silence. These pins cover the carriers; each
+// red-on-main pin below fails on main for its own reason.
+
+describe("#1039 — multi-call: every tool_use block reaches the client with complete input", () => {
+  const CALLS = [
+    { id: "fc_1", call_id: "call_1", name: "get_weather", args: '{"city":"Paris"}' },
+    { id: "fc_2", call_id: "call_2", name: "get_time", args: '{"tz":"Europe/Paris"}' },
+    { id: "fc_3", call_id: "call_3", name: "echo_text", args: '{"text":"bonjour"}' },
+  ];
+
+  type ToolBlock = { index: number; id: string; name: string; input: string; lastDeltaSeq: number; stopSeq: number };
+
+  /** Rebuild what the CLIENT assembles: tool blocks, their partial_json, event order. */
+  function toolBlocks(output: string): ToolBlock[] {
+    const blocks = new Map<number, ToolBlock>();
+    const re = /event: (content_block_start|content_block_delta|content_block_stop)\ndata: ([^\n]*)/g;
+    let seq = 0;
+    for (const m of output.matchAll(re)) {
+      seq++;
+      const d = JSON.parse(m[2]);
+      if (m[1] === "content_block_start" && d.content_block?.type === "tool_use") {
+        blocks.set(d.index, {
+          index: d.index,
+          id: d.content_block.id,
+          name: d.content_block.name,
+          input: "",
+          lastDeltaSeq: -1,
+          stopSeq: -1,
+        });
+      } else if (m[1] === "content_block_delta" && d.delta?.type === "input_json_delta") {
+        const b = blocks.get(d.index);
+        if (b) {
+          b.input += d.delta.partial_json;
+          b.lastDeltaSeq = seq;
+        }
+      } else if (m[1] === "content_block_stop") {
+        const b = blocks.get(d.index);
+        if (b) b.stopSeq = seq;
+      }
+    }
+    return [...blocks.values()].sort((a, b) => a.index - b.index);
+  }
+
+  function addedEvents() {
+    return CALLS.map((c, i) => ({
+      type: "response.output_item.added",
+      output_index: i,
+      item: { type: "function_call", id: c.id, call_id: c.call_id, name: c.name, arguments: "" },
+    }));
+  }
+
+  function doneEvents(withArguments: boolean) {
+    return CALLS.map((c, i) => ({
+      type: "response.output_item.done",
+      output_index: i,
+      item: {
+        type: "function_call",
+        id: c.id,
+        call_id: c.call_id,
+        name: c.name,
+        ...(withArguments ? { arguments: c.args } : {}),
+      },
+    }));
+  }
+
+  function completedEvent(withOutput: boolean) {
+    return {
+      type: "response.completed",
+      response: {
+        usage: { input_tokens: 10, output_tokens: 67 },
+        ...(withOutput
+          ? {
+              output: CALLS.map((c) => ({
+                type: "function_call",
+                id: c.id,
+                call_id: c.call_id,
+                name: c.name,
+                arguments: c.args,
+              })),
+            }
+          : {}),
+      },
+    };
+  }
+
+  test("(a) arguments carried ONLY by the done items reach their blocks", async () => {
+    // Each pin isolates ONE carrier: the completed output array here carries no
+    // arguments, so an implementation that only reads it cannot pass this one.
+    const { output } = await runStreamCollect([
+      ...addedEvents(),
+      ...doneEvents(true),
+      completedEvent(false),
+    ]);
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual(CALLS.map((c) => c.args));
+    // The delta must precede the stop: after content_block_stop a delta is
+    // not legal on the Anthropic wire.
+    expect(blocks.every((b) => b.lastDeltaSeq > 0 && b.lastDeltaSeq < b.stopSeq)).toBe(true);
+  });
+
+  test("(b) arguments carried ONLY by the completed output array reach their blocks (and close them)", async () => {
+    // No output_item.done at all: main never closed these blocks either.
+    const { output } = await runStreamCollect([...addedEvents(), completedEvent(true)]);
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual(CALLS.map((c) => c.args));
+    expect(blocks.every((b) => b.stopSeq > b.lastDeltaSeq)).toBe(true);
+  });
+
+  test("(c) deltas keyed ONLY by output_index land on their block", async () => {
+    // The delta event's documented fields are item_id + output_index; a
+    // compatible backend that omits item_id leaves main nothing to match on
+    // (`event.call_id || event.item_id` = undefined -> silent drop). The done
+    // and completed items carry NO arguments here — the deltas are the only
+    // carrier this pin exercises.
+    const { output } = await runStreamCollect([
+      ...addedEvents(),
+      ...CALLS.flatMap((c, i) => [
+        { type: "response.function_call_arguments.delta", output_index: i, delta: c.args.slice(0, 6) },
+        { type: "response.function_call_arguments.delta", output_index: i, delta: c.args.slice(6) },
+      ]),
+      ...doneEvents(false),
+      completedEvent(false),
+    ]);
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual(CALLS.map((c) => c.args));
+  });
+
+  test("(d) function_call_arguments.done is a carrier of its own", async () => {
+    const { output } = await runStreamCollect([
+      ...addedEvents(),
+      ...CALLS.map((c, i) => ({
+        type: "response.function_call_arguments.done",
+        item_id: c.id,
+        output_index: i,
+        arguments: c.args,
+      })),
+      ...doneEvents(false),
+      completedEvent(false),
+    ]);
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual(CALLS.map((c) => c.args));
+  });
+
+  test("(e) an argument delta with no registered call logs ARG-DELTA-UNMATCHED once per identity", async () => {
+    const { lines, output } = await runStreamCollect([
+      { type: "response.function_call_arguments.delta", item_id: "fc_ghost", output_index: 9, delta: '{"a"' },
+      { type: "response.function_call_arguments.delta", item_id: "fc_ghost", output_index: 9, delta: ":1}" },
+      completedEvent(false),
+    ]);
+    const hits = lines.filter((l) => l.includes("ARG-DELTA-UNMATCHED"));
+    expect(hits.length).toBe(1);
+    expect(hits[0]).toContain("id=fc_ghost");
+    // A dropped delta must never stall the turn.
+    expect(output).toContain("event: message_stop");
+  });
+
+  test("(f) the buffered stream:false path assembles the same complete inputs", async () => {
+    // ComposedHandler feeds the parser's SSE through collectAnthropicSseToMessage
+    // when the client sent stream:false — the exact function pinned here.
+    const events = [...addedEvents(), ...doneEvents(true), completedEvent(false)];
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sseChunks(events)));
+        controller.close();
+      },
+    });
+    const response = new Response(stream, { headers: new Headers(SSE_HEADERS) });
+    const parserResponse = createResponsesStreamHandler(mockContext(), response, {
+      modelName: "gpt-5.6-sol",
+    }) as Response;
+    const message = await collectAnthropicSseToMessage(parserResponse, "gpt-5.6-sol");
+    const toolUses = message.content.filter((b: any) => b.type === "tool_use");
+    expect(toolUses.map((b: any) => b.input)).toEqual(CALLS.map((c) => JSON.parse(c.args)));
+    expect(message.stop_reason).toBe("tool_use");
+  });
+
+  test("(g) the per-spec multi-call fixture replays with complete inputs", async () => {
+    // A per-spec stream (deltas keyed by item_id, the full string also on the
+    // done items) ALREADY works on main — this fixture is the multi-call
+    // companion the lane never had, and the proof that the real-provider
+    // deviation is in the SHAPE, not in multi-call itself.
+    const body = readFileSync(
+      join(__dirname, "..", "..", "..", "test-fixtures", "sse-responses", "SEED-responses-multicall-parallel.sse")
+    );
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(body));
+        controller.close();
+      },
+    });
+    const response = new Response(stream, { headers: new Headers(SSE_HEADERS) });
+    let output = "";
+    await captureStdout(() => {
+      const result = createResponsesStreamHandler(mockContext(), response, {
+        modelName: "gpt-5.6-sol",
+      }) as Response;
+      return result.body!.pipeTo(
+        new WritableStream({
+          write(chunk: Uint8Array) {
+            output += new TextDecoder().decode(chunk, { stream: true });
+          },
+        })
+      );
+    });
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual([
+      '{"city":"Paris"}',
+      '{"tz":"Europe/Paris"}',
+      '{"text":"bonjour"}',
+    ]);
   });
 });

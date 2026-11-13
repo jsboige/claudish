@@ -212,11 +212,49 @@ export function createResponsesStreamHandler(
   ]);
 
   // Track function calls being streamed
-  const functionCalls: Map<
-    string,
-    { name: string; arguments: string; index: number; claudeId?: string }
-  > = new Map();
+  interface FnCallState {
+    name: string;
+    arguments: string;
+    index: number;
+    claudeId?: string;
+    /** `output_index` of the response's output array, when the wire states it. */
+    outputIndex?: number;
+  }
+  const functionCalls: Map<string, FnCallState> = new Map();
+  // #1039: the arguments events do not always carry a call id or an item id —
+  // the documented `response.function_call_arguments.delta` carries
+  // `item_id` + `output_index` and nothing else, and a compatible backend may
+  // omit `item_id` too. Key the same FnCallState by output_index so a delta
+  // whose only identity is its position still lands on its block.
+  const functionCallsByOutputIndex: Map<number, FnCallState> = new Map();
   const closedFunctionBlocks = new Set<number>();
+  // #1039: one line per unmatched identity — a dropped delta used to vanish
+  // without a trace, which is how three tool calls were billed and delivered
+  // empty. Deduped so a broken identity cannot flood the log per delta.
+  const unmatchedArgumentDeltas = new Set<string>();
+
+  // #1039: resolve the function call an upstream event refers to, whichever
+  // identity field the provider filled in. The events do NOT share one form:
+  // `output_item.added/done` carry `item.id` and `item.call_id`; the argument
+  // events carry `item_id` (plus `output_index`), and some carry the position
+  // alone. Main matched `call_id || item_id` only, so every multi-call turn
+  // whose deltas used another form closed its blocks empty.
+  const resolveFunctionCall = (ids: {
+    callId?: unknown;
+    itemId?: unknown;
+    outputIndex?: unknown;
+  }): FnCallState | undefined => {
+    for (const key of [ids.callId, ids.itemId]) {
+      if (typeof key === "string" && key) {
+        const found = functionCalls.get(key);
+        if (found) return found;
+      }
+    }
+    if (typeof ids.outputIndex === "number") {
+      return functionCallsByOutputIndex.get(ids.outputIndex);
+    }
+    return undefined;
+  };
 
   // Terminal usage shape, ONE derivation point for all six emission sites
   // (#186). The parser accumulates the Responses wire's numbers into locals
@@ -482,12 +520,16 @@ export function createResponsesStreamHandler(
                   }
                   const fnIndex = nextBlockIndex++;
 
-                  const fnCallData = {
+                  const fnCallData: FnCallState = {
                     name: fnName,
                     arguments: "",
                     index: fnIndex,
                     claudeId: callId,
                   };
+                  if (typeof event.output_index === "number") {
+                    fnCallData.outputIndex = event.output_index;
+                    functionCallsByOutputIndex.set(event.output_index, fnCallData);
+                  }
 
                   functionCalls.set(openaiCallId, fnCallData);
                   if (itemId && itemId !== openaiCallId) {
@@ -500,6 +542,20 @@ export function createResponsesStreamHandler(
                     content_block: { type: "tool_use", id: callId, name: fnName, input: {} },
                   });
                   hasToolUse = true;
+                  // #1039: some providers carry (part of) the argument string on
+                  // the item itself. Whatever is already known at open time is
+                  // owed to the client as a delta — the block's `input: {}` is
+                  // syntax, not content.
+                  const addedArgs =
+                    typeof event.item.arguments === "string" ? event.item.arguments : "";
+                  if (addedArgs) {
+                    fnCallData.arguments = addedArgs;
+                    send("content_block_delta", {
+                      type: "content_block_delta",
+                      index: fnIndex,
+                      delta: { type: "input_json_delta", partial_json: addedArgs },
+                    });
+                  }
                 }
               } else if (event.type === "response.reasoning_summary_text.delta") {
                 if (textBlockIndex === null) {
@@ -517,21 +573,93 @@ export function createResponsesStreamHandler(
                   delta: { type: "text_delta", text: event.delta || "" },
                 });
               } else if (event.type === "response.function_call_arguments.delta") {
-                const callId = event.call_id || event.item_id;
-                const fnCall = functionCalls.get(callId);
-                if (fnCall) {
+                const fnCall = resolveFunctionCall({
+                  callId: event.call_id,
+                  itemId: event.item_id,
+                  outputIndex: event.output_index,
+                });
+                if (fnCall && !closedFunctionBlocks.has(fnCall.index)) {
                   fnCall.arguments += event.delta || "";
                   send("content_block_delta", {
                     type: "content_block_delta",
                     index: fnCall.index,
                     delta: { type: "input_json_delta", partial_json: event.delta || "" },
                   });
+                } else if (fnCall) {
+                  // The block was already closed (out-of-order wire): a delta
+                  // after content_block_stop is not legal on the Anthropic
+                  // wire. Name it rather than emit a protocol violation — once
+                  // per block, so a late tail cannot flood the log.
+                  const identity = `after-stop:${fnCall.index}`;
+                  if (!unmatchedArgumentDeltas.has(identity)) {
+                    unmatchedArgumentDeltas.add(identity);
+                    log(
+                      `[ResponsesSSE] ARG-DELTA-AFTER-STOP model=${opts.modelName} reqN=${reqN} index=${fnCall.index} dropped=${String(event.delta || "").length}B`,
+                      true
+                    );
+                  }
+                } else {
+                  // #1039: this used to be a silent drop. One line per identity,
+                  // greppable: it is the field that names the wire shape a
+                  // future occurrence actually used.
+                  const identity = String(
+                    event.call_id ?? event.item_id ?? `output_index:${event.output_index ?? "?"}`
+                  );
+                  if (!unmatchedArgumentDeltas.has(identity)) {
+                    unmatchedArgumentDeltas.add(identity);
+                    log(
+                      `[ResponsesSSE] ARG-DELTA-UNMATCHED model=${opts.modelName} reqN=${reqN} id=${identity} output_index=${event.output_index ?? "?"} deltaLen=${String(event.delta || "").length} registered=${functionCalls.size}`,
+                      true
+                    );
+                  }
+                }
+              } else if (event.type === "response.function_call_arguments.done") {
+                // #1039: the event that carries the COMPLETE argument string —
+                // this parser had no branch for it at all, so a provider that
+                // streams nothing but this event delivered empty tool inputs.
+                const fnCall = resolveFunctionCall({
+                  callId: event.call_id,
+                  itemId: event.item_id,
+                  outputIndex: event.output_index,
+                });
+                const full = typeof event.arguments === "string" ? event.arguments : "";
+                if (fnCall && full && !fnCall.arguments && !closedFunctionBlocks.has(fnCall.index)) {
+                  fnCall.arguments = full;
+                  send("content_block_delta", {
+                    type: "content_block_delta",
+                    index: fnCall.index,
+                    delta: { type: "input_json_delta", partial_json: full },
+                  });
+                } else if (fnCall && full && fnCall.arguments && fnCall.arguments !== full) {
+                  // Deltas are already client-visible and disagree with the
+                  // terminal string; what the client holds is the stream.
+                  log(
+                    `[ResponsesSSE] ARG-DONE-MISMATCH model=${opts.modelName} reqN=${reqN} index=${fnCall.index} streamed=${fnCall.arguments.length}B done=${full.length}B`,
+                    true
+                  );
                 }
               } else if (event.type === "response.output_item.done") {
                 if (event.item?.type === "function_call") {
-                  const callId = event.item.call_id || event.item.id;
-                  const fnCall = functionCalls.get(callId) || functionCalls.get(event.item.id);
+                  const fnCall = resolveFunctionCall({
+                    callId: event.item.call_id,
+                    itemId: event.item.id,
+                    outputIndex: event.output_index ?? event.item.output_index,
+                  });
                   if (fnCall && !closedFunctionBlocks.has(fnCall.index)) {
+                    // #1039: the completed item carries the authoritative
+                    // argument string, and main never read it. Emit what the
+                    // client is owed BEFORE the stop — once the block is
+                    // closed, a delta is not legal.
+                    const itemArgs =
+                      typeof event.item.arguments === "string" ? event.item.arguments : "";
+                    if (!fnCall.arguments && itemArgs) {
+                      fnCall.arguments = itemArgs;
+                      send("content_block_delta", {
+                        type: "content_block_delta",
+                        index: fnCall.index,
+                        delta: { type: "input_json_delta", partial_json: itemArgs },
+                      });
+                    }
                     send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
                     closedFunctionBlocks.add(fnCall.index);
                   }
@@ -559,6 +687,44 @@ export function createResponsesStreamHandler(
                   cacheReadTokens = readCacheReadTokens(event.usage, inputTokens);
                 }
                 completed = true;
+                // #1039: the response object carries the terminal output array —
+                // the last place a function call's arguments can live. Main never
+                // read it, so a provider that delivers arguments only here closed
+                // every block empty. Fill what is still empty, then close every
+                // block still open: `response.completed` is the terminal event,
+                // and a started block must stop before message_stop.
+                const completedOutput = event.response?.output ?? event.output;
+                if (Array.isArray(completedOutput)) {
+                  for (const item of completedOutput) {
+                    if (item?.type !== "function_call") continue;
+                    const fnCall = resolveFunctionCall({
+                      callId: item.call_id,
+                      itemId: item.id,
+                      outputIndex: item.output_index,
+                    });
+                    if (!fnCall) continue;
+                    const itemArgs = typeof item.arguments === "string" ? item.arguments : "";
+                    if (!fnCall.arguments && itemArgs) {
+                      if (closedFunctionBlocks.has(fnCall.index)) {
+                        // Fourth shape: the block was already closed empty by a
+                        // done item that carried no arguments. Nothing legal can
+                        // re-open it — name it so the shape is visible.
+                        log(
+                          `[ResponsesSSE] ARG-LATE-COMPLETED model=${opts.modelName} reqN=${reqN} index=${fnCall.index} args=${itemArgs.length}B dropped-after-stop`,
+                          true
+                        );
+                      } else {
+                        fnCall.arguments = itemArgs;
+                        send("content_block_delta", {
+                          type: "content_block_delta",
+                          index: fnCall.index,
+                          delta: { type: "input_json_delta", partial_json: itemArgs },
+                        });
+                      }
+                    }
+                  }
+                }
+                closeOpenBlocks();
                 // No [resp] marker here. The marker is emitted once, at CLOSE, by
                 // the response capture: emitting one here as well would double
                 // every count in traffic-live.ps1 ($responses matches /\[resp\]/),
