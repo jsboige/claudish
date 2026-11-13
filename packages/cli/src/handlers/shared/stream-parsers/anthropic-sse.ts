@@ -17,6 +17,7 @@ import { ttftMarkerLine } from "../traffic-markers.js";
 import { requestNumberFor } from "../../../fork/middleware/request-logger.js";
 import { executeWebFetch } from "../web-search-executor.js";
 import { passthroughFrame, reconcileFrame } from "./frame-coherence.js";
+import { messageStartUsage } from "./message-start-usage.js";
 import {
   isPolicyRefusal,
   logPolicyRefusal,
@@ -387,7 +388,13 @@ export function createAnthropicPassthroughStream(
                           content: [],
                           stop_reason: null,
                           stop_sequence: null,
-                          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+                          // #1014 / #179 rule (b): a synthetic message_start must
+                      // seed BOTH cache counters (at an explicit 0) — the client
+                      // sums the three input counters raw, and an absent key
+                      // makes that sum NaN. The counted outputTokens ride the
+                      // terminal message_delta instead (absent delta keys keep
+                      // this seed).
+                      usage: messageStartUsage(inputTokens),
                         },
                       }) +
                       "\n\n"
@@ -1180,7 +1187,13 @@ export function createAnthropicPassthroughStream(
                       content: [],
                       stop_reason: null,
                       stop_sequence: null,
-                      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+                      // #1014 / #179 rule (b): a synthetic message_start must
+                      // seed BOTH cache counters (at an explicit 0) — the client
+                      // sums the three input counters raw, and an absent key
+                      // makes that sum NaN. The counted outputTokens ride the
+                      // terminal message_delta instead (absent delta keys keep
+                      // this seed).
+                      usage: messageStartUsage(inputTokens),
                     },
                   }) +
                   "\n\n"
