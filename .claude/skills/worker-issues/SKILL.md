@@ -31,7 +31,10 @@ cycle générale + périmètre hub) : ici, le cœur du cycle est l'avancement de
    - Priorité 2 : issue ouverte non attribuée, décrémentable d'un grain sûr
      (fix/feat borné, DoD atteignable en un cycle).
    - Exclure : issues bloquées sur geste user (registre des questions), épics non découpés,
-     issues déjà portées par un pair (une PR ouverte dessus, un claim dashboard).
+     issues déjà portées par un pair (une PR ouverte dessus, un claim dashboard),
+     issues portant le label `cloud-ready` : offertes d'abord à une session cloud, le
+     coordinateur retire le label à l'échéance (`docs/reference/delegation-protocol.md`).
+     C'est le seul label qui change le choix d'un worker.
 2. **Lire intégralement** : body complet + tous les commentaires + reviews avec leur `state`
    + diff — règle HARD « Read Body Before Any Action », sans exception, même pour une issue
    déjà connue. Ne jamais fixer sur le titre seul.

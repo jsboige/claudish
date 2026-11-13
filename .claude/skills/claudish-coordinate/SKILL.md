@@ -164,6 +164,8 @@ contexte et mesures : reference.md § Phase 4c, enquête #328.
   - 3-4 **de repli**, autonomes (mesures, docs), sans dépendance à un merge ni à une fenêtre.
   - Un grain bloqué donne `[BLOCKED] #NN — attend X`, et le worker passe au suivant.
 - Chaque grain porte son issue, un AC vérifiable et sa taille. `[CLAIMED] #NN` au démarrage.
+- Un grain qui tient seul s'écrit au gabarit `.github/ISSUE_TEMPLATE/grain.md` : le même texte sert une session
+  cloud (label `cloud-ready` + échéance) ou un worker. Règles : `docs/reference/delegation-protocol.md`.
 - **Cohérence** : une zone par worker, et deux files ne touchent pas les mêmes fichiers. Pas de PR empilée :
   un grain qui dépend d'un merge va en fin de file.
 - La file **se renouvelle** : le DM republie la file entière, pas un delta.
