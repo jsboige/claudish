@@ -101,6 +101,21 @@ def main():
     check("billing_fields_of still yields workload for live-consumption",
           got == {"sub": True, "workload": None}, got)
 
+    # --- the FULL mode reads `json.dumps(body)`, the leak-policy reads the
+    #     whole request FILE. Two different byte sources for one verdict —
+    #     they must agree, or the two paths drift again (#1051). The billing
+    #     header lives in `body.system`, so it survives the re-serialisation
+    #     (measured on 400 real captures: identical verdict, 400/400). ---
+    import json
+    body = {"system": [{"type": "text", "text": SUB_HDR}], "messages": []}
+    envelope = {"ts": "x", "machine": "myia-po-2024", "body": body}
+    check("verdict on json.dumps(body) == verdict on the whole file",
+          sf.subagent_flag(json.dumps(body)) == sf.subagent_flag(json.dumps(envelope)))
+    check("the echo in the body does not flip the verdict",
+          sf.subagent_flag(json.dumps(
+              {"system": [{"type": "text", "text": SUB_HDR},
+                          {"type": "text", "text": ECHO}], "messages": []})) is True)
+
     if FAILS:
         print(f"\n{len(FAILS)} FAILED: {FAILS}")
         raise SystemExit(1)
