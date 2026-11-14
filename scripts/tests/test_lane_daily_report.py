@@ -174,6 +174,28 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+print("main — CR N1 : chemin --refusal-log absent = une ligne stderr, pas un silence")
+import contextlib
+import io
+tmp2 = tempfile.mkdtemp(prefix="lane-report-n1-")
+try:
+    argv_backup, err, out = sys.argv, io.StringIO(), io.StringIO()
+    sys.argv = ["lane-daily-report.py", "--dir", tmp2,
+                "--refusal-log", os.path.join(tmp2, "absent.log")]
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = ldr.main()
+    finally:
+        sys.argv = argv_backup
+    check("exit 0 a chemin absent (un rapport vide est un rapport)", rc == 0)
+    check("une ligne stderr nomme le chemin (refus non lus != zero refus)",
+          "introuvable" in err.getvalue() and "absent.log" in err.getvalue(),
+          f"(stderr={err.getvalue()!r})")
+    check("le rapport reste rendu", "aucune requete" in out.getvalue(),
+          f"(stdout={out.getvalue()[:120]!r})")
+finally:
+    shutil.rmtree(tmp2, ignore_errors=True)
+
 print()
 if FAILS:
     print(f"FAILED: {len(FAILS)} -> {FAILS}")

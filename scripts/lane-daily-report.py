@@ -24,9 +24,12 @@ Deux sources, deux vérités complémentaires :
      sans horodatage comptent toutes (l'appelant maîtrise sa fenêtre via
      `docker logs --since`).
 
-Usage :
-  docker logs -t claudish-sidecar > %TEMP%/sidecar.log
-  python scripts/lane-daily-report.py --lane nb-coder --refusal-log %TEMP%/sidecar.log
+Usage (exporter le journal du NOEUD QUI ADMET — CR B2 : l'admission de lane
+tourne APRÈS le relais, donc pour un trafic relayé (client -> sidecar -> hub,
+NOMINAL) les lignes REFUSE sont dans le journal du HUB ; le sidecar ne les
+porte qu'en AUTONOMOUS) :
+  docker logs -t claudish-proxy > %TEMP%/refusals.log
+  python scripts/lane-daily-report.py --lane nb-coder --refusal-log %TEMP%/refusals.log
   python scripts/lane-daily-report.py --json            # toutes les lanes, 24 h
 
 Exit 0 même à vide (une lane silencieuse est un rapport, pas une erreur).
@@ -198,9 +201,15 @@ def main():
     cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=args.hours)
     report = build_report(args.dir, cutoff_dt, args.lane or None)
     refusals = {}
-    if args.refusal_log and os.path.exists(args.refusal_log):
-        with open(args.refusal_log, "r", encoding="utf-8", errors="replace") as fh:
-            refusals = parse_refusals(fh.read(), cutoff_dt, args.lane or None)
+    if args.refusal_log:
+        # CR N1 — un chemin absent lu en silence lirait « zero refus » : une
+        # ligne stderr, le rapport reste exact (refus non lus ≠ zéro refus).
+        if not os.path.exists(args.refusal_log):
+            print(f"lane-daily-report: --refusal-log introuvable, refus non lus : "
+                  f"{args.refusal_log}", file=sys.stderr)
+        else:
+            with open(args.refusal_log, "r", encoding="utf-8", errors="replace") as fh:
+                refusals = parse_refusals(fh.read(), cutoff_dt, args.lane or None)
 
     if args.json:
         print(json.dumps({
