@@ -294,6 +294,14 @@ services:
       # value (#304).
       - CLAUDISH_SESSION_BUDGET_CEILING=${CLAUDISH_SESSION_BUDGET_CEILING:-}
       - CLAUDISH_SESSION_BUDGET_WARN=${CLAUDISH_SESSION_BUDGET_WARN:-}
+      # #1055 g2 — harness-lane knobs (read-per-request; both inert unset):
+      # BUDGETS is the flat `lane/model:bar,lane:bar` list (a per-(lane,model)
+      # daily output-token bar, typed local 429 at the bar); STOP_DIR is a
+      # bind-mounted dir whose `<lane>` FILE is the operator emergency stop —
+      # a file, not an env value, because env is frozen at create (#310) and a
+      # stop must toggle without a recreate.
+      - CLAUDISH_LANE_BUDGETS=${CLAUDISH_LANE_BUDGETS:-}
+      - CLAUDISH_LANE_STOP_DIR=${CLAUDISH_LANE_STOP_DIR:-}
       # #431 — step-skip kill switch: "0" restores the pre-#431 behavior (an
       # overflowed/busy cascade step surfaces its recovery turn / waits
       # unbounded instead of skipping forward). Read-per-request.
