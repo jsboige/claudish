@@ -25,12 +25,18 @@ Artifact/Workflow deny on any machine" off this matrix, while ai-01, po-2024
 and po-2028 each carried all four entries in their live settings.json. The
 script now says so on every run (`permission_lines`/`permission_flags`).
 
-Usage: settings-matrix.py [--shared DIR] [--stale-hours 48] [--canon-stale-hours 24] [machine ...]
+Usage: settings-matrix.py [--shared DIR] [--stale-hours 48] [--canon-stale-hours 24]
+                          [--cascade-container NAME | --cascade-env-file PATH]
+                          [--cascade-canon FILE] [--show-cascade-values]
+                          [--write-cascade-canon FILE] [machine ...]
 """
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
+import re
+import subprocess
 
 DEFAULT_MACHINES = [
     "myia-ai-01", "myia-po-2023", "myia-po-2024", "myia-po-2025",
@@ -327,6 +333,171 @@ def permission_flags(snaps):
     return []
 
 
+# ---------------------------------------------------------------------------
+# Container cascades (#711 grain 2, Refs #764 criterion 7).
+#
+# The settings snapshots above say nothing about the budget-failover env of a
+# seat's container -- the values live at create time (#310), not in
+# settings.json. The coordinator's recurrent control is this section: read the
+# container's `CLAUDISH_FAILOVER_*` BY VALUE, publish ONE FINGERPRINT per
+# variable, and flag a deviation from the canon -- where the canon file is
+# produced by the seat that reads the hub (po-2025), never composed here
+# (#711 tenue: "le canon se lit sur le hub, par valeur, jamais ici").
+#
+# Two rules this section carries by construction:
+#   - it never prints a secret. The container's full `printenv` is filtered
+#     inside this process (CLAUDISH_PROXY_KEY, provider keys: dropped before
+#     anything can format them); a cascade VALUE is a model id, a role or a
+#     machine name, and even those are fingerprints unless
+#     --show-cascade-values is passed.
+#   - a count is never the test (the grain's own wording: "un changement de
+#     valeur a nombre de variables egal" must break). Comparison is
+#     name -> sha8(value); a count-equal edit still moves exactly one
+#     fingerprint.
+CASCADE_PREFIX = "CLAUDISH_FAILOVER_"
+FAILOVER_ROLES = ("opus", "sonnet", "haiku", "fable")
+# Decorators are role-SUFFIXED in the live container (`SONNET_LABEL`,
+# `FABLE_DIRECTION`, `FABLE_RESET`...), and the switch family is open
+# (`SESSION_DWELL_MS`, `ARM_AFTER`, `WALK_BUDGET_MS`...). So the cascades are
+# named POSITIVELY -- the four roles, nothing inferred -- and every other name
+# is treated as a switch/decorator. The inverse guess (anything not in a
+# hardcoded decorator list is a cascade) turned `SESSION_DWELL_MS=600000` into
+# a one-step cascade "600000", measured on the first real render, 14/11.
+_CASCADE_STEP_RE = re.compile(r"^(?:role:([a-z][a-z0-9_-]*)|[^\s>@]+@[^\s>]+)$")
+
+
+def fingerprint(value):
+    """8 hex chars -- enough to catch a one-token edit, short enough to read."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def parse_env_dump(text):
+    """`NAME=VALUE` lines -> {short_name: value}, `CLAUDISH_FAILOVER_*` ONLY.
+
+    Filtering happens here, in the process, so a credential living in the same
+    environment is never carried past this function -- the caller cannot print
+    what was never kept. The suffix (SONNET, HAIKU, ...) is the key, matching
+    the issue's table.
+    """
+    env = {}
+    for line in text.splitlines():
+        line = line.rstrip("\r")
+        name, sep, value = line.partition("=")
+        if not sep or not name.startswith(CASCADE_PREFIX):
+            continue
+        env[name[len(CASCADE_PREFIX):]] = value
+    return env
+
+
+def read_cascade_env(container):
+    """(env, error). `docker exec NAME printenv`, filtered by parse_env_dump.
+
+    A container read is a create-time snapshot (#310): it measures what the
+    running process holds, which is exactly what a cascade control needs.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", container, "printenv"],
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {}, "%r" % (exc,)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return {}, "docker exec exit %d (%s)" % (
+            proc.returncode, detail[-1][:160] if detail else "no output")
+    return parse_env_dump(proc.stdout), None
+
+
+def is_cascade(var):
+    """True only for the four role cascades -- never inferred by exclusion.
+
+    Env suffixes are UPPERCASE (`SONNET`); the role vocabulary is lowercase.
+    Comparing them as-is silently matched nothing, and every structural check
+    went quiet while the pins still had a green look -- measured 14/11.
+    """
+    return var.lower() in FAILOVER_ROLES
+
+
+def cascade_steps(value):
+    return [step.strip() for step in value.split(">")] if value else []
+
+
+def structural_flags(env):
+    """Canon-free checks: a cascade that cannot be what it claims to be.
+
+    These catch what a value comparison cannot name -- a typo'd role, a step
+    that is not a step, a LABEL/DIRECTION whose segment count no longer matches
+    its cascade (the hub's own 05/11 row checked exactly this).
+    """
+    flags = []
+    auto = env.get("AUTO")
+    if auto not in (None, "", "0", "1"):
+        flags.append("cascade AUTO = %s is neither 0 nor 1" % json.dumps(auto))
+    role_models = env.get("ROLE_MODELS")
+    if role_models:
+        for entry in role_models.replace(",", " ").split():
+            model_id, sep, role = entry.rpartition(":")
+            if not sep or not model_id:
+                flags.append("cascade ROLE_MODELS entry %s is not <id>:<role>"
+                             % json.dumps(entry))
+            elif role not in FAILOVER_ROLES:
+                flags.append("cascade ROLE_MODELS maps %s to unknown role %s"
+                             % (json.dumps(model_id), json.dumps(role)))
+    for var, value in sorted(env.items()):
+        if not is_cascade(var):
+            continue
+        steps = cascade_steps(value)
+        for step in steps:
+            match = _CASCADE_STEP_RE.match(step)
+            if not match:
+                flags.append("cascade %s: step %s is neither provider@model nor role:<r>"
+                             % (var, json.dumps(step)))
+            elif match.group(1) and match.group(1) not in FAILOVER_ROLES:
+                flags.append("cascade %s: delegates to unknown role %s"
+                             % (var, json.dumps(match.group(1))))
+        for family in ("LABEL", "DIRECTION"):
+            decorated = env.get("%s_%s" % (var, family))
+            if decorated and value and len(cascade_steps(decorated)) != len(steps):
+                flags.append(
+                    "cascade %s: %s_%s has %d segment(s) for %d step(s)"
+                    % (var, var, family, len(cascade_steps(decorated)), len(steps)))
+    return flags
+
+
+def canon_deviations(env, canon):
+    """Per-variable deviation against `{name: sha8}`. NEVER a count test.
+
+    Counts are equal in the failure this exists for: a one-token edit on a live
+    cascade keeps every name and every name's position.
+    """
+    flags = []
+    for name in sorted(set(env) | set(canon)):
+        if name not in env:
+            flags.append("cascade %s: declared in the canon, absent from the container" % name)
+        elif name not in canon:
+            flags.append("cascade %s: present in the container, undeclared in the canon" % name)
+        elif fingerprint(env[name]) != canon[name]:
+            flags.append("cascade %s: sha8 %s off canon %s"
+                         % (name, fingerprint(env[name]), canon[name]))
+    return flags
+
+
+def cascade_lines(env, show_values):
+    """One line per variable: fingerprint always, value only on request."""
+    if not env:
+        return ["  none declared (no %s* in the source)" % CASCADE_PREFIX]
+    lines = []
+    for name in sorted(env):
+        value = env[name]
+        line = "  %s sha8=%s %s" % (
+            name, fingerprint(value), "len=%d" % len(value) if value else "(empty)")
+        if show_values and value:
+            line += " = %s" % value
+        lines.append(line)
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--shared", default=os.environ.get("ROOSYNC_SHARED_PATH", ""))
@@ -338,6 +509,33 @@ def main():
              "(default 24, Refs #291)",
     )
     ap.add_argument("machines", nargs="*", default=DEFAULT_MACHINES)
+    ap.add_argument(
+        "--cascade-container", metavar="NAME",
+        help="also read the budget-failover env BY VALUE from this container "
+             "(`docker exec NAME printenv`, CLAUDISH_FAILOVER_* kept, the rest "
+             "dropped before it can be printed)",
+    )
+    ap.add_argument(
+        "--cascade-env-file", metavar="PATH",
+        help="same variables from a saved `printenv` dump (offline reading of a "
+             "seat's container, and the tests' seam -- no docker needed)",
+    )
+    ap.add_argument(
+        "--cascade-canon", metavar="PATH",
+        help="JSON {name: sha8} expected fingerprints; produced by the seat that "
+             "reads the hub (never composed here) and compared per variable -- "
+             "a count-equal value change still breaks",
+    )
+    ap.add_argument(
+        "--show-cascade-values", action="store_true",
+        help="print each cascade value next to its fingerprint (model ids, roles, "
+             "machine names -- never a credential)",
+    )
+    ap.add_argument(
+        "--write-cascade-canon", metavar="PATH",
+        help="write this source's fingerprints as a canon file (the hub-reading "
+             "seat's side of the loop)",
+    )
     args = ap.parse_args()
     if not args.shared:
         ap.error("--shared or ROOSYNC_SHARED_PATH is required")
@@ -402,6 +600,58 @@ def main():
         if len(values) > 1:
             spread = "; ".join(f"{v} x{len(ms)} ({', '.join(ms)})" for v, ms in values.items())
             flags.append(f"divergent {key}: {spread}")
+    if args.cascade_container and args.cascade_env_file:
+        ap.error("--cascade-container and --cascade-env-file are mutually exclusive")
+    if args.cascade_container or args.cascade_env_file:
+        source = args.cascade_container or args.cascade_env_file
+        print("=== cascade (%s)" % (
+            "container %s" % source if args.cascade_container else "env file %s" % source))
+        if args.cascade_container:
+            env, error = read_cascade_env(args.cascade_container)
+        else:
+            try:
+                with open(args.cascade_env_file, encoding="utf-8") as f:
+                    env, error = parse_env_dump(f.read()), None
+            except OSError as exc:
+                env, error = {}, "%r" % (exc,)
+        if error:
+            print("  UNREADABLE: %s" % error)
+            flags.append("cascade: source %s unreadable (%s)" % (source, error))
+        else:
+            for line in cascade_lines(env, args.show_cascade_values):
+                print(line)
+            flags.extend(structural_flags(env))
+            if args.cascade_canon:
+                try:
+                    with open(args.cascade_canon, encoding="utf-8") as f:
+                        canon = json.load(f)
+                    if not isinstance(canon, dict):
+                        raise ValueError("expected a {name: sha8} object")
+                except (OSError, ValueError) as exc:
+                    print("  canon: UNREADABLE %r" % (exc,))
+                    flags.append("cascade: canon file %s unreadable (%r)"
+                                 % (args.cascade_canon, exc))
+                else:
+                    print("  canon: %d fingerprint(s) from %s"
+                          % (len(canon), args.cascade_canon))
+                    flags.extend(canon_deviations(env, canon))
+            else:
+                print("  canon: none supplied (fingerprints only -- rerun with "
+                      "--cascade-canon to flag deviations)")
+            if args.write_cascade_canon:
+                try:
+                    with open(args.write_cascade_canon, "w", encoding="utf-8") as f:
+                        json.dump({k: fingerprint(v) for k, v in sorted(env.items())},
+                                  f, indent=2, sort_keys=True)
+                        f.write("\n")
+                except OSError as exc:
+                    flags.append("cascade: could not write canon %s (%r)"
+                                 % (args.write_cascade_canon, exc))
+                else:
+                    print("  canon written: %s" % args.write_cascade_canon)
+    elif args.cascade_canon or args.write_cascade_canon or args.show_cascade_values:
+        flags.append("cascade: --cascade-canon/--write-cascade-canon/--show-cascade-values "
+                     "given with no cascade source (--cascade-container or --cascade-env-file)")
     print("=== flags")
     for flag in flags or ["none"]:
         print(f"  - {flag}")
