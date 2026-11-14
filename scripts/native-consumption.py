@@ -69,7 +69,6 @@ import sys
 from datetime import datetime, timedelta
 
 USER_PATH_RE = re.compile(r"[\\/]+users[\\/]+[a-z_0-9-]+")
-SUB_RE = re.compile(r'"cc_is_subagent":\s*true')
 
 RESP_RE = re.compile(
     r"^resp-(\d+)-r\d+-(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-\d{2}-\d+Z-(.+)\.sse$")
@@ -174,9 +173,10 @@ def workspace_of(body_text):
 
 ENV_MACHINE_RE = re.compile(r'"machine":\s*"([^"]*)"')
 ENV_DEVICE8_RE = re.compile(r'"device_id8":\s*"([0-9a-f]{8})"')
-# Deux formes vues dans les captures : la cle JSON et le texte du bloc
-# billing-header (cc_is_subagent=true). Une seule suffit a signer le sous-agent.
-SUB_ANY_RE = re.compile(r'cc_is_subagent(?:"\s*:\s*|=)true')
+# #1051 — le predicat `cc_is_subagent` n'est PAS defini ici. Une seule copie
+# vit dans lib/subagent_flag.py : trois etats, segment x-anthropic-billing-
+# header seul, dernier segment gagne. Les deux copies locales avaient diverge,
+# et celle du mode complet matchait un echo du CLAUDE.md du depot.
 NO_MACHINE = "(sans machine)"
 
 
@@ -281,7 +281,7 @@ def leak_policy(resps, req_index, opus_home, workers=16):
     bodies = dict(zip(sub_paths, bs.read_heads(sub_paths, None, workers)))
     for machine, req_path in off_home:
         body = bodies.get(req_path)
-        if body is not None and SUB_ANY_RE.search(body):
+        if body is not None and _subagent_flag(body) is True:
             rows[machine]["sub"] += 1
 
     print("Leak-policy (#445) — reponses natives par machine "
@@ -310,17 +310,39 @@ def leak_policy(resps, req_index, opus_home, workers=16):
     return 0
 
 
-def _load_blind_spot():
-    """Declaration de l'angle mort AUTONOMOUS (#933) — lib partagee avec
-    traffic-consumption.py et billed-attrib.py, une seule copie."""
+def _load_lib(name):
+    """Charge une lib de scripts/lib/ — une copie par semantique, pas deux."""
     import importlib.util
     from pathlib import Path
 
-    p = Path(__file__).resolve().parent / "lib" / "blind_spot.py"
-    spec = importlib.util.spec_from_file_location("blind_spot", p)
+    p = Path(__file__).resolve().parent / "lib" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_blind_spot():
+    """Declaration de l'angle mort AUTONOMOUS (#933) — lib partagee avec
+    traffic-consumption.py et billed-attrib.py, une seule copie."""
+    return _load_lib("blind_spot")
+
+
+_SF = None
+
+
+def _subagent_flag(raw):
+    """Le predicat #1051, charge une fois par processus.
+
+    True / False / None. None (« aucune preuve dans ce texte ») ne compte
+    jamais comme un sous-agent : c'est la difference entre un zero mesure et
+    un zero devine. Les deux chemins (mode complet et --leak-policy) passent
+    par ICI — c'est tout l'objet de #1051.
+    """
+    global _SF
+    if _SF is None:
+        _SF = _load_lib("subagent_flag")
+    return _SF.subagent_flag(raw)
 
 
 def main():
@@ -466,7 +488,7 @@ def main():
             d["compact"] += 1
         elif lu.startswith("This session is being continued"):
             d["cont"] += 1
-        if SUB_RE.search(raw):
+        if _subagent_flag(raw) is True:
             d["sub"] += 1
         k = (device, w, "cron" if cron else "interactif")
         dev[k]["n"] += 1
@@ -488,7 +510,9 @@ def main():
           f"{'OUT tok':>11s} {'in frais':>10s} {'cache_read':>12s} "
           f"{'compact':>7s} {'continu':>7s}")
     print("  (marqC = marque cc_workload=cron SUR CETTE requete — voir piege 8 ;"
-          " sub = cc_is_subagent, signature leak-policy)")
+          " sub = cc_is_subagent=true dans le segment billing-header seulement —"
+          " un echo du CLAUDE.md ne compte pas, une absence d'en-tete reste"
+          " inconnue et ne compte pas non plus)")
     for w, d in sorted(ws.items(), key=lambda kv: -kv[1]["out"])[:a.top]:
         print(f"  {w:22s} {d['n']:5d} {d['cron']:5d} {d['int']:5d} {d['sub']:4d} "
               f"{d['out']:11,d} {d['in']:10,d} {d['cr']:12,d} "
