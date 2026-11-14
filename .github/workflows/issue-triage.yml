@@ -19,6 +19,7 @@ permissions:
 jobs:
   triage:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Skip if comment is from the bot itself (claudish-bot app)
     if: github.event_name != 'issue_comment' || github.event.comment.user.login != 'claudish-bot[bot]'
     env:

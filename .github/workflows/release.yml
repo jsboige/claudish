@@ -36,6 +36,7 @@ jobs:
             goarch: arm64
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -100,6 +101,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -212,6 +214,7 @@ jobs:
   publish-npm:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # OIDC trusted publishing - no NPM_TOKEN needed!
     # Configure at: https://www.npmjs.com/package/claudish/access (Trusted Publishers)
 
@@ -301,6 +304,7 @@ jobs:
   update-homebrew:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: ${{ vars.ENABLE_HOMEBREW == 'true' }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
