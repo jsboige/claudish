@@ -1,12 +1,14 @@
 /**
  * Shared helpers for ~/.claudish/all-models.json
  *
- * This file is written and read by three independent consumers:
+ * Runtime consumers of this file (every non-test importer of the module):
  *   - providers/catalog-resolvers/openrouter.ts (v2 authoritative — Firebase slim catalog)
- *   - cli.ts (fetchRemoteModels + printAllModels)
- *   - model-selector.ts (fetchAllModels + shouldRefreshForFreeModels)
+ *   - launcher/catalog-warm.ts
+ *   - providers/catalog-query.ts
+ *   - providers/model-catalog.ts
+ *   - adapters/model-catalog.ts
  *
- * (mcp-server.ts's search_models used to be a fourth, v1-shape writer; since
+ * (mcp-server.ts's search_models used to be a sixth, v1-shape writer; since
  * #1028 it reads and writes its own list file — providers/mcp-models-list.ts.)
  *
  * Historically each consumer wrote its own v1-shape `{lastUpdated, models}` blob,
@@ -18,9 +20,9 @@
  *     only supply `models` do NOT destroy the Firebase `entries` catalog.
  */
 
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { AggregatorEntry } from "../model-loader.js";
 
 /**
@@ -104,7 +106,10 @@ export interface CatalogCoverage {
  * forever.
  */
 export function allModelsCachePath(): string {
-  return (process.env.CLAUDISH_MODEL_CACHE_PATH ?? "").trim() || join(homedir(), ".claudish", "all-models.json");
+  return (
+    (process.env.CLAUDISH_MODEL_CACHE_PATH ?? "").trim() ||
+    join(homedir(), ".claudish", "all-models.json")
+  );
 }
 
 /**

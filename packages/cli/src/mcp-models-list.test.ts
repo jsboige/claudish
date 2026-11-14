@@ -144,7 +144,9 @@ describe("mcp-models-list (#1028)", () => {
     writeFileSync(shared, sharedBefore, "utf-8");
     const storedRows = [{ id: "vendor/stored", pricing: { prompt: "9" }, context_length: 8 }];
     const listBefore = JSON.stringify({
-      lastUpdated: new Date().toISOString(),
+      // Stale on purpose: a fresh list would early-return and never call the
+      // (failing) fetch, leaving the catch branch unpinned (review R1).
+      lastUpdated: isoDaysAgo(3),
       models: storedRows,
     });
     writeFileSync(list, listBefore, "utf-8");

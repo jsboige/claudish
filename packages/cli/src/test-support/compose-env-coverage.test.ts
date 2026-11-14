@@ -87,6 +87,10 @@ const EXEMPT: ReadonlyArray<{ name: string; why: string }> = [
     why: "gates the MCP stdio server (--mcp), a host-side process; no MCP server runs in the proxy container",
   },
   {
+    name: "CLAUDISH_MCP_MODELS_LIST_PATH",
+    why: "#1028 overrides the model-list file of the host-side search_models MCP server (--mcp); the proxy container never reads it",
+  },
+  {
     name: "CLAUDISH_CATALOG_TTL_HOURS",
     why: "launcher cache-warm CLI knob; the proxy reads CLAUDISH_CATALOG_URL, not the warm TTL",
   },

@@ -48,9 +48,9 @@ import {
   getDerivedContextLimit,
 } from "./providers/runtime-providers.js";
 import { claudishStatusHandler, renderCapabilities } from "./mcp-status-tools.js";
-// One cache path for the whole binary: a local constant here would drift from
-// the proxy the day CLAUDISH_MODEL_CACHE_PATH is set, and the MCP tool would
-// list a different catalog than the router resolves against.
+// Deliberately a SEPARATE file from the router's all-models.json (#1028): the
+// shapes differ (full OpenRouter rows here, v2 entries/coverage there), and the
+// old shared-file writes were clobbering each other.
 import { loadMcpModelsList } from "./providers/mcp-models-list.js";
 
 // Load environment variables. quiet is load-bearing here, not cosmetic: this
