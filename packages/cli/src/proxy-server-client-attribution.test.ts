@@ -232,7 +232,7 @@ async function spinHub(): Promise<void> {
 async function postMessages(headers: Record<string, string>): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers: { "content-type": "application/json", ...headers, "connection": "close" },
     body: JSON.stringify({
       model: "attr-anth@fake-model",
       max_tokens: 32,
@@ -245,7 +245,7 @@ async function postMessages(headers: Record<string, string>): Promise<Response> 
 async function postChatCompletions(headers: Record<string, string>): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json", ...headers },
+    headers: { "content-type": "application/json", ...headers, "connection": "close" },
     body: JSON.stringify({
       model: "attr-oai@fake-model",
       max_tokens: 32,

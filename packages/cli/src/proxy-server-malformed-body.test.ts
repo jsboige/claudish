@@ -63,7 +63,7 @@ const HEADERS: Record<string, string> = {
 async function postTo(path: string, body: string): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}${path}`, {
     method: "POST",
-    headers: HEADERS,
+    headers: { ...HEADERS, "connection": "close" },
     body,
   });
 }

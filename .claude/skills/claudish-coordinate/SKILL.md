@@ -1,24 +1,28 @@
 ---
 name: claudish-coordinate
-description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8h sous Opus) — files profondes aux workers, reviews/merges exigeants, santé hub/relais/sidecar, trafic et leak-policy Anthropic, arbitrages au user, bilan [DONE]. À invoquer au réveil du cron ou sur demande du user.
+description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8h, modèle choisi par le user) — files profondes aux workers, reviews/merges exigeants, santé hub/relais/sidecar, trafic et leak-policy Anthropic, arbitrages au user, bilan [DONE]. À invoquer au réveil du cron ou sur demande du user.
 ---
 
 # Cycle de coordination claudish — myia-ai-01
 
 > **Cœur opératoire.** Mesures, incidents et historiques : [`reference.md`](reference.md) — verbatim du
 > runbook au 12/10 (`45622fc6`), **non chargé** ; le lire par section pour justifier ou étendre une règle.
-> **Budget de ce fichier : ≤ 15 Ko** (EPIC #445) : un ajout = une ligne ici + son détail dans `reference.md`.
+> **Budget de ce fichier : ≤ 16 Kio** (EPIC #445, gate `harness-budget.test.ts`) : un ajout = une ligne ici + son détail dans `reference.md`.
 
 ## Cadence et mandats
 
 - **Cron `37 */8 * * *`** (heure locale : 00:37, 08:37, 16:37 — user 04/11, « passe stp sur un cycle de 8h pour
-  économiser les tokens Anthropic » ; 6 h depuis le 24/10), **sous Opus**. Le cron hérite du modèle de la
-  session qui l'arme : vérifier le modèle avant tout réarmement.
+  économiser les tokens Anthropic »). **Le modèle est le choix du user** : Opus depuis le 13/11 vers
+  13:15Z (même session, modèle changé au sélecteur), Fable le 13/11 au matin (id de rôle `claude-fable[1m]`,
+  sans version), Opus du 04/11 au 13/11. Le cron hérite du modèle de la session qui l'arme : vérifier le
+  modèle avant tout réarmement ; un changement au sélecteur dans la même session garde le même cron.
 - **La cadence appartient au user** (arbitrage de dépense — historique complet : reference.md § en-tête).
   Ne jamais la changer seul. Quand il la change : `CronCreate` **et** patch de ce fichier dans le même
   geste (la Phase 0 réarme à la valeur écrite ici).
 - Armé juste après un créneau, le cron **tire en rattrapage** (pas un double-fire) : mener ce cycle
   économiquement et le dire au bilan.
+- Cycle manuel du user avec un tir déjà en attente (`CronList` : prochain tir < 30 min) : `CronDelete` +
+  `CronCreate` à l'identique retire ce tir, un cycle économisé (#445, mesure : reference.md § Phase 0).
 
 **Mandat coordinateur (user, 18/09 — verbatim : reference.md § Cadence)** — endosser le rôle : faire avancer
 les issues en dispatchant du travail aux workers, avec des reviews et merges exigeants. À tenir chaque
@@ -50,6 +54,9 @@ silence : la corriger dans le geste qui la rend fausse.
 
 ## Le cycle
 
+Protocoles (règles payées par incident, à lire au moment d'agir) : review/merge → `docs/reference/review-protocol.md` ·
+chiffre ou verdict → `docs/reference/measurement-protocol.md` · relais/hub → `docs/reference/relay-diagnosis-protocol.md`.
+
 ### Phase 0 — Cron (entrée)
 
 `CronList`. Si le job est absent, le réarmer **immédiatement** :
@@ -70,6 +77,7 @@ seul le user ou un pair la voit.
 roosync_dashboard(action:"read", type:"workspace", section:"all")   # jamais section:"status" seul
 roosync_messages(action:"inbox", status:"unread", from:":claudish", limit:20)   # DMs des lanes claudish
 roosync_messages(action:"inbox", status:"unread", priority:"URGENT", limit:20)  # filet : URGENT de toute lane
+roosync_messages(action:"inbox", status:"unread", priority:"HIGH", limit:30)    # filet : HIGH d'une AUTRE lane adressé à `:claudish` (colonne À)
 ```
 
 - Lire l'inbox **avant** d'écrire une attente : un go attendu peut y dormir.
@@ -89,21 +97,15 @@ docker ps --format '{{.Names}}\t{{.Status}}'
 docker image inspect claudish-claudish-proxy --format 'created={{.Created}}'
 ```
 
-- `uptimeSec` ≈ 0 = restart ; s'il recule sans repartir de zéro, c'est un pas NTP.
-- **Un restart se diagnostique à l'échelle de l'hôte** :
-  `docker ps -q | xargs -r docker inspect --format '{{.State.StartedAt}}  {{.Name}}' | sort` — départs
-  groupés = daemon ou hôte (`LastBootUpTime`, System 41/6008/1074, `nvlddmkm`) ; un départ isolé seul rend
-  la question « qui ? » sensée.
-- **Une capture locale ne prouve pas une bascule** (un repli `[1/2]` en écrit aussi) : compter les épisodes
-  `\[Relay\] (upstream|forward failed)` de `docker logs claudish-sidecar --tail 800 --timestamps`, fenêtre
-  bornée. Une bascule mesure la joignabilité, pas la vie : sans preuve hub-side, « attribution hub non établie ».
-- Causes à écarter d'abord : compaction nocturne du hub (`compaction.log`, ~00:47Z → 02-03Z) ; restart
-  proactif du watchdog (03:00-06:00 locale) ; deploys et recreates annoncés.
-
-  Seul un épisode sans cause mérite une enquête.
+- `uptimeSec` ≈ 0 = restart (recul sans zéro = pas NTP). **Un restart se diagnostique à l'échelle de
+  l'hôte** (départs groupés = daemon ou hôte) ; **une capture locale ne prouve pas une bascule** (compter les
+  épisodes `[Relay]`, sans preuve hub-side « attribution hub non établie ») — commandes : reference.md § Phase 2.
+- Causes à écarter d'abord : compaction nocturne du hub (~00:47Z → 02-03Z), restart proactif du watchdog
+  (03:00-06:00 locale), deploys et recreates annoncés. Seul un épisode sans cause mérite une enquête.
 - **`settings.json` de chaque machine (user 20/10, mandat répété)** : `scripts/settings-matrix.py`
   (instantanés RooSync ; il imprime ses drapeaux) + la ligne de forme postée par chaque lane. Je dois
-  savoir ce que contient chaque fichier (reference.md).
+  savoir ce que contient chaque fichier. Un drapeau d'instantané n'est pas une mesure : la ligne live
+  de la lane avant tout `[ASK]` (reference.md).
 
 ### Phase 3 — Trafic et leak-policy
 
@@ -114,11 +116,10 @@ avec `--tail N` (N ≤ 800) et borner la fenêtre (reference.md § Phase 3).
 Règles de verdict :
 - **Jamais de leak-policy depuis les logs du sidecar** : en NOMINAL, il est muet sur mon propre trafic. La
   source est le **corpus hub** (SMB, lecture seule). Écrire « à travers claudish », jamais « ailleurs ».
-- **Facturé Anthropic = le backend qui a servi** (`resp-*-native-*.sse`), pas le modèle demandé.
-  Attribution : 300 premiers octets de `req-*.json` ; pièges de lecture (pas de retour ligne,
-  `rNNNN` remis à zéro, archive sans machine) : reference.md § Phase 3.
-- **Le seau `machine=""`** (le relais préserve l'en-tête, il ne le pose jamais) ne doit contenir **aucun
-  Opus** avant un verdict. Contrôle de complétude : en-têtes extraits == `req-*` annoncés.
+- **Verdict en une commande (#445)** : `python scripts/native-consumption.py --leak-policy --since <J>T<HH>
+  --captures-dir //192.168.0.50/d$/claudish-captures`. Facturé = le backend qui a servi (`resp-*-native-*`),
+  appariement par l'en-tête de la réponse (le rang `rNNNN` n'est pas une clé). **Exit 3 = verdict refusé** :
+  Opus sans machine (le relais préserve l'en-tête, il ne le pose jamais) ou non apparié. Archives : reference.md § Phase 3.
 - **Transcripts** : dédupliquer par `message.id` (les `agent-*.jsonl` rejouent ~2,5×) ; motif sans
   `[1m]` et sens attendu (hub ≥ transcripts) : reference.md § Phase 3.
 
@@ -130,7 +131,7 @@ Sonnet/GLM ou Haiku/MiniMax ; une 6ᵉ lane n'est pas une faute d'office, mais e
   Opus. Boucle de détection : reference.md § Phase 3.
 - **Inter-machines (user 20/10)** : aucune restriction en dur, chaque machine s'authentifie elle-même ; Opus
   hors ai-01 reste exceptionnel (durable : CoursIA-3 seul ; po-2025 20/10 = temporaire autorisé, suivi jusqu'au retour). Signaler un Opus qui **dure** hors ai-01, pas
-  un usage ponctuel. Sous-agent : `cc_is_subagent=true`, dans le corps de la requête.
+  un usage ponctuel.
 
 **Burst ou mur** : lire `D:\claudish-captures\upstream-errors.log`. Le code `1308` est un mur (il arme la
 cascade), `1302` un burst (il ne l'arme pas). Rapporter « N requêtes rendues en 429 », pas « N agents
@@ -147,7 +148,12 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 - **Collisions** : tous poussent sous `jsboige`, donc comparer les `files`, pas les titres.
 - **Avant review ou merge** :
   - vérifier `Closes #NN` dans le body **et** dans les commits de branche (`git log origin/main..<branche>`) ;
-  - rejouer en local ; le job CI `test` peut sortir « success » avec des échecs : lire ses compteurs ;
+  - rejouer en local ; les checks `test` (#934) et `typecheck` (#982, packages/cli seul, bridge : #981) du
+    workflow `Test` bloquent et font foi **pour la suite bun et le typecheck cli** (ni Pester, ni
+    `test:scripts:py` : `scripts/` se rejoue ici, sous pwsh 7 et 5.1), `claude-code` jamais ; PR sans run
+    `pull_request` → `gh workflow run test.yml --ref <branche>` ;
+  - un AC « N runs verts » compte les exécutions par `started_at` : un rerun des jobs en échec recopie le
+    vert des autres (reference.md § Phase 4) ;
   - faire tourner une mutation sur chaque garde ajoutée.
   - Pas de merge sur un CR non adressé. Mes CR sont des **commentaires** : écrire « attend TON push » dans
     la file du worker.
@@ -155,13 +161,16 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 ### Phase 4c — Dispatch : file profonde par worker
 
 Mandats user 04/10 (plusieurs grains par worker et par cycle) et 05/10 (deep queues, passage à 12 h) —
-contexte et mesures : reference.md § Phase 4c, enquête #328.
+contexte et mesures : reference.md § Phase 4c, enquête #328. Ce qui entre dans la file (objectifs, grain
+de consolidation, commentaire de tenue d'une issue) : `docs/reference/coordination-program.md`.
 
 - **~10 grains ordonnés par worker** :
   - 6-7 principaux : retours de review d'abord, puis sa zone par priorité ;
   - 3-4 **de repli**, autonomes (mesures, docs), sans dépendance à un merge ni à une fenêtre.
   - Un grain bloqué donne `[BLOCKED] #NN — attend X`, et le worker passe au suivant.
 - Chaque grain porte son issue, un AC vérifiable et sa taille. `[CLAIMED] #NN` au démarrage.
+- Un grain qui tient seul s'écrit au gabarit `.github/ISSUE_TEMPLATE/grain.md` : le même texte sert une session
+  cloud (label `cloud-ready` + échéance) ou un worker. Règles : `docs/reference/delegation-protocol.md`.
 - **Cohérence** : une zone par worker, et deux files ne touchent pas les mêmes fichiers. Pas de PR empilée :
   un grain qui dépend d'un merge va en fin de file.
 - La file **se renouvelle** : le DM republie la file entière, pas un delta.
@@ -169,22 +178,15 @@ contexte et mesures : reference.md § Phase 4c, enquête #328.
 
 ### Phase 4b — Consoles fournisseurs (1 relevé/jour suffit)
 
-Onglets ouverts par le user dans le Playwright Edge d'ai-01 ; URLs verbatim dans
-`C:\Users\MYIA\.claudish-browser\provider-consoles-urls.json` (ne jamais les deviner ni les modifier).
-- Lancer `C:\Users\MYIA\.claudish-browser\provider-consoles-reader.py` **détaché** (hors dépôt, propre à
-  ai-01). Relevé valide seulement si `read` = 11 dans `readings\_pass.txt`. Puis
-  `python scripts/console-tabs.py publish` (copie Drive lue par les autres sièges, user 04/11).
-- Chiffres d'usage seulement, **dashboard interne seulement** (jamais GitHub — seuls des ratios dérivés
-  vont en #405) ; aucun clic dans les fenêtres du user ; lire la période de chaque console avant toute
-  addition.
-
-Détail et pièges (ctx.pages, réauthentification, périodes) : reference.md § Phase 4b.
+`C:\Users\MYIA\.claudish-browser\provider-consoles-reader.py` lancé **détaché** ; relevé valide seulement si
+`read` = 11 dans `readings\_pass.txt`, puis `python scripts/console-tabs.py publish` (copie Drive, user 04/11).
+Chiffres d'usage, **dashboard interne seulement** (ratios dérivés seuls en #405) ; jamais une URL devinée ni
+un clic dans les fenêtres du user. URLs, `ctx.pages`, réauthentification, périodes : reference.md § Phase 4b.
 
 ### Phase 5 — Arbitrages au user
 
-Registre `memory/open-questions-ledger.md`. Toute question non bloquante y vit, au format : ce qui se
-passe · ce qui est demandé · ce qui arrive sans réponse · la reco · l'échéance. Elle n'en sort **que sur
-réponse du user** et se représente en Phase 6. On n'attend jamais une réponse pour exécuter.
+Registre `memory/open-questions-ledger.md` (règles et format : CLAUDE.md global § User Arbitration),
+représenté en Phase 6.
 
 ### Phase 5b — Contrôle des gestes (mandat user 07/09)
 
@@ -192,9 +194,7 @@ réponse du user** et se représente en Phase 6. On n'attend jamais une réponse
   onboarding provider, probe qui consomme du budget) passe par un `[PROPOSAL]` — objectif, commandes
   exactes, rayon d'impact, rollback, état attendu — puis attend mon `[ACK]` (il suffit, user 23/09 ; le
   plan d'exécution reste un artefact obligatoire). **Chaque cycle : scanner et trancher les `[PROPOSAL]`
-  en attente.**
-- **Infra d'un autre workspace** : demander, ne pas appliquer. En urgence : agir, puis poster excuse et
-  explication sur le dashboard du propriétaire dans le même cycle.
+  en attente**, par `roosync_dashboard` read et l'inbox : le fichier GDrive du dashboard retarde (reference.md).
 - **Urgence** (flotte à l'arrêt) : agir, `[INCIDENT]` + post-mortem ≤ 1 h, validation ex-post.
 - **Preuves post-restart du hub (≤ 15 min)** : la ligne `[Failover] configured=N auto=on`, `/health`,
   `test -f` sur chaque bind fichier, et le relais NOMINAL.
@@ -226,7 +226,6 @@ s'endormir sans cron, ni écrire « garanti jusqu'au prochain cycle ».
 - La section « status » du dashboard est une synthèse, et sa condensation fabrique des faits : vérifier à la
   source.
 - Silence ≠ DOWN ; un code retour n'est pas un diagnostic ; un label de log n'est pas une taxonomie.
-- En NOMINAL, un sidecar sert ~0 requête locale : un zéro n'est pas un script cassé.
 - `codebase_search` : aucune collection pour `d:/claudish` → grounding technique + conversationnel.
 - Sessions précédentes : dizaines de Mo → `conversation_browser` avec `smart_truncation` et des bornes.
 

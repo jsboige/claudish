@@ -83,6 +83,9 @@ skill **`worker-issues`**.
 Les 5 règles dures : `CLAUDE.md` §« Fleet-Rollout Verification » — quasi
 verbatim, chargé dans ce workspace.
 
+Avant d'ouvrir une PR : `docs/reference/review-protocol.md` (ce que la review vérifiera).
+Avant de publier un chiffre ou un verdict : `docs/reference/measurement-protocol.md`.
+
 ## Harness partagé
 
 Le harness vit dans CE dépôt (`.claude/`, plus gitignoré en bloc — seuls `worktrees/`

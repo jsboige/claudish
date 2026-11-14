@@ -825,6 +825,79 @@ Describe 'off-site sha256 manifest (#389) — engine functions' {
         } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
     }
 
+    It 'a four-argument call still writes exactly the four legacy fields, byte for byte (#872)' {
+        # -Extra is optional for a reason: every line already sitting in a fleet
+        # manifest was written by a four-argument call. Adding the parameter must
+        # not reshape that history, or next Sunday's re-read becomes a migration.
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            $null = Update-ShaManifest -Path $p -Archive 'captures-2026-10-05-po-2024.7z' -Sha256 ('A' * 64) -Bytes 6 -RecordedUtc '2026-10-06T02:47:11Z'
+            # @() matters: on a one-line file Get-Content returns a single string,
+            # and [0] on a string is its first CHARACTER, not its first line.
+            $raw = @(Get-Content -LiteralPath $p)[0]
+            $raw | Should -BeExactly ('{"archive":"captures-2026-10-05-po-2024.7z","sha256":"' + ('A' * 64) + '","bytes":6,"recorded":"2026-10-06T02:47:11Z"}')
+            @(($raw | ConvertFrom-Json).PSObject.Properties.Name).Count | Should -Be 4
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'carries extras through a round-trip, after the four base fields and sorted by name (#872)' {
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            $null = Update-ShaManifest -Path $p -Archive 'a.7z' -Sha256 ('b' * 64) -Bytes 7 -RecordedUtc '2026-10-06T02:47:11Z' `
+                     -Extra @{ source = 'deposit'; previous_sha = ('c' * 64); motif = 'drift' }
+            $raw = @(Get-Content -LiteralPath $p)[0]
+            $o = $raw | ConvertFrom-Json
+            $o.archive      | Should -Be 'a.7z'
+            $o.source       | Should -Be 'deposit'
+            $o.previous_sha | Should -Be ('c' * 64)
+            $o.motif        | Should -Be 'drift'
+            # Order is asserted on the RAW line, not on the parsed object: 5.1's
+            # ConvertFrom-Json does not promise to keep document order, so a
+            # parsed-order pin would be measuring the instrument.
+            $iRec = $raw.IndexOf('"recorded"')
+            $iMot = $raw.IndexOf('"motif"')
+            $iPre = $raw.IndexOf('"previous_sha"')
+            $iSrc = $raw.IndexOf('"source"')
+            $iRec | Should -BeLessThan $iMot          # extras never split the base four
+            $iMot | Should -BeLessThan $iPre          # sorted: motif < previous_sha < source
+            $iPre | Should -BeLessThan $iSrc          # a hashtable enumerates in no order, the writer must
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'upserting one archive leaves the extras of its siblings intact (#872)' {
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            $null = Update-ShaManifest -Path $p -Archive 'a.7z' -Sha256 ('a' * 64) -Bytes 1 -RecordedUtc 't1' `
+                     -Extra @{ source = 'deposit'; motif = 'drift' }
+            $null = Update-ShaManifest -Path $p -Archive 'b.7z' -Sha256 ('b' * 64) -Bytes 2 -RecordedUtc 't2' `
+                     -Extra @{ source = 'rotate'; previous_sha = ('9' * 64) }
+            $beforeB = @(Get-Content -LiteralPath $p)[1]
+            # a retried night re-deposits A with a narrower extras set
+            $null = Update-ShaManifest -Path $p -Archive 'a.7z' -Sha256 ('d' * 64) -Bytes 1 -RecordedUtc 't3' `
+                     -Extra @{ source = 'deposit' }
+            $m = Read-ShaManifest -Path $p
+            $m.Entries.Count | Should -Be 2
+            $m.Entries['a.7z'].sha256 | Should -Be ('d' * 64)
+            $m.Entries['a.7z'].source | Should -Be 'deposit'
+            # an upsert REPLACES its own record: the dropped extra is gone, not merged in
+            @($m.Entries['a.7z'].PSObject.Properties.Name) -contains 'motif' | Should -BeFalse
+            # the sibling keeps every extra, and its line is byte-identical (same position, same bytes)
+            $m.Entries['b.7z'].sha256       | Should -Be ('b' * 64)
+            $m.Entries['b.7z'].source       | Should -Be 'rotate'
+            $m.Entries['b.7z'].previous_sha | Should -Be ('9' * 64)
+            @(Get-Content -LiteralPath $p)[1] | Should -BeExactly $beforeB
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'refuses an extra that would overwrite a base field, before touching the file (#872)' {
+        $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
+        try {
+            { Update-ShaManifest -Path $p -Archive 'a.7z' -Sha256 ('a' * 64) -Bytes 1 -RecordedUtc 't1' `
+                -Extra @{ sha256 = 'deadbeef' } } | Should -Throw '*overwrite a base manifest field*'
+            Test-Path -LiteralPath $p | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+
     It 'skips a torn manifest line and counts it, without blinding the rest' {
         $p = Join-Path ([System.IO.Path]::GetTempPath()) ("sha-man-{0}.jsonl" -f ([guid]::NewGuid().ToString('N')))
         try {
@@ -1290,6 +1363,9 @@ exit /b 0
             $rec.bytes | Should -Be 6
             # the reference is the hash of what the DESTINATION holds, not a wish
             $rec.sha256 | Should -Be ((Get-FileHash -LiteralPath (Join-Path $gd "captures-$($day)-testbox.7z") -Algorithm SHA256).Hash)
+            # #872: the record says where it came from, so the next reader does not
+            # have to infer a deposit from a hash diff.
+            $rec.source | Should -Be 'deposit'
         } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
@@ -1346,6 +1422,86 @@ exit /b 0
         } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
+    # #872 step 2: on a seeded record, LastWriteTime < recorded means the bytes
+    # predate the hash (the entry does not describe this file) -> SEED MISMATCH.
+    # A rewrite AFTER recording is real drift (the re-seed read the bytes twice)
+    # -> CONTENT DRIFT, and a deposit never earns the seed label whatever its
+    # file mtime. All three stay loud ERROR + non-zero; only the class differs.
+    It 'reseed + file whose bytes predate the recorded hash is named SEED MISMATCH, not CONTENT DRIFT' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd   # night 1: upload + deposit record
+            $name = "captures-$($day)-testbox.7z"
+            # Rewrite the deposit record as a seeded one, recorded NOW.
+            $rec = [ordered]@{
+                archive = $name
+                sha256 = (Get-FileHash -LiteralPath (Join-Path $gd $name) -Algorithm SHA256).Hash
+                bytes = (Get-Item -LiteralPath (Join-Path $gd $name)).Length
+                recorded = ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                source = 'reseed'
+            }
+            [System.IO.File]::WriteAllText((Join-Path $gd 'captures-sha256-testbox.jsonl'), ($rec | ConvertTo-Json -Compress) + "`n", (New-Object System.Text.UTF8Encoding($false)))
+            # The drift: different bytes, LastWriteTimeUtc pushed BEFORE the recorded
+            # instant (the honest construction of "the bytes predate the hash").
+            [System.IO.File]::WriteAllText((Join-Path $gd $name), 'DRIFT!')
+            (Get-Item -LiteralPath (Join-Path $gd $name)).LastWriteTimeUtc = [datetime]::UtcNow.AddDays(-2)
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd   # night 2: re-check runs
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0
+            $log | Should -Match 'SEED MISMATCH'
+            $log | Should -Not -Match 'CONTENT DRIFT'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'reseed + file rewritten after the recorded instant stays CONTENT DRIFT (the re-seed read those bytes)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $name = "captures-$($day)-testbox.7z"
+            $rec = [ordered]@{
+                archive = $name
+                sha256 = (Get-FileHash -LiteralPath (Join-Path $gd $name) -Algorithm SHA256).Hash
+                bytes = (Get-Item -LiteralPath (Join-Path $gd $name)).Length
+                recorded = ((Get-Date).ToUniversalTime().AddDays(-1).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                source = 'reseed'
+            }
+            [System.IO.File]::WriteAllText((Join-Path $gd 'captures-sha256-testbox.jsonl'), ($rec | ConvertTo-Json -Compress) + "`n", (New-Object System.Text.UTF8Encoding($false)))
+            # Rewrite NOW: LastWriteTimeUtc > recorded by construction.
+            [System.IO.File]::WriteAllText((Join-Path $gd $name), 'DRIFT!')
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0
+            $log | Should -Match 'CONTENT DRIFT'
+            $log | Should -Not -Match 'SEED MISMATCH'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'deposit + file older than its record stays CONTENT DRIFT (the seed label is reserved to source=reseed)' {
+        $tmp = New-GuardSandbox
+        try {
+            $cap = Join-Path $tmp 'cap'; $gd = Join-Path $tmp 'gd'
+            $day = Add-LooseCapture -CaptureDir $cap -DaysBack 2
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd   # deposit record (source=deposit)
+            $name = "captures-$($day)-testbox.7z"
+            # Drifted bytes with an mtime pushed before the recorded instant: the
+            # deposit guard must keep CONTENT DRIFT regardless of the file mtime.
+            [System.IO.File]::WriteAllText((Join-Path $gd $name), 'DRIFT!')
+            (Get-Item -LiteralPath (Join-Path $gd $name)).LastWriteTimeUtc = [datetime]::UtcNow.AddDays(-2)
+            $null = Add-LooseCapture -CaptureDir $cap -DaysBack 1
+            Invoke-CompactionRun -CaptureDir $cap -GDriveDir $gd
+            $log = Get-Content (Join-Path $cap 'compaction.log') -Raw
+            $LASTEXITCODE | Should -BeGreaterThan 0
+            $log | Should -Match 'CONTENT DRIFT'
+            $log | Should -Not -Match 'SEED MISMATCH'
+        } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
     It 'wiring: the re-check block sits between the re-upload pass and the retention purge' {
         $text = Get-Content -LiteralPath $script:ScriptPath -Raw
         $reup   = $text.IndexOf('re-upload pass')
@@ -1361,5 +1517,13 @@ exit /b 0
         # 2 deposits (fresh + re-upload) + 2 readers (the nightly re-check, and the
         # #418 quarantine purge, which reuses the deposit record as its proof).
         @([regex]::Matches($text, 'Get-ShaManifestPath')).Count | Should -Be 4
+    }
+
+    It 'wiring: BOTH deposit sites declare source=deposit (#872)' {
+        $text = Get-Content -LiteralPath $script:ScriptPath -Raw
+        # Textual on purpose: the re-upload site is only reached on a repair night,
+        # so an end-to-end night cannot pin it without simulating a missing copy.
+        @([regex]::Matches($text, 'Update-ShaManifest')).Count | Should -Be 2
+        @([regex]::Matches($text, "-Extra @\{ source = 'deposit' \}")).Count | Should -Be 2
     }
 }

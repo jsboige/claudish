@@ -33,14 +33,14 @@ import {
   validateVertexOAuthConfig,
 } from "../auth/vertex-auth.js";
 import { ComposedHandler } from "../handlers/composed-handler.js";
-import type { ModelHandler } from "../handlers/types.js";
+import { getRuntimeProfiles } from "./runtime-providers.js";
 import { log, logStderr } from "../logger.js";
 import { formatProvenanceLog, resolveCredentialProvenance } from "./api-key-provenance.js";
+import type { ModelHandler } from "../handlers/types.js";
 import { ensureRouteRegistryReady } from "./catalog-client.js";
 import { declaredConnection, declaredWire } from "./declared-wire.js";
 import { ownerWireForModel } from "./meta-muse/muse-wire.js";
 import { getProviderByName } from "./provider-definitions.js";
-import { getRuntimeProfiles } from "./runtime-providers.js";
 import { AnthropicProviderTransport } from "./transport/anthropic-compat.js";
 import { AntigravityProviderTransport } from "./transport/antigravity.js";
 import { DevinProviderTransport } from "./transport/devin.js";

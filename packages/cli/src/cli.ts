@@ -65,7 +65,12 @@ import { describeMuseSigningSource } from "./providers/meta-muse/muse-credential
 import { parseModelChain, parseModelSpec } from "./providers/model-parser.js";
 import { NATIVE_NOT_PROBED } from "./providers/native-route.js";
 import { fetchOllamaModels } from "./providers/ollama-discovery.js";
-import { type ProbeResult, describeProbeState, probeLink } from "./providers/probe-live.js";
+import {
+  type ProbeResult,
+  describeProbeState,
+  probeLink,
+  resolveProbeProxyKey,
+} from "./providers/probe-live.js";
 import { type ProbeTarget, describeDropped, probeTargets } from "./providers/probe-runner.js";
 import {
   BUILTIN_PROVIDERS,
@@ -1724,11 +1729,18 @@ async function probeModelRouting(
   }
 
   /** One live request down one kept hop. `probeSpec` is final, so no second pinning. */
-  function probeTarget(proxyUrl: string, target: ProbeTarget): Promise<ProbeResult> {
+  function probeTarget(
+    proxyUrl: string,
+    target: ProbeTarget,
+    // #930 — forwarded to `probeLink` so the probe authenticates like a local
+    // client on a key-enforcing seat (see its own doc block).
+    proxyKey?: string
+  ): Promise<ProbeResult> {
     return probeLink(
       proxyUrl,
       { provider: target.provider, modelSpec: target.probeSpec, hasCredentials: true },
-      options.timeoutMs
+      options.timeoutMs,
+      proxyKey
     ).catch(
       (e): ProbeResult => ({
         state: "error",
@@ -1891,6 +1903,9 @@ async function probeModelRouting(
         liveProxy = null;
       }
     }
+    // #930 — the probe proxy enforces the seat's proxyKeys; the probe must
+    // authenticate like a local client or it 401s itself on every rung.
+    const probeProxyKey = resolveProbeProxyKey(process.env, loadConfig());
 
     try {
       const results: ChainProbe[] = [];
@@ -1902,7 +1917,7 @@ async function probeModelRouting(
         if (liveProxy) {
           const url = liveProxy.url;
           const probes = await Promise.all(
-            probe.targets.map(({ target }) => probeTarget(url, target))
+            probe.targets.map(({ target }) => probeTarget(url, target, probeProxyKey))
           );
           probe.targets.forEach(({ link }, i) => {
             link.probe = probes[i];
@@ -2001,6 +2016,9 @@ async function probeModelRouting(
         liveProxy = null;
       }
     }
+    // #930 — same resolution as the JSON path: the probe proxy enforces the
+    // seat's proxyKeys, so the probe authenticates like a local client.
+    const probeProxyKey = resolveProbeProxyKey(process.env, loadConfig());
 
     // Step 2: The routing decision per model — explainRoute loads the rules
     // itself, so it can name the scope of the rule that matched.
@@ -2074,7 +2092,7 @@ async function probeModelRouting(
       await Promise.all(
         liveRows.map(async ({ id, target, link }) => {
           updateLink(id, { status: "probing", startTime: Date.now() });
-          const result = await probeTarget(url, target);
+          const result = await probeTarget(url, target, probeProxyKey);
           if (result.state === "live") {
             updateLink(id, { status: "live", endTime: Date.now(), timing: result.timing });
           } else {

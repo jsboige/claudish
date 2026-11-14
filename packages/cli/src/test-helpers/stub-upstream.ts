@@ -16,6 +16,11 @@
 
 export type StubFormat = "openai-sse" | "anthropic-sse" | "openai-responses-sse";
 
+// #1019: every message_start construction seeds both cache counters — a test
+// stub included, so a parser wired against this stub can never mistake "no
+// cache fields" for a legal shape.
+import { messageStartUsage } from "../handlers/shared/stream-parsers/message-start-usage.js";
+
 export type StubPart =
   | { text: string }
   | { thinking: string }
@@ -125,7 +130,7 @@ function anthropicEvents(r: StubResponse, model: string): string[] {
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 10, output_tokens: 0 },
+          usage: messageStartUsage(10),
         },
       },
       "message_start"

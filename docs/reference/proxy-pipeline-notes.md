@@ -321,3 +321,13 @@ never refuses locally (a stale literal must not veto what the engine serves). Th
 extra round-trip per banded request on an endpoint that has a tokenizer — deliberately not cached
 beyond the 404 memo, because the prompt differs every time; paying a ~1 ms local tokenize to avoid
 a full prefill that 400s is the trade #739 measured.
+
+## Upstream request compression (#909)
+
+The proxy gzips **request bodies** toward providers whose ingress decodes them — the WAN-constrained direction (fleet-measured p50 ≈ 864 KB, max 1.18 MB). Claude Code itself sends gzipped large requests to api.anthropic.com in production (anthropics/claude-code#103218), which is why the **Anthropic native lane** is the only lane carrying the capability today. The **response path is never gzipped** — never-hang rules own that side entirely.
+
+- Capability is per-transport (`ProviderTransport.requestCompression: "gzip"`), set only on probed lanes (matrix on #909, recorded before any flip). A transport without the field can never emit `content-encoding: gzip` — pinned by wire tests in `handlers/shared/upstream-compression.test.ts` (stub-fetch, #604 rules), with mutation-proven pins at both call sites (`ComposedHandler.doFetch` + the 401-auth retry that rebuilds headers, and the native fetch).
+- Size floor `CLAUDISH_UPSTREAM_COMPRESS_MIN_BYTES` (default 16384): below it the body goes out plain — small turns pay no gzip tax. A **no-gain guard** sends the plain body when gzip would not shrink it (incompressible payloads: base64 media).
+- Kill switch `CLAUDISH_UPSTREAM_COMPRESS=0`, read **per request**; `""` (the compose `${VAR:-}` trap) means unset, i.e. enabled. Both names ride docker-compose `environment:` (compose-env-coverage gate).
+- Countability: every compression emits `[UpstreamCompress] <provider> <model> in=<n>B wire=<m>B (<p>%) ms=<n.n>` via logStderr — the per-provider saving is greppable in docker logs (AC-4's week-of-hub-traffic measurement reads these lines; `bytes_in` in captures keeps the pre-compression size, #763). `ms=` is the `gzipSync` CPU cost on the same call (hub p50 ≈ 8 ms for ~900 KB bodies), so the report reads a COST beside the byte gain; it is appended last so the older shape still matches, and the pins refuse a hardcoded value as well as one measured outside the call.
+- Failure semantics: a gzip error degrades to the plain body — compression can never stall or fail a turn.

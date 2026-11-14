@@ -28,7 +28,13 @@ export interface RecoveryEpisodeFrame {
   host: string;
   /** The endpoint that actually failed; the AUTH host on an auth-path failure. */
   endpoint: string;
-  kind: "dns" | "refused" | "unreachable";
+  /**
+   * Mirrors `ConnectionErrorKind` by value, not by import (this module stays
+   * import-free). `"closed"` (#251) is the reached-then-dropped class — an
+   * episode born from an ECONNRESET carries it, and the banner sentence
+   * (`buildConnectionErrorMessage`) already words it as the provider's fault.
+   */
+  kind: "dns" | "refused" | "unreachable" | "closed";
   code: string | null;
   loopback: boolean;
   /** `buildConnectionErrorMessage(...)` verbatim — the SAME sentence the inline 400 carries. */

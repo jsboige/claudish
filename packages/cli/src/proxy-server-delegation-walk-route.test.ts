@@ -151,7 +151,7 @@ function resetCascade(extra: Record<string, string> = {}): void {
 async function postHaiku(): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", "connection": "close" },
     body: JSON.stringify({
       model: "claude-haiku-4-5",
       max_tokens: 64,

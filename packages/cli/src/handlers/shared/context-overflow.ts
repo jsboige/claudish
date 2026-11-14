@@ -28,6 +28,7 @@
  * (a774f817) + #610 (8bb52c70) + #651/#660 (caps block).
  */
 
+import { messageStartUsage } from "./stream-parsers/message-start-usage.js";
 import {
   type OverflowCapRecord,
   overflowCapsPath,
@@ -414,7 +415,14 @@ export function buildOverflowRecoveryStream(
             content: [],
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: inputTokens, output_tokens: 0 },
+            // #1019 / #179 rule (b): the seed carries BOTH cache counters at
+            // an explicit 0. The client merges usage per key and sums the
+            // three input counters raw: with a key absent here and in the
+            // delta below, that sum is NaN on the very turn whose purpose is
+            // to advance the gauge. The delta's positive input_tokens still
+            // overrides this seed; a caller passing 0 (the pre-stream policy
+            // refusal) gets the helper's unknown-size fallback instead of 0.
+            usage: messageStartUsage(inputTokens),
           },
         })
       );

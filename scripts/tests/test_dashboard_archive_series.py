@@ -105,14 +105,25 @@ def build_store(root):
 
 
 def run_collect_summarize(root, era_a="2026-07-05:2026-07-05", era_b="2026-10-05:2026-10-05"):
+    # The children print a "→" in their summary lines. On a Windows seat the
+    # child's stdout defaults to cp1252 and its print() dies with
+    # UnicodeEncodeError before any pin runs (#1007 noted it; this fixes it).
+    # ⚠ PYTHONIOENCODING/PYTHONUTF8 do NOT work here: the child runs under -I
+    # (isolated), which implies -E and ignores every PYTHON* env var — measured.
+    # "-X utf8" is a command-line switch, so it survives -I. encoding= makes the
+    # parent decode the UTF-8 the child now emits. On the UTF-8 CI runner both
+    # are no-ops.
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")  # belt-and-braces if -I ever goes
     series = os.path.join(root, "series.jsonl")
     r1 = subprocess.run(
-        [sys.executable, "-I", _SCRIPT, "collect", "--store", root, "--out", series],
-        capture_output=True, text=True, timeout=120)
+        [sys.executable, "-I", "-X", "utf8", _SCRIPT, "collect", "--store", root, "--out", series],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env, timeout=120)
     r2 = subprocess.run(
-        [sys.executable, "-I", _SCRIPT, "summarize", "--series", series,
+        [sys.executable, "-I", "-X", "utf8", _SCRIPT, "summarize", "--series", series,
          "--era-a", era_a, "--era-b", era_b],
-        capture_output=True, text=True, timeout=120)
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env, timeout=120)
     return r1, r2
 
 

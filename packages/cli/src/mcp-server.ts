@@ -10,7 +10,6 @@
  */
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -20,7 +19,6 @@ import { EFFORT_LEVELS, type EffortLevel, isEffortLevel } from "./adapters/base-
 import { searchCatalogModels } from "./adapters/model-catalog.js";
 import { prehydrateCredentialsForSpawn } from "./auth/credentials/prehydrate.js";
 import { setCredentialPromptRole } from "./auth/credentials/prompt-role.js";
-import { writeFileAtomic } from "./fs-atomic.js";
 import { loadHooksOnce } from "./hooks/index.js";
 import { type ProtocolStdout, isolateProtocolStdout } from "./hooks/output-capture.js";
 import { initLogger, log } from "./logger.js";
@@ -113,7 +111,19 @@ import {
   validateSessionPath,
 } from "./team-orchestrator.js";
 import type { ProxyServer } from "./types.js";
+import { getRunModelMapping, loadConfig } from "./profile-config.js";
+// `version.ts` is generated from packages/cli/package.json, so serverInfo names
+// the release the host is actually talking to.
 import { VERSION } from "./version.js";
+import {
+  getDeclaredContextLimit,
+  getDerivedContextLimit,
+} from "./providers/runtime-providers.js";
+import { claudishStatusHandler, renderCapabilities } from "./mcp-status-tools.js";
+// Deliberately a SEPARATE file from the router's all-models.json (#1028): the
+// shapes differ (full OpenRouter rows here, v2 entries/coverage there), and the
+// old shared-file writes were clobbering each other.
+import { loadMcpModelsList } from "./providers/mcp-models-list.js";
 
 // No `.env` load here. `index.ts` loads the working directory's `.env` through the
 // allowlist (dotenv-allowlist.ts) before it imports this module, and that is the only
@@ -127,12 +137,6 @@ const __dirname = dirname(__filename);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const CLAUDISH_CACHE_DIR = join(homedir(), ".claudish");
-// OpenRouter's own model list, for `search_models`. Its OWN file: this once shared
-// `all-models.json` with the cloud models catalog cache, and each writer erased the
-// other's data, because the two hold different shapes.
-const OPENROUTER_MODELS_CACHE_PATH = join(CLAUDISH_CACHE_DIR, "openrouter-models.json");
-const CACHE_MAX_AGE_DAYS = 2;
 
 /** The server's `instructions`, which the host adds to its system prompt. */
 const INSTRUCTIONS = `Claudish MCP server gives you access to external AI models (OpenRouter, Ollama, LM Studio and every claudish provider), and to Claude models on the user's own Claude Code login.
@@ -227,54 +231,6 @@ interface ToolDefinition {
 
 // ─── Helper Functions ────────────────────────────────────────────────────────
 
-async function loadAllModels(forceRefresh = false): Promise<any[]> {
-  if (!forceRefresh && existsSync(OPENROUTER_MODELS_CACHE_PATH)) {
-    try {
-      const cacheData = JSON.parse(readFileSync(OPENROUTER_MODELS_CACHE_PATH, "utf-8"));
-      const lastUpdated = new Date(cacheData.lastUpdated);
-      const ageInDays = (Date.now() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
-      if (ageInDays <= CACHE_MAX_AGE_DAYS) {
-        return cacheData.models || [];
-      }
-    } catch {
-      // Cache invalid
-    }
-  }
-
-  try {
-    const response = await fetch("https://openrouter.ai/api/v1/models");
-    if (!response.ok) throw new Error(`API returned ${response.status}`);
-    const data = await response.json();
-    const models = data.data || [];
-    try {
-      writeFileAtomic(
-        OPENROUTER_MODELS_CACHE_PATH,
-        JSON.stringify({ lastUpdated: new Date().toISOString(), models })
-      );
-    } catch (err) {
-      // The fetched list is still the answer; only the cache is lost.
-      log(
-        `[mcp] OpenRouter models cache write failed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-    return models;
-  } catch (err) {
-    log(
-      `[mcp] OpenRouter models fetch failed: ${err instanceof Error ? err.message : String(err)}`
-    );
-    try {
-      if (existsSync(OPENROUTER_MODELS_CACHE_PATH)) {
-        const cacheData = JSON.parse(readFileSync(OPENROUTER_MODELS_CACHE_PATH, "utf-8"));
-        return cacheData.models || [];
-      }
-    } catch (cacheErr) {
-      log(
-        `[mcp] OpenRouter models cache unreadable: ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}`
-      );
-    }
-    return [];
-  }
-}
 
 // ─── Lazy Proxy Singleton ────────────────────────────────────────────────────
 // The proxy runs the same routing engine as the CLI: auto-route, fallback chains,
@@ -1525,6 +1481,107 @@ function defineTools(sessionManager: SessionManager, nested: boolean): ToolDefin
     },
   });
 
+  // ── Read-only introspection (#985) ────────────────────────────────────
+  // claudish_status / claudish_capabilities: the READ half of the negotiated
+  // capability surface. No side effects, no writes — the hub stays arbiter; a
+  // status read reports, it does not requisition. Both handlers go through
+  // mcp-status-tools.ts, which deep-scrubs anything credential-shaped before
+  // it reaches the wire (no secrets in the MCP surface).
+
+  tools.push({
+    name: "claudish_status",
+    description:
+      "Read-only: effective tier→provider mapping, armed failover steps, configured/auto state and reset clocks — as seen by THIS MCP server's own in-process proxy (scope: mcp-process-proxy), NOT the hub's live state. When that proxy has not started, serving is reported unknown, never defaulted. Never requisitions.",
+    inputSchema: { type: "object" },
+    group: "low-level",
+    handler: async () => {
+      try {
+        // #993 review: the failover init/wipe must NOT run here — it would
+        // un-wall every bucket the in-process proxy learned.
+        // claudishStatusHandler reads state without resetting it; when this
+        // process's proxy never started, it says so instead of defaulting
+        // `diverted: false`.
+        const payload = claudishStatusHandler({
+          proxyStarted: proxyInstance !== null || proxyStarting !== null,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [
+            { type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  });
+
+  tools.push({
+    name: "claudish_capabilities",
+    description:
+      "Read-only: what the current provider actually supports — vision yes/no, the real context window (measured > declared > catalog), tool-use, thinking. Check a capability before the task, not after the 400.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        model: {
+          type: "string",
+          description:
+            "Model to introspect (e.g. 'glm-5.3', 'gc@glm-5.3', 'claude-sonnet-5-5'). Omit to report the effective sonnet mapping.",
+        },
+      },
+    },
+    group: "low-level",
+    handler: async (args) => {
+      try {
+        const cfg = loadConfig();
+        const mapping = getRunModelMapping(cfg.defaultProfile).models;
+        const requested = (args.model as string | undefined) || mapping.sonnet || "unknown";
+        // Split an explicit provider prefix (gc@, cx@, or@, …) from the model id.
+        const provider = requested.includes("@") ? requested.split("@")[0] : undefined;
+        const bareModel = requested.includes("@") ? requested.slice(requested.indexOf("@") + 1) : requested;
+
+        // Catalog lookup (best-effort; absence = unknown, never a guess).
+        let catalog: { vision?: boolean; toolUse?: boolean; thinking?: boolean; context?: string | number } | null = null;
+        try {
+          const doc = await getRecommendedModels();
+          const entry = (doc.models || []).find(
+            (m: { id?: string; name?: string }) => m.id === bareModel || m.name === bareModel || m.id === requested
+          );
+          if (entry) {
+            catalog = {
+              vision: entry.supportsVision,
+              toolUse: entry.supportsTools,
+              thinking: entry.supportsReasoning,
+              context: entry.context,
+            };
+          }
+        } catch {
+          // catalog unavailable → leave null; the window still reports declared/derived.
+        }
+
+        const payload = renderCapabilities({
+          model: bareModel,
+          provider,
+          catalog,
+          declaredContextLimit: provider ? getDeclaredContextLimit(provider) : undefined,
+          derivedContextLimit: provider ? getDerivedContextLimit(provider) : undefined,
+        });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (error) {
+        return {
+          content: [
+            { type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  });
+
   tools.push({
     name: "search_models",
     description:
@@ -1545,7 +1602,7 @@ function defineTools(sessionManager: SessionManager, nested: boolean): ToolDefin
     handler: async (args) => {
       const query = args.query as string;
       const maxResults = (args.limit as number) || 10;
-      const allModels = await loadAllModels();
+      const allModels = await loadMcpModelsList();
       if (allModels.length === 0) {
         return {
           content: [

@@ -17,9 +17,9 @@ import { redactForClient } from "../../../redact.js";
 import { createResponseCapture } from "../response-capture.js";
 import {
   type ToolSchema,
+  validateAndRepairToolCall,
   extractToolCallsFromText,
   hasExtractableFunctionTag,
-  validateAndRepairToolCall,
 } from "../tool-call-recovery.js";
 import { ttftMarkerLine } from "../traffic-markers.js";
 import { isWebSearchToolCall } from "../web-search-detector.js";

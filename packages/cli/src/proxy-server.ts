@@ -432,21 +432,23 @@ export function isNativeTarget(target: string): boolean {
   return !target.includes("/") && !target.includes("@");
 }
 
-/** The v14 role set: opus / sonnet / haiku. Main carries a fourth (`fable`);
- *  this base's `modelMap` has no such slot (its options type reads
- *  opus/sonnet/haiku/subagent, and `subagent` is not a request keyword — it
- *  never names a model). Mirrors the substring tier match the serving
- *  resolution applies at `resolveHandlerForRequest` and `resolveNominalTarget`,
- *  which is also why a role keyword anywhere in the name counts. */
+/** The role set: opus / sonnet / haiku / fable. `fable` was present in the
+ *  pre-replatform trunk and #641 B4 restored it here — the fleet is wired for
+ *  Fable 5.2 (user 13/11), and a pin that cannot name the slot silently stops
+ *  repointing it. `subagent` is not a request keyword: it never names a model.
+ *  Mirrors the substring tier match the serving resolution applies at
+ *  `resolveHandlerForRequest` and `resolveNominalTarget`, which is also why a
+ *  role keyword anywhere in the name counts. */
 function resolveRoleMappedTarget(
   requestedModel: string,
-  modelMap?: { opus?: string; sonnet?: string; haiku?: string }
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string; fable?: string }
 ): string | undefined {
   if (!modelMap) return undefined;
   const requested = requestedModel.toLowerCase();
   if (requested.includes("opus")) return modelMap.opus;
   if (requested.includes("sonnet")) return modelMap.sonnet;
   if (requested.includes("haiku")) return modelMap.haiku;
+  if (requested.includes("fable")) return modelMap.fable;
   return undefined;
 }
 
@@ -469,7 +471,9 @@ function resolveRoleMappedTarget(
  *
  * Deliberately narrow — it returns a pin ONLY when all of these hold:
  *  - the role resolves to a mapped target (otherwise there is nothing to pin);
- *  - that target differs from what the client asked for (never rewrite a no-op);
+ *  - that target differs from what the client asked for (never rewrite a no-op).
+ *    Since #1017 the comparison runs AFTER the #219 override, on the id that
+ *    would actually be sent;
  *  - the target is an ANTHROPIC id (`claude-*`). Bare and native are NOT the same
  *    predicate, and conflating them is how this would misfire: the hub's own
  *    `sonnet: "glm-5.3"` is bare too, and is saved today only by resolving to a
@@ -492,15 +496,22 @@ function resolveRoleMappedTarget(
  */
 export function resolveNativeModelPin(
   requestedModel: string,
-  modelMap?: { opus?: string; sonnet?: string; haiku?: string },
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string; fable?: string },
   env: NodeJS.ProcessEnv = process.env
 ): string | undefined {
   if (env.CLAUDISH_NATIVE_MODEL_PIN === "0") return undefined;
   if (requestedModel.includes("@") || requestedModel.includes("/")) return undefined;
   const roleTarget = resolveRoleMappedTarget(requestedModel, modelMap);
-  if (!roleTarget || roleTarget === requestedModel) return undefined;
-  if (!roleTarget.startsWith("claude-")) return undefined;
-  return applyNativePinOverride(roleTarget);
+  if (!roleTarget || !roleTarget.startsWith("claude-")) return undefined;
+  // #219: an adopted catalog override (CLAUDISH_NATIVE_PIN_AUTO=on) replaces
+  // the version within the same family. Inert — byte-identical pass-through —
+  // unless the watch resolved and adopted a newer id.
+  // #1017: the no-op comparison runs on the OVERRIDDEN target. Comparing the
+  // configured one first made the adoption unreachable for the clients that
+  // matter most — those asking for exactly the configured version (the whole
+  // fleet sent `claude-fable-5-1` against a hub pinned `claude-fable-5-1`).
+  const pinned = applyNativePinOverride(roleTarget);
+  return pinned === requestedModel ? undefined : pinned;
 }
 
 export async function createProxyServer(
@@ -512,7 +523,7 @@ export async function createProxyServer(
   model?: string,
   monitorMode = false,
   anthropicApiKey?: string,
-  modelMap?: { opus?: string; sonnet?: string; haiku?: string; subagent?: string },
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string; fable?: string; subagent?: string },
   options: ProxyServerOptions = {}
 ): Promise<ProxyServer> {
   // Load user-declared custom endpoints from ~/.claudish/config.json and
@@ -1352,9 +1363,9 @@ export async function createProxyServer(
   // Inert with no CLAUDISH_FAILOVER_* env: no rule ⇒ one attempt ⇒ the nominal
   // through the same resolution as before, byte-identical serve.
   initFailover();
-  // The v14 modelMap carries no `fable` slot (its role set is opus/sonnet/
-  // haiku/subagent) — index by string, not by FailoverRole, so the resolver
-  // stays valid the day a slot is added.
+  // Index by string, not by FailoverRole: the map's slot set and the role set
+  // are maintained separately, so a role a newer map carries keeps resolving
+  // here without a type change.
   setRoleNominalResolver((r) => (modelMap as Record<string, string | undefined> | undefined)?.[r]);
 
   /** The request-side nominal target, mirroring resolveHandlerForRequest's own
@@ -1542,8 +1553,8 @@ export async function createProxyServer(
           }
           if (seen.has(s.roleRef)) continue;
           seen.add(s.roleRef);
-          // v14 modelMap has no `fable` slot (its role set is wider than the
-          // map) — index by string, the same cast as setRoleNominalResolver.
+          // Index by string, the same cast as setRoleNominalResolver — the map's
+          // slot set and the role set are maintained separately.
           collectWindow((modelMap as Record<string, string | undefined> | undefined)?.[s.roleRef]);
           collectSteps(s.roleRef);
         }

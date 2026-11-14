@@ -48,7 +48,7 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 REQ_FN = re.compile(r"^req-(\d+)-(\d+)-(.+)\.json$")
 RESP_FN = re.compile(r"^resp-\d+-r\d+-(\d{4}-\d{2}-\d{2}T[\d-]+Z)-(.+)\.sse$")
@@ -90,6 +90,19 @@ def _load_lane_out_trend():
 
     p = Path(__file__).resolve().parent / "lane-out-trend.py"
     spec = importlib.util.spec_from_file_location("lane_out_trend", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_blind_spot():
+    """Declaration de l'angle mort AUTONOMOUS (#933) — lib partagee avec
+    native-consumption.py et billed-attrib.py, une seule copie."""
+    import importlib.util
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / "blind_spot.py"
+    spec = importlib.util.spec_from_file_location("blind_spot", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -241,6 +254,13 @@ def main():
     ap.add_argument("--dir", default=os.environ.get("CLAUDISH_CAPTURE_DIR", r"D:\claudish-captures"))
     ap.add_argument("--json", action="store_true", help="sortie JSON machine-lisible (Phase 3)")
     ap.add_argument("--machines", action="store_true", help="rollup supplementaire par lane x machine")
+    ap.add_argument("--fleet", default="",
+                    help="machines sidecar attendues (separees par des virgules) — "
+                         "active l'avertissement d'angle mort AUTONOMOUS (#933)")
+    ap.add_argument("--reconcile-dir", default="",
+                    help="dossier des archives outage-*.7z (defaut : GDrive du "
+                         "script de reconciliation, env CLAUDISH_RECONCILE_DIR ; "
+                         "<corpus>/reconcile reste source additionnelle, #940)")
     args = ap.parse_args()
 
     cutoff = datetime.now(timezone.utc).timestamp() - args.hours * 3600
@@ -303,6 +323,20 @@ def main():
 
     span_h = ((last_dt - first_dt).total_seconds() / 3600) if (first_dt and last_dt and last_dt > first_dt) else args.hours
 
+    # #933 — l'angle mort AUTONOMOUS se declare, il ne se lit pas comme un 0 :
+    # fleet declaree (+ archives outage, dossier GDrive du script de
+    # reconciliation) avec 0 nominal et 0 archive dans la fenetre = BLIND.
+    # Coram la fenetre DEMANDEE (cutoff -> maintenant). Les comptes nominaux
+    # viennent de load_requests (il a deja lu chaque tete req-* pour
+    # l'appariement) — pas de relecture (#940).
+    fleet = [m.strip() for m in args.fleet.split(",") if m.strip()]
+    now_dt = datetime.now(timezone.utc)
+    bs = _load_blind_spot()
+    _rdir = args.reconcile_dir or bs.default_reconcile_dir()
+    _nominal = Counter(v["machine"] for lst in reqs.values() for v in lst)
+    blind = bs.assess(args.dir, cutoff_dt, now_dt, fleet,
+                      reconcile_dir=_rdir, nominal_counts=_nominal)
+
     if args.json:
         print(json.dumps({
             "window_hours": args.hours,
@@ -312,6 +346,7 @@ def main():
             "files": {"resp": n_resp, "paired": n_paired, "unpaired": n_unpaired, "no_usage": n_nousage},
             "lanes": {k: v for k, v in lanes.items()},
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
+            "blind_spot": {k: v for k, v in blind.items()} or None,
         }, indent=2))
         return
 
@@ -349,6 +384,13 @@ def main():
         for key in sorted(machines):
             tot = {k: sum(r[k] for r in machines[key].values()) for k in ("n", "inp", "out")}
             print(f"  {key:46} req {tot['n']:>6}  in {fmt_int(tot['inp']):>13}  out {fmt_int(tot['out']):>12}")
+
+    # #933 : la section se render meme sans --machines — une absence lue comme
+    # un 0 est le mensonge que ce rapport existe pour empecher.
+    print()
+    for line in bs.render(args.dir, cutoff_dt, now_dt, fleet,
+                          reconcile_dir=_rdir, res=blind):
+        print(line)
 
     print(f"\ntotal out_tok fenetre: {fmt_int(total_out)} | debit moyen out: {fmt_int(int(total_out / span_h))}/h")
 

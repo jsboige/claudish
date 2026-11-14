@@ -142,6 +142,9 @@ import {
   classifyConnectionError,
 } from "./shared/connection-error.js";
 import { sniffDevinStreamHead } from "./shared/devin-stream-head-sniffer.js";
+// #909: request-body gzip toward providers whose transport declares the
+// capability — never the SSE response, and never a transport-serialized body.
+import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 // #575 (#431 row 7a): the engine's per-prompt image cap — a request-SHAPE
 // incapacity classified from the 400 body and answered as a `media` step-skip.
 // v14 port note: `countMediaBlocks` rides THIS import on v14 (no
@@ -1969,6 +1972,22 @@ export class ComposedHandler implements ModelHandler {
     // as the bytes exist (the read `fetchHeaders` made for this binding).
     addSigningSecrets(c, transportSecrets(binding));
     headers["Content-Type"] = serialized?.contentType ?? "application/json";
+    // #909/#924 — gzip the request body toward providers whose transport
+    // declares `requestCompression` (floor + kill switch live in
+    // upstream-compression.ts). Computed ONCE against the SHARED `headers`
+    // object: the compressor sets `content-encoding: gzip` on it in place, so
+    // `doFetch` and `doFetchWith` below — which reuse that object — stay in
+    // contract with these bytes without re-compressing. A transport-serialized
+    // body (`serialized`) rides untouched: it already owns its encoding (proto
+    // bytes, not JSON) and no such transport declares the capability.
+    const wireBody =
+      serialized?.body ??
+      compressUpstreamRequestBody({
+        capability: this.provider.requestCompression,
+        headers,
+        body: JSON.stringify(requestPayload),
+        label: `${this.provider.displayName} ${this.targetModel}`,
+      });
 
     log(`[${this.provider.displayName}] Calling API: ${endpoint}`);
 
@@ -1998,7 +2017,7 @@ export class ComposedHandler implements ModelHandler {
           {
             method: "POST",
             headers,
-            body: serialized?.body ?? JSON.stringify(requestPayload),
+            body: wireBody,
             ...requestInit,
           },
           withCallSignal(clamp.signal, callSignal)
@@ -2080,7 +2099,7 @@ export class ComposedHandler implements ModelHandler {
             {
               method: "POST",
               headers,
-              body: serialized?.body ?? JSON.stringify(requestPayload),
+              body: wireBody,
               ...(this.provider.getRequestInit?.() || {}),
             },
             sig
@@ -2248,13 +2267,24 @@ export class ComposedHandler implements ModelHandler {
             if (callSignal?.aborted) throw callAbortError();
             const retryHeaders = await raceCallAbort(fetchHeaders(binding), callSignal);
             retryHeaders["Content-Type"] = retrySerialized?.contentType ?? "application/json";
+            // #924 — fresh headers, so the body must be (re)compressed to
+            // match: the original `content-encoding` rides the shared object
+            // above, not this one.
+            const retryWireBody =
+              retrySerialized?.body ??
+              compressUpstreamRequestBody({
+                capability: this.provider.requestCompression,
+                headers: retryHeaders,
+                body: JSON.stringify(requestPayload),
+                label: `${this.provider.displayName} ${this.targetModel}`,
+              });
             return fetch(
               endpoint,
               mergeSignalIntoInit(
                 {
                   method: "POST",
                   headers: retryHeaders,
-                  body: retrySerialized?.body ?? JSON.stringify(requestPayload),
+                  body: retryWireBody,
                   ...(this.provider.getRequestInit?.() || {}),
                 },
                 withCallSignal(sig, callSignal)
@@ -2381,8 +2411,17 @@ export class ComposedHandler implements ModelHandler {
           const retryHeaders = await raceCallAbort(fetchHeaders(binding), callSignal);
           // Same serialization as the primary request — this is a separate call
           // site and the easy one to forget, which is why both are pinned by
-          // the same assertion.
+          // the same assertion. #924: fresh headers ⇒ the body is recompressed
+          // to match (the original `content-encoding` rode the shared object).
           retryHeaders["Content-Type"] = serialized?.contentType ?? "application/json";
+          const retryWireBody =
+            serialized?.body ??
+            compressUpstreamRequestBody({
+              capability: this.provider.requestCompression,
+              headers: retryHeaders,
+              body: JSON.stringify(requestPayload),
+              label: `${this.provider.displayName} ${this.targetModel}`,
+            });
           const retryInit = this.provider.getRequestInit?.() || {};
           return fetch(
             endpoint,
@@ -2390,7 +2429,7 @@ export class ComposedHandler implements ModelHandler {
               {
                 method: "POST",
                 headers: retryHeaders,
-                body: serialized?.body ?? JSON.stringify(requestPayload),
+                body: retryWireBody,
                 ...retryInit,
               },
               withCallSignal(sig, callSignal)
