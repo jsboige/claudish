@@ -96,6 +96,20 @@ export interface RelayState {
    */
   recoveredAt?: number;
   probeAttempts?: { model: string; ms: number; ok: boolean; reason: string }[];
+  /**
+   * #587 g1 — the hub's last observed `/health` body, log-only (no decision path
+   * reads it). The issue's minute-join had turned zero complete pairs because
+   * the relay journaled only its own verdict: `eventLoopMax60sMs` and
+   * `activeStreams` exist live on the hub and nowhere in this log. Every flip
+   * now carries the last thing the hub said, in the same line. `null` values
+   * mean the field was ABSENT on the hub image — never report absent as 0.
+   */
+  lastHealth?: {
+    instanceId: string;
+    eventLoopMax60sMs: number | null;
+    activeStreams: number | null;
+    at: number;
+  };
 }
 
 // ── Hysteresis tuning ──────────────────────────────────────────────
@@ -1008,12 +1022,18 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
     }
     // JSON.parse failure IS "not detected": a non-JSON 200 keeps the pre-#156
     // verdict (true) rather than reaching the outer catch as a failure.
-    let upstreamId: unknown = undefined;
+    let parsed: Record<string, unknown> | null = null;
     try {
-      upstreamId = (JSON.parse(text) as { instanceId?: unknown } | null)?.instanceId;
+      const body = JSON.parse(text) as unknown;
+      if (body && typeof body === "object") parsed = body as Record<string, unknown>;
     } catch {
       // non-JSON → not detected
     }
+    const upstreamId = parsed?.instanceId;
+    // #587 g1 — keep the body's dated fields for the flip lines. Log-only;
+    // a non-JSON 200 leaves the previous snapshot in place (it is still the
+    // last thing the hub actually said).
+    noteHubHealth(state, parsed);
     if (typeof upstreamId === "string") {
       const isSelf = upstreamId === getInstanceId();
       if (isSelf !== state.selfLoop) {
@@ -1060,6 +1080,55 @@ function shapeOfHeartbeatError(err: unknown, budgetMs: number): string {
   }
 }
 
+/**
+ * #587 g1 — record the hub's `/health` body fields that date a flip. Log-only
+ * and never throwing: a logging instrument that can fail the prober is worse
+ * than none. A field the image does not publish stays `null`, so the line says
+ * `none` — coercing it to 0 would manufacture "no loop stall" evidence forever
+ * (the 24/10 trap on this issue).
+ */
+function noteHubHealth(state: RelayState, body: Record<string, unknown> | null): void {
+  try {
+    if (!body) return;
+    const rawId = typeof body.instanceId === "string" ? body.instanceId : "";
+    const max =
+      typeof body.eventLoopMax60sMs === "number" && Number.isFinite(body.eventLoopMax60sMs)
+        ? body.eventLoopMax60sMs
+        : null;
+    const streams =
+      typeof body.activeStreams === "number" && Number.isFinite(body.activeStreams)
+        ? body.activeStreams
+        : null;
+    if (!rawId && max === null && streams === null) return; // nothing worth dating a flip with
+    state.lastHealth = {
+      instanceId: rawId.slice(0, 64),
+      eventLoopMax60sMs: max,
+      activeStreams: streams,
+      at: Date.now(),
+    };
+  } catch {
+    // never throw out of an instrument
+  }
+}
+
+/**
+ * #587 g1 — the hub-side half of a relay flip, appended to BOTH the failure and
+ * the NOMINAL line so the issue's minute-join reads one journal. `age` is the
+ * distance to the body read: ~0 s on a recovery (the beat that decided it),
+ * minutes on a failure that outlived the last answer. `none` means never read
+ * or not published by that image — never 0.
+ */
+function hubHealthSegment(state: RelayState, now = Date.now()): string {
+  const h = state.lastHealth;
+  if (!h) return " — hub-last=none (no /health body read yet)";
+  const max = h.eventLoopMax60sMs === null ? "none" : String(h.eventLoopMax60sMs);
+  const streams = h.activeStreams === null ? "none" : String(h.activeStreams);
+  return (
+    ` — hub-last instanceId=${h.instanceId || "none"} eventLoopMax60sMs=${max}` +
+    ` activeStreams=${streams} age=${((now - h.at) / 1000).toFixed(1)}s`
+  );
+}
+
 /** First failure of an episode is logged WITH its shape and elapsed time; the
  * rest are counted silently (a multi-hour outage must not become a log flood),
  * then one recovery line closes the episode with the totals. */
@@ -1069,7 +1138,7 @@ function noteHeartbeatFailure(state: RelayState, startedAt: number, shape: strin
   if (!ep) {
     state.hbEpisode = { startedAt, failures: 1, firstShape: shape };
     log(
-      `[Relay] heartbeat FAILED after ${elapsed}ms — ${shape} (${redactUpstreamForLog(state.upstream)})`,
+      `[Relay] heartbeat FAILED after ${elapsed}ms — ${shape} (${redactUpstreamForLog(state.upstream)})${hubHealthSegment(state)}`,
       true
     );
   } else {
@@ -1439,7 +1508,7 @@ export async function proberTick(state: RelayState): Promise<void> {
             : ` — probe ${probeS}s [${attempts}]`;
         state.recoveredAt = undefined; // next episode opens its own queue
         log(
-          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)${queueSeg}`,
+          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)${queueSeg}${hubHealthSegment(state, now)}`,
           true
         );
       } else {
