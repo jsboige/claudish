@@ -178,6 +178,69 @@ describe("request-logger capture (fork)", () => {
     expect(hostileJson.workspace.length).toBeLessThanOrEqual(64);
   });
 
+  // #1055 — the harness-lane attribution: `machine` names the box, `workspace`
+  // the seat, `lane` the PRODUCER harness (nb-coder), so its traffic reads as a
+  // distinct line in the consumption table. Unlike workspace, ALWAYS written
+  // (the #566 hops precedent): the traffic reader takes the FIRST `"lane":`
+  // match on the head, which is only safe if the envelope field is
+  // unconditionally present on post-#1055 captures.
+  it("persists the harness lane after model/workspace, empty string when absent (#1055)", async () => {
+    mkdirSync(capDir, { recursive: true });
+    process.env.CLAUDISH_CAPTURE_DIR = capDir;
+
+    logRequest(
+      { model: "m1", messages: [] },
+      "test-handler",
+      mkRequest({
+        "x-claudish-machine": "myia-po-2028",
+        "x-claudish-lane": "nb-coder",
+      }),
+      new WeakMap()
+    );
+    const file = await waitForCapture(capDir);
+    expect(file).not.toBeNull();
+    const raw = readFileSync(file!, "utf8");
+    const json = JSON.parse(raw);
+    expect(json.lane).toBe("nb-coder");
+    // Seated AFTER model (leak-window discipline #41) — a long lane value must
+    // never push model out of the head window, and model must stay before it.
+    expect(raw.indexOf('"model":"')).toBeLessThan(400);
+    expect(raw.indexOf('"lane":"nb-coder"')).toBeGreaterThan(raw.indexOf('"model":"'));
+
+    rmSync(capDir, { recursive: true, force: true });
+    mkdirSync(capDir, { recursive: true });
+    logRequest(
+      { model: "m2", messages: [] },
+      "test-handler",
+      mkRequest({ "x-claudish-machine": "myia-test" }),
+      new WeakMap()
+    );
+    const bare = await waitForCapture(capDir);
+    expect(bare).not.toBeNull();
+    const bareJson = JSON.parse(readFileSync(bare!, "utf8"));
+    // ALWAYS written: "" = header not sent; an absent key would mean a
+    // pre-#1055 capture (the hops three-way-readability rule).
+    expect(bareJson.lane).toBe("");
+  });
+
+  it("sanitizes and bounds a hostile harness lane instead of echoing it (#1055)", async () => {
+    mkdirSync(capDir, { recursive: true });
+    process.env.CLAUDISH_CAPTURE_DIR = capDir;
+
+    logRequest(
+      { model: "m1", messages: [] },
+      "test-handler",
+      mkRequest({ "x-claudish-lane": '  evil"lane  ,<script>,' + "z".repeat(200) }),
+      new WeakMap()
+    );
+    const hostile = await waitForCapture(capDir);
+    expect(hostile).not.toBeNull();
+    const hostileJson = JSON.parse(readFileSync(hostile!, "utf8"));
+    expect(hostileJson.lane).toBeDefined();
+    expect(hostileJson.lane).toMatch(/^[a-zA-Z0-9._-]{1,64}$/);
+    expect(hostileJson.lane.length).toBeLessThanOrEqual(64);
+  });
+
   it("writes nothing when CLAUDISH_CAPTURE_DIR is unset", async () => {
     delete process.env.CLAUDISH_CAPTURE_DIR;
     mkdirSync(capDir, { recursive: true });

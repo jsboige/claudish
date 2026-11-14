@@ -165,6 +165,20 @@ export function logRequest(
     .replace(/[^a-zA-Z0-9._-]/g, "")
     .slice(0, 64);
 
+  // #1055 — the harness-lane half of the attribution chain: `machine` names
+  // the box, `workspace` the seat, this names the PRODUCER harness (e.g.
+  // "nb-coder"), so its traffic shows as a distinct line in the consumption
+  // table. ALWAYS written like `hops` (#566): "" = no lane header on the
+  // request, key ABSENT = capture written before #1055. That unconditional
+  // write is also what lets traffic-consumption.py take the FIRST regex match
+  // on the head — a conditional field would let a body occurrence
+  // (e.g. a web tool result quoting `"lane":`) win the search on the
+  // pre-#1055 corpus. Sanitized like workspace: client-supplied, lands on
+  // disk, read back by the analyzers — [a-zA-Z0-9._-], 64 max.
+  const harnessLane = (req.headers.get("x-claudish-lane") || "")
+    .replace(/[^a-zA-Z0-9._-]/g, "")
+    .slice(0, 64);
+
   // #566 — the relay's hop chain (the same header #156/#279 appends for loop
   // detection), captured so a relayed request is distinguishable from a direct
   // one after the fact. `src` cannot answer that: a LAN relay hop leaves no
@@ -219,6 +233,10 @@ export function logRequest(
       // bytes, and this field is client-supplied (up to 64 chars). Seating it
       // between them would spend that window on a field no leak verdict needs.
       ...(workspace ? { workspace } : {}),
+      // #1055 — ALWAYS written (see the harnessLane comment above): "" = no
+      // lane, absent key = pre-#1055 capture. Seated after `workspace` and
+      // after `model` for the same leak-window reason (#41).
+      lane: harnessLane,
       pid: process.pid,
       // #662 — the per-process instanceId (#156) as a payload FIELD: `pid` is 1
       // in EVERY container life (the proxy is the image's command), so it cannot
