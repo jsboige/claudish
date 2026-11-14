@@ -2,11 +2,13 @@ import { describe, expect, test } from "bun:test";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
 import { OpenAIProviderTransport } from "./openai.js";
 
-const mockProvider = {
+const mockProvider: RemoteProvider = {
   name: "opencode-zen",
   baseUrl: "https://opencode.ai/zen",
   apiPath: "/v1/chat/completions",
-} as RemoteProvider;
+  apiKeyEnvVar: "OPENCODE_API_KEY",
+  prefixes: ["zen@"],
+};
 
 describe("OpenAIProviderTransport 429 retry (#66)", () => {
   test("retries on 429 with exponential backoff", async () => {
