@@ -477,6 +477,45 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     expect(state.alive).toBe(true); // still NOMINAL after two consecutive freezes
   });
 
+  // ── #1055 g2 CR B2: the typed lane refusal survives the hop ───────────────
+  // A lane refusal (budget/stop) is a JSON 429 carrying
+  // x-claudish-lane-refusal — never SSE — so whatever `stream` the client
+  // asked for, it lands on the non-streaming rebuild below. The pilot's
+  // harness reaches the hub THROUGH its sidecar; an untyped 429 there is
+  // indistinguishable from a quota wall, which is exactly what the typed
+  // header exists to prevent. Same composition argument as the drain-freeze
+  // marker above (#318): the property must hold across A→B→hub chains too.
+  it("a typed lane-refusal 429 keeps its marker across the relay rebuild, stream:false and stream:true alike (#1055 CR B2)", async () => {
+    const refusalBody = JSON.stringify({
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        message: "[LaneBudget] lane daily output budget consumed 700 of 700 — defer this notebook; retry after 3600s",
+      },
+    });
+    fetchImpl = async () =>
+      new Response(refusalBody, {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "3600",
+          "x-claudish-lane-refusal": "budget",
+        },
+      });
+    for (const stream of [false, true]) {
+      const state = deadState();
+      const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream }, state);
+      expect(r).not.toBeNull();
+      expect(r!.status).toBe(429);
+      expect(await r!.text()).toBe(refusalBody);
+      expect(r!.headers.get("x-claudish-lane-refusal")).toBe("budget");
+      expect(r!.headers.get("retry-after")).toBe("3600");
+      // The hub ANSWERED (a 4xx is not liveness evidence against it): the
+      // relay stays NOMINAL, no local replay against the lane's own budget.
+      expect(state.consecutiveFail).toBe(0);
+    }
+  });
+
   it("an UNMARKED 503 keeps the fallthrough — a hub's own failure is NOT passed through (#318 control)", async () => {
     fetchImpl = async () =>
       new Response("hub boom", { status: 503, headers: { "content-type": "application/json" } });

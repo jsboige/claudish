@@ -882,3 +882,27 @@ each has a different remedy and a different reset anchor. The providers' own
 consoles, the reading recipe and the baseline ledger live in
 [`subscription-consoles.md`](subscription-consoles.md)
 (`python scripts/console-tabs.py list`).
+
+## Harness lane budget & emergency stop (#1055)
+
+Distinct concern from the role cascades above: a *harness lane* (`x-claudish-lane`,
+e.g. `nb-coder`) is capped per (lane, model) on upstream output tokens over a
+sliding 24 h — `CLAUDISH_LANE_BUDGETS=nb-coder/nb-minimax:500000,nb-coder:1000000`
+(`/` entry wins over the lane-wide default). Both knobs are inert until a
+recreate carries values (#310); nothing ships armed.
+
+**Tripping the emergency stop** (`CLAUDISH_LANE_STOP_DIR`): create a FILE named
+exactly after the lane inside the dir — the operator does not restart anything:
+
+```powershell
+docker exec claudish-sidecar sh -c "touch /lane-stop/nb-coder"   # stop
+docker exec claudish-sidecar sh -c "rm /lane-stop/nb-coder"      # lift
+```
+
+The dir must be volume-mounted into the container at the path the env names
+(`docker-compose.yml` carries the env name but mounts nothing by default — a
+seat that arms the stop adds the bind). A stopped lane's requests are refused
+locally with `x-claudish-lane-refusal: stop` (900 s retry-after); every other
+lane and lane-less traffic is untouched. Both refusals (budget and stop) log a
+`[Lane…] REFUSE` stderr line — the lane report's refusal feed, since a refused
+request writes no capture (it never reaches `logRequest`).

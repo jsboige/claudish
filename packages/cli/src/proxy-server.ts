@@ -1962,8 +1962,13 @@ export async function createProxyServer(
         if (budgetDecision) releaseBudget = budgetDecision.commit();
         openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
         // #1055 g2 — the same attempt feeds the lane ledger (inert without a
-        // lane header AND a bar for this (lane, model)).
-        openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, (body.model as string) ?? "", process.env);
+        // lane header AND a bar for this (lane, model)). CR B1: keyed on
+        // `requestedModel` (what the ADMISSION read), never `body.model` — the
+        // #218 native pin rewrites body.model to the pinned version BEFORE this
+        // site, and the two spellings would split the ledger key: consumption
+        // booked under `claude-haiku-5-1` while admission looks up `claude-haiku-5`
+        // (measured 200,200,200 against a bar of 700).
+        openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
         // #747 (b): while a SUBSTITUTE serves, it learns its capability delta
         // from the request side — appended to the top-level `system` of every
         // such request (the banners are stripped from history, and the
@@ -2340,8 +2345,10 @@ export async function createProxyServer(
                 if (walkBudget) walkRelease = walkBudget.commit();
                 // #317: the walk is a paid upstream attempt too — fresh token.
                 openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
-                // #1055 g2 — the walk feeds the lane ledger too.
-                openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, (body.model as string) ?? "", process.env);
+                // #1055 g2 — the walk feeds the lane ledger too. CR B1: keyed
+                // on `requestedModel` (the admission's spelling), same reason
+                // as the loop-site open above.
+                openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
                 const targetResp = await targetHandler.handle(c, body);
                 if (targetResp.ok) {
                   // The step proved itself — mirror the loop's success
@@ -3417,6 +3424,37 @@ export async function createProxyServer(
             },
             429,
             { "retry-after": String(admission.retryAfterSec) }
+          );
+        }
+      }
+
+      // #1055 g2 CR B3 — the lane admission mirrors here too. The repo names
+      // this ingress as the sk-agent one in four places (route comments,
+      // openai-ingress.md, #1055's harness IS an sk-agent agent), so the
+      // operator emergency stop must stop the lane on BOTH wires — an untyped
+      // pass-through here would keep a stopped lane paying on this ingress.
+      // Same typed header as the native ingress; the ledger keys on the same
+      // client spelling (`anthropicBody.model` — pre-pin, pre-failover).
+      {
+        const admission = admitLaneBudget(
+          c.req.header("x-claudish-lane") ?? null,
+          (anthropicBody.model as string) ?? "",
+          process.env
+        );
+        if (admission?.refused) {
+          return c.json(
+            {
+              error: {
+                message: admission.message,
+                type: "rate_limit_error",
+                code: null,
+              },
+            },
+            429,
+            {
+              "retry-after": String(admission.retryAfterSec),
+              "x-claudish-lane-refusal": admission.type,
+            }
           );
         }
       }

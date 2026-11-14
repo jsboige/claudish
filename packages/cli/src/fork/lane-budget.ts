@@ -46,6 +46,9 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { log } from "../logger.js";
 import { wrapAnthropicError } from "../handlers/shared/anthropic-error.js";
+// #1055 CR N6 — the ONE sanitizer, shared with the g1 capture envelope so the
+// attribution key and the budget key cannot drift. Leading dot refused there.
+import { sanitizeHarnessLane } from "./middleware/request-logger.js";
 
 export const LANE_BUDGET_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** A stream that reported nothing for this long is done or dead — seal it (#317). */
@@ -54,11 +57,9 @@ const MAX_TRACKED_LANES = 1024;
 
 export const LANE_HEADER = "x-claudish-lane";
 
-/** Same sanitize contract as the g1 envelope field: client-supplied, lands in
- *  logs, so keep it to the attribution alphabet. */
-export function sanitizeLane(raw: string | null | undefined): string {
-  return (raw ?? "").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 64);
-}
+/** Kept as the module's historical export name; the CONTRACT lives in
+ *  sanitizeHarnessLane (request-logger.ts, the g1 site). */
+export const sanitizeLane = sanitizeHarnessLane;
 
 interface LaneBudgetEvent {
   ts: number;
@@ -232,7 +233,11 @@ export function admitLaneBudget(
       bar: 0,
       retryAfterSec: 900,
       message:
-        `[LaneStop] lane ${lane} is under an operator emergency stop — defer this ` +
+        // CR N2 — the CLIENT message never echoes the lane/model names: the
+        // client sent the header, it knows its own lane, and a hostile-enough
+        // name ("credit-analyst-v1") would put a quota-class word in our own
+        // 429 body (isQuotaExhaustion measured true on those echoes).
+        `[LaneStop] this lane is under an operator emergency stop — defer this ` +
         `notebook and retry later (the stop is lifted when the operator removes the stop file)`,
     };
   }
@@ -261,7 +266,10 @@ export function admitLaneBudget(
     const retryAfterSec =
       horizonTs > 0 ? Math.max(1, Math.ceil((LANE_BUDGET_WINDOW_MS - (now - horizonTs)) / 1000)) : 60;
     log(
-      `[LaneBudget] REFUSE lane=${lane} model=${model} consumed ${consumed} >= ${bar} ` +
+      // #1063 CR B1 — `consumed=` (equals sign), the spelling the lane report
+      // reader pins; the two sides cannot drift again (emitter pin in
+      // lane-budget.test.ts, reader pins in test_lane_daily_report.py).
+      `[LaneBudget] REFUSE lane=${lane} model=${model} consumed=${consumed} >= ${bar} ` +
         `(retry-after ${retryAfterSec}s)`,
       true
     );
@@ -274,8 +282,10 @@ export function admitLaneBudget(
       bar,
       retryAfterSec,
       message:
-        `[LaneBudget] lane ${lane} model ${model} consumed ${consumed} output tokens ` +
-        `in a 24h sliding window (bar ${bar}) — defer this notebook; retry after ${retryAfterSec}s`,
+        // CR N2 — no lane/model echo in the CLIENT body (quota-word hazard);
+        // the numbers stay (the harness needs them to defer, not queue).
+        `[LaneBudget] this lane's daily output budget is consumed (${consumed} of ` +
+        `${bar} output tokens in a 24h sliding window) — defer this notebook; retry after ${retryAfterSec}s`,
     };
   }
   return null;

@@ -76,6 +76,73 @@ describe("lane-budget (#1055 g2)", () => {
     expect(isQuotaExhaustion(429, adm!.message)).toBe(false);
   });
 
+  // ── CR N1 — the traversal lane names are NOT lanes ───────────────────────
+  // "." and ".." resolve to the stop dir and its parent once sanitized; a
+  // lane starting with a dot is refused as a lane ("" ⇒ instrument inert),
+  // on BOTH sides of the shared sanitizer (N6: this is request-logger's
+  // sanitizeHarnessLane re-exported — the envelope field gets the same rule).
+  it("sanitizeLane refuses leading-dot lanes — traversal closed (CR N1)", () => {
+    for (const hostile of ["..", ".", "../x", "..\\x", ".hidden", "../../etc"]) {
+      expect(sanitizeLane(hostile)).toBe("");
+    }
+    // Dots INSIDE a lane are fine — only the leading one is refused.
+    expect(sanitizeLane("nb-coder.v2")).toBe("nb-coder.v2");
+    expect(sanitizeLane("a.b-c_d")).toBe("a.b-c_d");
+  });
+
+  // ── CR N2 — a quota-word NAME must not arm the failover off our own 429 ──
+  // The client message never echoes the lane/model names, so even a lane
+  // called "weekly-digest" with a model "credit-analyst-v1" (both measured
+  // matching isQuotaExhaustion when echoed) stays arm-safe.
+  it("quota-word lane/model names: refusal wording stays arm-safe (CR N2)", () => {
+    const env = ENV({ CLAUDISH_LANE_BUDGETS: "weekly-digest:500" });
+    let clock = 1_000_000;
+    setLaneBudgetClockForTests(() => clock);
+    const raw = {};
+    openLaneBudgetAttempt(raw, "weekly-digest", "credit-analyst-v1", env);
+    recordLaneBudgetOutput(raw, 600);
+    const adm = admitLaneBudget("weekly-digest", "credit-analyst-v1", env);
+    expect(adm?.refused).toBe(true);
+    expect(isQuotaExhaustion(429, adm!.message)).toBe(false);
+    expect(adm!.message).not.toContain("weekly-digest");
+    expect(adm!.message).not.toContain("credit-analyst-v1");
+    const stopDir = mkdtempSync(join(tmpdir(), "lane-stop-n2-"));
+    try {
+      writeFileSync(join(stopDir, "weekly-digest"), "");
+      const stopAdm = admitLaneBudget("weekly-digest", "credit-analyst-v1", ENV({
+        CLAUDISH_LANE_STOP_DIR: stopDir,
+      }));
+      expect(stopAdm?.refused).toBe(true);
+      expect(isQuotaExhaustion(429, stopAdm!.message)).toBe(false);
+    } finally {
+      rmSync(stopDir, { recursive: true, force: true });
+    }
+  });
+
+  // ── #1063 CR B1 — the emitter's log line is `consumed=`, the reader's ────
+  // spelling; one pin per side so they cannot drift again.
+  it("the REFUSE log line writes consumed= (the lane report's regex) (#1063 CR B1)", () => {
+    const env = ENV({ CLAUDISH_LANE_BUDGETS: "nb-coder:500" });
+    let clock = 1_000_000;
+    setLaneBudgetClockForTests(() => clock);
+    const raw = {};
+    openLaneBudgetAttempt(raw, "nb-coder", "nb-minimax", env);
+    recordLaneBudgetOutput(raw, 600);
+    const lines: string[] = [];
+    const realLog = console.log;
+    console.log = ((...args: any[]) => {
+      for (const a of args) if (typeof a === "string" && a.includes("REFUSE")) lines.push(a);
+    }) as any;
+    try {
+      admitLaneBudget("nb-coder", "nb-minimax", env);
+    } finally {
+      console.log = realLog;
+    }
+    expect(lines.some((l) =>
+      /\[LaneBudget\] REFUSE lane=nb-coder model=nb-minimax consumed=\d+ >= \d+ /.test(l)
+    )).toBe(true);
+  });
+
   it("two paid attempts of one request land in TWO slots — sum, not max", () => {
     const env = ENV({ CLAUDISH_LANE_BUDGETS: "nb-coder:1000" });
     setLaneBudgetClockForTests(() => 1_000_000);

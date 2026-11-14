@@ -140,6 +140,19 @@ export function extractAttributionFields(body: Record<string, unknown>): Record<
   return out;
 }
 
+/**
+ * #1055 CR N6 — the ONE harness-lane sanitizer, exported from the g1 site so
+ * the attribution key (capture envelope) and the budget ledger key (#1060)
+ * cannot drift apart. Leading dot refused (#1060 CR N1): the dot-only lanes
+ * `.` and `..` would resolve to the stop dir and its parent on the budget
+ * side — a lane starting with `.` is not a lane. Alphabet [a-zA-Z0-9._-],
+ * 64 max, same contract as `workspace`.
+ */
+export function sanitizeHarnessLane(raw: string | null | undefined): string {
+  const s = (raw ?? "").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 64);
+  return s.startsWith(".") ? "" : s;
+}
+
 export function logRequest(
   body: Record<string, unknown>,
   handlerName: string,
@@ -175,9 +188,7 @@ export function logRequest(
   // (e.g. a web tool result quoting `"lane":`) win the search on the
   // pre-#1055 corpus. Sanitized like workspace: client-supplied, lands on
   // disk, read back by the analyzers — [a-zA-Z0-9._-], 64 max.
-  const harnessLane = (req.headers.get("x-claudish-lane") || "")
-    .replace(/[^a-zA-Z0-9._-]/g, "")
-    .slice(0, 64);
+  const harnessLane = sanitizeHarnessLane(req.headers.get("x-claudish-lane"));
 
   // #566 — the relay's hop chain (the same header #156/#279 appends for loop
   // detection), captured so a relayed request is distinguishable from a direct
