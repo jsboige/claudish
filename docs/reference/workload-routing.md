@@ -95,5 +95,5 @@ never silently disagree about what "agent-sdk" means.
 - Engine pressure: the #704 R door (ECONNRESET/hairpin fixed, capacity measured) gates any
   arming — this spec does not bypass it.
 
-**Trigger conditions** (ROADMAP): (1) user refines the 25/10 arbitration to
-workload-level; (2) #704 porte R passed. Either alone parks the item.
+**Trigger conditions** (ROADMAP-FORK.md, this fork's parked items): (1) user refines the 25/10
+arbitration to workload-level; (2) #704 porte R passed. Either alone parks the item.

@@ -5,6 +5,8 @@ Planned-but-unimplemented work for Claudish. Items here are deliberately scoped,
 For shipped features and current architecture, see `CLAUDE.md`. For ad-hoc research and validation sessions, see `ai-docs/sessions/`.
 
 > **Fork note (this fork).** `ai-docs/` is a gitignored local research-session dir — every citation to it below is provenance, not a repo path. Parking facts verified in this fork: the parked push-notifications item's SDK trigger is MET (`modelcontextprotocol/typescript-sdk#1041` merged 2025-11-27, verified 2026-10-16); the other two gates still block it.
+>
+> Items parked by THIS FORK (fleet-specific) live in [`ROADMAP-FORK.md`](ROADMAP-FORK.md), not here — this file stays upstream-shaped so it merges cleanly (#897 P1).
 
 ---
 
