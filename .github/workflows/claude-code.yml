@@ -24,7 +24,11 @@ name: Claude Code PR Assistant
 #   gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body on
 # To turn it off again: gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body off
 #
-# Fork PRs never receive repository secrets, so `review` skips them by construction.
+# A fork PR's `pull_request` event carries no repository secrets, so `review` skips
+# fork heads. `mention` is different: `issue_comment` runs in the base repository WITH
+# secrets, even on a fork PR. It is therefore limited to OWNER/MEMBER/COLLABORATOR
+# authors, on top of the action's own `restrict_untrusted_prs` default.
+# `contains()` is case-insensitive; "@claude-bot" would still start a no-op run.
 
 on:
   pull_request:
