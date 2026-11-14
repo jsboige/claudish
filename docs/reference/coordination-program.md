@@ -122,5 +122,5 @@ Everything else is decided by the coordinator, written in the issue, and reversi
 ## Keeping this page true
 
 - An objective changes here when its carrying issues change: a closed issue leaves the table, a new strategic issue enters it, in the cycle where it happens.
-- The first cycle of each week compares the table with `gh issue list --state open`. An open issue that fits no objective is either given one, or closed, or written down in `ROADMAP.md` with its trigger.
+- The first cycle of each week compares the table with `gh issue list --state open`. An open issue that fits no objective is either given one, or closed, or written down in `ROADMAP.md` / `ROADMAP-FORK.md` with its trigger.
 - Apart from the date the page was written and the dates of the mandates, no date, count or percentage is added to this page. If a number seems needed here, it belongs in an issue.
