@@ -2621,3 +2621,99 @@ describe("v27 — heartbeat failure shape and episode log", () => {
     expect(lines.filter((l) => l.includes("[Relay] heartbeat"))).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v28 — #587 g1: every relay flip carries the hub's own /health fields.
+//
+// The 13/11 tenue queued this grain because the issue's minute-join had turned
+// ZERO complete pairs: the relay journaled only its verdict, while
+// `eventLoopMax60sMs` and `activeStreams` exist live on the hub and nowhere in
+// this log. Two lines now carry the last body the hub actually said — the
+// failure line (which may be minutes past that body: `age`) and the NOMINAL
+// line (whose body is the beat that just decided it). A field the image does
+// not publish reads `none`, never 0: coercing an absent counter to zero
+// manufactures "no loop stall" evidence forever (the 24/10 trap on this issue).
+describe("#587 g1 — flip lines carry the hub's /health fields", () => {
+  const realConsoleLog = console.log;
+  let lines: string[];
+
+  beforeEach(() => {
+    lines = [];
+    console.log = ((m: unknown) => {
+      lines.push(String(m));
+    }) as typeof console.log;
+  });
+  afterEach(() => {
+    console.log = realConsoleLog;
+  });
+
+  const failed = () => lines.filter((l) => l.includes("[Relay] heartbeat FAILED"));
+  const nominal = () => lines.filter((l) => l.includes("healthy again → NOMINAL (relay resumed)"));
+  const healthBody = (extra: Record<string, unknown>) =>
+    new Response(JSON.stringify({ status: "ok", instanceId: "hub-abc", ...extra }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  const stream = () =>
+    sseResponse(
+      'event: message_start\ndata: {"type":"message_start"}\n\n' +
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    );
+  const timeout = async (): Promise<Response> => {
+    const e = new Error("The operation was aborted due to timeout");
+    e.name = "TimeoutError";
+    throw e;
+  };
+
+  it("C1: a failure names the last body the hub gave — id, loop max, streams, and its age", async () => {
+    fetchImpl = async () => healthBody({ eventLoopMax60sMs: 1234, activeStreams: 7 });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    fetchImpl = timeout;
+    expect(await heartbeat(state)).toBe(false);
+    expect(failed()).toHaveLength(1);
+    const line = failed()[0]!;
+    expect(line).toContain("instanceId=hub-abc");
+    expect(line).toContain("eventLoopMax60sMs=1234");
+    expect(line).toContain("activeStreams=7");
+    expect(line).toMatch(/age=\d+\.\ds/);
+  });
+
+  it("C2: absent fields read none, never 0 — and a first-beat failure reads hub-last=none", async () => {
+    // A pre-#615 hub image publishes no loop counter: the line must say so.
+    fetchImpl = async () => healthBody({});
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    fetchImpl = timeout;
+    expect(await heartbeat(state)).toBe(false);
+    expect(failed()[0]).toContain("eventLoopMax60sMs=none");
+    expect(failed()[0]).toContain("activeStreams=none");
+    expect(failed()[0]).not.toContain("eventLoopMax60sMs=0");
+
+    // No body was ever read (hub silent from the very first beat).
+    lines.length = 0;
+    const cold = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(cold)).toBe(false);
+    expect(failed()).toHaveLength(1);
+    expect(failed()[0]).toContain("hub-last=none");
+  });
+
+  it("C3: the NOMINAL line carries the beat's own hub fields", async () => {
+    const s = createRelayState({ upstream: "http://hub:3000" });
+    s.alive = false;
+    s.lastFlipAt = 0;
+    s.consecutiveOk = 3;
+    fetchImpl = async (url: any) =>
+      String(url).endsWith("/health")
+        ? healthBody({ eventLoopMax60sMs: 42, activeStreams: 3 })
+        : Promise.resolve(stream());
+    await proberTick(s);
+    expect(s.alive).toBe(true);
+    expect(nominal()).toHaveLength(1);
+    const line = nominal()[0]!;
+    expect(line).toContain("instanceId=hub-abc");
+    expect(line).toContain("eventLoopMax60sMs=42");
+    expect(line).toContain("activeStreams=3");
+    expect(line).toMatch(/age=0\.\ds/);
+  });
+});
