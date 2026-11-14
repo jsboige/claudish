@@ -22,7 +22,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
-import { CAPTURE_PROBE_TTL_ENV, resetCaptureBindProbeForTests } from "./handlers/shared/capture-bind-probe.js";
+import {
+  CAPTURE_PROBE_TTL_ENV,
+  captureBindProbeSettleForTests,
+  resetCaptureBindProbeForTests,
+} from "./handlers/shared/capture-bind-probe.js";
 import type { ProxyServer } from "./types.js";
 
 // One allocation per file; the scan in test-support/port-allocation.test.ts
@@ -63,21 +67,28 @@ async function health(): Promise<any> {
 }
 
 describe("#291 /health carries captureBindWrite", () => {
-  test("capture on, writable bind ⇒ \"ok\"", async () => {
+  // CR #1057 — async model: a COLD cache answers "unknown:probing" on the
+  // first /health (never a guessed verdict, never a sync write on the path),
+  // and the REAL verdict lands one probe later.
+  test("capture on, writable bind: cold ⇒ unknown:probing, real \"ok\" one probe later", async () => {
     const dir = mkdtempSync(join(tmpdir(), "route-291-"));
     scratch.push(dir);
     process.env.CLAUDISH_CAPTURE_DIR = dir;
     activeProxy = await createProxyServer(PROXY_PORT, undefined, undefined, false, undefined, undefined, {
       quiet: true,
     });
-    const body = await health();
-    expect(body.captureBindWrite).toBe("ok");
+    const first = await health();
+    expect(first.captureBindWrite).toBe("unknown:probing");
+    await captureBindProbeSettleForTests();
+    const second = await health();
+    expect(second.captureBindWrite).toBe("ok");
   });
 
   test("capture on, dead bind ⇒ \"error:<code>\" — and /health still 200", async () => {
     // A FILE where the dir should be: deterministic ENOTDIR/ENOENT on every
     // platform, no ACL games. The point is not the code — it is that the
-    // endpoint SURFACES the refusal instead of no-op'ing silently.
+    // endpoint SURFACES the refusal instead of no-op'ing silently. Same
+    // one-probe cadence as above.
     const blocker = join(tmpdir(), `route-291-blocker-${process.pid}`);
     writeFileSync(blocker, "not a dir");
     scratch.push(blocker);
@@ -85,7 +96,10 @@ describe("#291 /health carries captureBindWrite", () => {
     activeProxy = await createProxyServer(PROXY_PORT, undefined, undefined, false, undefined, undefined, {
       quiet: true,
     });
-    const body = await health();
-    expect(body.captureBindWrite).toMatch(/^error:[A-Z]+/);
+    const first = await health();
+    expect(first.captureBindWrite).toBe("unknown:probing");
+    await captureBindProbeSettleForTests();
+    const second = await health();
+    expect(second.captureBindWrite).toMatch(/^error:[A-Z]+/);
   });
 });

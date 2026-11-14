@@ -18,26 +18,51 @@
  *                      the errno code when present (ENOSPC, EROFS, EACCES,
  *                      ENOTDIR, ENOENT…), else the clamped error text.
  *
- * Never throws — a probe that can kill /health would trade a silent capture
- * gap for a dead health endpoint. Result is TTL-cached
- * (CLAUDISH_CAPTURE_PROBE_TTL_MS, default 30 s, ≤0 = re-probe every call) so
- * a /health flood cannot stamp the disk; the cache invalidates on dir or TTL
- * change so an operator flipping the env sees the new verdict immediately.
+ * CR #1057 — the probe is ASYNC-REFRESHED, never run inline on /health: the
+ * writers paid twice for a sync write on this loop (request-logger.ts
+ * 2026-08-20: "one slow write froze every handler, including the 4s /health
+ * heartbeat"; response-capture.ts 24/08). A wedged bind does not fail fast —
+ * the diagnosis instrument must not become the outage. So:
+ *   - captureBindWriteVerdict() is a PURE CACHE READ (sync, ~free): the last
+ *     known verdict, or "unknown:probing" on a cold/re-keyed cache — never a
+ *     guessed "ok" (a cold cache that reported ok would hide exactly the
+ *     dead-bind class being probed); a stale-but-matching verdict is served
+ *     while its refresh runs (last MEASURED truth, aging, never a guess);
+ *   - a stale/missing verdict kicks ONE fire-and-forget async refresh
+ *     (fs/promises writeFile + unlink); errors fold into the next verdict;
+ *   - at most one refresh in flight — a /health flood cannot stamp the disk
+ *     or pile up probes (the TTL additionally spaces them:
+ *     CLAUDISH_CAPTURE_PROBE_TTL_MS, default 30 s; ≤0 = refresh allowed on
+ *     every call — the "≤0" spelling INCLUDES the empty-string compose case,
+ *     `${VAR:-}` injecting "" yields Number("") = 0 — deliberately treated
+ *     as "probe often", the safe direction, never as a parse error);
+ *   - the cache invalidates on dir or TTL change so an operator flipping the
+ *     env sees the new verdict on the next refresh, not the stale one.
  */
 
-import { rmSync, writeFileSync } from "node:fs";
+import { writeFile, unlink } from "node:fs/promises";
 
 const PROBE_FILE = ".bind-write-probe";
 const DEFAULT_TTL_MS = 30_000;
 
+/**
+ * Read via a STRING LITERAL (CR #1057 blocking 2): `process.env[CONST]` is
+ * invisible to the compose-env-coverage scanner, so the name could sit
+ * missing from docker-compose.yml's environment: with the test green (#310:
+ * the env is fixed at create time — an absent name never reaches the
+ * process). The literal keeps the scanner honest.
+ */
 export const CAPTURE_PROBE_TTL_ENV = "CLAUDISH_CAPTURE_PROBE_TTL_MS";
 
 let cache: { dir: string; ttlMs: number; verdict: string; at: number } | null = null;
+let refreshing = false;
 
 function probeTtlMs(): number {
-  const raw = Number(process.env[CAPTURE_PROBE_TTL_ENV]);
-  if (!Number.isFinite(raw)) return DEFAULT_TTL_MS;
-  return raw > 0 ? raw : 0;
+  const raw = process.env.CLAUDISH_CAPTURE_PROBE_TTL_MS;
+  if (raw === undefined || raw === "") return DEFAULT_TTL_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_TTL_MS;
+  return n > 0 ? n : 0;
 }
 
 function errorTag(err: unknown): string {
@@ -49,12 +74,52 @@ function errorTag(err: unknown): string {
 /** Test seam — drops the TTL cache so each test probes from a clean slate. */
 export function resetCaptureBindProbeForTests(): void {
   cache = null;
+  refreshing = false;
+}
+
+/** Test seam — true while an async refresh is in flight (the one-flight pin). */
+export function captureBindProbeRefreshingForTests(): boolean {
+  return refreshing;
+}
+
+/** Test seam — await the in-flight refresh (asserts the real verdict later). */
+export async function captureBindProbeSettleForTests(): Promise<void> {
+  while (refreshing) await new Promise((r) => setTimeout(r, 5));
 }
 
 /**
- * The verdict for /health's `captureBindWrite` field. Reads the env per call
- * (the capture writers do the same — see response-capture.ts), so a mid-life
- * env change is honored on the next probe once the TTL allows it.
+ * The ONE async refresh. Fire-and-forget from the reader below; never
+ * awaited on the /health path. Errors fold into the cached verdict — the
+ * probe still never throws.
+ */
+async function refreshVerdict(dir: string, ttlMs: number, now: number): Promise<void> {
+  const file = `${dir}/${PROBE_FILE}`;
+  let verdict = "ok";
+  try {
+    await writeFile(file, String(now));
+    await unlink(file);
+  } catch (err) {
+    verdict = `error:${errorTag(err)}`;
+  }
+  // No re-key guard here: under one-flight NOTHING else can write the cache
+  // while this refresh runs (the `refreshing` gate is the whole mutex), so a
+  // cache whose key differs from this refresh's key is simply the STALE
+  // entry this result supersedes — always overwrite, always clear the flag
+  // (a latched `refreshing` would freeze every later call on
+  // unknown:probing).
+  cache = { dir, ttlMs, verdict, at: now };
+  refreshing = false;
+}
+
+/**
+ * The verdict for /health's `captureBindWrite` field — a PURE SYNC CACHE
+ * READ. Reads the env per call (the capture writers do the same — see
+ * response-capture.ts), so a mid-life env change is honored on the next
+ * refresh. The verdict served is the LAST MEASURED TRUTH for THIS
+ * (dir, TTL) key — never a guess: a cold or re-keyed cache reports
+ * "unknown:probing" until the first refresh lands (CR: never a guessed
+ * "ok"). A stale-but-matching verdict is served WHILE one async refresh
+ * runs — /health never blocks on disk, and the truth lands one probe later.
  */
 export function captureBindWriteVerdict(now = Date.now()): string {
   const dir = process.env.CLAUDISH_CAPTURE_DIR;
@@ -66,16 +131,18 @@ export function captureBindWriteVerdict(now = Date.now()): string {
     return "disabled";
   }
   const ttlMs = probeTtlMs();
-  if (cache && cache.dir === dir && cache.ttlMs === ttlMs && now - cache.at < ttlMs) {
-    return cache.verdict;
+  const matching = cache !== null && cache.dir === dir && cache.ttlMs === ttlMs;
+  // Stale when no matching verdict, or the matching one aged past the TTL
+  // (age >= ttl: at TTL<=0 every call is stale — "re-probe every call").
+  const stale = !matching || now - cache!.at >= ttlMs;
+  if (stale && !refreshing) {
+    refreshing = true;
+    void refreshVerdict(dir, ttlMs, now).catch(() => {
+      // refreshVerdict never throws (its body folds errors), this guards a
+      // truly unexpected rejection from leaving `refreshing` latched.
+      refreshing = false;
+    });
   }
-  let verdict = "ok";
-  try {
-    writeFileSync(`${dir}/${PROBE_FILE}`, String(now));
-    rmSync(`${dir}/${PROBE_FILE}`, { force: true });
-  } catch (err) {
-    verdict = `error:${errorTag(err)}`;
-  }
-  cache = { dir, ttlMs, verdict, at: now };
-  return verdict;
+  if (!matching) return "unknown:probing";
+  return cache!.verdict;
 }

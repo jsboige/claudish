@@ -2938,8 +2938,10 @@ export async function createProxyServer(
         // #291 — verdict of an ACTUAL write+unlink into CLAUDISH_CAPTURE_DIR:
         // "ok" | "disabled" (capture off by env) | "error:<code>" (the bind
         // refused — the 29/10 rootfs-full class that no-op'd every writer
-        // silently). TTL-cached inside the probe; never throws, so a dead
-        // bind can never take /health down with it.
+        // silently) | "unknown:probing" (cold cache, first refresh in flight
+        // — CR #1057: the probe is async-refreshed, NEVER a sync write on
+        // this path: the writers paid twice for that, and a wedged bind does
+        // not fail fast). Pure cache read; never throws; never blocks.
         captureBindWrite: captureBindWriteVerdict(),
       },
       stalled ? 503 : 200

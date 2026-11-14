@@ -130,6 +130,11 @@ services:
       - SEARXNG_URL=${SEARXNG_URL:-http://192.168.0.47:8181}
       # Empty disables capture writing (sidecar default; hub leaves it at /captures).
       - CLAUDISH_CAPTURE_DIR=${CLAUDISH_CAPTURE_DIR-/captures}
+      # #291 capture bind-write probe TTL on /health. CONCRETE default, not the
+      # bare `:-` form: `${VAR:-}` injects "" and Number("") is 0 = re-probe on
+      # every /health call (CR #1057 trap). The probe also treats "" as unset
+      # at the read site — belt and braces.
+      - CLAUDISH_CAPTURE_PROBE_TTL_MS=${CLAUDISH_CAPTURE_PROBE_TTL_MS:-30000}
       # Sidecar relay (fork extension). All empty → this container is the HUB
       # (po-2025 since the 2026-09 migration): always local, unchanged. On a
       # sidecar machine, set these in the per-machine .env:
