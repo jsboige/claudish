@@ -6,33 +6,9 @@
  * Includes 30-second timeout with detailed error reporting.
  */
 
-import type { ExactPromptCount, ProviderTransport, StreamFormat } from "./types.js";
+import type { ProviderTransport, StreamFormat } from "./types.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
-import { LocalModelQueue } from "../../handlers/shared/local-queue.js";
-import { ConcurrencyLimiter } from "../../handlers/shared/concurrency-limiter.js";
 import { log } from "../../logger.js";
-import { isQuotaWall } from "./quota-wall.js";
-import { isConcurrencyRefusalResponse } from "../../handlers/shared/step-skip.js";
-
-/**
- * #674 — how long the exact-count probe may take. The tokenizer answers in
- * milliseconds (measured against the shipping vLLM); this bound exists so a
- * black-holed endpoint degrades to the estimate instead of holding the turn.
- */
-const EXACT_COUNT_TIMEOUT_MS = 3000;
-
-/**
- * #674 — tokenizer URLs already known to have no route. Module-level, not
- * per-instance: the proxy rebuilds transports (handler cache, cascade steps),
- * and a process-wide memo is what makes "one 404, then never again" true. Keyed
- * by URL so two endpoints on the same host are judged separately.
- */
-const tokenizeUnsupportedUrls = new Set<string>();
-
-/** Test seam: forget the memo (no production caller). */
-export function resetTokenizerMemoForTests(): void {
-  tokenizeUnsupportedUrls.clear();
-}
 
 export class OpenAIProviderTransport implements ProviderTransport {
   readonly name: string;
@@ -42,10 +18,10 @@ export class OpenAIProviderTransport implements ProviderTransport {
   readonly clientAttribution: boolean;
 
   protected provider: RemoteProvider;
-  private apiKey: string;
-  private modelName: string;
   private maxConcurrency?: number;
   private limiter?: ConcurrencyLimiter;
+  private apiKey: string;
+  private modelName: string;
 
   constructor(
     provider: RemoteProvider,
@@ -336,3 +312,37 @@ export class OpenAIConnectionError extends Error {
 // Backward-compatible alias
 /** @deprecated Use OpenAIProviderTransport */
 export { OpenAIProviderTransport as OpenAIProvider };
+
+// ---------------------------------------------------------------------------
+// FORK (myia fleet) — #897 P1 seam: fleet additions, kept OUT of the import
+// block and the class field/constant anchors above, which the next upstream
+// sync rewrites (auth architecture, declarative streamFormat). Imports are
+// hoisted and the constants are consumed only inside class methods (never at
+// module-eval time), so their position here is behavior-neutral.
+// ---------------------------------------------------------------------------
+
+import type { ExactPromptCount } from "./types.js";
+import { LocalModelQueue } from "../../handlers/shared/local-queue.js";
+import { ConcurrencyLimiter } from "../../handlers/shared/concurrency-limiter.js";
+import { isQuotaWall } from "./quota-wall.js";
+import { isConcurrencyRefusalResponse } from "../../handlers/shared/step-skip.js";
+
+/**
+ * #674 — how long the exact-count probe may take. The tokenizer answers in
+ * milliseconds (measured against the shipping vLLM); this bound exists so a
+ * black-holed endpoint degrades to the estimate instead of holding the turn.
+ */
+const EXACT_COUNT_TIMEOUT_MS = 3000;
+
+/**
+ * #674 — tokenizer URLs already known to have no route. Module-level, not
+ * per-instance: the proxy rebuilds transports (handler cache, cascade steps),
+ * and a process-wide memo is what makes "one 404, then never again" true. Keyed
+ * by URL so two endpoints on the same host are judged separately.
+ */
+const tokenizeUnsupportedUrls = new Set<string>();
+
+/** Test seam: forget the memo (no production caller). */
+export function resetTokenizerMemoForTests(): void {
+  tokenizeUnsupportedUrls.clear();
+}

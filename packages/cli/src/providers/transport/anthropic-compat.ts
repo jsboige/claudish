@@ -11,12 +11,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import type { ProviderTransport, StreamFormat } from "./types.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
-import { LocalModelQueue } from "../../handlers/shared/local-queue.js";
-import { ConcurrencyLimiter } from "../../handlers/shared/concurrency-limiter.js";
 import { log } from "../../logger.js";
 import { KimiOAuth } from "../../auth/kimi-oauth.js";
-import { isQuotaWall } from "./quota-wall.js";
-import { isConcurrencyRefusalResponse } from "../../handlers/shared/step-skip.js";
 
 export class AnthropicProviderTransport implements ProviderTransport {
   readonly name: string;
@@ -231,3 +227,15 @@ export class AnthropicProviderTransport implements ProviderTransport {
 // Backward-compatible alias
 /** @deprecated Use AnthropicProviderTransport */
 export { AnthropicProviderTransport as AnthropicCompatProvider };
+
+// ---------------------------------------------------------------------------
+// FORK (myia fleet) — #897 P1 seam: fleet imports, kept OUT of the import
+// block above (base-shaped), which the next upstream sync rewrites for its
+// auth architecture. Import declarations are hoisted, so their position here
+// is behavior-neutral.
+// ---------------------------------------------------------------------------
+
+import { LocalModelQueue } from "../../handlers/shared/local-queue.js";
+import { ConcurrencyLimiter } from "../../handlers/shared/concurrency-limiter.js";
+import { isQuotaWall } from "./quota-wall.js";
+import { isConcurrencyRefusalResponse } from "../../handlers/shared/step-skip.js";
