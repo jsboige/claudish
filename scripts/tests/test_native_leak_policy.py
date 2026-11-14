@@ -61,6 +61,23 @@ def _run(d, *extra):
     return p.returncode, p.stdout + p.stderr
 
 
+def _run_full(d, *extra):
+    empty = tempfile.mkdtemp(prefix="full-rdir-")
+    p = subprocess.run(
+        [sys.executable, _SCRIPT, "--captures-dir", d,
+         "--reconcile-dir", empty, *extra],
+        capture_output=True, text=True, encoding="utf-8")
+    return p.returncode, p.stdout + p.stderr
+
+
+def _ws_sub(out):
+    """La colonne `sub` de la rangee de workspace du mode complet."""
+    for line in out.splitlines():
+        if line.strip().startswith("(inconnu) "):
+            return line.split()[4]
+    return None
+
+
 def _anchor(d):
     # an early unrelated request, so the corpus starts well before the pairs
     # under test and the compaction-truncated exception (8) cannot mask them
@@ -234,6 +251,44 @@ def test_pool_equivalence_refused_verdict():
     code, out = _equivalence(d, "--since", "2026-11-09T00")
     assert code == 3, f"expected exit 3, got {code}\n{out}"
     assert "Non appariees : natives=1 opus=1" in out, out
+
+
+def test_full_mode_and_leak_policy_agree_on_sub():
+    """#1051 — le meme corpus, les deux chemins, le MEME compte.
+
+    Avant #1051 le mode complet rendait 0 (la cle JSON n'existe pas dans les
+    captures reelles) et --leak-policy rendait tout (il matchait l'echo du
+    CLAUDE.md du depot, present dans le prompt systeme de chaque session
+    claudish) : 0 contre 165/165 sur le corpus hub du 14/11. Les deux captures
+    ci-dessous portent l'echo, donc les deux ANCIENS predicats se separent ;
+    le predicat partage doit rendre 1 — celui dont l'en-tete porte le drapeau.
+    """
+    d = tempfile.mkdtemp(prefix="leak-eq-1051-")
+    _anchor(d)
+    echo = "`cc_is_subagent=true` is the leak signature, and it lives in the request body"
+    # tour principal : en-tete SANS le drapeau, echo du CLAUDE.md a cote
+    _req(d, 1, 40, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"system": [
+             {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.322.245; cc_entrypoint=claude-vscode; cc_workload=cron;"},
+             {"type": "text", "text": echo}], "messages": []})
+    _resp(d, 1, 1, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 40)
+    # sous-agent : en-tete AVEC le drapeau, pas d'echo
+    _req(d, 1, 41, "2026-11-09T06-10-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"system": [
+             {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.322.245; cc_is_subagent=true;"}],
+             "messages": []})
+    _resp(d, 1, 2, "2026-11-09T06-10-05-000Z", "claude-opus-5-5", 41)
+
+    code, out = _run(d, "--since", "2026-11-09T00")
+    assert code == 0, out
+    po = _row(out, "myia-po-2024")
+    assert po.split()[1:3] == ["2", "2"], po
+    assert "sub=1/2" in po, f"leak-policy must count exactly one sub-agent: {po}"
+
+    code, out = _run_full(d, "--since", "2026-11-09T00")
+    assert code == 0, out
+    assert _ws_sub(out) == "1", \
+        f"full mode and leak-policy disagree on the same corpus (#1051):\n{out}"
 
 
 if __name__ == "__main__":
