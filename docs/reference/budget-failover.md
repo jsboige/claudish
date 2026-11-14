@@ -903,6 +903,28 @@ The dir must be volume-mounted into the container at the path the env names
 (`docker-compose.yml` carries the env name but mounts nothing by default — a
 seat that arms the stop adds the bind). A stopped lane's requests are refused
 locally with `x-claudish-lane-refusal: stop` (900 s retry-after); every other
-lane and lane-less traffic is untouched. Both refusals (budget and stop) log a
-`[Lane…] REFUSE` stderr line — the lane report's refusal feed, since a refused
-request writes no capture (it never reaches `logRequest`).
+lane and lane-less traffic is untouched.
+
+**Where each check runs (CR B4, measured):** the STOP check sits ABOVE the
+relay branch on both ingresses — a stop file belongs to the node the operator
+controls, so it holds there in BOTH relay modes (NOMINAL forward and
+AUTONOMOUS serve; pre-B4 a NOMINAL sidecar relayed a stopped lane to the hub
+and answered 200). The BUDGET admission sits BELOW the relay: only the node
+that serves counts tokens, and for relayed traffic that is the hub. In one
+sentence each — stop on a sidecar: that seat's lanes, both modes; stop on the
+hub: every relayed lane; budget: always the admitting node (hub in NOMINAL,
+the seat itself in AUTONOMOUS).
+
+**Two spellings of one lane entry are DELIBERATE (N4 decision):** the g2
+budget bar and the ledger key on the **admission model** — the client alias
+`body.model` as sent (`claude-sonnet-5`, pre-pin, pre-failover) — while the g3
+daily report's per-model table keys on the **served id** the upstream actually
+answered (`fake-nom`, the resolved concrete). The bar gates what the client
+asks for; the report explains what was paid. A report joined back to the bar
+must map alias→served through the route resolution, never by string equality.
+
+Both refusals (budget and stop) log a `[Lane…] REFUSE` **stdout** line
+(`logger.ts`'s `log(msg, true)` is `console.log` — `docker logs` reads both
+streams, but an operator capturing `2> file` would read a false zero) — the
+lane report's refusal feed, since a refused request writes no capture (it
+never reaches `logRequest`).

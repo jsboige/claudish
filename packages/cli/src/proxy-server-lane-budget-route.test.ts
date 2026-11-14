@@ -12,6 +12,13 @@
  *    onTokenUpdate) ⇒ L1 red (consumed stays 0);
  *  - remove the `x-claudish-lane-refusal` header from the refusal ⇒ L1/L2 red
  *    at the header assert.
+ *  - CR B4: move the pre-relay stop check back BELOW the relay branch ⇒ L6/L7
+ *    red (NOMINAL forward answers 200 FROM-THE-HUB with the stop file
+ *    present, hub called);
+ *  - CR B4 walk pin: re-key the walk-site attempt-open (:2351) on the SERVED
+ *    step concrete instead of `requestedModel` ⇒ L9 red (consumed lands under
+ *    the step's model, requested spelling reads 0); dropping the open
+ *    outright ⇒ L9 red the same way.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -20,6 +27,7 @@ import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
 import { isQuotaExhaustion } from "./fork/failover.js";
 import { laneBudgetConsumed, resetLaneBudgetForTests } from "./fork/lane-budget.js";
+import { createRelayState } from "./fork/server/relay.js";
 import type { ProxyServer } from "./types.js";
 
 // Distinct range from the other in-process route tests (19907, 19917 is
@@ -27,6 +35,8 @@ import type { ProxyServer } from "./types.js";
 const PROXY_PORT = 19927;
 const UPSTREAM_PORT = 20027;
 const UPSTREAM_BASE = `http://127.0.0.1:${UPSTREAM_PORT}`;
+const HUB_PORT = 20127;
+const HUB_BASE = `http://127.0.0.1:${HUB_PORT}`;
 
 const CONFIG_DIR = join(homedir(), ".claudish");
 const REAL_CONFIG_PATH = join(CONFIG_DIR, "config.json");
@@ -39,7 +49,7 @@ const SANDBOX_ENV_KEYS = [
   "OPENAI_API_KEY", "OPENAI_CODEX_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
   "MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY", "LITELLM_API_KEY", "POE_API_KEY",
   "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
-  "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
+  "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE", "CLAUDISH_FAILOVER_SONNET",
   "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
   "CLAUDISH_SESSION_BUDGET_CEILING", "CLAUDISH_SESSION_BUDGET_WARN",
@@ -51,6 +61,9 @@ let activeProxy: ProxyServer | null = null;
 const realFetch = globalThis.fetch;
 let calls: Record<string, number> = {};
 let nmCompletion = 350;
+// L9: the nominal answers HTTP 529 (the #299-B overload class) so the
+// one-shot walk fires; the walk step serves SSE usage.
+let nmOverload = false;
 
 function usageSSE(completionTokens: number, promptTokens = 10): Response {
   const chunk = (obj: any) => `data: ${JSON.stringify(obj)}\n\n`;
@@ -113,6 +126,12 @@ function writeTestConfig(): void {
           format: "openai",
           apiKey: "test-key",
         },
+        "walk-ep": {
+          kind: "simple",
+          url: `${UPSTREAM_BASE}/walk/v1`,
+          format: "openai",
+          apiKey: "test-key",
+        },
       },
     }),
     "utf-8"
@@ -146,6 +165,7 @@ async function postMessage(model: string, o: PostOpts = {}): Promise<Response> {
 beforeEach(() => {
   calls = { nm: 0 };
   nmCompletion = 350;
+  nmOverload = false;
   resetLaneBudgetForTests();
   configExisted = existsSync(REAL_CONFIG_PATH);
   configBackup = configExisted ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
@@ -161,8 +181,19 @@ beforeEach(() => {
       calls.native = (calls.native ?? 0) + 1;
       return nativeUsageSSE();
     }
+    if (url.startsWith(HUB_BASE)) {
+      // L6/L7/L8 — the relay forward leg: a plain JSON 200 answers both
+      // ingresses' non-streaming relays (the passthrough pipes it verbatim).
+      calls.hub = (calls.hub ?? 0) + 1;
+      return Response.json({ ok: "FROM-THE-HUB" }, { status: 200 });
+    }
     if (!url.startsWith(UPSTREAM_BASE)) return realFetch(input, init);
+    if (url.includes("/walk/")) {
+      calls.walk = (calls.walk ?? 0) + 1;
+      return usageSSE(400);
+    }
     calls.nm = (calls.nm ?? 0) + 1;
+    if (nmOverload) return Response.json({ error: { message: "overloaded" } }, { status: 529 });
     return usageSSE(nmCompletion);
   }) as typeof fetch;
 });
@@ -198,6 +229,25 @@ async function spin(map?: Record<string, string>): Promise<void> {
     undefined,
     map ?? { sonnet: SONNET_NOMINAL },
     { quiet: true }
+  );
+}
+
+/**
+ * L6/L7/L8 — spin as a NOMINAL sidecar relay (alive:true, no prober): the
+ * static boot-window verdict of proxy-server-hop-gate.test.ts. The hub leg is
+ * stub-intercepted (HUB_BASE) and counted, so a test can assert BOTH the stop
+ * holding (zero hub calls) and the relay being live (lane-less traffic
+ * forwards, FROM-THE-HUB body).
+ */
+async function spinRelay(): Promise<void> {
+  activeProxy = await createProxyServer(
+    PROXY_PORT,
+    undefined,
+    undefined,
+    false,
+    undefined,
+    undefined,
+    { quiet: true, relay: createRelayState({ upstream: HUB_BASE }) }
   );
 }
 
@@ -343,4 +393,108 @@ describe("#1055 g2 — harness-lane budget + emergency stop wired through the ro
     expect(Number(r3.headers.get("retry-after"))).toBeGreaterThan(0);
     expect(calls.nm).toBe(fetchesBefore); // refused pre-upstream on this wire too
   }, 30_000);
+
+  // CR B4 — THE emergency-stop placement. Measured on `5db7a80d`: on a
+  // NOMINAL sidecar the relay forward ran BEFORE the lane admission on both
+  // ingresses, so with the stop file present the answer was 200 FROM-THE-HUB
+  // with the hub called — the operator believes the lane is stopped and it
+  // keeps spending. The STOP check (and only it) moves ABOVE the relay: the
+  // stop file belongs to THIS node's operator, so it holds in BOTH modes. The
+  // budget stays below the relay: only the node that serves counts tokens
+  // (the hub, for relayed traffic).
+  test("L6: NOMINAL relay + stop file → typed local 429, ZERO hub calls (/v1/messages) (CR B4)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lane-stop-relay-"));
+    process.env.CLAUDISH_LANE_STOP_DIR = dir;
+    writeFileSync(join(dir, "nb-coder"), "");
+    await spinRelay();
+
+    const r1 = await postMessage("claude-sonnet-5", { lane: "nb-coder", session: "s1" });
+    expect(r1.status).toBe(429);
+    expect(r1.headers.get("x-claudish-lane-refusal")).toBe("stop");
+    expect(Number(r1.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(calls.hub ?? 0).toBe(0); // the stop held BEFORE the forward
+
+    // The relay itself is live in this test: lane-less traffic forwards.
+    const r2 = await postMessage("claude-sonnet-5", { session: "s2" });
+    expect(r2.status).toBe(200);
+    expect(await r2.text()).toContain("FROM-THE-HUB");
+    expect(calls.hub ?? 0).toBe(1);
+    rmSync(dir, { recursive: true, force: true });
+  }, 30_000);
+
+  test("L7: NOMINAL relay + stop file → OpenAI-shaped typed 429, ZERO hub calls (/v1/chat/completions) (CR B4)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lane-stop-relay-chat-"));
+    process.env.CLAUDISH_LANE_STOP_DIR = dir;
+    writeFileSync(join(dir, "nb-coder"), "");
+    await spinRelay();
+
+    const postChat = (session: string, lane?: string) =>
+      realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "connection": "close",
+          "Content-Type": "application/json",
+          ...(lane ? { "x-claudish-lane": lane } : {}),
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-5",
+          max_tokens: 64,
+          stream: false,
+          user: session,
+          messages: [{ role: "user", content: "say hi" }],
+        }),
+      });
+
+    const r1 = await postChat("s1", "nb-coder");
+    expect(r1.status).toBe(429);
+    const body = JSON.parse(await r1.text());
+    expect(body.error?.type).toBe("rate_limit_error");
+    expect(body.error?.message).toContain("[LaneStop]");
+    expect(r1.headers.get("x-claudish-lane-refusal")).toBe("stop");
+    expect(calls.hub ?? 0).toBe(0);
+
+    // Relay live on this wire too: lane-less chat traffic forwards.
+    const r2 = await postChat("s2");
+    expect(r2.status).toBe(200);
+    expect(await r2.text()).toContain("FROM-THE-HUB");
+    expect(calls.hub ?? 0).toBe(1);
+    rmSync(dir, { recursive: true, force: true });
+  }, 30_000);
+
+  // CR B4 regression guard — the stop moving above the relay must not change
+  // the no-stop behavior: lane'd traffic with an EMPTY stop dir relays exactly
+  // as it did pre-B4 (the check is a per-request stat of a file that is not
+  // there).
+  test("L8: empty stop dir → lane'd traffic relays exactly as today (CR B4)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lane-stop-empty-"));
+    process.env.CLAUDISH_LANE_STOP_DIR = dir; // dir present, NO lane file
+    await spinRelay();
+
+    const r1 = await postMessage("claude-sonnet-5", { lane: "nb-coder", session: "s1" });
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toContain("FROM-THE-HUB");
+    expect(calls.hub ?? 0).toBe(1);
+    rmSync(dir, { recursive: true, force: true });
+  }, 30_000);
+
+  // CR B4 unpinned guard — the walk-site attempt-open (`proxy-server.ts`
+  // #299-B walk, the second half of B1) had no pin of its own: a refactor of
+  // the walk would re-key the ledger silently. The nominal 529s (overload
+  // class), the one-shot walk serves from the cascade step, and the walk's
+  // output must land under the REQUESTED spelling — the admission's key —
+  // never under the walk step's served concrete.
+  test("L9: #299-B walk books the lane ledger under the REQUESTED model, not the served step (CR B4)", async () => {
+    process.env.CLAUDISH_LANE_BUDGETS = "nb-coder:100000"; // armed so the ledger records; bar never crossed
+    process.env.CLAUDISH_FAILOVER_SONNET = "walk-ep@fake-walk-model"; // rule defined, NOT armed
+    nmOverload = true; // nominal answers 529 → one-shot walk
+    await spin();
+
+    const r1 = await postMessage("claude-sonnet-5", { lane: "nb-coder", session: "s1" });
+    expect(r1.status).toBe(200); // the walk served the turn
+    expect(calls.walk ?? 0).toBe(1);
+    expect(calls.nm ?? 0).toBeGreaterThanOrEqual(1); // the nominal overloaded first
+    // THE pin: 400 output tokens under the admission's spelling.
+    expect(laneBudgetConsumed("nb-coder", "claude-sonnet-5")).toBe(400);
+    expect(laneBudgetConsumed("nb-coder", "fake-walk-model")).toBe(0);
+  }, 60_000);
 });

@@ -131,6 +131,7 @@ import {
 import {
   admitLaneBudget,
   laneBudgetRefusalAnthropic,
+  laneStopRefusal,
   openLaneBudgetAttempt,
 } from "./fork/lane-budget.js";
 import {
@@ -3189,6 +3190,25 @@ export async function createProxyServer(
       const freeze = drainFreezeGate();
       if (freeze) return freeze;
 
+      // #1055 g2 CR B4 — the operator STOP check sits ABOVE the relay branch,
+      // the same placement rule as the freeze above it: the stop file belongs
+      // to THIS node's operator, so the stop must hold in BOTH relay modes. A
+      // NOMINAL forward would relay a stopped lane to the hub and keep
+      // spending (measured: 200 with the hub called, both ingresses), and a
+      // stop enforced only at the hub would miss a sidecar that has gone
+      // AUTONOMOUS. The BUDGET admission stays BELOW the relay (see there):
+      // only the node that serves counts tokens — for relayed traffic that is
+      // the hub. A per-request stat of an operator-named file; inert without
+      // CLAUDISH_LANE_STOP_DIR / an x-claudish-lane header.
+      {
+        const stop = laneStopRefusal(
+          c.req.header("x-claudish-lane") ?? null,
+          (body.model as string) ?? "",
+          process.env
+        );
+        if (stop) return laneBudgetRefusalAnthropic(stop);
+      }
+
       // Sidecar relay (fork extension). In NOMINAL mode (upstream configured +
       // alive) forward the raw request to the central hub and return its piped
       // response. This branch sits BEFORE interceptWebTools / getHandlerForRequest
@@ -3248,11 +3268,15 @@ export async function createProxyServer(
         if (admission?.refused) return sessionBudgetRefusalAnthropic(admission);
       }
 
-      // #1055 g2 — harness-lane admission (per-(lane, model) daily budget +
-      // operator emergency stop). Null (zero work) for every request without
-      // an `x-claudish-lane` header — the pre-#1055 path is byte-identical.
-      // Refusals are TYPED (`x-claudish-lane-refusal`) so the harness defers
-      // the notebook instead of queueing silently; paid before any handler.
+      // #1055 g2 — harness-lane BUDGET admission (per-(lane, model) daily
+      // bar). CR B4: the emergency-stop half runs ABOVE the relay branch (see
+      // there); this site stays below because only the node that serves
+      // counts tokens — on a NOMINAL sidecar the hub admits relayed traffic.
+      // On a hub (no relay branch) this call still covers both halves. Null
+      // (zero work) for every request without an `x-claudish-lane` header —
+      // the pre-#1055 path is byte-identical. Refusals are TYPED
+      // (`x-claudish-lane-refusal`) so the harness defers the notebook
+      // instead of queueing silently; paid before any handler.
       {
         const admission = admitLaneBudget(
           c.req.header("x-claudish-lane") ?? null,
@@ -3377,6 +3401,36 @@ export async function createProxyServer(
       const freeze = drainFreezeGate();
       if (freeze) return freeze;
 
+      // #1055 g2 CR B4 — the operator STOP check above the relay, same rule
+      // as /v1/messages (this ingress is the sk-agent wire of #1055's
+      // harness): the stop holds on THIS node in BOTH relay modes — a NOMINAL
+      // forward would relay a stopped lane to the hub and keep spending. The
+      // budget admission stays below the relay (the hub counts relayed
+      // tokens). Inert without CLAUDISH_LANE_STOP_DIR / a lane header.
+      {
+        const stop = laneStopRefusal(
+          c.req.header("x-claudish-lane") ?? null,
+          typeof openaiBody?.model === "string" ? openaiBody.model : "",
+          process.env
+        );
+        if (stop) {
+          return c.json(
+            {
+              error: {
+                message: stop.message,
+                type: "rate_limit_error",
+                code: null,
+              },
+            },
+            429,
+            {
+              "retry-after": String(stop.retryAfterSec),
+              "x-claudish-lane-refusal": stop.type,
+            }
+          );
+        }
+      }
+
       // Relay (sidecar NOMINAL): forward the RAW OpenAI body to the hub's
       // /v1/chat/completions — the hub translates. Path-aware forward
       // (relay.ts) means this reaches the right hub route, not /v1/messages.
@@ -3431,8 +3485,9 @@ export async function createProxyServer(
       // #1055 g2 CR B3 — the lane admission mirrors here too. The repo names
       // this ingress as the sk-agent one in four places (route comments,
       // openai-ingress.md, #1055's harness IS an sk-agent agent), so the
-      // operator emergency stop must stop the lane on BOTH wires — an untyped
-      // pass-through here would keep a stopped lane paying on this ingress.
+      // budget must gate this wire exactly like /v1/messages. CR B4: the
+      // emergency-stop half runs ABOVE the relay branch on both wires (see
+      // the pre-relay stop block); this admission is the budget half.
       // Same typed header as the native ingress; the ledger keys on the same
       // client spelling (`anthropicBody.model` — pre-pin, pre-failover).
       {
