@@ -79,12 +79,29 @@ SEP_RE = re.compile(r"[\\/]+")
 USAGE_RX = re.compile(r'"usage"\s*:\s*\{([^}]*)\}')
 FIELD_RX = re.compile(
     r'"(input_tokens|cache_read_input_tokens|cache_creation_input_tokens|output_tokens)"\s*:\s*(\d+)')
+# #1051 — le predicat `cc_is_subagent` n'existe qu'en UNE copie, partagee avec
+# native-consumption.py (lib/subagent_flag.py). Ce script en portait la version
+# d'origine, nee et testee ici (#334 B1) ; native-consumption.py portait deux
+# autres predicats, et les trois avaient diverge.
+def _load_lib(name):
+    import importlib.util
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_SF = _load_lib("subagent_flag")
 # The billing-header marker, its k=v; run, and the flags that ride it. The
 # segment regex stops at the closing quote of the system text block, so a
 # match is the header's OWN fields, never what follows in the file.
-BILLING_MARKER = b"x-anthropic-billing-header:"
-BILLING_SEG_RE = re.compile(r'x-anthropic-billing-header:\s*([^"\\]*)')
-BILLING_KV_RE = re.compile(r"(\w+)=([^;]*)")
+BILLING_MARKER = _SF.BILLING_MARKER
+BILLING_SEG_RE = _SF.BILLING_SEG_RE
+BILLING_KV_RE = _SF.BILLING_KV_RE
+billing_fields_of = _SF.billing_fields_of
 # Chunked fallback (trap 2): 1 MB blocks with a 64 B overlap so a marker
 # straddling two blocks is found; the k=v run is short, a 2 KB window from the
 # match reads it whole.
@@ -142,24 +159,11 @@ def user_id_session(uid):
     return sess[:12] if isinstance(sess, str) else None
 
 
-def billing_fields_of(raw):
-    """Subagent + workload verdicts from the x-anthropic-billing-header segment
-    present in `raw` (None if the marker is absent from this text).
-
-    Semantics REUSED from native-consumption.py (#334 B1): three states —
-    cc_is_subagent=true -> True; header without the flag -> False (main);
-    no header anywhere -> None (unknown). The LAST occurrence wins: the real
-    system block is serialized after messages, so an echo quoted inside the
-    conversation comes earlier in the file."""
-    fields = None
-    for seg in BILLING_SEG_RE.finditer(raw):
-        pairs = dict(BILLING_KV_RE.findall(seg.group(1)))
-        if pairs:
-            fields = pairs
-    if fields is None:
-        return None
-    sub = True if fields.get("cc_is_subagent", "").strip() == "true" else False
-    return {"sub": sub, "workload": fields.get("cc_workload", "").strip() or None}
+# billing_fields_of(raw) vient de lib/subagent_flag.py (#1051) : trois etats —
+# cc_is_subagent=true -> True ; en-tete sans le drapeau -> False (principal) ;
+# aucun en-tete -> None (inconnu, jamais devine). Le DERNIER segment gagne : le
+# vrai bloc system est serialise apres messages, un echo cite dans la
+# conversation vient donc avant lui.
 
 
 def scan_billing_file(path):
@@ -189,10 +193,7 @@ def scan_billing_file(path):
                         fields = pairs
                 start = at + 1
             prev = buf[-SCAN_OVERLAP:]
-    if fields is None:
-        return None
-    sub = True if fields.get("cc_is_subagent", "").strip() == "true" else False
-    return {"sub": sub, "workload": fields.get("cc_workload", "").strip() or None}
+    return _SF.fields_to_verdict(fields)
 
 
 # The marker string is ECHOED in conversation prose — quoted rule text, harness
