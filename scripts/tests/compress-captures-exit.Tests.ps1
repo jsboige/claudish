@@ -4,13 +4,13 @@
 
     Founder (13/11, ai-01): the scheduler read LastTaskResult 0 for a night
     whose journal closed on END (errors=3). The script's own contract is
-    `exit $errors` (compress-captures.ps1 L.680) — whatever swallows the code
+    `exit $errors` (compress-captures.ps1 L.680) -- whatever swallows the code
     on a given seat, the script side must be PINNED end-to-end so a future
     regression here is caught in both interpreters and any remaining
     0-despite-errors is provably the launcher chain, not the script.
 
     The counted error is the deterministic one: a manifest entry whose archive
-    is ABSENT off-site (compress-captures.ps1 L.565-568) — no hash math, no
+    is ABSENT off-site (compress-captures.ps1 L.565-568) -- no hash math, no
     clock dependence. A second, clean run pins that the exit code is not
     vacuously nonzero: zero counted errors must exit 0.
 
@@ -29,7 +29,9 @@ foreach ($c in @('7z', '7z.exe', 'C:\Program Files\7-Zip\7z.exe', "$env:USERPROF
 }
 $sevenZip = $cands | Select-Object -First 1
 if (-not $sevenZip) {
-    Write-Output 'SKIP-REASON: no 7z binary resolved (PATH, C:\Program Files\7-Zip, ~/.claudish/bin/7zr.exe) - exit-contract Its will skip on this host'
+    # Write-Host, not Write-Output: Pester's discovery phase discards top-level
+    # Write-Output, and the skip reason must reach the operator (review 14/11).
+    Write-Host 'SKIP-REASON: no 7z binary resolved (PATH, C:\Program Files\7-Zip, ~/.claudish/bin/7zr.exe) - exit-contract Its will skip on this host'
 }
 
 BeforeAll {
