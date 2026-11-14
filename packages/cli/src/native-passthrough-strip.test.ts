@@ -178,7 +178,7 @@ describe("#282 — the proxy's own headers never reach api.anthropic.com", () =>
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
       method: "POST",
-      headers: INBOUND_HEADERS,
+      headers: { ...INBOUND_HEADERS, "connection": "close" },
       body: JSON.stringify({
         model: "claude-sonnet-5",
         max_tokens: 8,
@@ -211,7 +211,7 @@ describe("#282 — the proxy's own headers never reach api.anthropic.com", () =>
     await spin();
     const res = await realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages/count_tokens`, {
       method: "POST",
-      headers: INBOUND_HEADERS,
+      headers: { ...INBOUND_HEADERS, "connection": "close" },
       body: JSON.stringify({
         model: "claude-sonnet-5",
         messages: [{ role: "user", content: "ok" }],

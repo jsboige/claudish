@@ -40,19 +40,56 @@
   subfolder. Empty = skip GDrive (local staging only; loose files are then KEPT,
   never deleted without an off-site copy).
 
+.PARAMETER SevenZip
+  7z binary. Empty (the default) = resolve from the built-in candidate list plus
+  the PATH (#214 port, measured 08/11): the historical hardcoded default exists
+  on no seat of this family and the first armed-task run on po-2024 died on it.
+  An explicit value that exists is used as-is; one that does not exist is warned
+  about and the candidates are tried instead.
+
+.PARAMETER SevenZipCandidates
+  Extra 7z candidates, appended AFTER the built-ins (fallback of last resort).
+
+.PARAMETER NoSevenZipFallback
+  Kill the candidate fallback: an explicit (or absent) 7z that cannot be
+  resolved is then a hard FATAL.
+
 .PARAMETER WhatIf
   Show what would be archived/copied/deleted without changing anything.
+
+.PARAMETER Register
+  #912 (arbitrage a): register the hourly per-seat reconciliation task
+  'ClaudishReconcileOutageCaptures' and exit. The task runs THIS script (no
+  -Register) under the CURRENT operator account, RunLevel Limited — a per-user
+  task needs no elevation, which the registering run itself proves (it must
+  never raise a UAC prompt). Remove the task with:
+
+    Unregister-ScheduledTask -TaskName 'ClaudishReconcileOutageCaptures' -Confirm:$false
+
+  CAVEAT — LogonType Interactive: the task fires ONLY while the registering
+  operator is logged on. A logged-off seat does NOT reconcile (no run, no
+  error, no backlog processing until the next logon — StartWhenAvailable
+  catches up at most one missed run). The outage captures themselves are safe:
+  they are written the moment they happen and stay loose until a logged-on run
+  archives them. But every hub-corpus reader is blind for that seat and window
+  in the meantime — which is exactly why the readers declare their blind spot
+  (#933, scripts/lib/blind_spot.py) instead of printing a bare 0.
 
 .NOTES
   Schedule on each sidecar (Task Scheduler), e.g. hourly or a few minutes after a
   watchdog-detected recovery. Idempotent: with no loose captures it is a no-op.
+  install-sidecar.ps1 registers the task as part of a sidecar install (-Register);
+  on a seat installed before that, run this script once with -Register.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
   [string]$CaptureDir = "D:\claudish-captures",
   [string]$Machine    = "",
-  [string]$SevenZip   = "D:\Apps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe",
-  [string]$GDriveDir  = "G:\Mon Drive\MyIA\backups\claudish-captures"
+  [string]$SevenZip   = "",
+  [string[]]$SevenZipCandidates = @(),
+  [switch]$NoSevenZipFallback,
+  [string]$GDriveDir  = "G:\Mon Drive\MyIA\backups\claudish-captures",
+  [switch]$Register
 )
 
 $ErrorActionPreference = "Stop"
@@ -65,9 +102,68 @@ function Log([string]$msg) {
   try { Add-Content -LiteralPath $logFile -Value $line -Encoding utf8 } catch {}
 }
 
+# --- -Register: create the per-seat task, then exit (#912 arbitrage a) --------
+# Never elevated, never a service principal: the task runs as the installing
+# operator, RunLevel Limited. Registering a per-user task under one's own
+# account requires no UAC consent — the non-elevated registering run is itself
+# the proof the grain asks for.
+if ($Register) {
+    $self = $PSCommandPath
+    if (-not $self) { Write-Host "FATAL: -Register needs the script file path (not dot-sourced)"; exit 2 }
+    # pwsh 7 where installed (the fleet's scheduled interpreter), powershell.exe
+    # 5.1 otherwise — this script is 5.1-clean on purpose (#requires 5.1) and
+    # both interpreters must stay able to run it (test:scripts + :win51).
+    $pwsh7 = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+    $exe   = if (Test-Path -LiteralPath $pwsh7) { $pwsh7 } else { "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
+    $action  = New-ScheduledTaskAction -Execute $exe `
+        -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $self)
+    # Hourly repetition, first run a few minutes out. The job is an idempotent
+    # no-op while the sidecar stays NOMINAL, so hourly costs one directory
+    # listing — and StartWhenAvailable catches suspended-hours misses.
+    # RepetitionDuration: a large-but-VALID bound, never [TimeSpan]::MaxValue —
+    # MaxValue serializes to PT99999999DT23H59M59S, which Task Scheduler rejects
+    # as out-of-range XML ("valeur incorrectement formatée ou hors limites",
+    # caught by the non-elevated registering run). 10 years is indefinite enough.
+    $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(5)) `
+        -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+    $set     = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
+    $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+        -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName 'ClaudishReconcileOutageCaptures' `
+        -Action $action -Trigger $trigger -Settings $set -Principal $princ -Force | Out-Null
+    Write-Host ("OK  task ClaudishReconcileOutageCaptures registered: hourly, as {0}\{1}, RunLevel Limited (no elevation)" -f $env:USERDOMAIN, $env:USERNAME)
+    exit 0
+}
+
 # --- preconditions -----------------------------------------------------------
-if (-not (Test-Path -LiteralPath $SevenZip))   { Log "FATAL: 7z not found at $SevenZip"; exit 2 }
 if (-not (Test-Path -LiteralPath $CaptureDir)) { Log "FATAL: capture dir not found: $CaptureDir"; exit 2 }
+
+# 7z resolution (#214 port, measured 08/11 on po-2024): never a single hardcoded
+# path. All four built-in candidates are absent on this seat family AND '7z' is
+# not on PATH - only the winget '7zr' is - so the first armed-task run died on
+# the old hardcoded portable-apps default (see the 10:42:35Z FATAL in
+# reconcile.log). Same fix class as compress-captures.ps1 (#214): candidate
+# list + PATH probes. 7zr is 7z-format-only, which is exactly what this script
+# creates and tests (-t7z), so it is a fully valid resolver here. The PATH probe
+# covers BOTH names because compress-captures' 'Get-Command 7z' alone resolves
+# nothing on po-2024.
+Import-Module (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1') -Force -DisableNameChecking
+$candidates = @(Get-SevenZipCandidates -Extra $SevenZipCandidates)
+foreach ($bin in '7z', '7zr') {
+  $onPath = Get-Command $bin -ErrorAction SilentlyContinue
+  if ($onPath -and $onPath.Source) { $candidates += $onPath.Source }
+}
+$sevenZipResolved = Resolve-SevenZipPath -Explicit $SevenZip -Candidates $candidates -NoFallback:$NoSevenZipFallback
+if (-not $sevenZipResolved.Path) {
+  Log ("FATAL: 7z not found - tried: {0}" -f (($sevenZipResolved.Tried) -join '; ')); exit 2
+}
+if ($sevenZipResolved.ExplicitMissing) {
+  Log ("WARN  -SevenZip '{0}' does not exist -> resolved to {1}" -f $SevenZip, $sevenZipResolved.Path)
+}
+$SevenZip = $sevenZipResolved.Path
+Log ("SEVENZIP {0} (source={1})" -f $SevenZip, $sevenZipResolved.Source)
 
 # --- enumerate loose captures (outage captures by construction on a sidecar) --
 $rx = '^(req|resp)-.*?(?<d>\d{4}-\d{2}-\d{2})T(?<t>\d{2}-\d{2}-\d{2})'

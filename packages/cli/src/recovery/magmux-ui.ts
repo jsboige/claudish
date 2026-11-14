@@ -350,6 +350,10 @@ const KIND_WORD: Record<RecoveryEpisodeFrame["kind"], string> = {
   refused: "refused",
   dns: "not found",
   unreachable: "unreachable",
+  // #251 — reached, then dropped: the pill must not read as the user's
+  // network being down. `frame.reason` (the banner's second line) already
+  // blames the provider side in full.
+  closed: "connection dropped",
 };
 
 /**

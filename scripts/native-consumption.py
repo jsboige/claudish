@@ -7,6 +7,8 @@ what hourly cadence.
 
     python scripts/native-consumption.py [--since 2026-09-13T00] [--top 10]
         [--captures-dir D:\\claudish-captures]
+    python scripts/native-consumption.py --leak-policy --since 2026-11-09T00 \\
+        --captures-dir //192.168.0.50/d$/claudish-captures   # verdict, tetes seules
 
 Reads only loose req-*.json / resp-*.sse captures (archives are packed
 nightly by compress-captures.ps1 at 02:47 — run before packing, or pull the
@@ -23,7 +25,10 @@ a wrong-but-plausible number during development:
   3. Pairing key is (pid, reqN-from-resp-HEADER), never the resp filename
      rank rNNNN: the response counter is a different sequence, and BOTH
      counters reset at every container restart — always add a time window
-     (req within 35 min before its resp, same day).
+     (req within 35 min before its resp, same day). The req FILENAME pads
+     the counter to 4 digits (req-1-0100-...) while the header says
+     reqN=100: the index keys on the integer, or every request below 1000
+     after a restart stays unpaired (found 09/11 on the hub corpus).
   4. Timestamps: parse as datetimes. String-slicing minutes across two
      different filename shapes is how you pair 06:49 with 06:09.
   5. Usage tokens: input/cache fields come from message_start (FIRST
@@ -91,8 +96,27 @@ def parse_args():
                          "2026-10-15T23:00:00Z (UTC, truncated to the hour, inclusive)")
     ap.add_argument("--until", default="", help="same shapes as --since, exclusive")
     ap.add_argument("--top", type=int, default=12)
+    ap.add_argument("--fleet", default="",
+                    help="machines sidecar attendues (separees par des virgules) — "
+                         "active l'avertissement d'angle mort AUTONOMOUS (#933)")
+    ap.add_argument("--reconcile-dir", default="",
+                    help="dossier des archives outage-*.7z (defaut : GDrive du "
+                         "script de reconciliation, env CLAUDISH_RECONCILE_DIR ; "
+                         "<corpus>/reconcile reste source additionnelle, #940)")
     ap.add_argument("--selftest", action="store_true",
                     help="run the fname_dt parsing checks and exit")
+    ap.add_argument("--leak-policy", action="store_true",
+                    help="verdict leak-policy rapide (#445) : reponses natives et Opus "
+                         "par machine (enveloppe req), seau sans machine, sous-agents "
+                         "Opus hors --opus-home ; lit les TETES seulement. Exit 3 = "
+                         "verdict refuse (Opus sans machine ou non apparie)")
+    ap.add_argument("--opus-home", default="myia-ai-01",
+                    help="machine dont l'Opus n'est pas detaille (defaut myia-ai-01)")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="taille du pool des tete-lectures (#997) : 95 ms par "
+                         "ouverture sur UNC rendaient les verdicts serie >30 min ; "
+                         "plafond de threads, pas un objectif. 1 = passe "
+                         "exactement serie, sans pool (temoin d'equivalence)")
     return ap.parse_args()
 
 
@@ -148,6 +172,157 @@ def workspace_of(body_text):
     return best if counts[best] >= 3 else "(inconnu)"
 
 
+ENV_MACHINE_RE = re.compile(r'"machine":\s*"([^"]*)"')
+ENV_DEVICE8_RE = re.compile(r'"device_id8":\s*"([0-9a-f]{8})"')
+# Deux formes vues dans les captures : la cle JSON et le texte du bloc
+# billing-header (cc_is_subagent=true). Une seule suffit a signer le sous-agent.
+SUB_ANY_RE = re.compile(r'cc_is_subagent(?:"\s*:\s*|=)true')
+NO_MACHINE = "(sans machine)"
+
+
+def leak_policy(resps, req_index, opus_home, workers=16):
+    """Verdict leak-policy (#445) en tetes seulement.
+
+    Meme appariement que le mode complet (piege 3 : reqN + pid lus dans
+    l'EN-TETE de la reponse, req au plus 35 min avant, la plus recente) — le
+    rang rNNNN du nom de fichier n'est jamais une cle. Machine et device lus
+    dans les ~1 Ko de tete de l'enveloppe req ; le corps entier n'est lu que
+    pour un Opus servi hors `opus_home` (signature sous-agent).
+
+    #997 : chaque lecture passe par le pool borne de la lib blind_spot
+    (`workers` threads, defaut 16 — sur UNC une ouverture coute ~95 ms et la
+    passe serie depassait 30 min). Decoupage en PHASES : toutes les tetes de
+    reponse, puis toutes les tetes d'enveloppe des apparies (dedupliquees par
+    chemin : deux retries d'une meme req ne paient qu'une lecture), puis les
+    corps des Opus hors home (rares, dedupliques). L'AGREGATION reste dans
+    l'ordre serie des reponses : la sortie est identique a workers=1, et une
+    lecture en echec (None) vaut exactement l'OSError de la passe serie.
+    Le corpus est append-only pendant la lecture : deux reponses citant la
+    meme enveloppe voient le meme contenu, ce que le serie garantissait
+    seulement de fait.
+
+    Le verdict est REFUSE (retour 3) si un Opus tombe dans le seau sans
+    machine ou reste non apparie : c'est ce controle, et lui seul, qui rend le
+    verdict valide malgre l'angle mort du relais (qui preserve l'en-tete
+    machine sans jamais le poser).
+
+    Exception declaree, pas refusee : une reponse sans requete dont la fenetre
+    de 35 min commence AVANT la premiere requete du corpus vivant. La
+    compaction nocturne archive les req de la veille (live 09/11 : resp a
+    00:00:08Z, reqN=2506, sa req du 08/11 partie dans l'archive) — l'instrument
+    ne peut pas la voir, il le dit, comme la ligne BLIND de #933."""
+    rows = collections.defaultdict(lambda: {
+        "nat": 0, "opus": 0, "sub": 0, "dev": collections.Counter(),
+        "hours": collections.Counter()})
+    unp = {"nat": 0, "opus": 0}
+    trunc = {"nat": 0, "opus": 0}
+    corpus_start = min((c[0] for lst in req_index.values() for c in lst),
+                       default=None)
+    bs = _load_blind_spot()  # read_heads / read_head : pool borne #997
+
+    # Phase 1 (#997) — tetes de TOUTES les reponses en pool borne, ordre
+    # preserve. None = l'OSError du serie : la reponse est sautee.
+    heads = bs.read_heads([p for (_ts, _pid, p) in resps], 400, workers)
+    # Phase 2 — decisions d'appariement (CPU, serie) ; les compteurs des non-
+    # appariees sont increments ICI, dans l'ordre serie.
+    planned = []  # (ts, is_opus, req_path) — une entree par reponse appariee
+    for (ts, _pid, path), head in zip(resps, heads):
+        if head is None:
+            continue
+        h = HDR_RE.search(head)
+        if not h:
+            continue
+        model, reqN, hdr_pid = h.group(1), h.group(2), h.group(3)
+        is_opus = "opus" in model
+        cands = sorted(
+            (c for c in req_index.get((hdr_pid, int(reqN)), [])
+             if c[0] <= ts and ts - c[0] <= timedelta(minutes=35)))
+        if not cands:
+            if corpus_start and ts - timedelta(minutes=35) < corpus_start:
+                trunc["nat"] += 1
+                trunc["opus"] += is_opus
+                continue
+            unp["nat"] += 1
+            unp["opus"] += is_opus
+            continue
+        planned.append((ts, is_opus, cands[-1][1]))
+
+    # Phase 3 (#997) — tetes d'enveloppe des apparies, pool borne, DEDUPLI-
+    # QUEES par chemin. Une enveloppe illisible vaut pour CHACUNE des
+    # reponses qui la citent : non appariee, comme l'OSError du serie.
+    req_paths = sorted({p for (_ts, _op, p) in planned})
+    env_heads = dict(zip(req_paths, bs.read_heads(req_paths, 1024, workers)))
+    # Phase 4 — agregation, ordre serie des reponses. Les Opus hors home
+    # reportent leur lecture de CORPS en phase 5.
+    off_home = []  # (machine, req_path) — corps entier a relire
+    for ts, is_opus, req_path in planned:
+        env_head = env_heads.get(req_path)
+        if env_head is None:
+            unp["nat"] += 1
+            unp["opus"] += is_opus
+            continue
+        mm = ENV_MACHINE_RE.search(env_head)
+        machine = (mm.group(1) if mm else "") or NO_MACHINE
+        r = rows[machine]
+        r["nat"] += 1
+        if not is_opus:
+            continue
+        r["opus"] += 1
+        if machine == opus_home:
+            continue
+        dv = ENV_DEVICE8_RE.search(env_head)
+        r["dev"][dv.group(1) if dv else "?"] += 1
+        r["hours"][ts.strftime("%d %Hh")] += 1
+        off_home.append((machine, req_path))
+    # Phase 5 (#997) — corps des Opus hors home : lecture ENTIERE, pool
+    # borne, dedupliquee ; le serie relisait le fichier a chaque reponse.
+    # Un corps illisible ne compte pas (le serie faisait except OSError: pass).
+    sub_paths = sorted({p for (_m, p) in off_home})
+    bodies = dict(zip(sub_paths, bs.read_heads(sub_paths, None, workers)))
+    for machine, req_path in off_home:
+        body = bodies.get(req_path)
+        if body is not None and SUB_ANY_RE.search(body):
+            rows[machine]["sub"] += 1
+
+    print("Leak-policy (#445) — reponses natives par machine "
+          "(enveloppe req, appariement en-tete reqN+pid) :")
+    print(f"  {'machine':18s} {'natives':>7s} {'opus':>5s}  detail Opus hors {opus_home}")
+    for machine, r in sorted(rows.items(), key=lambda kv: -kv[1]["opus"]):
+        detail = ""
+        if r["opus"] and machine != opus_home:
+            devs = " ".join(f"{d}:{c}" for d, c in r["dev"].most_common(4))
+            hrs = " ".join(f"{k}:{v}" for k, v in sorted(r["hours"].items()))
+            detail = f"sub={r['sub']}/{r['opus']} dev={devs} heures={hrs}"
+        print(f"  {machine:18s} {r['nat']:7d} {r['opus']:5d}  {detail}")
+    empty_opus = rows[NO_MACHINE]["opus"] if NO_MACHINE in rows else 0
+    print(f"Non appariees : natives={unp['nat']} opus={unp['opus']}")
+    if trunc["nat"]:
+        print(f"Fenetre tronquee (req avant le debut du corpus vivant "
+              f"{corpus_start:%Y-%m-%dT%H:%M:%S}Z, archivee par la compaction) : "
+              f"natives={trunc['nat']} opus={trunc['opus']} — non attribuees, "
+              "hors verdict")
+    if empty_opus or unp["opus"]:
+        print(f"VERDICT REFUSE : {empty_opus} Opus sans machine, {unp['opus']} Opus "
+              "non apparie(s) — l'attribution ne couvre pas tout l'Opus servi")
+        return 3
+    print("Seau sans machine : 0 Opus, tout Opus apparie -> verdict valide "
+          "(corpus hub seulement : « a travers claudish »)")
+    return 0
+
+
+def _load_blind_spot():
+    """Declaration de l'angle mort AUTONOMOUS (#933) — lib partagee avec
+    traffic-consumption.py et billed-attrib.py, une seule copie."""
+    import importlib.util
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / "blind_spot.py"
+    spec = importlib.util.spec_from_file_location("blind_spot", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main():
     a = parse_args()
     if a.selftest:
@@ -165,7 +340,10 @@ def main():
                 m = REQ_RE.match(n)
                 if m:
                     dt = fname_dt(m.group(3), m.group(4))
-                    req_index[(m.group(1), m.group(2))].append((dt, e.path))
+                    # the req filename pads the counter to 4 digits (req-1-0100-...)
+                    # while the resp header says reqN=100: key on the integer, or
+                    # every request below 1000 after a restart stays unpaired
+                    req_index[(m.group(1), int(m.group(2)))].append((dt, e.path))
             elif n.startswith("resp-") and "-native-" in n and n.endswith(".sse"):
                 m = RESP_RE.match(n)
                 if not m:
@@ -176,10 +354,32 @@ def main():
                 if until and dt >= until:
                     continue
                 resps.append((dt, m.group(1), e.path))
+    # #933 — l'angle mort AUTONOMOUS se declare AVANT tout verdict lane : le
+    # check est corpus-level, il ne depend pas des captures natives. Une fenetre
+    # sans AUCUNE capture native est precisement le cas outillage-aveugle — le
+    # early-return ci-dessous ne doit pas l'avaler. Fenetre : since/until
+    # declares, sinon l'etendue des resps vues -> maintenant ; sans resps,
+    # since ou 24h en arriere. Les bornes fname_dt sont naives (captures UTC) :
+    # tz-aware pour la lib.
+    from datetime import timezone as _tz
+    fleet = [m.strip() for m in a.fleet.split(",") if m.strip()]
+    _now = datetime.now(_tz.utc)
+    _fallback_start = (resps[0][0] if resps else _now - timedelta(hours=24))
+    w_start = (since if since else _fallback_start).replace(tzinfo=_tz.utc)
+    w_end = (until if until else _now).replace(tzinfo=_tz.utc)
+    _bs = _load_blind_spot()
+    _rdir = a.reconcile_dir or _bs.default_reconcile_dir()
+    for line in _bs.render(a.captures_dir, w_start, w_end, fleet,
+                           reconcile_dir=_rdir, workers=a.workers):
+        print(line)
+    print()
+
     if not resps:
         print("Aucune capture native dans la fenetre.", file=sys.stderr)
         return 1
     resps.sort()
+    if a.leak_policy:
+        return leak_policy(resps, req_index, a.opus_home, workers=a.workers)
 
     ws = collections.defaultdict(lambda: {
         "n": 0, "out": 0, "in": 0, "cr": 0, "cc": 0,
@@ -215,7 +415,7 @@ def main():
         hours[ts.strftime("%d %Hh")] += 1
         top_out.append((o, ts))
         cands = sorted(
-            (c for c in req_index.get((hdr_pid, reqN), [])
+            (c for c in req_index.get((hdr_pid, int(reqN)), [])
              if c[0] <= ts and ts - c[0] <= timedelta(minutes=35)))
         if not cands:
             tot["unp"] += 1

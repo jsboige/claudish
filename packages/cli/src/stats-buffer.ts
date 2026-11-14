@@ -34,7 +34,8 @@ interface BufferFile {
 }
 
 // ─── In-Memory Cache ──────────────────────────────────────────────────────────
-// Reduces disk I/O from O(requests) to O(requests/FLUSH_EVERY_N_EVENTS).
+// Reduces disk I/O by coalescing writes: every event schedules a single deferred
+// flush per event-loop tick (setImmediate), so N events in one tick cost one write.
 
 let memoryCache: StatsEvent[] | null = null;
 let eventsSinceLastFlush = 0;
@@ -128,8 +129,7 @@ function scheduleFlushed(): void {
  * Append a stats event to the buffer.
  *
  * Hot path: writes to in-memory cache only. Flushes to disk:
- * - Every FLUSH_EVERY_N_EVENTS events
- * - Every FLUSH_EVERY_MS milliseconds
+ * - After the current event-loop tick (setImmediate, coalesced)
  * - On process exit (via process.on('exit'))
  */
 export function appendEvent(event: StatsEvent): void {

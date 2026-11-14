@@ -223,6 +223,7 @@ async function postMessages(hops?: string): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
     headers: {
+      "connection": "close",
       "content-type": "application/json",
       ...(hops !== undefined ? { "x-claudish-hops": hops } : {}),
     },
@@ -239,6 +240,7 @@ async function postChatCompletions(hops?: string): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
     method: "POST",
     headers: {
+      "connection": "close",
       "content-type": "application/json",
       ...(hops !== undefined ? { "x-claudish-hops": hops } : {}),
     },

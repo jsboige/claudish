@@ -639,6 +639,29 @@ function Invoke-ClaudishDrainedRestartImpl {
         }
     }
 
+    # #925 — the quietest-moment phase must always get a window when the
+    # zero wait gives up. With ObserveSec >= MaxWait the target was set on
+    # the very last observe poll and the loop exited without a single
+    # adaptive sample: the proactive path (MaxWait 300 = ObserveSec 300)
+    # announced "waiting for a moment at or below that" and restarted the
+    # same second at the cap — 4 cap-hit nights, 3 in a row, 6-10 streams
+    # cut. Clamp the observe budget to half the total so both phases get a
+    # real share, and LOG the clamp (a silent retune is undebuggable from
+    # drain.log alone). Chosen over raising the watchdog's MaxWait: the
+    # scheduled-task ExecutionTimeLimit (PT15M) and the drain budget move
+    # together (2026-08-26 silent non-restart) — raising MaxWait to 600
+    # would push worst case past the limit; the clamp leaves every budget
+    # invariant untouched (worst case stays observe + adaptive + grace +
+    # settle < PT15M) and fixes EVERY caller with ObserveSec >= MaxWait,
+    # not just the watchdog. The hang path (MaxWait 120) gains the same
+    # dip-picking at observe 60 — strictly earlier than the cap, never
+    # later: $MaxWait still gates the loop.
+    if ($ObserveSec -ge $MaxWait -and $MaxWait -gt 0) {
+        $clampedObserve = [int]($MaxWait / 2)
+        Write-DrainLog "DRAIN ($Reason): ObserveSec ${ObserveSec}s >= MaxWait ${MaxWait}s — clamping observe to ${clampedObserve}s so the quietest-moment phase gets a window (#925)"
+        $ObserveSec = $clampedObserve
+    }
+
     $active = Get-ClaudishActiveStreams -Url $Url
     if ($null -eq $active) {
         Write-DrainLog "RESTART ($Reason): no activeStreams signal from $Url/health for container '$Container' (wrong port? proxy down? image predates #37?) — restarting without drain"

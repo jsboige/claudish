@@ -375,7 +375,8 @@ foreach ($day in $daysToArchive) {
                   $manifestPath = Get-ShaManifestPath -GDriveDir $GDriveDir -MachineTag $MachineTag
                   $null = Update-ShaManifest -Path $manifestPath -Archive (Split-Path $archivePath -Leaf) `
                            -Sha256 $shaDest -Bytes $archBytes `
-                           -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                           -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) `
+                           -Extra @{ source = 'deposit' }
                   Log ("GDRIVE {0}: uploaded ({1:N1} MB, sha256 {2}.. recorded)" -f $day, ($archBytes/1MB), $shaDest.Substring(0,8))
                 }
               } else {
@@ -523,7 +524,8 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
           $manifestPath = Get-ShaManifestPath -GDriveDir $GDriveDir -MachineTag $MachineTag
           $null = Update-ShaManifest -Path $manifestPath -Archive $arch.Name `
                    -Sha256 $shaDest -Bytes $arch.Length `
-                   -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+                   -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) `
+                   -Extra @{ source = 'deposit' }
           Log ("GDRIVE {0}: re-uploaded ({1:N1} MB, was missing, sha256 {2}.. recorded)" -f $arch.BaseName, ($arch.Length/1MB), $shaDest.Substring(0,8))
         }
       } else {
@@ -567,8 +569,24 @@ if ($GDriveDir -and (Test-Path -LiteralPath $GDriveDir) -and $ShaCheckCount -gt 
       }
       $liveSha = (Get-FileHash -LiteralPath $live -Algorithm SHA256).Hash
       if ($liveSha -ne $rec.sha256) {
+        # #872 step 2: on a SEEDED record, LastWriteTime < recorded means the
+        # bytes predate the hash — the seed recorded a hash for bytes that are
+        # not these (the entry does not describe this file): SEED MISMATCH.
+        # A rewrite AFTER recording (LastWriteTime > recorded) is real drift —
+        # the re-seed read the bytes twice, so the file changed under a verified
+        # entry: CONTENT DRIFT, same class as a deposit. Same severity either
+        # way (loud ERROR, non-zero night, read-only verdict).
+        $class = 'CONTENT DRIFT'
+        if ($rec.source -eq 'reseed') {
+          try {
+            # recorded is a DateTime under pwsh 7 (ConvertFrom-Json) but a raw string
+            # under PS 5.1. Use -f: formats a DateTime ISO, passes a string through.
+            $recTime = [DateTimeOffset]::ParseExact(('{0:yyyy-MM-ddTHH:mm:ssZ}' -f $rec.recorded), 'yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+            if ((Get-Item -LiteralPath $live).LastWriteTimeUtc -lt $recTime.UtcDateTime) { $class = 'SEED MISMATCH' }
+          } catch { }   # unparseable recorded: stay on the conservative CONTENT DRIFT
+        }
         $errors++
-        Log ("ERROR SHA-CHECK {0}: CONTENT DRIFT at destination (recorded {1}.., live {2}.., {3} bytes recorded vs {4} live) - equal-size drift is invisible to every other guard" -f $name, $rec.sha256.Substring(0,8), $liveSha.Substring(0,8), $rec.bytes, (Get-Item -LiteralPath $live).Length)
+        Log ("ERROR SHA-CHECK {0}: $class at destination (recorded {1}.., live {2}.., {3} bytes recorded vs {4} live) - equal-size drift is invisible to every other guard" -f $name, $rec.sha256.Substring(0,8), $liveSha.Substring(0,8), $rec.bytes, (Get-Item -LiteralPath $live).Length)
       } else {
         Log ("SHA-CHECK {0}: OK (matches deposit hash {1}..)" -f $name, $liveSha.Substring(0,8))
       }

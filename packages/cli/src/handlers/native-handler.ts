@@ -28,6 +28,7 @@ import {
 import { noteProxyKeyAuthentication } from "./shared/proxy-key-rotation.js";
 import { matchesProxyKey } from "./shared/proxy-keys.js";
 import { appendUpstreamError, createResponseCapture } from "./shared/response-capture.js";
+import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import {
   type UpstreamReaderSlot,
   cancelEndsUpstreamWork,
@@ -281,11 +282,26 @@ export class NativeHandler implements ModelHandler {
     addSigningSecrets(c, credentialValuesFromRequest(headers));
 
     // Execute fetch
+    // #780: the abort controller reaches the fetch so a client cancel can end
+    // the upstream turn instead of letting it run (and bill) to completion.
+    // #909 — gzip the request body toward api.anthropic.com (capability proven:
+    // Claude Code itself sends gzipped bodies in production — anthropics/
+    // claude-code#103218; our credential-free probe showed no regression: the
+    // 401 auth answer is identical plain vs gzipped). Kill switch and floor
+    // live in upstream-compression.ts.
+    const upstreamAbort = new AbortController();
     try {
+      const wireBody = compressUpstreamRequestBody({
+        capability: "gzip",
+        headers,
+        body: JSON.stringify(payload),
+        label: `Anthropic-native ${String(payload?.model ?? "claude")}`,
+      });
       const anthropicResponse = await fetch(`${this.baseUrl}/v1/messages`, {
         method: "POST",
         headers,
-        body: JSON.stringify(payload),
+        body: wireBody,
+        signal: upstreamAbort.signal,
       });
 
       const contentType = anthropicResponse.headers.get("content-type") || "";

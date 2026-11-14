@@ -171,7 +171,7 @@ const NATIVE_BODY = {
 async function post(path: string, hdrs: Record<string, string>, body: unknown) {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}${path}`, {
     method: "POST",
-    headers: hdrs,
+    headers: { ...hdrs, "connection": "close" },
     body: JSON.stringify(body),
   });
 }

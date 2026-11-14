@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type * as net from "node:net";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -452,7 +453,9 @@ export class BridgeServer {
         // Attach CONNECT handler to HTTPS proxy server for tunneling
         if (this.httpsProxyServer) {
           this.httpsProxyServer.setConnectHandler((req, socket, head) => {
-            this.connectHandler?.handle(req, socket, head);
+            // A TCP/TLS "connect" event emits a net.Socket (typed Duplex upstream);
+            // CONNECTHandler.handle expects net.Socket.
+            this.connectHandler?.handle(req, socket as net.Socket, head);
           });
         }
 

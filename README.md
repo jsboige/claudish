@@ -5,7 +5,7 @@
 ### Claude Code. Any Model.
 
 [![npm version](https://img.shields.io/npm/v/claudish.svg?style=flat-square&color=00D4AA)](https://www.npmjs.com/package/claudish)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](./package.json)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Claude Code](https://img.shields.io/badge/Claude_Code-Compatible-d97757?style=flat-square)](https://claude.ai/claude-code)
 
 **Use your existing AI subscriptions with Claude Code.** Works with Anthropic Max, Gemini Advanced, ChatGPT Plus/Codex, Kimi, GLM, OllamaCloud — plus 580+ models via OpenRouter and local models for complete privacy.
@@ -277,7 +277,6 @@ claudish [OPTIONS] <claude-args...>
 | `--model-haiku <model>` | | Model for Haiku role (fast tasks) | |
 | `--model-fable <model>` | | Model for Fable role (version-independent family mapping) | |
 | `--model-subagent <model>` | | Model for sub-agents (Task tool) | |
-| `--model-freshness` | | Check configured Fable/Astra pins without inference | |
 | `--profile <name>` | `-p` | Named profile for model mapping | Default profile |
 | `--interactive` | `-i` | Interactive mode (persistent session) | Auto when no prompt |
 | `--auto-approve` | `-y` | Skip permission prompts | `false` |
@@ -311,6 +310,8 @@ claudish [OPTIONS] <claude-args...>
 | `--` | | Everything after passes to Claude Code | |
 
 **Flag passthrough**: Any unrecognized flag is automatically forwarded to Claude Code (e.g., `--agent`, `--effort`, `--permission-mode`).
+
+**Fork-only flags** (this fork): `--model-freshness` — check the configured Fable/Astra pins via catalog metadata, without inference or mutation.
 
 ### Environment Variables
 
@@ -375,7 +376,7 @@ Claudish automatically loads `.env` from the current directory at startup. For t
 |----------|----------|---------|
 | `GEMINI_BASE_URL` | Gemini API | `https://generativelanguage.googleapis.com` |
 | `OPENAI_BASE_URL` | OpenAI/Azure | `https://api.openai.com` |
-| `MINIMAX_BASE_URL` | MiniMax | `https://api.minimaxi.com` |
+| `MINIMAX_BASE_URL` | MiniMax | `https://api.minimax.io` (China-platform keys: `https://api.minimaxi.com`) |
 | `MOONSHOT_BASE_URL` | Kimi/Moonshot | `https://api.moonshot.ai` |
 | `ZHIPU_BASE_URL` | GLM/Zhipu | `https://open.bigmodel.cn` |
 | `ZAI_BASE_URL` | Z.AI | `https://api.z.ai` |

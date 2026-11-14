@@ -193,6 +193,12 @@ interface RecoveryState {
 /** Parsed once at module load; re-read only by resetFailoverForTests(). */
 let rules = new Map<FailoverRole, FailoverRule>();
 let autoArmEnabled = false;
+/**
+ * True once initFailover() (or the read-only ensureFailoverRulesLoaded()) has
+ * parsed the environment in this process. Lets the #985 status surface answer
+ * "were the cascade rules ever loaded here?" without poking `rules` internals.
+ */
+let rulesLoaded = false;
 
 // ─── #275: per-model maxing, provider-scoped contagion ─────────────────────────
 // Walls used to be keyed by ROLE: any member's refusal (Sol's weekly wall, a native
@@ -620,6 +626,7 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
   }
   roleAliases = parseRoleAliases(env.CLAUDISH_FAILOVER_ROLE_MODELS || "");
   autoArmEnabled = /^(1|true|yes|on)$/i.test((env.CLAUDISH_FAILOVER_AUTO || "").trim());
+  rulesLoaded = true;
   walled.clear();
   configArmedRoles.clear();
   configArmedMachines.clear();
@@ -796,6 +803,46 @@ export function initFailover(env: NodeJS.ProcessEnv = process.env): void {
 function describeResolved(role: FailoverRole): string {
   const { step } = resolveFailoverTarget(role);
   return step ? step.label : "nominal";
+}
+
+/**
+ * The REAL auto-arm flag (CLAUDISH_FAILOVER_AUTO), as this process parsed it.
+ * A configured cascade is not an auto-arm — CLAUDE.md is explicit that
+ * configuring a target does not activate it. Read surface (#985) reads this
+ * instead of inferring "auto" from step counts or armed state.
+ */
+export function isAutoArmEnabled(): boolean {
+  return autoArmEnabled;
+}
+
+/**
+ * Read-only rules warm-up (#993 CR): parse the cascade rules, role aliases and
+ * the auto flag from the environment WITHOUT touching any live state — unlike
+ * initFailover(), which clears `walled`/`stepFailures`/`dwellPins`/… on the
+ * grounds that in-memory state does not survive a restart.
+ *
+ * Why this exists: the MCP server runs a real proxy in this same process
+ * (`getProxy()`, mcp-server.ts), and that proxy's boot already called
+ * initFailover(). A status read that called initFailover() again would un-wall
+ * every bucket the in-process proxy had learned — a read must never reset the
+ * thing it reads. If the proxy never started here, this parses the rules so the
+ * status surface can still report configured steps and the auto flag; the
+ * runtime state (walls, serving) is reported as unknown instead of "nominal".
+ *
+ * Deliberately does NOT parse CLAUDISH_FAILOVER_ACTIVE (config arming is a
+ * write-path gesture owned by proxy boot) — only what the read surface needs.
+ */
+export function ensureFailoverRulesLoaded(env: NodeJS.ProcessEnv = process.env): void {
+  if (rulesLoaded) return;
+  rules = loadRules(env);
+  roleAliases = parseRoleAliases(env.CLAUDISH_FAILOVER_ROLE_MODELS || "");
+  autoArmEnabled = /^(1|true|yes|on)$/i.test((env.CLAUDISH_FAILOVER_AUTO || "").trim());
+  rulesLoaded = true;
+}
+
+/** Test/read seam: were the cascade rules ever parsed in this process? */
+export function areFailoverRulesLoaded(): boolean {
+  return rulesLoaded;
 }
 
 /**
@@ -2472,6 +2519,14 @@ export interface ServedStepRecord {
   role: FailoverRole;
   step: FailoverStep;
   stepIndex: number;
+  /** #681: set when the serve came through ANOTHER role's cascade (a context
+   * re-route jumped the request mid-walk). The notice must name the serving
+   * cascade's rung — or, when stepIndex is -1, the TARGET role's NOMINAL (the
+   * loop synthesizes that record; nothing else can produce a -1 with a step) —
+   * under the role the CLIENT asked for, and must never slice the ORIGIN role's
+   * steps for the "ahead of it" clause: the indexes belong to different
+   * cascades. */
+  via?: FailoverRole;
 }
 
 /**
@@ -2484,15 +2539,37 @@ export interface ServedStepRecord {
  */
 const servedStepRecords = new WeakMap<object, ServedStepRecord>();
 
-/** Loop-side record: the step whose response goes back to the client. No-op without one. */
+/** Loop-side record: the step whose response goes back to the client. No-op
+ * without one — EXCEPT a #681 nominal serve (`via` set, stepIndex -1), which
+ * must still be announced: a haiku request answered by the sonnet subscription
+ * is a substitution, and doctrine says every substitution is announced. */
 export function recordServedStepForNotices(
   c: object,
   role: FailoverRole,
   step: FailoverStep | null | undefined,
-  stepIndex: number
+  stepIndex: number,
+  via?: FailoverRole
 ): void {
-  if (!step || stepIndex < 0) return;
-  servedStepRecords.set(c, { role, step, stepIndex });
+  // No step, no via: the plain nominal produced this response. That is the
+  // normal path of every unarmed request — nothing to announce, silent on
+  // purpose (#431 CR B1).
+  if (!step && !via) return;
+  // Past the guard above, `!via` means a STEP arrived with no index. That pair
+  // is never legitimate: a step serve always carries its index (the loop reads
+  // both from the same `resolved`), and -1 is the NOMINAL's coordinate. Dropping
+  // it silently — the pre-#681 behaviour — left the notice builders falling back
+  // to the GENERIC resolver (`resolveFailoverTarget`), which cannot see
+  // request-local skips or the session pin: it names a rung that did not serve,
+  // with no trace of why the record went missing. The very mis-naming #431 CR B1
+  // was written to end. Say it out loud instead; the behaviour is unchanged
+  // (no record, no banner) so no nominal path moves.
+  if (stepIndex < 0 && !via) {
+    logStderr(
+      `[Failover] NOTICE-RECORD DROP: step '${step?.target ?? "?"}' served with stepIndex ${stepIndex} and no via — no record written, the banner falls back to the generic resolver (#681)`
+    );
+    return;
+  }
+  servedStepRecords.set(c, { role, step: step as FailoverStep, stepIndex, via });
 }
 
 /** Notice-side read: this request's served step, when it reports `role` (else undefined). */
@@ -2524,7 +2601,7 @@ export function buildFailoverNotice(
   bucket?: string,
   served?: ServedStepRecord
 ): string | null {
-  const active: (ResolvedFailover & { bucket: string })[] = [];
+  const active: (ResolvedFailover & { bucket: string; via?: FailoverRole })[] = [];
   if (role) {
     // One session, one (role, bucket): only ITS OWN bucket's diversion is "the
     // model actually serving you" — a sibling bucket's wall is someone else's
@@ -2534,9 +2611,22 @@ export function buildFailoverNotice(
     // from for THIS request. When present it wins over the general resolver,
     // which cannot see request-local skips: a turn served by the SUCCESSOR
     // after a skipped step otherwise announced the skipped step's name.
+    // #681: a jumped serve records the CLIENT's role with the TARGET cascade's
+    // step (or its nominal) — the record survives the jump and the banner names
+    // what actually answered, never the origin role's refusing rung.
     const servedRec = served && served.role === role ? served : undefined;
-    const { step, stepIndex } = servedRec ?? resolveFailoverTarget(role, bucket);
-    if (step) active.push({ role, step, stepIndex, bucket: bucket ?? LEGACY_ROLE_WIDE_BUCKET });
+    if (servedRec) {
+      active.push({
+        role,
+        step: servedRec.step,
+        stepIndex: servedRec.stepIndex,
+        bucket: bucket ?? LEGACY_ROLE_WIDE_BUCKET,
+        via: servedRec.via,
+      });
+    } else {
+      const { step, stepIndex } = resolveFailoverTarget(role, bucket);
+      if (step) active.push({ role, step, stepIndex, bucket: bucket ?? LEGACY_ROLE_WIDE_BUCKET });
+    }
   } else {
     active.push(...getActiveFailovers());
   }
@@ -2546,18 +2636,25 @@ export function buildFailoverNotice(
   const lines: string[] = [];
   for (const a of active) {
     const { role, step, stepIndex } = a;
-    const ahead =
-      stepIndex > 0
-        ? ` (${rules
-            .get(role)!
-            .steps.slice(0, stepIndex)
-            .map((s) => s.label)
-            .join(", ")} ahead of it ${stepIndex === 1 ? "is" : "are"} also exhausted)`
-        : "";
+    // #681: a jumped serve names the serving cascade — and never slices the
+    // ORIGIN role's steps for the "ahead of it" clause (the stepIndex belongs
+    // to the TARGET cascade; the names would come from the wrong list). A -1
+    // index on a via-record is the TARGET role's NOMINAL (the synthesized #681
+    // record), not a fallback rung.
+    const suffix = a.via && a.via !== a.role
+      ? stepIndex < 0
+        ? `the \`${a.via}\` nominal (context re-route #681)`
+        : `the ${ordinal(stepIndex)} fallback of the \`${a.via}\` cascade (context re-route #681)`
+      : `the ${ordinal(stepIndex)} fallback`;
+    const ahead = !a.via && stepIndex > 0
+      ? ` (${rules
+          .get(role)!
+          .steps.slice(0, stepIndex)
+          .map((s) => s.label)
+          .join(", ")} ahead of it ${stepIndex === 1 ? "is" : "are"} also exhausted)`
+      : "";
     const bits = [
-      `- \`${role}\` is being served by **${step.label}** (\`${step.target}\`) — the ${ordinal(
-        stepIndex
-      )} fallback${ahead}, ${DIRECTION_TEXT[step.direction]}.`,
+      `- \`${role}\` is being served by **${step.label}** (\`${step.target}\`) — ${suffix}${ahead}, ${DIRECTION_TEXT[step.direction]}.`,
     ];
     if (step.note) bits.push(`  ${step.note}`);
     lines.push(bits.join("\n"));
@@ -2911,6 +3008,7 @@ export function resetFailoverForTests(env?: NodeJS.ProcessEnv): void {
     rules = new Map();
     roleAliases = [];
     autoArmEnabled = false;
+    rulesLoaded = false;
     walled.clear();
     configArmedRoles.clear();
     configArmedMachines.clear();

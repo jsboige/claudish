@@ -166,7 +166,7 @@ async function postMessage(opts: { stream?: boolean; history?: boolean } = {}): 
   }
   return realFetch(`${activeProxy!.url}/v1/messages`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
+    headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01", "connection": "close" },
     body: JSON.stringify({
       model: "claude-sonnet-5",
       max_tokens: 64,

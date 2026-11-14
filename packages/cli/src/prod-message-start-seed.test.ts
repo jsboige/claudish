@@ -1,0 +1,362 @@
+/**
+ * #1019 — every `message_start` the proxy builds itself seeds both cache
+ * counters (#179 rule b, `docs/reference/model-routing.md`).
+ *
+ * The client merges usage per key and takes a delta only when it is `> 0`;
+ * otherwise the `message_start` seed stands. It then sums the three input
+ * counters raw to get the conversation size. A cache key absent from the seed
+ * is therefore `undefined` after the merge, and the sum is `NaN`.
+ *
+ * #444 seeded the five stream parsers, #1014 the two synthetic starts of
+ * `anthropic-sse.ts`. Two builders were left: the overflow recovery turn
+ * (`buildOverflowRecoveryStream`, #79 / #565 / the pre-stream policy refusal).
+ * On the v14 base the web-tools answer is built inside the stream parsers
+ * (openai-sse's synthetic tail), not a proxy-server `buildTextResponse`, so
+ * this file pins the overflow turn by behaviour and the whole class by
+ * structure, so a new builder cannot ship a keyless seed unnoticed.
+ *
+ * Behaviour pins: the seed and the terminal delta are run through the
+ * client's documented merge, and the resulting size must be a finite number.
+ * Red by mutation: revert a site to its keyless literal and both its
+ * behaviour pin and the corpus scan fail.
+ *
+ * Structural pin: every `type: "message_start"` property line in production
+ * sources opens an object that carries both cache counters, through
+ * `messageStartUsage(` or as explicit keys (the Codex lane keeps an explicit
+ * literal on purpose, #186). Positive controls run the same detector over
+ * synthetic sources first: if it can go blind, they fail before the corpus
+ * scan can certify anything.
+ *
+ * What the scan covers, and what it does not:
+ *  - The corpus is `packages/cli/src`, the proxy. `packages/macos-bridge`
+ *    builds frames for another wire and is not read here.
+ *  - Two shapes it cannot read are reported, never skipped: the object
+ *    written on one line, and a frame hand-written as JSON text inside a
+ *    string. The second has one known, harmless instance, listed with its
+ *    reason in `JSON_TEXT_ALLOWED`.
+ *  - The object's extent is the brace-matched remainder of the object the
+ *    `type:` line sits in. Cache keys anywhere in that extent satisfy it, not
+ *    only inside `usage`; a type held in a variable is not seen at all. No
+ *    source does either today.
+ *  - Sources are read with either line ending: this repository is checked
+ *    out CRLF on Windows, where a `\r` left at the end of a line would stop
+ *    the trailing-comment strip from matching.
+ */
+
+import { describe, expect, test } from "bun:test";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
+import { buildOverflowRecoveryStream } from "./handlers/shared/context-overflow.js";
+
+type Usage = Record<string, number | undefined>;
+
+/** Parsed `data:` payloads of an SSE body, in order. */
+function sseEvents(body: string): Array<Record<string, any>> {
+  return body
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)));
+}
+
+function seedAndDelta(body: string): { seed: Usage; delta: Usage } {
+  const events = sseEvents(body);
+  const start = events.find((e) => e.type === "message_start");
+  const delta = events.find((e) => e.type === "message_delta");
+  expect(start, "the turn opens with a message_start").toBeTruthy();
+  expect(delta, "the turn carries a terminal message_delta").toBeTruthy();
+  return { seed: start!.message.usage as Usage, delta: delta!.usage as Usage };
+}
+
+/**
+ * The conversation size as the client computes it: per-key merge (a delta is
+ * taken only when `> 0`, else the seed stands), then the raw three-way sum.
+ */
+function clientContextSize(seed: Usage, delta: Usage): number {
+  const pick = (key: string): number => {
+    const d = delta[key];
+    return (d != null && d > 0 ? d : seed[key]) as number;
+  };
+  return (
+    pick("input_tokens") + pick("cache_creation_input_tokens") + pick("cache_read_input_tokens")
+  );
+}
+
+describe("#1019 synthetic message_start seeds, by behaviour", () => {
+  test("overflow recovery turn: the client's size is exactly the real input count", async () => {
+    const res = buildOverflowRecoveryStream("context is full", 405_000, "claude-sonnet-5");
+    const { seed, delta } = seedAndDelta(await res.text());
+
+    expect(seed.cache_read_input_tokens).toBe(0);
+    expect(seed.cache_creation_input_tokens).toBe(0);
+    // The gauge must advance by the real size, not by NaN.
+    expect(clientContextSize(seed, delta)).toBe(405_000);
+  });
+
+  test("overflow builder called with 0 (pre-stream policy refusal): the size stays a positive number", async () => {
+    const res = buildOverflowRecoveryStream("refused upstream", 0, "claude-sonnet-5");
+    const { seed, delta } = seedAndDelta(await res.text());
+
+    expect(seed.cache_read_input_tokens).toBe(0);
+    expect(seed.cache_creation_input_tokens).toBe(0);
+    // A delta of 0 is discarded by the merge: whatever the seed carries is
+    // what the client records. Neither NaN nor a bare 0 (#179: a zero
+    // input_tokens is a trap).
+    const size = clientContextSize(seed, delta);
+    expect(Number.isFinite(size)).toBe(true);
+    expect(size).toBeGreaterThan(0);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// Structural pin
+// ---------------------------------------------------------------------------
+
+const SRC_ROOT = join(import.meta.dir);
+
+/** `type: "message_start"` alone on its line: an object-literal property. */
+const PROPERTY_LINE = /^\s*type:\s*"message_start",?\s*$/;
+/** The same construction anywhere on a line of code. */
+const ANY_CONSTRUCTION = /\btype:\s*"message_start"/;
+/** A frame hand-written as JSON text inside a string
+ * (`{"type":"message_start",…}`, quotes escaped or not). */
+const JSON_TEXT_CONSTRUCTION = /\\?"type\\?"\s*:\s*\\?"message_start\\?"/;
+const COMMENT_LINE = /^\s*(\/\/|\/\*|\*)/;
+
+/**
+ * Frames written as JSON text that are known and harmless, each with its
+ * reason. Keyed by path relative to `src`, forward slashes. An entry that no
+ * longer matches anything fails the scan: remove it with the construction.
+ */
+const JSON_TEXT_ALLOWED: Record<string, string> = {
+  "fork/server/relay-e2e.ts":
+    "canned SSE of the mock hub in the relay E2E script: a fixture the script serves to itself, never built for a client",
+};
+
+/** A code line without its trailing `// …` comment (a `//` glued to a
+ * non-space character, as in a URL, is left alone). */
+function code(line: string): string {
+  if (COMMENT_LINE.test(line)) return "";
+  return line.replace(/\s\/\/.*$/, "");
+}
+
+interface Finding {
+  line: number;
+  problem: "keyless-seed" | "unreadable-shape" | "json-text-frame";
+}
+
+/**
+ * For each `message_start` construction: the rest of the object it opens (up
+ * to the brace that closes it) must carry both cache counters. `sites` counts
+ * the object-literal constructions only.
+ */
+function scanSource(content: string): { sites: number; findings: Finding[] } {
+  // Either line ending: a `\r` left on the line would defeat `code()`.
+  const lines = content.split(/\r?\n/);
+  const findings: Finding[] = [];
+  let sites = 0;
+  lines.forEach((raw, idx) => {
+    const line = code(raw);
+    if (JSON_TEXT_CONSTRUCTION.test(line)) {
+      // Its usage cannot be read from here. Reported; the corpus scan
+      // accepts it only from a file listed in JSON_TEXT_ALLOWED.
+      findings.push({ line: idx + 1, problem: "json-text-frame" });
+      return;
+    }
+    if (!ANY_CONSTRUCTION.test(line)) return;
+    sites++;
+    if (!PROPERTY_LINE.test(line)) {
+      // Inline shape (`{ type: "message_start", message: … }` on one line):
+      // the extent below would be read wrong. Reported, never skipped.
+      findings.push({ line: idx + 1, problem: "unreadable-shape" });
+      return;
+    }
+    let depth = 0;
+    const extent: string[] = [];
+    for (let j = idx + 1; j < lines.length && depth >= 0; j++) {
+      const l = code(lines[j]);
+      for (const ch of l) {
+        if (ch === "{") depth++;
+        else if (ch === "}") depth--;
+        if (depth < 0) break;
+      }
+      extent.push(l);
+    }
+    const object = extent.join("\n");
+    const seeded =
+      object.includes("messageStartUsage(") ||
+      (/\bcache_read_input_tokens\s*:/.test(object) &&
+        /\bcache_creation_input_tokens\s*:/.test(object));
+    if (!seeded) findings.push({ line: idx + 1, problem: "keyless-seed" });
+  });
+  return { sites, findings };
+}
+
+/** Production .ts files: everything under src except tests, the test-support
+ * harness and checked-in fixtures (same corpus as prod-no-controller-error). */
+function collectProdFiles(): string[] {
+  const skipDirs = new Set(["test-support", "test-fixtures", "node_modules", "dist"]);
+  const files: string[] = [];
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) {
+        if (!skipDirs.has(entry)) walk(full);
+        continue;
+      }
+      if (!entry.endsWith(".ts") && !entry.endsWith(".tsx")) continue;
+      if (entry.endsWith(".test.ts") || entry.endsWith(".test.tsx")) continue;
+      files.push(full);
+    }
+  };
+  walk(SRC_ROOT);
+  return files;
+}
+
+describe("#1019 synthetic message_start seeds, by structure", () => {
+  test("positive controls: the detector flags a keyless seed and nothing else", () => {
+    const keyless = [
+      "send({",
+      '  type: "message_start",',
+      "  message: {",
+      "    id,",
+      "    // cache_read_input_tokens: and messageStartUsage( in a comment are not a seed",
+      "    usage: { input_tokens: 0, output_tokens: 0 },",
+      "  },",
+      "});",
+      "const later = messageStartUsage(1); // outside the object: not a seed either",
+    ].join("\n");
+    expect(scanSource(keyless)).toEqual({
+      sites: 1,
+      findings: [{ line: 2, problem: "keyless-seed" }],
+    });
+
+    const viaHelper = [
+      "send({",
+      '  type: "message_start",',
+      "  message: {",
+      "    usage: messageStartUsage(prior),",
+      "  },",
+      "});",
+    ].join("\n");
+    expect(scanSource(viaHelper)).toEqual({ sites: 1, findings: [] });
+
+    const explicitKeys = [
+      "send({",
+      '  type: "message_start",',
+      "  message: {",
+      "    usage: {",
+      "      input_tokens: 0,",
+      "      output_tokens: 0,",
+      "      cache_read_input_tokens: 0,",
+      "      cache_creation_input_tokens: 0,",
+      "    },",
+      "  },",
+      "});",
+    ].join("\n");
+    expect(scanSource(explicitKeys)).toEqual({ sites: 1, findings: [] });
+
+    const oneKeyOnly = [
+      "send({",
+      '  type: "message_start",',
+      "  message: {",
+      "    usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },",
+      "  },",
+      "});",
+    ].join("\n");
+    expect(scanSource(oneKeyOnly).findings).toEqual([{ line: 2, problem: "keyless-seed" }]);
+
+    const inline = 'send({ type: "message_start", message: { usage: messageStartUsage() } });';
+    expect(scanSource(inline)).toEqual({
+      sites: 1,
+      findings: [{ line: 1, problem: "unreadable-shape" }],
+    });
+
+    const mentionsOnly = [
+      '// type: "message_start" in a comment is not a construction',
+      ' * type: "message_start" in a doc block is not one either',
+      'if (event.type === "message_start") sawStart = true;',
+      'if (/"type"\\s*:\\s*"message_start"/.test(sniff)) return true;',
+    ].join("\n");
+    expect(scanSource(mentionsOnly)).toEqual({ sites: 0, findings: [] });
+  });
+
+  test("positive controls: a trailing comment never passes for a seed, on either line ending", () => {
+    const keysOnlyInTrailingComment = [
+      "send({",
+      '  type: "message_start",',
+      "  message: {",
+      "    usage: { input_tokens: 0, output_tokens: 0 }, // cache_read_input_tokens: 0, cache_creation_input_tokens: 0",
+      "  },",
+      "});",
+    ];
+    const expected: Finding[] = [{ line: 2, problem: "keyless-seed" }];
+    expect(scanSource(keysOnlyInTrailingComment.join("\n")).findings).toEqual(expected);
+    // The CRLF checkout of this repository on Windows.
+    expect(scanSource(keysOnlyInTrailingComment.join("\r\n")).findings).toEqual(expected);
+
+    // A brace in a trailing comment must not move the object's extent either.
+    const braceInTrailingComment = [
+      "send({",
+      '  type: "message_start", // }',
+      "  message: {",
+      "    usage: messageStartUsage(prior),",
+      "  },",
+      "});",
+    ];
+    expect(scanSource(braceInTrailingComment.join("\n"))).toEqual({ sites: 1, findings: [] });
+    expect(scanSource(braceInTrailingComment.join("\r\n"))).toEqual({ sites: 1, findings: [] });
+  });
+
+  test("positive controls: a frame written as JSON text is reported, quotes escaped or not", () => {
+    const plain =
+      'const CANNED = \'event: message_start\\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\\n\\n\';';
+    expect(scanSource(plain)).toEqual({
+      sites: 0,
+      findings: [{ line: 1, problem: "json-text-frame" }],
+    });
+
+    const escaped = 'const CANNED = "data: {\\"type\\":\\"message_start\\"}";';
+    expect(scanSource(escaped)).toEqual({
+      sites: 0,
+      findings: [{ line: 1, problem: "json-text-frame" }],
+    });
+  });
+
+  test("the scan covers the production corpus and every construction is seeded", () => {
+    const files = collectProdFiles();
+    // Guard against a silently-empty corpus (a path change making the walk
+    // find nothing would otherwise certify a vacuous green).
+    expect(files.length).toBeGreaterThan(100);
+
+    let sites = 0;
+    const offenders: string[] = [];
+    const allowedSeen = new Set<string>();
+    for (const f of files) {
+      const rel = relative(SRC_ROOT, f).replace(/\\/g, "/");
+      const result = scanSource(readFileSync(f, "utf-8"));
+      sites += result.sites;
+      for (const finding of result.findings) {
+        if (finding.problem === "json-text-frame" && rel in JSON_TEXT_ALLOWED) {
+          allowedSeen.add(rel);
+          continue;
+        }
+        offenders.push(`${rel}:${finding.line} (${finding.problem})`);
+      }
+    }
+    expect(
+      offenders.length === 0
+        ? "every message_start construction seeds both cache counters"
+        : `message_start constructions to fix (keyless-seed: seed via messageStartUsage(); unreadable-shape or json-text-frame: write a multi-line object literal):\n  ${offenders.join("\n  ")}`
+    ).toBe("every message_start construction seeds both cache counters");
+    // On the v14 base the measured set is 9 constructions (anthropic-sse,
+    // devin-connect, gemini-sse, ollama-jsonl, openai-sse, the responses
+    // claude-sse-sink, hooks/synthetic-terminal, test-helpers/stub-upstream,
+    // the overflow turn). Finding fewer means the detector lost sight of
+    // some: lower this floor only with the site that was removed in hand.
+    expect(sites).toBeGreaterThanOrEqual(8);
+    // A listed exception that matches nothing is stale: it would silently
+    // excuse the next frame written in that file.
+    expect([...allowedSeen].sort()).toEqual(Object.keys(JSON_TEXT_ALLOWED).sort());
+  });
+});

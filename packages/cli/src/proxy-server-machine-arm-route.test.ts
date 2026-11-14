@@ -106,6 +106,7 @@ async function postMessage(
   return realFetch(`http://127.0.0.1:${PROXY_PORT}${opts.path ?? "/v1/messages"}`, {
     method: "POST",
     headers: {
+      "connection": "close",
       "Content-Type": "application/json",
       "anthropic-version": "2023-06-01",
       ...(machine ? { "X-Claudish-Machine": machine } : {}),
@@ -124,6 +125,7 @@ async function postChat(machine?: string): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
     method: "POST",
     headers: {
+      "connection": "close",
       "Content-Type": "application/json",
       ...(machine ? { "X-Claudish-Machine": machine } : {}),
     },
