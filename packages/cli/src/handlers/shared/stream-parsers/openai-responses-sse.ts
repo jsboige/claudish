@@ -526,9 +526,12 @@ export function createResponsesStreamHandler(
                     index: fnIndex,
                     claudeId: callId,
                   };
-                  if (typeof event.output_index === "number") {
-                    fnCallData.outputIndex = event.output_index;
-                    functionCallsByOutputIndex.set(event.output_index, fnCallData);
+                  // Same expression as the done carrier below: the index may sit
+                  // at the top level OR on the item (review N6, 14/11).
+                  const addedOutputIndex = event.output_index ?? event.item.output_index;
+                  if (typeof addedOutputIndex === "number") {
+                    fnCallData.outputIndex = addedOutputIndex;
+                    functionCallsByOutputIndex.set(addedOutputIndex, fnCallData);
                   }
 
                   functionCalls.set(openaiCallId, fnCallData);
@@ -542,20 +545,18 @@ export function createResponsesStreamHandler(
                     content_block: { type: "tool_use", id: callId, name: fnName, input: {} },
                   });
                   hasToolUse = true;
-                  // #1039: some providers carry (part of) the argument string on
-                  // the item itself. Whatever is already known at open time is
-                  // owed to the client as a delta — the block's `input: {}` is
-                  // syntax, not content.
-                  const addedArgs =
-                    typeof event.item.arguments === "string" ? event.item.arguments : "";
-                  if (addedArgs) {
-                    fnCallData.arguments = addedArgs;
-                    send("content_block_delta", {
-                      type: "content_block_delta",
-                      index: fnIndex,
-                      delta: { type: "input_json_delta", partial_json: addedArgs },
-                    });
-                  }
+                  // #1039 review (14/11, B1): arguments carried on the ADDED item
+                  // are deliberately NOT emitted here. No guard can prevent the
+                  // double-emit — no delta has arrived when the block opens, and
+                  // the delta branch below appends to the same buffer, so a
+                  // provider repeating the full string as its first delta makes
+                  // the client assemble `<added><delta>`: invalid JSON on the
+                  // stream path, and `[{}]` through collectAnthropicSseToMessage
+                  // (the collector's JSON.parse falls back to {}). The complete-
+                  // string carriers — function_call_arguments.done,
+                  // output_item.done and response.completed — are guarded by
+                  // `!fnCall.arguments` and cover every shape that carries the
+                  // full string.
                 }
               } else if (event.type === "response.reasoning_summary_text.delta") {
                 if (textBlockIndex === null) {
@@ -602,9 +603,13 @@ export function createResponsesStreamHandler(
                   // #1039: this used to be a silent drop. One line per identity,
                   // greppable: it is the field that names the wire shape a
                   // future occurrence actually used.
-                  const identity = String(
+                  const rawIdentity = String(
                     event.call_id ?? event.item_id ?? `output_index:${event.output_index ?? "?"}`
                   );
+                  // Provider ids are unbounded on the wire; the log line is not
+                  // (review N3, 14/11).
+                  const identity =
+                    rawIdentity.length > 64 ? `${rawIdentity.slice(0, 64)}...` : rawIdentity;
                   if (!unmatchedArgumentDeltas.has(identity)) {
                     unmatchedArgumentDeltas.add(identity);
                     log(
@@ -659,12 +664,28 @@ export function createResponsesStreamHandler(
                         index: fnCall.index,
                         delta: { type: "input_json_delta", partial_json: itemArgs },
                       });
+                    } else if (fnCall.arguments && itemArgs && fnCall.arguments !== itemArgs) {
+                      // Partial deltas are already client-visible and the terminal
+                      // string disagrees: the client keeps what it streamed. Say
+                      // so — this used to drop in silence (review N1, 14/11).
+                      // One line per EVENT, deliberately not deduped: unlike the
+                      // per-delta sites, this fires at most once per terminal
+                      // carrier (review N4, 14/11).
+                      log(
+                        `[ResponsesSSE] ARG-DONE-MISMATCH model=${opts.modelName} reqN=${reqN} index=${fnCall.index} via=item.done streamed=${fnCall.arguments.length}B done=${itemArgs.length}B`,
+                        true
+                      );
                     }
                     send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
                     closedFunctionBlocks.add(fnCall.index);
                   }
                 }
               } else if (event.type === "response.incomplete") {
+                // A started block must stop before message_stop — the invariant
+                // this PR states, applied to incomplete too: it is a terminal
+                // event, and leaving the block unstopped desyncs the client
+                // (review N2, 14/11).
+                closeOpenBlocks();
                 const reason = event.reason || "unknown";
                 incompleteReason = reason;
                 log(
@@ -709,6 +730,8 @@ export function createResponsesStreamHandler(
                         // Fourth shape: the block was already closed empty by a
                         // done item that carried no arguments. Nothing legal can
                         // re-open it — name it so the shape is visible.
+                        // One line per EVENT, deliberately not deduped: this
+                        // fires at most once per completed item (review N4, 14/11).
                         log(
                           `[ResponsesSSE] ARG-LATE-COMPLETED model=${opts.modelName} reqN=${reqN} index=${fnCall.index} args=${itemArgs.length}B dropped-after-stop`,
                           true
@@ -721,6 +744,14 @@ export function createResponsesStreamHandler(
                           delta: { type: "input_json_delta", partial_json: itemArgs },
                         });
                       }
+                    } else if (fnCall.arguments && itemArgs && fnCall.arguments !== itemArgs) {
+                      // Same class as the item.done site: the client keeps its
+                      // stream, and the disagreement is said, lengths only
+                      // (review N1, 14/11).
+                      log(
+                        `[ResponsesSSE] ARG-DONE-MISMATCH model=${opts.modelName} reqN=${reqN} index=${fnCall.index} via=completed streamed=${fnCall.arguments.length}B done=${itemArgs.length}B`,
+                        true
+                      );
                     }
                   }
                 }

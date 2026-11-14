@@ -1296,4 +1296,63 @@ describe("#1039 — multi-call: every tool_use block reaches the client with com
       '{"text":"bonjour"}',
     ]);
   });
+
+  test("(h) arguments on the ADDED item never double-emit when a delta repeats them (review B1)", async () => {
+    // The blocking defect of the 14/11 review: the added carrier emitted at
+    // open time, and the first delta appended the same string — the client
+    // assembled `{"city":"Paris"}{"city":"Paris"}` on the stream, and `[{}]`
+    // through collectAnthropicSseToMessage (the collector's JSON.parse falls
+    // back to {}). Both paths are pinned: a pin on the streaming path alone
+    // misses the buffered one.
+    const events = [
+      ...CALLS.map((c, i) => ({
+        type: "response.output_item.added",
+        output_index: i,
+        item: { type: "function_call", id: c.id, call_id: c.call_id, name: c.name, arguments: c.args },
+      })),
+      ...CALLS.map((c, i) => ({
+        type: "response.function_call_arguments.delta",
+        item_id: c.id,
+        output_index: i,
+        delta: c.args,
+      })),
+      ...doneEvents(false),
+      completedEvent(false),
+    ];
+    const { output } = await runStreamCollect(events);
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual(CALLS.map((c) => c.args));
+
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sseChunks(events)));
+        controller.close();
+      },
+    });
+    const response = new Response(stream, { headers: new Headers(SSE_HEADERS) });
+    const parserResponse = createResponsesStreamHandler(mockContext(), response, {
+      modelName: "gpt-5.6-sol",
+    }) as Response;
+    const message = await collectAnthropicSseToMessage(parserResponse, "gpt-5.6-sol");
+    const toolUses = message.content.filter((b: any) => b.type === "tool_use");
+    expect(toolUses.map((b: any) => b.input)).toEqual(CALLS.map((c) => JSON.parse(c.args)));
+  });
+
+  test("(i) function_call_arguments.done after equal deltas does not re-emit (review B1)", async () => {
+    // The deltas are client-visible; the done event carries the same complete
+    // string. Correct behaviour — pinned before someone turns the done carrier
+    // into a second emission: nothing re-emitted, the client keeps its stream.
+    const { output } = await runStreamCollect([
+      ...addedEvents(),
+      ...CALLS.flatMap((c, i) => [
+        { type: "response.function_call_arguments.delta", item_id: c.id, output_index: i, delta: c.args.slice(0, 6) },
+        { type: "response.function_call_arguments.delta", item_id: c.id, output_index: i, delta: c.args.slice(6) },
+        { type: "response.function_call_arguments.done", item_id: c.id, output_index: i, arguments: c.args },
+      ]),
+      ...doneEvents(false),
+      completedEvent(false),
+    ]);
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual(CALLS.map((c) => c.args));
+  });
 });
