@@ -1,6 +1,6 @@
 # Claudish - Development Notes
 
-Planned-but-unimplemented work lives in `ROADMAP.md`, each item with an explicit trigger condition.
+Planned-but-unimplemented work lives in `ROADMAP.md` (upstream-shaped) and `ROADMAP-FORK.md` (this fork's parked items), each with an explicit trigger condition.
 
 **This file is the decision layer: what an agent must know *before* acting.** Detail is deferred, not deleted — each pointer below leads to the full text:
 
@@ -13,8 +13,8 @@ Planned-but-unimplemented work lives in `ROADMAP.md`, each item with an explicit
 | Relay internals (header build, prober, compression, outage reconciliation) | `docs/reference/relay-internals.md` |
 | Budget failover: cascade walk, notices, backoff, Qwen/GLM thinking measurements | `docs/reference/budget-failover.md` · `.env.sidecar.example` |
 | Capability vocabulary (#83 — wired, gate `CLAUDISH_CAPABILITY_VOCAB` default off) | `docs/reference/capability-vocabulary.md` |
-| Signature-based role routing (#82 — design only, unarbitrated, no code) | `docs/reference/signature-routing.md` · `ROADMAP.md` |
-| Haiku → swift debrayage — staged widening (02/11 : po-2028 in swift trial on user directive, revert if net PAYG rises; ai-01 + po-2024 excluded) | `docs/reference/haiku-swift-debrayage.md` · `ROADMAP.md` |
+| Signature-based role routing (#82 — design only, unarbitrated, no code) | `docs/reference/signature-routing.md` · `ROADMAP-FORK.md` |
+| Haiku → swift debrayage — staged widening (02/11 : po-2028 in swift trial on user directive, revert if net PAYG rises; ai-01 + po-2024 excluded) | `docs/reference/haiku-swift-debrayage.md` · `ROADMAP-FORK.md` |
 | OpenAI-compatible ingress (`/v1/chat/completions`) translation | `docs/reference/openai-ingress.md` |
 | Delegating a grain to a cloud agent or a worker — read before writing a work order or accepting its pull request | `docs/reference/delegation-protocol.md` · `.github/ISSUE_TEMPLATE/grain.md` |
 | Coordination program — objectives and the issues that carry them, consolidation, issue upkeep, what goes in a queue; read before building a queue or taking over the coordinator seat | `docs/reference/coordination-program.md` |
