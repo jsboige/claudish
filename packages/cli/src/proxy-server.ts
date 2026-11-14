@@ -129,6 +129,11 @@ import {
   sessionBudgetRefusalAnthropic,
 } from "./fork/session-budget.js";
 import {
+  admitLaneBudget,
+  laneBudgetRefusalAnthropic,
+  openLaneBudgetAttempt,
+} from "./fork/lane-budget.js";
+import {
   encodeStepSkipHeader,
   readStepSkip,
   stepSkipDisabled,
@@ -1956,6 +1961,9 @@ export async function createProxyServer(
       } else {
         if (budgetDecision) releaseBudget = budgetDecision.commit();
         openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+        // #1055 g2 — the same attempt feeds the lane ledger (inert without a
+        // lane header AND a bar for this (lane, model)).
+        openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, (body.model as string) ?? "", process.env);
         // #747 (b): while a SUBSTITUTE serves, it learns its capability delta
         // from the request side — appended to the top-level `system` of every
         // such request (the banners are stripped from history, and the
@@ -2332,6 +2340,8 @@ export async function createProxyServer(
                 if (walkBudget) walkRelease = walkBudget.commit();
                 // #317: the walk is a paid upstream attempt too — fresh token.
                 openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+                // #1055 g2 — the walk feeds the lane ledger too.
+                openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, (body.model as string) ?? "", process.env);
                 const targetResp = await targetHandler.handle(c, body);
                 if (targetResp.ok) {
                   // The step proved itself — mirror the loop's success
@@ -3229,6 +3239,20 @@ export async function createProxyServer(
           process.env
         );
         if (admission?.refused) return sessionBudgetRefusalAnthropic(admission);
+      }
+
+      // #1055 g2 — harness-lane admission (per-(lane, model) daily budget +
+      // operator emergency stop). Null (zero work) for every request without
+      // an `x-claudish-lane` header — the pre-#1055 path is byte-identical.
+      // Refusals are TYPED (`x-claudish-lane-refusal`) so the harness defers
+      // the notebook instead of queueing silently; paid before any handler.
+      {
+        const admission = admitLaneBudget(
+          c.req.header("x-claudish-lane") ?? null,
+          (body.model as string) ?? "",
+          process.env
+        );
+        if (admission?.refused) return laneBudgetRefusalAnthropic(admission);
       }
 
       // #83 grain 2: capability vocabulary — lift the session's declaration from
