@@ -24,12 +24,34 @@ Deux sources, deux vérités complémentaires :
      sans horodatage comptent toutes (l'appelant maîtrise sa fenêtre via
      `docker logs --since`).
 
-Usage (exporter le journal du NOEUD QUI ADMET — CR B2 : l'admission de lane
-tourne APRÈS le relais, donc pour un trafic relayé (client -> sidecar -> hub,
-NOMINAL) les lignes REFUSE sont dans le journal du HUB ; le sidecar ne les
-porte qu'en AUTONOMOUS) :
-  docker logs -t claudish-proxy > %TEMP%/refusals.log
-  python scripts/lane-daily-report.py --lane nb-coder --refusal-log %TEMP%/refusals.log
+     --refusal-log est RÉPÉTABLE (CR re-sync #1063) : un opérateur qui ne sait
+     pas encore quel nœud admet — ou qui veut couvrir les deux modes de relais
+     — passe le journal du hub ET celui du sidecar dans le même rapport. Les
+     lignes HORODATÉES identiques entre deux exports (fenêtres `--since` qui se
+     chevauchent sur le MÊME conteneur) sont fusionnées : un même refus n'est
+     pas compté deux fois. Les lignes SANS horodatage ne sont jamais
+     dédupliquées — deux refus réels d'une même lane y sont indiscernables
+     d'un doublon, et sous-compter un refus réel serait le pire des deux
+     mensonges.
+
+     Un chemin ABSENT n'est pas un zéro : il est nommé dans le rapport (stdout,
+     donc dans le rapport lui-même — le mettre sur stderr le ferait disparaître
+     à la première redirection) et listé dans la sortie --json. Les refus de
+     cette source sont « non lus », jamais « aucun ».
+
+Usage (re-sync #1063, la règle CR3 B5 : STOP et BUDGET ne vivent PAS dans le
+même journal — « stop REFUSE : le nœud qui PORTE le fichier stop ; budget
+REFUSE : le nœud qui ADMET ». Le check stop tourne AU-DESSUS du relais (B4) :
+la ligne stop est dans le journal du nœud où l'opérateur a posé le fichier
+(typiquement le sidecar du siège). L'admission budget tourne APRÈS le relais
+(B2) : pour un trafic relayé (client -> sidecar -> hub, NOMINAL) la ligne
+budget est dans le journal du HUB ; le sidecar ne la porte qu'en AUTONOMOUS.
+Comme un rapport ne sait pas a priori quel nœud a refusé quoi, passer les
+DEUX journaux — --refusal-log est répété précisément pour ça) :
+  docker logs -t claudish-proxy  > %TEMP%/refusals-hub.log
+  docker logs -t claudish-sidecar > %TEMP%/refusals-seat.log
+  python scripts/lane-daily-report.py --lane nb-coder \
+      --refusal-log %TEMP%/refusals-hub.log --refusal-log %TEMP%/refusals-seat.log
   python scripts/lane-daily-report.py --json            # toutes les lanes, 24 h
 
 Exit 0 même à vide (une lane silencieuse est un rapport, pas une erreur).
@@ -147,10 +169,15 @@ def build_report(cdir, cutoff_dt, lane_filter=None):
     return {"lanes": lanes, "unpaired": unpaired}
 
 
-def render(lanes, refusals, unpaired, hours, lane_filter):
+def render(lanes, refusals, unpaired, hours, lane_filter, missing_sources=()):
     lines = []
     def fmt(n):
         return f"{n:,}".replace(",", " ")
+    # Une source de refus NON LUE se dit AVANT tout compteur : « refus non
+    # lus » et « aucun refus » sont deux verdicts differents, et le lecteur
+    # d'un tableau de zeros ne doit pas pouvoir les confondre.
+    for path in missing_sources or ():
+        lines.append(f"refus NON LUS — journal introuvable : {path}")
     if not lanes and not refusals:
         lines.append(
             "aucune requete porteuse de lane harnais dans la fenetre"
@@ -193,23 +220,41 @@ def main():
         "CLAUDISH_CAPTURE_DIR", r"D:\claudish-captures"))
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--lane", default="", help="une seule lane (defaut: toutes)")
-    ap.add_argument("--refusal-log", default="",
-                    help="export `docker logs -t <conteneur>` (defaut: aucun refus lu)")
+    ap.add_argument("--refusal-log", action="append", default=[], metavar="FICHIER",
+                    help="export `docker logs -t <conteneur>` ; REPETABLE (hub + "
+                         "sidecar) — les lignes horodatees identiques sont fusionnees. "
+                         "Defaut : aucun refus lu (et le rapport le dit)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=args.hours)
     report = build_report(args.dir, cutoff_dt, args.lane or None)
     refusals = {}
+    # CR N1 (re-sync #1063) — un chemin absent lu en silence lirait « zero
+    # refus ». Il est NOMMÉ dans le rapport (stdout : une ligne stderr
+    # disparaîtrait à la première redirection, et le rapport doit se suffire).
+    missing_sources = []
     if args.refusal_log:
-        # CR N1 — un chemin absent lu en silence lirait « zero refus » : une
-        # ligne stderr, le rapport reste exact (refus non lus ≠ zéro refus).
-        if not os.path.exists(args.refusal_log):
-            print(f"lane-daily-report: --refusal-log introuvable, refus non lus : "
-                  f"{args.refusal_log}", file=sys.stderr)
-        else:
-            with open(args.refusal_log, "r", encoding="utf-8", errors="replace") as fh:
-                refusals = parse_refusals(fh.read(), cutoff_dt, args.lane or None)
+        seen_ts_lines = set()
+        merged = []
+        for path in args.refusal_log:
+            if not os.path.exists(path):
+                missing_sources.append(path)
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    # Dedupe ONLY timestamped lines: `docker logs -t` makes a
+                    # line uniquely identifiable, so two overlapping exports of
+                    # one container collapse to one. An untimestamped line is
+                    # never dropped — two real refusals of one lane look
+                    # exactly like a duplicate there.
+                    if DOCKER_TS.match(line):
+                        key = line.rstrip("\r\n")
+                        if key in seen_ts_lines:
+                            continue
+                        seen_ts_lines.add(key)
+                    merged.append(line)
+        refusals = parse_refusals("".join(merged), cutoff_dt, args.lane or None)
 
     if args.json:
         print(json.dumps({
@@ -223,11 +268,13 @@ def main():
                 } for lane, e in report["lanes"].items()
             },
             "refusals": {lane: dict(v) for lane, v in refusals.items()},
+            "refusal_sources": list(args.refusal_log or []),
+            "refusal_sources_missing": missing_sources,
             "unpaired": report["unpaired"],
         }, ensure_ascii=False, indent=2))
     else:
         print(render(report["lanes"], refusals, report["unpaired"],
-                     args.hours, args.lane or None))
+                     args.hours, args.lane or None, missing_sources))
     return 0
 
 

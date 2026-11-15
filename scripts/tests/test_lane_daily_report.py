@@ -23,6 +23,14 @@ Chaque pin défend une lecture qu'une implémentation plausible obtient FAUX :
      (l'appelant a borné par `docker logs --since`).
   8. LANE FILTER : --lane n'exclut QUE les autres lanes, jamais les
      unpaired du décompte global.
+  9. (re-sync #1063) --refusal-log RÉPÉTABLE : deux exports fusionnés ; une
+     ligne HORODATÉE identique dans les deux compte UNE fois (fenêtres
+     `--since` qui se chevauchent) ; une ligne SANS horodatage n'est jamais
+     dédupliquée (deux refus réels y sont indiscernables d'un doublon, et
+     sous-compter un refus réel est le pire des deux mensonges).
+  10. (re-sync #1063) Un chemin ABSENT est nommé DANS LE RAPPORT (stdout),
+      jamais seulement sur stderr — une ligne stderr disparaît à la première
+      redirection, et « refus non lus » ne doit pas pouvoir se lire « 0 ».
 
 Run: python scripts/tests/test_lane_daily_report.py
 """
@@ -174,7 +182,7 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-print("main — CR N1 : chemin --refusal-log absent = une ligne stderr, pas un silence")
+print("main — CR N1 (re-sync #1063) : chemin absent = le RAPPORT le dit, sur stdout")
 import contextlib
 import io
 tmp2 = tempfile.mkdtemp(prefix="lane-report-n1-")
@@ -188,13 +196,93 @@ try:
     finally:
         sys.argv = argv_backup
     check("exit 0 a chemin absent (un rapport vide est un rapport)", rc == 0)
-    check("une ligne stderr nomme le chemin (refus non lus != zero refus)",
-          "introuvable" in err.getvalue() and "absent.log" in err.getvalue(),
-          f"(stderr={err.getvalue()!r})")
+    # Le rapport SE SUFFIT : une ligne stderr disparait a la premiere
+    # redirection, et « refus non lus » ne doit pas pouvoir se lire « 0 ».
+    check("le chemin absent est nomme dans le RAPPORT (stdout)",
+          "refus NON LUS" in out.getvalue() and "absent.log" in out.getvalue(),
+          f"(stdout={out.getvalue()[:160]!r})")
+    check("rien n'est ecrit sur stderr pour ce cas",
+          "introuvable" not in err.getvalue(), f"(stderr={err.getvalue()!r})")
     check("le rapport reste rendu", "aucune requete" in out.getvalue(),
           f"(stdout={out.getvalue()[:120]!r})")
 finally:
     shutil.rmtree(tmp2, ignore_errors=True)
+
+print("main — --refusal-log REPETABLE : fusion des exports, doublons horodates comptes une fois")
+tmp3 = tempfile.mkdtemp(prefix="lane-report-multi-")
+try:
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%S")
+    recent2 = (datetime.now(timezone.utc) - timedelta(minutes=19)).strftime("%Y-%m-%dT%H:%M:%S")
+    DUP_BUDGET = (f"{recent}.000000000Z [claudish] [LaneBudget] REFUSE lane=nb-coder "
+                  f"model=m consumed=5 >= 5 (retry-after 60s)")
+    DUP_STOP = (f"{recent2}.000000000Z [claudish] [LaneStop] REFUSE lane=nb-coder "
+                f"(operator stop file present)")
+    # Sans horodatage, deux refus REELS sont indiscernables d'un doublon : les
+    # deux comptent. C'est le pin qui interdit d'etendre la dedupe a ces lignes.
+    NOTS = "[LaneStop] REFUSE lane=nb-coder (operator stop file present)"
+    path_a = os.path.join(tmp3, "hub.log")
+    path_b = os.path.join(tmp3, "seat.log")
+    with open(path_a, "w", encoding="utf-8") as fh:
+        fh.write("\n".join([DUP_BUDGET, DUP_STOP, NOTS, NOTS]) + "\n")
+    with open(path_b, "w", encoding="utf-8") as fh:
+        # fenetre --since qui chevauche : la meme ligne horodatee revient
+        fh.write("\n".join([DUP_BUDGET]) + "\n")
+
+    argv_backup, out = sys.argv, io.StringIO()
+    sys.argv = ["lane-daily-report.py", "--dir", tmp3, "--json",
+                "--refusal-log", path_a, "--refusal-log", path_b]
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = ldr.main()
+    finally:
+        sys.argv = argv_backup
+    data = json.loads(out.getvalue())
+    check("exit 0 en mode multi-journaux", rc == 0)
+    check("les DEUX sources sont listees", len(data["refusal_sources"]) == 2,
+          f"(got {data.get('refusal_sources')})")
+    check("aucune source manquante", data["refusal_sources_missing"] == [],
+          f"(got {data.get('refusal_sources_missing')})")
+    got = data["refusals"].get("nb-coder", {})
+    check("budget=1 : la ligne horodatee vue dans les DEUX exports compte une fois",
+          got.get("budget") == 1, f"(got {got})")
+    check("stop=3 : 1 horodate + 2 sans horodatage (jamais dedupliques)",
+          got.get("stop") == 3, f"(got {got})")
+finally:
+    shutil.rmtree(tmp3, ignore_errors=True)
+
+print("emitter contract — le lecteur lit la ligne TELLE QUE L'EMETTEUR la construit (rejeu)")
+# Re-sync #1063 : la ligne REFUSE appartient a g2 (lane-budget.ts, mergé
+# eb592d3e) ; le lecteur la re-pine avec SES fixtures. Ce pin ferme la boucle :
+# il extrait le GABARIT LITTERAL du fichier source de l'emetteur, le rend avec
+# des valeurs reelles, et le fait lire par parse_refusals. Toute derive de
+# wording cote emetteur casse CE pin (et le pin emetteur de
+# lane-budget.test.ts casse aussi) — les deux cotes ne peuvent plus deriver
+# separement sans qu'un test le dise.
+src_path = os.path.join(_HERE, "..", "..", "packages", "cli", "src", "fork", "lane-budget.ts")
+try:
+    _src = io.open(src_path, encoding="utf-8").read()
+    flat = " ".join(_src.split())
+    TMPL_BUDGET = "[LaneBudget] REFUSE lane=${lane} model=${model} consumed=${consumed} >= ${bar}"
+    TMPL_STOP = "[LaneStop] REFUSE lane=${lane} (operator stop file present)"
+    check("l'emetteur (eb592d3e) porte toujours le gabarit budget",
+          TMPL_BUDGET in flat)
+    check("l'emetteur porte toujours le gabarit stop", TMPL_STOP in flat)
+    line_b = (TMPL_BUDGET
+              .replace("${lane}", "nb-coder")
+              .replace("${model}", "MiniMax-M3.1-Flash")
+              .replace("${consumed}", "1234")
+              .replace("${bar}", "1000")
+              + " (retry-after 60s)")
+    line_s = TMPL_STOP.replace("${lane}", "nb-coder")
+    recent3 = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    replay = f"{recent3}.000000000Z [claudish] {line_b}\n{recent3}.100000000Z [claudish] {line_s}\n"
+    ref_r = ldr.parse_refusals(replay, cutoff)
+    check("rejeu : la ligne BUDGET rendue par l'emetteur est lue (cause budget)",
+          ref_r.get("nb-coder", {}).get("budget") == 1, f"(got {dict(ref_r)})")
+    check("rejeu : la ligne STOP rendue par l'emetteur est lue (cause stop)",
+          ref_r.get("nb-coder", {}).get("stop") == 1, f"(got {dict(ref_r)})")
+except OSError as e:
+    check("source de l'emetteur lisible", False, f"({e})")
 
 print()
 if FAILS:

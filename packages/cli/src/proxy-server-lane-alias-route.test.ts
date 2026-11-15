@@ -46,6 +46,18 @@ import type { ProxyServer } from "./types.js";
 // client-attribution's; checked against port-allocation.test.ts's scan).
 const PROXY_PORT = 14991;
 const NB_BASE = "http://127.0.0.1:14992"; // openai-wire custom endpoint
+// #1055 g3 CR (AC1 model_used item): a SECOND custom endpoint on the
+// Anthropic wire, because `mmc@` takes the `anthropic-sse` parser in
+// production (MiniMax direct) while the fixture above streams OpenAI chunks.
+// URL prefixes only — the legs are stubbed through globalThis.fetch, nothing
+// binds these ports.
+const ANTH_BASE = "http://127.0.0.1:14993";
+const ANTH_ALIAS = "nb-anthropic";
+// Deliberately NOT the routing target: on the Anthropic wire the upstream's
+// own `message_start.model` passes through verbatim (anthropic-sse emits the
+// data line unchanged), so a distinct spelling is what makes the
+// pass-through visible instead of assumed.
+const ANTH_UPSTREAM_SPELLING = "MiniMax-M3.1-Flash-20260101";
 
 /** The stable harness alias — a BARE name, no provider prefix (that is the
  * #3401 trap: the bare-name heuristic would call it native-anthropic). */
@@ -102,6 +114,66 @@ function fakeNbEndpointResponse(): Response {
   });
 }
 
+/**
+ * The Anthropic-wire fixture: a real `message_start` whose `model` is the
+ * provider's own spelling, then one text block and the terminal pair. Served
+ * as SSE when the request streams, as a complete `message` JSON otherwise.
+ */
+function fakeAnthropicEndpoint(stream: boolean): Response {
+  const message = {
+    id: "msg-nb-anth",
+    type: "message",
+    role: "assistant",
+    model: ANTH_UPSTREAM_SPELLING,
+    content: [{ type: "text", text: "SERVED-ANTH" }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 7, output_tokens: 3 },
+  };
+  if (!stream) {
+    return new Response(JSON.stringify(message), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const enc = new TextEncoder();
+  const ev = (type: string, data: any) =>
+    enc.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  const streamBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(ev("message_start", {
+        type: "message_start",
+        message: {
+          ...message,
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 7, output_tokens: 1 },
+        },
+      }));
+      controller.enqueue(ev("content_block_start", {
+        type: "content_block_start", index: 0,
+        content_block: { type: "text", text: "" },
+      }));
+      controller.enqueue(ev("content_block_delta", {
+        type: "content_block_delta", index: 0,
+        delta: { type: "text_delta", text: "SERVED-ANTH" },
+      }));
+      controller.enqueue(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
+      controller.enqueue(ev("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 3 },
+      }));
+      controller.enqueue(ev("message_stop", { type: "message_stop" }));
+      controller.close();
+    },
+  });
+  return new Response(streamBody, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
 beforeEach(() => {
   configExisted = existsSync(REAL_CONFIG_PATH);
   configBackup = configExisted ? readFileSync(REAL_CONFIG_PATH, "utf-8") : null;
@@ -116,11 +188,19 @@ beforeEach(() => {
           format: "openai",
           apiKey: "test-key",
         },
+        // The Anthropic wire — the parser `mmc@` actually runs in production.
+        "nb-anth-ep": {
+          kind: "simple",
+          url: `${ANTH_BASE}/v1`,
+          format: "anthropic",
+          apiKey: "test-key",
+        },
       },
       // THE stable alias (#1055): one routing entry, exact key — this is what
       // `matchUserRoutingOverride` consults to beat the native heuristic (2c).
       routing: {
         [ALIAS]: [`nb-ep@${RESOLVED}`],
+        [ANTH_ALIAS]: [`nb-anth-ep@${RESOLVED}`],
       },
     }),
     "utf-8"
@@ -136,6 +216,13 @@ beforeEach(() => {
   // Intercept only the proxy→endpoint leg; the client→proxy leg keeps real fetch.
   globalThis.fetch = (async (input: any, init: any) => {
     const url = typeof input === "string" ? input : String(input?.url ?? "");
+    if (url.startsWith(ANTH_BASE)) {
+      let stream = true;
+      try {
+        stream = JSON.parse(String(init?.body ?? "{}")).stream !== false;
+      } catch {}
+      return fakeAnthropicEndpoint(stream);
+    }
     if (url.startsWith(NB_BASE)) {
       let bodyModel = "";
       try {
@@ -201,6 +288,47 @@ async function postAlias(lane: string | null): Promise<Response> {
   });
 }
 
+/** Any ingress, any wire — the AC1 model_used pins drive all four shapes. */
+async function post(
+  path: "/v1/messages" | "/v1/chat/completions",
+  model: string,
+  stream: boolean,
+  lane: string | null
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    connection: "close",
+  };
+  if (lane !== null) headers["x-claudish-lane"] = lane;
+  return realFetch(`http://127.0.0.1:${PROXY_PORT}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      max_tokens: 32,
+      stream,
+      messages: [{ role: "user", content: "say hi" }],
+    }),
+  });
+}
+
+/** Every JSON payload of an SSE body, `[DONE]` and unparseable lines dropped. */
+function sseData(text: string): any[] {
+  return text
+    .split("\n")
+    .filter((l) => l.startsWith("data:"))
+    .map((l) => l.slice(5).trim())
+    .filter((d) => d && d !== "[DONE]")
+    .map((d) => {
+      try {
+        return JSON.parse(d);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
 function readCaptures(): { reqs: any[]; resps: string[] } {
   const files = readdirSync(captureDir!);
   const reqs = files
@@ -251,5 +379,80 @@ describe("#1055 g3 — stable alias + lane attribution, one request (AC1)", () =
     // "" = no lane on this request; an ABSENT key would mean a pre-#1055
     // capture (g1's three-way rule) — both must stay distinguishable.
     expect(reqs[0].lane).toBe("");
+  }, 30_000);
+});
+
+/**
+ * #1055 AC1, the `model_used` item the coordinator added at 14/11 ~23:30Z.
+ *
+ * The pin above settles what the CAPTURE says. What the HARNESS receives is a
+ * different value, and it is the one the harness will report as `model_used`:
+ * an alias that leaks through unchanged would make every row of the pilot's
+ * measurement table say `nb-minimax` instead of the model that served.
+ *
+ * Both ingresses are pinned because sk-agent speaks `/v1/chat/completions`
+ * (ms#1760) while the rest of the fleet speaks `/v1/messages`.
+ */
+describe("#1055 AC1 — the client-visible response `model` is the SERVED id", () => {
+  test("/v1/messages (streaming): message_start.model is the resolved concrete, never the alias", async () => {
+    await spinHub();
+    const res = await post("/v1/messages", ALIAS, true, "nb-coder");
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    const start = sseData(text).find((e) => e?.type === "message_start");
+    expect(start).toBeDefined();
+    // openai-sse synthesizes message_start with `model: target` (#437) — the
+    // resolved concrete, the value a harness reads back as model_used.
+    expect(start.message.model).toBe(RESOLVED);
+    expect(start.message.model).not.toBe(ALIAS);
+  }, 30_000);
+
+  test("/v1/chat/completions (streaming, the sk-agent ingress): every chunk.model is the resolved concrete", async () => {
+    await spinHub();
+    const res = await post("/v1/chat/completions", ALIAS, true, "nb-coder");
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    const chunks = sseData(text).filter((e) => e?.object === "chat.completion.chunk");
+    expect(chunks.length).toBeGreaterThan(0);
+    // anthropic-to-openai copies message_start.model into each chunk (#212).
+    // Mutation (the one this pin exists for): keep `fallbackModel` instead —
+    // fallbackModel is the CLIENT's spelling (the alias), so this goes red.
+    for (const chunk of chunks) {
+      expect(chunk.model).toBe(RESOLVED);
+    }
+  }, 30_000);
+
+  test("/v1/messages on the ANTHROPIC wire (the mmc@ production parser): the upstream's own spelling passes through, reported", async () => {
+    await spinHub();
+    const res = await post("/v1/messages", ANTH_ALIAS, true, "nb-coder");
+    const text = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(text).toContain("SERVED-ANTH");
+    const start = sseData(text).find((e) => e?.type === "message_start");
+    expect(start).toBeDefined();
+    // MEASURED, not assumed: anthropic-sse emits the upstream data line
+    // unchanged, so the harness reads the PROVIDER's spelling — not the
+    // routing target, and not the alias. This is the spelling the pilot's
+    // measurement table will carry for an `mmc@` request: `MiniMax-M3.1-Flash`
+    // in production (the provider echoes the id it served); the fixture uses a
+    // distinguishable one so the pass-through is falsifiable.
+    expect(start.message.model).toBe(ANTH_UPSTREAM_SPELLING);
+    expect(start.message.model).not.toBe(ANTH_ALIAS);
+  }, 30_000);
+
+  test("/v1/chat/completions (stream:false) on the ANTHROPIC wire: the JSON model is the served spelling", async () => {
+    await spinHub();
+    const res = await post("/v1/chat/completions", ANTH_ALIAS, false, "nb-coder");
+    const body: any = await res.json();
+
+    expect(res.status).toBe(200);
+    // anthropicMessageToChatCompletion: `message.model ?? fallbackModel` — the
+    // served spelling wins over the alias whenever the upstream states one.
+    expect(body.model).toBe(ANTH_UPSTREAM_SPELLING);
+    expect(body.model).not.toBe(ANTH_ALIAS);
+    expect(body.choices?.[0]?.message?.content).toBe("SERVED-ANTH");
   }, 30_000);
 });
