@@ -76,6 +76,48 @@ function Get-ClaudishContainers {
     return , @($lines | Where-Object { $_ -match 'claud' })
 }
 
+function Format-ByteLimit([string]$Raw) {
+    # HostConfig.Memory / MemorySwap, in bytes. THREE outcomes, and they are not
+    # the same finding:
+    #   'none'  -> the container is genuinely unbounded (0). A measured state.
+    #   '1g'    -> bounded, rendered in the largest exact unit.
+    #   $null   -> no signal (empty, <nil>, <no value>, garbage): the caller
+    #              renders '?'. An unreadable limit must never read as 'none',
+    #              exactly like a blank cascade cell never reads as "0 armed".
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
+    $t = $Raw.Trim()
+    if ($t -eq '<no value>' -or $t -eq '<nil>') { return 'none' }
+    $n = [long]0
+    if (-not [long]::TryParse($t, [ref]$n)) { return $null }
+    if ($n -le 0) { return 'none' }
+    if ($n % 1GB -eq 0) { return ('{0}g' -f [long]($n / 1GB)) }
+    if ($n % 1MB -eq 0) { return ('{0}m' -f [long]($n / 1MB)) }
+    return ('{0}b' -f $n)
+}
+
+function Format-ContainerBounds([string]$Raw) {
+    # One inspect line, three fields: "<Memory>|<MemorySwap>|<PidsLimit>".
+    # Rendered "mem/swap/pids" (e.g. 1g/1g/512). The whole cell is '?' when any
+    # of the three cannot be read: a partially rendered bound would be read as
+    # "this is the bound", which is the class of quiet lie the matrix exists for.
+    # PidsLimit is a nil-able int in Docker: nil / 0 = unlimited.
+    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
+    $parts = $Raw.Trim() -split '\|'
+    if ($parts.Count -ne 3) { return $null }
+    $mem = Format-ByteLimit $parts[0]
+    $swap = Format-ByteLimit $parts[1]
+    $pRaw = $parts[2].Trim()
+    $pids = $null
+    if ($pRaw -eq '<no value>' -or $pRaw -eq '<nil>' -or $pRaw -eq '') {
+        $pids = 'none'
+    } else {
+        $p = [long]0
+        if ([long]::TryParse($pRaw, [ref]$p)) { $pids = if ($p -le 0) { 'none' } else { "$p" } }
+    }
+    if ($null -eq $mem -or $null -eq $swap -or $null -eq $pids) { return $null }
+    return ('{0}/{1}/{2}' -f $mem, $swap, $pids)
+}
+
 function Get-ContainerFacts([string]$Name) {
     # upstream, published host port, image created date, armed-by-value count,
     # role-cascade count - all from ONE inspect env dump + one created read.
@@ -99,6 +141,11 @@ function Get-ContainerFacts([string]$Name) {
         Get-DockerLines @('image', 'inspect', $imageId, '--format', '{{.Created}}') | Select-Object -First 1
     } else { $null }
     $ports = (Get-DockerLines @('inspect', $Name, '--format', '{{json .HostConfig.PortBindings}}') | Select-Object -First 1)
+    # Host bounds (#303 / #917): the compose sets mem_limit, memswap_limit and
+    # pids_limit; a `docker update` bound dies at the next recreate, so the LIVE
+    # HostConfig is the only place that says what is actually enforced. One read.
+    $bounds = Format-ContainerBounds (Get-DockerLines @('inspect', $Name, '--format',
+            '{{.HostConfig.Memory}}|{{.HostConfig.MemorySwap}}|{{.HostConfig.PidsLimit}}') | Select-Object -First 1)
     # JSON form: {"3000/tcp":[{"HostIp":"","HostPort":"3000"}]} - the KEY is
     # the container port; the host port lives in HostPort. Match HostPort
     # first, else a 1:1 mapping silently reports the container port as host.
@@ -110,6 +157,7 @@ function Get-ContainerFacts([string]$Name) {
         RoleCascades  = $roleCascades
         ImageCreated  = $created
         HostPort      = $hostPort
+        Bounds        = $bounds
     }
 }
 
@@ -175,7 +223,7 @@ function Render-Row([string]$Machine, $Containers, [string]$LanCell) {
         # whole row is. The client cell does not depend on docker - it stays
         # measured (one honest cell beats a uniform '?'). The LAN cell is
         # docker-independent too and renders whatever the probe measured.
-        $cells.AddRange([string[]]@('?', '?', '?', '?', '?', $client, '?', '?'))
+        $cells.AddRange([string[]]@('?', '?', '?', '?', '?', $client, '?', '?', '?'))
         $cells.Add($LanCell)
         $script:MatrixExitCode = 2
         return ($cells -join ' | ')
@@ -189,7 +237,7 @@ function Render-Row([string]$Machine, $Containers, [string]$LanCell) {
     $Containers = @($Containers)
     if ($Containers.Count -eq 0) {
         # No claudish container: a real, sayable state - not a blank.
-        $cells.AddRange([string[]]@('none', '-', '-', '-', '-', $client, '-', '-'))
+        $cells.AddRange([string[]]@('none', '-', '-', '-', '-', $client, '-', '-', '-'))
         $cells.Add($LanCell)
         return ($cells -join ' | ')
     }
@@ -218,6 +266,10 @@ function Render-Row([string]$Machine, $Containers, [string]$LanCell) {
     if ($null -eq $facts0) { $unknown = $true; $cells.Add('?') } else {
         $cells.Add(("{0} names / {1} role cascade(s)" -f $facts0.ArmedByValue, $facts0.RoleCascades))
     }
+    # Bounds (#291 grain 7): from the container's LIVE HostConfig, never from the
+    # compose file - a `docker update` bound and a compose bound look identical
+    # in the file and differently in the container. '?' when the read gave nothing.
+    if ($null -eq $facts0 -or $null -eq $facts0.Bounds) { $unknown = $true; $cells.Add('?') } else { $cells.Add($facts0.Bounds) }
     $transitions = Get-RelayTransitions $firstName
     if ($null -eq $transitions) { $unknown = $true; $cells.Add('?') } else { $cells.Add($transitions) }
     $cells.Add($LanCell)
@@ -237,7 +289,7 @@ Write-Output ("  containers : {0}" -f $containerSummary)
 Write-Output ""
 $lanCell = Get-LanHubReachability $LanHub
 if ($lanCell -eq '?') { $script:MatrixExitCode = [Math]::Max($script:MatrixExitCode, 1) }
-Write-Output "| machine | container(s) | host port | image | upstream (live) | /health role | client base_url (live) | cascade by value | relay transitions | LAN hub reachability |"
-Write-Output "|---|---|---|---|---|---|---|---|---|---|"
+Write-Output "| machine | container(s) | host port | image | upstream (live) | /health role | client base_url (live) | cascade by value | bounds (mem/swap/pids) | relay transitions | LAN hub reachability |"
+Write-Output "|---|---|---|---|---|---|---|---|---|---|---|"
 Write-Output ("| " + (Render-Row $machine $containers $lanCell) + " |")
 exit $script:MatrixExitCode
