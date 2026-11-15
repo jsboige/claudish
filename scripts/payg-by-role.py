@@ -135,6 +135,11 @@ def plan_of(model: str) -> str:
     # family fallbacks, deliberately narrow
     if model.startswith("glm-") or model.startswith("zai-glm-"):
         return "prepaid"
+    # The z.ai wire spells the same family `z-ai_glm-*` (measured 13/11 in the
+    # 24 h capture: 6 responses served as `z-ai_glm-4.5-air` and read UNKNOWN
+    # because neither prefix above matches). Same provider, same plan.
+    if model.startswith("z-ai_glm-"):
+        return "prepaid"
     if model.startswith("MiniMax-"):
         return "prepaid"
     return "unknown"
@@ -318,6 +323,9 @@ def selftest():
             fails.append("qwen prepaid alias classified as PAYG")
         if plan_of("deepseek-v4-flash") != "payg":
             fails.append("condensation model not classified as PAYG")
+        # the z.ai wire's vendor-prefixed spelling of a GLM model
+        if plan_of("z-ai_glm-4.5-air") != "prepaid":
+            fails.append("z-ai_glm-* served name read UNKNOWN (a forfait left invisible)")
 
         # --as-of: the window END must move, and the two timestamp spellings
         # (capture filenames vs ISO-8601 on the command line) must agree.
@@ -338,8 +346,9 @@ def selftest():
             for f in fails:
                 print("  -", f)
             return 2
-        print("SELFTEST OK — 9 pins (2 pairs, 1 unmatched, trap #48, alias, "
-              "condensation, as-of window end, as-of tz refusal, as-of before corpus)")
+        print("SELFTEST OK — 10 pins (2 pairs, 1 unmatched, trap #48, alias, "
+              "condensation, z-ai_glm prefix, as-of window end, as-of tz refusal, "
+              "as-of before corpus)")
         return 0
 
 
