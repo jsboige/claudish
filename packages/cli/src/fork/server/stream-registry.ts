@@ -154,6 +154,17 @@ export function createStreamTracker(): StreamTracker {
       return;
     }
 
+    // #1064 — admission on a fully idle proxy is progress. The silence that
+    // preceded it was not silence on in-flight work: there was none. Without
+    // this, a seat idle longer than the threshold answers every /health hit
+    // stalled (503) from its first request until that request's first chunk.
+    // Guarded by BOTH counters being zero before the increment, so a second
+    // request admitted behind a genuinely stuck one cannot mask the wedge —
+    // otherwise a steady trickle of admissions would keep the stamp fresh
+    // forever and a wedged proxy would report healthy.
+    if (activeStreams === 0 && pendingRequests === 0) {
+      lastProgressAt = Date.now();
+    }
     pendingRequests++;
     try {
       await next();
