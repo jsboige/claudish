@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUDGET_FOOTER_MARKER, manifestFooter } from "./env-gate";
 import {
+  DEFAULT_WALL_CLOCK_MS,
   type StrictBaseline,
   type SuiteRun,
   diffAgainstBaseline,
@@ -21,6 +22,7 @@ import {
   parseEnvGateManifests,
   parseRunOutput,
   realSuiteRunner,
+  resolveWallClockMs,
   runIsAccountable,
   splitFreshByReproduction,
 } from "./strict-runner";
@@ -116,6 +118,27 @@ describe("parseRunOutput (real bun output)", () => {
   });
 });
 
+describe("resolveWallClockMs (per-seat wall override, #641 C3)", () => {
+  test("unset and empty env → the 420 s default, silently", () => {
+    expect(resolveWallClockMs({})).toBe(DEFAULT_WALL_CLOCK_MS);
+    expect(DEFAULT_WALL_CLOCK_MS).toBe(420_000); // the default is part of the arbitration
+    expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: "" })).toBe(DEFAULT_WALL_CLOCK_MS);
+  });
+
+  test("a positive integer of ms overrides", () => {
+    expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: "900000" })).toBe(900_000);
+    expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: "1" })).toBe(1);
+  });
+
+  test("invalid values fall back to the default (never a silent bound change, never a crash)", () => {
+    for (const bad of ["abc", "0", "-5", "420.5", "420 000", "undefined", "20min"]) {
+      expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: bad })).toBe(
+        DEFAULT_WALL_CLOCK_MS
+      );
+    }
+  });
+});
+
 describe("realSuiteRunner (kill path — re-review 2 defect)", () => {
   const tmpDirs: string[] = [];
   afterEach(() => {
@@ -164,6 +187,8 @@ describe("realSuiteRunner (kill path — re-review 2 defect)", () => {
     expect(out).toContain("RUN KILLED (ETIMEDOUT)");
     expect(out).toContain("the hung file is the NEXT one");
     expect(out).toContain("aaa-first.test.ts");
+    // The kill line names the wall that actually killed the run (#641 C3).
+    expect(out).toContain("The wall clock in force was 8000 ms");
   }, 20000);
 });
 

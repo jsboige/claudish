@@ -245,9 +245,32 @@ export function diffAgainstBaseline(
   };
 }
 
-type SuiteRunner = () => { raw: string; killed?: boolean; errorCode?: string };
+type SuiteRunner = () => { raw: string; killed?: boolean; errorCode?: string; wallMs?: number };
 
-const WALL_CLOCK_MS = 420_000;
+export const DEFAULT_WALL_CLOCK_MS = 420_000;
+
+/**
+ * The wall clock is overridable per seat (env `CLAUDISH_STRICT_WALL_CLOCK_MS`,
+ * positive integer, milliseconds). Measured 2026-11-15 (#641 C3): the v14
+ * population does not fit 420 s on seats that run it (po-2024 and po-2028 both
+ * killed ETIMEDOUT while main's baseline fits — population and/or seat load,
+ * not a port defect), so the arbitrated fix is a per-seat bound, default
+ * unchanged; sharding was considered and rejected. An invalid value (empty,
+ * non-numeric, <= 0, fractional) falls back to the default WITH a warning —
+ * never a silent bound change, never a crash before the run starts.
+ */
+export function resolveWallClockMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.CLAUDISH_STRICT_WALL_CLOCK_MS;
+  if (raw === undefined || raw === "") return DEFAULT_WALL_CLOCK_MS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    process.stderr.write(
+      `[STRICT] CLAUDISH_STRICT_WALL_CLOCK_MS=${raw} is not a positive integer of ms — using the default ${DEFAULT_WALL_CLOCK_MS}.\n`
+    );
+    return DEFAULT_WALL_CLOCK_MS;
+  }
+  return n;
+}
 
 /**
  * The real suite runner. Bounded by default: an unbounded suite cannot back a
@@ -279,6 +302,7 @@ export function realSuiteRunner(
   opts: { testPath?: string; wallClockMs?: number } = {}
 ): SuiteRunner {
   return () => {
+    const wallMs = opts.wallClockMs ?? resolveWallClockMs();
     const r = spawnSync(
       process.execPath,
       [
@@ -292,12 +316,17 @@ export function realSuiteRunner(
         encoding: "utf-8",
         maxBuffer: 64 * 1024 * 1024,
         cwd,
-        timeout: opts.wallClockMs ?? WALL_CLOCK_MS,
+        timeout: wallMs,
       }
     );
     const raw = (r.stdout ?? "") + (r.stderr ?? "");
     if (r.error)
-      return { raw, killed: true, errorCode: (r.error as NodeJS.ErrnoException).code ?? "?" };
+      return {
+        raw,
+        killed: true,
+        errorCode: (r.error as NodeJS.ErrnoException).code ?? "?",
+        wallMs,
+      };
     return { raw };
   };
 }
@@ -378,10 +407,17 @@ function printVerdict(v: StrictVerdict, hadBaseline: boolean): void {
   }
 }
 
-function printKill(errorCode: string, raw: string): void {
+function printKill(errorCode: string, raw: string, wallMs?: number): void {
+  const wall =
+    wallMs === undefined
+      ? ""
+      : ` The wall clock in force was ${wallMs} ms` +
+        (wallMs === DEFAULT_WALL_CLOCK_MS
+          ? " (default)."
+          : ` — CLAUDISH_STRICT_WALL_CLOCK_MS overrides the ${DEFAULT_WALL_CLOCK_MS} default.`);
   process.stdout.write(
     `[STRICT] 🔴 RUN KILLED (${errorCode}) — no verdict can be drawn from a killed run; ` +
-      "re-run (the flaky tail is exactly this class of event).\n"
+      `re-run (the flaky tail is exactly this class of event).${wall}\n`
   );
   // Diagnosis: bun's non-TTY reporter prints a file header only once that file
   // produces output, so a file hung in a hook stays nameless — the last file
@@ -408,7 +444,7 @@ export function main(
 
   const run1 = runSuite();
   if (run1.killed) {
-    printKill(run1.errorCode ?? "killed", run1.raw);
+    printKill(run1.errorCode ?? "killed", run1.raw, run1.wallMs);
     return 3;
   }
   const parsed1 = parseRunOutput(run1.raw);
@@ -463,7 +499,7 @@ export function main(
       );
       const run2 = runSuite();
       if (run2.killed) {
-        printKill(run2.errorCode ?? "killed", run2.raw);
+        printKill(run2.errorCode ?? "killed", run2.raw, run2.wallMs);
         return 3;
       }
       const parsed2 = parseRunOutput(run2.raw);
