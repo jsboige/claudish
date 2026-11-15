@@ -899,7 +899,16 @@ export function createAnthropicPassthroughStream(
               // full synthetic open only when NOTHING was delivered, otherwise
               // just the terminal pair (a synthetic message_start after a
               // delivered body would be a lie about what the client holds).
-              finalizeAbandonedStream(controller, undefined, forwardedAnyData);
+              // A stream that delivered nothing also owes the human a readable
+              // reason (#286 wording, main's text) — it rides the same notice
+              // mechanism as #65's policy refusals, one block before the tail.
+              finalizeAbandonedStream(
+                controller,
+                !sawMessageStart && !forwardedAnyData
+                  ? "[Error: The model returned an empty response. This is usually transient — a momentary provider load or rate limit, NOT a context-size problem. Please retry. If it recurs repeatedly on a very large conversation, then try /compact.]"
+                  : undefined,
+                forwardedAnyData
+              );
               isClosed = true;
               if (pingInterval) {
                 clearInterval(pingInterval);
