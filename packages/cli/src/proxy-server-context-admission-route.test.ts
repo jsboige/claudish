@@ -42,6 +42,10 @@ const realConsoleLog = console.log;
 
 let calls: Record<string, number> = {};
 let markerLog: string[] = [];
+/** Endpoints refusing the prompt as too large (#681/#939: the size refusal
+ *  that triggers the context-skip jump — census metadata says the window fits,
+ *  the upstream says it does not). */
+let overflowEndpoints = new Set<string>();
 
 const SANDBOX_ENV_KEYS = [
   "ZAI_API_KEY",
@@ -115,8 +119,25 @@ const fakeEp = (name: string, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
+/** The vLLM context-overflow 400 the #431/#681 family classifies as a size
+ *  skip (same body shape as the failover-route file's #431 pins). */
+function contextOverflow(): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: "This model's maximum context length is 8192 tokens.",
+        type: "invalid_request_error",
+        code: "context_length_exceeded",
+      },
+    }),
+    { status: 400, headers: { "content-type": "application/json" } }
+  );
+}
+
 /** Every candidate on the armed path declares 262 144, except `bare-ep`
- *  (declares nothing — the stand-down candidate) and `small-ep` (32 768). */
+ *  (declares nothing — the stand-down candidate) and `small-ep` (32 768).
+ *  The c*-ep set is #939's: a haiku path capped at 128k (ch 100k, c0 100k,
+ *  cd 128k) one jump away from a sonnet path that fits (cs/cn 400k). */
 function registerFakeEndpoints(): void {
   const customEndpoints: Record<string, ReturnType<typeof fakeEp>> = {
     "nm-ep": fakeEp("nm", { contextLimit: 262144 }),
@@ -124,6 +145,11 @@ function registerFakeEndpoints(): void {
     "s1-ep": fakeEp("s1", { contextLimit: 262144 }),
     "small-ep": fakeEp("sm", { contextLimit: 32768 }),
     "bare-ep": fakeEp("bare"),
+    "ch-ep": fakeEp("ch", { contextLimit: 100_000 }),
+    "c0-ep": fakeEp("c0", { contextLimit: 100_000 }),
+    "cd-ep": fakeEp("cd", { contextLimit: 128_000 }),
+    "cs-ep": fakeEp("cs", { contextLimit: 400_000 }),
+    "cn-ep": fakeEp("cn", { contextLimit: 400_000 }),
   };
   ensureEndpointsRegistered({
     config: {
@@ -170,8 +196,9 @@ const messageText = (msg: any): string =>
   (msg?.content ?? []).map((b: any) => (b?.type === "text" ? b.text : "")).join("\n");
 
 beforeEach(() => {
-  calls = { nm: 0, s0: 0, s1: 0, sm: 0, bare: 0 };
+  calls = { nm: 0, s0: 0, s1: 0, sm: 0, bare: 0, ch: 0, c0: 0, cd: 0, cs: 0, cn: 0 };
   markerLog = [];
+  overflowEndpoints = new Set();
   registerFakeEndpoints();
   for (const k of SANDBOX_ENV_KEYS) {
     savedEnv[k] = process.env[k];
@@ -198,12 +225,13 @@ beforeEach(() => {
     }
     const which = url.slice("http://fake.invalid/".length).split("/")[0].slice(0, 4);
     calls[which] = (calls[which] ?? 0) + 1;
+    if (overflowEndpoints.has(which)) return contextOverflow();
     return healthySSE();
   }) as typeof fetch;
   console.log = ((...args: any[]) => {
     const text = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
     for (const line of text.split("\n")) {
-      if (line.includes("[ContextAdmission]")) markerLog.push(line);
+      if (line.includes("[ContextAdmission]") || line.includes("[Failover]")) markerLog.push(line);
     }
     realConsoleLog(...args);
   }) as any;
@@ -469,3 +497,86 @@ async function responseText(r: Response): Promise<string> {
   const msg = await r.json();
   return messageText(msg);
 }
+
+// ---------------------------------------------------------------------------
+// #939 — the admission census weighs the sonnet path when the #681 jump could
+// fire (v14 port of main's C1/C2). Decision (a) on the issue: when
+// sonnetJumpTarget() holds for this request (non-sonnet walk + sonnet rule
+// with ≥1 step + mapped nominal — the SAME predicate the loop consults at its
+// first context skip, one helper for both sites), the #565 census also weighs
+// resolveNominalTarget(sonnetNominal) plus collectSteps("sonnet"). Only
+// candidates are added, never removed, so with no jump target the census is
+// exactly #565's conservative refusal. Mutation proofs: drop the
+// sonnet-weighing block ⇒ C1 red (the request is refused at admission naming
+// 128000 and never reaches the jump); drop the shared predicate's
+// step/nominal conditions at the census site only ⇒ C2 stays green but C1's
+// shape no longer matches the loop's (drift — the reason the predicate is one
+// helper).
+// ---------------------------------------------------------------------------
+
+describe("#939 — census + jump: an all-declared origin path narrower than the sonnet path no longer refuses", () => {
+  /** The issue's repro with numbers, on the DEDICATED c*-ep endpoints: the
+   * haiku path is ALL-declared (ch 100k, c0 100k, cd 128k) and the request
+   * is ~300k — doomed on every haiku candidate. The sonnet path (cn 400k,
+   * cs 400k) fits it, one #681 jump away. Est ≈ 300k: above 128k, below
+   * 400k — the exact bracket. The DECLARED windows are census metadata; the
+   * size refusal comes from the upstream (scripted vLLM 400, J1's family). */
+  const BIG = "x".repeat(1_200_000); // est ≈ 300k tokens
+  const MAP: Record<string, string> = { sonnet: "cn-ep@fake-cn", haiku: "ch-ep@fake-ch" };
+  const HAIKU_CASCADE = "c0-ep@fake-c0>cd-ep@fake-cd";
+
+  test("C1: origin all-declared-and-smaller + jump target fits → ADMITTED, served by the jump", async () => {
+    await spin(MAP, {
+      CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+      CLAUDISH_FAILOVER_SONNET: "cs-ep@fake-cs",
+      CLAUDISH_FAILOVER_ACTIVE: "haiku,sonnet",
+    });
+    // The declared 100k on c0 is CENSUS metadata; the refusal itself comes
+    // from the upstream (the vLLM 400, same family as J1) — a fresh prefix
+    // carries no learned cap, so the #651 guard would not short-circuit it.
+    overflowEndpoints = new Set(["c0"]);
+
+    const r = await postMessage({ model: "claude-haiku-4-5", content: BIG });
+
+    // THE PIN: admitted (the sonnet windows are weighed), then the #681 jump
+    // serves it — the very path the pre-#939 census used to refuse naming
+    // 128000 while a 400k window sat one jump away.
+    expect(r.status).toBe(200);
+    const text = await responseText(r);
+    expect(text).not.toContain("exceeds every declared context window");
+    expect(text).toContain("served by **cs-ep@fake-cs**"); // the jump target served
+    expect(calls.c0).toBe(1); // paid exactly once, refused on size
+    expect(calls.cs).toBe(1); // sonnet[0], the jump's first servable step — SERVES
+    expect(calls.cd).toBe(0); // the narrower rungs are never paid
+    expect(calls.ch).toBe(0); // armed: no nominal detour
+    expect(calls.cn).toBe(0); // armed sonnet: the step, not the nominal
+    expect(markerLog.some((l) => l.includes("ROLE-JUMP sonnet"))).toBe(true);
+    expect(markerLog.some((l) => l.includes("[ContextAdmission] REFUSE"))).toBe(false);
+  }, 30_000);
+
+  test("C2: same shape, NO sonnet rule (jump disabled) → the census refuses AS TODAY", async () => {
+    // The shared predicate is the gate: with no sonnet rule there is no jump
+    // target, the census must weigh the haiku path alone, and the #565
+    // conservative refusal stands — the number it names is the largest
+    // declared window on the ORIGIN path (128000), zero upstream calls.
+    await spin(MAP, {
+      CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+      CLAUDISH_FAILOVER_SONNET: "", // no sonnet rule: the jump cannot fire
+      CLAUDISH_FAILOVER_ACTIVE: "haiku",
+    });
+    // MAP's sonnet nominal is still MAPPED — mapping alone must not weigh.
+
+    const r = await postMessage({ model: "claude-haiku-4-5", content: BIG });
+
+    expect(r.status).toBe(200); // the recoverable turn, never a bare 400 (#79)
+    const text = await responseText(r);
+    expect(text).toContain("exceeds every declared context window");
+    expect(text).toContain("128000"); // the largest window on the origin path
+    expect(calls.c0).toBe(0); // not one round-trip, on any candidate
+    expect(calls.cd).toBe(0);
+    expect(calls.ch).toBe(0);
+    expect(calls.cs).toBe(0);
+    expect(markerLog.some((l) => l.includes("[ContextAdmission] REFUSE"))).toBe(true);
+    expect(markerLog.some((l) => l.includes("ROLE-JUMP sonnet"))).toBe(false);
+  }, 30_000);
+});
