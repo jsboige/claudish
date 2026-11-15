@@ -56,13 +56,13 @@ import { resumeFromToolResults } from "../code-mode/resume.js";
 import { loadQuickJSModule } from "../code-mode/sandbox/quickjs-loader.js";
 import { getCodeModeStores, peekCodeModeStores } from "../code-mode/stores.js";
 import { conversationMessages } from "../code-mode/types.js";
+// #1055 g2 / #1060 — the harness-lane ledger twin of the session budget.
+import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
 // Capture pipeline (#641 blocker-2 port): durable trace of non-ok upstream
 // bodies + the pinned stderr wall marker (reqN-keyed) that the traffic-*.ps1
 // readers parse.
 import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
-// #1055 g2 / #1060 — the harness-lane ledger twin of the session budget.
-import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
 import { getHookEngine } from "../hooks/index.js";
 import { type RawStreamTap, statsNames } from "../hooks/raw.js";
 import type { UpstreamFacts } from "../hooks/registry.js";
@@ -144,9 +144,6 @@ import {
   classifyConnectionError,
 } from "./shared/connection-error.js";
 import { sniffDevinStreamHead } from "./shared/devin-stream-head-sniffer.js";
-// #909: request-body gzip toward providers whose transport declares the
-// capability — never the SSE response, and never a transport-serialized body.
-import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 // #575 (#431 row 7a): the engine's per-prompt image cap — a request-SHAPE
 // incapacity classified from the 400 body and answered as a `media` step-skip.
 // v14 port note: `countMediaBlocks` rides THIS import on v14 (no
@@ -222,6 +219,9 @@ import {
   tier1DeadlineAt,
   withConnectionRetry,
 } from "./shared/transient-retry.js";
+// #909: request-body gzip toward providers whose transport declares the
+// capability — never the SSE response, and never a transport-serialized body.
+import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { captureUpstreamError } from "./shared/upstream-error-capture.js";
 
 /**

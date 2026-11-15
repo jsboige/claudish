@@ -4,10 +4,11 @@
  * these pin the instrument itself: parse grammar, refusal wording (the
  * isQuotaExhaustion contract), stop-file lane isolation, the attempt ledger.
  */
-import { describe, expect, it, beforeEach } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isQuotaExhaustion } from "./failover.js";
 import {
   admitLaneBudget,
   laneBudgetConsumed,
@@ -19,11 +20,11 @@ import {
   sanitizeLane,
   setLaneBudgetClockForTests,
 } from "./lane-budget.js";
-import { isQuotaExhaustion } from "./failover.js";
 
-const ENV = (over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv => ({
-  ...over,
-} as NodeJS.ProcessEnv);
+const ENV = (over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv =>
+  ({
+    ...over,
+  }) as NodeJS.ProcessEnv;
 
 describe("lane-budget (#1055 g2)", () => {
   beforeEach(() => {
@@ -41,7 +42,9 @@ describe("lane-budget (#1055 g2)", () => {
     expect(b.laneWide.size).toBe(1);
     // Cached by raw value: the same string returns the same parse, a different
     // one re-parses (tests set different budgets per test).
-    const again = parseLaneBudgets("nb-coder/nb-minimax:500000, nb-coder:1000000 , bad-entry, other/zero:0, x/y:-5");
+    const again = parseLaneBudgets(
+      "nb-coder/nb-minimax:500000, nb-coder:1000000 , bad-entry, other/zero:0, x/y:-5"
+    );
     expect(again).toBe(b);
     expect(parseLaneBudgets("nb-coder:7").laneWide.get("nb-coder")).toBe(7);
   });
@@ -62,7 +65,7 @@ describe("lane-budget (#1055 g2)", () => {
   it("over the bar → typed refusal, wording NEVER arms isQuotaExhaustion (pin)", async () => {
     const env = ENV({ CLAUDISH_LANE_BUDGETS: "nb-coder/nb-minimax:500" });
     // Feed the ledger: one attempt, terminal usage 600.
-    let clock = 1_000_000;
+    const clock = 1_000_000;
     setLaneBudgetClockForTests(() => clock);
     const raw = {};
     openLaneBudgetAttempt(raw, "nb-coder", "nb-minimax", env);
@@ -97,7 +100,7 @@ describe("lane-budget (#1055 g2)", () => {
   // matching isQuotaExhaustion when echoed) stays arm-safe.
   it("quota-word lane/model names: refusal wording stays arm-safe (CR N2)", () => {
     const env = ENV({ CLAUDISH_LANE_BUDGETS: "weekly-digest:500" });
-    let clock = 1_000_000;
+    const clock = 1_000_000;
     setLaneBudgetClockForTests(() => clock);
     const raw = {};
     openLaneBudgetAttempt(raw, "weekly-digest", "credit-analyst-v1", env);
@@ -113,9 +116,13 @@ describe("lane-budget (#1055 g2)", () => {
       // CR3 B5: the stop check is route-side; the module pin calls
       // `laneStopRefusal` directly — admitLaneBudget no longer re-checks the
       // file (the unconditional pre-relay check refuses first everywhere).
-      const stopAdm = laneStopRefusal("weekly-digest", "credit-analyst-v1", ENV({
-        CLAUDISH_LANE_STOP_DIR: stopDir,
-      }));
+      const stopAdm = laneStopRefusal(
+        "weekly-digest",
+        "credit-analyst-v1",
+        ENV({
+          CLAUDISH_LANE_STOP_DIR: stopDir,
+        })
+      );
       expect(stopAdm?.refused).toBe(true);
       expect(isQuotaExhaustion(429, stopAdm!.message)).toBe(false);
     } finally {
@@ -127,7 +134,7 @@ describe("lane-budget (#1055 g2)", () => {
   // spelling; one pin per side so they cannot drift again.
   it("the REFUSE log line writes consumed= (the lane report's regex) (#1063 CR B1)", () => {
     const env = ENV({ CLAUDISH_LANE_BUDGETS: "nb-coder:500" });
-    let clock = 1_000_000;
+    const clock = 1_000_000;
     setLaneBudgetClockForTests(() => clock);
     const raw = {};
     openLaneBudgetAttempt(raw, "nb-coder", "nb-minimax", env);
@@ -142,9 +149,11 @@ describe("lane-budget (#1055 g2)", () => {
     } finally {
       console.log = realLog;
     }
-    expect(lines.some((l) =>
-      /\[LaneBudget\] REFUSE lane=nb-coder model=nb-minimax consumed=\d+ >= \d+ /.test(l)
-    )).toBe(true);
+    expect(
+      lines.some((l) =>
+        /\[LaneBudget\] REFUSE lane=nb-coder model=nb-minimax consumed=\d+ >= \d+ /.test(l)
+      )
+    ).toBe(true);
   });
 
   it("two paid attempts of one request land in TWO slots — sum, not max", () => {

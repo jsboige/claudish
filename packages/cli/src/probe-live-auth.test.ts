@@ -40,8 +40,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createProxyServer } from "./proxy-server.js";
 import { probeLink, resolveProbeProxyKey } from "./providers/probe-live.js";
+import { createProxyServer } from "./proxy-server.js";
 import type { ProxyServer } from "./types.js";
 
 // One allocation per FILE (CR on #938): a port bound and released once per
@@ -57,13 +57,29 @@ let configBackup: string | null = null;
 let configExisted = false;
 
 const SANDBOX_ENV_KEYS = [
-  "ZAI_API_KEY", "ZAI_CODING_API_KEY", "GLM_API_KEY", "ZHIPU_API_KEY",
-  "GLM_CODING_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_CODING_API_KEY",
-  "OPENAI_API_KEY", "OPENAI_CODEX_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
-  "MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY", "LITELLM_API_KEY", "POE_API_KEY",
-  "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
-  "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
-  "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
+  "ZAI_API_KEY",
+  "ZAI_CODING_API_KEY",
+  "GLM_API_KEY",
+  "ZHIPU_API_KEY",
+  "GLM_CODING_API_KEY",
+  "MOONSHOT_API_KEY",
+  "KIMI_API_KEY",
+  "KIMI_CODING_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_CODEX_API_KEY",
+  "GEMINI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "MINIMAX_API_KEY",
+  "MINIMAX_CODING_API_KEY",
+  "LITELLM_API_KEY",
+  "POE_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "CLAUDE_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "CLAUDISH_NO_ANTHROPIC",
+  "CLAUDISH_FAILOVER_ACTIVE",
+  "CLAUDISH_PROXY_KEY",
+  "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
 ];
 const savedEnv: Record<string, string | undefined> = {};
@@ -167,9 +183,7 @@ describe("resolveProbeProxyKey (#930)", () => {
 
   test("U1b — config fallback when env absent; primary preferred over previous", () => {
     expect(resolveProbeProxyKey({}, { proxyKey: "config-key" })).toBe("config-key");
-    expect(
-      resolveProbeProxyKey({}, { proxyKeyPrevious: "only-prev" })
-    ).toBe("only-prev");
+    expect(resolveProbeProxyKey({}, { proxyKeyPrevious: "only-prev" })).toBe("only-prev");
     expect(resolveProbeProxyKey({}, {})).toBeUndefined();
   });
 });

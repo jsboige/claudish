@@ -34,9 +34,9 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { writeFile as realWriteFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeFile as realWriteFile } from "node:fs/promises";
 import {
   CAPTURE_PROBE_TTL_ENV,
   captureBindProbeRefreshingForTests,
@@ -80,11 +80,11 @@ async function truth(): Promise<string> {
 }
 
 describe("#291 capture bind-write probe (async refresh, CR #1057)", () => {
-  test("env unset ⇒ \"disabled\" (capture off BY CONFIG, not an incident)", () => {
+  test('env unset ⇒ "disabled" (capture off BY CONFIG, not an incident)', () => {
     expect(captureBindWriteVerdict()).toBe("disabled");
   });
 
-  test("writable dir: cold cache ⇒ unknown:probing (one refresh in flight), then \"ok\", file gone", async () => {
+  test('writable dir: cold cache ⇒ unknown:probing (one refresh in flight), then "ok", file gone', async () => {
     const dir = mkdtempSync(join(tmpdir(), "bind-probe-291-"));
     try {
       process.env.CLAUDISH_CAPTURE_DIR = dir;
@@ -105,7 +105,7 @@ describe("#291 capture bind-write probe (async refresh, CR #1057)", () => {
     }
   });
 
-  test("dir path occupied by a FILE ⇒ \"error:<code>\", never a throw", async () => {
+  test('dir path occupied by a FILE ⇒ "error:<code>", never a throw', async () => {
     const blocker = join(tmpdir(), `bind-probe-291-blocker-${process.pid}`);
     writeFileSync(blocker, "not a dir");
     try {
@@ -211,7 +211,7 @@ describe("#291 capture bind-write probe (async refresh, CR #1057)", () => {
 
   // CR #1057 trap — compose's `${VAR:-}` injects "": the read must treat ""
   // as unset (the DEFAULT TTL), never as Number("")===0 (re-probe storm).
-  test("TTL env = \"\" (the compose trap) ⇒ default TTL, not 0", async () => {
+  test('TTL env = "" (the compose trap) ⇒ default TTL, not 0', async () => {
     const dirA = mkdtempSync(join(tmpdir(), "bind-probe-291-empty-"));
     try {
       process.env[CAPTURE_PROBE_TTL_ENV] = "";
@@ -314,7 +314,7 @@ describe("#291 capture bind-write probe (async refresh, CR #1057)", () => {
   // `|| raw === ""` collapses the TTL to 0: the read goes stale, kicks a
   // refresh (refreshing latches true) and the key change answers
   // unknown:probing — red on BOTH asserts under that mutation.
-  test("\"\" TTL after a settled ok ⇒ cache served, NO refresh kicked (CR r2 N3)", async () => {
+  test('"" TTL after a settled ok ⇒ cache served, NO refresh kicked (CR r2 N3)', async () => {
     const dirA = mkdtempSync(join(tmpdir(), "bind-probe-291-empty2-"));
     try {
       process.env.CLAUDISH_CAPTURE_DIR = dirA;

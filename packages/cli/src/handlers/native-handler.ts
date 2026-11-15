@@ -1,13 +1,13 @@
 import type { Context } from "hono";
 import { credentials } from "../auth/credentials/authority.js";
+// #1055 g2 / #1060 — the harness-lane ledger twin of the session budget.
+import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
 // Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [resp] stdout
 // marker on the streaming branch, and a durable appendUpstreamError trace of
 // non-ok bodies — NativeHandler is the ONLY path for Anthropic-native traffic,
 // so without it a quota wall from api.anthropic.com left no durable trace.
 import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
-// #1055 g2 / #1060 — the harness-lane ledger twin of the session budget.
-import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
 import { requestHooksOf } from "../hooks/request-stage.js";
 import { log, maskCredential } from "../logger.js";
 import { redactForClient } from "../redact.js";
@@ -30,12 +30,12 @@ import {
 import { noteProxyKeyAuthentication } from "./shared/proxy-key-rotation.js";
 import { matchesProxyKey } from "./shared/proxy-keys.js";
 import { appendUpstreamError, createResponseCapture } from "./shared/response-capture.js";
-import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import {
   type UpstreamReaderSlot,
   cancelEndsUpstreamWork,
 } from "./shared/stream-parsers/upstream-cancel.js";
 import { stripUnsignedThinkingBlocks } from "./shared/thinking-signature.js";
+import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import type { ModelHandler } from "./types.js";
 
 /** One SSE line split into its field name and value (one leading space dropped), per the SSE spec. */

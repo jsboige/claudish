@@ -4,10 +4,10 @@
  * Run: bun test packages/cli/src/mcp-server.test.ts
  */
 
-import { describe, test, expect } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseAnthropicSse } from "./mcp-server.js";
 
 const __filename = fileURLToPath(import.meta.url);

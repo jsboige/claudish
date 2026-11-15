@@ -44,8 +44,8 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { log } from "../logger.js";
 import { wrapAnthropicError } from "../handlers/shared/anthropic-error.js";
+import { log } from "../logger.js";
 // #1055 CR N6 — the ONE sanitizer, shared with the g1 capture envelope so the
 // attribution key and the budget key cannot drift. Leading dot refused there.
 import { sanitizeHarnessLane } from "./middleware/request-logger.js";
@@ -239,8 +239,8 @@ export function laneStopRefusal(
         // client sent the header, it knows its own lane, and a hostile-enough
         // name ("credit-analyst-v1") would put a quota-class word in our own
         // 429 body (isQuotaExhaustion measured true on those echoes).
-        `[LaneStop] this lane is under an operator emergency stop — defer this ` +
-        `notebook and retry later (the stop is lifted when the operator removes the stop file)`,
+        "[LaneStop] this lane is under an operator emergency stop — defer this " +
+        "notebook and retry later (the stop is lifted when the operator removes the stop file)",
     };
   }
   return null;
@@ -288,7 +288,9 @@ export function admitLaneBudget(
       if (consumed - prefix < bar) break;
     }
     const retryAfterSec =
-      horizonTs > 0 ? Math.max(1, Math.ceil((LANE_BUDGET_WINDOW_MS - (now - horizonTs)) / 1000)) : 60;
+      horizonTs > 0
+        ? Math.max(1, Math.ceil((LANE_BUDGET_WINDOW_MS - (now - horizonTs)) / 1000))
+        : 60;
     log(
       // #1063 CR B1 — `consumed=` (equals sign), the spelling the lane report
       // reader pins; the two sides cannot drift again (emitter pin in

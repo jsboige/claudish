@@ -945,7 +945,6 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
   } catch {
     return false;
   }
-  return false;
 }
 
 /**
@@ -1201,7 +1200,7 @@ async function probeAttempt(
       if (isQuotaExhaustion(res.status, errBody)) {
         log(
           `[Relay] deep probe: upstream answered ${res.status} naming a quota/plan wall — ` +
-            `that IS liveness (it routed the request to answer), returning to NOMINAL ` +
+            "that IS liveness (it routed the request to answer), returning to NOMINAL " +
             `(model=${model}, attempt ${attemptNo}/2)`,
           true
         );
@@ -1259,7 +1258,11 @@ async function probeAttempt(
     // it must stay visible as such in the logs.
     const name = (e as { name?: string })?.name;
     if (name === "TimeoutError" || name === "AbortError") {
-      return { ok: false, reason: `timed out after ${timeoutMs}ms (${name})`, ms: Date.now() - startedAt };
+      return {
+        ok: false,
+        reason: `timed out after ${timeoutMs}ms (${name})`,
+        ms: Date.now() - startedAt,
+      };
     }
     return { ok: false, reason: String(e).slice(0, 200), ms: Date.now() - startedAt };
   }

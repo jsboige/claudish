@@ -13,6 +13,12 @@ import { VERTEX_SET_PROJECT_REMEDY } from "../auth/vertex-auth.js";
 import type { RemoteProvider } from "../handlers/shared/remote-provider-types.js";
 import type { ModelHandler } from "../handlers/types.js";
 import { getEndpoint as getConfigEndpoint } from "../profile-config.js";
+// #892 — the builtin providers' probe surface, authored ONCE. The watcher
+// (scripts/lib/claudish-model-version.psm1) reads this same JSON, so the base
+// URL a request is sent to and the base URL the watcher probes cannot drift.
+// Only providers listed here are wired from it; everything else keeps its
+// literal below.
+import PROBE_SURFACES from "./builtin-probe-surfaces.json";
 // Type-only import — erased at compile time, so no runtime import cycle with
 // model-discovery.ts (which imports getProviderByName from here).
 import type { ModelDiscoveryDescriptor } from "./model-discovery.js";
@@ -21,12 +27,6 @@ import type { ModelDiscoveryDescriptor } from "./model-discovery.js";
 // in provider-profiles.ts arrive only when `lazyHandler`'s thunk is invoked.
 import type { AsyncProviderProfile, ProfileContext, ProviderProfile } from "./provider-profiles.js";
 import { getRuntimeProviders } from "./runtime-providers.js";
-// #892 — the builtin providers' probe surface, authored ONCE. The watcher
-// (scripts/lib/claudish-model-version.psm1) reads this same JSON, so the base
-// URL a request is sent to and the base URL the watcher probes cannot drift.
-// Only providers listed here are wired from it; everything else keeps its
-// literal below.
-import PROBE_SURFACES from "./builtin-probe-surfaces.json";
 
 // ---------------------------------------------------------------------------
 // Types

@@ -28,13 +28,13 @@
  * (a774f817) + #610 (8bb52c70) + #651/#660 (caps block).
  */
 
-import { messageStartUsage } from "./stream-parsers/message-start-usage.js";
 import {
   type OverflowCapRecord,
   overflowCapsPath,
   readOverflowCapsFile,
   writeOverflowCapsFile,
 } from "./overflow-caps-store.js";
+import { messageStartUsage } from "./stream-parsers/message-start-usage.js";
 
 /**
  * #441/#442 — fixed token allocation charged for ONE image/document block

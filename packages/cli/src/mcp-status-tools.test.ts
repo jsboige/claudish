@@ -15,6 +15,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { armFailover, isBucketWalled, resetFailoverForTests } from "./fork/failover.js";
 import {
   claudishStatusHandler,
   renderCapabilities,
@@ -22,7 +23,6 @@ import {
   scrubForWire,
   scrubScalar,
 } from "./mcp-status-tools.js";
-import { armFailover, isBucketWalled, resetFailoverForTests } from "./fork/failover.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);

@@ -6,9 +6,9 @@
  */
 
 import * as fs from "node:fs";
+import type * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import type * as net from "node:net";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";

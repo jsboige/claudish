@@ -105,7 +105,6 @@ describe("#1019 synthetic message_start seeds, by behaviour", () => {
     expect(Number.isFinite(size)).toBe(true);
     expect(size).toBeGreaterThan(0);
   });
-
 });
 
 // ---------------------------------------------------------------------------

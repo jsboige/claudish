@@ -439,7 +439,8 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
       type: "error",
       error: {
         type: "rate_limit_error",
-        message: "[LaneBudget] lane daily output budget consumed 700 of 700 — defer this notebook; retry after 3600s",
+        message:
+          "[LaneBudget] lane daily output budget consumed 700 of 700 — defer this notebook; retry after 3600s",
       },
     });
     fetchImpl = async () =>
@@ -493,7 +494,8 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
       type: "error",
       error: {
         type: "rate_limit_error",
-        message: "[LaneBudget] lane daily output budget consumed 700 of 700 — defer this notebook; retry after 3600s",
+        message:
+          "[LaneBudget] lane daily output budget consumed 700 of 700 — defer this notebook; retry after 3600s",
       },
     });
     fetchImpl = async () =>

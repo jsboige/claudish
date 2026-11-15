@@ -2641,18 +2641,20 @@ export function buildFailoverNotice(
     // to the TARGET cascade; the names would come from the wrong list). A -1
     // index on a via-record is the TARGET role's NOMINAL (the synthesized #681
     // record), not a fallback rung.
-    const suffix = a.via && a.via !== a.role
-      ? stepIndex < 0
-        ? `the \`${a.via}\` nominal (context re-route #681)`
-        : `the ${ordinal(stepIndex)} fallback of the \`${a.via}\` cascade (context re-route #681)`
-      : `the ${ordinal(stepIndex)} fallback`;
-    const ahead = !a.via && stepIndex > 0
-      ? ` (${rules
-          .get(role)!
-          .steps.slice(0, stepIndex)
-          .map((s) => s.label)
-          .join(", ")} ahead of it ${stepIndex === 1 ? "is" : "are"} also exhausted)`
-      : "";
+    const suffix =
+      a.via && a.via !== a.role
+        ? stepIndex < 0
+          ? `the \`${a.via}\` nominal (context re-route #681)`
+          : `the ${ordinal(stepIndex)} fallback of the \`${a.via}\` cascade (context re-route #681)`
+        : `the ${ordinal(stepIndex)} fallback`;
+    const ahead =
+      !a.via && stepIndex > 0
+        ? ` (${rules
+            .get(role)!
+            .steps.slice(0, stepIndex)
+            .map((s) => s.label)
+            .join(", ")} ahead of it ${stepIndex === 1 ? "is" : "are"} also exhausted)`
+        : "";
     const bits = [
       `- \`${role}\` is being served by **${step.label}** (\`${step.target}\`) — ${suffix}${ahead}, ${DIRECTION_TEXT[step.direction]}.`,
     ];

@@ -67,7 +67,16 @@ const SESSION_TOOLS = [
 const TOOL_GROUPS: Array<{ value: string | undefined; names: string[] }> = [
   { value: undefined, names: ALL_TOOLS },
   { value: "all", names: ALL_TOOLS },
-  { value: "low-level", names: ["claudish_capabilities", "claudish_status", "list_models", "run_prompt", "search_models"] },
+  {
+    value: "low-level",
+    names: [
+      "claudish_capabilities",
+      "claudish_status",
+      "list_models",
+      "run_prompt",
+      "search_models",
+    ],
+  },
   { value: "agentic", names: ["preflight", "report_error", "team"] },
   { value: "session", names: SESSION_TOOLS },
   { value: "debug", names: ["compare_models"] },

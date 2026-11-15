@@ -31,10 +31,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { createProxyServer } from "./proxy-server.js";
 import { isQuotaExhaustion } from "./fork/failover.js";
 import { laneBudgetConsumed, resetLaneBudgetForTests } from "./fork/lane-budget.js";
 import { createRelayState } from "./fork/server/relay.js";
+import { createProxyServer } from "./proxy-server.js";
 import type { ProxyServer } from "./types.js";
 
 // Distinct range from the other in-process route tests (19907, 19917 is
@@ -51,17 +51,37 @@ let configBackup: string | null = null;
 let configExisted = false;
 
 const SANDBOX_ENV_KEYS = [
-  "ZAI_API_KEY", "ZAI_CODING_API_KEY", "GLM_API_KEY", "ZHIPU_API_KEY",
-  "GLM_CODING_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_CODING_API_KEY",
-  "OPENAI_API_KEY", "OPENAI_CODEX_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
-  "MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY", "LITELLM_API_KEY", "POE_API_KEY",
-  "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
-  "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE", "CLAUDISH_FAILOVER_SONNET",
-  "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
+  "ZAI_API_KEY",
+  "ZAI_CODING_API_KEY",
+  "GLM_API_KEY",
+  "ZHIPU_API_KEY",
+  "GLM_CODING_API_KEY",
+  "MOONSHOT_API_KEY",
+  "KIMI_API_KEY",
+  "KIMI_CODING_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_CODEX_API_KEY",
+  "GEMINI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "MINIMAX_API_KEY",
+  "MINIMAX_CODING_API_KEY",
+  "LITELLM_API_KEY",
+  "POE_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "CLAUDE_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "CLAUDISH_NO_ANTHROPIC",
+  "CLAUDISH_FAILOVER_ACTIVE",
+  "CLAUDISH_FAILOVER_SONNET",
+  "CLAUDISH_PROXY_KEY",
+  "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
-  "CLAUDISH_SESSION_BUDGET_CEILING", "CLAUDISH_SESSION_BUDGET_WARN",
-  "CLAUDISH_LANE_BUDGETS", "CLAUDISH_LANE_STOP_DIR",
-  "CLAUDISH_ENDPOINT_TOKEN_BUDGET_NOM_EP", "CLAUDISH_ENDPOINT_BIG_LIMIT_NOM_EP",
+  "CLAUDISH_SESSION_BUDGET_CEILING",
+  "CLAUDISH_SESSION_BUDGET_WARN",
+  "CLAUDISH_LANE_BUDGETS",
+  "CLAUDISH_LANE_STOP_DIR",
+  "CLAUDISH_ENDPOINT_TOKEN_BUDGET_NOM_EP",
+  "CLAUDISH_ENDPOINT_BIG_LIMIT_NOM_EP",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -75,7 +95,12 @@ let nmOverload = false;
 
 function usageSSE(completionTokens: number, promptTokens = 10): Response {
   const chunk = (obj: any) => `data: ${JSON.stringify(obj)}\n\n`;
-  const base = { id: "chatcmpl-fake", object: "chat.completion.chunk", created: 1, model: "fake-c" };
+  const base = {
+    id: "chatcmpl-fake",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "fake-c",
+  };
   const sse =
     chunk({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: "" } }] }) +
     chunk({ ...base, choices: [{ index: 0, delta: { content: "Hello." } }] }) +
@@ -106,12 +131,13 @@ const SONNET_NOMINAL = "nom-ep@fake-nom";
 /** Anthropic-wire SSE for the native lane stub — 400 output tokens. */
 function nativeUsageSSE(outputTokens = 400): Response {
   const enc = new TextEncoder();
-  const sse = [
-    `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_n", type: "message", role: "assistant", model: "claude-haiku-5-1", content: [], usage: { input_tokens: 5, output_tokens: 1 } } })}`,
-    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } as any)}`,
-    `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: outputTokens } } as any)}`,
-    `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
-  ].join("\n") + "\n\n";
+  const sse =
+    [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_n", type: "message", role: "assistant", model: "claude-haiku-5-1", content: [], usage: { input_tokens: 5, output_tokens: 1 } } })}`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } as any)}`,
+      `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: outputTokens } } as any)}`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+    ].join("\n") + "\n\n";
   return new Response(
     new ReadableStream<Uint8Array>({
       start(controller) {
@@ -155,7 +181,7 @@ async function postMessage(model: string, o: PostOpts = {}): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
     headers: {
-      "connection": "close",
+      connection: "close",
       "Content-Type": "application/json",
       "anthropic-version": "2023-06-01",
       ...(o.lane ? { "x-claudish-lane": o.lane } : {}),
@@ -323,25 +349,26 @@ describe("#1055 g2 — harness-lane budget + emergency stop wired through the ro
     process.env.CLAUDISH_LANE_BUDGETS = "nb-coder:700";
     process.env.ANTHROPIC_API_KEY = "test-key"; // #296 shape A: the native lane needs a credential (stub-intercepted)
     await spin({ haiku: "claude-haiku-5-1" }); // bare claude target ⇒ native lane + pin
-    const post = (session: string) => realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "connection": "close",
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "x-claudish-lane": "nb-coder",
-        // #296 shape A: the native lane needs the CLIENT's own Anthropic-shaped
-        // credential — never substituted, forwarded as-is (stub-intercepted).
-        "x-api-key": "sk-ant-api03-l4-route-pin",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-5",
-        max_tokens: 64,
-        stream: true,
-        metadata: { user_id: session },
-        messages: [{ role: "user", content: "say hi" }],
-      }),
-    });
+    const post = (session: string) =>
+      realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
+        method: "POST",
+        headers: {
+          connection: "close",
+          "Content-Type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "x-claudish-lane": "nb-coder",
+          // #296 shape A: the native lane needs the CLIENT's own Anthropic-shaped
+          // credential — never substituted, forwarded as-is (stub-intercepted).
+          "x-api-key": "sk-ant-api03-l4-route-pin",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-5",
+          max_tokens: 64,
+          stream: true,
+          metadata: { user_id: session },
+          messages: [{ role: "user", content: "say hi" }],
+        }),
+      });
 
     const r1 = await post("s1");
     expect(r1.status).toBe(200);
@@ -369,21 +396,22 @@ describe("#1055 g2 — harness-lane budget + emergency stop wired through the ro
     await spin();
     nmCompletion = 400;
 
-    const postChat = (session: string) => realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "connection": "close",
-        "Content-Type": "application/json",
-        "x-claudish-lane": "nb-coder",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-5",
-        max_tokens: 64,
-        stream: false,
-        user: session,
-        messages: [{ role: "user", content: "say hi" }],
-      }),
-    });
+    const postChat = (session: string) =>
+      realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          connection: "close",
+          "Content-Type": "application/json",
+          "x-claudish-lane": "nb-coder",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-5",
+          max_tokens: 64,
+          stream: false,
+          user: session,
+          messages: [{ role: "user", content: "say hi" }],
+        }),
+      });
 
     const r1 = await postChat("s1");
     expect(r1.status).toBe(200);
@@ -440,7 +468,7 @@ describe("#1055 g2 — harness-lane budget + emergency stop wired through the ro
       realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`, {
         method: "POST",
         headers: {
-          "connection": "close",
+          connection: "close",
           "Content-Type": "application/json",
           ...(lane ? { "x-claudish-lane": lane } : {}),
         },

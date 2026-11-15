@@ -143,7 +143,7 @@ async function postMessage(
   return realFetch(`${activeProxy!.url}${opts.path ?? "/v1/messages"}`, {
     method: "POST",
     headers: {
-      "connection": "close",
+      connection: "close",
       "Content-Type": "application/json",
       "anthropic-version": "2023-06-01",
       ...(machine ? { "X-Claudish-Machine": machine } : {}),

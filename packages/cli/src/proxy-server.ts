@@ -14,13 +14,6 @@ import {
   isCapabilityVocabEnabled,
   liftCapabilityDeclaration,
 } from "./fork/capability-vocabulary.js";
-// #641 G6 — fork extensions carried onto the branch: the per-session output-token
-// ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
-// are INERT without their env knobs, so their presence changes nothing on a
-// fleet that never opts in.
-// #291 / #1057 — /health publishes the verdict of an ACTUAL write+unlink into
-// CLAUDISH_CAPTURE_DIR (async-refreshed cache, never a sync write here).
-import { captureBindWriteVerdict } from "./handlers/shared/capture-bind-probe.js";
 import {
   ARM_TTL_MAX_MS,
   type DelegationOwner,
@@ -55,6 +48,14 @@ import {
   setRoleNominalResolver,
   stripServingNoticesFromRequestBody,
 } from "./fork/failover.js";
+// #1055 g2 — harness-lane budget admission, stop and ledger (fork module; all
+// paths inert without a lane header AND a configured bar).
+import {
+  admitLaneBudget,
+  laneBudgetRefusalAnthropic,
+  laneStopRefusal,
+  openLaneBudgetAttempt,
+} from "./fork/lane-budget.js";
 // Row 9 of the port map (#101): Claude Code's `cch=` per-turn hash opens the
 // system prompt, so a prefix-caching backend re-reads the whole prefix every
 // turn. transform.ts's stripBillingHeader already runs in step 1 of EVERY
@@ -92,14 +93,6 @@ import {
   openSessionBudgetAttempt,
   sessionBudgetRefusalAnthropic,
 } from "./fork/session-budget.js";
-// #1055 g2 — harness-lane budget admission, stop and ledger (fork module; all
-// paths inert without a lane header AND a configured bar).
-import {
-  admitLaneBudget,
-  laneBudgetRefusalAnthropic,
-  laneStopRefusal,
-  openLaneBudgetAttempt,
-} from "./fork/lane-budget.js";
 import {
   type AdvisorPresenceMonitor,
   createAdvisorPresenceMonitor,
@@ -136,6 +129,13 @@ import {
   createSigningSecrets,
   releaseWhenBodyEnds,
 } from "./handlers/shared/call-context.js";
+// #641 G6 — fork extensions carried onto the branch: the per-session output-token
+// ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
+// are INERT without their env knobs, so their presence changes nothing on a
+// fleet that never opts in.
+// #291 / #1057 — /health publishes the verdict of an ACTUAL write+unlink into
+// CLAUDISH_CAPTURE_DIR (async-refreshed cache, never a sync write here).
+import { captureBindWriteVerdict } from "./handlers/shared/capture-bind-probe.js";
 // #565 (port-map row 1) — the admission census and the recoverable-turn
 // constructors its refusal answers with. See handlers/shared/context-overflow.ts.
 import {
@@ -1764,9 +1764,10 @@ export async function createProxyServer(
       // #681: the nominal LANE label — the keyless refusal names it and the
       // #654 budget prefixes by it. Post-jump it is the target role's nominal,
       // never the origin mapping.
-      const nominalLane = cascadeRoleJumped && jumpNominal
-        ? jumpNominal
-        : resolveNominalTarget(requestedModel).target;
+      const nominalLane =
+        cascadeRoleJumped && jumpNominal
+          ? jumpNominal
+          : resolveNominalTarget(requestedModel).target;
       // #412: the guard below (and only it) reads the UNWRAPPED resolution —
       // withRequestHooks/withAdvisor sit outside getHandlerForRequest exactly
       // because `instanceof NativeHandler` must stay visible here (same
@@ -2082,7 +2083,12 @@ export async function createProxyServer(
         // in the `else` of `budgetSynthResponse` — a #654 budget-skipped
         // nominal NEVER reaches it, which is why the walk-site open is the
         // only ledger attach on that path (route L10 pins it).
-        openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
+        openLaneBudgetAttempt(
+          c.req.raw,
+          c.req.header("x-claudish-lane") ?? null,
+          requestedModel,
+          process.env
+        );
         response = await handler.handle(c, body);
         if (pinnedModel && !response.ok) body.model = modelBeforePin;
         if (servingNote && !response.ok) body.system = systemBeforeNote;
@@ -2306,7 +2312,12 @@ export async function createProxyServer(
                 // nominal never reaches it (pinned by route L10: without this
                 // open, a lane behind a saturated endpoint budget would spend
                 // through the walk with no ledger at all).
-                openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
+                openLaneBudgetAttempt(
+                  c.req.raw,
+                  c.req.header("x-claudish-lane") ?? null,
+                  requestedModel,
+                  process.env
+                );
                 const targetResp = await targetHandler.handle(c, body);
                 if (targetResp.ok) {
                   if (!target.step.roleRef) resetStepSuccess(walkRole, target.stepIndex);

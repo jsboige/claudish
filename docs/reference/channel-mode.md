@@ -94,26 +94,11 @@ claude --dangerously-load-development-channels plugin:code-analysis@magus
 
 The `--dangerously-load-development-channels` flag triggers a one-time confirmation prompt per session. To remove that prompt, the plugin would need to be added to Anthropic's curated channel allowlist (security review required) or to your org's `allowedChannelPlugins` managed setting.
 
-## Diagnostic tracing — `CLAUDISH_CHANNEL_TRACE=1`
+## Diagnostic tracing — not wired in this branch
 
-When the channel pipeline appears broken (e.g., client never renders `<channel>` blocks), set `CLAUDISH_CHANNEL_TRACE=1` before starting the MCP server. The diagnostics module (`packages/cli/src/channel/diagnostics.ts`) then emits `[channel-trace] …` lines to stderr at three checkpoints:
+`CLAUDISH_CHANNEL_TRACE` and `CLAUDISH_CHANNEL_TRACE_FILE` have **no effect** here. The diagnostics module that consumed them (`packages/cli/src/channel/diagnostics.ts`) and the three test-helper scripts it shipped with (`packages/cli/src/channel/test-helpers/`) are not part of this branch. Setting either variable is inert: it writes no file and emits no stderr lines.
 
-1. `fired sid=… type=… model=… elapsed=…s` — onStateChange callback entered (producer side fires)
-2. `callback returned sid=… type=…` — bridge invoked `server.notification()` without throwing
-3. `WIRE-OUT {…json…}` — the JSON-RPC frame literally hit stdout
-
-If you see (1) but not (2): the bridge is throwing or rejecting silently.
-If you see (1)+(2) but not (3): the SDK's transport is dropping the frame.
-If you see all three but the client doesn't render the notification: the issue is client-side — most often one of the gating conditions above is unmet.
-
-Off by default. Zero overhead in production.
-
-When the MCP server is spawned by a host that captures stderr (e.g. Claude Code), set `CLAUDISH_CHANNEL_TRACE_FILE=/path/to/log` alongside `CLAUDISH_CHANNEL_TRACE=1` to mirror trace lines to a file you can `tail` from outside the host process. The file is opened with `appendFileSync` so multiple sessions append safely.
-
-Three diagnostic scripts:
-- `packages/cli/src/channel/test-helpers/channel-diagnostic.ts` — drives the MCP server with raw JSON-RPC against the OpenRouter free model. Confirms the producer→bridge→wire pipeline.
-- `packages/cli/src/channel/test-helpers/client-diagnostic.ts` — spawns `claude -p` against the instrumented MCP server and compares what the server sent vs. what the client surfaced. Useful for diagnosing client-side gating.
-- `packages/cli/src/channel/test-helpers/claudish-mock.ts` — a standalone mock MCP server that exposes a single `start_mock_session` tool, then emits a scripted sequence of 6 channel notifications over ~9 seconds. Decouples channel-rendering tests from real-model behavior.
+An operator should therefore **not** read the absence of `[channel-trace]` output as evidence that the pipeline is healthy — the instrument is missing, not quiet. When the channel pipeline appears broken, diagnose it from the frames the server actually sends rather than from a trace that this branch cannot produce.
 
 ## Testing
 

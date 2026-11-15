@@ -1,8 +1,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import https from "node:https";
 import net from "node:net";
-import tls, { type SecureContext } from "node:tls";
 import type { Duplex } from "node:stream";
+import tls, { type SecureContext } from "node:tls";
 import type { CertificateManager } from "./certificate-manager";
 
 // Maximum SecureContext cache size to prevent memory exhaustion
@@ -16,11 +16,7 @@ export interface HTTPSProxyServerOptions {
 // Type for CONNECT handler callback. The https "connect" event emits a
 // stream.Duplex (a net.Socket in practice, but typed Duplex); accept Duplex so
 // the handler signature matches what the server actually hands over.
-export type ConnectHandler = (
-  req: IncomingMessage,
-  socket: Duplex,
-  head: Buffer
-) => void;
+export type ConnectHandler = (req: IncomingMessage, socket: Duplex, head: Buffer) => void;
 
 export class HTTPSProxyServer {
   private server: https.Server | null = null;

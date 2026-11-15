@@ -19,12 +19,17 @@ import { EFFORT_LEVELS, type EffortLevel, isEffortLevel } from "./adapters/base-
 import { searchCatalogModels } from "./adapters/model-catalog.js";
 import { prehydrateCredentialsForSpawn } from "./auth/credentials/prehydrate.js";
 import { setCredentialPromptRole } from "./auth/credentials/prompt-role.js";
+// SSE spec: the space after `data:` is optional — parseAnthropicSse reads both
+// forms through the shared helper (upstream 3dbd3167; pin re-added with this
+// file's suite, #1054 CR B5).
+import { sseDataPayload } from "./handlers/shared/stream-parsers/sse-line.js";
 import { loadHooksOnce } from "./hooks/index.js";
 import { type ProtocolStdout, isolateProtocolStdout } from "./hooks/output-capture.js";
 import { initLogger, log } from "./logger.js";
 import { SessionManager } from "./mcp-session/index.js";
 import { resolveSetupFrom } from "./mcp-session/inherited-settings.js";
 import { parentSessionForCall } from "./mcp-session/parent-session.js";
+import { claudishStatusHandler, renderCapabilities } from "./mcp-status-tools.js";
 import { NESTED_INSTRUCTIONS, NESTED_MCP_TOOL_NAMES } from "./mcp/nested-mode.js";
 import {
   type HeartbeatHandle,
@@ -43,10 +48,6 @@ import {
   getRecommendedModels,
   readLastRecommendedModels,
 } from "./model-loader.js";
-// SSE spec: the space after `data:` is optional — parseAnthropicSse reads both
-// forms through the shared helper (upstream 3dbd3167; pin re-added with this
-// file's suite, #1054 CR B5).
-import { sseDataPayload } from "./handlers/shared/stream-parsers/sse-line.js";
 // Imported for the predicate only. child-env's import-time bootstrap is a no-op here:
 // a claudish MCP server is never the pane child (it carries no CLAUDISH_PANE_CWD).
 import { inMcpSession } from "./pane/child-env.js";
@@ -66,9 +67,14 @@ import {
   sockRootFor,
 } from "./pane/index.js";
 import { findAvailablePort } from "./port-manager.js";
+import { getRunModelMapping, loadConfig } from "./profile-config.js";
 import { readAllModelsCache } from "./providers/all-models-cache.js";
 import { latestEffortRecommendations } from "./providers/effort-recommendations.js";
 import { ensureEndpointsRegistered } from "./providers/endpoint-registration.js";
+// Deliberately a SEPARATE file from the router's all-models.json (#1028): the
+// shapes differ (full OpenRouter rows here, v2 entries/coverage there), and the
+// old shared-file writes were clobbering each other.
+import { loadMcpModelsList } from "./providers/mcp-models-list.js";
 import { compareByReleaseDateDesc } from "./providers/model-ordering.js";
 import { isLocalProviderName, parseModelChain, parseModelSpec } from "./providers/model-parser.js";
 import { nativeRouteFor } from "./providers/native-route.js";
@@ -88,6 +94,7 @@ import {
   loadRoutingRules,
   matchRoutingRuleKey,
 } from "./providers/routing-rules.js";
+import { getDeclaredContextLimit, getDerivedContextLimit } from "./providers/runtime-providers.js";
 import { createProxyServer } from "./proxy-server.js";
 import { renderEffortTableMarkdown, renderRecommendedMarkdown } from "./recommended-listing.js";
 import { sanitizeForReport } from "./redact.js";
@@ -115,19 +122,9 @@ import {
   validateSessionPath,
 } from "./team-orchestrator.js";
 import type { ProxyServer } from "./types.js";
-import { getRunModelMapping, loadConfig } from "./profile-config.js";
 // `version.ts` is generated from packages/cli/package.json, so serverInfo names
 // the release the host is actually talking to.
 import { VERSION } from "./version.js";
-import {
-  getDeclaredContextLimit,
-  getDerivedContextLimit,
-} from "./providers/runtime-providers.js";
-import { claudishStatusHandler, renderCapabilities } from "./mcp-status-tools.js";
-// Deliberately a SEPARATE file from the router's all-models.json (#1028): the
-// shapes differ (full OpenRouter rows here, v2 entries/coverage there), and the
-// old shared-file writes were clobbering each other.
-import { loadMcpModelsList } from "./providers/mcp-models-list.js";
 
 // No `.env` load here. `index.ts` loads the working directory's `.env` through the
 // allowlist (dotenv-allowlist.ts) before it imports this module, and that is the only
@@ -140,7 +137,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-
 
 /** The server's `instructions`, which the host adds to its system prompt. */
 const INSTRUCTIONS = `Claudish MCP server gives you access to external AI models (OpenRouter, Ollama, LM Studio and every claudish provider), and to Claude models on the user's own Claude Code login.
@@ -234,7 +230,6 @@ interface ToolDefinition {
 }
 
 // ─── Helper Functions ────────────────────────────────────────────────────────
-
 
 // ─── Lazy Proxy Singleton ────────────────────────────────────────────────────
 // The proxy runs the same routing engine as the CLI: auto-route, fallback chains,
@@ -1515,7 +1510,10 @@ function defineTools(sessionManager: SessionManager, nested: boolean): ToolDefin
       } catch (error) {
         return {
           content: [
-            { type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` },
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
           ],
           isError: true,
         };
@@ -1545,14 +1543,22 @@ function defineTools(sessionManager: SessionManager, nested: boolean): ToolDefin
         const requested = (args.model as string | undefined) || mapping.sonnet || "unknown";
         // Split an explicit provider prefix (gc@, cx@, or@, …) from the model id.
         const provider = requested.includes("@") ? requested.split("@")[0] : undefined;
-        const bareModel = requested.includes("@") ? requested.slice(requested.indexOf("@") + 1) : requested;
+        const bareModel = requested.includes("@")
+          ? requested.slice(requested.indexOf("@") + 1)
+          : requested;
 
         // Catalog lookup (best-effort; absence = unknown, never a guess).
-        let catalog: { vision?: boolean; toolUse?: boolean; thinking?: boolean; context?: string | number } | null = null;
+        let catalog: {
+          vision?: boolean;
+          toolUse?: boolean;
+          thinking?: boolean;
+          context?: string | number;
+        } | null = null;
         try {
           const doc = await getRecommendedModels();
           const entry = (doc.models || []).find(
-            (m: { id?: string; name?: string }) => m.id === bareModel || m.name === bareModel || m.id === requested
+            (m: { id?: string; name?: string }) =>
+              m.id === bareModel || m.name === bareModel || m.id === requested
           );
           if (entry) {
             catalog = {
@@ -1579,7 +1585,10 @@ function defineTools(sessionManager: SessionManager, nested: boolean): ToolDefin
       } catch (error) {
         return {
           content: [
-            { type: "text" as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` },
+            {
+              type: "text" as const,
+              text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+            },
           ],
           isError: true,
         };

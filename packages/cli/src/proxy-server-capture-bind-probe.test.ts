@@ -21,12 +21,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createProxyServer } from "./proxy-server.js";
 import {
   CAPTURE_PROBE_TTL_ENV,
   captureBindProbeSettleForTests,
   resetCaptureBindProbeForTests,
 } from "./handlers/shared/capture-bind-probe.js";
+import { createProxyServer } from "./proxy-server.js";
 import type { ProxyServer } from "./types.js";
 
 // One allocation per file; the scan in test-support/port-allocation.test.ts
@@ -70,13 +70,21 @@ describe("#291 /health carries captureBindWrite", () => {
   // CR #1057 — async model: a COLD cache answers "unknown:probing" on the
   // first /health (never a guessed verdict, never a sync write on the path),
   // and the REAL verdict lands one probe later.
-  test("capture on, writable bind: cold ⇒ unknown:probing, real \"ok\" one probe later", async () => {
+  test('capture on, writable bind: cold ⇒ unknown:probing, real "ok" one probe later', async () => {
     const dir = mkdtempSync(join(tmpdir(), "route-291-"));
     scratch.push(dir);
     process.env.CLAUDISH_CAPTURE_DIR = dir;
-    activeProxy = await createProxyServer(PROXY_PORT, undefined, undefined, false, undefined, undefined, {
-      quiet: true,
-    });
+    activeProxy = await createProxyServer(
+      PROXY_PORT,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      {
+        quiet: true,
+      }
+    );
     const first = await health();
     expect(first.captureBindWrite).toBe("unknown:probing");
     await captureBindProbeSettleForTests();
@@ -84,7 +92,7 @@ describe("#291 /health carries captureBindWrite", () => {
     expect(second.captureBindWrite).toBe("ok");
   });
 
-  test("capture on, dead bind ⇒ \"error:<code>\" — and /health still 200", async () => {
+  test('capture on, dead bind ⇒ "error:<code>" — and /health still 200', async () => {
     // A FILE where the dir should be: deterministic ENOTDIR/ENOENT on every
     // platform, no ACL games. The point is not the code — it is that the
     // endpoint SURFACES the refusal instead of no-op'ing silently. Same
@@ -93,9 +101,17 @@ describe("#291 /health carries captureBindWrite", () => {
     writeFileSync(blocker, "not a dir");
     scratch.push(blocker);
     process.env.CLAUDISH_CAPTURE_DIR = blocker;
-    activeProxy = await createProxyServer(PROXY_PORT, undefined, undefined, false, undefined, undefined, {
-      quiet: true,
-    });
+    activeProxy = await createProxyServer(
+      PROXY_PORT,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      {
+        quiet: true,
+      }
+    );
     const first = await health();
     expect(first.captureBindWrite).toBe("unknown:probing");
     await captureBindProbeSettleForTests();

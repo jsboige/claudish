@@ -52,7 +52,7 @@
  *     (every capture writer names its files the same way).
  */
 
-import { writeFile, unlink } from "node:fs/promises";
+import { unlink, writeFile } from "node:fs/promises";
 
 const PROBE_FILE = ".bind-write-probe";
 const DEFAULT_TTL_MS = 30_000;
@@ -112,7 +112,9 @@ function probeTtlMs(): number {
 function errorTag(err: unknown): string {
   const code = (err as { code?: unknown } | null)?.code;
   if (typeof code === "string" && code) return code.slice(0, 64);
-  return String((err as Error)?.message ?? err).replace(/\s+/g, " ").slice(0, 64);
+  return String((err as Error)?.message ?? err)
+    .replace(/\s+/g, " ")
+    .slice(0, 64);
 }
 
 /** Test seam — drops the TTL cache so each test probes from a clean slate. */
