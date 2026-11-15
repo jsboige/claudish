@@ -11,6 +11,7 @@ import { join } from "node:path";
 import {
   admitLaneBudget,
   laneBudgetConsumed,
+  laneStopRefusal,
   openLaneBudgetAttempt,
   parseLaneBudgets,
   recordLaneBudgetOutput,
@@ -109,7 +110,10 @@ describe("lane-budget (#1055 g2)", () => {
     const stopDir = mkdtempSync(join(tmpdir(), "lane-stop-n2-"));
     try {
       writeFileSync(join(stopDir, "weekly-digest"), "");
-      const stopAdm = admitLaneBudget("weekly-digest", "credit-analyst-v1", ENV({
+      // CR3 B5: the stop check is route-side; the module pin calls
+      // `laneStopRefusal` directly — admitLaneBudget no longer re-checks the
+      // file (the unconditional pre-relay check refuses first everywhere).
+      const stopAdm = laneStopRefusal("weekly-digest", "credit-analyst-v1", ENV({
         CLAUDISH_LANE_STOP_DIR: stopDir,
       }));
       expect(stopAdm?.refused).toBe(true);
@@ -185,31 +189,38 @@ describe("lane-budget (#1055 g2)", () => {
     expect(admitLaneBudget("nb-coder", "m", env)).toBeNull();
   });
 
+  // CR3 B5: the stop check is route-side (`laneStopRefusal`); these module
+  // pins call it DIRECTLY — `admitLaneBudget` is the budget half only, and the
+  // unconditional pre-relay route check refuses first everywhere (route pins
+  // L2/L6/L7 cover the wiring; the "wins over an under-bar budget" ordering
+  // lives in the ROUTE's stop-above-admission placement, B4).
   it("emergency stop file: immediate typed refusal for THAT lane only", () => {
     const dir = mkdtempSync(join(tmpdir(), "lane-stop-"));
     try {
       const env = ENV({ CLAUDISH_LANE_STOP_DIR: dir });
       writeFileSync(join(dir, "nb-coder"), "");
-      const adm = admitLaneBudget("nb-coder", "nb-minimax", env);
+      const adm = laneStopRefusal("nb-coder", "nb-minimax", env);
       expect(adm?.refused).toBe(true);
       expect(adm?.type).toBe("stop");
       expect(isQuotaExhaustion(429, adm!.message)).toBe(false);
       // Lane isolation — the AC3 pin: other lanes untouched.
-      expect(admitLaneBudget("other-lane", "nb-minimax", env)).toBeNull();
+      expect(laneStopRefusal("other-lane", "nb-minimax", env)).toBeNull();
       // No stop dir configured → the file (if any) is irrelevant.
-      expect(admitLaneBudget("nb-coder", "nb-minimax", ENV())).toBeNull();
+      expect(laneStopRefusal("nb-coder", "nb-minimax", ENV())).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("the stop wins over an under-bar budget (checked first)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "lane-stop-"));
+  it("the stop refuses even when no budget is configured at all", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lane-stop-order-"));
     try {
       const env = ENV({ CLAUDISH_LANE_STOP_DIR: dir, CLAUDISH_LANE_BUDGETS: "nb-coder:100000" });
       writeFileSync(join(dir, "nb-coder"), "");
-      const adm = admitLaneBudget("nb-coder", "nb-minimax", env);
+      const adm = laneStopRefusal("nb-coder", "nb-minimax", env);
       expect(adm?.type).toBe("stop");
+      // And the budget half, on its own, has nothing to say under the bar.
+      expect(admitLaneBudget("nb-coder", "nb-minimax", env)).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

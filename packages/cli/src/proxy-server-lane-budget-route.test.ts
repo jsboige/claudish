@@ -15,10 +15,17 @@
  *  - CR B4: move the pre-relay stop check back BELOW the relay branch ⇒ L6/L7
  *    red (NOMINAL forward answers 200 FROM-THE-HUB with the stop file
  *    present, hub called);
- *  - CR B4 walk pin: re-key the walk-site attempt-open (:2351) on the SERVED
- *    step concrete instead of `requestedModel` ⇒ L9 red (consumed lands under
- *    the step's model, requested spelling reads 0); dropping the open
- *    outright ⇒ L9 red the same way.
+ *  - CR B4 walk pin: re-key the walk-site attempt-open on the SERVED step
+ *    concrete instead of `requestedModel` ⇒ L9 red (consumed lands under the
+ *    step's model, requested spelling reads 0).
+ *  - CR3 B5 (M-L9b): drop the walk-site open outright ⇒ L10 red. L9 stays
+ *    GREEN under that mutation — its nominal was actually called, so the
+ *    loop-site token catches the walk's usage. On the #654 budget-skip → walk
+ *    path (L10's shape) the loop-site open never runs (it lives in the `else`
+ *    of `budgetSynthResponse`), so the walk-site open is the ONLY ledger
+ *    attach: without it a lane behind a saturated endpoint budget would spend
+ *    through the walk with nothing booked (measured: consumed 0 while the
+ *    walk served 400).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -54,6 +61,7 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_CAPTURE_DIR",
   "CLAUDISH_SESSION_BUDGET_CEILING", "CLAUDISH_SESSION_BUDGET_WARN",
   "CLAUDISH_LANE_BUDGETS", "CLAUDISH_LANE_STOP_DIR",
+  "CLAUDISH_ENDPOINT_TOKEN_BUDGET_NOM_EP", "CLAUDISH_ENDPOINT_BIG_LIMIT_NOM_EP",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -494,6 +502,34 @@ describe("#1055 g2 — harness-lane budget + emergency stop wired through the ro
     expect(calls.walk ?? 0).toBe(1);
     expect(calls.nm ?? 0).toBeGreaterThanOrEqual(1); // the nominal overloaded first
     // THE pin: 400 output tokens under the admission's spelling.
+    expect(laneBudgetConsumed("nb-coder", "claude-sonnet-5")).toBe(400);
+    expect(laneBudgetConsumed("nb-coder", "fake-walk-model")).toBe(0);
+  }, 60_000);
+
+  // CR3 B5 — THE only-open pin. On the #654 nominal budget-skip path the
+  // endpoint token budget refuses the nominal BEFORE it is called, the loop
+  // synthesizes a 529 (budgetSynthResponse), and the loop-site attempt-open
+  // NEVER runs (it lives in the `else`). The #299-B walk then serves from the
+  // step — the walk-site open is the ONLY thing attaching a ledger token to
+  // the request. Without it (M-L9b: drop the walk-site open) this test reads
+  // consumed=0 while the walk served 400: a lane whose nominal sits behind a
+  // saturated endpoint budget — the vLLM shape #654 was built for — would
+  // spend without limit through the walk. L9 stays green under that mutation;
+  // THIS is the pin that goes red.
+  test("L10: #654 budget-skip → walk — the walk-site open is the ONLY ledger attach (CR3 B5)", async () => {
+    process.env.CLAUDISH_LANE_BUDGETS = "nb-coder:100000"; // armed so the ledger records; bar never crossed
+    process.env.CLAUDISH_FAILOVER_SONNET = "walk-ep@fake-walk-model"; // rule defined, NOT armed
+    // Any body exceeds a budget of 1 estimated token: the nominal is refused
+    // pre-call (#654 busy-skip), never fetched — nm stays at ZERO.
+    process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_NOM_EP = "1";
+    await spin();
+
+    const r1 = await postMessage("claude-sonnet-5", { lane: "nb-coder", session: "s1" });
+    expect(r1.status).toBe(200); // the walk served the turn
+    expect(calls.nm ?? 0).toBe(0); // THE budget-skip shape: nominal NEVER called
+    expect(calls.walk ?? 0).toBe(1);
+    // THE pin: 400 output tokens booked under the requested spelling — via
+    // the walk-site open alone (the loop-site open never ran).
     expect(laneBudgetConsumed("nb-coder", "claude-sonnet-5")).toBe(400);
     expect(laneBudgetConsumed("nb-coder", "fake-walk-model")).toBe(0);
   }, 60_000);

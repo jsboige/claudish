@@ -247,25 +247,22 @@ export function laneStopRefusal(
 }
 
 /**
- * Request admission. Call ONCE per request, BEFORE any handler resolution (a
- * refused request pays nothing upstream and writes no failover state).
- * Returns null when inert: no lane header, no bar for this (lane, model), and
- * no stop file — the pre-#1055 byte-identical path.
+ * BUDGET admission only. Call ONCE per request, BEFORE any handler resolution
+ * (a refused request pays nothing upstream and writes no failover state).
+ * Returns null when inert: no lane header, or no bar for this (lane, model) —
+ * the pre-#1055 byte-identical path.
  *
- * The stop half ALSO runs pre-relay on the routes (B4 above): on a sidecar the
- * pre-relay check refuses first; this call remains the hub's only stop check
- * (a hub has no relay branch) and is unreachable-but-consistent on a sidecar.
+ * CR3 B5: the STOP half lives route-side ONLY (`laneStopRefusal`, above the
+ * relay branch — B4). That pre-relay check is UNCONDITIONAL, so it refuses
+ * first on every ingress, hub included; this function no longer re-checks the
+ * stop file — the second `existsSync` per lane'd request bought no behavior
+ * (the module stop pins call `laneStopRefusal` directly).
  */
 export function admitLaneBudget(
   laneRaw: string | null,
   model: string,
   env: NodeJS.ProcessEnv
 ): LaneBudgetAdmission | null {
-  // Emergency stop FIRST: it refuses even when no budget is configured, and it
-  // must never be shadowed by an under-bar budget check.
-  const stop = laneStopRefusal(laneRaw, model, env);
-  if (stop) return stop;
-
   const lane = sanitizeLane(laneRaw);
   if (!lane) return null; // not a harness-lane request — instrument inert
 

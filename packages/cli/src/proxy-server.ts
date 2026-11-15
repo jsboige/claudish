@@ -1968,7 +1968,10 @@ export async function createProxyServer(
         // #218 native pin rewrites body.model to the pinned version BEFORE this
         // site, and the two spellings would split the ledger key: consumption
         // booked under `claude-haiku-5-1` while admission looks up `claude-haiku-5`
-        // (measured 200,200,200 against a bar of 700).
+        // (measured 200,200,200 against a bar of 700). CR3 B5: this open sits
+        // in the `else` of `budgetSynthResponse` — a #654 budget-skipped
+        // nominal NEVER reaches it, which is why the walk-site open is the
+        // only ledger attach on that path (route L10 pins it).
         openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
         // #747 (b): while a SUBSTITUTE serves, it learns its capability delta
         // from the request side — appended to the top-level `system` of every
@@ -2348,7 +2351,12 @@ export async function createProxyServer(
                 openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
                 // #1055 g2 — the walk feeds the lane ledger too. CR B1: keyed
                 // on `requestedModel` (the admission's spelling), same reason
-                // as the loop-site open above.
+                // as the loop-site open above. CR3 B5: on the #654 budget-skip
+                // → walk path this is the ONLY open — the loop-site open lives
+                // in the `else` of `budgetSynthResponse`, and a budget-skipped
+                // nominal never reaches it (pinned by route L10: without this
+                // open, a lane behind a saturated endpoint budget would spend
+                // through the walk with no ledger at all).
                 openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
                 const targetResp = await targetHandler.handle(c, body);
                 if (targetResp.ok) {
@@ -3272,7 +3280,9 @@ export async function createProxyServer(
       // bar). CR B4: the emergency-stop half runs ABOVE the relay branch (see
       // there); this site stays below because only the node that serves
       // counts tokens — on a NOMINAL sidecar the hub admits relayed traffic.
-      // On a hub (no relay branch) this call still covers both halves. Null
+      // CR3 B5: the stop is route-side ONLY — the pre-relay check above is
+      // unconditional, so it refuses FIRST on every ingress, hub included;
+      // this site is the budget half everywhere. Null
       // (zero work) for every request without an `x-claudish-lane` header —
       // the pre-#1055 path is byte-identical. Refusals are TYPED
       // (`x-claudish-lane-refusal`) so the harness defers the notebook

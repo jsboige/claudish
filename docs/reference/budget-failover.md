@@ -895,9 +895,16 @@ recreate carries values (#310); nothing ships armed.
 exactly after the lane inside the dir — the operator does not restart anything:
 
 ```powershell
-docker exec claudish-sidecar sh -c "touch /lane-stop/nb-coder"   # stop
+docker exec claudish-sidecar sh -c "touch /lane-stop/nb-coder"   # stop, one seat
+docker exec claudish-proxy  sh -c "touch /lane-stop/nb-coder"   # stop, the hub (every relayed lane)
 docker exec claudish-sidecar sh -c "rm /lane-stop/nb-coder"      # lift
 ```
+
+The file NAME is the lane exactly as the capture envelope or the daily report
+shows it — case-sensitive inside the container (Linux; on the NTFS host a
+`NB-CODER` file would match by filesystem case-insensitivity, inside the
+container it would not). The bar and the capture key are case-sensitive
+everywhere.
 
 The dir must be volume-mounted into the container at the path the env names
 (`docker-compose.yml` carries the env name but mounts nothing by default — a
@@ -913,13 +920,24 @@ and answered 200). The BUDGET admission sits BELOW the relay: only the node
 that serves counts tokens, and for relayed traffic that is the hub. In one
 sentence each — stop on a sidecar: that seat's lanes, both modes; stop on the
 hub: every relayed lane; budget: always the admitting node (hub in NOMINAL,
-the seat itself in AUTONOMOUS).
+the seat itself in AUTONOMOUS). Which LOG carries which REFUSE line (CR3 B5):
+**stop REFUSE — the node holding the stop file; budget REFUSE — the admitting
+node.** `admitLaneBudget` itself is budget-only (the redundant inner stop
+re-check was removed; the route check is unconditional and always first).
+
+**Ledger attach sites (CR3 B5, pinned by route L10):** the attempt-open runs
+at the loop site AND at the #299-B walk site. On the **#654 endpoint
+budget-skip → walk** path the loop-site open NEVER runs (it lives in the
+`else` of the synthesized 529), so the walk-site open is the ONLY thing
+attaching a ledger token — without it, a lane whose nominal sits behind a
+saturated endpoint budget spends through the walk with nothing booked
+(measured: consumed 0 while the walk served 400).
 
 **Two spellings of one lane entry are DELIBERATE (N4 decision):** the g2
 budget bar and the ledger key on the **admission model** — the client alias
 `body.model` as sent (`claude-sonnet-5`, pre-pin, pre-failover) — while the g3
 daily report's per-model table keys on the **served id** the upstream actually
-answered (`fake-nom`, the resolved concrete). The bar gates what the client
+answered (`MiniMax-M3.1-Flash`, the resolved concrete). The bar gates what the client
 asks for; the report explains what was paid. A report joined back to the bar
 must map alias→served through the route resolution, never by string equality.
 
