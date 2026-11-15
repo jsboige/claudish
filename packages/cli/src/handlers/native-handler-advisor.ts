@@ -460,7 +460,12 @@ function buildAdvisorRequest(
   const rawModelId = parsed.isExplicitProvider && provider !== "openrouter"
     ? `${provider}/${parsed.model}`
     : parsed.model;
-  const modelId = resolveModelNameSync("openrouter", rawModelId) ?? rawModelId;
+  // #1027 — `resolveModelNameSync(userInput, targetProvider)` returns a
+  // ModelResolutionResult, never null: the arguments were swapped and the
+  // object (not its id) went into the request body. `resolvedId` is the id,
+  // and it equals `rawModelId` on the passthrough paths (unknown model, cold
+  // catalogue), so it is the whole fallback too.
+  const modelId = resolveModelNameSync(rawModelId, "openrouter").resolvedId;
 
   return {
     url: "https://openrouter.ai/api/v1/chat/completions",
