@@ -1,10 +1,18 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseAdvisorFlag } from "../cli.js";
+import {
+  resetOpenRouterCatalogForTests,
+  setMemCatalogForTests,
+} from "../providers/catalog-resolvers/openrouter.js";
+import { installStubFetch } from "../test-support/stub-fetch.js";
 import {
   _debug_getTrackedAdvisorIds,
   _debug_resetTrackedAdvisorIds,
   convertToOpenAIMessages,
   extractBlocksAsText,
+  fetchMultiModelAdvice,
   findPendingAdvisorToolResults,
   loadAdvisorSwapConfig,
   recordAdvisorEventsFromChunk,
@@ -408,6 +416,100 @@ describe("extractBlocksAsText", () => {
     expect(extractBlocksAsText(null)).toBe("");
     expect(extractBlocksAsText(42)).toBe("");
     expect(extractBlocksAsText(undefined)).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1027 — the `model` field sent to OpenRouter is an id, not a resolution object
+// ---------------------------------------------------------------------------
+
+describe("OpenRouter request body — the model field is an id (#1027)", () => {
+  const originalCachePath = process.env.CLAUDISH_MODEL_CACHE_PATH;
+  const sentBodies: Array<{ model?: unknown }> = [];
+  let restoreFetch: (() => void) | null = null;
+
+  beforeEach(() => {
+    sentBodies.length = 0;
+    // Cold in-memory catalogue AND an unreadable disk cache: `_getEntries()`
+    // falls back to readAllModelsCache() whenever the memory catalogue is empty,
+    // and a warm disk cache would turn the "unknown id" pin into a catalogue hit.
+    resetOpenRouterCatalogForTests();
+    process.env.CLAUDISH_MODEL_CACHE_PATH = join(
+      tmpdir(),
+      `claudish-1027-absent-${Date.now()}`,
+      "all-models.json"
+    );
+    restoreFetch = installStubFetch(async (req) => {
+      sentBodies.push(JSON.parse(await req.text()));
+      return new Response(JSON.stringify({ choices: [{ message: { content: "advice" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+  });
+
+  afterEach(() => {
+    restoreFetch?.();
+    restoreFetch = null;
+    resetOpenRouterCatalogForTests();
+    if (originalCachePath === undefined) {
+      // Reflect.deleteProperty, not `delete`: same effect on process.env,
+      // without the noDelete diagnostic this file's baseline does not carry.
+      Reflect.deleteProperty(process.env, "CLAUDISH_MODEL_CACHE_PATH");
+    } else {
+      process.env.CLAUDISH_MODEL_CACHE_PATH = originalCachePath;
+    }
+  });
+
+  // `or@x-ai/grok-4`, not bare `x-ai/grok-4`: parseModelSpec auto-detects the
+  // `x-ai/*` native pattern and strips the vendor prefix (measured:
+  // `x-ai/grok-4` → {provider:"xai", model:"grok-4"}), so the bare form never
+  // reaches this branch with its prefix intact — that strip is line 460-462
+  // territory, explicitly out of scope for #1027. `or@` is the form that puts
+  // a vendor-prefixed id on the OpenRouter wire.
+  it("sends a vendor-prefixed id as that string, not as a resolution object", async () => {
+    await fetchMultiModelAdvice(
+      "toolu_1027a",
+      [{ role: "user", content: "hi" }],
+      ["or@x-ai/grok-4"],
+      null,
+      { openrouter: "sk-or-test" }
+    );
+    expect(sentBodies).toHaveLength(1);
+    expect(typeof sentBodies[0].model).toBe("string");
+    expect(sentBodies[0].model).toBe("x-ai/grok-4");
+  });
+
+  it("maps a bare id the catalogue knows to its OpenRouter external id", async () => {
+    setMemCatalogForTests([
+      {
+        modelId: "grok-4",
+        aliases: [],
+        sources: { "openrouter-api": { externalId: "x-ai/grok-4" } },
+      },
+    ]);
+    await fetchMultiModelAdvice(
+      "toolu_1027b",
+      [{ role: "user", content: "hi" }],
+      ["grok-4"],
+      null,
+      { openrouter: "sk-or-test" }
+    );
+    expect(sentBodies).toHaveLength(1);
+    expect(sentBodies[0].model).toBe("x-ai/grok-4");
+  });
+
+  it("sends an id the catalogue does not know unchanged, as a string", async () => {
+    await fetchMultiModelAdvice(
+      "toolu_1027c",
+      [{ role: "user", content: "hi" }],
+      ["unknown-vendor-model-1027"],
+      null,
+      { openrouter: "sk-or-test" }
+    );
+    expect(sentBodies).toHaveLength(1);
+    expect(typeof sentBodies[0].model).toBe("string");
+    expect(sentBodies[0].model).toBe("unknown-vendor-model-1027");
   });
 });
 
