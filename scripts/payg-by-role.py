@@ -48,6 +48,8 @@ Exit: 0 ok, 2 nothing in the window, an unreadable capture dir, or selftest fail
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -174,9 +176,9 @@ def scan(captures: str, since_ts: float, until_ts: float, max_pairs: int = 4000)
         # look alike" — is only kept if the unreadable one SAYS so. A traceback
         # reads as a broken instrument, and a broken instrument gets replaced by
         # a greppable lie.
-        raise SystemExit(print(f"capture dir unreadable: {captures} "
-                               f"({e.strerror or e}) — nothing was measured",
-                               file=sys.stderr) or 2)
+        print(f"capture dir unreadable: {captures} "
+              f"({e.strerror or e}) — nothing was measured", file=sys.stderr)
+        raise SystemExit(2)
     with entries:
         for entry in entries:
             name = entry.name
@@ -340,15 +342,29 @@ def selftest():
         past_pairs, _s = scan(d, as_of - 86400, as_of)
         if past_pairs:
             fails.append(f"--as-of moved nothing: {len(past_pairs)} pair(s) before the corpus")
+        # The refusal must reach the EXIT CONTRACT through main(): every pin
+        # above calls the helpers directly, so a main() that ignored args.as_of
+        # would leave them all green. argparse refuses on stderr; capture it so
+        # the selftest output stays readable.
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                main(["--captures", d, "--as-of", "2026-10-29T00:00:00"])
+            fails.append("main() accepted a timezone-less --as-of (no SystemExit)")
+        except SystemExit as e:
+            if e.code != 2:
+                fails.append(f"refused --as-of exited {e.code}, the contract says 2")
+            if "has no timezone" not in err.getvalue():
+                fails.append("refused --as-of said nothing on stderr")
 
         if fails:
             print("SELFTEST FAIL")
             for f in fails:
                 print("  -", f)
             return 2
-        print("SELFTEST OK — 10 pins (2 pairs, 1 unmatched, trap #48, alias, "
+        print("SELFTEST OK — 11 pins (2 pairs, 1 unmatched, trap #48, alias, "
               "condensation, z-ai_glm prefix, as-of window end, as-of tz refusal, "
-              "as-of before corpus)")
+              "as-of before corpus, as-of refusal through main)")
         return 0
 
 
@@ -376,7 +392,13 @@ def main(argv=None):
             print(f"{k:28} {PLAN[k]}")
         return 0
 
-    now = resolve_as_of(args.as_of) if args.as_of else time.time()
+    try:
+        now = resolve_as_of(args.as_of) if args.as_of else time.time()
+    except ValueError as e:
+        # argparse's own refusal: usage and message on stderr, exit 2. The
+        # docstring promises 2 for a refused window, and a traceback reads as
+        # a broken instrument (the same reasoning as the unreadable dir).
+        ap.error(str(e))
     since = now - args.hours * 3600
     pairs, stats = scan(args.captures, since, now, max_pairs=args.max_pairs)
     if not pairs:
