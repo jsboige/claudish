@@ -98,6 +98,8 @@ async function probeAfterShutdown(
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health`, {
       signal: AbortSignal.timeout(1500),
+      // CR 15/11 — no keep-alive socket left in bun's pool by the probe itself.
+      headers: { connection: "close" },
     });
     let answererUptime: number | null = null;
     let bodyText = "";
@@ -117,8 +119,11 @@ async function probeAfterShutdown(
       // fall inside the band — this probe cannot attribute them, and the
       // message says exactly that instead of guessing.
       const sameAge = Math.abs(answererUptime - expectedOwnUptime) <= 1.5;
+      // In-band is NOT an attribution (CR 15/11: Mutation B0 — a second server
+      // born right after the stop answered in-band and was named "the server
+      // under test"). Say what the probe knows: same age, two possible owners.
       diagnosis = sameAge
-        ? `the server under test still answers /health (uptimeSec=${answererUptime}, own clock would read ≈${expectedOwnUptime.toFixed(1)}s) — its listener survived shutdown()`
+        ? `same age as the server under test (uptimeSec=${answererUptime}, own clock would read ≈${expectedOwnUptime.toFixed(1)}s, ±1.5 s) — either its listener survived shutdown(), or another listener was born within 1.5 s of it; this probe cannot tell those apart`
         : `ANOTHER claudish listener answers /health (uptimeSec=${answererUptime}, this server's clock would read ≈${expectedOwnUptime.toFixed(1)}s) — not the server under test`;
     } else if (answererUptime !== null) {
       diagnosis = `a claudish listener answers /health (uptimeSec=${answererUptime}), but this server's own uptime was not read before the stop — who answered is NOT attributable by this probe`;
@@ -318,6 +323,8 @@ describe("#630 shutdown waits only for consumable work", () => {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/health`, {
         signal: AbortSignal.timeout(1500),
+        // CR 15/11 — the pre-probe must not leave a pooled socket behind.
+        headers: { connection: "close" },
       });
       uptimeBefore = ((await res.json()) as { uptimeSec?: number }).uptimeSec ?? null;
       uptimeReadAt = Date.now();
