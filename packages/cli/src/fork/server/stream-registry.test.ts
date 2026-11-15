@@ -388,10 +388,20 @@ describe("idle-then-busy is not a stall (#1064)", () => {
     expect(tracker.getPendingRequests()).toBe(1);
     // This is the false 503 the relays read on an idle-then-busy seat.
     expect(tracker.isStalled(180_000)).toBe(false);
+    // The stamp's VALUE, not just its effect: the clock is frozen here, so the
+    // admission stamp must read as zero elapsed. Mutation (d) — stamping
+    // `Date.now() - 100_000` inside the guard — leaves every boolean assertion
+    // above green (100s is under the threshold) yet turns this red: without
+    // the value pin, a seat whose first request takes 80s to its first byte
+    // would answer 503 again.
+    expect(tracker.getMsSinceProgress()).toBe(0);
 
-    // But a request that then never moves for the threshold IS a stall — the
-    // stamp is a fresh start, not an exemption.
-    clock += 181_000;
+    // The budget is measured from the ADMISSION, not from the idle gap: 179s
+    // after admission is still inside it, only the full threshold past it is
+    // a stall — the stamp is a fresh start, not an exemption.
+    clock += 179_000;
+    expect(tracker.isStalled(180_000)).toBe(false);
+    clock += 2_000;
     expect(tracker.isStalled(180_000)).toBe(true);
   });
 

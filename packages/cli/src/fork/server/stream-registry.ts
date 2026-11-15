@@ -62,7 +62,11 @@
  * wrapper — the middleware is still sitting in `next()` — yet they are exactly
  * the ones an operator would call "hung". So pending requests are counted from
  * entry, and progress is stamped on every byte, every stream end, and every
- * completed response.
+ * completed response — and at the ADMISSION of a request onto a fully idle
+ * proxy (#1064), where the preceding silence was not silence on in-flight
+ * work: there was none. That admission stamp is guarded by both counters
+ * being zero before the increment, so a request admitted behind a stuck one
+ * does not refresh it and a wedged proxy stays readable as wedged.
  *
  * `/health` itself is excluded from both. Each sidecar polls it every 10s, so
  * counting it as progress would refresh the stamp forever and leave the detector
