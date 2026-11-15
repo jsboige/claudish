@@ -253,6 +253,57 @@ def test_pool_equivalence_refused_verdict():
     assert "Non appariees : natives=1 opus=1" in out, out
 
 
+def test_lane_axis_basename_only():
+    """#1055 item 2 — l'axe lane : basename du cwd, JAMAIS le chemin.
+
+    Le constat fondateur (coordinateur, 15/11) : 9 des 67 Opus du siege
+    viennent de CoursIA/CoursIA-2, lus dans le cwd des corps. L'axe rend
+    cela une colonne du verdict — pour la machine HOME aussi, pas seulement
+    hors home (les 9 l'etaient). Le parsing porte les trois pieges
+    (suffixe `(was ...)`, antislash avant le `\\n`, dernier marqueur
+    gagne) ; un corps sans preambule CC tombe dans (non-cc), un corps
+    illisible reste visible. Arbitrage : basename seulement — un chemin
+    est prive, un nom est un axe.
+    """
+    d = tempfile.mkdtemp(prefix="leak-lane-")
+    _anchor(d)
+    # home Opus : un marqueur plus ancien cite AVANT (dernier gagne),
+    # suffixe (was ...), antislash litteral — les trois pieges d'un coup.
+    # HOME par defaut = myia-ai-01 : po-2024 est la machine hors home ici.
+    _req(d, 1, 60, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"system": [{"type": "text", "text":
+               "Primary working directory: c:\\\\old\\\\place\\nquoted stuff\\n"
+               "Primary working directory: d:\\\\Dev\\\\CoursIA-2 (was c:\\dev\\\\CoursIA-2)"}],
+               "messages": []})
+    _resp(d, 1, 70, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 60)
+    # meme machine, corps sans preambule CC -> seau (non-cc), pas un gap
+    _req(d, 1, 61, "2026-11-09T06-05-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"system": [{"type": "text", "text": "Tu es Hermes"}], "messages": []})
+    _resp(d, 1, 71, "2026-11-09T06-05-03-000Z", "claude-opus-5-5", 61)
+    # machine HOME (defaut --opus-home myia-ai-01) : l'axe lane seul, le
+    # detail sub/dev/heures reste reserve aux hors home
+    _req(d, 1, 62, "2026-11-09T06-10-00-000Z", "myia-ai-01",
+         body={"system": [{"type": "text", "text":
+               "Primary working directory: d:\\\\Dev\\\\Argumentum"}], "messages": []})
+    _resp(d, 1, 72, "2026-11-09T06-10-04-000Z", "claude-opus-5-5", 62)
+    # un natif non-Opus ne paie pas de lecture de corps : pas d'axe pour lui
+    _req(d, 1, 63, "2026-11-09T06-15-00-000Z", "myia-po-2024", model="claude-sonnet-5-5")
+    _resp(d, 1, 73, "2026-11-09T06-15-02-000Z", "claude-sonnet-5-5", 63)
+    code, out = _run(d, "--since", "2026-11-09T00")
+    assert code == 0, out
+    po = _row(out, "myia-po-2024")
+    assert po.split()[1:3] == ["3", "2"], f"po-2024 natives/opus wrong: {po}\n{out}"
+    assert "lanes=coursia-2:1 (non-cc):1" in po, f"lane axis wrong off-home: {po}"
+    assert "sub=0/2" in po and "dev=0b9b0d8c:2" in po, f"off-home detail lost: {po}"
+    ai = _row(out, "myia-ai-01")
+    assert "lanes=argumentum:1" in ai, f"lane axis wrong on home row: {ai}"
+    assert "sub=" not in ai, f"home row must not carry off-home detail: {ai}"
+    # LE CHEMIN NE SORT JAMAIS (arbitrage coordinateur 15/11) : ni le
+    # dossier parent, ni l'unite, ni le marqueur plus ancien
+    for forbidden in ("Dev", "d:", "place", "old"):
+        assert forbidden not in out, f"path fragment {forbidden!r} leaked:\n{out}"
+
+
 def test_full_mode_and_leak_policy_agree_on_sub():
     """#1051 — le meme corpus, les deux chemins, le MEME compte.
 
