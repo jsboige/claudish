@@ -47,7 +47,7 @@ session length) is.**
   prefer action over planning.` Low token cost, 100 % presence — a constant that ties the
   turns together, not a cost lever.
 - **C. A misfiring guard becomes the next turn's input.** Verbatim: `PreToolUse:Bash hook
-  error: [node "D:\dev\roo-extensions\scripts\hooks\guard-bash-composite.js"]:
+  error: [node "<roo-extensions>\scripts\hooks\guard-bash-composite.js"]:
   guard-bash-composite (#4243) : commande composee cd + rm sur un chemin …` — a guard that
   blocks in error pays for a whole turn.
 - **D. Coordination and machine state get dumped into the input.** A `ls -la` listing, a PDF

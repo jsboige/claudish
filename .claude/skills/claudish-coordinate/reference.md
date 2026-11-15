@@ -381,7 +381,7 @@ leak-policy ne dépend plus d'un rapport de po-2025. Deux chemins, **lecture seu
 | chemin | contenu | usage |
 |---|---|---|
 | `\\192.168.0.50\d$\claudish-captures` | captures **vivantes** du hub | verdict du jour |
-| `G:\Mon Drive\Backups-Cloud\claudish\captures-YYYY-MM-DD.7z` | 93 jours d'archives nocturnes | historique, comparaisons |
+| `<gdrive>\Backups-Cloud\claudish\captures-YYYY-MM-DD.7z` | 93 jours d'archives nocturnes | historique, comparaisons |
 
 ⚠️ **Le discriminant « facturé Anthropic » est le backend qui a SERVI, pas le modèle demandé.**
 `resp-*-native-*.sse` = api.anthropic.com ; tout le reste est du forfait. Un `claude-sonnet-5`
@@ -434,14 +434,14 @@ Opus est **cantonné aux 5 lanes coordinatrices d'ai-01** :
 
 | lane | raison |
 |---|---|
-| `d--CoursIA` | projet flagship |
-| `d--roo-extensions` | le harnais |
-| `d--2025-Epita-Intelligence-Symbolique` | doit lander bientôt, se distille dans CoursIA puis passe le relais |
-| `d--Argumentum` | pré-release qui s'éternise |
+| `CoursIA` | projet flagship |
+| `roo-extensions` | le harnais |
+| `2025-Epita-Intelligence-Symbolique` | doit lander bientôt, se distille dans CoursIA puis passe le relais |
+| `Argumentum` | pré-release qui s'éternise |
 | `d--claudish` | coordination (ce workspace) |
 
-**Lanes promues par le user (autorisées, à compter mais pas à signaler)** : `g--Mon-Drive-Maintenance`
-sur ai-01 (08/09, SAV du matin) · **`D:\Dev\CoursIA-3` sur po-2024** (04/10, registre #44 : « Oui
+**Lanes promues par le user (autorisées, à compter mais pas à signaler)** : `Maintenance`
+sur ai-01 (08/09, SAV du matin) · **`CoursIA-3` sur po-2024** (04/10, registre #44 : « Oui
 elle a le droit »). Cette dernière est la première lane Opus **hors ai-01**. Son identifiant de poste paie,
 sur le même forfait hebdomadaire. Signature : `machine=myia-po-2024`, `device_id8=0b9b0d8c`. Le détail
 est dans la memory `opus-spend-policy-five-lanes`.
@@ -500,7 +500,7 @@ cycle sur l'autre. Le vrai correctif est le **routage intelligent déjà spécif
 au LLM sur les capacités nécessaires avant chaque condensation, puis switch — à implémenter *quand
 on sera prêt*, pas maintenant.
 
-Cas fondateur : lane `d--qdrant`, 31/08 — 0 Opus du 29/08 au 31/08 08h, puis 100 % Opus à 09h, 11h
+Cas fondateur : lane `qdrant`, 31/08 — 0 Opus du 29/08 au 31/08 08h, puis 100 % Opus à 09h, 11h
 et 17h (31 req dédup, 1,5 % du jour). Session interactive, 0 `agent-*`.
 
 **Leak-policy Anthropic** (Opus / Fable / Sonnet) : `ai-01` = `[OK]` · `po-2025` = `[REVIEW]`, workflow Safari/agent-sdk possiblement autorisé → **demander au user avant de parler de fuite** · toute autre machine = `[LEAK]`. La signature d'une vraie fuite est `cc_is_subagent=true`, qui vit **dans le corps de la requête**, pas dans stdout : `docker logs` seul ne peut pas la voir.
@@ -583,7 +583,7 @@ Pour chaque décision pendante, donner assez de contexte pour trancher **sans ou
 **Arbitrage user du 07/09 (~16:00 locale), après l'incident hub po-2025** (flotte à l'arrêt par bind EISDIR, puis cascades vidées par un `up -d` de réparation) : le coordinateur **valide ex-ante tout geste infra/trafic du workspace**, urgence exceptée (validée ex-post). La règle lie toutes les machines, coordinateur compris.
 
 - **Gate ex-ante** : tout geste (recreate/restart de conteneur, `.env`/config, cutover/routage, onboarding provider, probe consommant du budget) = `[PROPOSAL]` dashboard AVANT exécution (objectif, commandes exactes, rayon d'impact, rollback, état vérifiable attendu) → attendre mon `[ACK]`. **Chaque cycle : scanner les `[PROPOSAL]` en attente et trancher** — un ACK tardif de 6h bloque un pair, dire « ACK sous réserve de X » quand le geste est sain mais incomplet.
-- **Le scan lit le primaire, pas l'export (12/11)** : les écritures du dashboard vont au primaire PG et rendent `gdriveSkipped: true`. Le fichier `G:/Mon Drive/Synchronisation/RooSync/.shared-state/dashboards/workspace-claudish.md` n'est qu'un export. Mesure du 12/11 à 16:20Z : son mtime était 16:00:05Z et son dernier message 15:59:54Z, alors que mes deux appends de 16:1xZ (`[ACK]` à po-2023, `[REPLY]`) étaient déjà acquis côté PG. Un grep sur ce fichier peut donc manquer les `[PROPOSAL]` les plus récents. Le scan passe par `roosync_dashboard(action:"read", type:"workspace", section:"all")` et par l'inbox, puisqu'un `[PROPOSAL]` peut aussi arriver en DM (po-2023, 12/11 10:19Z, ACKé à 16:10Z au cycle suivant). Une seule mesure : la cadence de l'export n'est pas établie.
+- **Le scan lit le primaire, pas l'export (12/11)** : les écritures du dashboard vont au primaire PG et rendent `gdriveSkipped: true`. Le fichier `<gdrive>/Synchronisation/RooSync/.shared-state/dashboards/workspace-claudish.md` n'est qu'un export. Mesure du 12/11 à 16:20Z : son mtime était 16:00:05Z et son dernier message 15:59:54Z, alors que mes deux appends de 16:1xZ (`[ACK]` à po-2023, `[REPLY]`) étaient déjà acquis côté PG. Un grep sur ce fichier peut donc manquer les `[PROPOSAL]` les plus récents. Le scan passe par `roosync_dashboard(action:"read", type:"workspace", section:"all")` et par l'inbox, puisqu'un `[PROPOSAL]` peut aussi arriver en DM (po-2023, 12/11 10:19Z, ACKé à 16:10Z au cycle suivant). Une seule mesure : la cadence de l'export n'est pas établie.
 - **Un seul `[ACK]` suffit** (arbitrage user 23/09, registre #23) : l'`[ACK]` du `[PROPOSAL]` vaut autorisation d'exécution. Le plan d'exécution du worker reste **obligatoire comme artefact** (posté avant le geste, commandes exactes, vérifs par consommateur) mais **n'attend pas un second ACK** — avec une cadence coordinateur de 5 h, ce second ACK coûtait jusqu'à 5 h pour une protection que le premier donne déjà. Précédent : 18/09, plan posté 22:55Z, exécuté 23:03Z, résultat vérifié bon. Ce qui reste exigé, c'est la **validation ex-post** ci-dessous : le geste se juge sur ses preuves, pas sur un second tampon.
 - **Infra d'un autre workspace : on demande, on n'applique pas** (arbitrage user 23/09, registre #26/#22) : un `.env`, un `compose` ou un conteneur d'infra partagée ne se modifie que depuis le workspace qui le porte ; une autre lane **demande** sur le dashboard du propriétaire. **Exception urgence** (flotte à l'arrêt) : agir, puis poster **un message d'excuse et d'explication sur le dashboard du workspace propriétaire**, dans le même cycle. La règle lie aussi claudish envers les autres lanes. Précédents : 17/09 (CoursIA-2) et 19/09 (roo-extensions), deux recreate du hub claudish, 4 h 40 de hub dans le mauvais rôle la seconde fois.
 - **Urgence** : flotte à l'arrêt / tours perdus → agir d'abord, `[INCIDENT]` + post-mortem avec preuves ≤ 1h, validation ex-post. Le post-mortem hub du 07/09 14:01Z (chaîne racine vérifiée, pièges, état vérifié) est le format de référence.
