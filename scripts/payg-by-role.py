@@ -137,11 +137,16 @@ def plan_of(model: str) -> str:
     # family fallbacks, deliberately narrow
     if model.startswith("glm-") or model.startswith("zai-glm-"):
         return "prepaid"
-    # The z.ai wire spells the same family `z-ai_glm-*` (measured 13/11 in the
-    # 24 h capture: 6 responses served as `z-ai_glm-4.5-air` and read UNKNOWN
-    # because neither prefix above matches). Same provider, same plan.
+    # `z-ai_glm-*` is the OpenRouter CATALOGUE spelling (`z-ai/glm-4.5-air`,
+    # `/` flattened to `_` in capture filenames), not the z.ai forfait lane.
+    # Measured on the wire 14/11 (review c.6891755835): the client sends bare
+    # `glm-4.5-air`, the hub's vendor-prefix resolution maps it to the
+    # OpenRouter entry, and the response is served `z-ai_glm-4.5-air` with
+    # parser=openai (req-1-18737-2026-11-14T15-20-21-500Z-direct.json, an RSM
+    # condensation checkpoint). OpenRouter bills per token: PAYG. The bare
+    # `glm-4.5-air` above stays prepaid — that spelling is the z.ai direct lane.
     if model.startswith("z-ai_glm-"):
-        return "prepaid"
+        return "payg"
     if model.startswith("MiniMax-"):
         return "prepaid"
     return "unknown"
@@ -325,9 +330,11 @@ def selftest():
             fails.append("qwen prepaid alias classified as PAYG")
         if plan_of("deepseek-v4-flash") != "payg":
             fails.append("condensation model not classified as PAYG")
-        # the z.ai wire's vendor-prefixed spelling of a GLM model
-        if plan_of("z-ai_glm-4.5-air") != "prepaid":
-            fails.append("z-ai_glm-* served name read UNKNOWN (a forfait left invisible)")
+        # z-ai_glm-* = the OpenRouter catalogue spelling, measured 14/11:
+        # per-token money. Misreading it prepaid would hide a metered leak —
+        # the exact blindness the unknown bucket exists to prevent.
+        if plan_of("z-ai_glm-4.5-air") != "payg":
+            fails.append("z-ai_glm-* served name read prepaid (an OpenRouter PAYG left invisible)")
 
         # --as-of: the window END must move, and the two timestamp spellings
         # (capture filenames vs ISO-8601 on the command line) must agree.
