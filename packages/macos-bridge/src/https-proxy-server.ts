@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import https from "node:https";
+import net from "node:net";
 import tls, { type SecureContext } from "node:tls";
 import type { Duplex } from "node:stream";
 import type { CertificateManager } from "./certificate-manager";
