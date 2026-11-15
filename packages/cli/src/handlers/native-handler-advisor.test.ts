@@ -1,11 +1,33 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAdvisorFlag } from "../cli.js";
 import {
+  OpenRouterCatalogResolver,
   resetOpenRouterCatalogForTests,
   setMemCatalogForTests,
 } from "../providers/catalog-resolvers/openrouter.js";
+
+// `launcher/catalog-warm.test.ts` installs `mock.module()` on
+// `model-catalog-resolver.js` (to fake `getResolver`), and bun overrides are
+// process-global with no undo — the suite runs every file in ONE process, and
+// `launcher/` is loaded before `handlers/`. Left alone, the resolver seen here
+// is that stub, whose `resolveSync` always returns null, so a seeded catalogue
+// entry never reaches the wire (measured on CI 15/11: this file's pin received
+// the bare id unchanged; reproduced locally with
+// `bun test ./src/launcher/catalog-warm.test.ts ./src/handlers/native-handler-advisor.test.ts`).
+// Mock again, with the REAL resolver class: openrouter resolves for real, every
+// other provider keeps returning null exactly as the leaked stub did.
+mock.module("../providers/model-catalog-resolver.js", () => {
+  let real: OpenRouterCatalogResolver | null = null;
+  return {
+    getResolver: (provider: string) => {
+      if (provider !== "openrouter") return null;
+      real ??= new OpenRouterCatalogResolver();
+      return real;
+    },
+  };
+});
 import { installStubFetch } from "../test-support/stub-fetch.js";
 import {
   _debug_getTrackedAdvisorIds,

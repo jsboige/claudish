@@ -58,6 +58,12 @@ mock.module("../providers/model-catalog-resolver.js", () => ({
   },
 }));
 
+// `mock.module()` overrides are process-global and bun offers no way to undo
+// one (measured 15/11: mock.restore(), the re-import idiom, and an empty
+// factory all leave the override in place). A later file that needs the REAL
+// module must therefore re-mock it itself — see the neutraliser in
+// handlers/native-handler-advisor.test.ts (#1027).
+
 // Now import the module under test. The two mocks above are wired in.
 import {
   shouldWarmCatalog,
