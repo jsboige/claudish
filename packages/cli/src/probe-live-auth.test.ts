@@ -37,9 +37,10 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { ALL_MODELS_CACHE_PATH } from "./providers/all-models-cache.js";
 import { probeLink, resolveProbeProxyKey } from "./providers/probe-live.js";
 import { createProxyServer } from "./proxy-server.js";
 import type { ProxyServer } from "./types.js";
@@ -55,6 +56,15 @@ const CONFIG_DIR = join(homedir(), ".claudish");
 const REAL_CONFIG_PATH = join(CONFIG_DIR, "config.json");
 let configBackup: string | null = null;
 let configExisted = false;
+/** The catalog cache the proxy resolves `deepseek@deepseek-flash` through —
+ * seeded from a fixture below, backed up and put back like the config. */
+const CATALOG_PATH = join(CONFIG_DIR, basename(ALL_MODELS_CACHE_PATH));
+const CATALOG_FIXTURE = join(
+  import.meta.dir,
+  "test-fixtures/catalog-v3/wire-g-20261012101007285-7770c36e.json"
+);
+let catalogBackup: string | null = null;
+let catalogExisted = false;
 
 const SANDBOX_ENV_KEYS = [
   "ZAI_API_KEY",
@@ -128,6 +138,21 @@ beforeAll(async () => {
   // Minimal config: no customEndpoints, no inboundKeys — the proxyKeys under
   // test come from the env alone, so the hermetic shape is the default shape.
   writeFileSync(REAL_CONFIG_PATH, "{}", "utf-8");
+  // P1 hermeticity (#1054 CR, third red check). The probe resolves
+  // `deepseek@deepseek-flash` through the CLOUD MODELS CATALOG's route
+  // registry — stubbing the upstream does not reach that lookup. CI runs with
+  // `CLAUDISH_DISABLE_CATALOG_WARM=1` (test.yml:138), so on a fresh runner
+  // nothing ever warms the catalog: resolution returns `no-catalog` and the
+  // proxy answers 400 "the cloud models catalog (with its route registry) is
+  // not available", measured here at 25 ms with `state: "error"`, not the
+  // `live` the pin asserts. Before this fixture P1 passed only on a seat whose
+  // ~/.claudish happened to hold a warm catalog — an accident of the machine,
+  // which is exactly what "hermetic" forbids. The fixture carries the deepseek
+  // routes INLINE (`routeRegistry` inside the cache file), so no sidecar and no
+  // network are needed, and `--models-refresh` can never overwrite it mid-test.
+  catalogExisted = existsSync(CATALOG_PATH);
+  catalogBackup = catalogExisted ? readFileSync(CATALOG_PATH, "utf-8") : null;
+  copyFileSync(CATALOG_FIXTURE, CATALOG_PATH);
   for (const k of SANDBOX_ENV_KEYS) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
@@ -170,6 +195,10 @@ afterAll(async () => {
     // A config that did not exist before must not exist after.
     writeFileSync(REAL_CONFIG_PATH, "", "utf-8");
   }
+  // Same contract for the catalog: a seat that had one gets its own back
+  // byte-for-byte; a seat that had none keeps the fixture out of its HOME.
+  if (catalogBackup !== null) writeFileSync(CATALOG_PATH, catalogBackup, "utf-8");
+  else if (!catalogExisted && existsSync(CATALOG_PATH)) rmSync(CATALOG_PATH, { force: true });
 });
 
 describe("resolveProbeProxyKey (#930)", () => {
@@ -189,14 +218,15 @@ describe("resolveProbeProxyKey (#930)", () => {
 });
 
 describe("probeLink against a key-enforcing proxy (#930)", () => {
-  // Explicit timeouts (#1054 CR B4 pin 2, v14 shape): the FIRST /v1/messages
-  // through this file's proxy pays the paged model-catalog refresh (#635) —
-  // real queryModels/queryPlans calls that ride the stub's realFetch
-  // passthrough, measured ~7s of WAN latency under bun test on this host
-  // (second request: ~7ms; the turn itself: 10-20ms). Bun's default 5s
-  // per-test timeout kills P1 mid-fetch and the aborted probe resurfaces as
-  // an unhandled `network-error` expect — a harness artifact, not a verdict.
-  // The pin itself is unchanged: with the time to finish, P1 reads `live`.
+  // Explicit timeouts (#1054 CR B4 pin 2, v14 shape). They were first added
+  // for a WAN effect: the FIRST /v1/messages through a cold proxy paid the
+  // paged model-catalog refresh (#635) — real queryModels/queryPlans calls
+  // riding the stub's realFetch passthrough, ~7 s measured on this host
+  // (second request: ~7 ms; the turn itself: 10-20 ms) — and Bun's 5 s
+  // default killed P1 mid-fetch, resurfacing as a `network-error` expect.
+  // The catalog fixture seeded in `beforeAll` removes that fetch entirely, so
+  // what they cover now is the in-process proxy boot; they stay as margin.
+  // Measured after the fixture: P1 reads `live` in tens of ms.
   test("P1 — probe with the resolved key is LIVE, not auth-failed", async () => {
     const result = await probeLink(PROXY_BASE, { ...LINK }, 15000, PROXY_KEY);
     expect(result.state).toBe("live");
