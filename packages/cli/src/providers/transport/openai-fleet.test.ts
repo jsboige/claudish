@@ -18,7 +18,7 @@ describe("OpenAIProviderTransport 429 backoff releases the concurrency slot", ()
   // The cap exists to bound requests IN FLIGHT to a backend. A backoff sleep has
   // nothing in flight, so a slot held across one is capacity the backend could be
   // serving with. With cap=6 on the GLM lane, six throttled requests held every
-  // slot for the full ladder (~62.5s) while the backend sat idle â€” one burst 429
+  // slot for the full ladder (~62.5s) while the backend sat idle — one burst 429
   // amplified into fleet-wide `Connection lost mid-response` (2026-08-24).
   test("a request in 429 backoff does not block another request to the same provider", async () => {
     const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key", 1);
@@ -72,7 +72,7 @@ describe("OpenAIProviderTransport 429 backoff releases the concurrency slot", ()
 
     await Promise.all([fire(), fire(), fire(), fire(), fire()]);
 
-    expect(peak).toBe(2); // gating still applies â€” only the sleep was moved out
+    expect(peak).toBe(2); // gating still applies — only the sleep was moved out
   });
 
   test("patience is unchanged: exhausted retries still return the last 429", async () => {
@@ -95,7 +95,7 @@ describe("OpenAIProviderTransport 429 backoff releases the concurrency slot", ()
 });
 
 describe("OpenAIProviderTransport busy bound applies to the first admission only (#431 CR S1)", () => {
-  test("a 429-retry admission is unbounded â€” the bound never rides the ladder", async () => {
+  test("a 429-retry admission is unbounded — the bound never rides the ladder", async () => {
     const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key", 1);
 
     let bCalls = 0;
@@ -105,7 +105,7 @@ describe("OpenAIProviderTransport busy bound applies to the first admission only
           bCalls++;
           if (bCalls === 1) {
             // While B backs off (Retry-After: 0), A takes the only slot and
-            // holds it ~400 ms â€” B's RETRY admission finds the limiter full.
+            // holds it ~400 ms — B's RETRY admission finds the limiter full.
             void transport
               .enqueueRequest(
                 () =>
@@ -128,7 +128,7 @@ describe("OpenAIProviderTransport busy bound applies to the first admission only
       .then((r) => r.status);
 
     // Pre-fix, the retry's gate call re-applied the 100 ms bound and rejected
-    // with StepBusyError â€” a skip-shaped failure for a request the backend had
+    // with StepBusyError — a skip-shaped failure for a request the backend had
     // already 429'd. Post-fix the retry admits unbounded and waits out A's
     // lease (the pre-#431 behavior of every unbounded caller).
     await expect(b).resolves.toBe(200);
@@ -163,7 +163,7 @@ describe("OpenAIProviderTransport 429 quota-wall short-circuit", () => {
     expect(await response.text()).toBe(WALL);
   }, 10000);
 
-  test("a BURST still walks the ladder â€” the property that keeps this safe", async () => {
+  test("a BURST still walks the ladder — the property that keeps this safe", async () => {
     const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key");
     let callCount = 0;
     const startTime = Date.now();
@@ -179,13 +179,13 @@ describe("OpenAIProviderTransport 429 quota-wall short-circuit", () => {
     expect(Date.now() - startTime).toBeGreaterThanOrEqual(1900); // it slept the 2s rung
   }, 15000);
 
-  test("a body that never ARRIVES also degrades to the ladder â€” it must not hang", async () => {
+  test("a body that never ARRIVES also degrades to the ladder — it must not hang", async () => {
     // Regression, 2026-08-25. The short-circuit reads the 429 body; the ladder
     // never touched it before. Nothing else bounds that read on this path:
     // OpenAIProviderTransport implements no getRequestInit, so its fetch carries
     // no AbortSignal (only local.ts and vertex-oauth.ts attach one). Against a
     // Response over a never-closing stream, clone().text() awaited forever and
-    // enqueueRequest never returned â€” a hung turn for whatever agent made the
+    // enqueueRequest never returned — a hung turn for whatever agent made the
     // request. The read now has its own 2s deadline and falls through here.
     const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key");
     let callCount = 0;
@@ -235,7 +235,7 @@ describe("OpenAIProviderTransport 429 quota-wall short-circuit", () => {
 // cost a timing-correlation study across 28.5h of traffic (2026-08-25).
 //
 // `Retry-After: 0.01` collapses each rung to 10ms, so the full ladder runs in
-// milliseconds instead of 62s â€” otherwise this path is untestable in a suite.
+// milliseconds instead of 62s — otherwise this path is untestable in a suite.
 describe("OpenAIProviderTransport 429 ladder exhaustion", () => {
   test("walks every rung, then returns the last 429 rather than throwing", async () => {
     const transport = new OpenAIProviderTransport(mockProvider, "glm-5.2", "test-key");
@@ -258,7 +258,7 @@ describe("OpenAIProviderTransport 429 ladder exhaustion", () => {
   }, 15000);
 
   // The exhaustion line sits just before `return response`, which is ALSO the
-  // success path â€” so it needs a status guard, and that guard needs a test.
+  // success path — so it needs a status guard, and that guard needs a test.
   // (The first version of this fix put the line after the loop instead, where
   // it was dead code and never fired at all; the test above caught that.)
   test("a request that succeeds after a retry logs no exhaustion line", async () => {
@@ -293,7 +293,7 @@ describe("OpenAIProviderTransport.countPromptTokens (#674)", () => {
   // Measured 25/10 on the shipping vLLM, from inside the hub container:
   // POST {root}/tokenize â†’ 200 {count, max_model_len}; `{model, messages}` is
   // the only usable shape (12 tokens for `hello world` against 2 for a raw
-  // prompt â€” the chat template is applied server-side), and /v1/tokenize is a
+  // prompt — the chat template is applied server-side), and /v1/tokenize is a
   // 404. Those three facts are what these pins hold.
   // Derived from the file's own mockProvider (same RemoteProvider shape, same
   // typing convention) so this pin adds no typecheck error of its own.
@@ -322,7 +322,7 @@ describe("OpenAIProviderTransport.countPromptTokens (#674)", () => {
     };
   }
 
-  test("posts {model, messages} to the ROOT /tokenize â€” never /v1/tokenize", async () => {
+  test("posts {model, messages} to the ROOT /tokenize — never /v1/tokenize", async () => {
     const s = stub(
       async () =>
         new Response(JSON.stringify({ count: 12, max_model_len: 262_144 }), { status: 200 })
@@ -349,7 +349,7 @@ describe("OpenAIProviderTransport.countPromptTokens (#674)", () => {
     try {
       const first = new OpenAIProviderTransport(vllm, "swift-1.5-27b", "k");
       expect(await first.countPromptTokens([{ role: "user", content: "hi" }])).toBeNull();
-      // A DIFFERENT transport instance â€” the proxy rebuilds them, so the memo
+      // A DIFFERENT transport instance — the proxy rebuilds them, so the memo
       // has to be process-wide or the 404 is paid again on every recreate.
       const second = new OpenAIProviderTransport(vllm, "swift-1.5-27b", "k");
       expect(await second.countPromptTokens([{ role: "user", content: "hi" }])).toBeNull();
@@ -372,7 +372,7 @@ describe("OpenAIProviderTransport.countPromptTokens (#674)", () => {
     }
   });
 
-  test("an unreadable count is null, never a guess â€” and an absent max_model_len is fine", async () => {
+  test("an unreadable count is null, never a guess — and an absent max_model_len is fine", async () => {
     const s = stub(async () => new Response(JSON.stringify({ count: "many" }), { status: 200 }));
     try {
       const transport = new OpenAIProviderTransport(vllm, "swift-1.5-27b", "k");
