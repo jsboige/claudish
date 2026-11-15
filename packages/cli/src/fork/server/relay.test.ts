@@ -47,10 +47,37 @@ let fetchCalls: { url: string; init: any }[] = [];
 let fetchImpl: (url: any, init: any) => Promise<Response> = async () =>
   new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
 
+// #1076 — the stub below answers EVERY fetch in the process, and CI runs the
+// whole suite in ONE process without --isolate (deliberate — see test.yml: bun
+// has no undo for mock.module(), so only a shared process surfaces cross-file
+// leaks). Async work left behind by an earlier file can therefore call
+// globalThis.fetch while a pin here runs and bump its closure counter by
+// exactly one — two CI flakes on 15/11 (runs 43685593858 / 43695183792, both
+// green on rerun; not reproduced locally in 3 one-process full-suite runs).
+// The stub thus only RECORDS and only FORWARDS calls to an upstream this
+// file's tests create — the URLs the code under test sends. Anything else is
+// a stray from another file: it gets the default stub's benign 200 JSON, is
+// never counted, never reaches `fetchImpl` (so it cannot flip a `calls === 1`
+// branch), and stays out of `fetchCalls` and `lastFetch` (so index- and
+// last-based readers keep reading THIS test's requests).
+const FILE_UPSTREAMS = [
+  "http://hub:3000",
+  "http://192.168.0.50:3000",
+  "https://models.myia.io",
+  "http://h:1",
+];
+function isStrayCall(url: unknown): boolean {
+  const s = String(url);
+  return !FILE_UPSTREAMS.some((u) => s === u || s.startsWith(`${u}/`));
+}
+
 beforeEach(() => {
   lastFetch = null;
   fetchCalls = [];
   globalThis.fetch = (async (url: any, init: any) => {
+    if (isStrayCall(url)) {
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }
     lastFetch = { url: String(url), init };
     fetchCalls.push(lastFetch);
     return fetchImpl(url, init);

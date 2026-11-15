@@ -43,6 +43,21 @@ jobs:
       # failure being the third flake itself; #928 root-caused that one
       # (keep-alive zombie socket, connection: close) and its head held
       # 20/20. The non-gating era of #570 ends here.
+      #
+      # One process, no --isolate — DELIBERATE (arbitrated 15/11, #1076).
+      # The package's own `test` script runs `bun test --isolate` for seat
+      # convenience; CI keeps the whole suite in a single process because
+      # bun's mock.module() has NO undo (measured 15/11: mock.restore(), the
+      # re-import idiom and an empty factory all leave the override in
+      # place), so a file that leaks a module mock only poisons the files
+      # that run after it WHEN they share a process — the exact class of the
+      # #1027 CI red (catalog-warm.test.ts's resolver mock leaked into the
+      # advisor test; fixed consumer-side by re-mocking with the real
+      # resolver). Isolating here would hide that class forever. The cost is
+      # symmetrical and owned: async work left behind by an earlier file can
+      # call globalThis.fetch while a later pin runs, so a pin that counts
+      # fetch calls must count only its own upstream (#1076), never every
+      # fetch in the process.
       - name: Run test suite (packages/cli)
         env:
           CLAUDISH_TEST_PRESET_HOME: "1"
