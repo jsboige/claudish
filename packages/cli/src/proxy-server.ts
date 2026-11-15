@@ -67,6 +67,7 @@ import {
   previousKeyHitsSnapshot,
 } from "./handlers/shared/proxy-key-rotation.js";
 import { admissionFreezeState } from "./handlers/shared/admission-freeze.js";
+import { captureBindWriteVerdict } from "./handlers/shared/capture-bind-probe.js";
 import {
   describeRoutingRuleProblem,
   effectiveDefaultProvider,
@@ -2934,6 +2935,14 @@ export async function createProxyServer(
         eventLoopMax60sMs: lagWindowed(lagProbeWindows.maxMs, "max"),
         eventLoopBlockedMs5m: lagWindowed(lagProbeWindows.blockedMs, "blockedSum"),
         eventLoopMaxMs: Math.round(lagMaxCumulative * 10) / 10,
+        // #291 — verdict of an ACTUAL write+unlink into CLAUDISH_CAPTURE_DIR:
+        // "ok" | "disabled" (capture off by env) | "error:<code>" (the bind
+        // refused — the 29/10 rootfs-full class that no-op'd every writer
+        // silently) | "unknown:probing" (cold cache, first refresh in flight
+        // — CR #1057: the probe is async-refreshed, NEVER a sync write on
+        // this path: the writers paid twice for that, and a wedged bind does
+        // not fail fast). Pure cache read; never throws; never blocks.
+        captureBindWrite: captureBindWriteVerdict(),
       },
       stalled ? 503 : 200
     );
