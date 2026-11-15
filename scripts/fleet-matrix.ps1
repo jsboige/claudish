@@ -86,7 +86,11 @@ function Format-ByteLimit([string]$Raw) {
     #              exactly like a blank cascade cell never reads as "0 armed".
     if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
     $t = $Raw.Trim()
-    if ($t -eq '<no value>' -or $t -eq '<nil>') { return 'none' }
+    # '<no value>' / '<nil>' fall through to TryParse and fail -> $null ('?'):
+    # Memory and MemorySwap are plain int64 in Docker, so a real read never
+    # produces either form — if one appears, the read gave NO signal, and the
+    # matrix must say '?' (exit 1), never 'none' ("can eat the host" off an
+    # unmeasured field). Measured under PS 5.1 by review c.6891742489.
     $n = [long]0
     if (-not [long]::TryParse($t, [ref]$n)) { return $null }
     if ($n -le 0) { return 'none' }

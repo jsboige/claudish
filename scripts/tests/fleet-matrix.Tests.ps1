@@ -287,6 +287,24 @@ Describe 'fleet-matrix' {
             $r.Out | Should -Match '\| \? \| 1 in tail'
             $r.Code | Should -Be 1
         }
+
+        # It NAME carries no angle brackets on purpose: Pester expands
+        # <token> in It names as a TestCases template, and '<no value>'
+        # became $($no value) -> ParseException before the body ever ran.
+        It 'renders a no-value memory token as ?, not none (review c.6891742489)' {
+            # Memory / MemorySwap are plain int64 in Docker - a real read never
+            # produces <no value> or <nil>. If one appears anyway, the read
+            # gave NO signal: '?' and exit 1, never 'none', which would say
+            # "this container can eat the host" off an unmeasured field.
+            # Measured under PS 5.1: the deleted line 89 rendered none/1g/512.
+            $r = Invoke-Matrix -Bounds '<no value>|1073741824|512'
+            $r.Out | Should -Match '\| \? \| 1 in tail'
+            $r.Out | Should -Not -Match 'none/1g'
+            $r.Code | Should -Be 1
+            $r = Invoke-Matrix -Bounds '1073741824|<nil>|512'
+            $r.Out | Should -Match '\| \? \| 1 in tail'
+            $r.Code | Should -Be 1
+        }
     }
 
     Context 'LAN hub reachability (#291 grain 6)' {
