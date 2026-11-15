@@ -904,6 +904,13 @@ export async function forwardToUpstream(
     // (#279's hop list exists because A→B shapes happen), so the property
     // has to compose. Fixed literal set by our own hub — nothing sensitive.
     const drainFreezeMarker = res.headers.get("x-claudish-drain-freeze");
+    // #1055 g2 CR B2 — the typed lane refusal survives the hop the same way.
+    // The pilot's harness reaches the hub THROUGH its sidecar, and an untyped
+    // 429 arriving at the harness cannot be told apart from a quota wall — the
+    // whole point of the typed header. A lane refusal is a JSON 429 (never
+    // SSE), so it always lands on this rebuild branch, whatever `stream` the
+    // client asked for. Fixed literal set by our own hub — same as above.
+    const laneRefusalMarker = res.headers.get("x-claudish-lane-refusal");
     return carryNoticeHeader(
       res,
       new Response(text, {
@@ -912,6 +919,7 @@ export async function forwardToUpstream(
           "Content-Type": contentType || "application/json",
           ...(retryAfter ? { "retry-after": retryAfter } : {}),
           ...(drainFreezeMarker ? { "x-claudish-drain-freeze": drainFreezeMarker } : {}),
+          ...(laneRefusalMarker ? { "x-claudish-lane-refusal": laneRefusalMarker } : {}),
         },
       })
     );

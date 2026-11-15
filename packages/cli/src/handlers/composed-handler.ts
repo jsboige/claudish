@@ -81,6 +81,7 @@ import {
 import { StepBusyError } from "./shared/concurrency-limiter.js";
 import { extractSessionKey, isQuotaExhaustion } from "../fork/failover.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
+import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
 import type { StreamFormat } from "../providers/transport/types.js";
 import { log, logStderr, logStructured, getLogLevel, truncateContent } from "../logger.js";
 import {
@@ -2132,6 +2133,9 @@ export class ComposedHandler implements ModelHandler {
       // attempt token was attached to c.req.raw by the cascade loop). Never
       // throws; no-op when the instrument is inert (no token attached).
       recordSessionBudgetOutput(c.req.raw, output);
+      // #1055 g2: the same report feeds the harness-lane ledger (own attempt
+      // token, inert without a lane header AND a bar).
+      recordLaneBudgetOutput(c.req.raw, output);
       // #518: the full context size, keyed by THIS stream's session — feeds
       // the next same-session message_start seed (see priorInputTokens below).
       if (sessionKey !== null) this.rememberSessionInput(sessionKey, input);
