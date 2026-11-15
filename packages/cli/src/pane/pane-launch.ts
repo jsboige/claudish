@@ -583,12 +583,25 @@ async function probeMagmux(binary?: string): Promise<MagmuxBinary> {
   return { binary: found, version };
 }
 
-/** How long one `magmux --version` run may take before it is killed and counted as no answer. */
-const MAGMUX_VERSION_TIMEOUT_MS = 5000;
+/**
+ * How long one `magmux --version` run may take before it is killed and counted as no answer.
+ * Default 5000 ms, overridable per probe via `CLAUDISH_MAGMUX_VERSION_TIMEOUT_MS`: the macOS CI
+ * gate runs three pane slices as concurrent processes on 3 vCPUs, and under that load the
+ * probe's exec has exceeded the 5 s default (#1082 — runs 43730396398 and 43733872570, both
+ * `no answer in 5000 ms`, both green on rerun) while the install step's own version exec
+ * passes: the binary works, the runner is just late. 0 or an unparseable value falls back to
+ * the default — there is deliberately no unbounded mode.
+ */
+const DEFAULT_MAGMUX_VERSION_TIMEOUT_MS = 5000;
+
+function magmuxVersionTimeoutMs(): number {
+  const raw = Number.parseInt(process.env.CLAUDISH_MAGMUX_VERSION_TIMEOUT_MS ?? "", 10);
+  return raw > 0 ? raw : DEFAULT_MAGMUX_VERSION_TIMEOUT_MS;
+}
 
 /** The `X.Y.Z` from one `<binary> --version` run, read from stdout and stderr together; "" when absent. */
 async function readMagmuxVersion(found: string): Promise<string> {
-  const out = await runMagmuxVersion(found, MAGMUX_VERSION_TIMEOUT_MS);
+  const out = await runMagmuxVersion(found, magmuxVersionTimeoutMs());
   return out.match(/(\d+\.\d+\.\d+)/)?.[1] ?? "";
 }
 
