@@ -43,7 +43,7 @@ Usage
   python -I scripts/payg-by-role.py --print-table           # the plan classifier
   python -I scripts/payg-by-role.py --selftest              # synthetic, no real data
 
-Exit: 0 ok, 2 nothing in the window or selftest failure.
+Exit: 0 ok, 2 nothing in the window, an unreadable capture dir, or selftest failure.
 """
 from __future__ import annotations
 
@@ -162,24 +162,35 @@ def scan(captures: str, since_ts: float, until_ts: float, max_pairs: int = 4000)
     """
     reqs = defaultdict(list)   # N -> [(ts, path, raw_ts)]
     resps = defaultdict(list)  # N -> [(ts, model, raw_ts)]
-    for entry in os.scandir(captures):
-        name = entry.name
-        if name.startswith("req-"):
-            m = REQ_RE.match(name)
-            if not m:
-                continue
-            ts = parse_ts(m.group(3))
-            if ts is None or ts < since_ts or ts > until_ts:
-                continue
-            reqs[m.group(2)].append((ts, entry.path, m.group(3)))
-        elif name.startswith("resp-"):
-            m = RESP_RE.match(name)
-            if not m:
-                continue
-            ts = parse_ts(m.group(3))
-            if ts is None or ts < since_ts - MAX_STREAM_S or ts > until_ts + MAX_STREAM_S:
-                continue
-            resps[m.group(2).lstrip("0") or "0"].append((ts, m.group(5), m.group(3)))
+    try:
+        entries = os.scandir(captures)
+    except OSError as e:
+        # The docstring's promise — "a quiet dir and an unreadable dir must never
+        # look alike" — is only kept if the unreadable one SAYS so. A traceback
+        # reads as a broken instrument, and a broken instrument gets replaced by
+        # a greppable lie.
+        raise SystemExit(print(f"capture dir unreadable: {captures} "
+                               f"({e.strerror or e}) — nothing was measured",
+                               file=sys.stderr) or 2)
+    with entries:
+        for entry in entries:
+            name = entry.name
+            if name.startswith("req-"):
+                m = REQ_RE.match(name)
+                if not m:
+                    continue
+                ts = parse_ts(m.group(3))
+                if ts is None or ts < since_ts or ts > until_ts:
+                    continue
+                reqs[m.group(2)].append((ts, entry.path, m.group(3)))
+            elif name.startswith("resp-"):
+                m = RESP_RE.match(name)
+                if not m:
+                    continue
+                ts = parse_ts(m.group(3))
+                if ts is None or ts < since_ts - MAX_STREAM_S or ts > until_ts + MAX_STREAM_S:
+                    continue
+                resps[m.group(2).lstrip("0") or "0"].append((ts, m.group(5), m.group(3)))
     pairs = []
     unmatched = 0
     ambiguous = 0
@@ -218,9 +229,29 @@ def aggregate(pairs):
     return by_role, served
 
 
-def render(by_role, served, stats, hours):
+def iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resolve_as_of(s: str) -> float:
+    """The window's END, from an ISO-8601 instant. Raises ValueError on garbage.
+
+    A naive instant is REFUSED: the capture timestamps are UTC, and reading a
+    local-time `--as-of` as UTC silently shifts the window by the box's offset
+    (the "Get-Date -Format u" trap, transplanted).
+    """
+    t = s.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(t)
+    if dt.tzinfo is None:
+        raise ValueError(f"--as-of {s!r} has no timezone; the window is UTC")
+    return dt.timestamp()
+
+
+def render(by_role, served, stats, hours, since=None, until=None):
     out = []
     out.append(f"PAYG by role — last {hours} h (capture pairs)")
+    if since is not None and until is not None:
+        out.append(f"window: {iso(since)} .. {iso(until)}")
     out.append(f"pairs: {stats['matched']} matched / {stats['requests']} requests "
                f"({stats['unmatched']} unmatched, {stats['ambiguous']} ambiguous"
                + (f", {stats['capped']} CAPPED - raise --max-pairs" if stats.get("capped") else "")
@@ -288,12 +319,27 @@ def selftest():
         if plan_of("deepseek-v4-flash") != "payg":
             fails.append("condensation model not classified as PAYG")
 
+        # --as-of: the window END must move, and the two timestamp spellings
+        # (capture filenames vs ISO-8601 on the command line) must agree.
+        if resolve_as_of("2026-10-29T00:00:00Z") != parse_ts("2026-10-29T00-00-00-000Z"):
+            fails.append("--as-of disagrees with the capture timestamp parser")
+        try:
+            resolve_as_of("2026-10-29T00:00:00")
+            fails.append("a timezone-less --as-of was accepted (local time read as UTC)")
+        except ValueError:
+            pass
+        as_of = resolve_as_of("2026-10-27T12:00:00Z")
+        past_pairs, _s = scan(d, as_of - 86400, as_of)
+        if past_pairs:
+            fails.append(f"--as-of moved nothing: {len(past_pairs)} pair(s) before the corpus")
+
         if fails:
             print("SELFTEST FAIL")
             for f in fails:
                 print("  -", f)
             return 2
-        print("SELFTEST OK — 6 pins (2 pairs, 1 unmatched, trap #48, alias, condensation)")
+        print("SELFTEST OK — 9 pins (2 pairs, 1 unmatched, trap #48, alias, "
+              "condensation, as-of window end, as-of tz refusal, as-of before corpus)")
         return 0
 
 
@@ -301,6 +347,11 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="PAYG share per role, from capture pairs")
     ap.add_argument("--captures", default=r"D:/claudish-captures")
     ap.add_argument("--hours", type=float, default=24.0)
+    ap.add_argument("--as-of", default=None,
+                    help="ISO-8601 instant the window ends at (e.g. "
+                         "2026-11-14T00:00:00Z). Default: now. Needed to measure a "
+                         "DAY out of an archive, where 'the last 24 h' would be empty "
+                         "and the emptiness would read as 'no PAYG'")
     ap.add_argument("--max-pairs", type=int, default=4000,
                     help="bound on request-body reads (one open per pair); "
                          "overflow is reported as CAPPED, never dropped silently")
@@ -316,22 +367,25 @@ def main(argv=None):
             print(f"{k:28} {PLAN[k]}")
         return 0
 
-    now = time.time()
+    now = resolve_as_of(args.as_of) if args.as_of else time.time()
     since = now - args.hours * 3600
     pairs, stats = scan(args.captures, since, now, max_pairs=args.max_pairs)
     if not pairs:
-        print("no capture pair in the window — a quiet dir and an unreadable dir "
-              "look alike, check --captures before concluding 'no PAYG'")
+        print(f"no capture pair in the window {iso(since)} .. {iso(now)} — a quiet dir "
+              "and an unreadable dir look alike, check --captures and --as-of before "
+              "concluding 'no PAYG'")
         return 2
     by_role, served = aggregate(pairs)
     if args.json:
         print(json.dumps({
-            "hours": args.hours, "stats": stats,
+            "hours": args.hours,
+            "window": {"since": iso(since), "until": iso(now)},
+            "stats": stats,
             "by_role": {r: dict(c) for r, c in by_role.items()},
             "served": {r: dict(c) for r, c in served.items()},
         }, indent=2))
     else:
-        print(render(by_role, served, stats, args.hours))
+        print(render(by_role, served, stats, args.hours, since, now))
     return 0
 
 
