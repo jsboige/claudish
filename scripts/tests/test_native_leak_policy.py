@@ -25,11 +25,15 @@ Pinned on a synthetic corpus:
 Run: python scripts/tests/test_native_leak_policy.py
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPT = os.path.join(_HERE, "..", "native-consumption.py")
@@ -330,6 +334,69 @@ def test_phase5_chunked_bodies_survive_lot_boundary():
     assert "(corps illisible)" not in po, po
     for lane, n in (("coursia-0", 13), ("coursia-1", 14), ("coursia-2", 13)):
         assert f"{lane}:{n}" in po, f"lane {lane} miscounted: {po}"
+
+
+def test_unreadable_opus_body_lands_in_visible_bucket():
+    """#1055 N3 (revue c.6891789440) — un corps d'Opus illisible reste
+    VISIBLE : seau `(corps illisible)`, jamais un zero devine. Le mutant
+    qui traverse le cas sans compter (continue sans seau) doit devenir
+    ROUGE ici.
+
+    In-process : l'enveloppe (tete 1 Ko) et le corps sont le MEME fichier,
+    donc un fichier illisible casserait l'appariement avant la phase 5 —
+    en subprocess le cas est inconstructible. On appelle leak_policy()
+    directement avec un pool stubbe : tetes reelles, corps -> None.
+    """
+    _spec = importlib.util.spec_from_file_location("nc", _SCRIPT)
+    nc = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(nc)
+
+    class _StubPool:
+        """Tetes reelles ; le corps ENTIER (size None) echoue -> None."""
+
+        def read_heads(self, paths, size, workers=16):
+            if size is None:
+                return [None] * len(paths)
+            return [self._head(p, size) for p in paths]
+
+        @staticmethod
+        def _head(p, size):
+            try:
+                with open(p, "rb") as fh:
+                    return fh.read(size).decode("utf-8", errors="replace")
+            except OSError:
+                return None
+
+    d = tempfile.mkdtemp(prefix="leak-unread-")
+    _anchor(d)
+    _req(d, 1, 80, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"system": [{"type": "text", "text":
+               "Primary working directory: d:\\\\Dev\\\\CoursIA"}], "messages": []})
+    _resp(d, 1, 90, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 80)
+    req_path = os.path.join(d, "req-1-80-2026-11-09T06-00-00-000Z-direct.json")
+    resps = [(datetime(2026, 11, 9, 6, 0, 5), 1,
+              os.path.join(d, "resp-1-r90-2026-11-09T06-00-05-000Z-native-claude-opus-5-5.sse"))]
+    # the anchor's index entry too: a corpus starting at the req's own ts
+    # makes the 35 min window read as compaction-truncated (the _anchor
+    # trick, applied by hand here since main() is bypassed). Key shape per
+    # main(): pid is the STRING from the filename, only the counter is int.
+    req_index = {
+        ("1", 80): [(datetime(2026, 11, 9, 6, 0, 0), req_path)],
+        ("9", 1): [(datetime(2026, 11, 9, 1, 0, 0),
+                    os.path.join(d, "req-9-1-2026-11-09T01-00-00-000Z-direct.json"))],
+    }
+    nc._load_blind_spot = lambda: _StubPool()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = nc.leak_policy(resps, req_index, "myia-ai-01", workers=1)
+    text = out.getvalue()
+    assert code == 0, text
+    assert "(corps illisible):1" in text, \
+        "an unreadable Opus body must land in its visible bucket:\n" + text
+    assert "(non-cc)" not in text, "unreadable is NOT 'no preamble':\n" + text
+    po = _row(text, "myia-po-2024")
+    assert po.split()[1:3] == ["1", "1"], \
+        "native/opus counts must not move on an unreadable body:\n" + text
 
 
 def test_full_mode_and_leak_policy_agree_on_sub():
