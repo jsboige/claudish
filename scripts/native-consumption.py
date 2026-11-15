@@ -280,21 +280,34 @@ def leak_policy(resps, req_index, opus_home, workers=16):
             r["hours"][ts.strftime("%d %Hh")] += 1
         opus_reads.append((machine, req_path, off_home))
     # Phase 5 (#997) — corps des Opus (TOUS : axe lane ; les hors home en
-    # plus pour la signature sous-agent) : lecture ENTIERE, pool borne,
-    # dedupliquee ; le serie relisait le fichier a chaque reponse. Un corps
-    # illisible ne signe rien (le serie faisait except OSError: pass) mais
-    # reste VISIBLE dans l'axe lane : un zero mesure et un zero devine ne
-    # se lisent pas pareil.
+    # plus pour la signature sous-agent) : lecture ENTIERE mais PAR LOTS —
+    # le rejeu 7 jours (15/11) a fait MemoryError sur le dict tenant TOUS
+    # les corps d'un coup (des milliers d'Opus x des Mo chacun). Le lot
+    # (32 chemins) paie le pool borne ; SEUL le verdict (axe lane, drapeau
+    # sous-agent) survit au lot, le corps est jete. Un corps illisible ne
+    # signe rien (le serie faisait except OSError: pass) mais reste
+    # VISIBLE dans l'axe lane : un zero mesure et un zero devine ne se
+    # lisent pas pareil.
+    _UNREAD = _Unread()
+    off_home_paths = {p for (_m, p, off) in opus_reads if off}
+    verdicts = {}  # req_path -> ((lane, cc), sub|None) ou _UNREAD
     opus_paths = sorted({p for (_m, p, _o) in opus_reads})
-    bodies = dict(zip(opus_paths, bs.read_heads(opus_paths, None, workers)))
+    for i in range(0, len(opus_paths), 32):
+        chunk = opus_paths[i:i + 32]
+        for p, body in zip(chunk, bs.read_heads(chunk, None, workers)):
+            if body is None:
+                verdicts[p] = _UNREAD
+            else:
+                verdicts[p] = (_lane_key(body),
+                               _subagent_flag(body) if p in off_home_paths else None)
     for machine, req_path, off_home in opus_reads:
-        body = bodies.get(req_path)
-        if body is None:
+        v = verdicts.get(req_path, _UNREAD)
+        if v is _UNREAD:
             rows[machine]["lanes"]["(corps illisible)"] += 1
             continue
-        lane, _cc = _lane_key(body)
+        (lane, _cc), sub = v
         rows[machine]["lanes"][lane if lane is not None else NON_CC_LANE] += 1
-        if off_home and _subagent_flag(body) is True:
+        if off_home and sub is True:
             rows[machine]["sub"] += 1
 
     print("Leak-policy (#445) — reponses natives par machine "
@@ -347,6 +360,13 @@ def _load_blind_spot():
 _SF = None
 _CWD = None
 NON_CC_LANE = "(non-cc)"
+
+
+class _Unread:
+    """Sentinelle « corps illisible » — distincte de (None, False), le
+    verdict « pas de preambule CC » du predicat : les deux ne se
+    confondent JAMAIS, l'un est un echec de lecture, l'autre une lecture
+    qui dit quelque chose."""
 
 
 def _lane_key(raw):

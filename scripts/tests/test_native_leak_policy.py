@@ -304,6 +304,34 @@ def test_lane_axis_basename_only():
         assert forbidden not in out, f"path fragment {forbidden!r} leaked:\n{out}"
 
 
+def test_phase5_chunked_bodies_survive_lot_boundary():
+    """#1055 item 2 — phase 5 lit les corps par LOTS de 32 : le rejeu 7
+    jours (15/11) a fait MemoryError sur le dict tenant tous les corps.
+    Le pin traverse la frontiere de lot (40 Opus = 2 lots) : chaque Opus
+    doit quand meme rendre son axe lane et son drapeau sous-agent — un
+    lot perdu se lirait comme un « (corps illisible) » massif."""
+    d = tempfile.mkdtemp(prefix="leak-chunk-")
+    _anchor(d)
+    for i in range(1, 41):
+        sub = i % 2 == 0
+        _req(d, 1, 100 + i, f"2026-11-09T06-00-00-000Z", "myia-po-2024",
+             device="0b9b0d8c",
+             body={"system": [{"type": "text", "text":
+                   ("x-anthropic-billing-header: cc_is_subagent=true;"
+                    if sub else "x-anthropic-billing-header: cc_version=2.1.322;") +
+                   f"\nPrimary working directory: d:\\\\Dev\\\\CoursIA-{i % 3}"}],
+                   "messages": []})
+        _resp(d, 1, 500 + i, "2026-11-09T06-01-00-000Z", "claude-opus-5-5", 100 + i)
+    code, out = _run(d, "--since", "2026-11-09T00")
+    assert code == 0, out
+    po = _row(out, "myia-po-2024")
+    assert po.split()[1:3] == ["40", "40"], f"chunk lost responses: {po}\n{out}"
+    assert "sub=20/40" in po, f"chunk lost sub flags: {po}"
+    assert "(corps illisible)" not in po, po
+    for lane, n in (("coursia-0", 13), ("coursia-1", 14), ("coursia-2", 13)):
+        assert f"{lane}:{n}" in po, f"lane {lane} miscounted: {po}"
+
+
 def test_full_mode_and_leak_policy_agree_on_sub():
     """#1051 — le meme corpus, les deux chemins, le MEME compte.
 
