@@ -2755,4 +2755,20 @@ describe("#587 g1 — flip lines carry the hub's /health fields", () => {
     expect(line).toContain("activeStreams=3");
     expect(line).toMatch(/age=0\.\ds/);
   });
+
+  it("C4: age is the distance to the body read, measured at render — a 5 s-stale snapshot says so (#1061 suite)", async () => {
+    // The case `age` exists for: a failure that outlived the last answer. The
+    // operator must see HOW stale the snapshot is, not a zero stamped at note
+    // time. Pins the arithmetic (render-time now minus the body's `at`) —
+    // stamping age at note time, or computing it from anything but
+    // `lastHealth.at`, turns this red.
+    fetchImpl = async () => healthBody({ eventLoopMax60sMs: 1234, activeStreams: 7 });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    // The hub went quiet 5 s before the relay gave up on it.
+    state.lastHealth!.at = Date.now() - 5_000;
+    fetchImpl = timeout;
+    expect(await heartbeat(state)).toBe(false);
+    expect(failed()[0]).toMatch(/age=5\.\ds/);
+  });
 });
