@@ -6,6 +6,8 @@ import { credentials } from "../auth/credentials/authority.js";
 // so without it a quota wall from api.anthropic.com left no durable trace.
 import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
+// #1055 g2 / #1060 — the harness-lane ledger twin of the session budget.
+import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
 import { requestHooksOf } from "../hooks/request-stage.js";
 import { log, maskCredential } from "../logger.js";
 import { redactForClient } from "../redact.js";
@@ -385,6 +387,8 @@ export class NativeHandler implements ModelHandler {
                       if (line.includes('"output_tokens"')) {
                         for (const m of line.matchAll(/"output_tokens"\s*:\s*(\d+)/g)) {
                           recordSessionBudgetOutput(c.req.raw, Number(m[1]));
+                          // #1055 g2 — the same report feeds the harness-lane ledger.
+                          recordLaneBudgetOutput(c.req.raw, Number(m[1]));
                         }
                       }
                       held.push(line);
@@ -465,7 +469,11 @@ export class NativeHandler implements ModelHandler {
       // #317: non-streaming native usage feeds the session budget too.
       {
         const n = Number((data as any)?.usage?.output_tokens);
-        if (Number.isFinite(n) && n > 0) recordSessionBudgetOutput(c.req.raw, n);
+        if (Number.isFinite(n) && n > 0) {
+          recordSessionBudgetOutput(c.req.raw, n);
+          // #1055 g2 — the same report feeds the harness-lane ledger.
+          recordLaneBudgetOutput(c.req.raw, n);
+        }
       }
       log("\n=== [NATIVE] Response ===");
       log(JSON.stringify(data, null, 2));

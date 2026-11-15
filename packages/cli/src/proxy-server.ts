@@ -18,6 +18,9 @@ import {
 // ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
 // are INERT without their env knobs, so their presence changes nothing on a
 // fleet that never opts in.
+// #291 / #1057 — /health publishes the verdict of an ACTUAL write+unlink into
+// CLAUDISH_CAPTURE_DIR (async-refreshed cache, never a sync write here).
+import { captureBindWriteVerdict } from "./handlers/shared/capture-bind-probe.js";
 import {
   ARM_TTL_MAX_MS,
   type DelegationOwner,
@@ -89,6 +92,14 @@ import {
   openSessionBudgetAttempt,
   sessionBudgetRefusalAnthropic,
 } from "./fork/session-budget.js";
+// #1055 g2 — harness-lane budget admission, stop and ledger (fork module; all
+// paths inert without a lane header AND a configured bar).
+import {
+  admitLaneBudget,
+  laneBudgetRefusalAnthropic,
+  laneStopRefusal,
+  openLaneBudgetAttempt,
+} from "./fork/lane-budget.js";
 import {
   type AdvisorPresenceMonitor,
   createAdvisorPresenceMonitor,
@@ -2061,6 +2072,17 @@ export async function createProxyServer(
         // keys its max-ledger on it (two paid attempts of one request must
         // land in two slots). No-op when both bars are off.
         openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+        // #1055 g2 — the same attempt feeds the lane ledger (inert without a
+        // lane header AND a bar for this (lane, model)). CR B1: keyed on
+        // `requestedModel` (what the ADMISSION read), never `body.model` — the
+        // #218 native pin rewrites body.model to the pinned version BEFORE this
+        // site, and the two spellings would split the ledger key: consumption
+        // booked under `claude-haiku-5-1` while admission looks up `claude-haiku-5`
+        // (measured 200,200,200 against a bar of 700). CR3 B5: this open sits
+        // in the `else` of `budgetSynthResponse` — a #654 budget-skipped
+        // nominal NEVER reaches it, which is why the walk-site open is the
+        // only ledger attach on that path (route L10 pins it).
+        openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
         response = await handler.handle(c, body);
         if (pinnedModel && !response.ok) body.model = modelBeforePin;
         if (servingNote && !response.ok) body.system = systemBeforeNote;
@@ -2276,6 +2298,15 @@ export async function createProxyServer(
                 if (walkBudget) walkRelease = walkBudget.commit();
                 // #317: the walk is a paid upstream attempt too — fresh token.
                 openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+                // #1055 g2 — the walk feeds the lane ledger too. CR B1: keyed
+                // on `requestedModel` (the admission's spelling), same reason
+                // as the loop-site open above. CR3 B5: on the #654 budget-skip
+                // → walk path this is the ONLY open — the loop-site open lives
+                // in the `else` of `budgetSynthResponse`, and a budget-skipped
+                // nominal never reaches it (pinned by route L10: without this
+                // open, a lane behind a saturated endpoint budget would spend
+                // through the walk with no ledger at all).
+                openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
                 const targetResp = await targetHandler.handle(c, body);
                 if (targetResp.ok) {
                   if (!target.step.roleRef) resetStepSuccess(walkRole, target.stepIndex);
@@ -2739,6 +2770,21 @@ export async function createProxyServer(
         // expire a fresh flag). The reason, never the flag content.
         admissionFreeze: admissionFreezeState().reason,
         ...(options.relay ? { selfLoop: options.relay.selfLoop } : {}),
+        // #291 — verdict of an ACTUAL write+unlink into CLAUDISH_CAPTURE_DIR:
+        // "ok" | "disabled" (capture off by env) | "error:<code>" (the bind
+        // refused — the 29/10 rootfs-full class that no-op'd every writer
+        // silently) | "unknown:probing" (cold cache, first refresh in flight
+        // — CR #1057: the probe is async-refreshed, NEVER a sync write on
+        // this path: the writers paid twice for that, and a wedged bind does
+        // not fail fast). Pure cache read; never throws; never blocks.
+        //
+        // NB on the replatform /health: the #587 event-loop lag counters and
+        // the #439 rotation snapshot are NOT published here (the replatform
+        // dropped both instruments) — a #587 g1 flip segment reading this hub
+        // dates its flips with instanceId/activeStreams/age and prints
+        // `eventLoopMax60sMs=none`, which the segment treats as ABSENT, never
+        // as 0 (the 24/10 trap on that issue).
+        captureBindWrite: captureBindWriteVerdict(),
       },
       stalled ? 503 : 200
     );
@@ -3094,6 +3140,25 @@ export async function createProxyServer(
       // returns null → fall through to the normal local path for this one
       // request (and feeds the prober's hysteresis toward AUTONOMOUS).
       //
+      // #1055 g2 CR B4 — the operator STOP check sits ABOVE the relay branch:
+      // the stop file belongs to THIS node's operator, so the stop must hold
+      // in BOTH relay modes. A NOMINAL forward would relay a stopped lane to
+      // the hub and keep spending (measured: 200 with the hub called, both
+      // ingresses), and a stop enforced only at the hub would miss a sidecar
+      // that has gone AUTONOMOUS. The BUDGET admission stays BELOW the relay
+      // (see there): only the node that serves counts tokens — for relayed
+      // traffic that is the hub. A per-request stat of an operator-named
+      // file; inert without CLAUDISH_LANE_STOP_DIR / an x-claudish-lane
+      // header.
+      {
+        const stop = laneStopRefusal(
+          c.req.header("x-claudish-lane") ?? null,
+          (body.model as string) ?? "",
+          process.env
+        );
+        if (stop) return laneBudgetRefusalAnthropic(stop);
+      }
+      //
       // #279 — checked BEFORE forwarding: a request whose hop list carries
       // our own instanceId is one of our forwards coming back (boot window
       // before the heartbeat latched selfLoop, or an A→B→A cycle heartbeat
@@ -3143,6 +3208,26 @@ export async function createProxyServer(
       {
         const admission = admitSessionBudget(machineHeader, sessionKey, process.env);
         if (admission?.refused) return sessionBudgetRefusalAnthropic(admission);
+      }
+
+      // #1055 g2 — harness-lane BUDGET admission (per-(lane, model) daily
+      // bar). CR B4: the emergency-stop half runs ABOVE the relay branch (see
+      // there); this site stays below because only the node that serves
+      // counts tokens — on a NOMINAL sidecar the hub admits relayed traffic.
+      // CR3 B5: the stop is route-side ONLY — the pre-relay check above is
+      // unconditional, so it refuses FIRST on every ingress, hub included;
+      // this site is the budget half everywhere. Null
+      // (zero work) for every request without an `x-claudish-lane` header —
+      // the pre-#1055 path is byte-identical. Refusals are TYPED
+      // (`x-claudish-lane-refusal`) so the harness defers the notebook
+      // instead of queueing silently; paid before any handler.
+      {
+        const admission = admitLaneBudget(
+          c.req.header("x-claudish-lane") ?? null,
+          (body.model as string) ?? "",
+          process.env
+        );
+        if (admission?.refused) return laneBudgetRefusalAnthropic(admission);
       }
 
       // #83 grain 2: capability vocabulary — lift the session's declaration from
@@ -3270,6 +3355,36 @@ export async function createProxyServer(
         );
       }
 
+      // #1055 g2 CR B4 — the operator STOP check above the relay, same rule
+      // as /v1/messages (this ingress is the sk-agent wire of #1055's
+      // harness): the stop holds on THIS node in BOTH relay modes — a NOMINAL
+      // forward would relay a stopped lane to the hub and keep spending. The
+      // budget admission stays below the relay (the hub counts relayed
+      // tokens). Inert without CLAUDISH_LANE_STOP_DIR / a lane header.
+      {
+        const stop = laneStopRefusal(
+          c.req.header("x-claudish-lane") ?? null,
+          typeof openaiBody?.model === "string" ? openaiBody.model : "",
+          process.env
+        );
+        if (stop) {
+          return c.json(
+            {
+              error: {
+                message: stop.message,
+                type: "rate_limit_error",
+                code: null,
+              },
+            },
+            429,
+            {
+              "retry-after": String(stop.retryAfterSec),
+              "x-claudish-lane-refusal": stop.type,
+            }
+          );
+        }
+      }
+
       // Relay (sidecar NOMINAL): forward the RAW OpenAI body to the hub's
       // /v1/chat/completions — the hub translates. forwardToUpstream is
       // path-aware, so the forward reaches the route the client hit, not
@@ -3324,6 +3439,38 @@ export async function createProxyServer(
             },
             429,
             { "retry-after": String(admission.retryAfterSec) }
+          );
+        }
+      }
+
+      // #1055 g2 CR B3 — the lane admission mirrors here too. The repo names
+      // this ingress as the sk-agent one in four places (route comments,
+      // openai-ingress.md, #1055's harness IS an sk-agent agent), so the
+      // budget must gate this wire exactly like /v1/messages. CR B4: the
+      // emergency-stop half runs ABOVE the relay branch on both wires (see
+      // the pre-relay stop block); this admission is the budget half.
+      // Same typed header as the native ingress; the ledger keys on the same
+      // client spelling (`anthropicBody.model` — pre-pin, pre-failover).
+      {
+        const admission = admitLaneBudget(
+          c.req.header("x-claudish-lane") ?? null,
+          (anthropicBody.model as string) ?? "",
+          process.env
+        );
+        if (admission?.refused) {
+          return c.json(
+            {
+              error: {
+                message: admission.message,
+                type: "rate_limit_error",
+                code: null,
+              },
+            },
+            429,
+            {
+              "retry-after": String(admission.retryAfterSec),
+              "x-claudish-lane-refusal": admission.type,
+            }
           );
         }
       }

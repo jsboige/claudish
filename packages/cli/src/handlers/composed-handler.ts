@@ -61,6 +61,8 @@ import { conversationMessages } from "../code-mode/types.js";
 // readers parse.
 import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
+// #1055 g2 / #1060 — the harness-lane ledger twin of the session budget.
+import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
 import { getHookEngine } from "../hooks/index.js";
 import { type RawStreamTap, statsNames } from "../hooks/raw.js";
 import type { UpstreamFacts } from "../hooks/registry.js";
@@ -3544,6 +3546,9 @@ export class ComposedHandler implements ModelHandler {
       // attempt). Never throws; a no-op when the instrument is inert (no token
       // attached) — so an unarmed fleet runs this identical path for free.
       recordSessionBudgetOutput(c.req.raw, output);
+      // #1055 g2: the same report feeds the harness-lane ledger (own attempt
+      // token, inert without a lane header AND a bar).
+      recordLaneBudgetOutput(c.req.raw, output);
       const strategy = this.options.tokenStrategy || "standard";
       switch (strategy) {
         case "accumulate-both":

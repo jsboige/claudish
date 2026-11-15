@@ -199,6 +199,8 @@ Claudish applies the placeholders together with `forceLoginMethod: "console"` on
 
 **Note on `OPENCODE_BASE_URL`**: For the Zen Go plan endpoint, Claudish replaces `/zen` with `/zen/go` automatically. Setting `OPENCODE_BASE_URL=https://opencode.ai/zen` is equivalent to the default.
 
+**Fork note (this fork)**: the table above documents the upstream default `https://api.minimax.io` for `MINIMAX_BASE_URL`; this fork's code keeps `https://api.minimaxi.com` as the built-in MiniMax default (`providers/provider-definitions.ts`, `config-command.ts` — the China-platform host), pinned by `provider-definitions.test.ts`. Set `MINIMAX_BASE_URL` explicitly on seats that target the `.io` host.
+
 ### 3.5 Local Provider Endpoints
 
 | Variable | Provider | Default |

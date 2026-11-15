@@ -882,3 +882,68 @@ each has a different remedy and a different reset anchor. The providers' own
 consoles, the reading recipe and the baseline ledger live in
 [`subscription-consoles.md`](subscription-consoles.md)
 (`python scripts/console-tabs.py list`).
+
+## Harness lane budget & emergency stop (#1055)
+
+Distinct concern from the role cascades above: a *harness lane* (`x-claudish-lane`,
+e.g. `nb-coder`) is capped per (lane, model) on upstream output tokens over a
+sliding 24 h — `CLAUDISH_LANE_BUDGETS=nb-coder/nb-minimax:500000,nb-coder:1000000`
+(`/` entry wins over the lane-wide default). Both knobs are inert until a
+recreate carries values (#310); nothing ships armed.
+
+**Tripping the emergency stop** (`CLAUDISH_LANE_STOP_DIR`): create a FILE named
+exactly after the lane inside the dir — the operator does not restart anything:
+
+```powershell
+docker exec claudish-sidecar sh -c "touch /lane-stop/nb-coder"   # stop, one seat
+docker exec claudish-proxy  sh -c "touch /lane-stop/nb-coder"   # stop, the hub (every relayed lane)
+docker exec claudish-sidecar sh -c "rm /lane-stop/nb-coder"      # lift
+```
+
+Name the file exactly as the lane appears in the capture envelope or the daily
+report. Whether another case also matches depends on the mount, not on the
+container: on a Docker Desktop Windows bind mount (`drvfs`) a file named
+`nb-coder` was measured to match `/lane-stop/NB-CODER` from inside the
+container (15/11), and a Linux-native mount is untested. The bar and the
+capture key are case-sensitive everywhere.
+
+The dir must be volume-mounted into the container at the path the env names
+(`docker-compose.yml` carries the env name but mounts nothing by default — a
+seat that arms the stop adds the bind). A stopped lane's requests are refused
+locally with `x-claudish-lane-refusal: stop` (900 s retry-after); every other
+lane and lane-less traffic is untouched.
+
+**Where each check runs (CR B4, measured):** the STOP check sits ABOVE the
+relay branch on both ingresses — a stop file belongs to the node the operator
+controls, so it holds there in BOTH relay modes (NOMINAL forward and
+AUTONOMOUS serve; pre-B4 a NOMINAL sidecar relayed a stopped lane to the hub
+and answered 200). The BUDGET admission sits BELOW the relay: only the node
+that serves counts tokens, and for relayed traffic that is the hub. In one
+sentence each — stop on a sidecar: that seat's lanes, both modes; stop on the
+hub: every relayed lane; budget: always the admitting node (hub in NOMINAL,
+the seat itself in AUTONOMOUS). Which LOG carries which REFUSE line (CR3 B5):
+**stop REFUSE — the node holding the stop file; budget REFUSE — the admitting
+node.** `admitLaneBudget` itself is budget-only (the redundant inner stop
+re-check was removed; the route check is unconditional and always first).
+
+**Ledger attach sites (CR3 B5, pinned by route L10):** the attempt-open runs
+at the loop site AND at the #299-B walk site. On the **#654 endpoint
+budget-skip → walk** path the loop-site open NEVER runs (it lives in the
+`else` of the synthesized 529), so the walk-site open is the ONLY thing
+attaching a ledger token — without it, a lane whose nominal sits behind a
+saturated endpoint budget spends through the walk with nothing booked
+(measured: consumed 0 while the walk served 400).
+
+**Two spellings of one lane entry are DELIBERATE (N4 decision):** the g2
+budget bar and the ledger key on the **admission model** — the client alias
+`body.model` as sent (`claude-sonnet-5`, pre-pin, pre-failover) — while the g3
+daily report's per-model table keys on the **served id** the upstream actually
+answered (`MiniMax-M3.1-Flash`, the resolved concrete). The bar gates what the client
+asks for; the report explains what was paid. A report joined back to the bar
+must map alias→served through the route resolution, never by string equality.
+
+Both refusals (budget and stop) log a `[Lane…] REFUSE` **stdout** line
+(`logger.ts`'s `log(msg, true)` is `console.log` — `docker logs` reads both
+streams, but an operator capturing `2> file` would read a false zero) — the
+lane report's refusal feed, since a refused request writes no capture (it
+never reaches `logRequest`).

@@ -146,6 +146,19 @@ export function extractAttributionFields(body: Record<string, unknown>): Record<
   return out;
 }
 
+/**
+ * #1055 CR N6 — the ONE harness-lane sanitizer, exported from the g1 site so
+ * the attribution key (capture envelope) and the budget ledger key (#1060)
+ * cannot drift apart. Leading dot refused (#1060 CR N1): the dot-only lanes
+ * `.` and `..` would resolve to the stop dir and its parent on the budget
+ * side — a lane starting with `.` is not a lane. Alphabet [a-zA-Z0-9._-],
+ * 64 max, same contract as `workspace`.
+ */
+export function sanitizeHarnessLane(raw: string | null | undefined): string {
+  const s = (raw ?? "").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 64);
+  return s.startsWith(".") ? "" : s;
+}
+
 export function logRequest(
   body: Record<string, unknown>,
   handlerName: string,
@@ -174,6 +187,18 @@ export function logRequest(
   const workspace = (req.headers.get("x-claudish-workspace") || "")
     .replace(/[^a-zA-Z0-9._-]/g, "")
     .slice(0, 64);
+
+  // #1055 — the harness-lane half of the attribution chain: `machine` names
+  // the box, `workspace` the seat, this names the PRODUCER harness (e.g.
+  // "nb-coder"), so its traffic shows as a distinct line in the consumption
+  // table. ALWAYS written like `hops` (#566): "" = no lane header on the
+  // request, key ABSENT = capture written before #1055. That unconditional
+  // write is also what lets traffic-consumption.py take the FIRST regex match
+  // on the head — a conditional field would let a body occurrence
+  // (e.g. a web tool result quoting `"lane":`) win the search on the
+  // pre-#1055 corpus. Sanitized like workspace: client-supplied, lands on
+  // disk, read back by the analyzers — [a-zA-Z0-9._-], 64 max.
+  const harnessLane = sanitizeHarnessLane(req.headers.get("x-claudish-lane"));
 
   // #566 — the relay's hop chain (the same header #156/#279 appends for loop
   // detection), captured so a relayed request is distinguishable from a direct
@@ -235,6 +260,10 @@ export function logRequest(
       // between them would spend that window on a field no leak verdict needs.
       // Forward-ported from #752 (main).
       ...(workspace ? { workspace } : {}),
+      // #1055 — ALWAYS written (see the harnessLane comment above): "" = no
+      // lane, absent key = pre-#1055 capture. Seated after `workspace` and
+      // after `model` for the same leak-window reason (#41).
+      lane: harnessLane,
       pid: process.pid,
       // #662 — the per-process instanceId (#156) as a payload FIELD: `pid` is 1
       // in EVERY container life (the proxy is the image's command), so it cannot

@@ -56,6 +56,11 @@ HDR = re.compile(r"^#\s*parser=(\S+)\s+model=(\S+)\s+reqN=(\d+)\s+pid=(\d+)", re
 RESP_TS = re.compile(r"resp-\d+-r\d+-(\d{4}-\d{2}-\d{2}T[\d-]+Z)-")
 
 MACHINE_FIELD = re.compile(r'"machine"\s*:\s*"([^"]*)"')
+# #1055 — lane harnais (champ enveloppe, TOUJOURS ecrit cote proxy depuis
+# #1055 : "" = pas de lane, cle absente = capture pre-#1055). La recherche est
+# BORNEE a la zone avant "body" : sur un corpus pre-#1055, une occurrence de
+# "lane" dans le corps (resultat d'outil web, message) ne doit pas gagner.
+LANE_FIELD = re.compile(r'"lane"\s*:\s*"([^"]*)"')
 BILLING_EP = re.compile(r"cc_entrypoint=([^;\s]+)")
 BILLING_WL = re.compile(r"cc_workload=([^;\s]+)")
 # #98: champs d'attribution persistes dans l'enveloppe (avant le body dans le
@@ -224,11 +229,15 @@ def load_requests(cdir, cutoff_dt):
         mm = MACHINE_FIELD.search(head)
         em = ENTRYPOINT_FIELD.search(head) or BILLING_EP.search(head)
         wm = WORKLOAD_FIELD.search(head) or BILLING_WL.search(head)
+        # #1055 — borné à l'enveloppe (avant "body") : voir LANE_FIELD.
+        env = head[: head.find('"body"')] if '"body"' in head else head
+        lm = LANE_FIELD.search(env)
         reqs[(int(m.group(1)), int(m.group(2)))].append({
             "ts": m.group(3),
             "machine": mm.group(1) if mm else "",
             "ep": em.group(1) if em else "",
             "wl": wm.group(1) if wm else "",
+            "hlane": lm.group(1) if lm else "",
         })
     for v in reqs.values():
         v.sort(key=lambda d: d["ts"])
@@ -254,6 +263,10 @@ def main():
     ap.add_argument("--dir", default=os.environ.get("CLAUDISH_CAPTURE_DIR", r"D:\claudish-captures"))
     ap.add_argument("--json", action="store_true", help="sortie JSON machine-lisible (Phase 3)")
     ap.add_argument("--machines", action="store_true", help="rollup supplementaire par lane x machine")
+    ap.add_argument("--harness-lanes", action="store_true",
+                    help="rollup supplementaire par lane harnais (#1055 — champ "
+                         "enveloppe 'lane', ex. nb-coder ; les requetes sans lane "
+                         "harnais sont exclues du rollup, pas de la table principale)")
     ap.add_argument("--fleet", default="",
                     help="machines sidecar attendues (separees par des virgules) — "
                          "active l'avertissement d'angle mort AUTONOMOUS (#933)")
@@ -270,6 +283,10 @@ def main():
 
     lanes = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
     machines = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
+    # #1055 — cle = "<lane harnais> | <machine>" : la lane harnais seule ne
+    # suffit pas (deux sieges peuvent porter le meme harnais), la machine seule
+    # ne distingue pas le harnais du reste du siege.
+    hlanes = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
     n_resp = n_paired = n_unpaired = n_nousage = 0
     first_dt = last_dt = None
 
@@ -300,7 +317,7 @@ def main():
         req = pick_request(reqs.get((pid, reqn)) or [], tsm.group(1) if tsm else None)
         if req is None:
             n_unpaired += 1
-            info = {"machine": "(unpaired)", "ep": "", "wl": ""}
+            info = {"machine": "(unpaired)", "ep": "", "wl": "", "hlane": ""}
             bucket = "other"
         else:
             n_paired += 1
@@ -313,7 +330,12 @@ def main():
         else:
             inp, out, cread, ccre = u
         lane = lane_for(model)
-        for table, key in ((lanes, lane), (machines, f"{lane} | {info['machine'] or 'direct'}")):
+        keys = [(lanes, lane), (machines, f"{lane} | {info['machine'] or 'direct'}")]
+        # #1055 — le rollup harnais n'accumule que les requetes porteuses d'une
+        # lane harnais declaree (une absence n'est pas un 0 mesurable).
+        if info.get("hlane"):
+            keys.append((hlanes, f"{info['hlane']} | {info['machine'] or 'direct'}"))
+        for table, key in keys:
             r = table[key][bucket]
             r["n"] += 1
             r["inp"] += inp
@@ -346,12 +368,20 @@ def main():
             "files": {"resp": n_resp, "paired": n_paired, "unpaired": n_unpaired, "no_usage": n_nousage},
             "lanes": {k: v for k, v in lanes.items()},
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
+            "harness_lanes": {k: v for k, v in hlanes.items()} if args.harness_lanes else None,
             "blind_spot": {k: v for k, v in blind.items()} or None,
         }, indent=2))
         return
 
     total_out = sum(r["out"] for b in lanes.values() for r in b.values())
-    print(f"fenetre: {args.hours}h demandees | couverture {first_dt:%H:%M} -> {last_dt:%H:%M}Z ({span_h:.2f} h)")
+    # Fenetre a 0 resp (sidecar NOMINAL : les captures vont au hub) : la
+    # couverture se NOMME vide, elle ne crashe pas au format d'une date
+    # inexistante — un instrument doit rendre un verdict sur un corpus vide.
+    if first_dt and last_dt:
+        couv = f"couverture {first_dt:%H:%M} -> {last_dt:%H:%M}Z ({span_h:.2f} h)"
+    else:
+        couv = "couverture (aucune resp dans la fenetre)"
+    print(f"fenetre: {args.hours}h demandees | {couv}")
     print(f"resp: {n_resp} | appariees: {n_paired} | non appariees: {n_unpaired} | sans usage: {n_nousage}")
     print()
     hdr = f"{'lane':24} {'bucket':12} {'req':>6} {'in_tok':>13} {'out_tok':>12} {'cache_rd':>13} {'cache_wr':>12} {'hit%':>5} {'in/h':>13} {'out/h':>12}"
@@ -384,6 +414,20 @@ def main():
         for key in sorted(machines):
             tot = {k: sum(r[k] for r in machines[key].values()) for k in ("n", "inp", "out")}
             print(f"  {key:46} req {tot['n']:>6}  in {fmt_int(tot['inp']):>13}  out {fmt_int(tot['out']):>12}")
+
+    # #1055 — le rollup harnais se render MEME sans requete porteuse quand le
+    # drapeau est passe : la ligne "aucune requete porteuse de lane harnais"
+    # nomme l'absence (l'enveloppe ne porte pas encore le champ, ou le harnais
+    # n'a pas tourne) au lieu d'un tableau absent qu'on lirait comme un 0.
+    if args.harness_lanes:
+        print()
+        print("== par lane harnais (#1055) ==")
+        if not hlanes:
+            print("  aucune requete porteuse de lane harnais dans la fenetre")
+        for key in sorted(hlanes):
+            tot = {k: sum(r[k] for r in hlanes[key].values()) for k in ("n", "inp", "out", "cread", "ccre")}
+            print(f"  {key:46} req {tot['n']:>6}  in {fmt_int(tot['inp']):>13}  out {fmt_int(tot['out']):>12}"
+                  f"  cache_rd {fmt_int(tot['cread']):>13}")
 
     # #933 : la section se render meme sans --machines — une absence lue comme
     # un 0 est le mensonge que ce rapport existe pour empecher.
