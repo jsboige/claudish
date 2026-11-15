@@ -900,11 +900,12 @@ docker exec claudish-proxy  sh -c "touch /lane-stop/nb-coder"   # stop, the hub 
 docker exec claudish-sidecar sh -c "rm /lane-stop/nb-coder"      # lift
 ```
 
-The file NAME is the lane exactly as the capture envelope or the daily report
-shows it — case-sensitive inside the container (Linux; on the NTFS host a
-`NB-CODER` file would match by filesystem case-insensitivity, inside the
-container it would not). The bar and the capture key are case-sensitive
-everywhere.
+Name the file exactly as the lane appears in the capture envelope or the daily
+report. Whether another case also matches depends on the mount, not on the
+container: on a Docker Desktop Windows bind mount (`drvfs`) a file named
+`nb-coder` was measured to match `/lane-stop/NB-CODER` from inside the
+container (15/11), and a Linux-native mount is untested. The bar and the
+capture key are case-sensitive everywhere.
 
 The dir must be volume-mounted into the container at the path the env names
 (`docker-compose.yml` carries the env name but mounts nothing by default — a

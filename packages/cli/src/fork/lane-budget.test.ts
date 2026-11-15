@@ -212,7 +212,7 @@ describe("lane-budget (#1055 g2)", () => {
     }
   });
 
-  it("the stop refuses even when no budget is configured at all", () => {
+  it("the stop refuses while the lane is under its budget bar (the budget half alone admits)", () => {
     const dir = mkdtempSync(join(tmpdir(), "lane-stop-order-"));
     try {
       const env = ENV({ CLAUDISH_LANE_STOP_DIR: dir, CLAUDISH_LANE_BUDGETS: "nb-coder:100000" });
