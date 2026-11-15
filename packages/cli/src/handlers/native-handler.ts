@@ -1,5 +1,7 @@
 import type { Context } from "hono";
 import { credentials } from "../auth/credentials/authority.js";
+// #1055 g2 / #1060 — the harness-lane ledger twin of the session budget.
+import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
 // Capture pipeline (#641 blocker-2 port): resp-*.sse tap + [resp] stdout
 // marker on the streaming branch, and a durable appendUpstreamError trace of
 // non-ok bodies — NativeHandler is the ONLY path for Anthropic-native traffic,
@@ -33,6 +35,7 @@ import {
   cancelEndsUpstreamWork,
 } from "./shared/stream-parsers/upstream-cancel.js";
 import { stripUnsignedThinkingBlocks } from "./shared/thinking-signature.js";
+import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import type { ModelHandler } from "./types.js";
 
 /** One SSE line split into its field name and value (one leading space dropped), per the SSE spec. */
@@ -281,11 +284,26 @@ export class NativeHandler implements ModelHandler {
     addSigningSecrets(c, credentialValuesFromRequest(headers));
 
     // Execute fetch
+    // #780: the abort controller reaches the fetch so a client cancel can end
+    // the upstream turn instead of letting it run (and bill) to completion.
+    // #909 — gzip the request body toward api.anthropic.com (capability proven:
+    // Claude Code itself sends gzipped bodies in production — anthropics/
+    // claude-code#103218; our credential-free probe showed no regression: the
+    // 401 auth answer is identical plain vs gzipped). Kill switch and floor
+    // live in upstream-compression.ts.
+    const upstreamAbort = new AbortController();
     try {
+      const wireBody = compressUpstreamRequestBody({
+        capability: "gzip",
+        headers,
+        body: JSON.stringify(payload),
+        label: `Anthropic-native ${String(payload?.model ?? "claude")}`,
+      });
       const anthropicResponse = await fetch(`${this.baseUrl}/v1/messages`, {
         method: "POST",
         headers,
-        body: JSON.stringify(payload),
+        body: wireBody,
+        signal: upstreamAbort.signal,
       });
 
       const contentType = anthropicResponse.headers.get("content-type") || "";
@@ -369,6 +387,8 @@ export class NativeHandler implements ModelHandler {
                       if (line.includes('"output_tokens"')) {
                         for (const m of line.matchAll(/"output_tokens"\s*:\s*(\d+)/g)) {
                           recordSessionBudgetOutput(c.req.raw, Number(m[1]));
+                          // #1055 g2 — the same report feeds the harness-lane ledger.
+                          recordLaneBudgetOutput(c.req.raw, Number(m[1]));
                         }
                       }
                       held.push(line);
@@ -449,7 +469,11 @@ export class NativeHandler implements ModelHandler {
       // #317: non-streaming native usage feeds the session budget too.
       {
         const n = Number((data as any)?.usage?.output_tokens);
-        if (Number.isFinite(n) && n > 0) recordSessionBudgetOutput(c.req.raw, n);
+        if (Number.isFinite(n) && n > 0) {
+          recordSessionBudgetOutput(c.req.raw, n);
+          // #1055 g2 — the same report feeds the harness-lane ledger.
+          recordLaneBudgetOutput(c.req.raw, n);
+        }
       }
       log("\n=== [NATIVE] Response ===");
       log(JSON.stringify(data, null, 2));

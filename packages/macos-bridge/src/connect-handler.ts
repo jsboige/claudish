@@ -2428,10 +2428,10 @@ export class CONNECTHandler {
         timestamp: new Date().toISOString(),
         app: "Claude Desktop",
         confidence: 1.0,
-        requestedModel: sourceModel,
+        requestedModel: sourceModel ?? "unknown",
         targetModel: targetModel,
         status: 200,
-        latency: Date.now() - startTime,
+        latency: Date.now() - (startTime ?? Date.now()),
         inputTokens: usage?.prompt_tokens || 0,
         outputTokens: usage?.completion_tokens || 0,
         cost: 0, // TODO: compute cost based on model pricing

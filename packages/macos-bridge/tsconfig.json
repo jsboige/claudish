@@ -12,7 +12,10 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "outDir": "./dist",
-    "rootDir": "./src",
+    // No rootDir: routing-middleware.ts imports 13 modules from ../cli/src,
+    // outside ./src. With rootDir:./src those cross-imports raise TS6059 x155.
+    // The build is `bun build src/index.ts` (bundler), which never consults
+    // rootDir/outDir — dropping rootDir only removes the false containment.
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
@@ -28,6 +31,9 @@
     "skipLibCheck": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"],
-  "references": [{ "path": "../cli" }]
+  "exclude": ["node_modules", "dist"]
+  // No project reference to ../cli (#981): packages/cli is not composite, so the
+  // reference raised TS6306; making cli composite would emit declaration outputs
+  // and force CI build-order coupling. The bridge typechecks the cli sources it
+  // imports directly (they enter the program through the import graph).
 }

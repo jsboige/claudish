@@ -1,8 +1,38 @@
 name: Claude Code PR Assistant
 
+# Two jobs, one switch.
+#
+# Before this rewrite the workflow went green in ~10 s on every PR without ever
+# reviewing anything, for two independent reasons (run 43644203118, 14/11):
+#   1. no `prompt` input -> the action ran in agent mode with "Context prompt: NO
+#      PROMPT", logged "No trigger found, skipping remaining steps", and succeeded;
+#   2. no credential -> the fork carries no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
+#      secret, so even a triggered run could not have called a model.
+# It also took a runner for EVERY comment on a PR (the issue_comment trigger had no
+# `@claude` filter), inside an account-wide Actions queue that is often saturated.
+#
+# Now:
+#   - `review` runs a real review prompt when a PR is opened / reopened / marked ready;
+#   - `mention` answers an `@claude` comment from a repository member;
+#   - BOTH are gated at job level on the repository variable CLAUDE_PR_REVIEW == 'on'.
+#     A job-level `if` is evaluated before any runner is allocated, so while the
+#     switch is off the jobs show "skipped" (honest) and cost zero runner time.
+#
+# To turn it on (repository owner): add ONE credential secret, then the variable.
+#   gh secret set CLAUDE_CODE_OAUTH_TOKEN -R jsboige/claudish   # from `claude setup-token`
+#     (or: gh secret set ANTHROPIC_API_KEY -R jsboige/claudish   # pay-as-you-go)
+#   gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body on
+# To turn it off again: gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body off
+#
+# A fork PR's `pull_request` event carries no repository secrets, so `review` skips
+# fork heads. `mention` is different: `issue_comment` runs in the base repository WITH
+# secrets, even on a fork PR. It is therefore limited to OWNER/MEMBER/COLLABORATOR
+# authors, on top of the action's own `restrict_untrusted_prs` default.
+# `contains()` is case-insensitive; "@claude-bot" would still start a no-op run.
+
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, reopened, ready_for_review]
   pull_request_review_comment:
     types: [created]
   issue_comment:
@@ -14,66 +44,84 @@ permissions:
   issues: write
 
 jobs:
-  claude-code:
+  review:
+    if: |
+      vars.CLAUDE_PR_REVIEW == 'on' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    # Three separate concerns in this condition:
-    #
-    # 1. Never loop on our own bot's comments.
-    # 2. For issue_comment, only run when the comment is on a PR.
-    # 3. Comment events run in the BASE repo context, so unlike a fork
-    #    `pull_request` they DO receive repository secrets (ANTHROPIC_API_KEY)
-    #    and a token with pull-requests/issues write. Since the checkout step
-    #    below now resolves to refs/pull/N/head — i.e. contributor-controlled
-    #    content on a fork PR — the trigger must be restricted to people who
-    #    already have write access. Nothing here executes the checked-out code,
-    #    so this is not RCE, but the action READS those files and prompt
-    #    injection is a real path to making it act with that write token.
-    #    claude-code-action performs its own actor check at runtime; this makes
-    #    the boundary explicit in the workflow instead of relying on that.
-    #
-    # A fork `pull_request` gets no secrets, so the action can only fail. Skip it
-    # rather than leaving a guaranteed red X on every external contribution
-    # (see #101, whose only failing check was exactly this).
-    if: |
-      (github.event_name == 'pull_request' &&
-        github.event.pull_request.head.repo.full_name == github.repository) ||
-      ((github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
-        github.event.comment.user.login != 'github-actions[bot]' &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
-        (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request))
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
         with:
-          fetch-depth: 0
-          # For an `issue_comment` event GitHub's context points at the DEFAULT BRANCH,
-          # not the PR — `actions/checkout` then checks out `main` and the action reviews
-          # the wrong tree. It is invisible on a PR that only edits existing files, and
-          # fatal on one that ADDS them: the action's data fetcher tries to read each
-          # changed file, every new path is absent, and the run dies with
-          # `fatal: could not open '<new file>' for reading` before Claude sees anything.
-          # Observed on #158 (16 new files): two runs, ~3m each, is_error with no review.
-          # `pull_request` events already resolve to refs/pull/N/merge, so this only
-          # needs to fill in the comment-triggered cases.
-          #
-          # BOTH comment events need it, not just issue_comment: a
-          # pull_request_review_comment has the same default (GITHUB_REF is the
-          # default branch) and therefore the same bug. The two carry the PR
-          # number in different places — issue_comment has github.event.issue,
-          # pull_request_review_comment has github.event.pull_request and no
-          # `issue` object at all.
-          ref: >-
-            ${{ github.event_name == 'issue_comment'
-                && format('refs/pull/{0}/head', github.event.issue.number)
-                || github.event_name == 'pull_request_review_comment'
-                && format('refs/pull/{0}/head', github.event.pull_request.number)
-                || '' }}
+          fetch-depth: 1
 
-      - name: Claude Code Action
+      - name: Claude Code review
         uses: anthropics/claude-code-action@v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. Read CLAUDE.md first: it is the decision layer of
+            this repository, and its "Never-Hang Constraints" section is non-negotiable.
+
+            Report only defects you can point to in the diff, each with file:line and a
+            concrete failure scenario (inputs or state -> wrong output, crash or hung
+            stream). Priorities, in order:
+              1. a path that can stall or break a client stream (no message_stop, a
+                 controller.error() in production sources, SSE returned to stream:false);
+              2. a secret, key fragment, personal name, email, IP or absolute local path
+                 added to this public repository;
+              3. a behaviour change with no test pinning it, or a test that would still
+                 pass if the change were reverted;
+              4. a claim in the PR body or a comment that the code does not support.
+            Do not comment on style. Do not restate what the diff does. If you find
+            nothing, say so in one sentence.
+
+            Use inline comments for defects tied to a line, and one top-level comment
+            for the summary.
+          claude_args: |
+            --max-turns 30
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
+
+  mention:
+    if: |
+      vars.CLAUDE_PR_REVIEW == 'on' &&
+      (
+        (github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request &&
+          contains(github.event.comment.body, '@claude') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review_comment' &&
+          contains(github.event.comment.body, '@claude') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Claude Code (@claude mention)
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --max-turns 30

@@ -18,6 +18,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { AggregatorEntry } from "../model-loader.js";
+import { resolveNativeModelPin } from "../proxy-server.js";
 import type { SlimModelEntry } from "./all-models-cache.js";
 import { _resetCatalogClient, _setCatalogEntriesForTest } from "./catalog-client.js";
 import {
@@ -236,6 +237,50 @@ describe("pin override seam (row 3 / #219)", () => {
   test("the override seam is inert by default — the #218 pin is what serves", () => {
     setNativePinOverridesForTests(null);
     expect(applyNativePinOverride("claude-opus-5-5")).toBe("claude-opus-5-5");
+  });
+
+  test("an opus override never re-points another family's pin", () => {
+    setNativePinOverridesForTests({ opus: "claude-opus-6-0" });
+    expect(resolveNativeModelPin("claude-fable-5", { fable: "claude-fable-5-1" })).toBe(
+      "claude-fable-5-1"
+    );
+    expect(resolveNativeModelPin("claude-sonnet-5", { sonnet: "claude-sonnet-5" })).toBeUndefined();
+  });
+
+  test("#1017: a client already on the configured version still gets the adopted one", () => {
+    // Fleet state 13/11: seats send claude-fable-5-1, hub pins claude-fable-5-1,
+    // the watch adopted claude-fable-5-2. The no-op guard must see the override.
+    setNativePinOverridesForTests({ fable: "claude-fable-5-2" });
+    expect(resolveNativeModelPin("claude-fable-5-1", { fable: "claude-fable-5-1" })).toBe(
+      "claude-fable-5-2"
+    );
+    expect(resolveNativeModelPin("claude-fable-5", { fable: "claude-fable-5-1" })).toBe(
+      "claude-fable-5-2"
+    );
+  });
+
+  test("#1017: a client asking for exactly the adopted id is not rewritten", () => {
+    setNativePinOverridesForTests({ fable: "claude-fable-5-2" });
+    expect(
+      resolveNativeModelPin("claude-fable-5-2", { fable: "claude-fable-5-1" })
+    ).toBeUndefined();
+  });
+
+  test("#1017: without an override, configured == requested stays a no-op", () => {
+    expect(
+      resolveNativeModelPin("claude-fable-5-1", { fable: "claude-fable-5-1" })
+    ).toBeUndefined();
+  });
+
+  test("the #218 kill switch disarms the whole pin, override included", () => {
+    setNativePinOverridesForTests({ opus: "claude-opus-6-0" });
+    expect(
+      resolveNativeModelPin(
+        "claude-opus-5",
+        { opus: "claude-opus-5-5" },
+        { CLAUDISH_NATIVE_MODEL_PIN: "0" }
+      )
+    ).toBeUndefined();
   });
 });
 

@@ -93,6 +93,9 @@ EXTERNAL_ALLOWLIST = {
     "baseRefName",             # GitHub GraphQL schema field (gh pr view)
     "mergeStateStatus",        # GitHub GraphQL schema field (gh pr view)
     "CronList",               # Claude Code built-in tool (session scheduler)
+    "settings.json",          # Claude Code client settings (~/.claude/settings.json
+                              # on each machine, read by settings-matrix.py) -- no
+                              # tracked file of that name exists in this repo
 }
 
 # Scoped external allowlist: per-doc-path adjudications for tokens that can

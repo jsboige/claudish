@@ -238,6 +238,16 @@ is the only honest discriminator, and it reads the address, not the error.
 | client disconnected (Esc in Claude Code) | 499 (unread) | — | the socket is already gone |
 | unclassifiable throw on any attempt | rethrown unchanged | — | recovery must not widen what "transient" means |
 
+**C-14 amendment (#1054 CR B3a, coordinator arbitration): the wording follows the
+classified KIND.** In the exhaustion body (lease or no lease, chain-combined or
+banner), the client is told the upstream failed **in the words of its kind** — a
+refused connect stays `Cannot reach`/`Cannot connect`, and a peer that ACCEPTED
+then closed is #251's statement ("the connection … was closed before a response
+arrived … usually the provider or a proxy in between, **not your network**").
+Never "your network" for a closed peer, and never the refused-connect wording for
+one. The C-14 executable pin asserts the kind's wording plus the endpoint, not a
+single literal across kinds.
+
 ### There are no keys, and that is a trade
 
 The first banner was a pane of claudish's own, with `[r] try now` and `[q] give up`. Closing that

@@ -92,6 +92,8 @@ describe("Group 1: MCP Protocol — session tools", () => {
     expect(names).toEqual([
       "cancel_session",
       "capture_session",
+      "claudish_capabilities",
+      "claudish_status",
       "compare_models",
       "create_session",
       "get_diagnostics",
@@ -299,10 +301,16 @@ describe("Group 1b: MCP Protocol — low-level-only tools", () => {
     } catch {}
   });
 
-  test("lists only the 3 low-level tools when CLAUDISH_MCP_TOOLS=low-level", async () => {
+  test("lists only the 5 low-level tools when CLAUDISH_MCP_TOOLS=low-level", async () => {
     const result = await client.listTools();
     const names = result.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["list_models", "run_prompt", "search_models"]);
+    expect(names).toEqual([
+      "claudish_capabilities",
+      "claudish_status",
+      "list_models",
+      "run_prompt",
+      "search_models",
+    ]);
   });
 });
 
@@ -312,6 +320,8 @@ for (const [toolMode, expected] of [
     [
       "cancel_session",
       "capture_session",
+      "claudish_capabilities",
+      "claudish_status",
       "compare_models",
       "create_session",
       "get_diagnostics",

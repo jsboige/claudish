@@ -116,7 +116,15 @@ Describe 'memory witness (2026-10-27 01:06Z wedge)' {
 
     It 'degrades to n/a per counter, never to an exception' {
         Mock Get-Process { $null } -ParameterFilter { $Name -eq 'vmmemWSL' }
-        Mock Get-CimInstance { $null } -ParameterFilter { $Class -eq 'Win32_OperatingSystem' }
+        # The production call is POSITIONAL (Get-CimInstance Win32_OperatingSystem),
+        # so the bound parameter name decides whether the filter sees the value:
+        # Windows PowerShell 5.1's Pester binds the alias ($Class), pwsh 7's binds
+        # the real name ($ClassName) - a one-name filter silently misses on the
+        # other seat and the REAL CIM query runs (host_free_gb=10.1 instead of
+        # n/a, measured 09/11 on this seat). Accept both bound forms.
+        Mock Get-CimInstance { $null } -ParameterFilter {
+            ($Class -eq 'Win32_OperatingSystem') -or ($ClassName -eq 'Win32_OperatingSystem')
+        }
         (Get-MemoryWitness) | Should -Be ' vmmem_gb=n/a host_free_gb=n/a'
     }
 

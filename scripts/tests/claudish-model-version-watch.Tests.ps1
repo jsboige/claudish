@@ -854,6 +854,32 @@ Describe 'Get-RoutingCoverage (#635 AC 1 — the watch states what it cannot see
     }
 }
 
+Describe 'Get-BuiltinProbeSurfaces (#892 - the authored table, read by both the CLI and this module)' {
+    It 'reads the shipped table: gc/ds/mmc with the URLs the CLI itself uses' {
+        $t = Get-BuiltinProbeSurfaces
+        $t.Count | Should -Be 3
+        @($t.Keys) -contains 'gc' | Should -BeTrue
+        @($t.Keys) -contains 'ds' | Should -BeTrue
+        @($t.Keys) -contains 'mmc' | Should -BeTrue
+        $t['ds'].BaseUrl | Should -Be 'https://api.deepseek.com'
+        $t['ds'].ApiPath | Should -Be '/v1/chat/completions'
+        $t['gc'].BaseUrl | Should -Be 'https://api.z.ai'
+        @($t['gc'].KeyEnvAliases) -contains 'ZAI_CODING_API_KEY' | Should -BeTrue
+    }
+
+    It 'a missing file is an empty table, not a throw — the report degrades, never dies' {
+        $t = Get-BuiltinProbeSurfaces -Path 'C:\definitely\not\here\builtin-probe-surfaces.json'
+        $t.Count | Should -Be 0
+    }
+
+    It 'a garbage file is an empty table too (never an incident on a scheduled watch)' {
+        $junk = Join-Path $TestDrive 'junk.json'
+        Set-Content -LiteralPath $junk -Value '{ this is not json'
+        $t = Get-BuiltinProbeSurfaces -Path $junk
+        $t.Count | Should -Be 0
+    }
+}
+
 Describe 'Get-ModelsUrl / Get-ProviderProbeTargets (#635 AC 2 - what this seat can probe)' {
     BeforeAll {
         # A routing surface shaped like the hub's, plus the two custom-endpoint
@@ -885,7 +911,10 @@ Describe 'Get-ModelsUrl / Get-ProviderProbeTargets (#635 AC 2 - what this seat c
     }
 
     It 'classifies every prefix in routing exactly once, and never invents a builtin URL' {
-        $t = Get-ProviderProbeTargets -Routing $script:routing -CustomEndpoints $script:endpoints
+        # #892 — with NO builtin table passed, the builtins keep today's blind
+        # spot. The table is opt-in per call, so a seat without the authored
+        # file behaves exactly as before (and says so).
+        $t = Get-ProviderProbeTargets -Routing $script:routing -CustomEndpoints $script:endpoints -BuiltinSurfaces @{}
         @($t).Count | Should -Be 6   # gc@ ds@ qwen-token-plan@ vllm-myia@ mmc@ cx@  (bare model ignored)
         @($t | Where-Object { $_.Prefix -eq 'vllm-myia@' })[0].Probeable | Should -BeTrue
         @($t | Where-Object { $_.Prefix -eq 'qwen-token-plan@' })[0].Url | Should -Be 'https://qwen.example/v1/models'
@@ -899,6 +928,28 @@ Describe 'Get-ModelsUrl / Get-ProviderProbeTargets (#635 AC 2 - what this seat c
             $one.Url | Should -BeNullOrEmpty
             $one.Reason | Should -Match 'no probe surface'
         }
+    }
+
+    It 'probes a builtin prefix when the authored table names it (#892)' {
+        # gc@/ds@/mmc@ are no longer a blind spot: the ONE authored table
+        # (packages/cli/src/providers/builtin-probe-surfaces.json, read by the
+        # CLI too) gives the watcher a real catalogue URL.
+        $surfaces = @{
+            'gc' = @{ BaseUrl = 'https://api.z.ai'; ApiPath = '/api/coding/paas/v4/chat/completions'; AuthScheme = 'bearer'; KeyEnv = 'GLM_CODING_API_KEY'; KeyEnvAliases = @('ZAI_CODING_API_KEY') }
+            'ds' = @{ BaseUrl = 'https://api.deepseek.com'; ApiPath = '/v1/chat/completions'; AuthScheme = 'bearer'; KeyEnv = 'DEEPSEEK_API_KEY'; KeyEnvAliases = @() }
+        }
+        $t = @(Get-ProviderProbeTargets -Routing $script:routing -CustomEndpoints $script:endpoints -BuiltinSurfaces $surfaces)
+        $byP = @{}
+        foreach ($x in $t) { $byP[$x.Prefix] = $x }
+        $byP['gc@'].Probeable | Should -BeTrue
+        $byP['gc@'].Kind | Should -Be 'builtin'
+        $byP['gc@'].Url | Should -Be 'https://api.z.ai/api/coding/paas/v4/models'
+        $byP['gc@'].KeyName | Should -Be 'GLM_CODING_API_KEY'
+        @($byP['gc@'].KeyNames).Count | Should -Be 2
+        $byP['ds@'].Url | Should -Be 'https://api.deepseek.com/v1/models'
+        # mmc@ is absent from the table: it keeps the honest reason
+        $byP['mmc@'].Probeable | Should -BeFalse
+        $byP['mmc@'].Reason | Should -Match 'no probe surface'
     }
 
     It 'carries the auth scheme and extra headers the proxy transport would use (#661 a)' {
@@ -1296,6 +1347,30 @@ Describe 'Invoke-ProviderCatalogProbe (#635 AC 2 - "not probed" is never "curren
         $o = @(Invoke-ProviderCatalogProbe -Targets @($script:targets[2]) -ApiKeys $script:keys -EnvLookup $script:noEnv -Fetcher $f)
         $o[0].Status | Should -Be 'not probed'
         $o[0].Reason | Should -Match 'no probe surface'
+    }
+
+    It 'resolves a credential through its ALIASES, in order (#892)' {
+        # gc@ answers to GLM_CODING_API_KEY or ZAI_CODING_API_KEY. A seat that
+        # holds only the alias must still be probed; the FIRST name that
+        # resolves wins, and the key itself never leaves this scope.
+        $script:seenAliasKey = ''
+        $f = { param($u, $k, $t) $script:seenAliasKey = $k; @{ Status = 200; Body = '{"data":[{"id":"glm-5.3"}]}' } }
+        $tgt = @{
+            Prefix = 'gc@'; Probeable = $true; Kind = 'builtin'
+            Url = 'https://api.z.ai/api/coding/paas/v4/models'
+            KeyName = 'GLM_CODING_API_KEY'; KeyNames = @('GLM_CODING_API_KEY', 'ZAI_CODING_API_KEY')
+            KeyInline = ''; AuthScheme = 'bearer'; ExtraHeaders = $null; Reason = ''
+        }
+        $o = @(Invoke-ProviderCatalogProbe -Targets @($tgt) -ApiKeys @{} -EnvLookup $script:noEnv -Fetcher $f)
+        $o[0].Status | Should -Be 'not probed'
+        $o[0].Reason | Should -Match 'no credential'
+        $o[0].Reason | Should -Match 'GLM_CODING_API_KEY'
+        $o[0].Reason | Should -Match 'ZAI_CODING_API_KEY'
+
+        $aliasOnly = { param($n) if ($n -eq 'ZAI_CODING_API_KEY') { 'k-alias' } else { '' } }
+        $o2 = @(Invoke-ProviderCatalogProbe -Targets @($tgt) -ApiKeys @{} -EnvLookup $aliasOnly -Fetcher $f)
+        $o2[0].Status | Should -Be 'probed'
+        $script:seenAliasKey | Should -Be 'k-alias'
     }
 
     It 'one failing provider does not stop the next one' {

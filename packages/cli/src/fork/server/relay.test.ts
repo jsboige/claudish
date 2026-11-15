@@ -426,6 +426,46 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     expect(state.consecutiveFail).toBe(0);
   });
 
+  // ── #1055 g2 CR B2: the typed lane refusal survives the hop ───────────────
+  // A lane refusal (budget/stop) is a JSON 429 carrying
+  // x-claudish-lane-refusal — never SSE — so whatever `stream` the client
+  // asked for, it lands on the non-streaming rebuild below. The pilot's
+  // harness reaches the hub THROUGH its sidecar; an untyped 429 there is
+  // indistinguishable from a quota wall, which is exactly what the typed
+  // header exists to prevent. Same composition argument as the drain-freeze
+  // marker above (#318): the property must hold across A→B→hub chains too.
+  it("a typed lane-refusal 429 keeps its marker across the relay rebuild, stream:false and stream:true alike (#1055 CR B2)", async () => {
+    const refusalBody = JSON.stringify({
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        message:
+          "[LaneBudget] lane daily output budget consumed 700 of 700 — defer this notebook; retry after 3600s",
+      },
+    });
+    fetchImpl = async () =>
+      new Response(refusalBody, {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "3600",
+          "x-claudish-lane-refusal": "budget",
+        },
+      });
+    for (const stream of [false, true]) {
+      const state = deadState();
+      const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream }, state);
+      expect(r).not.toBeNull();
+      expect(r!.status).toBe(429);
+      expect(await r!.text()).toBe(refusalBody);
+      expect(r!.headers.get("x-claudish-lane-refusal")).toBe("budget");
+      expect(r!.headers.get("retry-after")).toBe("3600");
+      // The hub ANSWERED (a 4xx is not liveness evidence against it): the
+      // relay stays NOMINAL, no local replay against the lane's own budget.
+      expect(state.consecutiveFail).toBe(0);
+    }
+  });
+
   it("a MARKED 503 passes through for a STREAMING request too, and two keep the relay NOMINAL (#318)", async () => {
     fetchImpl = async () =>
       new Response(DRAIN_FREEZE_503_BODY, { status: 503, headers: DRAIN_FREEZE_503_HEADERS });
@@ -439,6 +479,46 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     }
     expect(state.consecutiveFail).toBe(0); // a drain freeze never fed the hysteresis
     expect(state.alive).toBe(true); // still NOMINAL after two consecutive freezes
+  });
+
+  // ── #1055 g2 CR B2: the typed lane refusal survives the hop ───────────────
+  // A lane refusal (budget/stop) is a JSON 429 carrying
+  // x-claudish-lane-refusal — never SSE — so whatever `stream` the client
+  // asked for, it lands on the non-streaming rebuild below. The pilot's
+  // harness reaches the hub THROUGH its sidecar; an untyped 429 there is
+  // indistinguishable from a quota wall, which is exactly what the typed
+  // header exists to prevent. Same composition argument as the drain-freeze
+  // marker above (#318): the property must hold across A→B→hub chains too.
+  it("a typed lane-refusal 429 keeps its marker across the relay rebuild, stream:false and stream:true alike (#1055 CR B2)", async () => {
+    const refusalBody = JSON.stringify({
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        message:
+          "[LaneBudget] lane daily output budget consumed 700 of 700 — defer this notebook; retry after 3600s",
+      },
+    });
+    fetchImpl = async () =>
+      new Response(refusalBody, {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "3600",
+          "x-claudish-lane-refusal": "budget",
+        },
+      });
+    for (const stream of [false, true]) {
+      const state = deadState();
+      const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream }, state);
+      expect(r).not.toBeNull();
+      expect(r!.status).toBe(429);
+      expect(await r!.text()).toBe(refusalBody);
+      expect(r!.headers.get("x-claudish-lane-refusal")).toBe("budget");
+      expect(r!.headers.get("retry-after")).toBe("3600");
+      // The hub ANSWERED (a 4xx is not liveness evidence against it): the
+      // relay stays NOMINAL, no local replay against the lane's own budget.
+      expect(state.consecutiveFail).toBe(0);
+    }
   });
 
   it("an UNMARKED 503 keeps the fallthrough — a hub's own failure is NOT passed through (#318 control)", async () => {
@@ -1939,5 +2019,111 @@ describe("#279b — hop-list self-detection", () => {
     await forwardToUpstream(mockForwardContext({}), { model: "glm-5.2" }, state);
     const h = lastFetch!.init.headers as Record<string, string>;
     expect(h["x-claudish-hops"]).toBe(getInstanceId());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v28 — #587 g1: every relay flip carries the hub's own /health fields.
+//
+// The 13/11 tenue queued this grain because the issue's minute-join had turned
+// ZERO complete pairs: the relay journaled only its verdict, while
+// `eventLoopMax60sMs` and `activeStreams` exist live on the hub and nowhere in
+// this log. Two lines now carry the last body the hub actually said — the
+// DOWN flip (which may be minutes past that body: `age`) and the NOMINAL
+// line (whose body is the beat that just decided it). A field the image does
+// not publish reads `none`, never 0: coercing an absent counter to zero
+// manufactures "no loop stall" evidence forever (the 24/10 trap on this issue).
+//
+// Replatform note: on main this grain tested the per-episode "heartbeat
+// FAILED" line (v27's noteHeartbeatFailure). The replatform relay has no
+// per-episode failure log — its failure flip is markFail's single DOWN line —
+// so C1/C2 pin THAT line; the contract under test (#1061: every flip carries
+// the hub's fields) is the same.
+describe("#587 g1 — flip lines carry the hub's /health fields", () => {
+  const realConsoleLog = console.log;
+  let lines: string[];
+
+  beforeEach(() => {
+    lines = [];
+    console.log = ((m: unknown) => {
+      lines.push(String(m));
+    }) as typeof console.log;
+  });
+  afterEach(() => {
+    console.log = realConsoleLog;
+  });
+
+  const down = () => lines.filter((l) => l.includes("→ AUTONOMOUS"));
+  const nominal = () => lines.filter((l) => l.includes("healthy again → NOMINAL (relay resumed)"));
+  const healthBody = (extra: Record<string, unknown>) =>
+    new Response(JSON.stringify({ status: "ok", instanceId: "hub-abc", ...extra }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  const stream = () =>
+    sseResponse(
+      'event: message_start\ndata: {"type":"message_start"}\n\n' +
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    );
+  const timeout = async (): Promise<Response> => {
+    const e = new Error("The operation was aborted due to timeout");
+    e.name = "TimeoutError";
+    throw e;
+  };
+
+  it("C1: a DOWN flip names the last body the hub gave — id, loop max, streams, and its age", async () => {
+    fetchImpl = async () => healthBody({ eventLoopMax60sMs: 1234, activeStreams: 7 });
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    fetchImpl = timeout;
+    await proberTick(state); // failure #1
+    await proberTick(state); // #2 → DOWN flip
+    expect(down()).toHaveLength(1);
+    const line = down()[0]!;
+    expect(line).toContain("instanceId=hub-abc");
+    expect(line).toContain("eventLoopMax60sMs=1234");
+    expect(line).toContain("activeStreams=7");
+    expect(line).toMatch(/age=\d+\.\ds/);
+  });
+
+  it("C2: absent fields read none, never 0 — and a cold flip reads hub-last=none", async () => {
+    // A pre-#615 hub image publishes no loop counter: the line must say so.
+    fetchImpl = async () => healthBody({});
+    const state = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    expect(await heartbeat(state)).toBe(true);
+    fetchImpl = timeout;
+    await proberTick(state);
+    await proberTick(state);
+    expect(down()[0]).toContain("eventLoopMax60sMs=none");
+    expect(down()[0]).toContain("activeStreams=none");
+    expect(down()[0]).not.toContain("eventLoopMax60sMs=0");
+
+    // No body was ever read (hub silent from the very first beat).
+    lines.length = 0;
+    const cold = createRelayState({ upstream: "http://192.168.0.50:3000" });
+    fetchImpl = timeout;
+    await proberTick(cold);
+    await proberTick(cold);
+    expect(down()).toHaveLength(1);
+    expect(down()[0]).toContain("hub-last=none");
+  });
+
+  it("C3: the NOMINAL line carries the beat's own hub fields", async () => {
+    const s = createRelayState({ upstream: "http://hub:3000" });
+    s.alive = false;
+    s.lastFlipAt = 0;
+    s.consecutiveOk = 3;
+    fetchImpl = async (url: any) =>
+      String(url).endsWith("/health")
+        ? healthBody({ eventLoopMax60sMs: 42, activeStreams: 3 })
+        : Promise.resolve(stream());
+    await proberTick(s);
+    expect(s.alive).toBe(true);
+    expect(nominal()).toHaveLength(1);
+    const line = nominal()[0]!;
+    expect(line).toContain("instanceId=hub-abc");
+    expect(line).toContain("eventLoopMax60sMs=42");
+    expect(line).toContain("activeStreams=3");
+    expect(line).toMatch(/age=0\.\ds/);
   });
 });

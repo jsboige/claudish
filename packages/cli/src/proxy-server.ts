@@ -14,14 +14,11 @@ import {
   isCapabilityVocabEnabled,
   liftCapabilityDeclaration,
 } from "./fork/capability-vocabulary.js";
-// #641 G6 — fork extensions carried onto the branch: the per-session output-token
-// ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
-// are INERT without their env knobs, so their presence changes nothing on a
-// fleet that never opts in.
 import {
   ARM_TTL_MAX_MS,
   type DelegationOwner,
   type FailoverRole,
+  type FailoverRule,
   type FailoverStep,
   NATIVE_BUCKET,
   buildServingNoteForRequest,
@@ -51,6 +48,14 @@ import {
   setRoleNominalResolver,
   stripServingNoticesFromRequestBody,
 } from "./fork/failover.js";
+// #1055 g2 — harness-lane budget admission, stop and ledger (fork module; all
+// paths inert without a lane header AND a configured bar).
+import {
+  admitLaneBudget,
+  laneBudgetRefusalAnthropic,
+  laneStopRefusal,
+  openLaneBudgetAttempt,
+} from "./fork/lane-budget.js";
 // Row 9 of the port map (#101): Claude Code's `cch=` per-turn hash opens the
 // system prompt, so a prefix-caching backend re-reads the whole prefix every
 // turn. transform.ts's stripBillingHeader already runs in step 1 of EVERY
@@ -124,6 +129,13 @@ import {
   createSigningSecrets,
   releaseWhenBodyEnds,
 } from "./handlers/shared/call-context.js";
+// #641 G6 — fork extensions carried onto the branch: the per-session output-token
+// ceiling (#317 option B) and the negotiated capability vocabulary (#83). Both
+// are INERT without their env knobs, so their presence changes nothing on a
+// fleet that never opts in.
+// #291 / #1057 — /health publishes the verdict of an ACTUAL write+unlink into
+// CLAUDISH_CAPTURE_DIR (async-refreshed cache, never a sync write here).
+import { captureBindWriteVerdict } from "./handlers/shared/capture-bind-probe.js";
 // #565 (port-map row 1) — the admission census and the recoverable-turn
 // constructors its refusal answers with. See handlers/shared/context-overflow.ts.
 import {
@@ -432,21 +444,23 @@ export function isNativeTarget(target: string): boolean {
   return !target.includes("/") && !target.includes("@");
 }
 
-/** The v14 role set: opus / sonnet / haiku. Main carries a fourth (`fable`);
- *  this base's `modelMap` has no such slot (its options type reads
- *  opus/sonnet/haiku/subagent, and `subagent` is not a request keyword — it
- *  never names a model). Mirrors the substring tier match the serving
- *  resolution applies at `resolveHandlerForRequest` and `resolveNominalTarget`,
- *  which is also why a role keyword anywhere in the name counts. */
+/** The role set: opus / sonnet / haiku / fable. `fable` was present in the
+ *  pre-replatform trunk and #641 B4 restored it here — the fleet is wired for
+ *  Fable 5.2 (user 13/11), and a pin that cannot name the slot silently stops
+ *  repointing it. `subagent` is not a request keyword: it never names a model.
+ *  Mirrors the substring tier match the serving resolution applies at
+ *  `resolveHandlerForRequest` and `resolveNominalTarget`, which is also why a
+ *  role keyword anywhere in the name counts. */
 function resolveRoleMappedTarget(
   requestedModel: string,
-  modelMap?: { opus?: string; sonnet?: string; haiku?: string }
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string; fable?: string }
 ): string | undefined {
   if (!modelMap) return undefined;
   const requested = requestedModel.toLowerCase();
   if (requested.includes("opus")) return modelMap.opus;
   if (requested.includes("sonnet")) return modelMap.sonnet;
   if (requested.includes("haiku")) return modelMap.haiku;
+  if (requested.includes("fable")) return modelMap.fable;
   return undefined;
 }
 
@@ -469,7 +483,9 @@ function resolveRoleMappedTarget(
  *
  * Deliberately narrow — it returns a pin ONLY when all of these hold:
  *  - the role resolves to a mapped target (otherwise there is nothing to pin);
- *  - that target differs from what the client asked for (never rewrite a no-op);
+ *  - that target differs from what the client asked for (never rewrite a no-op).
+ *    Since #1017 the comparison runs AFTER the #219 override, on the id that
+ *    would actually be sent;
  *  - the target is an ANTHROPIC id (`claude-*`). Bare and native are NOT the same
  *    predicate, and conflating them is how this would misfire: the hub's own
  *    `sonnet: "glm-5.3"` is bare too, and is saved today only by resolving to a
@@ -492,15 +508,54 @@ function resolveRoleMappedTarget(
  */
 export function resolveNativeModelPin(
   requestedModel: string,
-  modelMap?: { opus?: string; sonnet?: string; haiku?: string },
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string; fable?: string },
   env: NodeJS.ProcessEnv = process.env
 ): string | undefined {
   if (env.CLAUDISH_NATIVE_MODEL_PIN === "0") return undefined;
   if (requestedModel.includes("@") || requestedModel.includes("/")) return undefined;
   const roleTarget = resolveRoleMappedTarget(requestedModel, modelMap);
-  if (!roleTarget || roleTarget === requestedModel) return undefined;
-  if (!roleTarget.startsWith("claude-")) return undefined;
-  return applyNativePinOverride(roleTarget);
+  if (!roleTarget || !roleTarget.startsWith("claude-")) return undefined;
+  // #219: an adopted catalog override (CLAUDISH_NATIVE_PIN_AUTO=on) replaces
+  // the version within the same family. Inert — byte-identical pass-through —
+  // unless the watch resolved and adopted a newer id.
+  // #1017: the no-op comparison runs on the OVERRIDDEN target. Comparing the
+  // configured one first made the adoption unreachable for the clients that
+  // matter most — those asking for exactly the configured version (the whole
+  // fleet sent `claude-fable-5-1` against a hub pinned `claude-fable-5-1`).
+  const pinned = applyNativePinOverride(roleTarget);
+  return pinned === requestedModel ? undefined : pinned;
+}
+
+/**
+ * #681/#939 — the ONE predicate for "can a NON-sonnet walk JUMP into the sonnet
+ * cascade", shared by the two call sites that must never drift apart: the loop's
+ * context-skip jump (#681) and the #565 admission census (#939 — the census may
+ * only weigh the sonnet path when the jump could actually fire for this
+ * request). Conditions, verbatim from the 25/10 arbitration: the walk's role is
+ * defined and not already `sonnet` (single jump by construction), a sonnet rule
+ * exists with at least one step, and sonnet has a mapped nominal — without one,
+ * an unarmed post-jump resolution would target the literal "sonnet" and die at
+ * routing, which is worse than the local advance it replaced.
+ *
+ * The loop additionally requires an actual `reason=context` skip on a non-last
+ * step inside the #431 guard — that part is per-attempt state, not a property
+ * of the path, so it stays at the loop.
+ *
+ * v14 note: main threads the post-jump nominal mapping through a
+ * `roleOverride` argument of its multi-arg `getHandlerForRequest`; this base
+ * swaps at the loop (`serveModel`), so the caller uses `jump.nominal` directly
+ * for the post-jump nominal serve — the same value main's
+ * `resolveNominalTarget(roleOverride)` lands on.
+ */
+export function sonnetJumpTarget(
+  fromRole: FailoverRole | null | undefined,
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string; fable?: string }
+): { rule: FailoverRule; nominal: string } | undefined {
+  if (!fromRole || fromRole === "sonnet") return undefined;
+  const rule = getFailoverRule("sonnet");
+  if (!rule || rule.steps.length === 0) return undefined;
+  const nominal = modelMap?.sonnet;
+  return nominal ? { rule, nominal } : undefined;
 }
 
 export async function createProxyServer(
@@ -512,7 +567,7 @@ export async function createProxyServer(
   model?: string,
   monitorMode = false,
   anthropicApiKey?: string,
-  modelMap?: { opus?: string; sonnet?: string; haiku?: string; subagent?: string },
+  modelMap?: { opus?: string; sonnet?: string; haiku?: string; fable?: string; subagent?: string },
   options: ProxyServerOptions = {}
 ): Promise<ProxyServer> {
   // Load user-declared custom endpoints from ~/.claudish/config.json and
@@ -1352,9 +1407,9 @@ export async function createProxyServer(
   // Inert with no CLAUDISH_FAILOVER_* env: no rule ⇒ one attempt ⇒ the nominal
   // through the same resolution as before, byte-identical serve.
   initFailover();
-  // The v14 modelMap carries no `fable` slot (its role set is opus/sonnet/
-  // haiku/subagent) — index by string, not by FailoverRole, so the resolver
-  // stays valid the day a slot is added.
+  // Index by string, not by FailoverRole: the map's slot set and the role set
+  // are maintained separately, so a role a newer map carries keeps resolving
+  // here without a type change.
   setRoleNominalResolver((r) => (modelMap as Record<string, string | undefined> | undefined)?.[r]);
 
   /** The request-side nominal target, mirroring resolveHandlerForRequest's own
@@ -1486,9 +1541,19 @@ export async function createProxyServer(
     requestedModel: string,
     nominalBucket?: string
   ): Promise<Response> => {
-    const role = roleFromModelName(requestedModel);
-    const rule = role ? getFailoverRule(role) : undefined;
-    const bucket = nominalBucket ?? (rule ? await nominalBucketOfModel(requestedModel) : undefined);
+    // #681: role/rule/bucket/maxAttempts are `let` — a context-skip can JUMP the
+    // whole loop into the sonnet cascade mid-request (see the #431 consumer
+    // below), and every subsequent resolution must key on the TARGET role's
+    // arm, buckets and bounds, not the client's original role.
+    let role = roleFromModelName(requestedModel);
+    // #681: the role the CLIENT asked for — the notices key. `role` above is
+    // re-keyed to the jump target mid-request; a served-step record filed under
+    // the target role is invisible to the notice reader (it asks for the
+    // client's role), and the banner falls back to the generic resolver, which
+    // names the step that REFUSED (measured in the #932 review).
+    const clientRole = role;
+    let rule = role ? getFailoverRule(role) : undefined;
+    let bucket = nominalBucket ?? (rule ? await nominalBucketOfModel(requestedModel) : undefined);
     // ── #565 — admission census over DECLARED windows (port-map row 1) ─────
     // Placed HERE, before the loop and before any handler is built, because the
     // decision needs the whole PATH (nominal + every cascade step), not the
@@ -1542,8 +1607,8 @@ export async function createProxyServer(
           }
           if (seen.has(s.roleRef)) continue;
           seen.add(s.roleRef);
-          // v14 modelMap has no `fable` slot (its role set is wider than the
-          // map) — index by string, the same cast as setRoleNominalResolver.
+          // Index by string, the same cast as setRoleNominalResolver — the map's
+          // slot set and the role set are maintained separately.
           collectWindow((modelMap as Record<string, string | undefined> | undefined)?.[s.roleRef]);
           collectSteps(s.roleRef);
         }
@@ -1552,6 +1617,25 @@ export async function createProxyServer(
       if (role) {
         seen.add(role);
         collectSteps(role);
+      }
+      // #939: when the #681 jump could actually fire for this request — the
+      // SAME predicate the loop will consult at its first context skip, one
+      // helper for both sites so they cannot drift — the census also weighs
+      // the SONNET path. An all-declared origin path whose every window is
+      // smaller than the request would otherwise refuse with the #565 numbers
+      // text while the sonnet cascade (armed or nominal) has a declared window
+      // that fits: the request never reaches the skip that would jump it. Only
+      // candidates are ADDED, never removed, so #565's conservative refusal
+      // story is preserved for every request with no jump target — and
+      // fall-open stays global: an undeclared candidate on the sonnet path
+      // stands the whole census down, exactly as on the origin path. `seen`
+      // guards the (already-covered) case of an origin cascade that reaches
+      // sonnet via a `role:` step — its windows are already counted, and
+      // double-weighing a rung would inflate the undeclared tally.
+      const jump = sonnetJumpTarget(role, modelMap);
+      if (jump && !seen.has("sonnet")) {
+        collectWindow(resolveNominalTarget(jump.nominal).target);
+        collectSteps("sonnet");
       }
       const admission: ContextAdmissionDecision = decideContextAdmission(body, windows, undeclared);
       if (admission.refuse && admission.largest) {
@@ -1578,7 +1662,7 @@ export async function createProxyServer(
     // mark, no dwell pin): a request that may not spend fleet budget must not
     // shape the fleet's failover.
     const keylessNative = keylessNativeRequest(c, requestedModel);
-    const maxAttempts = rule ? rule.steps.length + 1 : 1; // nominal + each step
+    let maxAttempts = rule ? rule.steps.length + 1 : 1; // nominal + each step
     const armGraceMs = getArmGraceMs();
     const sessionKey = extractSessionKey(body); // #91 point 4: per-session dwell
     const machineHeader = c.req.header("x-claudish-machine") ?? null;
@@ -1602,6 +1686,19 @@ export async function createProxyServer(
     // state — this set is the request's ONLY memory of the skip, and it is
     // request-scoped by construction (the next request may fit).
     const skippedSteps = new Set<number>();
+    // #681: set when a context-skip has JUMPED this request into the sonnet
+    // cascade. Single jump per request by construction (the target role is
+    // always "sonnet", and the jump predicate excludes an already-sonnet walk),
+    // so no ping-pong between cascades is possible. On main the flag threads as
+    // roleOverride into handler construction; here the loop's own serveModel
+    // swap reads it (the post-jump nominal serves jumpNominal, and the loop's
+    // resolution/budget labels re-key on the TARGET role through `role`).
+    let cascadeRoleJumped = false;
+    // #681: the target role's mapped nominal, captured at the jump — the only
+    // label a post-jump NOMINAL serve can be announced under (an unarmed jump
+    // records no cascade rung; without this the recorder no-ops and the banner
+    // names the refusing origin step).
+    let jumpNominal: string | undefined;
     let response: Response | undefined;
     // #299-B: one-shot bounded — a nominal transient overload walks to the
     // first servable cascade step at most ONCE per request, whatever the loop
@@ -1652,10 +1749,25 @@ export async function createProxyServer(
       // The step's target is already concrete — serve it verbatim (the v14
       // getHandlerForRequest is single-arg; the swap happens HERE, at the loop,
       // not inside resolution). The nominal goes through the request-side
-      // mapping exactly as before the wiring.
+      // mapping exactly as before the wiring — EXCEPT post-jump (#681): a
+      // jumped nominal attempt serves the TARGET role's mapped nominal, the
+      // same value main's resolveNominalTarget(roleOverride) lands on; mapping
+      // the client's original name would send the walk back to the origin
+      // role's lane.
       const serveModel =
         override?.concrete ??
-        (stepIndex >= 0 && resolved.step?.target ? resolved.step.target : requestedModel);
+        (stepIndex >= 0 && resolved.step?.target
+          ? resolved.step.target
+          : cascadeRoleJumped && jumpNominal
+            ? jumpNominal
+            : requestedModel);
+      // #681: the nominal LANE label — the keyless refusal names it and the
+      // #654 budget prefixes by it. Post-jump it is the target role's nominal,
+      // never the origin mapping.
+      const nominalLane =
+        cascadeRoleJumped && jumpNominal
+          ? jumpNominal
+          : resolveNominalTarget(requestedModel).target;
       // #412: the guard below (and only it) reads the UNWRAPPED resolution —
       // withRequestHooks/withAdvisor sit outside getHandlerForRequest exactly
       // because `instanceof NativeHandler` must stay visible here (same
@@ -1790,7 +1902,7 @@ export async function createProxyServer(
         // nothing about which credential the request resolved to, and an
         // operator reading the marker needs the target (`glm-5.3`,
         // `frognano-4b`) to know what would have been spent.
-        const lane = resolved.step?.target ?? resolveNominalTarget(requestedModel).target;
+        const lane = resolved.step?.target ?? nominalLane;
         if (response) return response;
         logStderr(
           `[ProxyAuth] keyless request for ${requestedModel} resolves to a server-held credential (${lane}) — refused, zero upstream fetch`
@@ -1822,9 +1934,7 @@ export async function createProxyServer(
       // v14: the attempt's concrete is `serveModel` for a step (the loop's
       // own swap seam) and the mapped nominal for stepIndex -1, exactly the
       // two forms main's `attemptConcreteNow` collapsed.
-      const budgetPrefix = endpointPrefixOf(
-        stepIndex >= 0 ? serveModel : resolveNominalTarget(requestedModel).target
-      );
+      const budgetPrefix = endpointPrefixOf(stepIndex >= 0 ? serveModel : nominalLane);
       const budgetDecision = budgetPrefix
         ? evaluateEndpointTokenBudget(
             budgetPrefix,
@@ -1963,6 +2073,22 @@ export async function createProxyServer(
         // keys its max-ledger on it (two paid attempts of one request must
         // land in two slots). No-op when both bars are off.
         openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+        // #1055 g2 — the same attempt feeds the lane ledger (inert without a
+        // lane header AND a bar for this (lane, model)). CR B1: keyed on
+        // `requestedModel` (what the ADMISSION read), never `body.model` — the
+        // #218 native pin rewrites body.model to the pinned version BEFORE this
+        // site, and the two spellings would split the ledger key: consumption
+        // booked under `claude-haiku-5-1` while admission looks up `claude-haiku-5`
+        // (measured 200,200,200 against a bar of 700). CR3 B5: this open sits
+        // in the `else` of `budgetSynthResponse` — a #654 budget-skipped
+        // nominal NEVER reaches it, which is why the walk-site open is the
+        // only ledger attach on that path (route L10 pins it).
+        openLaneBudgetAttempt(
+          c.req.raw,
+          c.req.header("x-claudish-lane") ?? null,
+          requestedModel,
+          process.env
+        );
         response = await handler.handle(c, body);
         if (pinnedModel && !response.ok) body.model = modelBeforePin;
         if (servingNote && !response.ok) body.system = systemBeforeNote;
@@ -1978,7 +2104,27 @@ export async function createProxyServer(
       if (response.ok) {
         if (role) {
           // #431 CR B1: name the step that actually served, for the notices.
-          recordServedStepForNotices(c, role, resolved.step ?? undefined, stepIndex);
+          // #681: the record is keyed on the role the CLIENT asked for
+          // (clientRole — `role` is the jump target now), and a post-jump
+          // NOMINAL serve records a synthesized step so the banner names the
+          // sonnet subscription instead of the refusing origin rung.
+          if (cascadeRoleJumped && !resolved.step && jumpNominal) {
+            recordServedStepForNotices(
+              c,
+              clientRole ?? role,
+              { target: jumpNominal, label: jumpNominal, direction: "improved" },
+              -1,
+              role
+            );
+          } else {
+            recordServedStepForNotices(
+              c,
+              clientRole ?? role,
+              resolved.step ?? undefined,
+              stepIndex,
+              cascadeRoleJumped ? role : undefined
+            );
+          }
           if (stepIndex === -1)
             onNominalSuccess(role, bucket); // nominal healthy → fresh episode + maybe recovery
           else resetStepSuccess(role, stepIndex);
@@ -2086,6 +2232,10 @@ export async function createProxyServer(
               `[Failover] WALK ${role} one-shot (HTTP ${response.status} on nominal ${requestedModel}) → ${walk.concrete} (step ${walk.stepIndex})`,
               true
             );
+            // #681: `role` is `let` (the jump reassigns it mid-request), so the
+            // closure below cannot keep this block's non-null narrowing —
+            // capture it as a const, exactly like main's walkRole.
+            const walkRole: FailoverRole = role;
             // ONE paid walk attempt, factored so the advances below reuse the
             // exact bookkeeping. A served attempt mirrors the loop's success
             // bookkeeping (a success resets a step's failure count; it never
@@ -2112,7 +2262,7 @@ export async function createProxyServer(
               | { served: null; budgetRefused: true }
             > => {
               const targetDelegation = target.step.roleRef
-                ? resolveDelegationOwner(role, target.step)
+                ? resolveDelegationOwner(walkRole, target.step)
                 : null;
               // #654 r1 — the walk serves through the SAME endpoint budget as
               // the loop. A walk target carrying knobs is evaluated BEFORE the
@@ -2154,9 +2304,23 @@ export async function createProxyServer(
                 if (walkBudget) walkRelease = walkBudget.commit();
                 // #317: the walk is a paid upstream attempt too — fresh token.
                 openSessionBudgetAttempt(c.req.raw, machineHeader, sessionKey, process.env);
+                // #1055 g2 — the walk feeds the lane ledger too. CR B1: keyed
+                // on `requestedModel` (the admission's spelling), same reason
+                // as the loop-site open above. CR3 B5: on the #654 budget-skip
+                // → walk path this is the ONLY open — the loop-site open lives
+                // in the `else` of `budgetSynthResponse`, and a budget-skipped
+                // nominal never reaches it (pinned by route L10: without this
+                // open, a lane behind a saturated endpoint budget would spend
+                // through the walk with no ledger at all).
+                openLaneBudgetAttempt(
+                  c.req.raw,
+                  c.req.header("x-claudish-lane") ?? null,
+                  requestedModel,
+                  process.env
+                );
                 const targetResp = await targetHandler.handle(c, body);
                 if (targetResp.ok) {
-                  if (!target.step.roleRef) resetStepSuccess(role, target.stepIndex);
+                  if (!target.step.roleRef) resetStepSuccess(walkRole, target.stepIndex);
                   // Only credit the owner that actually served: a delegation
                   // resolved to a different concrete (or to null ⇒ cannot
                   // serve) during the round-trip must not lift a wall or reset
@@ -2303,6 +2467,49 @@ export async function createProxyServer(
               ? { reason: "context" as const, detail: `status=${response.status}` }
               : null);
           if (skip) {
+            // ── #681 — context-skip → enter the SONNET cascade ──────────────
+            // A context overflow on a NON-sonnet walk means this request's size
+            // class outruns the remaining rungs of its own role (they trend
+            // narrower, ending at a PAYG terminator that will refuse the same
+            // size). User arbitration 25/10: the oversized request should be
+            // RE-ROUTED to the sonnet role — deepseek stays its LAST rung, tried
+            // only when sonnet's own path is exhausted. Single jump per request
+            // by construction: the target is always "sonnet" and the predicate
+            // excludes an already-sonnet walk, so no ping-pong between cascades.
+            // busy/media skips keep today's local advance (#431).
+            if (skip.reason === "context") {
+              // #939: the jump predicate lives in sonnetJumpTarget — ONE helper,
+              // shared with the #565 admission census, so the two sites cannot
+              // drift (the census weighs the sonnet path exactly when this jump
+              // could fire). The `reason=context` part is per-attempt state and
+              // stays here.
+              const jump = sonnetJumpTarget(role, modelMap);
+              if (jump) {
+                log(
+                  `[Failover] SKIP ${role}[${stepIndex}] reason=context → ROLE-JUMP sonnet[0..] (#681) (${delegation?.concrete ?? resolved.step?.target ?? serveModel}) — entering the sonnet cascade at its first servable step; deepseek stays its last rung`,
+                  true // forceConsole — operational event (#681, countable marker)
+                );
+                skippedSteps.clear(); // origin-role indexes must not filter sonnet's steps
+                role = "sonnet";
+                rule = jump.rule;
+                jumpNominal = jump.nominal;
+                // #367 class: sonnet's nominal is already concrete — classify it,
+                // never run the request-side mapping (the walls arm on the bucket
+                // the nominal ACTUALLY draws on).
+                bucket = concreteStepBucketOfSync(jump.nominal);
+                maxAttempts = jump.rule.steps.length + 1;
+                attempt = -1; // restart the bounded loop for the sonnet phase
+                cascadeRoleJumped = true;
+                try {
+                  await response.body?.cancel();
+                } catch {
+                  // already gone — nothing to drain
+                }
+                continue;
+              }
+              // No sonnet lane here (no rule, no steps, or no mapped nominal):
+              // fall through to today's local advance.
+            }
             skippedSteps.add(stepIndex);
             log(
               `[Failover] STEP-SKIP ${role}[${stepIndex}] — ${skip.reason}${skip.detail ? ` (${skip.detail})` : ""}; ` +
@@ -2574,6 +2781,21 @@ export async function createProxyServer(
         // expire a fresh flag). The reason, never the flag content.
         admissionFreeze: admissionFreezeState().reason,
         ...(options.relay ? { selfLoop: options.relay.selfLoop } : {}),
+        // #291 — verdict of an ACTUAL write+unlink into CLAUDISH_CAPTURE_DIR:
+        // "ok" | "disabled" (capture off by env) | "error:<code>" (the bind
+        // refused — the 29/10 rootfs-full class that no-op'd every writer
+        // silently) | "unknown:probing" (cold cache, first refresh in flight
+        // — CR #1057: the probe is async-refreshed, NEVER a sync write on
+        // this path: the writers paid twice for that, and a wedged bind does
+        // not fail fast). Pure cache read; never throws; never blocks.
+        //
+        // NB on the replatform /health: the #587 event-loop lag counters and
+        // the #439 rotation snapshot are NOT published here (the replatform
+        // dropped both instruments) — a #587 g1 flip segment reading this hub
+        // dates its flips with instanceId/activeStreams/age and prints
+        // `eventLoopMax60sMs=none`, which the segment treats as ABSENT, never
+        // as 0 (the 24/10 trap on that issue).
+        captureBindWrite: captureBindWriteVerdict(),
       },
       stalled ? 503 : 200
     );
@@ -2929,6 +3151,25 @@ export async function createProxyServer(
       // returns null → fall through to the normal local path for this one
       // request (and feeds the prober's hysteresis toward AUTONOMOUS).
       //
+      // #1055 g2 CR B4 — the operator STOP check sits ABOVE the relay branch:
+      // the stop file belongs to THIS node's operator, so the stop must hold
+      // in BOTH relay modes. A NOMINAL forward would relay a stopped lane to
+      // the hub and keep spending (measured: 200 with the hub called, both
+      // ingresses), and a stop enforced only at the hub would miss a sidecar
+      // that has gone AUTONOMOUS. The BUDGET admission stays BELOW the relay
+      // (see there): only the node that serves counts tokens — for relayed
+      // traffic that is the hub. A per-request stat of an operator-named
+      // file; inert without CLAUDISH_LANE_STOP_DIR / an x-claudish-lane
+      // header.
+      {
+        const stop = laneStopRefusal(
+          c.req.header("x-claudish-lane") ?? null,
+          (body.model as string) ?? "",
+          process.env
+        );
+        if (stop) return laneBudgetRefusalAnthropic(stop);
+      }
+      //
       // #279 — checked BEFORE forwarding: a request whose hop list carries
       // our own instanceId is one of our forwards coming back (boot window
       // before the heartbeat latched selfLoop, or an A→B→A cycle heartbeat
@@ -2978,6 +3219,26 @@ export async function createProxyServer(
       {
         const admission = admitSessionBudget(machineHeader, sessionKey, process.env);
         if (admission?.refused) return sessionBudgetRefusalAnthropic(admission);
+      }
+
+      // #1055 g2 — harness-lane BUDGET admission (per-(lane, model) daily
+      // bar). CR B4: the emergency-stop half runs ABOVE the relay branch (see
+      // there); this site stays below because only the node that serves
+      // counts tokens — on a NOMINAL sidecar the hub admits relayed traffic.
+      // CR3 B5: the stop is route-side ONLY — the pre-relay check above is
+      // unconditional, so it refuses FIRST on every ingress, hub included;
+      // this site is the budget half everywhere. Null
+      // (zero work) for every request without an `x-claudish-lane` header —
+      // the pre-#1055 path is byte-identical. Refusals are TYPED
+      // (`x-claudish-lane-refusal`) so the harness defers the notebook
+      // instead of queueing silently; paid before any handler.
+      {
+        const admission = admitLaneBudget(
+          c.req.header("x-claudish-lane") ?? null,
+          (body.model as string) ?? "",
+          process.env
+        );
+        if (admission?.refused) return laneBudgetRefusalAnthropic(admission);
       }
 
       // #83 grain 2: capability vocabulary — lift the session's declaration from
@@ -3105,6 +3366,36 @@ export async function createProxyServer(
         );
       }
 
+      // #1055 g2 CR B4 — the operator STOP check above the relay, same rule
+      // as /v1/messages (this ingress is the sk-agent wire of #1055's
+      // harness): the stop holds on THIS node in BOTH relay modes — a NOMINAL
+      // forward would relay a stopped lane to the hub and keep spending. The
+      // budget admission stays below the relay (the hub counts relayed
+      // tokens). Inert without CLAUDISH_LANE_STOP_DIR / a lane header.
+      {
+        const stop = laneStopRefusal(
+          c.req.header("x-claudish-lane") ?? null,
+          typeof openaiBody?.model === "string" ? openaiBody.model : "",
+          process.env
+        );
+        if (stop) {
+          return c.json(
+            {
+              error: {
+                message: stop.message,
+                type: "rate_limit_error",
+                code: null,
+              },
+            },
+            429,
+            {
+              "retry-after": String(stop.retryAfterSec),
+              "x-claudish-lane-refusal": stop.type,
+            }
+          );
+        }
+      }
+
       // Relay (sidecar NOMINAL): forward the RAW OpenAI body to the hub's
       // /v1/chat/completions — the hub translates. forwardToUpstream is
       // path-aware, so the forward reaches the route the client hit, not
@@ -3159,6 +3450,38 @@ export async function createProxyServer(
             },
             429,
             { "retry-after": String(admission.retryAfterSec) }
+          );
+        }
+      }
+
+      // #1055 g2 CR B3 — the lane admission mirrors here too. The repo names
+      // this ingress as the sk-agent one in four places (route comments,
+      // openai-ingress.md, #1055's harness IS an sk-agent agent), so the
+      // budget must gate this wire exactly like /v1/messages. CR B4: the
+      // emergency-stop half runs ABOVE the relay branch on both wires (see
+      // the pre-relay stop block); this admission is the budget half.
+      // Same typed header as the native ingress; the ledger keys on the same
+      // client spelling (`anthropicBody.model` — pre-pin, pre-failover).
+      {
+        const admission = admitLaneBudget(
+          c.req.header("x-claudish-lane") ?? null,
+          (anthropicBody.model as string) ?? "",
+          process.env
+        );
+        if (admission?.refused) {
+          return c.json(
+            {
+              error: {
+                message: admission.message,
+                type: "rate_limit_error",
+                code: null,
+              },
+            },
+            429,
+            {
+              "retry-after": String(admission.retryAfterSec),
+              "x-claudish-lane-refusal": admission.type,
+            }
           );
         }
       }

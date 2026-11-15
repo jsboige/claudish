@@ -38,6 +38,8 @@ const CAPABILITIES = [
 const ALL_TOOLS = [
   "cancel_session",
   "capture_session",
+  "claudish_capabilities",
+  "claudish_status",
   "compare_models",
   "create_session",
   "get_diagnostics",
@@ -65,7 +67,16 @@ const SESSION_TOOLS = [
 const TOOL_GROUPS: Array<{ value: string | undefined; names: string[] }> = [
   { value: undefined, names: ALL_TOOLS },
   { value: "all", names: ALL_TOOLS },
-  { value: "low-level", names: ["list_models", "run_prompt", "search_models"] },
+  {
+    value: "low-level",
+    names: [
+      "claudish_capabilities",
+      "claudish_status",
+      "list_models",
+      "run_prompt",
+      "search_models",
+    ],
+  },
   { value: "agentic", names: ["preflight", "report_error", "team"] },
   { value: "session", names: SESSION_TOOLS },
   { value: "debug", names: ["compare_models"] },
@@ -253,7 +264,7 @@ describe("CLAUDISH_MCP_TOOLS startup warnings", () => {
         .filter((line) => line.includes("CLAUDISH_MCP_TOOLS"));
       if (value === "channel" || value === "lowlevel") {
         expect(tools.map((tool) => tool.name).sort()).toEqual(ALL_TOOLS);
-        expect(tools).toHaveLength(15);
+        expect(tools).toHaveLength(17);
         expect(warnings).toHaveLength(1);
         expect(warnings[0]).toContain(value);
         expect(warnings[0]).toContain("all, low-level, agentic, session, debug");
@@ -271,11 +282,11 @@ describe("CLAUDISH_MCP_TOOLS startup warnings", () => {
 // REQ-20 (TEST-21–TEST-26): preserve the existing pane-free session/team regressions.
 describe("tool list (FR11, §4)", () => {
   useStandardServer();
-  test("15 tools, resize_session among them, team modes are exactly the eight", async () => {
+  test("17 tools, resize_session among them, team modes are exactly the eight", async () => {
     const tools = await server.listTools();
     const names = tools.map((t) => t.name);
-    expect(names.length).toBe(15);
-    expect(new Set(names).size).toBe(15);
+    expect(names.length).toBe(17);
+    expect(new Set(names).size).toBe(17);
     for (const n of [
       "team",
       "create_session",
@@ -574,11 +585,11 @@ describe("nested MCP server over stdio", () => {
     expect(await paneOrphans(layout)).toEqual({ processes: [], files: [] });
   }, 30_000);
 
-  test("T-MCP-5: without the flag all still exposes 15 tools without an experimental capability", async () => {
+  test("T-MCP-5: without the flag all still exposes 17 tools without an experimental capability", async () => {
     const c = await connect("all", false);
     const tools = (await c.listTools()).tools;
-    expect(tools).toHaveLength(15);
-    expect(new Set(tools.map((tool) => tool.name)).size).toBe(15);
+    expect(tools).toHaveLength(17);
+    expect(new Set(tools.map((tool) => tool.name)).size).toBe(17);
     expect(c.getServerCapabilities()).toHaveProperty("tools");
     expect(c.getServerCapabilities()).not.toHaveProperty("experimental");
     expect(c.getInstructions()).not.toContain("## Nested mode — no sessions");

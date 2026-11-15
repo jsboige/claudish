@@ -129,7 +129,15 @@ describe("CP-4 — exhaustion with no banner on screen", () => {
       // the chain path it lands in `error.attempts[]` rather than
       // `error.message`, so assert against the body the client receives
       // rather than against one field of it.
-      expect(result.body).toContain("Cannot reach");
+      //
+      // C-14 amendment (#1054 CR B3a, coordinator arbitration): the wording
+      // follows the classified KIND. The raw fixture ACCEPTS the connection
+      // then hard-closes on open — kind `closed`, so #251's statement is the
+      // true one and wins: "the connection … was closed before a response
+      // arrived … not your network". The refused-connect family
+      // ("Cannot reach") never applies to a closed peer.
+      expect(result.body).toContain("was closed before a response arrived");
+      expect(result.body).toContain("not your network");
       expect(result.body).toContain(`127.0.0.1:${dead.port}`);
     } finally {
       await chainProxy?.shutdown();

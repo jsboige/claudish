@@ -57,11 +57,16 @@ import { createProxyServer } from "./proxy-server.js";
 import type { ProxyServer } from "./types.js";
 
 const realFetch = globalThis.fetch.bind(globalThis);
+const realStderrWrite = process.stderr.write.bind(process.stderr);
+const realConsoleLog = console.log;
 
 /** Everything the proxy's outbound calls can reach. No socket is opened by the
  *  test itself: the REAL proxy runs on an ephemeral port, and only its outbound
  *  legs are answered here (test-support pattern of #604). */
 let calls: Record<string, number> = {};
+/** Every [Failover] line the run produced — stderr (logStderr) and the
+ *  forceConsole markers (SKIP / ROLE-JUMP / STEP-ADVANCE) alike (#681). */
+let wallLog: string[] = [];
 /** Endpoints answering the quota wall (402 + subscription body). */
 let wallEndpoints = new Set<string>();
 /** Endpoints answering a plain 500 (the non-quota pin W3). */
@@ -254,7 +259,8 @@ function registerFakeEndpoints(
 }
 
 beforeEach(() => {
-  calls = { nm: 0, s0: 0, s1: 0 };
+  calls = { nm: 0, s0: 0, s1: 0, h0: 0, ds: 0, hn: 0 };
+  wallLog = [];
   wallEndpoints = new Set(["nm"]);
   errorEndpoints = new Set();
   overflowEndpoints = new Set();
@@ -280,9 +286,29 @@ beforeEach(() => {
     if (usageEndpoints.has(which)) return usageWall();
     return healthySSE();
   }) as typeof fetch;
+  // #681: capture every [Failover] line — logStderr goes to stderr, the
+  // SKIP/ROLE-JUMP markers are forceConsole (console.log). Silencing neither.
+  (process.stderr as any).write = ((chunk: any, ...rest: any[]) => {
+    const text = typeof chunk === "string" ? chunk : String(chunk);
+    for (const line of text.split("\n")) {
+      if (line.includes("[Failover]")) wallLog.push(line);
+    }
+    return realStderrWrite(chunk, ...rest);
+  }) as any;
+  console.log = ((...args: unknown[]) => {
+    for (const a of args) {
+      const text = typeof a === "string" ? a : String(a);
+      for (const line of text.split("\n")) {
+        if (line.includes("[Failover]")) wallLog.push(line);
+      }
+    }
+    return realConsoleLog(...args);
+  }) as typeof console.log;
 });
 
 afterEach(async () => {
+  (process.stderr as any).write = realStderrWrite;
+  console.log = realConsoleLog;
   globalThis.fetch = realFetch;
   if (activeProxy) {
     await activeProxy.shutdown();
@@ -296,16 +322,21 @@ afterEach(async () => {
 });
 
 /** Default spin: sonnet → nom-ep (the fake custom endpoint). */
-async function spin(): Promise<void> {
+async function spin(modelMap?: Record<string, string>): Promise<void> {
   activeProxy = await createProxyServer(
     0,
     undefined,
     undefined,
     false,
     undefined,
-    { sonnet: SONNET_NOMINAL },
+    modelMap ?? { sonnet: SONNET_NOMINAL },
     { quiet: true }
   );
+}
+
+/** The #681/J-series response body as flat text (banner pins read it). */
+async function responseText(r: Response): Promise<string> {
+  return JSON.stringify(await r.json());
 }
 
 // ---- the pins -------------------------------------------------------------------
@@ -611,5 +642,135 @@ describe("#431 — a step that cannot TAKE this request is skipped, not failed",
     // The emitter's annotation rides to the client unchanged (#229 doctrine):
     // harmless to a client that ignores it, greppable for one that looks.
     expect(r1.headers.get("x-claudish-step-skip")).toBe("busy; code=1302");
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// #681 — a context-skip JUMPS the request into the sonnet cascade (v14 port).
+// User arbitration 25/10: an oversized request on a NON-sonnet walk is
+// re-routed to the sonnet role; deepseek stays its LAST rung. Main threads the
+// post-jump attempts through a roleOverride argument of its multi-arg
+// getHandlerForRequest — on this base the swap lives at the loop (serveModel),
+// so the pins below also guard the serveModel seam: a post-jump nominal serve
+// that mapped the CLIENT's original name would land back on the origin lane
+// (J2's calls.nm pin) and the banner would name the refusing rung (J1/J2/J3).
+// ---------------------------------------------------------------------------
+
+describe("#681 — a context-skip jumps the request into the sonnet cascade", () => {
+  /** The incident shape: haiku walks h0→ds; sonnet walks s0→s1→ds (deepseek
+   * LAST, exactly the arbitration's wording). ds is shared so the pins can
+   * assert it is NEVER reached. */
+  const HAIKU_CASCADE = "h0-ep@fake-h0>ds-ep@fake-ds";
+  const SONNET_CASCADE = "s0-ep@fake-s0>s1-ep@fake-s1>ds-ep@fake-ds";
+  const HAIKU_NOMINAL = "hn-ep@fake-hn";
+  const ROLE_MAP: Record<string, string> = {
+    sonnet: SONNET_NOMINAL,
+    haiku: HAIKU_NOMINAL,
+  };
+
+  async function spinJump(): Promise<void> {
+    // Register the FULL endpoint set BEFORE the spin — the walk's sibling
+    // resolution snapshots the registry at proxy startup (S7's lesson).
+    registerFakeEndpoints({
+      "nom-ep": "nm",
+      "s0-ep": "s0",
+      "s1-ep": "s1",
+      "hn-ep": "hn",
+      "h0-ep": "h0",
+      "ds-ep": "ds",
+    });
+    await spin(ROLE_MAP);
+  }
+
+  function armBothRoles(): void {
+    resetFailoverForTests({
+      CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+      CLAUDISH_FAILOVER_SONNET: SONNET_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "haiku,sonnet",
+    });
+    setRoleNominalResolver((r) => ROLE_MAP[r]);
+  }
+
+  test("J1 (AC1a): haiku[0] context-refuses → served by sonnet[0]; ds NEVER called", async () => {
+    // Both roles armed from the start: attempt 0 IS step 0, the exact
+    // incident shape — no nominal detour.
+    await spinJump();
+    armBothRoles();
+    wallEndpoints = new Set(); // nothing walls: the skip, not a wall, drives this
+    overflowEndpoints = new Set(["h0"]);
+
+    const r = await postMessage("claude-haiku-5");
+
+    // THE PIN: the request lands on sonnet's FIRST step, not haiku's ds.
+    expect(r.status).toBe(200);
+    expect(calls.h0).toBe(1); // paid exactly once, refused on size
+    expect(calls.s0).toBe(1); // the jump target — sonnet's first servable step
+    expect(calls.ds).toBe(0); // deepseek stays sonnet's LAST rung, never the haiku escape
+    expect(calls.s1).toBe(0);
+    expect(calls.hn).toBe(0); // armed: no nominal detour
+    // The countable operational marker (#681).
+    expect(wallLog.some((l) => l.includes("ROLE-JUMP sonnet") && l.includes("#681"))).toBe(true);
+    // CR (#932 review): the banner names the server that actually answered —
+    // the refusing h0 is never named as the server (K1's anchor shape).
+    const text1 = await responseText(r);
+    expect(text1).toContain("served by **s0-ep@fake-s0**");
+    expect(text1).not.toContain("served by **h0-ep@fake-h0**");
+  }, 30_000);
+
+  test("J2 (AC1b): sonnet UNARMED → the jump serves the sonnet NOMINAL (the subscription)", async () => {
+    // ONLY haiku is armed; sonnet stays unarmed — an unarmed jump must serve
+    // sonnet's mapped nominal, matching the user's routing intent. On this
+    // base the nominal serve goes through the loop's serveModel seam: mapping
+    // the client's original name instead of the jump nominal would pay hn.
+    await spinJump();
+    resetFailoverForTests({
+      CLAUDISH_FAILOVER_HAIKU: HAIKU_CASCADE,
+      CLAUDISH_FAILOVER_SONNET: SONNET_CASCADE,
+      CLAUDISH_FAILOVER_ACTIVE: "haiku",
+    });
+    setRoleNominalResolver((r) => ROLE_MAP[r]);
+    wallEndpoints = new Set(); // nothing walls: the armed walk starts at h0
+    overflowEndpoints = new Set(["h0"]);
+
+    const r = await postMessage("claude-haiku-5");
+
+    expect(r.status).toBe(200);
+    expect(calls.h0).toBe(1); // the size refusal
+    expect(calls.nm).toBe(1); // THE PIN: sonnet's NOMINAL served the jump
+    expect(calls.s0).toBe(0); // unarmed sonnet: no cascade walk
+    expect(calls.hn).toBe(0); // armed: no haiku nominal detour
+    expect(calls.ds).toBe(0);
+    expect(wallLog.some((l) => l.includes("ROLE-JUMP sonnet") && l.includes("#681"))).toBe(true);
+    // CR (#932 review): a haiku request answered by the sonnet subscription is
+    // still a substitution — the banner must NAME the sonnet nominal.
+    const text2 = await responseText(r);
+    expect(text2).toContain("served by **nom-ep@fake-nom**");
+    expect(text2).toContain("the `sonnet` nominal (context re-route #681)");
+    expect(text2).not.toContain("served by **h0-ep@fake-h0**");
+  }, 30_000);
+
+  test("J3 (single jump): a context-refusing sonnet step ADVANCES inside sonnet — no ping-pong", async () => {
+    // s0 ALSO context-refuses: the walk is sonnet now (role === "sonnet"), so
+    // the second skip is today's #431 local advance to s1 — never a second
+    // jump, never a fall-through to haiku's ds.
+    await spinJump();
+    armBothRoles();
+    wallEndpoints = new Set();
+    overflowEndpoints = new Set(["h0", "s0"]);
+
+    const r = await postMessage("claude-haiku-5");
+
+    expect(r.status).toBe(200);
+    expect(calls.h0).toBe(1);
+    expect(calls.s0).toBe(1); // refused on size, advanced locally
+    expect(calls.s1).toBe(1); // served
+    expect(calls.ds).toBe(0); // still never the PAYG escape
+    expect(wallLog.filter((l) => l.includes("ROLE-JUMP sonnet")).length).toBe(1); // single jump
+    // CR (#932 review): the banner names s1 (the server); neither refusing
+    // rung — the cross-role h0 nor the in-cascade s0 — is named as the server.
+    const text3 = await responseText(r);
+    expect(text3).toContain("served by **s1-ep@fake-s1**");
+    expect(text3).not.toContain("served by **h0-ep@fake-h0**");
+    expect(text3).not.toContain("served by **s0-ep@fake-s0**");
   }, 30_000);
 });

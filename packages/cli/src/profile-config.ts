@@ -41,6 +41,7 @@ export interface ModelMapping {
   opus?: string; // Model for opus (claude-opus-4-*)
   sonnet?: string; // Model for sonnet (claude-sonnet-4-*)
   haiku?: string; // Model for haiku (claude-haiku-*)
+  fable?: string; // Model for fable (claude-fable-*) — the fleet wires it everywhere (user 13/11)
   subagent?: string; // Model for subagents (CLAUDE_CODE_SUBAGENT_MODEL)
 }
 

@@ -27,6 +27,14 @@ cell. Default $env:USERPROFILE\.claude\settings.json.
 Port for the /health probe when it cannot be derived from the container's
 published port map. Default: derived.
 
+.PARAMETER LanHub
+The LAN hub entry (host:port) the on-LAN machines must reach. The matrix has
+always shown the client's base_url without saying whether that path answers;
+the column added for grain 6 of #291 (po-2027's 29/10 proposal: LAN False
+while the WAN returned 200) closes that. A TCP refusal and an HTTP error are
+different findings, so the probe is a TCP connect - bounded at 2 s, because a
+matrix row must never hang a cycle on a dead path.
+
 .OUTPUTS
 A detail block then one markdown table row (the #291 shape, subset
 measurable from this seat). Exit 0 on a fully measured row, 1 when at least
@@ -38,7 +46,8 @@ pwsh -NoProfile -File scripts/fleet-matrix.ps1
 [CmdletBinding()]
 param(
     [string]$SettingsPath = (Join-Path $env:USERPROFILE '.claude\settings.json'),
-    [int]$HealthPort = 0
+    [int]$HealthPort = 0,
+    [string]$LanHub = '192.168.0.50:3000'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -113,6 +122,30 @@ function Get-HealthRole([int]$Port) {
     } catch { return 'unreachable' }
 }
 
+function Get-LanHubReachability([string]$Target) {
+    # TCP connect only: the column answers "does the LAN path answer at all"
+    # (the 29/10 finding: LAN False while the WAN returned 200), and a TCP
+    # refusal must not be confused with an HTTP error. A target that cannot
+    # be parsed is '?' - an instrument fault, never a silent 'unreachable'.
+    if ([string]::IsNullOrWhiteSpace($Target)) { return '?' }
+    $i = $Target.LastIndexOf(':')
+    $port = 0
+    if ($i -le 0 -or -not [int]::TryParse($Target.Substring($i + 1), [ref]$port)) { return '?' }
+    $hostName = $Target.Substring(0, $i)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $client = $null
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        # Wait(ms) throws on a faulted task (refused DNS name, refused port):
+        # both mean "no path from here" and render the same measured value.
+        $task = $client.ConnectAsync($hostName, $port)
+        if (-not $task.Wait(2000)) { return 'unreachable (timeout)' }
+        if ($client.Connected) { return ("ok ({0} ms)" -f $sw.ElapsedMilliseconds) }
+        return 'unreachable'
+    } catch { return 'unreachable' }
+    finally { if ($client) { $client.Dispose() } }
+}
+
 function Get-ClientBaseUrl([string]$Path) {
     if (-not (Test-Path $Path)) { return '?' }
     try {
@@ -132,7 +165,7 @@ function Get-RelayTransitions([string]$Name) {
     return ("{0} in tail, last {1}" -f $t.Count, $last)
 }
 
-function Render-Row([string]$Machine, $Containers) {
+function Render-Row([string]$Machine, $Containers, [string]$LanCell) {
     $cells = [System.Collections.Generic.List[string]]::new()
     $cells.Add($Machine)
     $client = Get-ClientBaseUrl $SettingsPath
@@ -140,8 +173,10 @@ function Render-Row([string]$Machine, $Containers) {
     if ($null -eq $Containers) {
         # Docker gave NO signal: every docker-read cell is UNKNOWN and the
         # whole row is. The client cell does not depend on docker - it stays
-        # measured (one honest cell beats a uniform '?').
+        # measured (one honest cell beats a uniform '?'). The LAN cell is
+        # docker-independent too and renders whatever the probe measured.
         $cells.AddRange([string[]]@('?', '?', '?', '?', '?', $client, '?', '?'))
+        $cells.Add($LanCell)
         $script:MatrixExitCode = 2
         return ($cells -join ' | ')
     }
@@ -155,6 +190,7 @@ function Render-Row([string]$Machine, $Containers) {
     if ($Containers.Count -eq 0) {
         # No claudish container: a real, sayable state - not a blank.
         $cells.AddRange([string[]]@('none', '-', '-', '-', '-', $client, '-', '-'))
+        $cells.Add($LanCell)
         return ($cells -join ' | ')
     }
     $unknown = $false
@@ -184,6 +220,7 @@ function Render-Row([string]$Machine, $Containers) {
     }
     $transitions = Get-RelayTransitions $firstName
     if ($null -eq $transitions) { $unknown = $true; $cells.Add('?') } else { $cells.Add($transitions) }
+    $cells.Add($LanCell)
     if ($unknown) { $script:MatrixExitCode = [Math]::Max($script:MatrixExitCode, 1) }
     return ($cells -join ' | ')
 }
@@ -198,7 +235,9 @@ if ($null -ne $containers) {
 Write-Output "fleet-matrix (read-only) - $machine"
 Write-Output ("  containers : {0}" -f $containerSummary)
 Write-Output ""
-Write-Output "| machine | container(s) | host port | image | upstream (live) | /health role | client base_url (live) | cascade by value | relay transitions |"
-Write-Output "|---|---|---|---|---|---|---|---|---|"
-Write-Output ("| " + (Render-Row $machine $containers) + " |")
+$lanCell = Get-LanHubReachability $LanHub
+if ($lanCell -eq '?') { $script:MatrixExitCode = [Math]::Max($script:MatrixExitCode, 1) }
+Write-Output "| machine | container(s) | host port | image | upstream (live) | /health role | client base_url (live) | cascade by value | relay transitions | LAN hub reachability |"
+Write-Output "|---|---|---|---|---|---|---|---|---|---|"
+Write-Output ("| " + (Render-Row $machine $containers $lanCell) + " |")
 exit $script:MatrixExitCode

@@ -407,6 +407,14 @@ afterEach(async () => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+  // A test that SETS a CLAUDISH_FAILOVER_* knob the sandbox never captured —
+  // W3's OVERLOAD_WALK=0, W4/W22's WALK_BUDGET_MS — would otherwise outlive the
+  // file and rewrite the walk behaviour of whatever file runs next: beforeEach
+  // only knows the keys that existed when it captured them. Same family sweep
+  // as the CLAUDISH_ENDPOINT_ loop below, and for the same reason.
+  for (const k of Object.keys(process.env)) {
+    if (k.startsWith("CLAUDISH_FAILOVER_") && !(k in savedFailoverEnv)) delete process.env[k];
+  }
   // #654: same family sweep as beforeEach — a pin that crashed mid-flight
   // must not leave its knobs (or leases) to the file's later tests.
   for (const k of Object.keys(process.env)) {

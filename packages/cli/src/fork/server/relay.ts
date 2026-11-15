@@ -81,6 +81,28 @@ export interface RelayState {
    * matching. Published on /health as `selfLoop`.
    */
   selfLoop: boolean;
+  /**
+   * v27 — heartbeat FAILURE-EPISODE bookkeeping, log-only. `consecutiveFail`
+   * feeds the hysteresis (and is shared with in-band forward failures); this
+   * latch answers the other question, which the 2026-11-01 episodes left open:
+   * *what* failed and *how long* it took. Open while heartbeats are failing,
+   * null once one succeeds. Never read by a decision path.
+   */
+  hbEpisode?: { startedAt: number; failures: number; firstShape: string } | null;
+  /**
+   * #587 g1 — the hub's last observed `/health` body, log-only (no decision path
+   * reads it). The issue's minute-join had turned zero complete pairs because
+   * the relay journaled only its own verdict: `eventLoopMax60sMs` and
+   * `activeStreams` exist live on the hub and nowhere in this log. Every flip
+   * now carries the last thing the hub said, in the same line. `null` values
+   * mean the field was ABSENT on the hub image — never report absent as 0.
+   */
+  lastHealth?: {
+    instanceId: string;
+    eventLoopMax60sMs: number | null;
+    activeStreams: number | null;
+    at: number;
+  };
 }
 
 // ── Hysteresis tuning ──────────────────────────────────────────────
@@ -176,7 +198,75 @@ export function resolveForwardHeadersTimeoutMs(): number {
   }
   return Math.floor(n);
 }
-const DEEP_PROBE_TIMEOUT_MS = 30_000;
+export const DEEP_PROBE_TIMEOUT_MS = 30_000;
+
+/**
+ * Budget of the FIRST deep-probe attempt only (#867 track 2). The second attempt
+ * (the glm-5.3 fallback, #636) keeps the full {@link DEEP_PROBE_TIMEOUT_MS}.
+ *
+ * Measured on po-2027 over 50 WAN flips (2026-11-03→05, docker logs, issue #867):
+ * 27 of 39 completed first attempts on the haiku-shaped id EXPIRED at the full
+ * 30 s (`first attempt … failed (TimeoutError)`), and every one of those was
+ * followed by a fallback answer in 1 012–1 606 ms; the first attempts that did
+ * succeed took 11.0–29.4 s, one at 29.4 s within 600 ms of the ceiling. The
+ * recovery formula measured on the same seat: `window − probe ≈ 70 − t` (t =
+ * heartbeat timeout) — i.e. every expired first attempt adds its WHOLE budget
+ * on top of the cooldown floor, and it did so on 69 % of flips.
+ *
+ * Capping only the first attempt at 10 s moves the worst case from ~34 s of
+ * probe to ~14 s WITHOUT touching coverage: a would-succeed-at-15s haiku
+ * attempt now spills to the fallback, which answers in the SAME tick — the
+ * probe was already defined as "true if either attempt passes" (#636). The
+ * verdict changes in ONE case only: a first attempt that would have passed
+ * between this budget and 30 s while the fallback fails on a non-quota error
+ * (a quota wall already counts as liveness). That probe now reads false and
+ * the gate waits for 3 more OK heartbeats. Every expired first attempt
+ * measured on po-2027 was followed by a passing fallback. The armement (2 heartbeat
+ * failures) and the cooldown (60 s, the anti-flap) are NOT touched by this
+ * constant — that separation is the whole point of putting the cap on the
+ * attempt, not on the recovery loop.
+ *
+ * Successful haiku first attempts measured at 11–16 s DO get preempted by this
+ * cap; that is the accepted trade. The alternative (raising the whole probe to
+ * 30 s and letting it ride) is exactly the 69 %-of-flips regression this bound
+ * exists to remove.
+ */
+export const DEEP_PROBE_FIRST_ATTEMPT_TIMEOUT_MS = 10_000;
+
+/**
+ * Legal range for CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS. The MIN keeps a
+ * hand-edit from arming an effectively zero budget (below ~1 s the first
+ * attempt becomes decorative — every probe would spill to the fallback, and a
+ * TRANSIENT overload on haiku would never be measured on its own lane). The
+ * MAX is {@link DEEP_PROBE_TIMEOUT_MS} itself: a first-attempt budget above
+ * the probe's outer bound is the unbounded case re-entering by the window.
+ */
+export const MIN_PROBE_FIRST_ATTEMPT_TIMEOUT_MS = 1_000;
+export const MAX_PROBE_FIRST_ATTEMPT_TIMEOUT_MS = DEEP_PROBE_TIMEOUT_MS;
+
+/**
+ * Per-call read of CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS (never cached — same
+ * rationale as the resolvers above: an operator turns this mid-incident).
+ * Empty/unset mean the 10 s default (compose injects every listed name as ""
+ * and Number("") === 0, #310); garbage and out-of-range values fall back to the
+ * default rather than arming a cap nobody asked for. **`0` is the kill
+ * switch**: it restores the pre-#867 behavior byte for byte (first attempt at
+ * the full 30 s) without a code change.
+ */
+export function resolveProbeFirstAttemptTimeoutMs(): number {
+  const raw = process.env.CLAUDISH_RELAY_PROBE_FIRST_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return DEEP_PROBE_FIRST_ATTEMPT_TIMEOUT_MS;
+  const n = Number(raw);
+  if (n === 0) return DEEP_PROBE_TIMEOUT_MS;
+  if (
+    !Number.isFinite(n) ||
+    n < MIN_PROBE_FIRST_ATTEMPT_TIMEOUT_MS ||
+    n > MAX_PROBE_FIRST_ATTEMPT_TIMEOUT_MS
+  ) {
+    return DEEP_PROBE_FIRST_ATTEMPT_TIMEOUT_MS;
+  }
+  return Math.floor(n);
+}
 /** #80 part 2: one retry on a connect-phase failure before falling through
  * (the Docker Desktop tunnel's chronic resets — see forwardToUpstream). */
 const CONNECT_RETRIES = 1;
@@ -317,7 +407,7 @@ function markFail(state: RelayState, reason: string): void {
       }
     }
     log(
-      `[Relay] upstream ${redactUpstreamForLog(state.upstream)} DOWN after ${state.consecutiveFail} failure(s) (${reason}) → AUTONOMOUS`,
+      `[Relay] upstream ${redactUpstreamForLog(state.upstream)} DOWN after ${state.consecutiveFail} failure(s) (${reason}) → AUTONOMOUS${hubHealthSegment(state)}`,
       true
     );
   }
@@ -704,6 +794,13 @@ export async function forwardToUpstream(
     // (#279's hop list exists because A→B shapes happen), so the property
     // has to compose. Fixed literal set by our own hub — nothing sensitive.
     const drainFreezeMarker = res.headers.get("x-claudish-drain-freeze");
+    // #1055 g2 CR B2 — the typed lane refusal survives the hop the same way.
+    // The pilot's harness reaches the hub THROUGH its sidecar, and an untyped
+    // 429 arriving at the harness cannot be told apart from a quota wall — the
+    // whole point of the typed header. A lane refusal is a JSON 429 (never
+    // SSE), so it always lands on this rebuild branch, whatever `stream` the
+    // client asked for. Fixed literal set by our own hub — same as above.
+    const laneRefusalMarker = res.headers.get("x-claudish-lane-refusal");
     return carryNoticeHeader(
       res,
       new Response(text, {
@@ -712,6 +809,7 @@ export async function forwardToUpstream(
           "Content-Type": contentType || "application/json",
           ...(retryAfter ? { "retry-after": retryAfter } : {}),
           ...(drainFreezeMarker ? { "x-claudish-drain-freeze": drainFreezeMarker } : {}),
+          ...(laneRefusalMarker ? { "x-claudish-lane-refusal": laneRefusalMarker } : {}),
         },
       })
     );
@@ -814,12 +912,18 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
     }
     // JSON.parse failure IS "not detected": a non-JSON 200 keeps the pre-#156
     // verdict (true) rather than reaching the outer catch as a failure.
-    let upstreamId: unknown = undefined;
+    let parsed: Record<string, unknown> | null = null;
     try {
-      upstreamId = (JSON.parse(text) as { instanceId?: unknown } | null)?.instanceId;
+      const body = JSON.parse(text) as unknown;
+      if (body && typeof body === "object") parsed = body as Record<string, unknown>;
     } catch {
       // non-JSON → not detected
     }
+    const upstreamId = parsed?.instanceId;
+    // #587 g1 — keep the body's dated fields for the flip lines. Log-only;
+    // a non-JSON 200 leaves the previous snapshot in place (it is still the
+    // last thing the hub actually said).
+    noteHubHealth(state, parsed);
     if (typeof upstreamId === "string") {
       const isSelf = upstreamId === getInstanceId();
       if (isSelf !== state.selfLoop) {
@@ -841,6 +945,55 @@ export async function heartbeat(state: RelayState): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * #587 g1 — record the hub's `/health` body fields that date a flip. Log-only
+ * and never throwing: a logging instrument that can fail the prober is worse
+ * than none. A field the image does not publish stays `null`, so the line says
+ * `none` — coercing it to 0 would manufacture "no loop stall" evidence forever
+ * (the 24/10 trap on this issue).
+ */
+function noteHubHealth(state: RelayState, body: Record<string, unknown> | null): void {
+  try {
+    if (!body) return;
+    const rawId = typeof body.instanceId === "string" ? body.instanceId : "";
+    const max =
+      typeof body.eventLoopMax60sMs === "number" && Number.isFinite(body.eventLoopMax60sMs)
+        ? body.eventLoopMax60sMs
+        : null;
+    const streams =
+      typeof body.activeStreams === "number" && Number.isFinite(body.activeStreams)
+        ? body.activeStreams
+        : null;
+    if (!rawId && max === null && streams === null) return; // nothing worth dating a flip with
+    state.lastHealth = {
+      instanceId: rawId.slice(0, 64),
+      eventLoopMax60sMs: max,
+      activeStreams: streams,
+      at: Date.now(),
+    };
+  } catch {
+    // never throw out of an instrument
+  }
+}
+
+/**
+ * #587 g1 — the hub-side half of a relay flip, appended to BOTH the failure and
+ * the NOMINAL line so the issue's minute-join reads one journal. `age` is the
+ * distance to the body read: ~0 s on a recovery (the beat that decided it),
+ * minutes on a failure that outlived the last answer. `none` means never read
+ * or not published by that image — never 0.
+ */
+function hubHealthSegment(state: RelayState, now = Date.now()): string {
+  const h = state.lastHealth;
+  if (!h) return " — hub-last=none (no /health body read yet)";
+  const max = h.eventLoopMax60sMs === null ? "none" : String(h.eventLoopMax60sMs);
+  const streams = h.activeStreams === null ? "none" : String(h.activeStreams);
+  return (
+    ` — hub-last instanceId=${h.instanceId || "none"} eventLoopMax60sMs=${max}` +
+    ` activeStreams=${streams} age=${((now - h.at) / 1000).toFixed(1)}s`
+  );
 }
 
 /**
@@ -933,9 +1086,10 @@ function probeFallbackModel(): string {
  * still reads as "not proven alive", and 401/404 never qualify, so a bad proxy key
  * or a bad model id can never be laundered into a health verdict.
  *
- * Bounded like the rest of the probe: the `fetch` carries
- * `AbortSignal.timeout(DEEP_PROBE_TIMEOUT_MS)`, which covers the error-body read
- * too, and any throw lands in the catch below as `false`.
+ * Bounded like the rest of the probe: the `fetch` carries an
+ * `AbortSignal.timeout` — the short first-attempt budget, the full
+ * `DEEP_PROBE_TIMEOUT_MS` on the fallback (#867) — which covers the
+ * error-body read too, and any throw lands in the catch below as `false`.
  *
  * No evidence exists that this defect has fired. 24h of ai-01 sidecar logs show 5
  * AUTONOMOUS switches and 5 returns to NOMINAL, every duration explained by a
@@ -953,15 +1107,25 @@ function probeFallbackModel(): string {
  */
 export async function deepProbe(state: RelayState): Promise<boolean> {
   const first = probeModel();
-  const firstResult = await probeAttempt(state, first);
+  // #867 track 2: the first attempt rides a SHORT budget — read per call so an
+  // operator can widen it mid-incident (`0` restores the full 30 s). The
+  // fallback below keeps the full budget: it is the attempt that carries the
+  // verdict when the first expires, so it must never be the one cut short.
+  const firstBudget = resolveProbeFirstAttemptTimeoutMs();
+  const firstResult = await probeAttempt(state, first, firstBudget);
   if (firstResult.ok) return true;
   const fallback = probeFallbackModel();
+  // #867: elapsed AND budget on the line — the timeout reason names what
+  // expired, not what it cost or under which bound. AC3's before/after
+  // measurement greps these numbers; the elapsed is the operator's only
+  // evidence of how much of the recovery gate the first attempt burned.
   log(
-    `[Relay] deep probe: first attempt on ${first} failed (${firstResult.reason}) — ` +
+    `[Relay] deep probe: first attempt on ${first} failed after ${firstResult.ms}ms ` +
+      `(budget ${firstBudget}ms, ${firstResult.reason}) — ` +
       `second attempt on ${fallback} in the same tick`,
     true
   );
-  const secondResult = await probeAttempt(state, fallback);
+  const secondResult = await probeAttempt(state, fallback, DEEP_PROBE_TIMEOUT_MS, 2);
   // No second "OK" line here: the attempt already logged one, naming the model
   // that passed. The line above names the model that failed. Two OK lines per
   // recovery would read as two probes.
@@ -974,11 +1138,22 @@ export async function deepProbe(state: RelayState): Promise<boolean> {
   return false;
 }
 
-/** One deep-probe request. No logging of the verdict — the caller owns it. */
+/** One deep-probe request. No logging of the verdict — the caller owns it.
+ * `timeoutMs` bounds THIS attempt's fetch and body read; the first attempt
+ * passes the short #867 budget, the fallback the full one. `ms` is the
+ * attempt's own latency — what the failure line reports the attempt cost
+ * (#976). `attemptNo` (1 = nominal, 2 = fallback) lands on the success
+ * lines, so a grep says WHICH attempt served without knowing the model
+ * pairing (#976). */
 async function probeAttempt(
   state: RelayState,
-  model: string
-): Promise<{ ok: boolean; reason: string }> {
+  model: string,
+  timeoutMs = DEEP_PROBE_TIMEOUT_MS,
+  attemptNo = 1
+): Promise<{ ok: boolean; reason: string; ms: number }> {
+  // Above the try on purpose: the catch computes the attempt's latency too
+  // (#976), and a `const` born inside the try is not visible there.
+  const startedAt = Date.now();
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (state.proxyKey) headers["x-proxy-key"] = state.proxyKey;
@@ -1014,27 +1189,27 @@ async function probeAttempt(
       ],
       messages: [{ role: "user", content: "List the current directory using Bash. Do it now." }],
     });
-    const startedAt = Date.now();
     const res = await fetch(`${state.upstream}/v1/messages`, {
       method: "POST",
       headers,
       body,
-      signal: AbortSignal.timeout(DEEP_PROBE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
       if (isQuotaExhaustion(res.status, errBody)) {
         log(
           `[Relay] deep probe: upstream answered ${res.status} naming a quota/plan wall — ` +
-            `that IS liveness (it routed the request to answer), returning to NOMINAL (model=${model})`,
+            "that IS liveness (it routed the request to answer), returning to NOMINAL " +
+            `(model=${model}, attempt ${attemptNo}/2)`,
           true
         );
-        return { ok: true, reason: "quota wall = liveness" };
+        return { ok: true, reason: "quota wall = liveness", ms: Date.now() - startedAt };
       }
-      return { ok: false, reason: `upstream HTTP ${res.status}` };
+      return { ok: false, reason: `upstream HTTP ${res.status}`, ms: Date.now() - startedAt };
     }
     if (!res.body) {
-      return { ok: false, reason: `HTTP ${res.status} with no body` };
+      return { ok: false, reason: `HTTP ${res.status} with no body`, ms: Date.now() - startedAt };
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -1051,7 +1226,8 @@ async function probeAttempt(
         // about where the probe is served, 06/10). One bounded line per
         // probe, on the deep-probe path only — never per heartbeat.
         log(
-          `[Relay] deep probe OK — message_stop after ${Date.now() - startedAt}ms (model=${model})`,
+          `[Relay] deep probe OK — message_stop after ${Date.now() - startedAt}ms ` +
+            `(model=${model}, attempt ${attemptNo}/2)`,
           true
         );
         try {
@@ -1059,17 +1235,36 @@ async function probeAttempt(
         } catch {
           /* ignore */
         }
-        return { ok: true, reason: "" };
+        return { ok: true, reason: "", ms: Date.now() - startedAt };
       }
       if (acc.length > 200_000) break; // bound memory
     }
     // Reached only by a stream that ended (or overran) without a terminal frame.
-    return { ok: false, reason: `stream ended after ${acc.length} bytes without message_stop` };
+    return {
+      ok: false,
+      reason: `stream ended after ${acc.length} bytes without message_stop`,
+      ms: Date.now() - startedAt,
+    };
   } catch (e) {
     // Every other exit names its reason; this one carries the last. Without
     // these lines a sidecar held in AUTONOMOUS behind a healthy hub gave no
     // signal at all — the gate was invisible in the logs.
-    return { ok: false, reason: String(e).slice(0, 200) };
+    //
+    // A timeout names its BUDGET (#867): `String(e)` alone says "TimeoutError"
+    // without saying WHICH bound expired, and the two budgets now differ (10 s
+    // first attempt, 30 s fallback). The recovery formula (window − probe ≈
+    // 70 − t) is verified by grepping these lines — an unlabeled 30 s expiry
+    // on the first attempt is exactly the regression this change removes, and
+    // it must stay visible as such in the logs.
+    const name = (e as { name?: string })?.name;
+    if (name === "TimeoutError" || name === "AbortError") {
+      return {
+        ok: false,
+        reason: `timed out after ${timeoutMs}ms (${name})`,
+        ms: Date.now() - startedAt,
+      };
+    }
+    return { ok: false, reason: String(e).slice(0, 200), ms: Date.now() - startedAt };
   }
 }
 
@@ -1114,7 +1309,7 @@ export async function proberTick(state: RelayState): Promise<void> {
         state.consecutiveOk = 0;
         state.lastFlipAt = Date.now();
         log(
-          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)`,
+          `[Relay] upstream ${redactUpstreamForLog(state.upstream)} healthy again → NOMINAL (relay resumed)${hubHealthSegment(state)}`,
           true
         );
       } else {

@@ -2421,20 +2421,36 @@ function Update-ShaManifest {
         entries are preserved byte-for-byte in their recorded order. Written
         UTF-8 WITHOUT BOM - the same discipline as the 7z @listfile: a BOM
         poisons readers of the first line.
+
+        -Extra (#872) carries fields past the four this record has always had
+        (previous_sha, motif, source, ...). Two invariants, both pinned by
+        tests: a four-argument call writes exactly the four legacy fields in
+        the same order, byte for byte - adding a field must never reshape every
+        historical line - and extras merge AFTER those four, sorted by name, so
+        the same input always renders the same bytes. A key that would overwrite
+        a base field is refused rather than silently rewriting the record.
     #>
     param(
         [Parameter(Mandatory)] [string]$Path,
         [Parameter(Mandatory)] [string]$Archive,
         [Parameter(Mandatory)] [string]$Sha256,
         [Parameter(Mandatory)] [long]$Bytes,
-        [Parameter(Mandatory)] [string]$RecordedUtc
+        [Parameter(Mandatory)] [string]$RecordedUtc,
+        [hashtable]$Extra = @{}
     )
+    $baseFields = @('archive', 'sha256', 'bytes', 'recorded')
+    foreach ($k in @($Extra.Keys)) {
+        if ($baseFields -contains $k) {
+            throw "Update-ShaManifest: -Extra key '$k' would overwrite a base manifest field"
+        }
+    }
     $m = Read-ShaManifest -Path $Path
     $names = @($m.Entries.Keys | Sort-Object)
     if ($names -notcontains $Archive) { $names = @($names + $Archive | Sort-Object) }
-    $rec = [pscustomobject]@{
+    $rec = [ordered]@{
         archive = $Archive; sha256 = $Sha256; bytes = $Bytes; recorded = $RecordedUtc
     }
+    foreach ($k in @($Extra.Keys | Sort-Object)) { $rec[$k] = $Extra[$k] }
     $lines = foreach ($n in $names) {
         if ($n -eq $Archive) { ($rec | ConvertTo-Json -Compress) } else { ($m.Entries[$n] | ConvertTo-Json -Compress) }
     }

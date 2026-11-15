@@ -29,6 +29,7 @@ import io
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -193,10 +194,14 @@ def test_series_renders_rows_written_by_log_too():
 
 
 def test_series_days_filter_drops_older_rows():
+    # The "recent" row is dated from the clock, never hard-coded: `--days 7`
+    # cuts at now - 7 days, so a fixed date rots out of the window (it did on
+    # 2026-11-10, 7 days after the 11-02 fixture).
+    recent = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _with_ledger([
         {"ts": "2026-01-01T00:00:00Z", "provider": "kimi", "status": "ok",
          "lines": ["10 % restants"], "provenance": "vieux"},
-        {"ts": "2026-11-02T22:47:02Z", "provider": "kimi", "status": "ok",
+        {"ts": recent, "provider": "kimi", "status": "ok",
          "lines": ["90 % restants"], "provenance": "recent"},
     ])
     rc, out = _run(tabs.cmd_series, provider=None, days=7, json=False)

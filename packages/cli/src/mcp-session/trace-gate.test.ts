@@ -162,7 +162,13 @@ async function runFakeSession(opts: {
 }
 
 describe("#567 trace gate", () => {
-  // UNPORTED on replatform/v14: channel mode (#567 trace gate) — v14 has no src/channel/; re-port with the channel-mode row.
+  // UNPORTED on replatform/v14: channel mode (#567 trace gate) — v14 has no
+  // src/channel/. CLAUDISH_CHANNEL_TRACE is therefore INERT on this branch:
+  // no source reads it, so setting it writes no file and prints no
+  // [channel-trace] line. Do not read that silence as a healthy pipeline —
+  // the instrument is missing, not quiet (docs/reference/channel-mode.md says
+  // the same to operators). Re-port the module with its helpers if the
+  // channel-mode row ever comes back.
   test.skip("OFF: a pointed TRACE_FILE stays a dead letter when CLAUDISH_CHANNEL_TRACE is absent", async () => {
     const dir = mkdtempSync(join(tmpdir(), "claudish-trace-off-"));
     const traceFile = join(dir, "trace.log");
@@ -183,7 +189,9 @@ describe("#567 trace gate", () => {
     }
   }, 30_000);
 
-  // UNPORTED on replatform/v14: channel mode (#567 trace gate).
+  // UNPORTED on replatform/v14: channel mode (#567 trace gate) — the ON
+  // control cannot pass here because CLAUDISH_CHANNEL_TRACE has no reader on
+  // this branch; see the OFF pin above.
   test.skip("ON control: with CLAUDISH_CHANNEL_TRACE=1 the same spawn writes [channel-trace] records", async () => {
     const dir = mkdtempSync(join(tmpdir(), "claudish-trace-on-"));
     const traceFile = join(dir, "trace.log");

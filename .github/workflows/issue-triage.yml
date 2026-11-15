@@ -40,6 +40,7 @@ jobs:
   # ---------------------------------------------------------------------------
   analyze:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Never loop on our own bot's comments.
     if: github.event_name != 'issue_comment' || github.event.comment.user.login != 'claudish-bot[bot]'
     permissions:

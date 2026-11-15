@@ -13,6 +13,12 @@ import { VERTEX_SET_PROJECT_REMEDY } from "../auth/vertex-auth.js";
 import type { RemoteProvider } from "../handlers/shared/remote-provider-types.js";
 import type { ModelHandler } from "../handlers/types.js";
 import { getEndpoint as getConfigEndpoint } from "../profile-config.js";
+// #892 — the builtin providers' probe surface, authored ONCE. The watcher
+// (scripts/lib/claudish-model-version.psm1) reads this same JSON, so the base
+// URL a request is sent to and the base URL the watcher probes cannot drift.
+// Only providers listed here are wired from it; everything else keeps its
+// literal below.
+import PROBE_SURFACES from "./builtin-probe-surfaces.json";
 // Type-only import — erased at compile time, so no runtime import cycle with
 // model-discovery.ts (which imports getProviderByName from here).
 import type { ModelDiscoveryDescriptor } from "./model-discovery.js";
@@ -786,11 +792,11 @@ export const BUILTIN_PROVIDERS: TieredProviderDefinition[] = [
     name: "minimax-coding",
     displayName: "MiniMax Coding",
     transport: "anthropic",
-    baseUrl: "https://api.minimax.io",
+    baseUrl: PROBE_SURFACES.providers.mmc.baseUrl,
     baseUrlEnvVars: ["MINIMAX_CODING_BASE_URL"],
-    apiPath: "/anthropic/v1/messages",
+    apiPath: PROBE_SURFACES.providers.mmc.apiPath,
     modelDiscovery: { path: "/v1/models", format: "openai-models-list" },
-    apiKeyEnvVar: "MINIMAX_CODING_API_KEY",
+    apiKeyEnvVar: PROBE_SURFACES.providers.mmc.keyEnv,
     apiKeyDescription: "MiniMax Coding Plan API Key",
     apiKeyUrl: "https://platform.minimax.io/user-center/basic-information/interface-key",
     authScheme: "bearer",
@@ -901,11 +907,11 @@ export const BUILTIN_PROVIDERS: TieredProviderDefinition[] = [
     displayName: "GLM Coding",
     transport: "openai",
     tokenStrategy: "delta-aware",
-    baseUrl: "https://api.z.ai",
-    apiPath: "/api/coding/paas/v4/chat/completions",
+    baseUrl: PROBE_SURFACES.providers.gc.baseUrl,
+    apiPath: PROBE_SURFACES.providers.gc.apiPath,
     modelDiscovery: { path: "/api/coding/paas/v4/models", format: "openai-models-list" },
-    apiKeyEnvVar: "GLM_CODING_API_KEY",
-    apiKeyAliases: ["ZAI_CODING_API_KEY"],
+    apiKeyEnvVar: PROBE_SURFACES.providers.gc.keyEnv,
+    apiKeyAliases: PROBE_SURFACES.providers.gc.keyEnvAliases,
     apiKeyDescription: "GLM Coding Plan API Key",
     apiKeyUrl: "https://z.ai/subscribe",
     shortcuts: ["gc"],
@@ -1303,10 +1309,10 @@ export const BUILTIN_PROVIDERS: TieredProviderDefinition[] = [
     displayName: "DeepSeek",
     transport: "openai",
     tokenStrategy: "delta-aware",
-    baseUrl: "https://api.deepseek.com",
+    baseUrl: PROBE_SURFACES.providers.ds.baseUrl,
     baseUrlEnvVars: ["DEEPSEEK_BASE_URL"],
-    apiPath: "/v1/chat/completions",
-    apiKeyEnvVar: "DEEPSEEK_API_KEY",
+    apiPath: PROBE_SURFACES.providers.ds.apiPath,
+    apiKeyEnvVar: PROBE_SURFACES.providers.ds.keyEnv,
     apiKeyDescription: "DeepSeek API Key",
     apiKeyUrl: "https://platform.deepseek.com/api_keys",
     shortcuts: ["ds"],

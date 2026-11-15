@@ -1807,3 +1807,111 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         (Get-MarkedSliceText -Text $doctored2 -BeginMarker '# <drain-detach-entry>' -EndMarker '# </drain-detach-entry>') | Should -Match $forbidden   # inside -> caught
     }
 }
+
+<#
+    #925 — the quietest-moment phase never ran on the proactive path.
+
+    The drain loop sets its relax target on the poll where waited reaches
+    ObserveSec. When ObserveSec >= MaxWait (the watchdog's proactive call:
+    MaxWait 300, ObserveSec default 300) that poll is the LAST one the loop
+    condition allows — the fix (clamping ObserveSec to MaxWait/2, logged)
+    lives in claudish-drain.ps1 right before the first stream probe.
+
+    HOW THE STREAM STUB WORKS: the suite dot-sourced the drain script, so
+    Get-ClaudishActiveStreams is a session function this Describe shadows
+    for its lifetime (captured and restored in AfterAll — the REST of the
+    suite relies on the real one returning $null against unroutable URLs,
+    a leaked number-returning stub would break every "no signal" path).
+    The stub pops values from a script-scoped series: first call = the
+    pre-loop sample, then one per poll, then the decision->action probe;
+    an exhausted series answers $null ("no signal"), which every consumer
+    already handles. Each It re-arms its own series.
+#>
+Describe 'Invoke-ClaudishDrainedRestart — observe clamp, the quietest phase gets a window (#925)' {
+    BeforeAll {
+        $script:OrigStreamsProbe = (Get-Command Get-ClaudishActiveStreams).ScriptBlock
+        $script:StreamSeries = @()
+        function Get-ClaudishActiveStreams {
+            param([string]$Url = $ProxyUrl)
+            if ($script:StreamSeries.Count -gt 0) {
+                $v = $script:StreamSeries[0]
+                if ($script:StreamSeries.Count -gt 1) {
+                    $script:StreamSeries = $script:StreamSeries[1..($script:StreamSeries.Count - 1)]
+                } else {
+                    $script:StreamSeries = @()
+                }
+                return $v
+            }
+            return $null
+        }
+        function Reset-DrainFixture925 {
+            Reset-DrainFixture
+            [System.IO.File]::WriteAllText((Join-Path $script:ShimDir 'ps_out.txt'), "claudish-proxy running", (New-Object System.Text.ASCIIEncoding))
+        }
+    }
+    AfterAll {
+        Set-Item -Path Function:\Get-ClaudishActiveStreams -Value $script:OrigStreamsProbe
+    }
+
+    It 'MaxWait == ObserveSec: the clamp fires, and the restart lands on the post-observe DIP, not at the cap (AC2)' {
+        Reset-DrainFixture925
+        # w0=6 initial; observe polls w1..w6 = 5,7,7,7,7,7 (seenMin 5, current 7);
+        # clamped observe boundary 6 -> target 5 "quietest was 5"; adaptive w7..w9
+        # = 8,8,3 -> the 3 is a moment at-or-below target -> break. Trailing 6s
+        # feed the decision->action and post-verb probes (and the un-clamped
+        # mutation path, which needs polls past w9 to reach ITS boundary at 12).
+        $script:StreamSeries = @(6, 5, 7, 7, 7, 7, 7, 8, 8, 3, 6, 6, 6, 6, 6)
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'pin-925-dip' -Url 'http://127.0.0.1:1' -MaxWait 12 -ObserveSec 12 -RelaxSec 4 -PollSec 1
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        # The clamp is LOUD: a silent retune is undebuggable from drain.log.
+        $log | Should -Match 'clamping observe to 6s'
+        # The zero-wait gave up at the CLAMPED boundary with the pre-dip minimum.
+        $log | Should -Match 'no zero within 6s .*quietest was 5 stream'
+        $log | Should -Not -Match 'quietest was 3'   # dip must be POST-boundary
+        # The restart fired at the dip (3), not at the cap (6-8) — and not at
+        # the un-clamped boundary either.
+        $log | Should -Match 'restarting at 3 in flight \(quietest seen: 3\)'
+        $log | Should -Not -Match 'restarting at [4-9] in flight'
+        $log | Should -Match 'OUTCOME success'
+    }
+
+    It 'default ObserveSec 300 with a small MaxWait (the hang-path shape): clamped, restart never waits past MaxWait (AC3)' {
+        Reset-DrainFixture925
+        # Constant 7 with MaxWait 8: clamp 300->4, target 7 at w4, the very
+        # next top-of-loop check fires at-or-below -> restart at waited=4.
+        # Scaled proxy for the hang call (MaxWait 120, clamp -> 60): the
+        # change can only make a bounded wait fire EARLIER at a chosen
+        # moment; $MaxWait still gates the loop, so 120 stays 120-capped.
+        $script:StreamSeries = @(7, 7, 7, 7, 7, 7, 7, 7, 7, 7)
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'pin-925-hang-shape' -Url 'http://127.0.0.1:1' -MaxWait 8 -ObserveSec 300 -RelaxSec 4 -PollSec 1
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Match 'clamping observe to 4s'
+        $log | Should -Match 'no zero within 4s .*quietest was 7 stream'
+        if ($log -match 'waited (\d+)s, restarting at') {
+            [int]$Matches[1] | Should -BeLessOrEqual 8   # never past MaxWait
+        } else {
+            throw "no 'waited Ns, restarting at' line found in drain.log — timing pin cannot assert"
+        }
+        $log | Should -Match 'OUTCOME success'
+    }
+
+    It 'control: ObserveSec < MaxWait is untouched — no clamp line, boundary at the passed value (surgical fix)' {
+        Reset-DrainFixture925
+        # The default call shape (600/300) and any sane caller keep their
+        # observe boundary verbatim; only the degenerate >= shape clamps.
+        $script:StreamSeries = @(6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6)
+
+        $r = Invoke-ClaudishDrainedRestart -Reason 'pin-925-control' -Url 'http://127.0.0.1:1' -MaxWait 12 -ObserveSec 6 -RelaxSec 4 -PollSec 1
+        $r | Should -BeTrue
+        $log = Get-DrainLogText
+        $log | Should -Not -Match 'clamping observe'
+        $log | Should -Match 'no zero within 6s .*quietest was 6 stream'
+        # Current == quietest is a legal at-or-below moment: fires at the boundary.
+        $log | Should -Match 'restarting at 6 in flight'
+        $log | Should -Match 'OUTCOME success'
+    }
+}

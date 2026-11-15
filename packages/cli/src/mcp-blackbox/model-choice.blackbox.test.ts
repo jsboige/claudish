@@ -49,7 +49,7 @@ beforeEach(() => {
     readFileSync(join(dataDir, "mcp-model-check/openrouter-20261023.json"), "utf8")
   );
   writeFileSync(
-    join(config, "openrouter-models.json"),
+    join(config, "mcp-models-list.json"),
     JSON.stringify({ ...openrouter, lastUpdated: new Date().toISOString() })
   );
   fetches = join(layout.root, "fetches.jsonl");

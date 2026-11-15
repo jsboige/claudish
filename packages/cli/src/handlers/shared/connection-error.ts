@@ -11,7 +11,7 @@
  * honest "can't reach host — check your network/DNS" instead.
  */
 
-export type ConnectionErrorKind = "dns" | "refused" | "unreachable";
+export type ConnectionErrorKind = "dns" | "refused" | "unreachable" | "closed";
 
 /** Node/undici syscall codes we treat as a failure to REACH the host. */
 const CODE_KIND: Record<string, ConnectionErrorKind> = {
@@ -19,12 +19,17 @@ const CODE_KIND: Record<string, ConnectionErrorKind> = {
   EAI_AGAIN: "dns", // getaddrinfo: temporary DNS failure
   ECONNREFUSED: "refused", // nothing listening at the endpoint
   ETIMEDOUT: "unreachable", // connect timed out
-  ECONNRESET: "unreachable", // connection reset before response
   ENETUNREACH: "unreachable", // network unreachable
   EHOSTUNREACH: "unreachable", // host unreachable
-  EPIPE: "unreachable", // broken pipe during connect
   UND_ERR_CONNECT_TIMEOUT: "unreachable", // undici connect timeout
-  UND_ERR_SOCKET: "unreachable", // undici socket closed
+
+  // Reached, then the connection died before a response: the peer (or a proxy
+  // in between) closed it — a TLS reject, an upstream that cuts. Kept separate
+  // from "unreachable" because blaming the user's network for a peer-side reset
+  // is a misdiagnosis; retry semantics are identical either way.
+  ECONNRESET: "closed", // connection reset before response
+  EPIPE: "closed", // broken pipe
+  UND_ERR_SOCKET: "closed", // undici socket closed
 
   // --- Bun runtime codes ---------------------------------------------------
   // claudish RUNS on Bun, and Bun's fetch does NOT use Node's errno names and
@@ -35,9 +40,9 @@ const CODE_KIND: Record<string, ConnectionErrorKind> = {
   // TTY). Note Bun reports a DNS failure as ConnectionRefused too — see
   // buildConnectionErrorMessage for how that ambiguity is resolved.
   ConnectionRefused: "refused", // Bun: refused OR unresolvable host
-  ConnectionClosed: "unreachable", // Bun: peer closed mid-connect
+  ConnectionClosed: "closed", // Bun: peer closed mid-connect
   FailedToOpenSocket: "unreachable", // Bun: could not open the socket
-  ERR_SOCKET_CLOSED: "unreachable", // Bun: socket closed before response
+  ERR_SOCKET_CLOSED: "closed", // Bun: socket closed before response
 };
 
 /**
@@ -201,6 +206,16 @@ function hostOf(endpoint: string): string {
   }
 }
 
+/** True when the endpoint points at this machine (loopback / unspecified). */
+export function isLoopbackEndpoint(endpoint: string): boolean {
+  try {
+    const { hostname } = new URL(endpoint);
+    return /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[?::1\]?)$/i.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
 /** Build the user-facing, actionable message for a connection failure. */
 export function buildConnectionErrorMessage(
   kind: ConnectionErrorKind,
@@ -217,12 +232,16 @@ export function buildConnectionErrorMessage(
       // server is running" would send the user to restart chatgpt.com. For a
       // remote host, give the DNS/network wording instead — that is the far
       // likelier cause, and the advice is right either way.
-      if (isLoopback(endpoint)) {
+      if (isLoopbackEndpoint(endpoint)) {
         return `Cannot connect to ${displayName} at ${endpoint}. Make sure the server is running.`;
       }
       return `Cannot reach ${host} for ${displayName}. This is a network problem on your machine — check your internet connection, VPN, or DNS resolver (e.g. Tailscale MagicDNS) — not ${displayName}.`;
     case "unreachable":
       return `Cannot reach ${displayName} at ${endpoint}. Check your network connection.`;
+    case "closed":
+      // The host was reached and then dropped the connection — that points at
+      // the provider or a proxy in between, not at the user's network.
+      return `The connection to ${displayName} at ${endpoint} was closed before a response arrived. This is usually the provider or a proxy in between, not your network.`;
   }
 }
 
@@ -275,4 +294,110 @@ export function buildRecoveryHoldMessage(
     `${reason} claudish retried ${attempts}× over ${formatHoldDuration(elapsedMs)} ` +
     "without reaching it — still trying, watch the recovery pane."
   );
+}
+
+/**
+ * Link ladder: the classes disproved as "stable" (dns / refused / unreachable).
+ *
+ * CLAUDISH_CONNECT_RETRY_MAX — retries after the initial attempt (default 2,
+ *   "0" disarms; re-read per request so an operator flip needs no restart).
+ * CLAUDISH_CONNECT_RETRY_DELAYS_MS — comma-separated ladder before each
+ *   retry (default "400,1200"; the last entry repeats when MAX exceeds it).
+ * CLAUDISH_CONNECT_RETRY_LINK — tri-state, re-read per request:
+ *   "0"/"false"/"no" disarms the link ladder everywhere (kill switch);
+ *   "1"/"true"/"yes" arms it everywhere (operator force, hub included);
+ *   unset → armed only in its default scope (see connectRetryPolicy).
+ * CLAUDISH_CONNECT_RETRY_LINK_MAX — default 3.
+ * CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS — default "500,2000,5000".
+ */
+export function connectRetryMax(): number {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_MAX;
+  if (raw === undefined || raw === "") return 2;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 2;
+}
+
+export function connectRetryDelaysMs(): number[] {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_DELAYS_MS;
+  if (raw === undefined || raw === "") return [400, 1200];
+  const parsed = raw
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  return parsed.length ? parsed : [400, 1200];
+}
+
+export function connectRetryLinkMax(): number {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK_MAX;
+  if (raw === undefined || raw === "") return 3;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 3;
+}
+
+export function connectRetryLinkDelaysMs(): number[] {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK_DELAYS_MS;
+  if (raw === undefined || raw === "") return [500, 2000, 5000];
+  const parsed = raw
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  return parsed.length ? parsed : [500, 2000, 5000];
+}
+
+/** The link ladder's kill switch: only an explicit no disarms it. */
+export function connectRetryLinkArmed(): boolean {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK?.trim().toLowerCase();
+  return !(raw === "0" || raw === "false" || raw === "no");
+}
+
+/** Operator force: an explicit yes arms the link ladder even out of scope. */
+export function connectRetryLinkForced(): boolean {
+  const raw = process.env.CLAUDISH_CONNECT_RETRY_LINK?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+/**
+ * Relay sidecar (CLAUDISH_RELAY_UPSTREAM set) — this process rides a roaming
+ * WAN link by construction, so the link classes are bursts for it even when
+ * its routing built a fallback chain. Re-read per request.
+ */
+export function relayUpstreamSet(): boolean {
+  return !!process.env.CLAUDISH_RELAY_UPSTREAM?.trim();
+}
+
+export interface ConnectRetryPolicy {
+  max: number;
+  delaysMs: number[];
+}
+
+/**
+ * The bounded retry policy for a connect failure of `kind` against `endpoint`.
+ * `null` (or `max === 0`) means: surface the failure on the first attempt.
+ *
+ * A loopback endpoint never gets the link ladder — "refused on localhost" is
+ * the stable condition the original comment was actually describing, and the
+ * honest "make sure the server is running" must not wait 7.5 s.
+ *
+ * The link ladder's DEFAULT scope is the relay sidecar ONLY (CR #906, second
+ * round): `CLAUDISH_RELAY_UPSTREAM` set — the process rides a roaming WAN link
+ * by construction, and every dead turn measured in #905 (26 in one morning)
+ * lived there, chain or not. The hub and plain CLI are excluded by default:
+ * a cascade-backed role's NOMINAL is an explicit `provider@model` that comes
+ * back as a solo handler, but its connect 400 is walk-class (#299 B,
+ * isOverloadWalkClass on connection_error) and `handleWithCascade` serves the
+ * first servable step — a ladder here would only stack up to 7.5 s of sleeps
+ * (per request, on every role) in front of a walk that already recovers the
+ * turn. Nobody has measured link blips there; the operator force exists for
+ * the day someone does. CLAUDISH_CONNECT_RETRY_LINK="1" forces it on
+ * anywhere; "0" disarms it everywhere.
+ */
+export function connectRetryPolicy(
+  kind: ConnectionErrorKind,
+  endpoint: string
+): ConnectRetryPolicy | null {
+  if (kind === "closed") return { max: connectRetryMax(), delaysMs: connectRetryDelaysMs() };
+  if (isLoopbackEndpoint(endpoint)) return null;
+  if (!connectRetryLinkArmed()) return null;
+  if (!connectRetryLinkForced() && !relayUpstreamSet()) return null;
+  return { max: connectRetryLinkMax(), delaysMs: connectRetryLinkDelaysMs() };
 }

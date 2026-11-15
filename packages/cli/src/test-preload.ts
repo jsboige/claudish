@@ -49,6 +49,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { presetRefusal } from "./test-sandbox";
+import { armCaptureHermeticity } from "./test-support/capture-hermeticity";
 
 const SANDBOX_PREFIX = "claudish-test-home-";
 
@@ -105,6 +106,13 @@ for (const name of readdirSync(tmpdir())) {
     }
   } catch {}
 }
+
+// Capture hermeticity (2026-11-08, three test files wrote into a seat's REAL
+// capture dir under an ambient CLAUDISH_CAPTURE_DIR): swap the ambient dir for
+// a per-run tmp sandbox BEFORE any test, and fail the run at the end if a
+// resp-<this pid>-*.sse still landed in the original dir. Mechanism and the
+// pid-attribution argument live in test-support/capture-hermeticity.ts.
+armCaptureHermeticity();
 
 // afterAll in a preload runs once, after the last test file. process "exit"
 // and "beforeExit" hooks do not fire under `bun test` (measured, Bun 1.3.13).

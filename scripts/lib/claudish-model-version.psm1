@@ -854,6 +854,60 @@ function Get-ModelsUrl {
     return $base + '/v1/models'
 }
 
+function Get-BuiltinProbeSurfaces {
+    # #892 — the builtin providers' probe surface, read from the ONE authored
+    # table the CLI also imports (packages/cli/src/providers/builtin-probe-
+    # surfaces.json). Before this, a builtin prefix reached the probe as
+    # 'no probe surface declared in config' and was never probed at all, so
+    # gc@/ds@/mmc@ freshness rode entirely on the disk cache.
+    #
+    # Never throws. A missing file (no repo checkout on this seat) or an
+    # unparsable one returns an EMPTY table, and the caller then keeps today's
+    # honest reason: a report must not become an incident because a path moved.
+    param([string]$Path = '')
+    $result = @{}
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $Path = Join-Path $PSScriptRoot '..\..\packages\cli\src\providers\builtin-probe-surfaces.json'
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $result }
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        $parsed = $raw | ConvertFrom-Json
+        if ($null -eq $parsed) { return $result }
+        if ($null -eq $parsed.PSObject.Properties['providers']) { return $result }
+        foreach ($p in @($parsed.providers.PSObject.Properties)) {
+            $v = $p.Value
+            if ($null -eq $v) { continue }
+            $baseUrl = ''
+            if ($null -ne $v.PSObject.Properties['baseUrl']) { $baseUrl = [string]$v.baseUrl }
+            if ([string]::IsNullOrWhiteSpace($baseUrl)) { continue }
+            $apiPath = ''
+            if ($null -ne $v.PSObject.Properties['apiPath']) { $apiPath = [string]$v.apiPath }
+            $authScheme = ''
+            if ($null -ne $v.PSObject.Properties['authScheme']) { $authScheme = [string]$v.authScheme }
+            $keyEnv = ''
+            if ($null -ne $v.PSObject.Properties['keyEnv']) { $keyEnv = [string]$v.keyEnv }
+            $aliases = @()
+            if ($null -ne $v.PSObject.Properties['keyEnvAliases']) {
+                foreach ($a in @($v.keyEnvAliases)) {
+                    $s = [string]$a
+                    if (-not [string]::IsNullOrWhiteSpace($s)) { $aliases += $s }
+                }
+            }
+            $result[[string]$p.Name] = @{
+                BaseUrl       = $baseUrl
+                ApiPath       = $apiPath
+                AuthScheme    = $authScheme
+                KeyEnv        = $keyEnv
+                KeyEnvAliases = $aliases
+            }
+        }
+    } catch {
+        return @{}
+    }
+    return $result
+}
+
 function Get-ProviderProbeTargets {
     # Every provider prefix the routing actually uses, classified by whether
     # this seat can probe it and why not when it cannot. Pure: config in,
@@ -867,7 +921,12 @@ function Get-ProviderProbeTargets {
         # when a plan walls, so a provider that appears there and nowhere in
         # `routing` is exactly the one nobody watches (`kc@` was re-pinned by
         # hand for that reason, 24/10).
-        [string[]]$CascadePrefixes = @()
+        [string[]]$CascadePrefixes = @(),
+        # #892 — prefix name without '@' -> probe surface, as returned by
+        # Get-BuiltinProbeSurfaces. Passed in (not read here) so the suite can
+        # pin every shape without touching the repo; $null means "read it from
+        # the authored table", an empty table means "none available".
+        $BuiltinSurfaces = $null
     )
     $byPrefix = @{}
     $routingSet = @{}
@@ -919,6 +978,37 @@ function Get-ProviderProbeTargets {
             $entry = $CustomEndpoints.PSObject.Properties[$name].Value
         }
         if ($null -eq $entry) {
+            # #892 — a builtin provider is now probed instead of reported as a
+            # blind spot, but ONLY when the authored table names it. An unknown
+            # prefix keeps the honest reason below.
+            $table = $BuiltinSurfaces
+            if ($null -eq $table) { $table = Get-BuiltinProbeSurfaces }
+            $builtin = $null
+            if ($null -ne $table -and $table.ContainsKey($name)) { $builtin = $table[$name] }
+            if ($null -ne $builtin) {
+                $keyNames = @()
+                if (-not [string]::IsNullOrWhiteSpace([string]$builtin.KeyEnv)) { $keyNames += [string]$builtin.KeyEnv }
+                foreach ($a in @($builtin.KeyEnvAliases)) {
+                    $s = [string]$a
+                    if (-not [string]::IsNullOrWhiteSpace($s) -and $keyNames -notcontains $s) { $keyNames += $s }
+                }
+                $firstKey = ''
+                if ($keyNames.Count -gt 0) { $firstKey = $keyNames[0] }
+                $targets += @{
+                    Prefix       = $prefix
+                    Probeable    = $true
+                    Kind         = 'builtin'
+                    Url          = (Get-ModelsUrl -BaseUrl $builtin.BaseUrl -ApiPath $builtin.ApiPath)
+                    KeyName      = $firstKey
+                    KeyNames     = $keyNames
+                    KeyInline    = ''
+                    AuthScheme   = $builtin.AuthScheme
+                    ExtraHeaders = $null
+                    Source       = $source
+                    Reason       = ''
+                }
+                continue
+            }
             $reason = 'no probe surface declared in config (builtin provider URL lives in the CLI, not here)'
             if ($source -eq 'cascade') { $reason += '; reached only from a CLAUDISH_FAILOVER_* cascade' }
             $targets += @{
@@ -1089,13 +1179,33 @@ function Invoke-ProviderCatalogProbe {
 
         $key = ''
         if (-not [string]::IsNullOrEmpty($t.KeyInline)) { $key = $t.KeyInline }
-        elseif (-not [string]::IsNullOrEmpty($t.KeyName)) {
-            if ($null -ne $ApiKeys) { $key = Get-ApiKeyValue -ApiKeys $ApiKeys -Name $t.KeyName }
-            if ([string]::IsNullOrEmpty($key) -and $null -ne $EnvLookup) { $key = [string](& $EnvLookup $t.KeyName) }
-            if ([string]::IsNullOrEmpty($key)) {
+        else {
+            # #892 — a surface may declare ALIASES (gc@ answers to
+            # GLM_CODING_API_KEY or ZAI_CODING_API_KEY). Try them in order and
+            # keep the first that resolves; a name absent from the config is
+            # not an error, the next one may be the one this seat holds.
+            $keyNames = @()
+            if (-not [string]::IsNullOrEmpty($t.KeyName)) { $keyNames += $t.KeyName }
+            $declared = $null
+            if ($t -is [System.Collections.IDictionary]) {
+                if ($t.Contains('KeyNames')) { $declared = $t['KeyNames'] }
+            } else {
+                $kp = $t.PSObject.Properties['KeyNames']
+                if ($null -ne $kp) { $declared = $kp.Value }
+            }
+            foreach ($n in @($declared)) {
+                $s = [string]$n
+                if (-not [string]::IsNullOrWhiteSpace($s) -and $keyNames -notcontains $s) { $keyNames += $s }
+            }
+            foreach ($n in $keyNames) {
+                if ($null -ne $ApiKeys) { $key = Get-ApiKeyValue -ApiKeys $ApiKeys -Name $n }
+                if ([string]::IsNullOrEmpty($key) -and $null -ne $EnvLookup) { $key = [string](& $EnvLookup $n) }
+                if (-not [string]::IsNullOrEmpty($key)) { break }
+            }
+            if ([string]::IsNullOrEmpty($key) -and $keyNames.Count -gt 0) {
                 $outcomes += @{
                     Prefix = $t.Prefix; Status = 'not probed'; Ids = @(); Kind = $t.Kind
-                    Reason = "no credential ($($t.KeyName) is neither in config.apiKeys nor in the environment)"
+                    Reason = "no credential ($($keyNames -join ' / ') is neither in config.apiKeys nor in the environment)"
                 }
                 continue
             }
@@ -1249,4 +1359,5 @@ Export-ModuleMember -Function `
     Split-ProbeDecisions, Get-ApiKeyValue, `
     Get-ProbeHeaders, Test-VersionEventEmitted, `
     Read-EnvFileValues, ConvertFrom-FailoverCascadeEnv, Format-CascadeCoverageLine, `
+    Get-BuiltinProbeSurfaces, `
     Invoke-DrainDetachedRestart
