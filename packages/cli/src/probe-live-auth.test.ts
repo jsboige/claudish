@@ -32,7 +32,8 @@
  * this is proxy-key-rotation-route.test.ts's shape: the real
  * createProxyServer in-process on a fixed port, the real middleware, the
  * upstream stubbed by URL dispatch (local proxy URL passes through to the
- * real fetch; the provider call gets a healthy OpenAI SSE stream).
+ * real fetch; the provider call gets a healthy Responses-wire SSE stream —
+ * the wire v14's deepseek transport actually uses).
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -80,21 +81,24 @@ const LINK = {
 let activeProxy: ProxyServer | null = null;
 const realFetch = globalThis.fetch;
 
-/** OpenAI-shaped SSE upstream — a content delta is what the probe accepts as
- * proof of life (a bare content_block_start is not, see isContentEvent). */
+/** Responses-wire SSE upstream — v14's deepseek transport POSTs
+ * api.deepseek.com/responses, so the stub must speak the Responses event
+ * vocabulary (`response.output_text.delta`, `response.completed`), not
+ * chat.completions chunks. A chat.completions stub is unparseable on that
+ * wire: the turn comes back 200 with ZERO content events and the probe
+ * verdict lands on "stream ended without content" (measured in this
+ * worktree, #1054 CR B4 pin 2) — an auth test failing on a parser shape,
+ * not on the credential it exists to pin. A text delta is what the probe
+ * accepts as proof of life (a bare content_block_start is not, see
+ * isContentEvent). */
 function deepseekSse(): Response {
-  const chunk = (delta: any, finish_reason: string | null = null) =>
-    `data: ${JSON.stringify({
-      id: "chatcmpl-930",
-      object: "chat.completion.chunk",
-      created: 1,
-      model: "deepseek-flash",
-      choices: [{ index: 0, delta, finish_reason }],
-    })}\n\n`;
+  const evt = (obj: any) => `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
   const sse =
-    chunk({ role: "assistant", content: "" }) +
-    chunk({ content: "ok" }) +
-    `data: [DONE]\n\n`;
+    evt({ type: "response.output_text.delta", delta: "ok" }) +
+    evt({
+      type: "response.completed",
+      response: { usage: { input_tokens: 9, output_tokens: 1 } },
+    });
   return new Response(sse, {
     status: 200,
     headers: { "content-type": "text/event-stream" },
@@ -171,15 +175,23 @@ describe("resolveProbeProxyKey (#930)", () => {
 });
 
 describe("probeLink against a key-enforcing proxy (#930)", () => {
+  // Explicit timeouts (#1054 CR B4 pin 2, v14 shape): the FIRST /v1/messages
+  // through this file's proxy pays the paged model-catalog refresh (#635) —
+  // real queryModels/queryPlans calls that ride the stub's realFetch
+  // passthrough, measured ~7s of WAN latency under bun test on this host
+  // (second request: ~7ms; the turn itself: 10-20ms). Bun's default 5s
+  // per-test timeout kills P1 mid-fetch and the aborted probe resurfaces as
+  // an unhandled `network-error` expect — a harness artifact, not a verdict.
+  // The pin itself is unchanged: with the time to finish, P1 reads `live`.
   test("P1 — probe with the resolved key is LIVE, not auth-failed", async () => {
     const result = await probeLink(PROXY_BASE, { ...LINK }, 15000, PROXY_KEY);
     expect(result.state).toBe("live");
-  });
+  }, 30_000);
 
   test("P2 — keyless probe still takes the middleware's 401", async () => {
     const result = await probeLink(PROXY_BASE, { ...LINK }, 15000);
     expect(result.state).toBe("auth-failed");
     expect(result.httpStatus).toBe(401);
     expect(result.errorMessage).toContain("invalid proxy authentication");
-  });
+  }, 30_000);
 });
