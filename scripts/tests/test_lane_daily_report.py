@@ -148,14 +148,20 @@ try:
           f"(lanes {list(rep_f['lanes'])}, unpaired {rep_f['unpaired']})")
 
     print("parse_refusals — causes, lanes, bruit, fenetre")
-    old = (datetime.now(timezone.utc) - timedelta(hours=30)).strftime(TS := "%Y-%m-%dT%H:%M:%S")
+    # Docker `-t` prefixes, all relative to now: an absolute date here is a
+    # time bomb — it leaves the 24 h window a day after it was written and
+    # turns the suite red on a tree that has not changed.
+    def dts(minutes_ago, frac="000000000"):
+        return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)) \
+            .strftime("%Y-%m-%dT%H:%M:%S") + "." + frac + "Z"
+    old = dts(30 * 60)
     log = "\n".join([
-        "2026-11-14T16:35:29.123456789Z [claudish] [LaneBudget] REFUSE lane=nb-coder model=MiniMax-M3.1-Flash consumed=500000 >= 400000 (retry-after 3600s)",
-        "2026-11-14T16:36:01.000000000Z [claudish] [LaneBudget] REFUSE lane=nb-coder model=glm-5.3 consumed=100 >= 90 (retry-after 60s)",
-        "2026-11-14T16:36:40.000000000Z [claudish] [LaneStop] REFUSE lane=nb-coder (operator stop file present)",
-        "2026-11-14T16:37:02.000000000Z [claudish] [LaneBudget] REFUSE lane=autre-lane model=x consumed=1 >= 1 (retry-after 1s)",
-        "2026-11-14T16:37:40.000000000Z [claudish] [Request] model=nb-minimax handler=ComposedHandler",
-        old + ".000000000Z [claudish] [LaneBudget] REFUSE lane=nb-coder model=vieux consumed=1 >= 1 (retry-after 1s)",
+        dts(40, "123456789") + " [claudish] [LaneBudget] REFUSE lane=nb-coder model=MiniMax-M3.1-Flash consumed=500000 >= 400000 (retry-after 3600s)",
+        dts(39) + " [claudish] [LaneBudget] REFUSE lane=nb-coder model=glm-5.3 consumed=100 >= 90 (retry-after 60s)",
+        dts(38) + " [claudish] [LaneStop] REFUSE lane=nb-coder (operator stop file present)",
+        dts(37) + " [claudish] [LaneBudget] REFUSE lane=autre-lane model=x consumed=1 >= 1 (retry-after 1s)",
+        dts(36) + " [claudish] [Request] model=nb-minimax handler=ComposedHandler",
+        old + " [claudish] [LaneBudget] REFUSE lane=nb-coder model=vieux consumed=1 >= 1 (retry-after 1s)",
         "[LaneStop] REFUSE lane=sans-horodatage (operator stop file present)",
     ])
     ref = ldr.parse_refusals(log, cutoff)
