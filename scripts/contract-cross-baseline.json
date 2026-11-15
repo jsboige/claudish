@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "sourceSha": "8608b755",
+  "capturedAt": "2026-11-15T16:03:26.838Z",
+  "modules": {
+    "packages/cli/src/handlers/shared/thinking-signature.ts": {
+      "raw": "14685d99e875f8e1eadcc14afcabe37f3cdbb6a52675c22bf8784de314dc61e1",
+      "normalized": "0e29ac41f2cd608e691e8b81c1120f4d239f71e03ed5b8e4307e870d984e8b58"
+    },
+    "packages/cli/src/handlers/shared/collect-sse-message.ts": {
+      "raw": "7d540a4e0e8461845c51e095ac29077f9e8ef95fe662d51a0fc38e29552eebc7",
+      "normalized": "3f583a1f3ca1499b134b566d8cb7a2966b77db07a9cbffcbe6c4b26a46c9b167"
+    },
+    "packages/cli/src/handlers/shared/stream-parsers/sse-line.ts": {
+      "raw": "3bb5a6469ec7e1ccc91fb5de275c89273a3f7f7a50c081bbd38ec032665c1635",
+      "normalized": "20cd97ca62120f83b424ef961ff1cf82c78eaeb2fb4e1d6f3026b8c436857e13"
+    },
+    "packages/cli/src/handlers/shared/stream-parsers/block-writer.ts": {
+      "raw": "c6647554c0c9c1e60e91880db7021b5617a5b35c964105c54f73ed7baf3df9fd",
+      "normalized": "5c22a7f3f0bb77c43a417e40236e2c302d445e04ce1c3e80d701eb738b0c031d"
+    },
+    "packages/cli/src/handlers/shared/stream-parsers/think-tag-splitter.ts": {
+      "raw": "b869785061496866fe62040ee33afbfa2fa02b7b7c455f80304976c5bc16c821",
+      "normalized": "186c3a365bee72c891abd0f4f66bd6d5fa3cb943b863f5869691f05e4c3354af"
+    },
+    "packages/cli/src/handlers/shared/stream-parsers/message-start-usage.ts": {
+      "raw": "ccc18aaf956a8e71dcd09185f584bbc19f42a507f52328eb98d68be342ff57f5",
+      "normalized": "59b908b183027938c8f14c7a42e89b3f8491b60a52258539145e24529e85aed6"
+    }
+  }
+}
