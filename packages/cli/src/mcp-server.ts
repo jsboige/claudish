@@ -43,6 +43,10 @@ import {
   getRecommendedModels,
   readLastRecommendedModels,
 } from "./model-loader.js";
+// SSE spec: the space after `data:` is optional — parseAnthropicSse reads both
+// forms through the shared helper (upstream 3dbd3167; pin re-added with this
+// file's suite, #1054 CR B5).
+import { sseDataPayload } from "./handlers/shared/stream-parsers/sse-line.js";
 // Imported for the predicate only. child-env's import-time bootstrap is a no-op here:
 // a claudish MCP server is never the pane child (it carries no CLAUDISH_PANE_CWD).
 import { inMcpSession } from "./pane/child-env.js";
@@ -276,7 +280,8 @@ export function parseAnthropicSse(raw: string): {
     const lines = block.split("\n").filter((l) => l.trim());
     let dataStr = "";
     for (const line of lines) {
-      if (line.startsWith("data: ")) dataStr += line.slice(6);
+      const payload = sseDataPayload(line);
+      if (payload !== null) dataStr += payload;
     }
     if (!dataStr || dataStr === "[DONE]") continue;
 

@@ -172,15 +172,17 @@ Reading rules that change verdicts:
 
 Capture format, archive/GDrive retention, device-id attribution, exact commands: `docs/reference/traffic-analysis.md`.
 
-## Channel Mode (MCP, v6.4.0+)
+## Channel Mode (MCP, v6.4.0+ — NOT on this platform branch)
 
-Async model sessions with push notifications, on the low-level `Server` class declaring `experimental: { 'claude/channel': {} }`. 13 tools, gated by `CLAUDISH_MCP_TOOLS` (`all` default · `low-level` · `agentic` · `channel`). Wire contract pinned by `channel-wire-format.test.ts`.
+**On replatform/v14 the channel pipeline does not exist**: the MCP server declares **no** `experimental: { 'claude/channel': {} }` capability and pushes nothing — a host polls `list_sessions` and reads the records on disk. Until a channel-mode row lands, `CLAUDISH_CHANNEL_TRACE` (and `_FILE`) is read by **no source on this branch** — setting it is inert, and `mcp-session/trace-gate.test.ts` stays `test.skip` with its re-port pointer. Do not point an operator at the switch here.
+
+The contract below is the **main-side** truth, kept for the row that re-ports it (and for reading main-side captures): async model sessions with push notifications on the low-level `Server` class; 13 tools gated by `CLAUDISH_MCP_TOOLS` (`all` default · `low-level` · `agentic` · `channel`); wire contract pinned by `channel-wire-format.test.ts`.
 
 - **`meta` keys must match `[a-zA-Z0-9_]+`** — Claude Code **silently drops** keys with hyphens or other characters. Keep new `extraMeta` keys underscore-only.
 - **Emitting a correct frame is not enough.** Rendering is gated client-side: CC ≥ v2.1.80; Anthropic auth via claude.ai or Console key; an **interactive** session (`-p` mode drops frames silently); the server declared in `.mcp.json` / `~/.claude.json` (**`--mcp-config` is not consulted**); and the server **named in `--channels`** or `--dangerously-load-development-channels`.
-- `CLAUDISH_CHANNEL_TRACE=1` (+ `CLAUDISH_CHANNEL_TRACE_FILE` when the host swallows stderr) traces producer → bridge → wire, so a server-side drop is distinguishable from client-side gating. Off by default.
+- `CLAUDISH_CHANNEL_TRACE=1` (+ `CLAUDISH_CHANNEL_TRACE_FILE` when the host swallows stderr) traces producer → bridge → wire — **on main only**; on this branch the module (`channel/diagnostics.ts` → `mcp-session/diagnostics.ts` in the 10/11 disposition) re-ports with the channel-mode row, whose notification wiring is its only consumer.
 
-Full contract, launch commands, diagnostics: `docs/reference/channel-mode.md`. Tests: `bun test --cwd . ./packages/cli/src/channel/*.test.ts` (win32 counts and skip classes in that reference).
+Full contract, launch commands, diagnostics: `docs/reference/channel-mode.md` (main-side reference). Tests on main: `bun test --cwd . ./packages/cli/src/channel/*.test.ts` (win32 counts and skip classes in that reference).
 
 ## Debugging & Tests
 
