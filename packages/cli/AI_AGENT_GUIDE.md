@@ -747,3 +747,5 @@ claudish --help-ai > claudish-agent-guide.md
 **Version:** 7.0.0
 **Last Updated:** April 14, 2026
 **Maintained by:** MadAppGang
+
+<!-- ac3-proof: transient PR, closed after the non-trigger measurement (Refs #1058) -->
