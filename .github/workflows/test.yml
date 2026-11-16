@@ -137,6 +137,13 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       CLAUDISH_SKIP_LIVE_E2E: "1"
       CLAUDISH_DISABLE_CATALOG_WARM: "1"
+      # #1082 — this job runs three pane slices as concurrent processes on 3 vCPUs, and the
+      # magmux version probe's exec has twice exceeded its 5 s default under that load (runs
+      # 43730396398 and 43733872570: `no answer in 5000 ms`, both green on rerun) while the
+      # install step's own version exec passes — the binary works, the runner is just late.
+      # Lift the bound here only; the user default stays 5 s. A missing binary still rejects
+      # at once (ENOENT) and a hung one still goes red, at this bound instead of 5 s.
+      CLAUDISH_MAGMUX_VERSION_TIMEOUT_MS: "30000"
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
