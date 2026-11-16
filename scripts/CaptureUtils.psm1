@@ -229,7 +229,28 @@ function Get-CCVersionFromSystem {
     if ($text -match 'cc_entrypoint=([^;\s]+)') {
         $result.Entrypoint = $Matches[1]
     }
-    if ($text -match 'cc_is_subagent=true') {
+
+    # Sub-agent flag — SEGMENT rule ported from scripts/lib/subagent_flag.py
+    # (#1051, wired here by #1053). A bare `cc_is_subagent=true` match is a
+    # T4 false positive: the fleet's CLAUDE.md quotes that literal, so it
+    # rides the system prompt of every claudish session (pin: "echo alone ->
+    # not a sub-agent"). Only the k=v run of an `x-anthropic-billing-header:`
+    # segment votes, the LAST segment wins (the real system block serializes
+    # after messages, so a conversation echo comes first and cannot override
+    # the true value), and the JSON key form is a fallback used only when no
+    # segment exists at all.
+    $kv = $null
+    foreach ($m in [regex]::Matches($text, 'x-anthropic-billing-header:\s*([^"\\]+)')) {
+        $pairs = @{}
+        foreach ($p in [regex]::Matches($m.Groups[1].Value, '(\w+)=([^;]*)')) {
+            $pairs[$p.Groups[1].Value] = $p.Groups[2].Value
+        }
+        if ($pairs.Count) { $kv = $pairs }
+    }
+    if ($null -ne $kv) {
+        $result.IsSubagent = ([string]$kv['cc_is_subagent']).Trim() -eq 'true'
+    }
+    elseif ($text -match '"cc_is_subagent"\s*:\s*true') {
         $result.IsSubagent = $true
     }
 

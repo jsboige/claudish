@@ -148,3 +148,47 @@ Describe 'traffic-anthropic.ps1 sonnet split (#72 g2)' {
         $script:LeakExit | Should -Be 1
     }
 }
+
+Describe 'Get-CCVersionFromSystem sub-agent segment rule (#1053)' {
+    # Ported rule: only the k=v run of an x-anthropic-billing-header: segment
+    # votes (LAST segment wins); a bare literal echo is T4 — the fleet's own
+    # CLAUDE.md quotes `cc_is_subagent=true`, so the echo rides the system
+    # prompt of every claudish session and the pre-fix bare match read those
+    # main turns as sub-agents.
+    BeforeAll {
+        # Pester scoping: a fixture set at Describe scope is NOT visible in
+        # It blocks — it must live in BeforeAll (measured trap, po-2023).
+        $script:Hdr = 'x-anthropic-billing-header: cc_version=2.1.300; cc_entrypoint=cli; cc_workload=interactive;'
+    }
+
+    It 'segment with the flag -> sub-agent' {
+        $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = "You are Claude Code.`n$script:Hdr cc_is_subagent=true;" })
+        $r.IsSubagent | Should -Be $true
+        $r.Version | Should -Be '2.1.300'
+    }
+    It 'segment without the flag -> proven main turn' {
+        $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = "You are Claude Code.`n$script:Hdr" })
+        $r.IsSubagent | Should -Be $false
+    }
+    It 'PIN: echo alone -> not a sub-agent' {
+        $echo = 'cc_is_subagent=true is the leak signature, and it lives in the request body, not stdout (fleet CLAUDE.md)'
+        $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = "You are Claude Code. cc_version=2.1.300 (cli)`n$echo" })
+        $r.IsSubagent | Should -Be $false
+    }
+    It 'earlier quoted segment is overridden by the later real one' {
+        $t = "user quoted `"x-anthropic-billing-header: cc_is_subagent=true`"`nYou are Claude Code.`n$script:Hdr"
+        $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = $t })
+        $r.IsSubagent | Should -Be $false
+    }
+    It 'JSON key fallback only when no segment exists' {
+        $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = 'meta {"cc_is_subagent": true} end' })
+        $r.IsSubagent | Should -Be $true
+    }
+    It 'JSON key inside a proven segment-scope does not vote' {
+        # A quoted JSON form rides the conversation but a REAL segment
+        # without the flag exists: the segment wins, not the JSON fallback.
+        $t = "user wrote {`"cc_is_subagent`": true} in a notebook`n$script:Hdr"
+        $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = $t })
+        $r.IsSubagent | Should -Be $false
+    }
+}
