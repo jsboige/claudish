@@ -558,6 +558,16 @@ Règles de la file :
 - Au bilan (Phase 6), compter par worker les **grains dispatchés et les grains livrés** depuis le cycle
   précédent : c'est la mesure de l'intervention elle-même.
 
+**Mandat à échéance courte : réveiller, ne pas seulement poster (#1089, 16/11).** Le 15/11, le user a
+demandé de consommer le surplus MiniMax hebdo avant le reset (~00:00Z). Le mandat est parti à 23:13Z par
+dashboard seulement. Les lanes tournent sur des crons de 4 à 6 h : huit d'entre elles ne l'ont vu qu'après le
+reset, et toutes ont nommé le même correctif. Règle : quand l'échéance d'un mandat tombe avant le prochain
+tir des lanes, le post part avec un `[WAKE-CLAUDE] <machine>:<workspace>` vers chaque siège exécuteur **sans
+session vivante**, dans le même tour. On ne réveille pas une lane qui a déjà une session ouverte : le 07/09,
+un réveil a fait naître une session rivale (deux instances d'une même lane). Le routage `machine:workspace`
+du listener est rapporté correct par les lanes (#2186). Le dashboard reste le point de rendez-vous ; le
+réveil ne fait qu'ouvrir la session qui ira le lire.
+
 ### Phase 4b — Relevé des consoles fournisseurs (depuis le 01/10)
 
 Le user a connecté et ouvert lui-même, dans le **Playwright Edge** d'ai-01, un onglet d'usage par fournisseur, 11 au total : forfaits et pay-as-you-go. **Les URLs font foi, mot pour mot, dans `C:\Users\MYIA\.claudish-browser\provider-consoles-urls.json`.** Ne jamais les deviner ni les modifier : mes URLs devinées menaient à des accueils, des 404 ou des redirections.

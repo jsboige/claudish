@@ -160,8 +160,7 @@ gh pr list --repo jsboige/claudish --state open --json number,title,headRefName,
 
 ### Phase 4c — Dispatch : file profonde par worker
 
-Mandats user 04/10 (plusieurs grains par worker et par cycle) et 05/10 (deep queues, passage à 12 h) —
-contexte et mesures : reference.md § Phase 4c, enquête #328. Ce qui entre dans la file (objectifs, grain
+Mandats user 04/10 et 05/10 (deep queues) — contexte et mesures : reference.md § Phase 4c, enquête #328. Ce qui entre dans la file (objectifs, grain
 de consolidation, commentaire de tenue d'une issue) : `docs/reference/coordination-program.md`.
 
 - **~10 grains ordonnés par worker** :
@@ -174,6 +173,8 @@ de consolidation, commentaire de tenue d'une issue) : `docs/reference/coordinati
 - **Cohérence** : une zone par worker, et deux files ne touchent pas les mêmes fichiers. Pas de PR empilée :
   un grain qui dépend d'un merge va en fin de file.
 - La file **se renouvelle** : le DM republie la file entière, pas un delta.
+- **Échéance avant le prochain tir des lanes** (reset de quota…) : `[WAKE-CLAUDE] <machine>:<workspace>`
+  à chaque siège sans session vivante, dans le tour du post (#1089, reference.md § Phase 4c).
 - Au bilan : grains dispatchés vs livrés, par worker.
 
 ### Phase 4b — Consoles fournisseurs (1 relevé/jour suffit)
