@@ -46,7 +46,7 @@ de #445 ; tout levier nomme le contrôle qu'il touche (en principe aucun : on vi
 | Hub | `http://192.168.0.50:3000` — **po-2025** depuis le 05/09 |
 | Relais | `http://192.168.0.46:3000` (po-2023) — maillon de flotte, **ni le hub ni mon chemin** |
 | Sidecar | `localhost:3002`, conteneur `claudish-sidecar`, upstream `.50` ; client `ANTHROPIC_BASE_URL` = `http://127.0.0.1:3002` (mesuré 12/10) : **le sidecar porte toutes mes sessions** → recreate seulement par gate 5b |
-| Captures | locales `D:\claudish-captures` · hub en lecture seule `\\192.168.0.50\d$\claudish-captures` · archives `G:\Mon Drive\Backups-Cloud\claudish\captures-YYYY-MM-DD.7z` |
+| Captures | locales `D:\claudish-captures` · hub en lecture seule `\\192.168.0.50\d$\claudish-captures` · archives `<gdrive>\Backups-Cloud\claudish\captures-YYYY-MM-DD.7z` |
 
 Sonder **hub ET relais** : deux hystérésis indépendantes. Le hub n'est pas un corpus complet (ce que le
 relais sert localement lui échappe — reference.md § Topologie). Une valeur périmée ici se propage en
@@ -123,9 +123,9 @@ Règles de verdict :
 - **Transcripts** : dédupliquer par `message.id` (les `agent-*.jsonl` rejouent ~2,5×) ; motif sans
   `[1m]` et sens attendu (hub ≥ transcripts) : reference.md § Phase 3.
 
-**Politique Opus (user, 31/08)** — Opus réservé aux 5 lanes d'ai-01 (`d--CoursIA`, `d--roo-extensions`,
-`d--2025-Epita-Intelligence-Symbolique`, `d--Argumentum`, `d--claudish`), plus 2 promues sans signal
-(`g--Mon-Drive-Maintenance` ai-01 ; `D:\Dev\CoursIA-3` po-2024, `device_id8=0b9b0d8c`). Le reste tourne en
+**Politique Opus (user, 31/08)** — Opus réservé aux 5 lanes d'ai-01 (`CoursIA`, `roo-extensions`,
+`2025-Epita-Intelligence-Symbolique`, `Argumentum`, `d--claudish`), plus 2 promues sans signal
+(`Maintenance` ai-01 ; `CoursIA-3` po-2024, `device_id8=0b9b0d8c`). Le reste tourne en
 Sonnet/GLM ou Haiku/MiniMax ; une 6ᵉ lane n'est pas une faute d'office, mais elle se **signale et se date**.
 - **Leak visé** : Opus non désiré sur une lane d'ai-01 ; signature, une **bascule** 100 % budget → 100 %
   Opus. Boucle de détection : reference.md § Phase 3.
