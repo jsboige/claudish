@@ -67,7 +67,7 @@ Describe 'compress-captures exit code (#1013 g7)' {
             $logTxt = Get-Content -LiteralPath $out -Raw
             $logTxt | Should -Match 'ERROR SHA-CHECK captures-2020-01-01-pintest\.7z: recorded in manifest but ABSENT off-site'
             $logTxt | Should -Match 'END \(errors=1\)'
-            $rc | Should -Be 0
+            $rc | Should -Be 1
         }
         finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
     }
