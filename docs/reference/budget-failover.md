@@ -907,11 +907,14 @@ container: on a Docker Desktop Windows bind mount (`drvfs`) a file named
 container (15/11), and a Linux-native mount is untested. The bar and the
 capture key are case-sensitive everywhere.
 
-The dir must be volume-mounted into the container at the path the env names
-(`docker-compose.yml` carries the env name but mounts nothing by default — a
-seat that arms the stop adds the bind). A stopped lane's requests are refused
-locally with `x-claudish-lane-refusal: stop` (900 s retry-after); every other
-lane and lane-less traffic is untouched.
+The dir is bind-mounted into every container at `/lane-stop` — since #1091 the
+bind ships in `docker-compose.yml` itself, host side `CLAUDISH_LANE_STOP_HOST_DIR`
+(default `D:\claudish-lane-stop`), so a seat that arms the stop adds only the
+env value, not the mount. Side effect of the bind being default: every seat's
+next recreate (the hub's included) creates the empty host dir on its machine —
+harmless, and expected rather than discovered. A stopped lane's requests are
+refused locally with `x-claudish-lane-refusal: stop` (900 s retry-after); every
+other lane and lane-less traffic is untouched.
 
 **Where each check runs (CR B4, measured):** the STOP check sits ABOVE the
 relay branch on both ingresses — a stop file belongs to the node the operator
