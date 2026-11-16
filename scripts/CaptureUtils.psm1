@@ -239,8 +239,14 @@ function Get-CCVersionFromSystem {
     # after messages, so a conversation echo comes first and cannot override
     # the true value), and the JSON key form is a fallback used only when no
     # segment exists at all.
+    # Segment terminator: unlike the python predicate (raw JSON, where a \n is
+    # an escape and `[^"\]` already stops at it), this text is DECODED — a
+    # newline is a real newline, so CR/LF must stop the run explicitly or
+    # every later `word=value` joins the header's k=v run (review 16/11,
+    # measured forms A/C on #1094: prose overwrote the true flag, and a bare
+    # echo past a newline voted True).
     $kv = $null
-    foreach ($m in [regex]::Matches($text, 'x-anthropic-billing-header:\s*([^"\\]+)')) {
+    foreach ($m in [regex]::Matches($text, 'x-anthropic-billing-header:\s*([^"\\\r\n]+)')) {
         $pairs = @{}
         foreach ($p in [regex]::Matches($m.Groups[1].Value, '(\w+)=([^;]*)')) {
             $pairs[$p.Groups[1].Value] = $p.Groups[2].Value

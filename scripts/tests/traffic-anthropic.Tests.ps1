@@ -191,4 +191,18 @@ Describe 'Get-CCVersionFromSystem sub-agent segment rule (#1053)' {
         $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = $t })
         $r.IsSubagent | Should -Be $false
     }
+    It 'PIN (form C, review 16/11): header without the flag, newline, bare echo -> main' {
+        # DECODED text: the segment run must stop at the newline. Without
+        # the CR/LF terminator the echo joins the k=v run and votes.
+        $t = "$script:Hdr`nlater line cc_is_subagent=true"
+        $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = $t })
+        $r.IsSubagent | Should -Be $false
+    }
+    It 'PIN (form A, review 16/11): header WITH the flag, then prose -> stays sub-agent' {
+        # The unsafe direction: prose mentioning the flag must not overwrite
+        # the header's true value through a cross-newline k=v run.
+        $t = "$script:Hdr cc_is_subagent=true;`nNote: cc_is_subagent=true is the leak signature"
+        $r = Get-CCVersionFromSystem @(@{ type = 'text'; text = $t })
+        $r.IsSubagent | Should -Be $true
+    }
 }
