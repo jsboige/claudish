@@ -11,6 +11,12 @@
 # scripts/lib/**), package.json (the test:scripts* entries live there) and this
 # workflow file. A packages/cli-only PR does not pay for a Pester run.
 #
+# The matrix axis names the INTERPRETER; steps pick their lane via
+# `if: matrix.shell == ...` with a LITERAL `shell:` — the matrix context is
+# not available in `shell:` itself (GitHub context-availability table), which
+# is how the first version of this file failed to compile at all (0s push
+# failure, zero jobs, measured 16/11).
+#
 # NOT a required check yet (#1058 arbitration): it becomes one only after 3
 # green runs on main, counted by started_at.
 name: Pester scripts
@@ -49,17 +55,25 @@ jobs:
       # Seats resolve Pester from their user module dirs (6.2.0 on the 5.1
       # lane); a hosted runner has no such guarantee - pin the same version
       # CurrentUser so both legs run the Pester the suites were written for.
-      # -SkipPublisherCheck: Pester ships MS-signed while the gallery package
-      # is not, the publisher check would otherwise refuse the install.
-      - name: Install Pester 6.2.0
-        shell: ${{ matrix.shell }}
-        run: Install-Module Pester -RequiredVersion 6.2.0 -Force -Scope CurrentUser -SkipPublisherCheck
+      # Each leg installs under ITS OWN interpreter so the module lands in
+      # that interpreter's user dir (Documents\PowerShell\Modules vs
+      # Documents\WindowsPowerShell\Modules - the hermetic 5.1 runner rebuilds
+      # its path from the latter). -SkipPublisherCheck: Pester ships
+      # MS-signed while the gallery package is not.
+      - name: Install Pester 6.2.0 (pwsh)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: Install-Module Pester -RequiredVersion 6.2.0 -Force -Scope CurrentUser -SkipPublisherCheck -AllowClobber
+      - name: Install Pester 6.2.0 (powershell 5.1)
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: Install-Module Pester -RequiredVersion 6.2.0 -Force -Scope CurrentUser -SkipPublisherCheck -AllowClobber
 
-      - name: Pester suite (${{ matrix.shell }})
-        shell: ${{ matrix.shell }}
-        run: |
-          if ('${{ matrix.shell }}' -eq 'powershell') {
-            & ./scripts/tests/run-pester51.ps1
-          } else {
-            Invoke-Pester ./scripts/tests -Output Detailed -CI
-          }
+      - name: Pester suite (pwsh 7)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: Invoke-Pester ./scripts/tests -Output Detailed -CI
+      - name: Pester suite (powershell 5.1, hermetic runner)
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: '& ./scripts/tests/run-pester51.ps1'
