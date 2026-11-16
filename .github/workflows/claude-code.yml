@@ -1,6 +1,6 @@
-name: Claude Code PR Assistant
+name: Claude Code PR Review
 
-# Two jobs, one switch, one lane: every job below reaches a model THROUGH THE
+# One job, one switch, one lane: the review below reaches a model THROUGH THE
 # FLEET HUB (claudish) on MiniMax M3.1-Flash, not api.anthropic.com (Q82).
 #
 # Before the 14/11 rewrite the workflow went green in ~10 s on every PR without
@@ -9,20 +9,30 @@ name: Claude Code PR Assistant
 #      PROMPT", logged "No trigger found, skipping remaining steps", and succeeded;
 #   2. no credential -> the fork carries no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
 #      secret, so even a triggered run could not have called a model.
-# It also took a runner for EVERY comment on a PR (the issue_comment trigger had no
-# `@claude` filter), inside an account-wide Actions queue that is often saturated.
+# It also took a runner for EVERY comment on a PR, inside an account-wide Actions
+# queue that is often saturated.
 #
-# Now:
-#   - `review` runs a real review prompt when a PR is opened / reopened / marked ready;
-#   - `mention` answers an `@claude` comment from a repository member;
-#   - BOTH are gated at job level on the repository variable CLAUDE_PR_REVIEW == 'on'.
-#     A job-level `if` is evaluated before any runner is allocated, so while the
-#     switch is off the jobs show "skipped" (honest) and cost zero runner time.
+# Now: `review` runs a real review prompt when a PR is opened / reopened / marked
+# ready, gated at job level on the repository variable CLAUDE_PR_REVIEW == 'on'.
+# A job-level `if` is evaluated before any runner is allocated, so while the switch
+# is off the job shows "skipped" (honest) and costs zero runner time.
 #
-# Routing (Q82). The hub base URL is a repository VARIABLE, never a literal:
+# Why there is NO comment-triggered job any more (Q82 review, 16/11). The old
+# `mention` job answered `@claude` comments, and `issue_comment` /
+# `pull_request_review_comment` run in the BASE repository WITH secrets even on a
+# fork PR: a fork diff carrying injected instructions plus one collaborator's
+# `@claude` could have driven an agent that holds the cluster key. GitHub masks
+# secrets in workflow LOGS, not in a comment written with the token, and
+# `Bash(gh pr comment:*)` alone is enough to publish a header value. The job never
+# worked (it had no credential either), so it is removed rather than wired:
+# bringing it back needs a SCOPED inbound key first (settings-reference.md §7.6 —
+# `inboundKeys` with `allowModels` limited to the MiniMax target and a
+# `maxConcurrency`), not the cluster key.
+#
+# Routing. The hub base URL is a repository VARIABLE, never a literal:
 #   gh variable set CLAUDISH_HUB_URL -R jsboige/claudish --body https://models.myia.io
-# The cluster key is a repository SECRET, and it travels ONLY as `x-proxy-key`
-# through ANTHROPIC_CUSTOM_HEADERS:
+# The key is a repository SECRET, carried ONLY as `x-proxy-key` through
+# ANTHROPIC_CUSTOM_HEADERS:
 #   gh secret set CLAUDISH_CLUSTER_KEY -R jsboige/claudish
 # Never `x-api-key`: that header arms NativeHandler's proxyKey->Anthropic swap and
 # the request 401s (docs/reference/relay-internals.md). proxy-auth.ts reads
@@ -36,11 +46,11 @@ name: Claude Code PR Assistant
 # variable (a step-level assignment that OVERRIDES the job env), so the input
 # carries a fixed, non-secret placeholder. The hub authenticates the cluster key.
 #
-# The three ANTHROPIC_DEFAULT_*_MODEL vars are load-bearing, not decorative:
-# Claude Code's helper calls (compaction, subagents) resolve by ROLE, and a role
-# left unset would resolve to a native `claude-*` model that the hub refuses for
-# a placeholder credential (#296). Pinning all three to the same MiniMax target
-# keeps every request on the wired lane.
+# The ANTHROPIC_DEFAULT_*_MODEL slots are load-bearing, not decorative: Claude
+# Code's helper calls resolve by ROLE, and a role left unset resolves to a native
+# `claude-*` model that the hub refuses for a placeholder credential (#296 shape
+# B, a 403). All four named slots are pinned to the same MiniMax target, plus the
+# subagent slot as belt and braces.
 #
 # The secret is never displayed: no step echoes the environment, no `set -x`, no
 # debug dump of ANTHROPIC_CUSTOM_HEADERS. GitHub masks the exact value; a derived
@@ -48,22 +58,12 @@ name: Claude Code PR Assistant
 #
 # To turn it on: secret, then variable, then the switch.
 #   gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body on
-# To turn it off again (cuts both jobs before any runner is allocated):
+# To turn it off again (cuts the job before any runner is allocated):
 #   gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body off
-#
-# A fork PR's `pull_request` event carries no repository secrets, so `review` skips
-# fork heads. `mention` is different: `issue_comment` runs in the base repository WITH
-# secrets, even on a fork PR. It is therefore limited to OWNER/MEMBER/COLLABORATOR
-# authors, on top of the action's own `restrict_untrusted_prs` default.
-# `contains()` is case-insensitive; "@claude-bot" would still start a no-op run.
 
 on:
   pull_request:
     types: [opened, reopened, ready_for_review]
-  pull_request_review_comment:
-    types: [created]
-  issue_comment:
-    types: [created]
 
 permissions:
   contents: read
@@ -81,6 +81,8 @@ env:
   ANTHROPIC_DEFAULT_OPUS_MODEL: mmc@MiniMax-M3.1-Flash
   ANTHROPIC_DEFAULT_SONNET_MODEL: mmc@MiniMax-M3.1-Flash
   ANTHROPIC_DEFAULT_HAIKU_MODEL: mmc@MiniMax-M3.1-Flash
+  ANTHROPIC_DEFAULT_FABLE_MODEL: mmc@MiniMax-M3.1-Flash
+  CLAUDE_CODE_SUBAGENT_MODEL: mmc@MiniMax-M3.1-Flash
 
 jobs:
   review:
@@ -90,7 +92,9 @@ jobs:
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 60 min for a 40-turn budget: the first real run took ~12 min for 31 turns,
+    # and a job killed at the timeout posts NO review at all (Q82 review 16/11).
+    timeout-minutes: 60
     concurrency:
       group: claude-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -150,35 +154,4 @@ jobs:
           claude_args: |
             --model mmc@MiniMax-M3.1-Flash
             --max-turns 40
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(grep:*),Bash(rg:*),Read,Grep,Glob"
-
-  mention:
-    if: |
-      vars.CLAUDE_PR_REVIEW == 'on' &&
-      (
-        (github.event_name == 'issue_comment' &&
-          github.event.issue.pull_request &&
-          contains(github.event.comment.body, '@claude') &&
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
-        (github.event_name == 'pull_request_review_comment' &&
-          contains(github.event.comment.body, '@claude') &&
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
-      )
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
-
-      - name: Claude Code (@claude mention)
-        uses: anthropics/claude-code-action@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          anthropic_api_key: placeholder-not-used-proxy-handles-auth
-          claude_args: |
-            --model mmc@MiniMax-M3.1-Flash
-            --max-turns 30
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(grep:*),Bash(rg:*),Read,Grep,Glob"
