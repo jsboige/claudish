@@ -134,6 +134,45 @@ function Log([string]$msg) {
   try { Add-Content -LiteralPath $logFile -Value $line -Encoding utf8 } catch {}
 }
 
+# --- Q85 / #1095 review: an unset Drive root must COUNT, not vanish ----------
+# The root is SEAT configuration, which is why the repo default had to go. But
+# on a seat that has archived off-site before, an unset value is a
+# configuration REGRESSION, and a silent skip is exactly the degradation a
+# monitor keyed on `END (errors=N)` cannot see: the night logs a clean END
+# while no off-site copy was made and the retention purge (correctly) keeps
+# every local archive. The proof of history has two forms (see the block
+# below): a LOCAL marker written on every confirmed off-site copy — written
+# only after a size+sha confirmation, never on intent — and, retroactively,
+# the journal lines every past upload already left. A seat that never archived
+# off-site stays errors=0 (a fresh install owes nobody an off-site copy).
+$errors = 0
+$offSiteMarker = Join-Path $ArchiveDir '.offsite-state.json'
+function Set-OffSiteMarker([string]$MarkerPath, [string]$DestDir) {
+  $line = ("{0}|{1}" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $DestDir)
+  try { [System.IO.File]::WriteAllText($MarkerPath, $line, (New-Object System.Text.UTF8Encoding($false))) } catch {}
+}
+if (-not $GDriveDir) {
+  # Two proofs of history, because the marker is NEW: an existing seat has
+  # uploaded for months and carries no marker yet, so the first night after
+  # this lands must already count. The journal line is the retroactive proof
+  # (every run writes it after a size+sha confirmation); the marker is the
+  # durable one (it survives log rotation and a deleted journal).
+  $offSiteProof = ''
+  if (Test-Path -LiteralPath $offSiteMarker) {
+    try { $offSiteProof = ([System.IO.File]::ReadAllText($offSiteMarker)).Trim() } catch {}
+  }
+  if (-not $offSiteProof -and (Test-Path -LiteralPath $logFile)) {
+    try {
+      $hit = Select-String -LiteralPath $logFile -Pattern 'GDRIVE .*(uploaded|re-uploaded|already current)' -List -ErrorAction Stop
+      if ($hit) { $offSiteProof = 'compaction.log: ' + $hit.Line.Trim() }
+    } catch {}
+  }
+  if ($offSiteProof) {
+    $errors++
+    Log ("ERROR GDriveDir unset but this seat archived off-site before ({0}) - off-site deferred, END counts this night as failed (Q85: the Drive root is seat config; set CLAUDISH_GDRIVE_ROOT)" -f $offSiteProof)
+  }
+}
+
 # #322/#741: move an unreadable or partial archive out of the CANONICAL name.
 # Rename only, never delete: the suffix goes AFTER ".7z" so the captures-*.7z
 # filter, the day parser and every reader exclude it structurally, and the
@@ -193,7 +232,7 @@ Log "START compaction CaptureDir=$CaptureDir KeepDays=$KeepDays cutoff(UTC)=$($c
 # --- enumerate loose captures, group by their filename date (UTC) ------------
 $rx = '^(req|resp)-.*?(?<d>\d{4}-\d{2}-\d{2})T\d{2}-\d{2}-\d{2}'
 $loose = Get-ChildItem -LiteralPath $CaptureDir -File | Where-Object { $_.Name -match $rx }
-if (-not $loose) { Log "nothing to do (0 loose capture files)"; Log "END"; exit 0 }
+if (-not $loose) { Log "nothing to do (0 loose capture files)"; Log ("END (errors={0})" -f $errors); exit $errors }
 
 $byDay = @{}
 foreach ($f in $loose) {
@@ -205,7 +244,7 @@ foreach ($f in $loose) {
 }
 
 $daysToArchive = $byDay.Keys | Where-Object { [datetime]::ParseExact($_, 'yyyy-MM-dd', $null) -lt $cutoff } | Sort-Object
-if (-not $daysToArchive) { Log "nothing to do (no completed past days; newest is kept loose)"; Log "END"; exit 0 }
+if (-not $daysToArchive) { Log "nothing to do (no completed past days; newest is kept loose)"; Log ("END (errors={0})" -f $errors); exit $errors }
 
 # --- single-writer lock (#741) ------------------------------------------------
 # Everything below MUTATES the archive directory, and two runs can reach it at
@@ -253,8 +292,8 @@ if (Test-Path -LiteralPath $lockPath) {
   }
   if ($lockVerdict.Action -eq 'wait') {
     Log ("LOCK held: {0} -> this run exits without touching anything (the holder is doing this night's work)" -f $lockVerdict.Reason)
-    Log "END (errors=0)"
-    exit 0
+    Log ("END (errors={0})" -f $errors)
+    exit $errors
   }
   if ($lockVerdict.Action -eq 'steal') { Log ("WARN  stale lock stolen: {0}" -f $lockVerdict.Reason) }
 }
@@ -264,7 +303,7 @@ try {
   Log ("WARN  cannot write the single-writer lock ({0}) - continuing, serialised by nothing but the scheduler" -f $_.Exception.Message)
 }
 
-$totalRaw = 0L; $totalArch = 0L; $totalFiles = 0; $errors = 0
+$totalRaw = 0L; $totalArch = 0L; $totalFiles = 0   # $errors is seeded above (Q85 precheck) and only ever increments
 
 foreach ($day in $daysToArchive) {
   $files = $byDay[$day]
@@ -364,6 +403,7 @@ foreach ($day in $daysToArchive) {
             Log ("REFUSE {0}: off-site {1} -> local kept, purge will skip, NOT overwritten" -f $day, $verdict.Reason)
           } elseif ($verdict.Action -eq 'idempotent') {
             Log ("GDRIVE {0}: already current ({1} bytes), idempotent - no copy needed" -f $day, $archBytes)
+            Set-OffSiteMarker $offSiteMarker $GDriveDir
           } else {
             try {
               Copy-Item -LiteralPath $archivePath -Destination $GDriveDir -Force -ErrorAction Stop
@@ -387,6 +427,7 @@ foreach ($day in $daysToArchive) {
                            -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) `
                            -Extra @{ source = 'deposit' }
                   Log ("GDRIVE {0}: uploaded ({1:N1} MB, sha256 {2}.. recorded)" -f $day, ($archBytes/1MB), $shaDest.Substring(0,8))
+                  Set-OffSiteMarker $offSiteMarker $GDriveDir
                 }
               } else {
                 $errors++
@@ -503,6 +544,7 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
     }
     if ($verdict.Action -eq 'idempotent') {
       Log ("GDRIVE {0}: already current ({1} bytes), idempotent - no re-upload needed" -f $arch.BaseName, $arch.Length)
+      Set-OffSiteMarker $offSiteMarker $GDriveDir
       continue
     }
     # #322: the verdict only compares SIZES — it cannot know the local archive
@@ -536,6 +578,7 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
                    -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) `
                    -Extra @{ source = 'deposit' }
           Log ("GDRIVE {0}: re-uploaded ({1:N1} MB, was missing, sha256 {2}.. recorded)" -f $arch.BaseName, ($arch.Length/1MB), $shaDest.Substring(0,8))
+          Set-OffSiteMarker $offSiteMarker $GDriveDir
         }
       } else {
         $errors++
