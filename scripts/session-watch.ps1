@@ -10,12 +10,15 @@ Per tick:
   1. live-session-scan.py --hours 0.3 --json  (short-window tripwire, #362)
   2. OPENAI-SHAPED sessions:
        - remote machine         -> journal 'remote-openai'    (owning lane relays/acts)
-       - CoursIA-2 workspace AND its worktrees -> journal 'exempt' (user-authorized
-         adjoint, cron coordinate-adjoint, principal gpt-6-sol declared — NEVER
-         killed, NEVER posted; unconditional, dominance-independent — user
+       - exempt workspace AND its worktrees -> journal 'exempt' (user-authorized
+         CoursIA-2 adjoint, cron coordinate-adjoint, principal gpt-6-sol declared —
+         NEVER killed, NEVER posted; unconditional, dominance-independent — user
          arbitration 06/10 23:05. B3, CR 08/10: the frontier is the boundary match
-         ^d--dev-CoursIA-2(--|$) — worktree project dirs carry a
-         '--claude-worktrees-*' suffix and the exact -eq left them killable)
+         ^<exempt-project>(--|$) — worktree project dirs carry a
+         '--claude-worktrees-*' suffix and the exact -eq left them killable.
+         Q85: the pattern is seat config, never repo content — it arrives via
+         -ExemptProjectPattern / CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN; UNSET
+         journals 'exempt-pattern-unset' and no session on the host is killable)
        - local, sonnet-majority -> journal 'sonnet-majority'  (never killed)
        - workspace identity unestablished (transcript under no project dir)
                             -> journal 'no-workspace-identity' and STOP (B3, CR
@@ -62,6 +65,12 @@ param(
     [string]$HubConfig = 'D:\claudish-shadow\config\config.json',
     [string]$RepoScripts = 'D:\dev\claudish\scripts',
     [double]$WindowHours = 0.3,
+    # Exemption frontier (Q85: seat config, not repo content). Boundary-match
+    # regex covering the main checkout AND its '--'-derived worktrees, e.g.
+    # '^d--dev-<lane>(--|$)'. Empty/whitespace = frontier unproven: every
+    # would-be-exempt session journals 'exempt-pattern-unset' and the kill path
+    # stays unreachable on that host (same philosophy as identity-unproven).
+    [string]$ExemptProjectPattern = $env:CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN,
     [switch]$DryRun,
     # Injectable seams (CR B2): tests pass fixtures so a kill-capable organ can be
     # pinned WITHOUT touching a live process list. Absent = production default,
@@ -166,10 +175,21 @@ if ($data -and $data.sessions) {
         # '--claude-worktrees-*' suffix (path separators flatten to '--'), so the
         # frontier is the boundary match ^<main>(--|$): the main checkout exactly,
         # every '--'-derived worktree of it, and NOT a different repo sharing the
-        # prefix (d--dev-CoursIA-20) — a permissive contains draws no frontier.
+        # prefix (alpha-lane0) — a permissive contains draws no frontier.
         # -match is case-insensitive: project dirs arrive as D--dev-… or d--dev-…
-        if ($projectName -and $projectName -match '^d--dev-CoursIA-2(--|$)') {
-            Write-Journal 'exempt' $sid8 ("coursia-2 adjoint or worktree (user-authorized, principal gpt-6-sol declared): $projectName")
+        # Q85: the pattern is seat config (the repo carries no real folder name),
+        # from -ExemptProjectPattern or CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN.
+        if ($projectName -and $ExemptProjectPattern -and $projectName -match $ExemptProjectPattern) {
+            Write-Journal 'exempt' $sid8 ("exempt workspace or worktree (user-authorized): $projectName")
+            continue
+        }
+        # UNSET pattern = the exemption frontier is unproven on this host. Identity
+        # unproven => no kill is this organ's philosophy (B3), so a kill that could
+        # have hit the exempt workspace is never taken: journal and stop BEFORE the
+        # dominance branches. The seat names its exempt workspace (scheduled-task
+        # action or machine env) to make the kill path reachable again.
+        if ($projectName -and -not $ExemptProjectPattern) {
+            Write-Journal 'exempt-pattern-unset' $sid8 ("project=$projectName (no -ExemptProjectPattern/CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN — kill path unreachable until the seat names its exempt workspace)")
             continue
         }
 

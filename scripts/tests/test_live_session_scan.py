@@ -202,10 +202,10 @@ def test_end_to_end_report():
 def test_deep_workdir_hint():
     with tempfile.TemporaryDirectory() as d:
         p = write(d, "req-1-0001-2026-10-06T00-00-00-000Z-direct.json",
-                  capture(workdir="d:\\Dev\\CoursIA-2"))
+                  capture(workdir="d:\\Dev\\alpha-lane-2"))
         deep = lss.parse_deep(p)
         fast = lss.parse_fast(p)
-        check("deep workdir hint", deep["workdir_hint"] == "d:\\Dev\\CoursIA-2",
+        check("deep workdir hint", deep["workdir_hint"] == "d:\\Dev\\alpha-lane-2",
               deep["workdir_hint"])
         check("fast head hint absent is expected",
               fast["workdir_hint"] == "",

@@ -70,7 +70,7 @@ Traps (each inherited from a sibling script or measured here):
      `--dir` on a full extraction restores the population-wide counts.
 
 Usage:
-  python scripts/minimax-chain-measure.py --archive "G:\\...\\captures-2026-10-04.7z" \
+  python scripts/minimax-chain-measure.py --archive "<gdrive>\\...\\captures-2026-10-04.7z" \
       [--since 2026-10-05T09:46:24Z] [--until ...] [--model-substr MiniMax] [--json out.json] \
       [--scratch D:\\big-disk-temp]
   # or point straight at an extracted/loose capture dir:

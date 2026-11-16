@@ -24,7 +24,14 @@ import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-ARCHIVE_DIR = r"G:\Mon Drive\Synchronisation\RooSync\.shared-state\dashboards\archive"
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
+ARCHIVE_DIR = _gdrive("Synchronisation", "RooSync", ".shared-state", "dashboards", "archive")
 PATTERN = os.path.join(ARCHIVE_DIR, "workspace-CoursIA-2026-[01][0-9]-*.md")
 
 HDR = re.compile(r"^### \[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\] (\S+)\|(\S*)\s*$")
@@ -61,6 +68,10 @@ def parse(path):
 
 
 def main():
+    if not ARCHIVE_DIR:
+        print("CLAUDISH_GDRIVE_ROOT required "
+              "(Q85: the Drive root is seat config, not a repo default)", file=sys.stderr)
+        return 2
     files = sorted(glob.glob(PATTERN))
     if not files:
         print(f"NO ARCHIVE FILES MATCHED {PATTERN}", file=sys.stderr)

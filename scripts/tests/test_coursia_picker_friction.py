@@ -111,7 +111,7 @@ def test_heredoc_body_pr_create_is_not_an_end():
 
 def test_pr_create_on_second_line_is_still_an_end():
     # The refusal-adjacent ACCEPT: a real multi-line command keeps its end.
-    lines = [_bash("2026-07-01T10:00:00.000Z", "cd /c/dev/CoursIA\ngh pr create -f")]
+    lines = [_bash("2026-07-01T10:00:00.000Z", "cd /c/dev/alpha-lane\ngh pr create -f")]
     _check(len(_kinds(_scan(lines), "END")) == 1, "real multi-line pr create missed")
 
 

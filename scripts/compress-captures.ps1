@@ -90,7 +90,7 @@ param(
   # online-only by default (DriveFS does not hydrate what it wrote) — never
   # pin this folder for offline access, that would re-hydrate the whole
   # history onto local disk.
-  [string]$GDriveDir  = "G:\Mon Drive\Backups-Cloud\claudish",
+  [string]$GDriveDir  = "",
   # Local retention: archives older than this (in days) are purged from the
   # local ArchiveDir, BUT only after confirming the copy exists on GDrive.
   # GDrive keeps everything; this only bounds local disk usage.
@@ -117,6 +117,15 @@ param(
 $ErrorActionPreference = "Stop"
 Import-Module (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1') -Force -DisableNameChecking
 if (-not $ArchiveDir) { $ArchiveDir = Join-Path $CaptureDir "archive" }
+# Q85: the Drive mount is seat config — CLAUDISH_GDRIVE_ROOT + the shared
+# subpath, resolved only when the env names a root. Empty stays empty = the
+# documented "off-site deferred" path below, never a hardcoded repo default.
+# String concat, NOT Join-Path: Join-Path VALIDATES the drive on PS 5.1 and
+# throws when the mount is absent — an unmounted Drive must degrade to the
+# deferred path, not kill the local compaction.
+if (-not $GDriveDir -and $env:CLAUDISH_GDRIVE_ROOT) {
+  $GDriveDir = ($env:CLAUDISH_GDRIVE_ROOT.TrimEnd('\') + '\Backups-Cloud\claudish')
+}
 $logFile = Join-Path $CaptureDir "compaction.log"
 
 function Log([string]$msg) {

@@ -64,11 +64,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 READINGS = Path.home() / ".claudish" / "console-readings.jsonl"
-# The private Drive every fleet machine mounts, in claudish's own folder (the one that
-# already holds the capture archives). Overridable for a seat that mounts it elsewhere.
-SHARED_LEDGER = Path(os.environ.get(
-    "CLAUDISH_CONSOLE_LEDGER_SHARED",
-    r"G:\Mon Drive\Backups-Cloud\claudish\console-readings\console-readings.jsonl"))
+
+
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
+# The shared Drive copy, in claudish's own folder (the one that already holds the
+# capture archives). Overridable for a seat that mounts it elsewhere. Unset
+# CLAUDISH_GDRIVE_ROOT leaves it None — NOT Path(""), which is Path('.') and
+# .exists() True: a wrong-but-plausible "shared copy" would be the CWD.
+_shared = os.environ.get("CLAUDISH_CONSOLE_LEDGER_SHARED") or _gdrive(
+    "Backups-Cloud", "claudish", "console-readings", "console-readings.jsonl")
+SHARED_LEDGER = Path(_shared) if _shared else None
 
 # `role` says WHAT the console answers, which is the part every session lost.
 # `auth` documents how the session is held, so a lost cookie is diagnosed rather
@@ -305,6 +316,10 @@ def cmd_publish(args) -> int:
     """Mirror the local ledger to the shared copy, atomically, never shrinking it."""
     src = READINGS
     dest = Path(args.to) if getattr(args, "to", None) else SHARED_LEDGER
+    if dest is None:
+        print("aucune copie partagée configurée : ni --to, ni "
+              "CLAUDISH_CONSOLE_LEDGER_SHARED, ni CLAUDISH_GDRIVE_ROOT", file=sys.stderr)
+        return 1
     if not src.exists():
         print(f"aucun registre local à publier : {src}", file=sys.stderr)
         return 1
@@ -357,7 +372,7 @@ def resolve_ledger(explicit: str | None) -> Path:
         return Path(explicit)
     if READINGS.exists():
         return READINGS
-    if SHARED_LEDGER.exists():
+    if SHARED_LEDGER is not None and SHARED_LEDGER.exists():
         return SHARED_LEDGER
     return READINGS
 
@@ -366,7 +381,8 @@ def cmd_series(args) -> int:
     """Consolidate the ledger into one table over time."""
     ledger = resolve_ledger(getattr(args, "ledger", None))
     if not ledger.exists():
-        print(f"aucun relevé : {ledger} (ni copie partagée : {SHARED_LEDGER})", file=sys.stderr)
+        print(f"aucun relevé : {ledger} (ni copie partagée : "
+              f"{SHARED_LEDGER or '(non configurée)'})", file=sys.stderr)
         return 1
     rows = []
     for line in ledger.read_text(encoding="utf-8").splitlines():
@@ -445,7 +461,7 @@ def main(argv=None) -> int:
     sr.add_argument("--json", action="store_true")
     sr.add_argument("--ledger", help="lire ce fichier (par défaut : registre local, sinon copie partagée)")
     pb = sub.add_parser("publish", help="copie le registre vers le Drive partagé (atomique, jamais raccourci)")
-    pb.add_argument("--to", help=f"destination (défaut : {SHARED_LEDGER})")
+    pb.add_argument("--to", help=f"destination (défaut : {SHARED_LEDGER or '(non configurée)'})")
     a = p.parse_args(argv)
     if a.cmd == "list":
         return cmd_list(a.json)

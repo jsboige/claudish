@@ -195,13 +195,21 @@ def aggregate(cache: dict[str, dict]) -> dict[str, dict]:
     return weeks
 
 
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--start", default="2026-06-03", help="first census day (ISO)")
     ap.add_argument("--end", default=date.today().isoformat(), help="last census day (ISO)")
     ap.add_argument("--arch", default=r"D:\claudish-captures\archive", help="local archive dir")
-    ap.add_argument("--gdir", default=r"G:\Mon Drive\Backups-Cloud\claudish",
-                    help="off-site archive dir (fallback)")
+    ap.add_argument("--gdir", default=_gdrive("Backups-Cloud", "claudish"),
+                    help="off-site archive dir (fallback; default derives from "
+                         "$CLAUDISH_GDRIVE_ROOT, absent when the env is unset)")
     ap.add_argument("--cache", default=os.path.expanduser(r"~\.claudish\drift-census.jsonl"))
     ap.add_argument("--refresh", type=int, default=0,
                     help="recount the last N days even if cached")
@@ -210,7 +218,10 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     start, end = date.fromisoformat(args.start), date.fromisoformat(args.end)
-    cache = build_census([args.arch, args.gdir], start, end, args.cache, args.refresh)
+    # gdir unset on a seat without the Drive mount: census on the local archive
+    # alone, never a ''-joined glob that silently reads the CWD (Q85).
+    cache = build_census([d for d in (args.arch, args.gdir) if d],
+                         start, end, args.cache, args.refresh)
     weeks = aggregate(cache)
 
     pr_counts: dict[str, int] = {}

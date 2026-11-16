@@ -88,9 +88,18 @@ import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default. This
+    module writes its paths with forward slashes (the historical literal
+    did), so the env root is normalized the same way."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip().replace("\\", "/")
+    return "/".join((root,) + parts) if root else ""
+
+
 ARCH = os.environ.get(
     "COURSIA_ARCHIVE",
-    r"G:/Mon Drive/Synchronisation/RooSync/.shared-state/dashboards/archive")
+    _gdrive("Synchronisation", "RooSync", ".shared-state", "dashboards", "archive"))
 CACHE = os.path.join(tempfile.gettempdir(), "coursia-dispatch-msgs-cache.json")
 MSG_RE = re.compile(r"^### \[(.+?)\] (\S+)\|(\S+)\s*$", re.M)
 NUM_RE = re.compile(r"#(\d{3,6})\b")
@@ -172,10 +181,10 @@ def load(months, use_cache=True, arch=None, cache=None):
     corpus silently (CR B3). A run with ANY unreadable file is never cached."""
     arch = arch or ARCH
     cache = cache or CACHE
-    files = select_files(arch, months)
+    files = select_files(arch, months) if arch else []
     if not files:
-        print(f"no archive files matched under {arch} for {sorted(months)} "
-              f"(set COURSIA_ARCHIVE?)", file=sys.stderr)
+        print(f"no archive files matched under {arch or '(unset)'} for {sorted(months)} "
+              f"(set COURSIA_ARCHIVE or CLAUDISH_GDRIVE_ROOT)", file=sys.stderr)
         raise SystemExit(2)
     key = {"v": CACHE_VERSION, "months": list(months),
            "files": [[os.path.basename(f), os.path.getsize(f)] for f in files]}
