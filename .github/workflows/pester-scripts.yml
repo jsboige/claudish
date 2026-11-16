@@ -38,13 +38,18 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# WORKFLOW level, deliberately: at job level the two matrix legs would share
+# the group and cancel-in-progress would kill the queued sibling leg of the
+# SAME run (measured 16/11: powershell leg cancelled at zero steps). Here it
+# cancels only the previous run of the same ref, which is the intent.
+concurrency:
+  group: pester-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pester-scripts:
     runs-on: windows-latest
     timeout-minutes: 30
-    concurrency:
-      group: pester-${{ github.ref }}
-      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:
