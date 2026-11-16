@@ -174,7 +174,16 @@ try:
     check("ligne sans horodatage docker comptee",
           ref["sans-horodatage"]["stop"] == 1,
           f"(got {dict(ref.get('sans-horodatage', {}))})")
-    check("ligne non-REFUSE ignoree", "model=vieux" not in str(ref))
+    # "model=vieux" not in str(ref) could never fail (ref holds lane names and
+    # counts only) — replaced with an assertion that CAN: a LaneBudget line
+    # WITHOUT the REFUSE verb (a notice/accept form) must not count as a
+    # refusal. Red the day someone drops the word from REFUSE_BUDGET.
+    ref_nr = ldr.parse_refusals(
+        dts(35) + " [claudish] [LaneBudget] lane=acceptee model=m consumed=1 >= 1",
+        cutoff,
+    )
+    check("ligne non-REFUSE (sans verbe) ignoree", "acceptee" not in ref_nr,
+          f"(got {list(ref_nr)})")
     ref_f = ldr.parse_refusals(log, cutoff, "autre-lane")
     check("filtre lane : une seule lane en sortie",
           list(ref_f) == ["autre-lane"], f"(got {list(ref_f)})")
