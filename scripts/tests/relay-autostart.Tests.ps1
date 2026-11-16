@@ -171,7 +171,7 @@ Describe 'install-relay-autostart.ps1' {
     }
 
     # HostBound (#1096): hosted 5.1 divergence (seat file/task layout assumptions; fixture
-    # passes on seats) — under diagnosis there. CI excludes it on both legs (counted in the log).
+    # passes on seats) - under diagnosis there. CI excludes it on both legs (counted in the log).
     It 'AC7: preflight fails BEFORE anything when relay.js is absent (no elevation consumed)' -Tag HostBound {
         $dir = New-RelayFixture -Name 'preflight'
         $out = & $script:PS51 -NoProfile -ExecutionPolicy Bypass -File $script:InstallPath `
