@@ -1,0 +1,65 @@
+# Pester suites for the ops scripts (#1058).
+#
+# The PowerShell ops scripts ship two suites, measured on seats at 17-18 min
+# each: `bun run test:scripts` (pwsh 7) and `bun run test:scripts:win51`
+# (powershell.exe 5.1 via the hermetic runner, which rebuilds PSModulePath
+# user-dir-first so the machine-wide Pester 3.4.0 can never win). The 5.1
+# interpreter ships with the OS and runs the scheduled tasks that call these
+# scripts, so both lanes must stay green in CI, not just on seats.
+#
+# Trigger is paths-scoped: scripts/** (which includes scripts/tests/** and
+# scripts/lib/**), package.json (the test:scripts* entries live there) and this
+# workflow file. A packages/cli-only PR does not pay for a Pester run.
+#
+# NOT a required check yet (#1058 arbitration): it becomes one only after 3
+# green runs on main, counted by started_at.
+name: Pester scripts
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'package.json'
+      - '.github/workflows/pester-scripts.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'package.json'
+      - '.github/workflows/pester-scripts.yml'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  pester-scripts:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    concurrency:
+      group: pester-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+    steps:
+      - uses: actions/checkout@v5
+
+      # Seats resolve Pester from their user module dirs (6.2.0 on the 5.1
+      # lane); a hosted runner has no such guarantee - pin the same version
+      # CurrentUser so both legs run the Pester the suites were written for.
+      # -SkipPublisherCheck: Pester ships MS-signed while the gallery package
+      # is not, the publisher check would otherwise refuse the install.
+      - name: Install Pester 6.2.0
+        shell: ${{ matrix.shell }}
+        run: Install-Module Pester -RequiredVersion 6.2.0 -Force -Scope CurrentUser -SkipPublisherCheck
+
+      - name: Pester suite (${{ matrix.shell }})
+        shell: ${{ matrix.shell }}
+        run: |
+          if ('${{ matrix.shell }}' -eq 'powershell') {
+            & ./scripts/tests/run-pester51.ps1
+          } else {
+            Invoke-Pester ./scripts/tests -Output Detailed -CI
+          }
