@@ -363,3 +363,87 @@ describe("pre-stream wedge (invisible to a body wrapper)", () => {
     expect(tracker.getPendingRequests()).toBe(0);
   });
 });
+
+describe("idle-then-busy is not a stall (#1064)", () => {
+  const realNow = Date.now;
+  afterEach(() => {
+    Date.now = realNow;
+  });
+
+  test("pin a — idle past the threshold, then one pending request: not stalled", async () => {
+    // Measured 14/11 on the po-203 relay: four /health hits answered stalled
+    // at the heartbeat of the 15-min canary, each on a seat idle for hours —
+    // nothing was wedged. The verdict read the idle gap as silence on
+    // in-flight work, but there was no in-flight work. Admission stamps
+    // progress; removing that stamp turns this red.
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    const { app, tracker } = appWithSse(() => sseBody(["a"]));
+
+    clock += 60 * 60 * 1000; // an hour idle; the stamp is 1h stale
+    expect(tracker.isStalled(180_000)).toBe(false); // no work: never stalled
+
+    void app.request("/wedged", { method: "POST" }); // the first admission
+    await new Promise((r) => setTimeout(r, 0));
+    expect(tracker.getPendingRequests()).toBe(1);
+    // This is the false 503 the relays read on an idle-then-busy seat.
+    expect(tracker.isStalled(180_000)).toBe(false);
+    // The stamp's VALUE, not just its effect: the clock is frozen here, so the
+    // admission stamp must read as zero elapsed. Mutation (d) — stamping
+    // `Date.now() - 100_000` inside the guard — leaves every boolean assertion
+    // above green (100s is under the threshold) yet turns this red: without
+    // the value pin, a seat whose first request takes 80s to its first byte
+    // would answer 503 again.
+    expect(tracker.getMsSinceProgress()).toBe(0);
+
+    // The budget is measured from the ADMISSION, not from the idle gap: 179s
+    // after admission is still inside it, only the full threshold past it is
+    // a stall — the stamp is a fresh start, not an exemption.
+    clock += 179_000;
+    expect(tracker.isStalled(180_000)).toBe(false);
+    clock += 2_000;
+    expect(tracker.isStalled(180_000)).toBe(true);
+  });
+
+  test("pin b — a second request admitted behind a stuck one stays stalled", async () => {
+    // The guard, not the stamp, is the fix: admission only counts as progress
+    // when nothing was in flight. If admission ALWAYS stamped, a steady
+    // trickle of new requests would keep the stamp fresh and a wedged proxy
+    // would report healthy forever. Making the stamp unconditional turns
+    // this red.
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    const { app, tracker } = appWithSse(() => sseBody(["a"]));
+
+    void app.request("/wedged", { method: "POST" });
+    await new Promise((r) => setTimeout(r, 0));
+    clock += 200_000; // the first request is stuck, well past the threshold
+    expect(tracker.isStalled(180_000)).toBe(true);
+
+    void app.request("/wedged", { method: "POST" }); // a second one arrives
+    await new Promise((r) => setTimeout(r, 0));
+    expect(tracker.getPendingRequests()).toBe(2);
+    expect(tracker.isStalled(180_000)).toBe(true); // no masking
+  });
+
+  test("a request admitted while a stream is open does not stamp either", async () => {
+    // Same principle as pin b, stream side: work is in flight, so the silence
+    // measured against it is real silence. The stamp stays where the last
+    // byte put it.
+    let clock = 1_000_000;
+    Date.now = () => clock;
+    const { app, tracker } = appWithSse(() => goesQuiet(["data: hello"]));
+
+    const reader = (await app.request("/sse")).body!.getReader();
+    await reader.read(); // first chunk landed: activeStreams = 1
+
+    clock += 181_000; // the open stream has gone quiet past the threshold
+    expect(tracker.getActiveStreams()).toBe(1);
+    expect(tracker.isStalled(180_000)).toBe(true);
+
+    void app.request("/wedged", { method: "POST" }); // admitted behind it
+    await new Promise((r) => setTimeout(r, 0));
+    expect(tracker.getPendingRequests()).toBe(1);
+    expect(tracker.isStalled(180_000)).toBe(true); // still wedged
+  });
+});
