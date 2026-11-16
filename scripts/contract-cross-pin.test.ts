@@ -112,6 +112,20 @@ describe("normalizeSource — adversarial pairs from review 1 (behaviour differs
       normalizeSource("function g(s) {\n  return /y/.test(s);\n}")
     );
   });
+
+  test("regex after return: whitespace inside the body must not collapse (review 2, blocker 1)", () => {
+    // The two bodies differ ONLY by whitespace inside the regex: if the `/`
+    // is misread as division, code-state collapsing makes them equal — the
+    // exact pair the round-2 false COMMENT-ONLY passed on.
+    expect(normalizeSource("function g(s) {\n  return /a  b/.test(s);\n}")).not.toBe(
+      normalizeSource("function g(s) {\n  return /a b/.test(s);\n}")
+    );
+    // Same through the ASI form: `return\n` then the regex opens the next
+    // statement — still a regex, not division.
+    expect(normalizeSource("function g(s) {\n  return\n  /a  b/.test(s);\n}")).not.toBe(
+      normalizeSource("function g(s) {\n  return\n  /a b/.test(s);\n}")
+    );
+  });
 });
 
 describe("normalizeSource — cosmetic-only changes still normalize equal", () => {
@@ -260,6 +274,17 @@ describe("baseline loading — 3 is the instrument-failure verdict", () => {
 
   test("absent file → null", () => {
     expect(loadBaseline(join(tmpdir(), "c4-pin-does-not-exist.json"))).toBeNull();
+  });
+
+  test("valid JSON, labels emptied ({}) → null → exit 3, not a DIVERGENT label (review 2, n-b 3)", () => {
+    const root = mkdtempSync(join(tmpdir(), "c4-pin-nolabels-"));
+    tempDirs.push(root);
+    const baseline = baselineOf(seedTree("nolabels"));
+    baseline.labels = {};
+    const path = join(root, "baseline.json");
+    writeFileSync(path, JSON.stringify(baseline), "utf8");
+    expect(loadBaseline(path)).toBeNull();
+    expect(runVerify(root, path)).toBe(3);
   });
 });
 

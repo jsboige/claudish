@@ -152,7 +152,12 @@ export function normalizeSource(src: string): string {
     out += " ";
   };
   const lastWord = (): string => {
-    const m = out.match(/([A-Za-z_$][A-Za-z0-9_$]*)$/);
+    // Trailing whitespace must not defeat the match: `return ` (one space,
+    // emitSpace collapses runs) and `return\n` (ASI — the regex opens the NEXT
+    // statement) are both regex positions. A plain `$` anchor matched neither
+    // and turned every keyword-prefixed regex into division, whose body then
+    // collapsed — a measured false COMMENT-ONLY (review 2, blocker 1).
+    const m = out.match(/([A-Za-z_$][A-Za-z0-9_$]*)\s*$/);
     return m ? m[1] : "";
   };
   // A `/` starts a regex literal (vs division) at the start of a file, after
@@ -396,8 +401,8 @@ export function compareTree(root: string, baseline: ContractBaseline): TreeCompa
 
 /**
  * Load and VALIDATE the baseline. A malformed file (unparseable JSON, wrong
- * schema, missing modules) is an instrument failure — exit 3 — never a
- * DIVERGENT-looking exit 1 (review 1, blocker 3).
+ * schema, missing modules, missing label entries) is an instrument failure —
+ * exit 3 — never a DIVERGENT-looking exit 1 (review 1, blocker 3).
  */
 export function loadBaseline(path: string): ContractBaseline | null {
   if (!existsSync(path)) return null;
@@ -421,6 +426,12 @@ export function loadBaseline(path: string): ContractBaseline | null {
       typeof d.normalized !== "string"
     )
       return null;
+  }
+  // A baseline without a recorded label for a probe would otherwise read as a
+  // DIVERGENT label in compareTree (exit 1) — an incomplete baseline is an
+  // instrument failure, same class as a missing module digest (review 2, n-b 3).
+  for (const probe of LABEL_PROBES) {
+    if (typeof b.labels[probe.name] !== "string") return null;
   }
   if (typeof b.labels !== "object" || b.labels === null) return null;
   return parsed as ContractBaseline;
