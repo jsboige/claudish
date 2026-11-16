@@ -13,6 +13,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUDGET_FOOTER_MARKER, manifestFooter } from "./env-gate";
 import {
+  DEFAULT_WALL_CLOCK_MS,
+  MAX_WALL_CLOCK_MS,
   type StrictBaseline,
   type SuiteRun,
   diffAgainstBaseline,
@@ -21,8 +23,11 @@ import {
   parseEnvGateManifests,
   parseRunOutput,
   realSuiteRunner,
+  resolveWallClock,
+  resolveWallClockMs,
   runIsAccountable,
   splitFreshByReproduction,
+  wallClockSentence,
 } from "./strict-runner";
 
 const base: StrictBaseline = {
@@ -116,6 +121,59 @@ describe("parseRunOutput (real bun output)", () => {
   });
 });
 
+describe("resolveWallClockMs (per-seat wall override, #641 C3)", () => {
+  test("unset and empty env → the 420 s default, silently", () => {
+    expect(resolveWallClockMs({})).toBe(DEFAULT_WALL_CLOCK_MS);
+    expect(DEFAULT_WALL_CLOCK_MS).toBe(420_000); // the default is part of the arbitration
+    expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: "" })).toBe(DEFAULT_WALL_CLOCK_MS);
+  });
+
+  test("a positive integer of ms overrides", () => {
+    expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: "900000" })).toBe(900_000);
+    expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: "1" })).toBe(1);
+    // the spawnSync ceiling itself is the largest legal value (review MINOR 1:
+    // 2^31 kills at once and reads as a flaky tail)
+    expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: "2147483647" })).toBe(
+      MAX_WALL_CLOCK_MS
+    );
+    expect(MAX_WALL_CLOCK_MS).toBe(2_147_483_647);
+  });
+
+  test("values above the spawnSync ceiling fall back to the default (review MINOR 1)", () => {
+    for (const bad of ["2147483648", "3000000000", "4294967296"]) {
+      expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: bad })).toBe(
+        DEFAULT_WALL_CLOCK_MS
+      );
+    }
+  });
+
+  test("invalid values fall back to the default (never a silent bound change, never a crash)", () => {
+    for (const bad of ["abc", "0", "-5", "420.5", "420 000", "undefined", "20min"]) {
+      expect(resolveWallClockMs({ CLAUDISH_STRICT_WALL_CLOCK_MS: bad })).toBe(
+        DEFAULT_WALL_CLOCK_MS
+      );
+    }
+  });
+
+  test("the source travels with the value, and the kill sentence names it exactly (review MINOR 2)", () => {
+    expect(resolveWallClock({})).toEqual({ ms: 420_000, source: "default" });
+    expect(resolveWallClock({ CLAUDISH_STRICT_WALL_CLOCK_MS: "420000" })).toEqual({
+      ms: 420_000,
+      source: "env",
+    });
+    // an env 420000 is NOT "(default)", an injected 420000 is NOT an env override
+    expect(wallClockSentence({ ms: 420_000, source: "default" })).toBe(
+      " The wall clock in force was 420000 ms (default)."
+    );
+    expect(wallClockSentence({ ms: 420_000, source: "env" })).toBe(
+      " The wall clock in force was 420000 ms — CLAUDISH_STRICT_WALL_CLOCK_MS overrides the 420000 default."
+    );
+    expect(wallClockSentence({ ms: 8000, source: "injected" })).toBe(
+      " The wall clock in force was 8000 ms (injected for this run)."
+    );
+  });
+});
+
 describe("realSuiteRunner (kill path — re-review 2 defect)", () => {
   const tmpDirs: string[] = [];
   afterEach(() => {
@@ -164,6 +222,8 @@ describe("realSuiteRunner (kill path — re-review 2 defect)", () => {
     expect(out).toContain("RUN KILLED (ETIMEDOUT)");
     expect(out).toContain("the hung file is the NEXT one");
     expect(out).toContain("aaa-first.test.ts");
+    // The kill line names the wall that actually killed the run (#641 C3).
+    expect(out).toContain("The wall clock in force was 8000 ms (injected for this run).");
   }, 20000);
 });
 
