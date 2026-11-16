@@ -245,31 +245,57 @@ export function diffAgainstBaseline(
   };
 }
 
-type SuiteRunner = () => { raw: string; killed?: boolean; errorCode?: string; wallMs?: number };
+type SuiteRunner = () => {
+  raw: string;
+  killed?: boolean;
+  errorCode?: string;
+  wall?: { ms: number; source: WallClockSource };
+};
 
 export const DEFAULT_WALL_CLOCK_MS = 420_000;
+/**
+ * `spawnSync`'s `timeout` misbehaves above 2^31-1 (measured on bun 1.3.13 by
+ * the coordinator: 2^31 → immediate ETIMEDOUT reported as a kill, 2^32 → a
+ * 133 ms kill, one value wrapped to ~1 s — each would masquerade as a flaky
+ * tail). The resolver refuses anything above the ceiling on the same warning
+ * path as the other invalid shapes.
+ */
+export const MAX_WALL_CLOCK_MS = 2_147_483_647;
+
+export type WallClockSource = "default" | "env" | "injected";
 
 /**
  * The wall clock is overridable per seat (env `CLAUDISH_STRICT_WALL_CLOCK_MS`,
- * positive integer, milliseconds). Measured 2026-11-15 (#641 C3): the v14
- * population does not fit 420 s on seats that run it (po-2024 and po-2028 both
- * killed ETIMEDOUT while main's baseline fits — population and/or seat load,
- * not a port defect), so the arbitrated fix is a per-seat bound, default
- * unchanged; sharding was considered and rejected. An invalid value (empty,
- * non-numeric, <= 0, fractional) falls back to the default WITH a warning —
- * never a silent bound change, never a crash before the run starts.
+ * positive integer, milliseconds, at most MAX_WALL_CLOCK_MS). Measured
+ * 2026-11-15 (#641 C3): the v14 population does not fit 420 s on seats that
+ * run it (po-2024 and po-2028 both killed ETIMEDOUT while main's baseline fits
+ * — population and/or seat load, not a port defect), so the arbitrated fix is
+ * a per-seat bound, default unchanged; sharding was considered and rejected.
+ * An invalid value (empty, non-numeric, <= 0, fractional, above the spawnSync
+ * ceiling) falls back to the default WITH a warning — never a silent bound
+ * change, never a crash before the run starts. The source travels with the
+ * value so the kill line can name where the bound came from instead of
+ * inferring it (an injected 420000 is not "the default", an env 420000 is not
+ * "injected").
  */
-export function resolveWallClockMs(env: NodeJS.ProcessEnv = process.env): number {
+export function resolveWallClock(env: NodeJS.ProcessEnv = process.env): {
+  ms: number;
+  source: WallClockSource;
+} {
   const raw = env.CLAUDISH_STRICT_WALL_CLOCK_MS;
-  if (raw === undefined || raw === "") return DEFAULT_WALL_CLOCK_MS;
+  if (raw === undefined || raw === "") return { ms: DEFAULT_WALL_CLOCK_MS, source: "default" };
   const n = Number(raw);
-  if (!Number.isInteger(n) || n <= 0) {
+  if (!Number.isInteger(n) || n <= 0 || n > MAX_WALL_CLOCK_MS) {
     process.stderr.write(
-      `[STRICT] CLAUDISH_STRICT_WALL_CLOCK_MS=${raw} is not a positive integer of ms — using the default ${DEFAULT_WALL_CLOCK_MS}.\n`
+      `[STRICT] CLAUDISH_STRICT_WALL_CLOCK_MS=${raw} is not a positive integer of ms up to ${MAX_WALL_CLOCK_MS} — using the default ${DEFAULT_WALL_CLOCK_MS}.\n`
     );
-    return DEFAULT_WALL_CLOCK_MS;
+    return { ms: DEFAULT_WALL_CLOCK_MS, source: "default" };
   }
-  return n;
+  return { ms: n, source: "env" };
+}
+
+export function resolveWallClockMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolveWallClock(env).ms;
 }
 
 /**
@@ -302,7 +328,10 @@ export function realSuiteRunner(
   opts: { testPath?: string; wallClockMs?: number } = {}
 ): SuiteRunner {
   return () => {
-    const wallMs = opts.wallClockMs ?? resolveWallClockMs();
+    const wall =
+      opts.wallClockMs !== undefined
+        ? { ms: opts.wallClockMs, source: "injected" as const }
+        : resolveWallClock();
     const r = spawnSync(
       process.execPath,
       [
@@ -316,7 +345,7 @@ export function realSuiteRunner(
         encoding: "utf-8",
         maxBuffer: 64 * 1024 * 1024,
         cwd,
-        timeout: wallMs,
+        timeout: wall.ms,
       }
     );
     const raw = (r.stdout ?? "") + (r.stderr ?? "");
@@ -325,7 +354,7 @@ export function realSuiteRunner(
         raw,
         killed: true,
         errorCode: (r.error as NodeJS.ErrnoException).code ?? "?",
-        wallMs,
+        wall,
       };
     return { raw };
   };
@@ -407,17 +436,32 @@ function printVerdict(v: StrictVerdict, hadBaseline: boolean): void {
   }
 }
 
-function printKill(errorCode: string, raw: string, wallMs?: number): void {
-  const wall =
-    wallMs === undefined
-      ? ""
-      : ` The wall clock in force was ${wallMs} ms` +
-        (wallMs === DEFAULT_WALL_CLOCK_MS
-          ? " (default)."
-          : ` — CLAUDISH_STRICT_WALL_CLOCK_MS overrides the ${DEFAULT_WALL_CLOCK_MS} default.`);
+/**
+ * The kill line's wall sentence, exact about where the bound came from:
+ * `default` (unset), `env` (the override), or `injected` (a test harness).
+ * Value-inference was wrong on both edges (an injected 420000 read as
+ * "default", an env 420000 read as an override… or the reverse — the source
+ * is carried, not guessed).
+ */
+export function wallClockSentence(wall: { ms: number; source: WallClockSource }): string {
+  const tail =
+    wall.source === "default"
+      ? " (default)."
+      : wall.source === "env"
+        ? ` — CLAUDISH_STRICT_WALL_CLOCK_MS overrides the ${DEFAULT_WALL_CLOCK_MS} default.`
+        : " (injected for this run).";
+  return ` The wall clock in force was ${wall.ms} ms${tail}`;
+}
+
+function printKill(
+  errorCode: string,
+  raw: string,
+  wall?: { ms: number; source: WallClockSource }
+): void {
+  const wallLine = wall === undefined ? "" : wallClockSentence(wall);
   process.stdout.write(
     `[STRICT] 🔴 RUN KILLED (${errorCode}) — no verdict can be drawn from a killed run; ` +
-      `re-run (the flaky tail is exactly this class of event).${wall}\n`
+      `re-run (the flaky tail is exactly this class of event).${wallLine}\n`
   );
   // Diagnosis: bun's non-TTY reporter prints a file header only once that file
   // produces output, so a file hung in a hook stays nameless — the last file
@@ -444,7 +488,7 @@ export function main(
 
   const run1 = runSuite();
   if (run1.killed) {
-    printKill(run1.errorCode ?? "killed", run1.raw, run1.wallMs);
+    printKill(run1.errorCode ?? "killed", run1.raw, run1.wall);
     return 3;
   }
   const parsed1 = parseRunOutput(run1.raw);
@@ -499,7 +543,7 @@ export function main(
       );
       const run2 = runSuite();
       if (run2.killed) {
-        printKill(run2.errorCode ?? "killed", run2.raw, run2.wallMs);
+        printKill(run2.errorCode ?? "killed", run2.raw, run2.wall);
         return 3;
       }
       const parsed2 = parseRunOutput(run2.raw);
