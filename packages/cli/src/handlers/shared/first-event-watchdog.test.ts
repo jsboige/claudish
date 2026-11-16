@@ -36,6 +36,45 @@ function keepAliveOnlySource(intervalMs: number): {
   return { body, stopped: () => stop };
 }
 
+/** A source that emits ONLY Anthropic-format ping frames (#1030), and closes
+ *  itself after `maxTicks` — so a mutated watchdog (one that disarms on the
+ *  ping) makes the pin fail on its assertion instead of hanging the suite. */
+function pingOnlySource(intervalMs: number, maxTicks: number): {
+  body: ReadableStream<Uint8Array>;
+  stopped: () => boolean;
+} {
+  let interval: ReturnType<typeof setInterval> | null = null;
+  let stop = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let n = 0;
+      interval = setInterval(() => {
+        if (stop) return;
+        if (n >= maxTicks) {
+          if (interval) clearInterval(interval);
+          try {
+            controller.close();
+          } catch {
+            /* already closed */
+          }
+          return;
+        }
+        try {
+          controller.enqueue(encoder.encode(`event: ping\ndata: {"type":"ping"}\n\n`));
+          n++;
+        } catch {
+          /* consumer gone */
+        }
+      }, intervalMs);
+    },
+    cancel() {
+      stop = true;
+      if (interval) clearInterval(interval);
+    },
+  });
+  return { body, stopped: () => stop };
+}
+
 /** Read a Response body to completion; returns [text, elapsedMs]. */
 async function drain(resp: Response): Promise<[string, number]> {
   const t0 = Date.now();
@@ -93,6 +132,55 @@ describe("first-useful-event watchdog (#108)", () => {
     expect(text).toContain('"message_start"');
     expect(text).toContain('"message_stop"');
     expect(elapsed).toBeLessThan(3000); // drained normally, no watchdog trip
+  });
+
+  it("PIN #1030: a ping-only stream is cancelled at the window, like a keep-alive-only one", async () => {
+    // The Anthropic keep-alive is `event: ping` + `data: {"type":"ping"}`:
+    // it HAS a payload, so the pre-#1030 `/^data:\s*\S/m` test cleared the
+    // timer on the first ping and the stream was never confined. Mutation:
+    // restore that regex and this pin goes red on both assertions (the
+    // source runs its 40 ticks = ~800ms instead of being cut at 200ms).
+    process.env.CLAUDISH_FIRST_EVENT_TIMEOUT_MS = "200";
+    const src = pingOnlySource(20, 40);
+    const wrapped = withFirstUsefulEventWatchdog(
+      new Response(src.body, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+      "test-model"
+    );
+    const [text, elapsed] = await drain(wrapped);
+    expect(text).toContain('"type":"ping"'); // the frames themselves are passthrough
+    expect(elapsed).toBeLessThan(600); // cut at the window, not at the source's own close
+    expect(src.stopped()).toBe(true); // upstream cancelled → hub slot freed
+  });
+
+  it("PIN #1030: a ping followed by a real event inside the window is NOT cancelled", async () => {
+    // The guard against over-fixing: ignoring pings must not ignore the
+    // event behind them. Window 300ms, real event at ~80ms, the stream then
+    // stays open past the window before closing on its own — an armed timer
+    // would have fired at 300ms.
+    process.env.CLAUDISH_FIRST_EVENT_TIMEOUT_MS = "300";
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encoder.encode(`event: ping\ndata: {"type":"ping"}\n\n`));
+        await new Promise((r) => setTimeout(r, 40));
+        controller.enqueue(encoder.encode(`event: ping\ndata: {"type":"ping"}\n\n`));
+        await new Promise((r) => setTimeout(r, 40));
+        controller.enqueue(
+          encoder.encode(`event: message_start\ndata: {"type":"message_start","message":{}}\n\n`)
+        );
+        await new Promise((r) => setTimeout(r, 500)); // past the 300ms window
+        controller.enqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`));
+        controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const wrapped = withFirstUsefulEventWatchdog(new Response(body, { status: 200 }), "test-model");
+    const [text] = await drain(wrapped);
+    expect(cancelled).toBe(false);
+    expect(text).toContain('"message_start"');
+    expect(text).toContain('"message_stop"');
   });
 
   it("is inert when CLAUDISH_FIRST_EVENT_TIMEOUT_MS=0", async () => {
