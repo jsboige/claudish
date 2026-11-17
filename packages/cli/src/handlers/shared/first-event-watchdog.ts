@@ -50,7 +50,18 @@ const DEFAULT_WINDOW_MS = 300_000;
  * beyond the issue's scope.
  */
 export function hasUsefulDataLine(buffer: string): boolean {
-  for (const line of buffer.split("\n")) {
+  // #1097 CR — judge COMPLETE lines only. A chunk that ends inside a frame
+  // (TCP, TLS or the relay cuts bytes anywhere) leaves the trailing segment
+  // without its `\n`; judging it made a split ping — `data: {"ty` — count as
+  // useful (the truncated payload fails JSON.parse), clearing the timer for
+  // good. The segment is not dropped: it stays in the caller's scanBuffer and
+  // is judged the moment its newline arrives. An unparseable COMPLETE line
+  // still counts as useful (the watchdog confines a hang, it does not audit
+  // JSON).
+  const completeLines = buffer.endsWith("\n")
+    ? buffer
+    : buffer.slice(0, buffer.lastIndexOf("\n") + 1);
+  for (const line of completeLines.split("\n")) {
     if (!line.startsWith("data:")) continue;
     const payload = line.slice(5).trim();
     if (!payload) continue;

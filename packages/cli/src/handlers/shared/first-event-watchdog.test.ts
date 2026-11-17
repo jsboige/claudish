@@ -3,6 +3,7 @@ import {
   withFirstUsefulEventWatchdog,
   boundRetryUpstream,
   firstEventWatchdogWindowMs,
+  hasUsefulDataLine,
 } from "./first-event-watchdog.js";
 
 const encoder = new TextEncoder();
@@ -61,6 +62,50 @@ function pingOnlySource(intervalMs: number, maxTicks: number): {
         }
         try {
           controller.enqueue(encoder.encode(`event: ping\ndata: {"type":"ping"}\n\n`));
+          n++;
+        } catch {
+          /* consumer gone */
+        }
+      }, intervalMs);
+    },
+    cancel() {
+      stop = true;
+      if (interval) clearInterval(interval);
+    },
+  });
+  return { body, stopped: () => stop };
+}
+
+/** #1097 CR — the same ping-only source, but each frame is enqueued in TWO
+ *  chunks split INSIDE the JSON payload (byte `splitAt` = 22 lands in
+ *  `{"type":"ping"}`), the way TCP, TLS or the relay cuts bytes. The first
+ *  chunk ends mid-payload (`…data: {"ty`): judged by the pre-CR scan it
+ *  looked like an unparseable — therefore useful — data line and disarmed
+ *  the timer for good (reviewer's measurement: 1 282 ms, never cancelled). */
+function splitPingOnlySource(intervalMs: number, maxTicks: number, splitAt = 22): {
+  body: ReadableStream<Uint8Array>;
+  stopped: () => boolean;
+} {
+  let interval: ReturnType<typeof setInterval> | null = null;
+  let stop = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let n = 0;
+      interval = setInterval(() => {
+        if (stop) return;
+        if (n >= maxTicks) {
+          if (interval) clearInterval(interval);
+          try {
+            controller.close();
+          } catch {
+            /* already closed */
+          }
+          return;
+        }
+        try {
+          const frame = encoder.encode(`event: ping\ndata: {"type":"ping"}\n\n`);
+          controller.enqueue(frame.slice(0, splitAt));
+          controller.enqueue(frame.slice(splitAt));
           n++;
         } catch {
           /* consumer gone */
@@ -152,6 +197,24 @@ describe("first-useful-event watchdog (#108)", () => {
     expect(src.stopped()).toBe(true); // upstream cancelled → hub slot freed
   });
 
+  it("PIN #1097 CR: a ping frame split across two chunks does not disarm the timer", async () => {
+    // The chunk-boundary hole: the first half ends inside the ping's JSON
+    // payload, and its truncated `data:` line is judged only once complete.
+    // Mutation: put the trailing (newline-less) segment back in the scan —
+    // this pin goes red exactly like the reviewer's end-to-end probe (the
+    // stream is never cancelled and runs its 40 ticks ≈ 800 ms).
+    process.env.CLAUDISH_FIRST_EVENT_TIMEOUT_MS = "200";
+    const src = splitPingOnlySource(20, 40);
+    const wrapped = withFirstUsefulEventWatchdog(
+      new Response(src.body, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+      "test-model"
+    );
+    const [text, elapsed] = await drain(wrapped);
+    expect(text).toContain('"type":"ping"'); // frames themselves are passthrough
+    expect(elapsed).toBeLessThan(600); // cut at the 200ms window, not the source's own close
+    expect(src.stopped()).toBe(true); // upstream cancelled → hub slot freed
+  });
+
   it("PIN #1030: a ping followed by a real event inside the window is NOT cancelled", async () => {
     // The guard against over-fixing: ignoring pings must not ignore the
     // event behind them. Window 300ms, real event at ~80ms, the stream then
@@ -214,6 +277,22 @@ describe("first-useful-event watchdog (#108)", () => {
     expect(firstEventWatchdogWindowMs()).toBe(1500);
     process.env.CLAUDISH_FIRST_EVENT_TIMEOUT_MS = "not-a-number";
     expect(firstEventWatchdogWindowMs()).toBe(300_000);
+  });
+});
+
+describe("hasUsefulDataLine — complete lines only (#1097 CR)", () => {
+  // The reviewer's table, with the fixed outcomes. Rows 3-4 were TRUE
+  // pre-fix (the hole); an unparseable COMPLETE line stays TRUE (scope).
+  it("a split ping is not judged until its newline arrives; a complete unparseable line is useful", () => {
+    expect(hasUsefulDataLine('event: ping\ndata: {"type":"ping"}\n\n')).toBe(false);
+    expect(hasUsefulDataLine('event: ping\r\ndata: {"type":"ping"}\r\n\r\n')).toBe(false);
+    expect(hasUsefulDataLine('event: ping\ndata: {"type":"pi')).toBe(false); // trailing segment: incomplete, not judged
+    expect(hasUsefulDataLine('event: ping\ndata: {"ty')).toBe(false);
+    expect(hasUsefulDataLine('data: {"ty')).toBe(false); // bare incomplete data line
+    expect(hasUsefulDataLine('data: not-json-but-COMPLETE\n')).toBe(true); // unparseable COMPLETE = useful (scope holds)
+    expect(hasUsefulDataLine('data: {"type":"message_start"}\n')).toBe(true);
+    // The split ping is judged the moment its newline arrives — still a ping.
+    expect(hasUsefulDataLine('event: ping\ndata: {"ty' + 'pe":"ping"}\n\n')).toBe(false);
   });
 });
 
