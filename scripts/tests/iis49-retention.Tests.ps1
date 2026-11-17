@@ -112,9 +112,21 @@ BeforeAll {
             $cli += @("-$k", "$($Params[$k])")
         }
         if ($Params.ContainsKey('WhatIf')) { $cli += '-WhatIf' }
-        $o = & $script:Exe @cli 2>&1 | ForEach-Object { "$_" }
+        # 5.1 GOTCHA (#1096, same class as traffic-live.ps1:69-75): under
+        # $ErrorActionPreference='Stop' the `2>&1` merge turns the child's FIRST
+        # stderr line into a terminating NativeCommandError on pwsh 5.1 — the
+        # capture dies before any output is read. pwsh 7 does not do this. The
+        # capture must run under 'Continue', restored even on throw (try/finally).
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $o = & $script:Exe @cli 2>&1 | ForEach-Object { "$_" }
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
         if ($Out) { $Out.Value = @($o) }
-        return $LASTEXITCODE
+        return $code
     }
 }
 
@@ -165,10 +177,12 @@ Describe 'iis49-retention' {
     }
 
     Context 'guard: 7z t failure refuses (ACK G2)' {
-        # HostBound (#1096): hosted 5.1 divergence — the six fixture-based guard Its in this
-        # Describe pass on seats and under hosted pwsh, fail only under hosted 5.1. Under
-        # diagnosis there. CI excludes them on both legs (counted in the log).
-        It 'exits non-zero, purges nothing, writes no manifest' -Tag HostBound {
+        # #1096 RESOLVED for this file: the six guard Its below were HostBound because the
+        # child-process capture in Invoke-Retention threw NativeCommandError on hosted 5.1
+        # (EAP='Stop' + `2>&1` — see the wrapper there). With the capture running under
+        # 'Continue' they pass on both CI legs; the tags are removed. HostBound remains on
+        # the other suites' seat-specific tests.
+        It 'exits non-zero, purges nothing, writes no manifest' {
             $f = New-FakeSite
             $out = $null
             try {
@@ -186,7 +200,7 @@ Describe 'iis49-retention' {
     }
 
     Context 'guard: drive copy that does not verify refuses (ACK G3)' {
-        It 'refuses when the drive copy diverges from staging after the copy' -Tag HostBound {
+        It 'refuses when the drive copy diverges from staging after the copy' {
             $f = New-FakeSite
             $out = $null
             try {
@@ -220,7 +234,7 @@ Describe 'iis49-retention' {
     }
 
     Context 'guard: path outside W3SVC49 refuses (ACK G4)' {
-        It 'refuses a same-shaped directory that is not W3SVC49' -Tag HostBound {
+        It 'refuses a same-shaped directory that is not W3SVC49' {
             $root = Join-Path ([System.IO.Path]::GetTempPath()) ("iis49-g4-{0}" -f ([guid]::NewGuid().ToString('N')))
             $site = Join-Path $root 'W3SVC42'
             New-Item -ItemType Directory -Path $site -Force | Out-Null
@@ -266,7 +280,7 @@ Describe 'iis49-retention' {
             } finally { Remove-Item -LiteralPath $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
         }
 
-        It 'never overwrites an existing drive archive (re-run safety)' -Tag HostBound {
+        It 'never overwrites an existing drive archive (re-run safety)' {
             $f = New-FakeSite
             $out = $null
             try {
@@ -286,7 +300,7 @@ Describe 'iis49-retention' {
     }
 
     Context 'guard: per-file membership proof refuses before purge (CR #965)' {
-        It 'a purged file MISSING from the drive archive listing refuses the entire purge, naming it' -Tag HostBound {
+        It 'a purged file MISSING from the drive archive listing refuses the entire purge, naming it' {
             $f = New-FakeSite
             $out = $null
             $omitted = 'u_ex{0:yyMMdd}.log' -f [DateTime]::Now.Date.AddDays(-35)
@@ -305,7 +319,7 @@ Describe 'iis49-retention' {
             } finally { Remove-Item -LiteralPath $f.Root -Recurse -Force -ErrorAction SilentlyContinue }
         }
 
-        It 'a purged file archived at the WRONG SIZE refuses the entire purge' -Tag HostBound {
+        It 'a purged file archived at the WRONG SIZE refuses the entire purge' {
             $f = New-FakeSite
             $out = $null
             $shrunk = 'u_ex{0:yyMMdd}.log' -f [DateTime]::Now.Date.AddDays(-33)
