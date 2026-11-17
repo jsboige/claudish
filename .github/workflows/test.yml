@@ -72,6 +72,7 @@ jobs:
   static:
     name: typecheck · lint
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
@@ -96,6 +97,7 @@ jobs:
   idle:
     name: hermetic · idle ${{ matrix.slice }}/3
     runs-on: ubuntu-latest
+    timeout-minutes: 7
     strategy:
       fail-fast: false
       matrix:
@@ -130,6 +132,7 @@ jobs:
   hermetic:
     name: hermetic · macOS ${{ matrix.runner }}/3
     runs-on: macos-latest
+    timeout-minutes: 14
     strategy:
       fail-fast: false
       matrix:
@@ -200,6 +203,7 @@ jobs:
   blind-hooks:
     name: blind hook tests · bun 1.4.0
     runs-on: macos-latest
+    timeout-minutes: 6
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
@@ -241,6 +245,7 @@ jobs:
       matrix:
         os: [macos-latest, macos-15-intel, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
