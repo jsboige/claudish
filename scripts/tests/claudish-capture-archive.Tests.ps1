@@ -296,10 +296,21 @@ exit /b 0
         # under $tmp. The fake archive is always exactly 6 bytes.
         function Invoke-CompactionRun {
             param([string]$CaptureDir, [string]$GDriveDir)
-            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
-                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
-                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
-                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            # #1096/#1103: the child writes to stderr on the quarantine and held-open
+            # paths; under EAP='Stop' (GitHub Actions injects it into every PowerShell
+            # step) 5.1 promotes the first redirected stderr line to a terminating
+            # RemoteException -- pwsh 7 does not, which is why only the 5.1 leg tripped.
+            # Capture under 'Continue' so the child's stderr stays data (PR #1103 motif).
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                    -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                    -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                    -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
         }
         function New-GuardSandbox {
             $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-guard-{0}" -f ([guid]::NewGuid().ToString('N')))
@@ -451,10 +462,21 @@ exit /b 0
 '@, (New-Object System.Text.ASCIIEncoding))
         function Invoke-CompactionRun {
             param([string]$CaptureDir, [string]$GDriveDir)
-            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
-                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
-                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
-                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            # #1096/#1103: the child writes to stderr on the quarantine and held-open
+            # paths; under EAP='Stop' (GitHub Actions injects it into every PowerShell
+            # step) 5.1 promotes the first redirected stderr line to a terminating
+            # RemoteException -- pwsh 7 does not, which is why only the 5.1 leg tripped.
+            # Capture under 'Continue' so the child's stderr stays data (PR #1103 motif).
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                    -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                    -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                    -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
         }
         function New-GuardSandbox {
             $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-322-{0}" -f ([guid]::NewGuid().ToString('N')))
@@ -609,10 +631,21 @@ exit /b 0
 '@, (New-Object System.Text.ASCIIEncoding))
         function Invoke-CompactionRun {
             param([string]$CaptureDir, [string]$GDriveDir)
-            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
-                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
-                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
-                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            # #1096/#1103: the child writes to stderr on the quarantine and held-open
+            # paths; under EAP='Stop' (GitHub Actions injects it into every PowerShell
+            # step) 5.1 promotes the first redirected stderr line to a terminating
+            # RemoteException -- pwsh 7 does not, which is why only the 5.1 leg tripped.
+            # Capture under 'Continue' so the child's stderr stays data (PR #1103 motif).
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                    -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                    -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                    -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
         }
         function New-GuardSandbox {
             $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-418-{0}" -f ([guid]::NewGuid().ToString('N')))
@@ -1033,10 +1066,21 @@ exit /b 0
 '@, (New-Object System.Text.ASCIIEncoding))
         function Invoke-CompactionRun {
             param([string]$CaptureDir, [string]$GDriveDir)
-            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
-                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
-                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
-                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            # #1096/#1103: the child writes to stderr on the quarantine and held-open
+            # paths; under EAP='Stop' (GitHub Actions injects it into every PowerShell
+            # step) 5.1 promotes the first redirected stderr line to a terminating
+            # RemoteException -- pwsh 7 does not, which is why only the 5.1 leg tripped.
+            # Capture under 'Continue' so the child's stderr stays data (PR #1103 motif).
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                    -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                    -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                    -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
         }
         function New-LockSandbox {
             $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-741-{0}" -f ([guid]::NewGuid().ToString('N')))
@@ -1169,10 +1213,21 @@ exit /b 0
 '@, (New-Object System.Text.ASCIIEncoding))
         function Invoke-CompactionRun {
             param([string]$CaptureDir, [string]$GDriveDir)
-            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
-                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
-                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
-                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            # #1096/#1103: the child writes to stderr on the quarantine and held-open
+            # paths; under EAP='Stop' (GitHub Actions injects it into every PowerShell
+            # step) 5.1 promotes the first redirected stderr line to a terminating
+            # RemoteException -- pwsh 7 does not, which is why only the 5.1 leg tripped.
+            # Capture under 'Continue' so the child's stderr stays data (PR #1103 motif).
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                    -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                    -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                    -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
         }
         function New-ProbeSandbox {
             $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-741b-{0}" -f ([guid]::NewGuid().ToString('N')))
@@ -1193,9 +1248,11 @@ exit /b 0
         Remove-Item -LiteralPath $script:FakeRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # HostBound (#1096): hosted 5.1 divergence (open-handle/FS semantics; fixture passes on
-    # seats) — under diagnosis there. CI excludes it on both legs (counted in the log).
-    It 'quarantines a corpse under the canonical name BEFORE the pack, and the night still succeeds' -Tag HostBound {
+    # #1096/#1103 (un-tagged: harness defect, fixed): the child writes stderr on the
+    # quarantine path; under GA-injected EAP='Stop' the old bare `*> $null` capture made
+    # 5.1 terminate at the invocation (run 44051973599, 5.1 leg only). Invoke-CompactionRun
+    # now captures under 'Continue' -- the test runs on CI again.
+    It 'quarantines a corpse under the canonical name BEFORE the pack, and the night still succeeds' {
         # Pre-fix: `7z a` refuses (rc=2), the quarantine runs afterwards, the day
         # produces no archive and the night exits non-zero. Post-fix: a 2-second
         # probe moves the corpse aside first and the day is archived.
@@ -1239,9 +1296,10 @@ exit /b 0
         } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
-    # HostBound (#1096): hosted 5.1 divergence (open-handle/FS semantics; fixture passes on
-    # seats) — under diagnosis there. CI excludes it on both legs (counted in the log).
-    It 'a loose file held open no longer tears the night: upload happens, the file is kept, exit stays 0' -Tag HostBound {
+    # #1096/#1103 (un-tagged: harness defect, fixed): same family as the corpse test above
+    # -- the held-open path writes stderr, the old bare `*> $null` capture terminated under
+    # GA-injected EAP='Stop' on 5.1 only (run 44051973599). Capture under 'Continue' fixes it.
+    It 'a loose file held open no longer tears the night: upload happens, the file is kept, exit stays 0' {
         # THE measured shape of defect 3: the purge ran before the upload, so a
         # file another process holds open (CPython open() shares no DELETE) left
         # the day half-deleted with NO off-site copy.
@@ -1330,10 +1388,21 @@ exit /b 0
 '@, (New-Object System.Text.ASCIIEncoding))
         function Invoke-CompactionRun {
             param([string]$CaptureDir, [string]$GDriveDir)
-            & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
-                -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
-                -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
-                -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            # #1096/#1103: the child writes to stderr on the quarantine and held-open
+            # paths; under EAP='Stop' (GitHub Actions injects it into every PowerShell
+            # step) 5.1 promotes the first redirected stderr line to a terminating
+            # RemoteException -- pwsh 7 does not, which is why only the 5.1 leg tripped.
+            # Capture under 'Continue' so the child's stderr stays data (PR #1103 motif).
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $script:ScriptPath `
+                    -CaptureDir $CaptureDir -GDriveDir $GDriveDir `
+                    -ArchiveDir (Join-Path $CaptureDir 'archive') -MachineTag 'testbox' `
+                    -SevenZip $script:Fake7z -KeepLocalDays 0 *> $null
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
         }
         function New-GuardSandbox {
             $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-389-{0}" -f ([guid]::NewGuid().ToString('N')))
