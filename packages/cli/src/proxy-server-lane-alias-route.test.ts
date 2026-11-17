@@ -35,7 +35,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -74,15 +82,33 @@ let configExisted = false;
 // CLAUDISH_CAPTURE_DIR is MANAGED here (set to a temp dir per test) — a
 // machine-level capture dir must not leak real captures into the assertions.
 const SANDBOX_ENV_KEYS = [
-  "ZAI_API_KEY", "ZAI_CODING_API_KEY", "GLM_API_KEY", "ZHIPU_API_KEY",
-  "GLM_CODING_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY", "KIMI_CODING_API_KEY",
-  "OPENAI_API_KEY", "OPENAI_CODEX_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
-  "MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY", "LITELLM_API_KEY", "POE_API_KEY",
-  "DEEPSEEK_API_KEY", "CLAUDE_API_KEY", "ANTHROPIC_API_KEY",
-  "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
-  "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
+  "ZAI_API_KEY",
+  "ZAI_CODING_API_KEY",
+  "GLM_API_KEY",
+  "ZHIPU_API_KEY",
+  "GLM_CODING_API_KEY",
+  "MOONSHOT_API_KEY",
+  "KIMI_API_KEY",
+  "KIMI_CODING_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_CODEX_API_KEY",
+  "GEMINI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "MINIMAX_API_KEY",
+  "MINIMAX_CODING_API_KEY",
+  "LITELLM_API_KEY",
+  "POE_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "CLAUDE_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "CLAUDISH_NO_ANTHROPIC",
+  "CLAUDISH_FAILOVER_ACTIVE",
+  "CLAUDISH_PROXY_KEY",
+  "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CLIENT_ATTRIBUTION",
-  "CLAUDISH_RELAY_UPSTREAM", "CLAUDISH_LANE_BUDGETS", "CLAUDISH_LANE_STOP_DIR",
+  "CLAUDISH_RELAY_UPSTREAM",
+  "CLAUDISH_LANE_BUDGETS",
+  "CLAUDISH_LANE_STOP_DIR",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -101,9 +127,21 @@ function fakeNbEndpointResponse(): Response {
   const enc = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(enc.encode(`data: ${JSON.stringify({ id: "chatcmpl-nb", object: "chat.completion.chunk", created: 1, model: RESOLVED, choices: [{ index: 0, delta: { role: "assistant", content: "" } }] })}\n\n`));
-      controller.enqueue(enc.encode(`data: ${JSON.stringify({ id: "chatcmpl-nb", object: "chat.completion.chunk", created: 1, model: RESOLVED, choices: [{ index: 0, delta: { content: "SERVED-NB" } }] })}\n\n`));
-      controller.enqueue(enc.encode(`data: ${JSON.stringify({ id: "chatcmpl-nb", object: "chat.completion.chunk", created: 1, model: RESOLVED, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`));
+      controller.enqueue(
+        enc.encode(
+          `data: ${JSON.stringify({ id: "chatcmpl-nb", object: "chat.completion.chunk", created: 1, model: RESOLVED, choices: [{ index: 0, delta: { role: "assistant", content: "" } }] })}\n\n`
+        )
+      );
+      controller.enqueue(
+        enc.encode(
+          `data: ${JSON.stringify({ id: "chatcmpl-nb", object: "chat.completion.chunk", created: 1, model: RESOLVED, choices: [{ index: 0, delta: { content: "SERVED-NB" } }] })}\n\n`
+        )
+      );
+      controller.enqueue(
+        enc.encode(
+          `data: ${JSON.stringify({ id: "chatcmpl-nb", object: "chat.completion.chunk", created: 1, model: RESOLVED, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`
+        )
+      );
       controller.enqueue(enc.encode("data: [DONE]\n\n"));
       controller.close();
     },
@@ -141,29 +179,39 @@ function fakeAnthropicEndpoint(stream: boolean): Response {
     enc.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
   const streamBody = new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(ev("message_start", {
-        type: "message_start",
-        message: {
-          ...message,
-          content: [],
-          stop_reason: null,
-          usage: { input_tokens: 7, output_tokens: 1 },
-        },
-      }));
-      controller.enqueue(ev("content_block_start", {
-        type: "content_block_start", index: 0,
-        content_block: { type: "text", text: "" },
-      }));
-      controller.enqueue(ev("content_block_delta", {
-        type: "content_block_delta", index: 0,
-        delta: { type: "text_delta", text: "SERVED-ANTH" },
-      }));
+      controller.enqueue(
+        ev("message_start", {
+          type: "message_start",
+          message: {
+            ...message,
+            content: [],
+            stop_reason: null,
+            usage: { input_tokens: 7, output_tokens: 1 },
+          },
+        })
+      );
+      controller.enqueue(
+        ev("content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        })
+      );
+      controller.enqueue(
+        ev("content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "SERVED-ANTH" },
+        })
+      );
       controller.enqueue(ev("content_block_stop", { type: "content_block_stop", index: 0 }));
-      controller.enqueue(ev("message_delta", {
-        type: "message_delta",
-        delta: { stop_reason: "end_turn" },
-        usage: { output_tokens: 3 },
-      }));
+      controller.enqueue(
+        ev("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn" },
+          usage: { output_tokens: 3 },
+        })
+      );
       controller.enqueue(ev("message_stop", { type: "message_stop" }));
       controller.close();
     },
@@ -210,7 +258,7 @@ beforeEach(() => {
     delete process.env[k];
   }
   captureDir = mkdtempSync(join(tmpdir(), "nb-alias-captures-"));
-  savedEnv["CLAUDISH_CAPTURE_DIR"] = process.env.CLAUDISH_CAPTURE_DIR;
+  savedEnv.CLAUDISH_CAPTURE_DIR = process.env.CLAUDISH_CAPTURE_DIR;
   process.env.CLAUDISH_CAPTURE_DIR = captureDir;
   nbHits.length = 0;
   // Intercept only the proxy→endpoint leg; the client→proxy leg keeps real fetch.
@@ -241,16 +289,20 @@ afterEach(async () => {
     await activeProxy.shutdown();
     activeProxy = null;
   }
-  if (savedEnv["CLAUDISH_CAPTURE_DIR"] === undefined) delete process.env.CLAUDISH_CAPTURE_DIR;
-  else process.env.CLAUDISH_CAPTURE_DIR = savedEnv["CLAUDISH_CAPTURE_DIR"];
+  if (savedEnv.CLAUDISH_CAPTURE_DIR === undefined) process.env.CLAUDISH_CAPTURE_DIR = undefined;
+  else process.env.CLAUDISH_CAPTURE_DIR = savedEnv.CLAUDISH_CAPTURE_DIR;
   if (captureDir) {
-    try { rmSync(captureDir, { recursive: true, force: true }); } catch {}
+    try {
+      rmSync(captureDir, { recursive: true, force: true });
+    } catch {}
     captureDir = null;
   }
   if (configBackup !== null) {
     writeFileSync(REAL_CONFIG_PATH, configBackup, "utf-8");
   } else if (!configExisted && existsSync(REAL_CONFIG_PATH)) {
-    try { rmSync(REAL_CONFIG_PATH); } catch {}
+    try {
+      rmSync(REAL_CONFIG_PATH);
+    } catch {}
   }
   configBackup = null;
   configExisted = false;
@@ -274,7 +326,10 @@ async function spinHub(): Promise<void> {
 }
 
 async function postAlias(lane: string | null): Promise<Response> {
-  const headers: Record<string, string> = { "content-type": "application/json", "connection": "close" };
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    connection: "close",
+  };
   if (lane !== null) headers["x-claudish-lane"] = lane;
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
