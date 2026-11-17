@@ -85,6 +85,8 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
   "CLAUDISH_FAILOVER_STEP_SKIP", "CLAUDISH_FAILOVER_STEP_BUSY_WAIT_MS",
+  // #781 — the nominal-1302 walk switch and the walk switch it rides on.
+  "CLAUDISH_FAILOVER_1302_WALK", "CLAUDISH_FAILOVER_OVERLOAD_WALK",
   "CLAUDISH_CONTEXT_ADMISSION",
   "CLAUDISH_HEALTH_ARRIVAL_LOG",
 ];
@@ -1816,6 +1818,54 @@ describe("#679 — plan concurrency refusal skips, the usage wall stays a wall",
     const r2 = await postMessage({ session: "sess-two" });
     expect(await responseText(r2)).toContain("ok-from-s0-again");
     expect(calls.s0 ?? 0).toBeGreaterThan(s0AfterR1);
+  }, 30_000);
+
+  // #781 — the NOMINAL side. Before #781 a plain 1302 on the nominal surfaced
+  // as the bare 429 (none of isTransientOverload's words is in "Rate limit
+  // reached for requests"), and Claude Code stopped the turn once its own
+  // retries ran out (measured 17/11: 15 stopped turns on one machine in 2 h).
+  // Mutation proofs: drop `|| isConcurrencyRefusalWalk(response)` from the
+  // walk predicate ⇒ K1302f red (429 to the client); drop the kill-switch
+  // check in isConcurrencyRefusalWalk ⇒ K1302g red (the walk fires anyway).
+  test("K1302f (#781): a NOMINAL 1302 walks once — s0 serves, no state, the next request re-probes the nominal", async () => {
+    await spin();
+    // NO auto-arm (B6 shape): attempt 0 IS the nominal.
+    resetFailoverForTests({ CLAUDISH_FAILOVER_SONNET: TWO_STEP });
+    setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
+    upstreamAnswer.nm = () => zai1302();
+
+    const r1 = await postMessage({ session: "k1302f-1" });
+    expect(r1.status).toBe(200);
+    expect(await responseText(r1)).toContain("ok-from-s0");
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(1);
+    expect(calls.s1 ?? 0).toBe(0);
+    const walkLine = markerLog.find((l) => l.includes("[Failover] WALK sonnet one-shot"));
+    expect(walkLine).toBeDefined();
+    expect(walkLine).toContain("HTTP 429");
+
+    // No failure state written: once the plan has a free slot again, a fresh
+    // session is served by the nominal — not pinned to s0, not walled.
+    upstreamAnswer.nm = () => okSse("ok-from-nm-again", "fake-nom");
+    const r2 = await postMessage({ session: "k1302f-2" });
+    expect(await responseText(r2)).toContain("ok-from-nm-again");
+    expect(calls.nm).toBe(2);
+    expect(calls.s0).toBe(1);
+  }, 30_000);
+
+  test("K1302g (#781): kill switch CLAUDISH_FAILOVER_1302_WALK=0 — the nominal 1302 surfaces bare, as before #781", async () => {
+    await spin();
+    resetFailoverForTests({ CLAUDISH_FAILOVER_SONNET: TWO_STEP });
+    setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
+    process.env.CLAUDISH_FAILOVER_1302_WALK = "0";
+    upstreamAnswer.nm = () => zai1302();
+
+    const r1 = await postMessage({ session: "k1302g" });
+    expect(r1.status).toBe(429);
+    expect(await r1.text()).toContain("Rate limit reached for requests");
+    expect(r1.headers.get("x-claudish-step-skip") ?? "").toContain("code=1302");
+    expect(calls.s0 ?? 0).toBe(0);
+    expect(markerLog.some((l) => l.includes("[Failover] WALK"))).toBe(false);
   }, 30_000);
 });
 

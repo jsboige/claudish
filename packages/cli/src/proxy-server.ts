@@ -142,6 +142,7 @@ import {
   readStepBusyWaitMs,
   markCascadeStepAttempt,
   markStepSkipEligible,
+  isConcurrencyRefusalWalk,
 } from "./handlers/shared/step-skip.js";
 import {
   endpointPrefixOf,
@@ -2208,7 +2209,11 @@ export async function createProxyServer(
           // keyless invariant forbids, and its "no failure state" promise
           // would not make that spend legitimate.
           !keylessNative &&
-          isOverloadWalkClass(response.status, errBody)
+          // #781: a plain 1302 (z.ai plan concurrency, "Rate limit reached
+          // for requests") matches none of isTransientOverload's words, so it
+          // used to surface bare and stop the client's turn. Same walk, same
+          // no-state contract; kill switch CLAUDISH_FAILOVER_1302_WALK=0.
+          (isOverloadWalkClass(response.status, errBody) || isConcurrencyRefusalWalk(response))
         ) {
           overloadWalked = true;
           // #348: the walk is a recovery attempt paid out of the client's

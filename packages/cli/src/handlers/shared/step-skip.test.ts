@@ -12,7 +12,12 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { classifyConcurrencyRefusal, isConcurrencyRefusalResponse } from "./step-skip.js";
+import {
+  classifyConcurrencyRefusal,
+  isConcurrencyRefusalResponse,
+  isConcurrencyRefusalWalk,
+  STEP_SKIP_HEADER,
+} from "./step-skip.js";
 
 const body = (error: unknown) => JSON.stringify(error);
 
@@ -100,5 +105,46 @@ describe("isConcurrencyRefusalResponse (#679) — the body read is bounded", () 
       status: 429,
     });
     expect(await isConcurrencyRefusalResponse(r)).toBe(true);
+  });
+});
+
+describe("isConcurrencyRefusalWalk (#781) — read from the #679 header, never the body", () => {
+  // The body the cascade loop sees is the Anthropic envelope, which has lost
+  // `error.code`; this is what that response looks like on the nominal.
+  const enveloped = (status: number, skip?: string) =>
+    new Response(
+      body({ type: "error", error: { type: "rate_limit_error", message: "Rate limit reached for requests" } }),
+      { status, headers: skip ? { [STEP_SKIP_HEADER]: skip } : {} }
+    );
+
+  test("429 + `busy; code=1302` walks", () => {
+    expect(isConcurrencyRefusalWalk(enveloped(429, "busy; code=1302"), {})).toBe(true);
+  });
+
+  test("the same wording WITHOUT the annotation does not walk — the code is the contract", () => {
+    expect(isConcurrencyRefusalWalk(enveloped(429), {})).toBe(false);
+  });
+
+  test("a busy skip that is not a 1302 (limiter wait, endpoint budget) does not walk on this predicate", () => {
+    expect(isConcurrencyRefusalWalk(enveloped(429, "busy; wait=2000"), {})).toBe(false);
+    expect(isConcurrencyRefusalWalk(enveloped(429, "busy"), {})).toBe(false);
+    expect(isConcurrencyRefusalWalk(enveloped(429, "busy; code=13020"), {})).toBe(false);
+  });
+
+  test("another skip reason carrying the same detail does not walk", () => {
+    expect(isConcurrencyRefusalWalk(enveloped(429, "context; code=1302"), {})).toBe(false);
+  });
+
+  test("status gate: only the bare 429 — the 529 variant is already walk-class elsewhere", () => {
+    expect(isConcurrencyRefusalWalk(enveloped(529, "busy; code=1302"), {})).toBe(false);
+    expect(isConcurrencyRefusalWalk(enveloped(200, "busy; code=1302"), {})).toBe(false);
+  });
+
+  test("kill switch: only an explicit 0 disarms", () => {
+    const r = () => enveloped(429, "busy; code=1302");
+    expect(isConcurrencyRefusalWalk(r(), { CLAUDISH_FAILOVER_1302_WALK: "0" })).toBe(false);
+    expect(isConcurrencyRefusalWalk(r(), { CLAUDISH_FAILOVER_1302_WALK: " 0 " })).toBe(false);
+    expect(isConcurrencyRefusalWalk(r(), { CLAUDISH_FAILOVER_1302_WALK: "" })).toBe(true);
+    expect(isConcurrencyRefusalWalk(r(), { CLAUDISH_FAILOVER_1302_WALK: "1" })).toBe(true);
   });
 });
