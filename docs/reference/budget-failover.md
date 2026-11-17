@@ -490,13 +490,13 @@ Env, read at proxy startup (canonical annotated template: `.env.sidecar.example`
 
 ### `CLAUDISH_QWEN_THINKING`
 
-`disabled` (default) · `passthrough` · `budget:<n>`. **Unset is not neutral** — Qwen reasons by default, so unset means "think, at length", and the Token Plan bills on **output**. Re-read on **every request**, deliberately: the fleet flips this during a budget crunch, and a cached value would require restarting the proxy that is at that moment keeping everyone working.
+`disabled` (default) · `passthrough` · `budget:<n>`. Aliases: `off`/`false` = `disabled`, `client`/`default` = `passthrough`; an **unrecognized value falls back to `disabled`** (logged), the opposite of GLM's fallback below. **Unset is not neutral** — the variable unset means `disabled`, because Qwen reasons by default: a request with no `thinking` field means "think, at length", and the Token Plan bills on **output**. Re-read on **every request**, deliberately: the fleet flips this during a budget crunch, and a cached value would require restarting the proxy that is at that moment keeping everyone working.
 
 **Two switches on two wires, and each endpoint ignores the other's form**: the OpenAI-compatible endpoint takes `enable_thinking` + `thinking_budget`, the Anthropic-compatible one takes the native `thinking` object. `QwenModelDialect.prepareRequest` branches on `ctx.wireFormat`; converting unconditionally (the old behavior) **deleted the only switch that works** on the Anthropic wire. Post-deploy check: on prompt `"Reponds exactement: ok"`, `input_tokens` dropping 67 → 31 proves the native switch reached Qwen. Full measurements: `docs/reference/budget-failover.md`.
 
 ### `CLAUDISH_GLM_THINKING`
 
-`passthrough` (default) · `disabled`. GLM's switch is **binary** on the OpenAI wire (`thinking: {"type":"enabled"|"disabled"}`) — no budget control, unlike Qwen. Re-read on every request, same crunch-flip rationale.
+`passthrough` (default) · `disabled`. Aliases: `off`/`false` = `disabled`, `client`/`default` = `passthrough`; an **unrecognized value falls back to `passthrough`** (logged) — a typo in a crunch leaves GLM thinking, where the same typo on Qwen disables it. GLM's switch is **binary** on the OpenAI wire (`thinking: {"type":"enabled"|"disabled"}`) — no budget control, unlike Qwen. Re-read on every request, same crunch-flip rationale.
 
 **GLM thought by default and had no off switch at all**: `GLMModelDialect` deleted `thinking` unconditionally (a GLM-4.x-era artifact) and the OpenAI `buildPayload` never emitted the field either, so the client's ask was inert in both directions. Probed 2026-08-20 against the `gc@` Coding Plan (`glm-5.3`, prompt `"Reponds exactement: ok"`): field absent → 37 output tokens / 131 reasoning chars; `{"type":"disabled"}` → **3 tokens, 0 reasoning**; `budget_tokens` tolerated and **ignored**. `passthrough` preserves today's effective behavior; the `zai@` anthropic wire is unprobed, so only an explicit `disabled` sets the field there.
 
@@ -907,11 +907,14 @@ container: on a Docker Desktop Windows bind mount (`drvfs`) a file named
 container (15/11), and a Linux-native mount is untested. The bar and the
 capture key are case-sensitive everywhere.
 
-The dir must be volume-mounted into the container at the path the env names
-(`docker-compose.yml` carries the env name but mounts nothing by default — a
-seat that arms the stop adds the bind). A stopped lane's requests are refused
-locally with `x-claudish-lane-refusal: stop` (900 s retry-after); every other
-lane and lane-less traffic is untouched.
+The dir is bind-mounted into every container at `/lane-stop` — since #1091 the
+bind ships in `docker-compose.yml` itself, host side `CLAUDISH_LANE_STOP_HOST_DIR`
+(default `D:\claudish-lane-stop`), so a seat that arms the stop adds only the
+env value, not the mount. Side effect of the bind being default: every seat's
+next recreate (the hub's included) creates the empty host dir on its machine —
+harmless, and expected rather than discovered. A stopped lane's requests are
+refused locally with `x-claudish-lane-refusal: stop` (900 s retry-after); every
+other lane and lane-less traffic is untouched.
 
 **Where each check runs (CR B4, measured):** the STOP check sits ABOVE the
 relay branch on both ingresses — a stop file belongs to the node the operator

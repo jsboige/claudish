@@ -129,7 +129,7 @@ What it sets (in `<RepoDir>/.env`, consumed by `docker-compose.yml`):
 - `CLAUDISH_MACHINE` (`-Machine`) — the canonical fleet id (e.g. `myia-po-2024`). Since #345 the relay's own liveness probe sends it as `X-Claudish-Machine` so the hub attributes that probe to the machine instead of filing it as a header-less phantom lane. Operator knowledge, never derived inside the container (its hostname is the container id).
 - `CLAUDISH_RELAY_COMPRESS=1` (only with `-Compress`; WAN uplink gzip).
 - `CLAUDISH_NO_ANTHROPIC=1` (only with `-NoAnthropic`; leak-policy local backstop).
-- `CLAUDISH_CONFIG_DIR` / `CLAUDISH_CAPTURE_HOST_DIR` — the host bind-mount paths.
+- `CLAUDISH_CONFIG_DIR` / `CLAUDISH_CAPTURE_HOST_DIR` / `CLAUDISH_LANE_STOP_HOST_DIR` — the host bind-mount paths. The third names the lane-budget stop dir (#1091): default `D:\claudish-lane-stop`, mounted at `/lane-stop` in every container; it stays inert until `CLAUDISH_LANE_STOP_DIR` points the registry at it (§ budget-failover.md "Harness lane budget").
 - `CLAUDISH_HOST_PORT` (`-HostPort`, default 3000) — the published host port. **Required on any machine where 3000 is already taken** (ai-01, where a third-party service holds it). The container side always stays 3000.
 - `CLAUDISH_CONTAINER_NAME` (`-ContainerName`, default `claudish-proxy`) — give a sidecar its own name so logs and scripts never confuse it with the hub container.
 - `CLAUDISH_CAPTURE_DIR=` (empty, only with `-NoCapture`) — disables capture writing. Escape hatch for disk-starved hosts only; it destroys the outage-capture trail that `reconcile-outage-captures.ps1` depends on.

@@ -152,7 +152,7 @@ aux deux reboots de po-2025, pas aux fenêtres d'ai-01. ai-01 morte = un barreau
 # de la journée a été détruit par le recreate de 16:57:48Z)
 python - <<'PY'
 import json, datetime
-for l in open(r"C:\Users\jsboi\.claudish\docker-events.log", encoding="utf-8", errors="replace"):
+for l in open(r"<home>\.claudish\docker-events.log", encoding="utf-8", errors="replace"):
     try: o = json.loads(l)
     except: continue
     t = o.get("time")

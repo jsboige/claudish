@@ -145,11 +145,22 @@ Describe 'Get-HealthPayload — real HTTP (the #760 CR defects, exercised on the
             param([ValidateSet('ok', 'stalled', 'garbage')] [string]$Mode)
             foreach ($try in 1..3) {
                 $port = Get-Random -Minimum 22000 -Maximum 39000
+                # Readiness is a MARKER the job writes once $l.Start() returned, NOT a
+                # fixed sleep. 700 ms was enough on a seat and not always on a hosted
+                # runner (measured 16/11, run 43843789565: the stalled mock missed its
+                # window, the probe met a refused connection, $p.Http was $null -- while
+                # the identical 503 shape in the very next It passed, and both legs
+                # passed the same test in the previous run). A marker cannot be early.
+                $ready = Join-Path ([System.IO.Path]::GetTempPath()) ("eventloop-mock-{0}-{1}.ready" -f $Mode, [Guid]::NewGuid().ToString('N'))
                 $job = Start-Job -ScriptBlock {
-                    param($Port, $Mode)
+                    param($Port, $Mode, $ReadyFile)
                     $l = [System.Net.HttpListener]::new()
                     $l.Prefixes.Add("http://127.0.0.1:$Port/")
                     try { $l.Start() } catch { return }
+                    # Past this line the listener is up. A bind that FAILED returned
+                    # above and never writes the marker, so the parent retries a port
+                    # instead of sleeping through a dead one.
+                    Set-Content -LiteralPath $ReadyFile -Value 'ready' -Encoding ASCII
                     # Serve EXACTLY ONE request, then exit: each It makes a single
                     # probe, and a job left waiting in GetContext() for a second
                     # request never returns — Remove-Job -Force then hangs the
@@ -183,9 +194,17 @@ Describe 'Get-HealthPayload — real HTTP (the #760 CR defects, exercised on the
                     $ctx.Response.OutputStream.Write($buf, 0, $buf.Length)
                     $ctx.Response.Close()
                     $l.Stop()
-                } -ArgumentList $port, $Mode
-                Start-Sleep -Milliseconds 700
-                if ($job.State -eq 'Running') { return @{ Url = "http://127.0.0.1:$port/health"; Job = $job } }
+                } -ArgumentList $port, $Mode, $ready
+                # Bounded wait on the marker: returns as soon as the listener is up,
+                # and gives up EARLY when the job died (a port already taken), so a
+                # collision costs one retry rather than the whole deadline.
+                $deadline = [DateTime]::UtcNow.AddSeconds(20)
+                while (-not (Test-Path -LiteralPath $ready) -and $job.State -eq 'Running' -and [DateTime]::UtcNow -lt $deadline) {
+                    Start-Sleep -Milliseconds 50
+                }
+                $up = (Test-Path -LiteralPath $ready) -and $job.State -eq 'Running'
+                Remove-Item -LiteralPath $ready -Force -ErrorAction SilentlyContinue
+                if ($up) { return @{ Url = "http://127.0.0.1:$port/health"; Job = $job } }
                 Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
             }
             return $null

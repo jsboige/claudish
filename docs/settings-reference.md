@@ -125,15 +125,15 @@ Claudish automatically loads `.env` from the current working directory at startu
 
 ### 3.2 Claude Code Compatibility Variables
 
-| Variable | Purpose | Fallback for |
+| Variable | Purpose | Fallback for — read only when this `CLAUDISH_*` variable is unset (`cli.ts`: the `CLAUDISH_*` value wins) |
 |----------|---------|-------------|
-| `ANTHROPIC_MODEL` | Claude Code standard model selection | `CLAUDISH_MODEL` (lower priority) |
+| `ANTHROPIC_MODEL` | Claude Code standard model selection | `CLAUDISH_MODEL` |
 | `ANTHROPIC_SMALL_FAST_MODEL` | Claude Code standard fast model var | — |
-| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Claude Code opus model var | `CLAUDISH_MODEL_OPUS` (lower priority) |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Claude Code sonnet model var | `CLAUDISH_MODEL_SONNET` (lower priority) |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Claude Code haiku model var | `CLAUDISH_MODEL_HAIKU` (lower priority) |
-| `ANTHROPIC_DEFAULT_FABLE_MODEL` | Claude Code fable model var | `CLAUDISH_MODEL_FABLE` (lower priority) |
-| `CLAUDE_CODE_SUBAGENT_MODEL` | Claude Code subagent model var | `CLAUDISH_MODEL_SUBAGENT` (lower priority) |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Claude Code opus model var | `CLAUDISH_MODEL_OPUS` |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Claude Code sonnet model var | `CLAUDISH_MODEL_SONNET` |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Claude Code haiku model var | `CLAUDISH_MODEL_HAIKU` |
+| `ANTHROPIC_DEFAULT_FABLE_MODEL` | Claude Code fable model var | `CLAUDISH_MODEL_FABLE` |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | Claude Code subagent model var | `CLAUDISH_MODEL_SUBAGENT` |
 | `ANTHROPIC_API_KEY` | Non-secret onboarding placeholder in proxy-only mode | (placeholder set by Claudish) |
 | `ANTHROPIC_AUTH_TOKEN` | Non-secret onboarding placeholder in proxy-only mode | (placeholder set by Claudish) |
 | `CLAUDE_PATH` | Custom path to Claude Code binary | `~/.claude/local/claude`, then global `PATH` |

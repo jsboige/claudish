@@ -106,9 +106,11 @@ def parse_args():
                     help="run the fname_dt parsing checks and exit")
     ap.add_argument("--leak-policy", action="store_true",
                     help="verdict leak-policy rapide (#445) : reponses natives et Opus "
-                         "par machine (enveloppe req), seau sans machine, sous-agents "
-                         "Opus hors --opus-home ; lit les TETES seulement. Exit 3 = "
-                         "verdict refuse (Opus sans machine ou non apparie)")
+                         "par machine (enveloppe req), seau sans machine, axe lane "
+                         "Opus (#1055 : basename du cwd, jamais le chemin), sous-agents "
+                         "Opus hors --opus-home ; tetes pour tout, le corps ENTIER des "
+                         "seuls Opus. Exit 3 = verdict refuse (Opus sans machine ou "
+                         "non apparie)")
     ap.add_argument("--opus-home", default="myia-ai-01",
                     help="machine dont l'Opus n'est pas detaille (defaut myia-ai-01)")
     ap.add_argument("--workers", type=int, default=16,
@@ -187,7 +189,9 @@ def leak_policy(resps, req_index, opus_home, workers=16):
     l'EN-TETE de la reponse, req au plus 35 min avant, la plus recente) — le
     rang rNNNN du nom de fichier n'est jamais une cle. Machine et device lus
     dans les ~1 Ko de tete de l'enveloppe req ; le corps entier n'est lu que
-    pour un Opus servi hors `opus_home` (signature sous-agent).
+    pour un OPUS (axe lane #1055 item 2 : le basename du cwd, jamais le
+    chemin — parsing partage lib/cwd_lane.py ; signature sous-agent pour les
+    hors `opus_home` seulement).
 
     #997 : chaque lecture passe par le pool borne de la lib blind_spot
     (`workers` threads, defaut 16 — sur UNC une ouverture coute ~95 ms et la
@@ -213,7 +217,7 @@ def leak_policy(resps, req_index, opus_home, workers=16):
     ne peut pas la voir, il le dit, comme la ligne BLIND de #933."""
     rows = collections.defaultdict(lambda: {
         "nat": 0, "opus": 0, "sub": 0, "dev": collections.Counter(),
-        "hours": collections.Counter()})
+        "hours": collections.Counter(), "lanes": collections.Counter()})
     unp = {"nat": 0, "opus": 0}
     trunc = {"nat": 0, "opus": 0}
     corpus_start = min((c[0] for lst in req_index.values() for c in lst),
@@ -252,9 +256,10 @@ def leak_policy(resps, req_index, opus_home, workers=16):
     # reponses qui la citent : non appariee, comme l'OSError du serie.
     req_paths = sorted({p for (_ts, _op, p) in planned})
     env_heads = dict(zip(req_paths, bs.read_heads(req_paths, 1024, workers)))
-    # Phase 4 — agregation, ordre serie des reponses. Les Opus hors home
-    # reportent leur lecture de CORPS en phase 5.
-    off_home = []  # (machine, req_path) — corps entier a relire
+    # Phase 4 — agregation, ordre serie des reponses. Les Opus (home
+    # compris) reportent leur lecture de CORPS en phase 5 : l'axe lane
+    # (#1055 item 2) se lit dans le preambule cwd, donc dans le corps.
+    opus_reads = []  # (machine, req_path, off_home) — corps entier a relire
     for ts, is_opus, req_path in planned:
         env_head = env_heads.get(req_path)
         if env_head is None:
@@ -268,31 +273,55 @@ def leak_policy(resps, req_index, opus_home, workers=16):
         if not is_opus:
             continue
         r["opus"] += 1
-        if machine == opus_home:
+        off_home = machine != opus_home
+        if off_home:
+            dv = ENV_DEVICE8_RE.search(env_head)
+            r["dev"][dv.group(1) if dv else "?"] += 1
+            r["hours"][ts.strftime("%d %Hh")] += 1
+        opus_reads.append((machine, req_path, off_home))
+    # Phase 5 (#997) — corps des Opus (TOUS : axe lane ; les hors home en
+    # plus pour la signature sous-agent) : lecture ENTIERE mais PAR LOTS —
+    # le rejeu 7 jours (15/11) a fait MemoryError sur le dict tenant TOUS
+    # les corps d'un coup (des milliers d'Opus x des Mo chacun). Le lot
+    # (32 chemins) paie le pool borne ; SEUL le verdict (axe lane, drapeau
+    # sous-agent) survit au lot, le corps est jete. Un corps illisible ne
+    # signe rien (le serie faisait except OSError: pass) mais reste
+    # VISIBLE dans l'axe lane : un zero mesure et un zero devine ne se
+    # lisent pas pareil.
+    _UNREAD = _Unread()
+    off_home_paths = {p for (_m, p, off) in opus_reads if off}
+    verdicts = {}  # req_path -> ((lane, cc), sub|None) ou _UNREAD
+    opus_paths = sorted({p for (_m, p, _o) in opus_reads})
+    for i in range(0, len(opus_paths), 32):
+        chunk = opus_paths[i:i + 32]
+        for p, body in zip(chunk, bs.read_heads(chunk, None, workers)):
+            if body is None:
+                verdicts[p] = _UNREAD
+            else:
+                verdicts[p] = (_lane_key(body),
+                               _subagent_flag(body) if p in off_home_paths else None)
+    for machine, req_path, off_home in opus_reads:
+        v = verdicts.get(req_path, _UNREAD)
+        if v is _UNREAD:
+            rows[machine]["lanes"]["(corps illisible)"] += 1
             continue
-        dv = ENV_DEVICE8_RE.search(env_head)
-        r["dev"][dv.group(1) if dv else "?"] += 1
-        r["hours"][ts.strftime("%d %Hh")] += 1
-        off_home.append((machine, req_path))
-    # Phase 5 (#997) — corps des Opus hors home : lecture ENTIERE, pool
-    # borne, dedupliquee ; le serie relisait le fichier a chaque reponse.
-    # Un corps illisible ne compte pas (le serie faisait except OSError: pass).
-    sub_paths = sorted({p for (_m, p) in off_home})
-    bodies = dict(zip(sub_paths, bs.read_heads(sub_paths, None, workers)))
-    for machine, req_path in off_home:
-        body = bodies.get(req_path)
-        if body is not None and _subagent_flag(body) is True:
+        (lane, _cc), sub = v
+        rows[machine]["lanes"][lane if lane is not None else NON_CC_LANE] += 1
+        if off_home and sub is True:
             rows[machine]["sub"] += 1
 
     print("Leak-policy (#445) — reponses natives par machine "
           "(enveloppe req, appariement en-tete reqN+pid) :")
-    print(f"  {'machine':18s} {'natives':>7s} {'opus':>5s}  detail Opus hors {opus_home}")
+    print(f"  {'machine':18s} {'natives':>7s} {'opus':>5s}  lanes Opus (basename cwd) · detail hors {opus_home}")
     for machine, r in sorted(rows.items(), key=lambda kv: -kv[1]["opus"]):
         detail = ""
-        if r["opus"] and machine != opus_home:
-            devs = " ".join(f"{d}:{c}" for d, c in r["dev"].most_common(4))
-            hrs = " ".join(f"{k}:{v}" for k, v in sorted(r["hours"].items()))
-            detail = f"sub={r['sub']}/{r['opus']} dev={devs} heures={hrs}"
+        if r["opus"]:
+            lanes = " ".join(f"{k}:{v}" for k, v in r["lanes"].most_common(5))
+            detail = f"lanes={lanes}"
+            if machine != opus_home:
+                devs = " ".join(f"{d}:{c}" for d, c in r["dev"].most_common(4))
+                hrs = " ".join(f"{k}:{v}" for k, v in sorted(r["hours"].items()))
+                detail += f" sub={r['sub']}/{r['opus']} dev={devs} heures={hrs}"
         print(f"  {machine:18s} {r['nat']:7d} {r['opus']:5d}  {detail}")
     empty_opus = rows[NO_MACHINE]["opus"] if NO_MACHINE in rows else 0
     print(f"Non appariees : natives={unp['nat']} opus={unp['opus']}")
@@ -329,6 +358,30 @@ def _load_blind_spot():
 
 
 _SF = None
+_CWD = None
+NON_CC_LANE = "(non-cc)"
+
+
+class _Unread:
+    """Sentinelle « corps illisible » — distincte de (None, False), le
+    verdict « pas de preambule CC » du predicat : les deux ne se
+    confondent JAMAIS, l'un est un echec de lecture, l'autre une lecture
+    qui dit quelque chose."""
+
+
+def _lane_key(raw):
+    """L'axe lane (#1055 item 2) — le parsing du preambule cwd, charge une
+    fois par processus depuis lib/cwd_lane.py (une copie par semantique).
+
+    Rend (basename minuscule ou seau visible, vient_de_claude_code) —
+    (None, False) sans marqueur : l'appelant pose son seau non-CC. Le
+    basename, JAMAIS le chemin (arbitrage coordinateur 15/11) : un chemin
+    est prive, un nom est un axe.
+    """
+    global _CWD
+    if _CWD is None:
+        _CWD = _load_lib("cwd_lane")
+    return _CWD.lane_key(raw)
 
 
 def _subagent_flag(raw):

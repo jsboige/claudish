@@ -79,6 +79,65 @@ const REAL_CONFIG_PATH = join(homedir(), ".claudish", "config.json");
 const SCRATCH_DIR = mkdtempSync(join(tmpdir(), "claudish-791-shutdown-"));
 const SCRATCH_CONFIG_PATH = join(SCRATCH_DIR, "config.json");
 
+/**
+ * #1025 — a post-shutdown probe answered: say WHO answered.
+ *
+ * `instanceId` is one value per PROCESS, so in a full-suite run (the CI shape
+ * where this pin failed once) it cannot tell two servers apart. `uptimeSec` is
+ * computed per server and is the only discriminator reachable from inside a
+ * test file: the server under test had `uptimeBefore` seconds at `uptimeReadAt`,
+ * so its own clock would read `uptimeBefore + elapsed` now; anything outside a
+ * ±1.5 s band (rounding to whole seconds, plus scheduling jitter) belongs to a
+ * different listener.
+ */
+async function probeAfterShutdown(
+  port: number,
+  uptimeBefore: number | null,
+  uptimeReadAt: number
+): Promise<{ refused: boolean; diagnosis: string }> {
+  let diagnosis = "the probe failed before any answer could be attributed";
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(1500),
+      // CR 15/11 — no keep-alive socket left in bun's pool by the probe itself.
+      headers: { connection: "close" },
+    });
+    let answererUptime: number | null = null;
+    let bodyText = "";
+    try {
+      bodyText = await res.text();
+      const parsed = JSON.parse(bodyText) as { uptimeSec?: number };
+      if (typeof parsed.uptimeSec === "number") answererUptime = parsed.uptimeSec;
+    } catch {
+      // Non-JSON body — not a claudish /health; still an answerer to name below.
+    }
+    if (answererUptime !== null && uptimeBefore !== null) {
+      // This server's uptime NOW, had it survived: its own measured clock,
+      // advanced by the wall time since that reading.
+      const expectedOwnUptime = uptimeBefore + (Date.now() - uptimeReadAt) / 1000;
+      // uptimeSec is rounded to whole seconds; ±1.5 s absorbs that rounding
+      // plus scheduling jitter. Two servers born within ~1.5 s of each other
+      // fall inside the band — this probe cannot attribute them, and the
+      // message says exactly that instead of guessing.
+      const sameAge = Math.abs(answererUptime - expectedOwnUptime) <= 1.5;
+      // In-band is NOT an attribution (CR 15/11: Mutation B0 — a second server
+      // born right after the stop answered in-band and was named "the server
+      // under test"). Say what the probe knows: same age, two possible owners.
+      diagnosis = sameAge
+        ? `same age as the server under test (uptimeSec=${answererUptime}, own clock would read ≈${expectedOwnUptime.toFixed(1)}s, ±1.5 s) — either its listener survived shutdown(), or another listener was born within 1.5 s of it; this probe cannot tell those apart`
+        : `ANOTHER claudish listener answers /health (uptimeSec=${answererUptime}, this server's clock would read ≈${expectedOwnUptime.toFixed(1)}s) — not the server under test`;
+    } else if (answererUptime !== null) {
+      diagnosis = `a claudish listener answers /health (uptimeSec=${answererUptime}), but this server's own uptime was not read before the stop — who answered is NOT attributable by this probe`;
+    } else {
+      const excerpt = bodyText.slice(0, 80).replace(/\s+/g, " ");
+      diagnosis = `a non-claudish listener answers on :${port} (no uptimeSec in the /health body: "${excerpt}") — not the server under test`;
+    }
+  } catch {
+    return { refused: true, diagnosis };
+  }
+  return { refused: false, diagnosis };
+}
+
 /** A request whose body never arrives: headers promise 500 bytes, 11 are sent. */
 function openHalfWrittenRequest(port: number): { socket: net.Socket; closed: () => boolean } {
   let closed = false;
@@ -168,18 +227,39 @@ describe("#630 shutdown waits only for consumable work", () => {
     const half = openHalfWrittenRequest(port);
     await new Promise((resolve) => setTimeout(resolve, 200));
 
+    // #1025 — diagnosis reference: this server's OWN uptime, read from its own
+    // /health BEFORE the stop. `instanceId` is one value per PROCESS, so in a
+    // full-suite run (the CI shape where this pin failed once) it cannot tell
+    // two servers apart; `uptimeSec` is computed per server and is the only
+    // discriminator reachable from inside a test file. Diagnostic only — a
+    // failure of this pre-probe must not change what the pin asserts.
+    let uptimeBefore: number | null = null;
+    let uptimeReadAt = 0;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/health`, {
+        signal: AbortSignal.timeout(1500),
+        // CR 15/11 — the pre-probe must not leave a pooled socket behind.
+        headers: { connection: "close" },
+      });
+      uptimeBefore = ((await res.json()) as { uptimeSec?: number }).uptimeSec ?? null;
+      uptimeReadAt = Date.now();
+    } catch {
+      // Leave the reference unread; the post-stop message says it could not attribute.
+    }
+
     await withGrace(() => proxy.shutdown());
 
     // A refused connection after shutdown proves close() ran; a listener left
     // behind would keep answering and would also keep the port busy for the
     // replacement container.
-    let refused = false;
-    try {
-      await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
-    } catch {
-      refused = true;
-    }
-    expect(refused).toBe(true);
+    //
+    // #1025 — when the probe DOES answer, the failure must say WHO answered.
+    // CI printed a bare `Expected: true, Received: false` once (full suite,
+    // one process): a claudish server answered /health after shutdown(), and
+    // the reader could not tell a lingering server-under-test from a sibling
+    // suite's listener that had grabbed the port (#791 family).
+    const { refused, diagnosis } = await probeAfterShutdown(port, uptimeBefore, uptimeReadAt);
+    expect(refused, `something answered on :${port} after shutdown() — ${diagnosis}`).toBe(true);
 
     half.socket.destroy();
   }, 15_000);

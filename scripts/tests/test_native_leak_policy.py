@@ -25,11 +25,15 @@ Pinned on a synthetic corpus:
 Run: python scripts/tests/test_native_leak_policy.py
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPT = os.path.join(_HERE, "..", "native-consumption.py")
@@ -251,6 +255,148 @@ def test_pool_equivalence_refused_verdict():
     code, out = _equivalence(d, "--since", "2026-11-09T00")
     assert code == 3, f"expected exit 3, got {code}\n{out}"
     assert "Non appariees : natives=1 opus=1" in out, out
+
+
+def test_lane_axis_basename_only():
+    """#1055 item 2 — l'axe lane : basename du cwd, JAMAIS le chemin.
+
+    Le constat fondateur (coordinateur, 15/11) : 9 des 67 Opus du siege
+    viennent de CoursIA/CoursIA-2, lus dans le cwd des corps. L'axe rend
+    cela une colonne du verdict — pour la machine HOME aussi, pas seulement
+    hors home (les 9 l'etaient). Le parsing porte les trois pieges
+    (suffixe `(was ...)`, antislash avant le `\\n`, dernier marqueur
+    gagne) ; un corps sans preambule CC tombe dans (non-cc), un corps
+    illisible reste visible. Arbitrage : basename seulement — un chemin
+    est prive, un nom est un axe.
+    """
+    d = tempfile.mkdtemp(prefix="leak-lane-")
+    _anchor(d)
+    # home Opus : un marqueur plus ancien cite AVANT (dernier gagne),
+    # suffixe (was ...), antislash litteral — les trois pieges d'un coup.
+    # HOME par defaut = myia-ai-01 : po-2024 est la machine hors home ici.
+    _req(d, 1, 60, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"system": [{"type": "text", "text":
+               "Primary working directory: c:\\\\old\\\\place\\nquoted stuff\\n"
+               "Primary working directory: d:\\\\Dev\\\\CoursIA-2 (was c:\\dev\\\\CoursIA-2)"}],
+               "messages": []})
+    _resp(d, 1, 70, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 60)
+    # meme machine, corps sans preambule CC -> seau (non-cc), pas un gap
+    _req(d, 1, 61, "2026-11-09T06-05-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"system": [{"type": "text", "text": "Tu es Hermes"}], "messages": []})
+    _resp(d, 1, 71, "2026-11-09T06-05-03-000Z", "claude-opus-5-5", 61)
+    # machine HOME (defaut --opus-home myia-ai-01) : l'axe lane seul, le
+    # detail sub/dev/heures reste reserve aux hors home
+    _req(d, 1, 62, "2026-11-09T06-10-00-000Z", "myia-ai-01",
+         body={"system": [{"type": "text", "text":
+               "Primary working directory: d:\\\\Dev\\\\Argumentum"}], "messages": []})
+    _resp(d, 1, 72, "2026-11-09T06-10-04-000Z", "claude-opus-5-5", 62)
+    # un natif non-Opus ne paie pas de lecture de corps : pas d'axe pour lui
+    _req(d, 1, 63, "2026-11-09T06-15-00-000Z", "myia-po-2024", model="claude-sonnet-5-5")
+    _resp(d, 1, 73, "2026-11-09T06-15-02-000Z", "claude-sonnet-5-5", 63)
+    code, out = _run(d, "--since", "2026-11-09T00")
+    assert code == 0, out
+    po = _row(out, "myia-po-2024")
+    assert po.split()[1:3] == ["3", "2"], f"po-2024 natives/opus wrong: {po}\n{out}"
+    assert "lanes=coursia-2:1 (non-cc):1" in po, f"lane axis wrong off-home: {po}"
+    assert "sub=0/2" in po and "dev=0b9b0d8c:2" in po, f"off-home detail lost: {po}"
+    ai = _row(out, "myia-ai-01")
+    assert "lanes=argumentum:1" in ai, f"lane axis wrong on home row: {ai}"
+    assert "sub=" not in ai, f"home row must not carry off-home detail: {ai}"
+    # LE CHEMIN NE SORT JAMAIS (arbitrage coordinateur 15/11) : ni le
+    # dossier parent, ni l'unite, ni le marqueur plus ancien
+    for forbidden in ("Dev", "d:", "place", "old"):
+        assert forbidden not in out, f"path fragment {forbidden!r} leaked:\n{out}"
+
+
+def test_phase5_chunked_bodies_survive_lot_boundary():
+    """#1055 item 2 — phase 5 lit les corps par LOTS de 32 : le rejeu 7
+    jours (15/11) a fait MemoryError sur le dict tenant tous les corps.
+    Le pin traverse la frontiere de lot (40 Opus = 2 lots) : chaque Opus
+    doit quand meme rendre son axe lane et son drapeau sous-agent — un
+    lot perdu se lirait comme un « (corps illisible) » massif."""
+    d = tempfile.mkdtemp(prefix="leak-chunk-")
+    _anchor(d)
+    for i in range(1, 41):
+        sub = i % 2 == 0
+        _req(d, 1, 100 + i, f"2026-11-09T06-00-00-000Z", "myia-po-2024",
+             device="0b9b0d8c",
+             body={"system": [{"type": "text", "text":
+                   ("x-anthropic-billing-header: cc_is_subagent=true;"
+                    if sub else "x-anthropic-billing-header: cc_version=2.1.322;") +
+                   f"\nPrimary working directory: d:\\\\Dev\\\\CoursIA-{i % 3}"}],
+                   "messages": []})
+        _resp(d, 1, 500 + i, "2026-11-09T06-01-00-000Z", "claude-opus-5-5", 100 + i)
+    code, out = _run(d, "--since", "2026-11-09T00")
+    assert code == 0, out
+    po = _row(out, "myia-po-2024")
+    assert po.split()[1:3] == ["40", "40"], f"chunk lost responses: {po}\n{out}"
+    assert "sub=20/40" in po, f"chunk lost sub flags: {po}"
+    assert "(corps illisible)" not in po, po
+    for lane, n in (("coursia-0", 13), ("coursia-1", 14), ("coursia-2", 13)):
+        assert f"{lane}:{n}" in po, f"lane {lane} miscounted: {po}"
+
+
+def test_unreadable_opus_body_lands_in_visible_bucket():
+    """#1055 N3 (revue c.6891789440) — un corps d'Opus illisible reste
+    VISIBLE : seau `(corps illisible)`, jamais un zero devine. Le mutant
+    qui traverse le cas sans compter (continue sans seau) doit devenir
+    ROUGE ici.
+
+    In-process : l'enveloppe (tete 1 Ko) et le corps sont le MEME fichier,
+    donc un fichier illisible casserait l'appariement avant la phase 5 —
+    en subprocess le cas est inconstructible. On appelle leak_policy()
+    directement avec un pool stubbe : tetes reelles, corps -> None.
+    """
+    _spec = importlib.util.spec_from_file_location("nc", _SCRIPT)
+    nc = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(nc)
+
+    class _StubPool:
+        """Tetes reelles ; le corps ENTIER (size None) echoue -> None."""
+
+        def read_heads(self, paths, size, workers=16):
+            if size is None:
+                return [None] * len(paths)
+            return [self._head(p, size) for p in paths]
+
+        @staticmethod
+        def _head(p, size):
+            try:
+                with open(p, "rb") as fh:
+                    return fh.read(size).decode("utf-8", errors="replace")
+            except OSError:
+                return None
+
+    d = tempfile.mkdtemp(prefix="leak-unread-")
+    _anchor(d)
+    _req(d, 1, 80, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
+         body={"system": [{"type": "text", "text":
+               "Primary working directory: d:\\\\Dev\\\\CoursIA"}], "messages": []})
+    _resp(d, 1, 90, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 80)
+    req_path = os.path.join(d, "req-1-80-2026-11-09T06-00-00-000Z-direct.json")
+    resps = [(datetime(2026, 11, 9, 6, 0, 5), 1,
+              os.path.join(d, "resp-1-r90-2026-11-09T06-00-05-000Z-native-claude-opus-5-5.sse"))]
+    # the anchor's index entry too: a corpus starting at the req's own ts
+    # makes the 35 min window read as compaction-truncated (the _anchor
+    # trick, applied by hand here since main() is bypassed). Key shape per
+    # main(): pid is the STRING from the filename, only the counter is int.
+    req_index = {
+        ("1", 80): [(datetime(2026, 11, 9, 6, 0, 0), req_path)],
+        ("9", 1): [(datetime(2026, 11, 9, 1, 0, 0),
+                    os.path.join(d, "req-9-1-2026-11-09T01-00-00-000Z-direct.json"))],
+    }
+    nc._load_blind_spot = lambda: _StubPool()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = nc.leak_policy(resps, req_index, "myia-ai-01", workers=1)
+    text = out.getvalue()
+    assert code == 0, text
+    assert "(corps illisible):1" in text, \
+        "an unreadable Opus body must land in its visible bucket:\n" + text
+    assert "(non-cc)" not in text, "unreadable is NOT 'no preamble':\n" + text
+    po = _row(text, "myia-po-2024")
+    assert po.split()[1:3] == ["1", "1"], \
+        "native/opus counts must not move on an unreadable body:\n" + text
 
 
 def test_full_mode_and_leak_policy_agree_on_sub():
