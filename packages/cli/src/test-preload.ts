@@ -50,6 +50,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { presetRefusal } from "./test-sandbox";
 import { armCaptureHermeticity } from "./test-support/capture-hermeticity";
+import { armRepoEnvFileNeutralizer } from "./test-support/env-file-neutralizer";
 
 const SANDBOX_PREFIX = "claudish-test-home-";
 
@@ -106,6 +107,14 @@ for (const name of readdirSync(tmpdir())) {
     }
   } catch {}
 }
+
+// Repo `.env` neutralizer (#1101) — BEFORE the capture guard, on purpose: the
+// guard arms on whatever ambient CLAUDISH_CAPTURE_DIR remains, i.e. on a
+// deliberate operator export (the #936 case, a real host dir), while the
+// container-absolute values the seat `.env` carries (/captures) are gone
+// before anything can mistake them for an environment to protect. Mechanism:
+// test-support/env-file-neutralizer.ts.
+armRepoEnvFileNeutralizer();
 
 // Capture hermeticity (2026-11-08, three test files wrote into a seat's REAL
 // capture dir under an ambient CLAUDISH_CAPTURE_DIR): swap the ambient dir for

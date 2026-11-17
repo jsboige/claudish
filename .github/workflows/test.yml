@@ -63,7 +63,7 @@ jobs:
           CLAUDISH_TEST_PRESET_HOME: "1"
         run: |
           mkdir -p "$RUNNER_TEMP/claudish-test-home"
-          HOME="$RUNNER_TEMP/claudish-test-home" bun test --cwd packages/cli 2>&1 | tee test-output.txt
+          HOME="$RUNNER_TEMP/claudish-test-home" bun --no-env-file test --cwd packages/cli 2>&1 | tee test-output.txt
           test ${PIPESTATUS[0]} -eq 0
 
       - name: Suite summary
