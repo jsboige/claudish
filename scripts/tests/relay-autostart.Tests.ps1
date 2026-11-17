@@ -170,12 +170,22 @@ Describe 'install-relay-autostart.ps1' {
         Test-Path -LiteralPath (Join-Path $dir 'relay-guard.ps1') | Should -Be $false
     }
 
-    # HostBound (#1096): hosted 5.1 divergence (seat file/task layout assumptions; fixture
-    # passes on seats) - under diagnosis there. CI excludes it on both legs (counted in the log).
-    It 'AC7: preflight fails BEFORE anything when relay.js is absent (no elevation consumed)' -Tag HostBound {
+    # #1096/#1103 (un-tagged: harness defect, fixed): the child's preflight `throw`
+    # lands on stderr; under EAP='Stop' (GitHub Actions injects it into every
+    # PowerShell step) 5.1 promotes the first `2>&1`-redirected stderr line to a
+    # terminating RemoteException at the invocation, before the assertions run --
+    # pwsh 7 does not, which is why only the 5.1 leg tripped. Capture under
+    # 'Continue' so the expected failure text stays data (PR #1103 motif).
+    It 'AC7: preflight fails BEFORE anything when relay.js is absent (no elevation consumed)' {
         $dir = New-RelayFixture -Name 'preflight'
-        $out = & $script:PS51 -NoProfile -ExecutionPolicy Bypass -File $script:InstallPath `
-                   -RelayDir $dir -GuardSource $script:GuardPath -DryRun 2>&1 | Out-String
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & $script:PS51 -NoProfile -ExecutionPolicy Bypass -File $script:InstallPath `
+                       -RelayDir $dir -GuardSource $script:GuardPath -DryRun 2>&1 | Out-String
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
         $LASTEXITCODE | Should -Not -Be 0
         $out | Should -Match 'relay\.js not found'
         Test-Path -LiteralPath (Join-Path $dir 'relay-guard.ps1') | Should -Be $false
