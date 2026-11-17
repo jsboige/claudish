@@ -33,7 +33,18 @@ name: Claude Code PR Review
 #   gh variable set CLAUDISH_HUB_URL -R jsboige/claudish --body https://models.myia.io
 # The key is a repository SECRET, carried ONLY as `x-proxy-key` through
 # ANTHROPIC_CUSTOM_HEADERS:
-#   gh secret set CLAUDISH_CLUSTER_KEY -R jsboige/claudish
+#   gh secret set CLAUDISH_REVIEWER_KEY -R jsboige/claudish
+#
+# CLAUDISH_REVIEWER_KEY is a SCOPED INBOUND KEY (settings-reference.md §7.6),
+# provisioned hub-side as an `inboundKeys` entry restricted to
+# `allowModels: ["mmc@MiniMax-M3.1-Flash"]` (the exact raw string this
+# workflow sends) with a `maxConcurrency` cap: it authenticates like the
+# proxy key, serves only that model, never the native lane, and is
+# attributed as `inbound_key` in the hub capture — revoking it is deleting
+# one config entry. The FULL CLUSTER KEY must NEVER be stored in this
+# repository: this job has an outbound channel (inline comments publish on a
+# public PR) and read tools reach /proc/self/environ, and a single leak of
+# the cluster key would force a fleet-wide rotation (Q82 review, 17/11).
 # Never `x-api-key`: that header arms NativeHandler's proxyKey->Anthropic swap and
 # the request 401s (docs/reference/relay-internals.md). proxy-auth.ts reads
 # `provided = x-proxy-key || x-api-key || bearer`, so x-proxy-key wins when both
@@ -77,7 +88,7 @@ env:
   ANTHROPIC_BASE_URL: ${{ vars.CLAUDISH_HUB_URL }}
   # No trailing newline: a YAML block scalar would add one, and the header
   # parser is fed this value verbatim.
-  ANTHROPIC_CUSTOM_HEADERS: "X-Claudish-Machine: myia-gh-actions\nx-proxy-key: ${{ secrets.CLAUDISH_CLUSTER_KEY }}"
+  ANTHROPIC_CUSTOM_HEADERS: "X-Claudish-Machine: myia-gh-actions\nx-proxy-key: ${{ secrets.CLAUDISH_REVIEWER_KEY }}"
   ANTHROPIC_DEFAULT_OPUS_MODEL: mmc@MiniMax-M3.1-Flash
   ANTHROPIC_DEFAULT_SONNET_MODEL: mmc@MiniMax-M3.1-Flash
   ANTHROPIC_DEFAULT_HAIKU_MODEL: mmc@MiniMax-M3.1-Flash
@@ -115,7 +126,7 @@ jobs:
             exit 1
           fi
           if ! printf '%s' "$ANTHROPIC_CUSTOM_HEADERS" | grep -qE '^x-proxy-key: [^[:space:]]'; then
-            echo "::error::Repository secret CLAUDISH_CLUSTER_KEY is not set"
+            echo "::error::Repository secret CLAUDISH_REVIEWER_KEY is not set"
             exit 1
           fi
 
