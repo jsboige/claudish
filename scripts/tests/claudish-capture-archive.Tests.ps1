@@ -821,15 +821,18 @@ exit /b 0
 }
 
 Describe 'off-site sha256 manifest (#389) — engine functions' {
-    # HostBound (#1096): seat-specific drive/manifest layout assumptions — fails in 6-18 ms
-    # on hosted runners, both legs; passes on seats. CI excludes it (counted in the log).
-    It 'names the manifest per machine tag, mirroring the archive-name namespace' -Tag HostBound {
-        Get-ShaManifestPath -GDriveDir 'G:\shared' -MachineTag 'po-2024' |
-            Should -Be 'G:\shared\captures-sha256-po-2024.jsonl'
-        Get-ShaManifestPath -GDriveDir 'G:\shared' |
-            Should -Be 'G:\shared\captures-sha256.jsonl'
+    It 'names the manifest per machine tag, mirroring the archive-name namespace' {
+        # #1096 root cause (run 43802070885): Join-Path RESOLVES the drive of
+        # the base path — 'G:\shared' throws DriveNotFoundException on hosted
+        # runners (no G: mapping there; every seat has one). Root on a drive
+        # every machine has; the LEAF naming stays a literal pin either way.
+        $root = "$env:SystemDrive\shared"
+        Get-ShaManifestPath -GDriveDir $root -MachineTag 'po-2024' |
+            Should -Be "$root\captures-sha256-po-2024.jsonl"
+        Get-ShaManifestPath -GDriveDir $root |
+            Should -Be "$root\captures-sha256.jsonl"
         # two machines never share one manifest file (same reason as #201)
-        (Get-ShaManifestPath -GDriveDir 'G:\s' -MachineTag 'a') -ne (Get-ShaManifestPath -GDriveDir 'G:\s' -MachineTag 'b') |
+        (Get-ShaManifestPath -GDriveDir $root -MachineTag 'a') -ne (Get-ShaManifestPath -GDriveDir $root -MachineTag 'b') |
             Should -BeTrue
     }
 
