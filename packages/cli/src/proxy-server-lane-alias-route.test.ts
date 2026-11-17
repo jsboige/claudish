@@ -283,14 +283,29 @@ beforeEach(() => {
   }) as typeof fetch;
 });
 
+/**
+ * #1107: restoring an UNSET CLAUDISH_CAPTURE_DIR must DELETE the key.
+ * Assigning `undefined` is not a delete — bun 1.3.13 (and Node) store the
+ * STRING "undefined"; request-logger's dir guard then reads a truthy value and
+ * every later route test in the same process writes captures into
+ * <cwd>/undefined/. `delete process.env.X` is biome-rewritten into exactly
+ * that assignment, hence Reflect.deleteProperty (the form #1104 kept on v14).
+ */
+function restoreCaptureDirEnv(): void {
+  if (savedEnv.CLAUDISH_CAPTURE_DIR === undefined) {
+    Reflect.deleteProperty(process.env, "CLAUDISH_CAPTURE_DIR");
+  } else {
+    process.env.CLAUDISH_CAPTURE_DIR = savedEnv.CLAUDISH_CAPTURE_DIR;
+  }
+}
+
 afterEach(async () => {
   globalThis.fetch = realFetch;
   if (activeProxy) {
     await activeProxy.shutdown();
     activeProxy = null;
   }
-  if (savedEnv.CLAUDISH_CAPTURE_DIR === undefined) process.env.CLAUDISH_CAPTURE_DIR = undefined;
-  else process.env.CLAUDISH_CAPTURE_DIR = savedEnv.CLAUDISH_CAPTURE_DIR;
+  restoreCaptureDirEnv();
   if (captureDir) {
     try {
       rmSync(captureDir, { recursive: true, force: true });
@@ -510,4 +525,26 @@ describe("#1055 AC1 — the client-visible response `model` is the SERVED id", (
     expect(body.model).not.toBe(ANTH_ALIAS);
     expect(body.choices?.[0]?.message?.content).toBe("SERVED-ANTH");
   }, 30_000);
+});
+
+describe("#1107 pin — env restore semantics", () => {
+  test("restoring an unset CLAUDISH_CAPTURE_DIR DELETES the key, never stores the string 'undefined'", () => {
+    // Mutation shown (review c.6953666472): swap restoreCaptureDirEnv's delete
+    // branch for `process.env.CLAUDISH_CAPTURE_DIR = undefined` and BOTH
+    // assertions go red — the assignment leaves the key present with the
+    // string "undefined", which request-logger's guard reads as a live dir.
+    const prev = process.env.CLAUDISH_CAPTURE_DIR;
+    const savedBackup = savedEnv.CLAUDISH_CAPTURE_DIR;
+    savedEnv.CLAUDISH_CAPTURE_DIR = undefined; // force the "was unset" branch
+    process.env.CLAUDISH_CAPTURE_DIR = join(tmpdir(), "pin-must-not-leak");
+    try {
+      restoreCaptureDirEnv();
+      expect("CLAUDISH_CAPTURE_DIR" in process.env).toBe(false);
+      expect(process.env.CLAUDISH_CAPTURE_DIR).toBeUndefined();
+    } finally {
+      savedEnv.CLAUDISH_CAPTURE_DIR = savedBackup;
+      if (prev === undefined) Reflect.deleteProperty(process.env, "CLAUDISH_CAPTURE_DIR");
+      else process.env.CLAUDISH_CAPTURE_DIR = prev;
+    }
+  });
 });
