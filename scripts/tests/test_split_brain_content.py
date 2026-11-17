@@ -50,7 +50,10 @@ def req_json(sid, ts, segs, sub=False):
     """A capture-shaped request: harness + user segments, nested user_id."""
     harness = HARNESS
     if sub:
-        harness += " cc_is_subagent=true"
+        # Real form (#1053): the flag rides the billing-header k=v segment,
+        # not a bare append to the preamble.
+        harness += (" x-anthropic-billing-header: cc_version=2.1.300;"
+                    " cc_entrypoint=cli; cc_is_subagent=true;")
     msgs = [{"role": "user", "content": harness},
             {"role": "assistant", "content": "ok"}]
     for s in segs:
@@ -146,13 +149,38 @@ def test_concurrent_overlap_vs_sequential():
     check("concurrent: sequential (compaction) does NOT pair", sbc.concurrent(seq) == [])
 
 
-def test_is_subagent_line_scoped():
-    main = 'preamble "cc_version=2.1.300 (cli) x-init=1" tail'
-    sub = 'preamble "cc_version=2.1.300 (cli) cc_is_subagent=true" tail'
-    quoted = 'CLAUDE.md says cc_is_subagent=true documents the leak; "cc_version=2.1.300 (cli)" line'
-    check("T4: flag on the cc_version line -> sub", sbc.is_subagent(sub) is True)
-    check("T4: no flag on the line -> main", sbc.is_subagent(main) is False)
-    check("T4: bare mention OUTSIDE the line stays main", sbc.is_subagent(quoted) is False)
+def test_is_subagent_segment_scoped():
+    """#1053: the shared predicate decides — billing-header SEGMENT, last one
+    wins, JSON key only when no segment exists. An echo of the bare literal
+    (T4: the fleet's own CLAUDE.md quotes it, so it rides every claudish
+    system prompt) has no marker and cannot vote."""
+    hdr = "x-anthropic-billing-header: cc_version=2.1.300; cc_entrypoint=cli;"
+    main = 'You are Claude Code.\n%s cc_workload=interactive;' % hdr
+    sub = 'You are Claude Code.\n%s cc_workload=interactive; cc_is_subagent=true;' % hdr
+    # PIN — echo alone -> not a sub-agent: the CLAUDE.md quote has no
+    # billing marker, and the old line-scoped defense would have read the
+    # same text as True when the echo sat inside the cc_version window.
+    echo_only = ('cc_is_subagent=true is the leak signature, and it lives in '
+                 'the request body, not stdout (fleet CLAUDE.md)')
+    check("segment with flag -> sub", sbc.is_subagent(sub) is True)
+    check("segment without flag -> main (proven)", sbc.is_subagent(main) is False)
+    check("PIN: echo alone -> not a sub-agent", sbc.is_subagent(echo_only) is False)
+    # Guard of the shared predicate: an EARLIER quoted segment (echo of a
+    # real header inside the conversation) never overrides the true one,
+    # which is serialized after messages.
+    echo_then_main = ('user quoted "x-anthropic-billing-header: cc_is_subagent=true"\n'
+                      + main)
+    check("earlier echo overridden by later real segment",
+          sbc.is_subagent(echo_then_main) is False)
+    main_then_echo = (main + '\nuser quoted "x-anthropic-billing-header:'
+                      ' cc_is_subagent=true"')
+    # Last-wins is the #1051 semantics, inherited here: the real system
+    # block serializes AFTER messages, so in a real capture the true header
+    # is always the last one. A quote carrying the full marker AFTER the
+    # true block cannot occur on the wire — this pins the semantics, not a
+    # wire case.
+    check("last segment wins (serialization-order trust, #1051)",
+          sbc.is_subagent(main_then_echo) is True)
 
 
 def test_user_segments_order():
@@ -236,7 +264,7 @@ def test_end_to_end_max_samples_zero_reads_all():
 if __name__ == "__main__":
     for fn in [test_chain_append_only, test_chain_disjoint_opens_second,
                test_chain_min_core_floor, test_concurrent_overlap_vs_sequential,
-               test_is_subagent_line_scoped, test_user_segments_order,
+               test_is_subagent_segment_scoped, test_user_segments_order,
                test_cache_control_not_hashed,
                test_end_to_end_fork_fires_and_sequential_stays_clean,
                test_end_to_end_max_samples_zero_reads_all]:

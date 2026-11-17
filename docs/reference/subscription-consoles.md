@@ -13,7 +13,7 @@ snapshot).
 
 **Reading the series from any seat** (user, 04/11): ai-01 alone holds the browser
 profile, so ai-01 alone writes the ledger; `console-tabs.py publish` mirrors it to
-`G:\Mon Drive\Backups-Cloud\claudish\console-readings\console-readings.jsonl` (the
+`<gdrive>\Backups-Cloud\claudish\console-readings\console-readings.jsonl` (the
 private Drive, next to the capture archives — never git, console figures stay
 internal), with a `_meta.json` beside it (`published_at`, `rows`, `last_ts`,
 `sha256_16`). On any machine: `python scripts/console-tabs.py series --days 14` falls

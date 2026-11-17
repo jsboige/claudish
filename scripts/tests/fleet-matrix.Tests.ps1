@@ -51,6 +51,9 @@ function script:docker {
         if ($a -match '\.Image') { return @('sha256:9e280fb3a939a37d829c5363fa561be4fdc3d4990c063ed8581bbc4066f7c92c') }
         if ($a -match '\.Created') { if (-not $env:FM_CREATED) { return @() }; return @($env:FM_CREATED) }
         if ($a -match 'PortBindings') { if (-not $env:FM_PORTS) { return @() }; return @($env:FM_PORTS) }
+        # Host bounds (#291 grain 7): "<Memory>|<MemorySwap>|<PidsLimit>".
+        # Empty FM_BOUNDS = the read gave no signal (the '?' class).
+        if ($a -match 'HostConfig\.Memory') { if (-not $env:FM_BOUNDS) { return @() }; return @($env:FM_BOUNDS) }
         return @()
     }
     if ($a -match '^logs\b') {
@@ -89,6 +92,10 @@ exit $LASTEXITCODE
             [string]$Created = '2026-10-27T17:49:52.123456789Z',
             [string]$ImageCreated = '',
             [string]$Ports = '{"3000/tcp":[{"HostIp":"","HostPort":"3000"}]}',
+            # Host bounds (#291 grain 7), in HostConfig's raw bytes. The default
+            # is the shape this seat's sidecar actually runs (1g/1g/512); ''
+            # models "the read gave no signal" - a different finding than 0.
+            [string]$Bounds = '1073741824|1073741824|512',
             [string[]]$Logs = @('2026-10-28T23:09:14.145886697Z [Relay] NOMINAL after 3 OK heartbeats'),
             # Loopback port 1 refuses in microseconds: the LAN cell is a
             # measured 'unreachable' in every pre-existing scenario, so no pin
@@ -103,6 +110,7 @@ exit $LASTEXITCODE
         $env:FM_CREATED = $Created
         $env:FM_IMAGE_CREATED = $ImageCreated
         $env:FM_PORTS = $Ports
+        $env:FM_BOUNDS = $Bounds
         $env:FM_LOGS = ($Logs -join '@@')
         $env:FM_DOCKER_DOWN = ''
         $settingsPath = Join-Path $script:Drive ('settings-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.json')
@@ -123,7 +131,8 @@ Describe 'fleet-matrix' {
         # Pester 6 refuses ROOT-level teardowns, so the FM_* scaffold env vars
         # are cleared here, inside the Describe.
         Remove-Item Env:FM_PS, Env:FM_ENV, Env:FM_CREATED, Env:FM_IMAGE_CREATED, Env:FM_PORTS,
-            Env:FM_LOGS, Env:FM_DOCKER_DOWN, Env:FM_SETTINGS_PATH, Env:FM_TARGET, Env:FM_LAN_HUB -ErrorAction SilentlyContinue
+            Env:FM_BOUNDS, Env:FM_LOGS, Env:FM_DOCKER_DOWN, Env:FM_SETTINGS_PATH, Env:FM_TARGET,
+            Env:FM_LAN_HUB -ErrorAction SilentlyContinue
     }
 
     Context 'the full row, measured from live objects' {
@@ -136,7 +145,7 @@ Describe 'fleet-matrix' {
                 'CLAUDISH_FAILOVER_HAIKU='
             ) -Logs @('2026-10-28T23:09:14.145886697Z [Relay] NOMINAL after 3 OK heartbeats')
             # ACTIVE carries a value too - the fleet regex counts it, on purpose.
-            $r.Out | Should -Match '\| MYIA-[A-Z0-9-]+ \| claudish-sidecar \| 3000 \| 2026-10-27 \| https://models\.myia\.io \| unreachable \| http://localhost:3000 \| 2 names / 1 role cascade\(s\) \| 1 in tail, last 2026-10-28T23:09:14\.145886697Z \|'
+            $r.Out | Should -Match '\| MYIA-[A-Z0-9-]+ \| claudish-sidecar \| 3000 \| 2026-10-27 \| https://models\.myia\.io \| unreachable \| http://localhost:3000 \| 2 names / 1 role cascade\(s\) \| 1g/1g/512 \| 1 in tail, last 2026-10-28T23:09:14\.145886697Z \|'
             $r.Code | Should -Be 0
         }
 
@@ -208,7 +217,7 @@ Describe 'fleet-matrix' {
             [System.IO.File]::WriteAllText($settingsPath, $json, (New-Object System.Text.UTF8Encoding($false)))
             $env:FM_SETTINGS_PATH = $settingsPath
             $out = & pwsh -NoProfile -File $script:WrapperPath 2>&1 | Out-String
-            $out | Should -Match '\| \? \| \? \| \? \| \? \| \? \| http://localhost:3000 \| \? \| \? \|'
+            $out | Should -Match '\| \? \| \? \| \? \| \? \| \? \| http://localhost:3000 \| \? \| \? \| \? \|'
             $out | Should -Match 'docker unreachable'
             $LASTEXITCODE | Should -Be 2
             Remove-Item Env:FM_PS, Env:FM_ENV, Env:FM_CREATED, Env:FM_PORTS, Env:FM_LOGS,
@@ -217,7 +226,7 @@ Describe 'fleet-matrix' {
 
         It 'renders "none" when docker is up but holds no claudish container' {
             $r = Invoke-Matrix -Ps 'nginx|nginx:latest|Up 3 days'
-            $r.Out | Should -Match '\| none \| - \| - \| - \| - \| http://localhost:3000 \| - \| - \|'
+            $r.Out | Should -Match '\| none \| - \| - \| - \| - \| http://localhost:3000 \| - \| - \| - \|'
             $r.Code | Should -Be 0
         }
 
@@ -231,7 +240,69 @@ Describe 'fleet-matrix' {
             # ps lists a container, inspect answers nothing: cells read ?, not blank.
             # /health stays measured (-HealthPort 1 is operator input, not docker).
             $r = Invoke-Matrix -EnvLines @() -Created '' -Ports ''
-            $r.Out | Should -Match '\| claudish-sidecar \| \? \| \? \| \? \| unreachable \| http://localhost:3000 \| \? \| 1 in tail'
+            $r.Out | Should -Match '\| claudish-sidecar \| \? \| \? \| \? \| unreachable \| http://localhost:3000 \| \? \| \? \| 1 in tail'
+            $r.Code | Should -Be 1
+        }
+    }
+
+    Context 'container bounds (#291 grain 7)' {
+        It 'prints the bounds column in the header' {
+            $r = Invoke-Matrix
+            $r.Out | Should -Match '\| bounds \(mem/swap/pids\) \|'
+        }
+
+        It 'renders the live HostConfig limits as mem/swap/pids, exit 0' {
+            # A 'docker update' bound dies at the next recreate, so the compose
+            # file cannot answer this cell - the column reads the container.
+            $r = Invoke-Matrix
+            $r.Out | Should -Match '\| 1g/1g/512 \|'
+            $r.Code | Should -Be 0
+        }
+
+        It 'renders an unbounded container as a measured none, not an unknown' {
+            # 0 in HostConfig = genuinely unlimited. That is a FINDING (this
+            # container can eat the host), so the row stays fully measured.
+            $r = Invoke-Matrix -Bounds '0|0|0'
+            $r.Out | Should -Match '\| none/none/none \|'
+            $r.Code | Should -Be 0
+        }
+
+        It 'renders a nil PidsLimit as none beside real memory bounds' {
+            $r = Invoke-Matrix -Bounds '2147483648|2147483648|<no value>'
+            $r.Out | Should -Match '\| 2g/2g/none \|'
+            $r.Code | Should -Be 0
+        }
+
+        It 'renders ? and exit 1 when the bounds read gives no signal' {
+            # Empty inspect output is the '?' class, never 'none': an unreadable
+            # limit must not read as "unlimited", the same silence the cascade
+            # column refuses for "0 armed".
+            $r = Invoke-Matrix -Bounds ''
+            $r.Out | Should -Match '\| \? \| 1 in tail'
+            $r.Code | Should -Be 1
+        }
+
+        It 'renders the whole cell ? when only part of the bound is readable' {
+            $r = Invoke-Matrix -Bounds '1073741824|garbage|512'
+            $r.Out | Should -Match '\| \? \| 1 in tail'
+            $r.Code | Should -Be 1
+        }
+
+        # It NAME carries no angle brackets on purpose: Pester expands
+        # <token> in It names as a TestCases template, and '<no value>'
+        # became $($no value) -> ParseException before the body ever ran.
+        It 'renders a no-value memory token as ?, not none (review c.6891742489)' {
+            # Memory / MemorySwap are plain int64 in Docker - a real read never
+            # produces <no value> or <nil>. If one appears anyway, the read
+            # gave NO signal: '?' and exit 1, never 'none', which would say
+            # "this container can eat the host" off an unmeasured field.
+            # Measured under PS 5.1: the deleted line 89 rendered none/1g/512.
+            $r = Invoke-Matrix -Bounds '<no value>|1073741824|512'
+            $r.Out | Should -Match '\| \? \| 1 in tail'
+            $r.Out | Should -Not -Match 'none/1g'
+            $r.Code | Should -Be 1
+            $r = Invoke-Matrix -Bounds '1073741824|<nil>|512'
+            $r.Out | Should -Match '\| \? \| 1 in tail'
             $r.Code | Should -Be 1
         }
     }

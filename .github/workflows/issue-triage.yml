@@ -225,6 +225,9 @@ jobs:
     needs: analyze
     if: needs.analyze.outputs.analyzed == 'true'
     runs-on: ubuntu-latest
+    # No successful recorded run of this job (recent runs cancelled before it);
+    # #1032's stop condition: no recorded run -> 15 minutes.
+    timeout-minutes: 15
     permissions:
       actions: read
     env:

@@ -156,10 +156,6 @@ import sys
 import time
 from datetime import date, timedelta
 
-MARKER = b"Primary working directory:"
-WINDOW = 400
-PREVIOUS = re.compile(r"\s+\((?:was|previously)\b[^)]*\)", re.IGNORECASE)
-ABSOLUTE = re.compile(r"^(?:[A-Za-z]:[\\/]|[/\\])")
 REQ = re.compile(r"req-\d+-\d+-\d{4}-\d{2}-\d{2}T[\d-]+Z-.+\.json$")
 REQNO = re.compile(r"^req-(\d+)-(\d+)-")          # req-<shard>-<N>-…  (N as written)
 SESSION_JSON = re.compile(rb'"session_id"\s*:\s*"([0-9a-fA-F-]{8,})"')
@@ -171,17 +167,31 @@ NO_SESSION = "(no-session)"
 DEFAULT_DIRS = (r"D:\claudish-captures\archive", r"G:\Mon Drive\Backups-Cloud\claudish")
 
 
+def _load_lib(name):
+    """Charge une lib de scripts/lib/ — une copie par semantique, pas deux."""
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# #1055 item 2 — le parsing du cwd de preambule n'est PAS defini ici. Une
+# seule copie vit dans lib/cwd_lane.py (suffixe (was ...), antislash avant
+# le \\n, dernier marqueur gagne), extraite verbatim d'ici : c'est le
+# precedent lib/subagent_flag.py (#1051), les deux copies d'un predicat a
+# pieges divergent et celle qui diverge ment sans lever d'erreur.
+_CWD = _load_lib("cwd_lane")
+MARKER = _CWD.MARKER
+UNPARSED = _CWD.UNPARSED
+ROOT = _CWD.ROOT
+
+
 def marker_line(body: bytes) -> str | None:
     """The workspace line of the LAST environment preamble in the body, unescaped."""
-    idx = body.rfind(MARKER)
-    if idx < 0:
-        return None
-    chunk = body[idx + len(MARKER): idx + len(MARKER) + WINDOW].decode("utf-8", "replace")
-    chunk = chunk.replace("\\\\", "\x00")          # a literal path separator
-    chunk = chunk.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
-    chunk = chunk.replace("\x00", "\\")
-    line = chunk.split("\n", 1)[0].split('"', 1)[0]
-    return line.strip().rstrip("\\").strip()
+    return _CWD.marker_line(body)
 
 
 # --split-noncc: known non-Claude-Code callers, recognised by the START of their
@@ -237,22 +247,13 @@ def non_cc_key(raw: bytes) -> str:
 
 
 def workspace_key(body: bytes) -> tuple[str, bool]:
-    """(workspace key, came_from_claude_code)."""
-    line = marker_line(body)
-    if line is None:
+    """(workspace key, came_from_claude_code) — le parsing vit dans
+    lib/cwd_lane.py (#1055 item 2), le seau non-CC et ses signatures
+    restent ici : ils sont a cet instrument, pas au predicat."""
+    lane, cc = _CWD.lane_key(body)
+    if lane is None:
         return non_cc_key(body), False
-    path = PREVIOUS.sub("", line).strip()
-    if not ABSOLUTE.match(path):
-        # The marker also appears inside quoted CODE (a script or a prompt that
-        # discusses this very string). Such a hit is not a directory: bucket it
-        # visibly instead of minting a workspace out of a fragment of source.
-        return UNPARSED, True
-    path = path.replace("\\", "/").rstrip("/")
-    leaf = path.split("/")[-1].strip() if path else ""
-    # No generic trailing-punctuation strip: a workspace may legitimately end in
-    # `)`. An unknown rendering must show up in the table as itself, not be
-    # silently folded into a neighbouring bucket.
-    return (leaf.lower() or ROOT), True
+    return lane, cc
 
 
 def session_key(raw: bytes) -> str | None:

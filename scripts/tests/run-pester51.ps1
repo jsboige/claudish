@@ -19,7 +19,11 @@
 # unset), so a registry-only recompute would drop it and fall back to the
 # machine-wide Pester 3.4.0.
 param(
-    [string]$Path = './scripts/tests'
+    [string]$Path = './scripts/tests',
+    # CI-only (#1096): tags to EXCLUDE from the run. Seats call this runner with no
+    # value and run everything; the hosted Pester workflow passes 'HostBound' so the
+    # host-divergent tests are skipped there while staying green-required on seats.
+    [string[]]$ExcludeTagFilter = @()
 )
 # NO `$ErrorActionPreference = 'Stop'` here: it would outlive this file and
 # leak into Invoke-Pester's test session, where every child-process stderr
@@ -36,4 +40,8 @@ if ($d) { $d = Join-Path $d 'WindowsPowerShell\Modules' }
 # construction puts the user dir first; mirror it.
 $env:PSModulePath = (@($u, $d, $m) | Where-Object { $_ }) -join ';'
 
-Invoke-Pester $Path -Output Detailed -CI
+if ($ExcludeTagFilter -and $ExcludeTagFilter.Count) {
+    Invoke-Pester $Path -Output Detailed -CI -ExcludeTagFilter $ExcludeTagFilter
+} else {
+    Invoke-Pester $Path -Output Detailed -CI
+}

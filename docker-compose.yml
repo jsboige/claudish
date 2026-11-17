@@ -117,6 +117,18 @@ services:
       - type: volume
         source: claudish-model-cache
         target: /var/cache/claudish
+      # Lane-budget emergency stop (#1055 g2, #1060): CLAUDISH_LANE_STOP_DIR points
+      # the lane-budget registry at this directory — a bind (not a named volume) on
+      # purpose, so an operator drops/removes stop files from the host without
+      # touching the container. Separate from /captures deliberately: capture is
+      # compacted nightly and purged after archive — a stop file parked there would
+      # be destroyed by capture hygiene. NB: the host-side variable is deliberately
+      # NOT named CLAUDISH_LANE_STOP_DIR (the container-side env) — one name for two
+      # planes is the CLAUDISH_CAPTURE_DIR/CAPTURE_HOST_DIR trap again.
+      # Directory bind: Docker creates an absent source, unlike the file-type bind.
+      - type: bind
+        source: ${CLAUDISH_LANE_STOP_HOST_DIR:-D:\claudish-lane-stop}
+        target: /lane-stop
     environment:
       - NODE_ENV=production
       - CLAUDISH_PROXY_KEY=${CLAUDISH_PROXY_KEY:-}

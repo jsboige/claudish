@@ -39,6 +39,14 @@ def workflow_jobs(text):
         if not in_jobs:
             continue
         stripped = body[2:]
+        # A comment is never a job, whatever its indent or last character. The
+        # first scanner counted any two-space line ending in `:` as a job id --
+        # v14's test.yml carries four such comments ("# WHERE EACH GROUP RUNS,
+        # measured on PR #328 (run 39545203694)" and kin), each then read as a
+        # job without a timeout. Latent on main too (it has no such comments
+        # today): skip before any job detection, not after.
+        if stripped.lstrip().startswith("#"):
+            continue
         if body.startswith("  ") and not body.startswith("    ") and stripped.endswith(":"):
             current = stripped[:-1].strip()
             jobs.append([current, None])
@@ -120,18 +128,45 @@ def test_adding_a_job_without_a_timeout_changes_the_result():
     assert "eleventh" in " ".join(missing), missing
 
 
+FIXTURE_COMMENT_AS_JOB = """\
+name: Fixture
+on:
+  pull_request:
+jobs:
+  # A job-indent comment ending with a colon (v14's own shape):
+  # WHERE EACH GROUP RUNS, measured on PR #328 (run 39545203694)
+  real-job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo ok
+"""
+
+
+def test_a_comment_line_is_never_a_job_whatever_it_ends_with():
+    """The first scanner took ANY two-space line ending in `:` for a job id,
+    so v14's four job-indent comments were counted (and then flagged as jobs
+    without a timeout). A comment is not a job, whatever its last character."""
+    jobs, missing = _scan_text(FIXTURE_COMMENT_AS_JOB)
+    assert [j for _, j, _ in jobs] == ["real-job"], jobs
+    assert missing == [], missing
+
+
 # --------------------------------------------------------------------------
 # The repository's own workflows
 # --------------------------------------------------------------------------
 
 def test_the_scanner_sees_the_jobs_it_must():
     """Anti-vacuity: a scanner returning nothing would make the next pin pass
-    on an empty set. Pin the known shape and the fleet minimum."""
+    on an empty set. Pin the known shape and the fleet minimum. The must-see
+    set matches the tree this file runs in (v14's test.yml: static/idle/
+    hermetic/blind-hooks/hooks-loading/scripts-tests -- main's test/typecheck
+    do not exist here, and vice versa on main)."""
     jobs, _missing = scan(_workflow_paths())
     ids = {(f, j) for f, j, _ in jobs}
-    assert ("test.yml", "test") in ids, sorted(ids)
-    assert ("test.yml", "typecheck") in ids, sorted(ids)
+    assert ("test.yml", "static") in ids, sorted(ids)
     assert ("test.yml", "scripts-tests") in ids, sorted(ids)
+    assert ("issue-triage.yml", "respond") in ids, sorted(ids)
     assert len(jobs) >= 10, jobs
 
 

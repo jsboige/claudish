@@ -62,7 +62,11 @@
  * wrapper — the middleware is still sitting in `next()` — yet they are exactly
  * the ones an operator would call "hung". So pending requests are counted from
  * entry, and progress is stamped on every byte, every stream end, and every
- * completed response.
+ * completed response — and at the ADMISSION of a request onto a fully idle
+ * proxy (#1064), where the preceding silence was not silence on in-flight
+ * work: there was none. That admission stamp is guarded by both counters
+ * being zero before the increment, so a request admitted behind a stuck one
+ * does not refresh it and a wedged proxy stays readable as wedged.
  *
  * `/health` itself is excluded from both. Each sidecar polls it every 10s, so
  * counting it as progress would refresh the stamp forever and leave the detector
@@ -154,6 +158,17 @@ export function createStreamTracker(): StreamTracker {
       return;
     }
 
+    // #1064 — admission on a fully idle proxy is progress. The silence that
+    // preceded it was not silence on in-flight work: there was none. Without
+    // this, a seat idle longer than the threshold answers every /health hit
+    // stalled (503) from its first request until that request's first chunk.
+    // Guarded by BOTH counters being zero before the increment, so a second
+    // request admitted behind a genuinely stuck one cannot mask the wedge —
+    // otherwise a steady trickle of admissions would keep the stamp fresh
+    // forever and a wedged proxy would report healthy.
+    if (activeStreams === 0 && pendingRequests === 0) {
+      lastProgressAt = Date.now();
+    }
     pendingRequests++;
     try {
       await next();
