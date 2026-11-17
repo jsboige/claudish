@@ -1848,6 +1848,19 @@ export async function createProxyServer(
           markCascadeStepAttempt(c, 0);
           markStepSkipEligible(c, false);
         }
+      } else if (role) {
+        // #1111 — kill switch off: the busy-wire markings stay off (today's
+        // behavior — the refusal MARKS the step), but the patience exemption
+        // still needs the attempt's step-ness. Without this, a non-last
+        // step's plain 1302 would pay the ~5-minute patient backoff before
+        // producing the very mark the switch was asked to restore
+        // (step-skip.ts: the step's whole job is to yield in seconds).
+        // isStepSkipEligible's only reader is composed-handler's patience
+        // gate; the skip itself is gated elsewhere, by the switch.
+        markStepSkipEligible(
+          c,
+          rule != null && stepIndex >= 0 && stepIndex < rule.steps.length - 1
+        );
       }
       // #654 — in-flight token budget per endpoint, evaluated BEFORE the
       // upstream call: a local engine saturates on CONTEXT, not request count

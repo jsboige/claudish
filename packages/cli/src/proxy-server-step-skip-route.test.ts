@@ -56,6 +56,7 @@ import {
 } from "./fork/failover.js";
 import { resetOverflowCapsForTests } from "./handlers/shared/context-overflow.js";
 import { resetTokenizerMemoForTests } from "./providers/transport/openai.js";
+import { setPatientBackoffTimingsForTests } from "./handlers/composed-handler.js";
 import {
   clearEndpointTokenBudgets,
   estimateBudgetTokens,
@@ -1774,21 +1775,43 @@ describe("#679 — plan concurrency refusal skips, the usage wall stays a wall",
     delete process.env.CLAUDISH_FAILOVER_STEP_SKIP;
   }, 30_000);
 
-  test("K1302d: on the LAST step the 429 surfaces to the client unchanged, header annotated but never acted on", async () => {
+  test("K1302d (#1111): on the LAST step a sustained plain 1302 surfaces as 529 — never the raw 429 that killed lanes", async () => {
     await spin();
     resetCascade(cascadeEnv("s0-ep@fake-s0"));
     upstreamAnswer.nm = () => quotaWall402();
     upstreamAnswer.s0 = () => zai1302();
+    // The real patient spread is 6 retries over ~5 min of sleeps — shrink it so
+    // the pin runs in milliseconds while keeping the loop's shape (the hook's
+    // doc in composed-handler.ts).
+    setPatientBackoffTimingsForTests({ maxRetries: 3, baseDelayMs: 5 });
 
     const r1 = await postMessage({ session: "sess-one" });
-    expect(r1.status).toBe(429); // the client sees the provider's own refusal
-    // An error envelope, not a message — read the raw body (responseText only
-    // extracts content[].text).
-    expect(await r1.text()).toContain("Rate limit reached for requests");
+    // Pre-#1111 this was the raw 429 ("Rate limit reached for requests") and
+    // Claude Code killed the turn on it (two dead Argumentum lanes, 17/11).
+    // The 529 is what the client RETRIES; the busy annotation still rides it.
+    expect(r1.status).toBe(529);
+    expect(await r1.text()).toContain("overloaded");
+    expect(r1.headers.get("retry-after")).toBe("5");
     expect(r1.headers.get("x-claudish-step-skip") ?? "").toContain("busy");
     expect(r1.headers.get("x-claudish-step-skip") ?? "").toContain("code=1302");
     expect(markerLog.some((l) => l.includes("[ConcurrencyRefusal]"))).toBe(true);
     expect(markerLog.some((l) => l.includes("[Failover] SKIP"))).toBe(false);
+    setPatientBackoffTimingsForTests(null);
+  }, 30_000);
+
+  test("K1302f (#1111): a plain 1302 burst on the NOMINAL no longer kills the turn — patience retries and the turn is served", async () => {
+    await spin();
+    resetCascade({}); // no cascade steps: the nominal IS the last resort
+    let nmCalls = 0;
+    upstreamAnswer.nm = () =>
+      ++nmCalls === 1 ? zai1302() : okSse("ok-after-burst", "fake-nom");
+    setPatientBackoffTimingsForTests({ maxRetries: 3, baseDelayMs: 5 });
+
+    const r1 = await postMessage({ session: "sess-one" });
+    expect(r1.status).toBe(200);
+    expect(await responseText(r1)).toContain("ok-after-burst");
+    expect(nmCalls).toBeGreaterThanOrEqual(2); // the burst was retried, not surfaced
+    setPatientBackoffTimingsForTests(null);
   }, 30_000);
 
   test("K1302e: the concurrency-WORDED variant converts to 529 as today — and still skips with no mark", async () => {

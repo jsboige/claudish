@@ -1364,10 +1364,21 @@ export class ComposedHandler implements ModelHandler {
       // to the 529 the busy skip already rides — measured before this gate, a
       // concurrency-worded 1302 on a step burned the full patient spread and
       // THEN benched the step anyway.
+      const concurrencyRefusal = classifyConcurrencyRefusal(response.status, probeText);
       const stepConcurrencyRefusal =
-        isStepSkipEligible(c as unknown as object) &&
-        classifyConcurrencyRefusal(response.status, probeText);
-      if (isTransientOverload(response.status, probeText) && !stepConcurrencyRefusal) {
+        isStepSkipEligible(c as unknown as object) && concurrencyRefusal;
+      // #1111 — the plain 1302 wording ("Rate limit reached for requests")
+      // matches no isTransientOverload word, so an attempt with NO successor
+      // (nominal, last step, keyless, non-cascade) forwarded the provider's
+      // 429 to the client raw: Claude Code reads 429 as a usage wall and kills
+      // the turn (measured 17/11: two dead Argumentum turns, 136 burst lines
+      // in one transcript tail). The CODE is the contract (#679's own doctrine
+      // — the two wordings vary), and contention on a no-successor attempt is
+      // exactly what the patient loop below exists for: a concurrency slot
+      // frees in seconds and the first retry is 5s out.
+      const transientContention =
+        isTransientOverload(response.status, probeText) || concurrencyRefusal;
+      if (transientContention && !stepConcurrencyRefusal) {
         const recovered = await this.patientOverloadBackoff(doFetch);
         if (recovered) response = recovered;
         // null = exhausted → response stays the overload → !response.ok below → 529
@@ -1675,7 +1686,13 @@ export class ComposedHandler implements ModelHandler {
         // HTTP 529 overloaded_error so the client retries with its own backoff,
         // NOT 429 (which the client reads as a quota wall and stops the turn).
         // (2026-06-25 patient-backoff.)
-        if (isTransientOverload(response.status, errorText)) {
+        // #1111 — the plain 1302 joins its concurrency-worded sibling here: by
+        // this point the patient backoff above has already exhausted on it, so
+        // sustained contention surfaces as 529 (client retries), never the raw
+        // 429 the client reads as a usage wall. `concurrencyRefusal` was
+        // computed at the top of this block; the busy annotation below already
+        // rides the 529 for any step consumer (#679 wire, unchanged).
+        if (isTransientOverload(response.status, errorText) || concurrencyRefusal) {
           logStderr(
             `[Overload] [${this.provider.displayName}] HTTP ${response.status} transient overload → returning 529 overloaded_error (patient ~5min backoff exhausted)`
           );
@@ -2348,10 +2365,14 @@ export class ComposedHandler implements ModelHandler {
   private async patientOverloadBackoff(
     doFetch: () => Promise<Response>
   ): Promise<Response | null> {
-    const maxRetries = 6;
+    const maxRetries = patientBackoffTimings.maxRetries;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       const backoffMs =
-        Math.min(5000 * 2 ** attempt, 150000) + Math.floor(Math.random() * 1000);
+        Math.min(patientBackoffTimings.baseDelayMs * 2 ** attempt, 150000) +
+        // Jitter capped at 20% of the base so the test hook (base in
+        // milliseconds) is not paying seconds of jitter per retry; at the
+        // production base of 5s the cap is the original 1000ms — unchanged.
+        Math.min(Math.floor(Math.random() * 1000), patientBackoffTimings.baseDelayMs * 0.2);
       log(
         `[Overload] [${this.provider.displayName}] transient overload (HTTP) — patient retry ${attempt + 1}/${maxRetries} in ${(backoffMs / 1000).toFixed(1)}s`,
         true // forceConsole — operational event, must be visible without --debug
@@ -2361,7 +2382,13 @@ export class ComposedHandler implements ModelHandler {
         const retryResp = await doFetch();
         if (retryResp.ok) return retryResp; // recovered
         const retryText = await retryResp.clone().text();
-        if (!isTransientOverload(retryResp.status, retryText)) {
+        // #1111 — a retried plain 1302 is still the same contention, not a
+        // "morphed" error: without this clause the first retried 1302 would
+        // exit the loop as non-transient and surface the raw 429 anyway.
+        if (
+          !isTransientOverload(retryResp.status, retryText) &&
+          !classifyConcurrencyRefusal(retryResp.status, retryText)
+        ) {
           // Morphed into a non-transient error (e.g. 500) — stop retrying and
           // let the caller surface the real error rather than masking it as 529.
           return retryResp;
@@ -2417,6 +2444,21 @@ export function isTransientOverload(status: number, errorText: string): boolean 
     );
   }
   return false;
+}
+
+/**
+ * #1111 — test hook for the patient backoff's REAL sleeps. The production
+ * spread is 6 retries over ~5 minutes; a sustained-refusal pin cannot pay
+ * that. Shrinking the base delay and retry count keeps the loop's SHAPE
+ * (retry → still-transient check → give up → null → 529) under
+ * milliseconds. Production code never calls the setter.
+ */
+const patientBackoffTimings = { maxRetries: 6, baseDelayMs: 5000 };
+export function setPatientBackoffTimingsForTests(
+  t: Partial<{ maxRetries: number; baseDelayMs: number }> | null
+): void {
+  if (t) Object.assign(patientBackoffTimings, t);
+  else Object.assign(patientBackoffTimings, { maxRetries: 6, baseDelayMs: 5000 });
 }
 
 /**
