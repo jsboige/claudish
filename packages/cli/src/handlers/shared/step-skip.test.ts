@@ -113,7 +113,10 @@ describe("isConcurrencyRefusalWalk (#781) — read from the #679 header, never t
   // `error.code`; this is what that response looks like on the nominal.
   const enveloped = (status: number, skip?: string) =>
     new Response(
-      body({ type: "error", error: { type: "rate_limit_error", message: "Rate limit reached for requests" } }),
+      body({
+        type: "error",
+        error: { type: "rate_limit_error", message: "Rate limit reached for requests" },
+      }),
       { status, headers: skip ? { [STEP_SKIP_HEADER]: skip } : {} }
     );
 
