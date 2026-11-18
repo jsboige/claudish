@@ -106,6 +106,43 @@ export function classifyConcurrencyRefusal(status: number, bodyText: string): bo
 /** Skip detail for a concurrency refusal — the countable marker's payload. */
 export const CONCURRENCY_REFUSAL_SKIP_DETAIL = "code=1302";
 
+// ── #781 — a NOMINAL 1302 joins the #299-B one-shot walk ──────────────────────
+
+/**
+ * `CLAUDISH_FAILOVER_1302_WALK=0` restores the pre-#781 behavior: a 1302 on
+ * the nominal surfaces as the bare 429 again. Read per request, same "only an
+ * explicit 0 disarms" convention as every house kill switch. Independent of
+ * `CLAUDISH_FAILOVER_OVERLOAD_WALK`, which still gates the whole walk.
+ */
+export function concurrencyWalkDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.CLAUDISH_FAILOVER_1302_WALK || "").trim() === "0";
+}
+
+/**
+ * #781 (user answer to Q68, 01/11: status quo only while the client's own
+ * retries outlast the burst, otherwise option b — walk). Measured 17/11: the
+ * bursts outlast them, and clients stop their turn on the bare 429.
+ *
+ * Read from the #679 annotation, never from the body: by the time the cascade
+ * loop sees the nominal's response, ComposedHandler has re-enveloped the body
+ * into the Anthropic error shape, which no longer carries `error.code`. The
+ * header is the one place the code survives. Status 429 only: the
+ * concurrency-WORDED variant is already a 529 and already walk-class.
+ */
+export function isConcurrencyRefusalWalk(
+  response: Response,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  if (concurrencyWalkDisabled(env)) return false;
+  if (response.status !== 429) return false;
+  const skip = readStepSkip(response);
+  if (skip?.reason !== "busy" || !skip.detail) return false;
+  return skip.detail
+    .split(";")
+    .map((t) => t.trim())
+    .includes(CONCURRENCY_REFUSAL_SKIP_DETAIL);
+}
+
 /** How long the 1302 check may spend reading a 429 body (see the call site). */
 const CONCURRENCY_BODY_READ_MS = 300;
 
