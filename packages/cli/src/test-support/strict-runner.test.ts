@@ -8,20 +8,29 @@ import { afterEach, describe, expect, test } from "bun:test";
  * through REAL bun output, not hand-written lines (review 2026-10-01).
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUDGET_FOOTER_MARKER, manifestFooter } from "./env-gate";
 import {
+  BASELINE_PATH,
+  DEFAULT_PARTITION_SIZE,
   DEFAULT_WALL_CLOCK_MS,
   MAX_WALL_CLOCK_MS,
+  type PartitionDeps,
   type StrictBaseline,
   type SuiteRun,
   diffAgainstBaseline,
+  entryFile,
+  enumerateTestFiles,
   main,
+  mergeEnvGates,
   normalizeFailLine,
   parseEnvGateManifests,
+  parsePartitionArg,
   parseRunOutput,
+  planPartitions,
+  ranLineFileCount,
   realSuiteRunner,
   resolveWallClock,
   resolveWallClockMs,
@@ -513,5 +522,380 @@ describe("strict-runner consolidated footer vs budget classes (#385 follow-up)",
       "(a complete machine runs them all; CLAUDISH_TEST_ENV_STRICT=1 fails them instead)"
     );
     expect(out).not.toContain("budget");
+  });
+});
+
+// ─── Partitioned mode (#641 C3) ───────────────────────────────────────────────
+//
+// The cut must be bounded by COUNT (a per-directory cut leaves three
+// directories at 119-151 files, inside the crash zone measured at 176); a
+// crashed partition must refuse the verdict and name its population; learn and
+// verify must provably run the same cut.
+
+describe("planPartitions (count-bounded, never directory-bounded)", () => {
+  test("151 files at N=50 → 50/50/50/1, order preserved, nothing lost", () => {
+    const files = Array.from({ length: 151 }, (_, i) => `f${String(i).padStart(3, "0")}.test.ts`);
+    const parts = planPartitions(files, 50);
+    expect(parts.map((p) => p.length)).toEqual([50, 50, 50, 1]);
+    expect(parts.flat()).toEqual(files);
+  });
+
+  test("120 files from ONE directory at N=50 → 50/50/20 — a directory cut could never shrink this slice", () => {
+    // The measured counter-example: src root alone holds 151 files, so any
+    // directory-shaped "partition" is not a bound at all.
+    const files = Array.from({ length: 120 }, (_, i) => `src/root${i}.test.ts`);
+    expect(planPartitions(files, 50).map((p) => p.length)).toEqual([50, 50, 20]);
+  });
+
+  test("fewer files than N → a single partition", () => {
+    expect(planPartitions(["a.test.ts", "b.test.ts"], 50)).toEqual([["a.test.ts", "b.test.ts"]]);
+  });
+
+  test("empty population → no partitions (main refuses separately)", () => {
+    expect(planPartitions([], 50)).toEqual([]);
+  });
+
+  test("n ≤ 0 or fractional throws (never a silent full-population slice)", () => {
+    expect(() => planPartitions(["a.test.ts"], 0)).toThrow();
+    expect(() => planPartitions(["a.test.ts"], -1)).toThrow();
+    expect(() => planPartitions(["a.test.ts"], 2.5)).toThrow();
+  });
+});
+
+describe("enumerateTestFiles (the partitioned population)", () => {
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    for (const d of tmpDirs.splice(0)) spawnSync("cmd", ["/c", "rmdir", "/s", "/q", d]);
+  });
+
+  test("recursive, test files only, sorted, forward slashes", () => {
+    const d = mkdtempSync(join(tmpdir(), "strict-enum-"));
+    tmpDirs.push(d);
+    mkdirSync(join(d, "sub"));
+    mkdirSync(join(d, "sub", "deep"));
+    writeFileSync(join(d, "b.test.ts"), "", "utf-8");
+    writeFileSync(join(d, "sub", "c.test.tsx"), "", "utf-8");
+    writeFileSync(join(d, "sub", "deep", "a.test.mjs"), "", "utf-8");
+    writeFileSync(join(d, "helper.ts"), "", "utf-8");
+    writeFileSync(join(d, "z.spec.ts"), "", "utf-8"); // .spec is not the population
+    const fwd = (p: string) => p.replace(/\\/g, "/");
+    expect(enumerateTestFiles(d)).toEqual(
+      [
+        fwd(join(d, "sub", "deep", "a.test.mjs")),
+        fwd(join(d, "b.test.ts")),
+        fwd(join(d, "sub", "c.test.tsx")),
+      ].sort()
+    );
+  });
+
+  test("an empty tree → empty population", () => {
+    const d = mkdtempSync(join(tmpdir(), "strict-enum-"));
+    tmpDirs.push(d);
+    expect(enumerateTestFiles(d)).toEqual([]);
+  });
+});
+
+describe("parsePartitionArg / entryFile / ranLineFileCount / mergeEnvGates", () => {
+  test("bare --partition → the default size; =N → N; malformed → invalid; absent → null", () => {
+    expect(DEFAULT_PARTITION_SIZE).toBe(50); // the measured starting point, part of the arbitration
+    expect(parsePartitionArg([])).toBeNull();
+    expect(parsePartitionArg(["--learn"])).toBeNull();
+    expect(parsePartitionArg(["--partition"])).toEqual({ n: 50 });
+    expect(parsePartitionArg(["--learn", "--partition=30"])).toEqual({ n: 30 });
+    for (const bad of [
+      "--partition=abc",
+      "--partition=0",
+      "--partition=-3",
+      "--partition=2.5",
+      "--partition=",
+    ]) {
+      expect(parsePartitionArg([bad])).toBe("invalid");
+    }
+  });
+
+  test("entryFile: named fail AND load-error shapes both reduce to the owning file", () => {
+    expect(entryFile("a/b.test.ts > describe > case")).toBe("a/b.test.ts");
+    expect(entryFile("a/b.test.ts: load error #2")).toBe("a/b.test.ts");
+  });
+
+  test("ranLineFileCount reads M off the Ran line, singular and plural", () => {
+    expect(ranLineFileCount("Ran 12 tests across 3 files. [10.00ms]")).toBe(3);
+    expect(ranLineFileCount("Ran 1 test across 1 file.")).toBe(1);
+    expect(ranLineFileCount("bun test v1.3.14\n(no summary)")).toBeNull();
+  });
+
+  test("mergeEnvGates sums counts per class and ORs the budget flag", () => {
+    expect(
+      mergeEnvGates([
+        [{ classId: "x", notExecuted: 3, budget: false }],
+        [
+          { classId: "x", notExecuted: 4, budget: true },
+          { classId: "y", notExecuted: 1, budget: false },
+        ],
+        [],
+      ])
+    ).toEqual([
+      { classId: "x", notExecuted: 7, budget: true },
+      { classId: "y", notExecuted: 1, budget: false },
+    ]);
+  });
+});
+
+describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
+  const prevCwd = process.cwd();
+  const tmpDirs: string[] = [];
+  afterEach(() => {
+    process.chdir(prevCwd);
+    for (const d of tmpDirs.splice(0)) spawnSync("cmd", ["/c", "rmdir", "/s", "/q", d]);
+  });
+
+  function chdirTmp(b?: StrictBaseline): void {
+    const d = mkdtempSync(join(tmpdir(), "strict-part-"));
+    tmpDirs.push(d);
+    if (b) writeFileSync(join(d, BASELINE_PATH), JSON.stringify(b), "utf-8");
+    process.chdir(d);
+  }
+
+  function captureStdout(fn: () => number): { code: number; out: string } {
+    const chunks: string[] = [];
+    const orig = process.stdout.write.bind(process.stdout);
+    (process.stdout as unknown as { write: (s: string) => boolean }).write = (s: string) => {
+      chunks.push(String(s));
+      return true;
+    };
+    try {
+      return { code: fn(), out: chunks.join("") };
+    } finally {
+      (process.stdout as unknown as { write: (s: string) => boolean }).write = orig as unknown as (
+        s: string
+      ) => boolean;
+    }
+  }
+
+  // A PartitionDeps whose every partition comes back accountable, built from a
+  // per-file entry map; records every invocation so the tests can count runs.
+  function depsFor(
+    files: string[],
+    entriesByFile: Record<string, string[]>
+  ): PartitionDeps & { invocations: string[][] } {
+    const invocations: string[][] = [];
+    return {
+      invocations,
+      listFiles: () => files,
+      runPartition: (fs) => {
+        invocations.push(fs);
+        const entries = fs.flatMap((f) => (entriesByFile[f] ?? []).map((n) => `${f} > ${n}`));
+        return { raw: outputFor(entries) };
+      },
+    };
+  }
+
+  /** Same, but every call for the given file adds a fresh entry (reproduction). */
+  function depsWithFresh(
+    files: string[],
+    baselineFails: Record<string, string[]>,
+    freshByFile: Record<string, string[]>
+  ): PartitionDeps & { invocations: string[][] } {
+    const invocations: string[][] = [];
+    return {
+      invocations,
+      listFiles: () => files,
+      runPartition: (fs) => {
+        invocations.push(fs);
+        const entries = fs.flatMap((f) => [
+          ...(baselineFails[f] ?? []).map((n) => `${f} > ${n}`),
+          ...(freshByFile[f] ?? []).map((n) => `${f} > ${n}`),
+        ]);
+        return { raw: outputFor(entries) };
+      },
+    };
+  }
+
+  const neverRunner = (): { raw: string } => ({ raw: "" }); // partitioned mode must never call it
+
+  const partBaseline = (fails: string[], n: number, boundaries: string[]): StrictBaseline => ({
+    sha: "abc1234",
+    capturedAt: "2026-11-18T00:00:00Z",
+    fails,
+    partition: { n, boundaries },
+  });
+
+  test("a malformed --partition value refuses BEFORE enumerating anything (no run started)", () => {
+    chdirTmp();
+    const deps = depsFor(["a.test.ts"], {});
+    const { code, out } = captureStdout(() => main(["--partition=abc"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("--partition expects a positive integer");
+    expect(deps.invocations.length).toBe(0);
+  });
+
+  test("an empty population refuses (exit 3, no spawn)", () => {
+    chdirTmp();
+    const deps = depsFor([], {});
+    const { code, out } = captureStdout(() => main(["--partition=50"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("NO TEST FILES");
+    expect(deps.invocations.length).toBe(0);
+  });
+
+  test("a CRASHED partition refuses the verdict, names the partition and its FULL file list, and stops (mutation pin)", () => {
+    chdirTmp();
+    const files = ["a.test.ts", "b.test.ts", "c.test.ts", "d.test.ts"];
+    const invocations: string[][] = [];
+    const deps: PartitionDeps = {
+      listFiles: () => files,
+      runPartition: (fs, i) => {
+        invocations.push(fs);
+        // partition 1 (c+d) dies mid-run — partial output only
+        if (i === 1)
+          return { raw: "c.test.ts:\n(fail) partial [1ms]", killed: true, errorCode: "ETIMEDOUT" };
+        return { raw: outputFor([]) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("PARTITION 2/2 RUN KILLED");
+    // The unknown population is named in full — "partition 2/2" alone tells no one anything
+    expect(out).toContain("c.test.ts");
+    expect(out).toContain("d.test.ts");
+    expect(out).toContain('never "zero fails"');
+    // No partition after the crash runs
+    expect(invocations.length).toBe(2);
+  });
+
+  test("an UNACCOUNTABLE partition refuses the verdict too (accounting gate holds per partition)", () => {
+    chdirTmp();
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (_fs, i) =>
+        i === 0
+          ? { raw: "a.test.ts:\n(fail) ghost > x [1ms]\n 1 fail\nRan 1 tests across 1 files." } // entries 1, fail 1 — fine
+          : { raw: "b.test.ts:\n(fail) seen > y [1ms]\n 2 fail\nRan 2 tests across 1 files." }, // parser sees 1, bun says 2
+    };
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("PARTITION 2/2 UNACCOUNTABLE");
+    expect(out).toContain("b.test.ts");
+  });
+
+  test("learn writes the partition manifest (N + boundaries) into the baseline", () => {
+    chdirTmp();
+    const deps = depsFor(["a.test.ts", "b.test.ts", "c.test.ts"], {
+      "a.test.ts": ["a1"],
+      "b.test.ts": ["b1"],
+    });
+    const { code } = captureStdout(() => main(["--learn", "--partition=2"], neverRunner, deps));
+    expect(code).toBe(0);
+    expect(deps.invocations).toEqual([["a.test.ts", "b.test.ts"], ["c.test.ts"]]);
+    const saved = JSON.parse(
+      readFileSync(join(process.cwd(), BASELINE_PATH), "utf-8")
+    ) as StrictBaseline;
+    expect(saved.partition).toEqual({ n: 2, boundaries: ["a.test.ts", "c.test.ts"] });
+    expect(saved.fails).toEqual(["a.test.ts > a1", "b.test.ts > b1"]);
+  });
+
+  test("observed = UNION of the partitions' entries; disjoint fails across partitions exit 0 when ⊆ baseline", () => {
+    chdirTmp(partBaseline(["a.test.ts > a1", "b.test.ts > b1"], 1, ["a.test.ts", "b.test.ts"]));
+    const deps = depsFor(["a.test.ts", "b.test.ts"], { "a.test.ts": ["a1"], "b.test.ts": ["b1"] });
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(0);
+    expect(out).toContain("failing population observed: 2");
+    // exactly one pass — nothing fresh, no confirmation re-run
+    expect(deps.invocations.length).toBe(2);
+  });
+
+  test("a baseline captured WITHOUT partitions refuses a partitioned verify", () => {
+    chdirTmp({ sha: "abc1234", capturedAt: "t", fails: ["a.test.ts > a1"] });
+    const deps = depsFor(["a.test.ts"], { "a.test.ts": ["a1"] });
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("captured WITHOUT partitions");
+    // fail-fast: the refusal precedes any partition run
+    expect(deps.invocations.length).toBe(0);
+  });
+
+  test("a verify at a DIFFERENT N than the baseline refuses", () => {
+    chdirTmp(partBaseline(["a.test.ts > a1", "b.test.ts > b1"], 2, ["a.test.ts"]));
+    const deps = depsFor(["a.test.ts", "b.test.ts"], { "a.test.ts": ["a1"], "b.test.ts": ["b1"] });
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("baseline was partitioned at N=2, this verify runs N=1");
+    expect(deps.invocations.length).toBe(0);
+  });
+
+  test("boundary drift alone is a WARNING, not a refusal (entries compare by name)", () => {
+    // baseline cut at n=1 on [a, b]; the tree today is [a0, a, b] — same N,
+    // different cut points (files added since the capture)
+    chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
+    const deps = depsFor(["a0.test.ts", "a.test.ts", "b.test.ts"], { "a.test.ts": ["a1"] });
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(0);
+    expect(out).toContain("boundary drift");
+  });
+
+  test("a fresh entry re-runs ONLY the partition hosting it — the clean partition is not re-spawned", () => {
+    chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
+    // run 1: partition a carries a1 (baseline) + NEW1 (fresh); re-run of a: a1 + NEW1 again (reproduces)
+    let seenA = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        if (fs[0] === "a.test.ts") {
+          seenA += 1;
+          const fresh = seenA <= 2 ? ["a.test.ts > NEW1"] : [];
+          return { raw: outputFor(["a.test.ts > a1", ...fresh]) };
+        }
+        return { raw: outputFor([]) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(1);
+    expect(out).toContain("re-running 1/2 partition(s)");
+    // a ran twice (first pass + confirmation), b once (never re-run)
+    expect(seenA).toBe(2);
+  });
+
+  test("a fresh entry that does NOT reproduce exits 0 (noise, by property not count — holds per partition)", () => {
+    chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
+    let seenA = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        if (fs[0] === "a.test.ts") {
+          seenA += 1;
+          // FLAKY appears on the first pass only
+          const fresh = seenA === 1 ? ["a.test.ts > FLAKY"] : [];
+          return { raw: outputFor(["a.test.ts > a1", ...fresh]) };
+        }
+        return { raw: outputFor([]) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(0);
+    expect(out).toContain("did NOT reproduce");
+  });
+
+  test("a fresh entry whose file maps to NO partition falls back to re-running everything (no blind spot)", () => {
+    chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
+    const deps = depsWithFresh(
+      ["a.test.ts", "b.test.ts"],
+      { "a.test.ts": ["a1"] },
+      { "unmapped/ghost.test.ts": ["g1"] } // entry observed but owning file not in the population
+    );
+    // depsWithFresh only maps files in the list; simulate the ghost by injecting it into a's output
+    const inner = deps.runPartition;
+    deps.runPartition = (fs, i, t) => {
+      const r = inner(fs, i, t);
+      if (fs[0] === "a.test.ts") {
+        return { raw: outputFor(["a.test.ts > a1", "unmapped/ghost.test.ts > g1"]) };
+      }
+      return r;
+    };
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    // conservative path: re-run ALL partitions (2) + first pass (2) = 4 invocations
+    expect(deps.invocations.length).toBe(4);
+    expect(out).toContain("re-running 2/2 partition(s)");
+    // the ghost reproduces every time (it is in every re-run of partition a) → regression
+    expect(code).toBe(1);
   });
 });
