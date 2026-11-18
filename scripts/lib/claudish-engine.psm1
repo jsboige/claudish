@@ -2332,6 +2332,13 @@ function Get-OffsiteWriteVerdict {
 
         Rules:
           - Destination absent        -> write. The legitimate first upload.
+          - Dest at 0 bytes, local >0 -> write. A 0-byte file holds no
+                                         information; it is the signature of a
+                                         dead upload (DriveFS created the file,
+                                         the copy never landed). The 14-day
+                                         loss #208 fixed was a NON-zero
+                                         competing archive - that case keeps
+                                         refusing below (#1113).
           - Same size as this run's   -> idempotent re-upload, fine as-is (a
                                          retried night must not start failing).
           - Different size            -> REFUSE, naming both sizes. A different
@@ -2350,6 +2357,12 @@ function Get-OffsiteWriteVerdict {
     )
     if (-not $DestExists) {
         return [pscustomobject]@{ Action = 'write'; Reason = 'destination absent' }
+    }
+    if ($DestBytes -eq 0 -and $LocalBytes -gt 0) {
+        return [pscustomobject]@{
+            Action = 'write'
+            Reason = 'destination exists at 0 bytes - dead upload (file created, copy never landed); rewriting it loses nothing (#1113)'
+        }
     }
     if ($DestBytes -eq $LocalBytes) {
         return [pscustomobject]@{
