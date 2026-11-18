@@ -500,7 +500,27 @@ let claudeUsable = false;
 if (!SKIP_LIVE_E2E) {
   try {
     const proc = spawn("claude", ["--version"], { env: { ...process.env }, stdio: "pipe" });
-    const versionOk = (await new Promise<number>((r) => proc.on("exit", (c) => r(c ?? 1)))) === 0;
+    // The version probe must resolve on EVERY terminal path, not just "exit":
+    // on a spawn failure (ENOENT — e.g. a PATH without the npm dir, as in a
+    // detached/scheduled run) bun emits "error" and "exit" never fires, so the
+    // module-scope await below would hang the whole test file forever
+    // (measured: partition burned a 30-min wall on this, 18/11). Bounded and
+    // error-resolved like the live probe below.
+    const versionOk =
+      (await new Promise<number>((r) => {
+        const t = setTimeout(() => {
+          proc.kill("SIGTERM");
+          r(-1);
+        }, 15_000);
+        proc.on("exit", (c) => {
+          clearTimeout(t);
+          r(c ?? 1);
+        });
+        proc.on("error", () => {
+          clearTimeout(t);
+          r(1);
+        });
+      })) === 0;
     if (versionOk) {
       const probe = spawn("claude", ["-p", "--dangerously-skip-permissions", "--bare", "hi"], {
         env: { ...process.env },
