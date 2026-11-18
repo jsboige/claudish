@@ -39,6 +39,13 @@ def workflow_jobs(text):
         if not in_jobs:
             continue
         stripped = body[2:]
+        if body.lstrip().startswith("#"):
+            # #1106: a comment is never a job key. v14's test.yml carries
+            # comments ending in ':' at job indent (e.g. "  # WHERE EACH GROUP
+            # RUNS, measured on PR #328 (run 39545203694):") — without this skip
+            # they scan as phantom "jobs without timeout-minutes" (4 on run
+            # 44025498658).
+            continue
         if body.startswith("  ") and not body.startswith("    ") and stripped.endswith(":"):
             current = stripped[:-1].strip()
             jobs.append([current, None])
@@ -118,6 +125,31 @@ def test_adding_a_job_without_a_timeout_changes_the_result():
       - run: echo new
 """)
     assert "eleventh" in " ".join(missing), missing
+
+
+FIXTURE_WITH_COMMENT = """\
+name: Fixture
+on:
+  pull_request:
+jobs:
+  # WHERE EACH GROUP RUNS, measured on PR #328 (run 39545203694):
+  covered:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: echo ok
+"""
+
+
+def test_a_comment_at_job_indent_is_not_a_job():
+    """#1106: a comment ending in ':' at job indent must not scan as a job
+    (v14's test.yml produced 4 phantom jobs on run 44025498658), and the real
+    job after it must still be seen -- with its timeout. Mutation: without the
+    comment skip in workflow_jobs(), exactly this pin goes red."""
+    jobs, missing = _scan_text(FIXTURE_WITH_COMMENT)
+    assert [j for _, j, _ in jobs] == ["covered"], jobs
+    assert jobs[0][2] == "5", jobs
+    assert missing == [], missing
 
 
 # --------------------------------------------------------------------------
