@@ -59,7 +59,14 @@ BLIND_TEXT = ("no capture from {machine} in this window, "
 # Ou reconcile-outage-captures.ps1 depose les archives ($GDriveDir + reconcile).
 # Le corpus hub n'a pas de reconcile/ local : sans ce dossier separat, le demi-
 # decompte « archives » du predicat BLIND ne mesure rien (#940 CR point 1).
-GDRIVE_RECONCILE_DIR = r"G:\Mon Drive\MyIA\backups\claudish-captures\reconcile"
+# Q85: la racine Drive est seat config (CLAUDISH_GDRIVE_ROOT), '' quand absente
+# — le hub la definit, un siege sans Drive n'a simplement pas de reconcile/.
+def _gdrive(*parts):
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
+GDRIVE_RECONCILE_DIR = _gdrive("MyIA", "backups", "claudish-captures", "reconcile")
 
 
 def default_reconcile_dir():

@@ -10,13 +10,13 @@ names the working directory.
 
 Marker contract (measured 2026-11-03 on capture archives 2026-07-27 .. 09-07):
 
-    Primary working directory: d:\\dev\\CoursIA
+    Primary working directory: d:\\dev\\<lane-workspace>
     - Is a git repository: true
     - Platform: win32
 
 and, in the SAME field from ~2026-09-08, the previous directory too:
 
-    Primary working directory: d:\\dev\\CoursIA (was c:\\dev\\CoursIA)
+    Primary working directory: d:\\dev\\<lane-workspace> (was c:\\dev\\<lane-workspace>)
 
 ⚠ TRAP 1 — the ` (was …)` suffix. Splitting the line on the separator before
 dropping that suffix yields `coursia)` as a workspace key. Measured on ONE day of
@@ -164,7 +164,17 @@ NON_CC = "(non-cc)"
 UNPARSED = "(unparsed)"
 ROOT = "(root)"
 NO_SESSION = "(no-session)"
-DEFAULT_DIRS = (r"D:\claudish-captures\archive", r"G:\Mon Drive\Backups-Cloud\claudish")
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
+# Local archive always; the Drive root appends only when the seat sets
+# CLAUDISH_GDRIVE_ROOT (an empty entry would glob the CWD — never shipped).
+DEFAULT_DIRS = tuple(d for d in (r"D:\claudish-captures\archive",
+                                 _gdrive("Backups-Cloud", "claudish")) if d)
 
 
 def _load_lib(name):

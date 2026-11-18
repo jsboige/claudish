@@ -33,7 +33,7 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$SourceDir  = 'C:\inetpub\logs\LogFiles\W3SVC49',
-    [string]$DriveDir   = 'G:\Mon Drive\Backups-Cloud\claudish\iis-logs',
+    [string]$DriveDir   = '',
     [string]$StagingDir = (Join-Path $env:TEMP 'iis49-retention'),
     [string]$SevenZip   = 'D:\Apps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe',
     [int]$CutoffDays    = 30,
@@ -41,6 +41,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Q85: the Drive mount is seat config — CLAUDISH_GDRIVE_ROOT + the shared
+# subpath. Unlike compress-captures this script has no empty-Drive mode: the
+# whole point is the off-site copy, so an unresolvable DriveDir refuses.
+if (-not $DriveDir -and $env:CLAUDISH_GDRIVE_ROOT) {
+    $DriveDir = ($env:CLAUDISH_GDRIVE_ROOT.TrimEnd('\') + '\Backups-Cloud\claudish\iis-logs')
+}
+if (-not $DriveDir) {
+    throw 'DriveDir empty: set CLAUDISH_GDRIVE_ROOT or pass -DriveDir (the Drive mount is seat config, Q85)'
+}
 
 function Assert-Iis49SourceDir {
     param([Parameter(Mandatory)][string]$Path)

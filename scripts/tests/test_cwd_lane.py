@@ -5,8 +5,8 @@ Extracted verbatim from capture-workspace-attribution.py (whose own pins,
 29 at last count, now exercise it through the consumer). These pins defend
 the predicate at the source, because two consumers now read it:
 
-  1. PREVIOUS-DIRECTORY SUFFIX — `d:\\dev\\CoursIA (was c:\\dev\\CoursIA)`
-     yields `coursia`, never `coursia)`. Measured 14/09: 38 of 300 sampled
+  1. PREVIOUS-DIRECTORY SUFFIX — `d:\\dev\\alpha-lane (was c:\\dev\\alpha-lane)`
+     yields `alpha-lane`, never `alpha-lane)`. Measured 14/09: 38 of 300 sampled
      bodies split in two without this.
   2. BACKSLASH BEFORE THE ESCAPED NEWLINE — `\\` is a literal separator and
      `\n` the JSON newline; unescaping in the wrong order cuts `d:\\dev\\new`
@@ -48,10 +48,10 @@ def check(name, ok, detail=""):
 
 
 # 1. previous-directory suffix
-key, cc = cl.lane_key(b"Primary working directory: d:\\\\dev\\\\CoursIA (was c:\\\\dev\\\\CoursIA)")
-check("previous suffix dropped", (key, cc) == ("coursia", True), f"got {(key, cc)!r}")
-key, _ = cl.lane_key(b"Primary working directory: c:\\\\dev\\\\CoursIA-2 (previously d:\\\\CoursIA-2)")
-check("previously variant", key == "coursia-2", f"got {key!r}")
+key, cc = cl.lane_key(b"Primary working directory: d:\\\\dev\\\\alpha-lane (was c:\\\\dev\\\\alpha-lane)")
+check("previous suffix dropped", (key, cc) == ("alpha-lane", True), f"got {(key, cc)!r}")
+key, _ = cl.lane_key(b"Primary working directory: c:\\\\dev\\\\alpha-lane-2 (previously d:\\\\alpha-lane-2)")
+check("previously variant", key == "alpha-lane-2", f"got {key!r}")
 
 # 2. backslash before the escaped newline
 key, _ = cl.lane_key(b"Primary working directory: d:\\\\dev\\\\new\\nnext line")
@@ -59,8 +59,8 @@ check("escaped separator survives", key == "new", f"got {key!r}")
 
 # 3. last marker wins
 key, _ = cl.lane_key(b"quote: Primary working directory: c:\\\\old\\\\place\\n"
-                     b"Primary working directory: d:\\\\dev\\\\CoursIA")
-check("last marker wins", key == "coursia", f"got {key!r}")
+                     b"Primary working directory: d:\\\\dev\\\\alpha-lane")
+check("last marker wins", key == "alpha-lane", f"got {key!r}")
 
 # 4. marker inside quoted code is not a directory
 key, cc = cl.lane_key(b"regex = re.compile(rb\"Primary working directory: n]+)') {\")")

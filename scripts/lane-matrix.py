@@ -264,9 +264,18 @@ def export_csv(conn, path):
     print(f"CSV écrit: {path} ({len(rows)} lignes)")
 
 
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--archives-dir", default=r"G:\Mon Drive\Backups-Cloud\claudish")
+    ap.add_argument("--archives-dir", default=_gdrive("Backups-Cloud", "claudish"),
+                    help="capture archive root "
+                         "(default: $CLAUDISH_GDRIVE_ROOT/Backups-Cloud/claudish)")
     ap.add_argument("--store", default=r"D:\claudish-captures\lane-series.sqlite")
     ap.add_argument("--loose-dir", default=r"D:\claudish-captures")
     ap.add_argument(
@@ -285,6 +294,9 @@ def main():
     ap.add_argument("--top", type=int, default=12, help="lanes shown in matrix")
     ap.add_argument("--csv", help="export full day x lane matrix to CSV")
     args = ap.parse_args()
+    if not args.archives_dir:
+        ap.error("--archives-dir or CLAUDISH_GDRIVE_ROOT required "
+                 "(Q85: the Drive root is seat config, not a repo default)")
 
     sevenz = find_7z()
     conn = init_store(args.store)

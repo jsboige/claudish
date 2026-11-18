@@ -25,7 +25,8 @@ Corpus
 ------
 Captures live in `D:\\claudish-captures` (loose = the live day) and
 `D:\\claudish-captures\\archive\\captures-YYYY-MM-DD.7z` (30-day local), then
-`G:\\Mon Drive\\Backups-Cloud\\claudish\\` (single home of history).
+`<gdrive>\\Backups-Cloud\\claudish\\` (single home of history; resolved from
+the seat's `CLAUDISH_GDRIVE_ROOT`).
 
 Filename grammar -- the free lunch, no body parse required:
 

@@ -12,7 +12,7 @@ conversation re-reads each turn (the harness floor lives there), OUT is what
 the agent produces (coordination round-trips and CI/review churn act there).
 
     python scripts/lane-out-trend.py --days 2026-07-05 2026-09-30 2026-10-06
-        [--archives-dir "G:\\Mon Drive\\Backups-Cloud\\claudish"]
+        [--archives-dir <CLAUDISH_GDRIVE_ROOT>\\Backups-Cloud\\claudish]
         [--7z "D:\\PortableApps\\PortableApps\\7-ZipPortable\\App\\7-Zip64\\7z.exe"]
 
 Every resp-*.sse capture is Anthropic-wire regardless of upstream provider
@@ -281,14 +281,27 @@ def stats(dirpath):
     return per
 
 
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--days", nargs="+", required=True)
-    ap.add_argument("--archives-dir", default=r"G:\Mon Drive\Backups-Cloud\claudish")
+    ap.add_argument("--archives-dir", default=_gdrive("Backups-Cloud", "claudish"),
+                    help="capture archive root "
+                         "(default: $CLAUDISH_GDRIVE_ROOT/Backups-Cloud/claudish)")
     ap.add_argument("--7z", dest="seven_z",
                     default=r"C:\Program Files\NVIDIA Corporation\NVIDIA App\7z.exe")
     ap.add_argument("--keep", action="store_true")
-    return ap.parse_args()
+    args = ap.parse_args()
+    if not args.archives_dir:
+        ap.error("--archives-dir or CLAUDISH_GDRIVE_ROOT required "
+                 "(Q85: the Drive root is seat config, not a repo default)")
+    return args
 
 
 def main():

@@ -63,7 +63,16 @@ import tempfile
 
 DEFAULT_STATE = os.path.join(os.path.expanduser("~"), ".claudish", "qwen-monthly-guard.json")
 DEFAULT_CAPTURES = r"D:\claudish-captures"
-DEFAULT_ARCHIVES = r"G:\Mon Drive\Backups-Cloud\claudish"
+
+
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
+DEFAULT_ARCHIVES = _gdrive("Backups-Cloud", "claudish")
 DEFAULT_7Z = r"D:\PortableApps\PortableApps\7-ZipPortable\App\7-Zip64\7z.exe"
 
 # Kimi steps (kc@k3, kc@kimi-for-coding) are deliberately absent — different
@@ -453,6 +462,9 @@ def main() -> None:
     r.add_argument("--percent", type=float, required=True)
     sub.add_parser("status")
     args = ap.parse_args()
+    if not args.archive_dir:
+        ap.error("--archive-dir or CLAUDISH_GDRIVE_ROOT required "
+                 "(Q85: the Drive root is seat config, not a repo default)")
 
     state = load_state(args.state)
     if args.cmd == "baseline":

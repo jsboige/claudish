@@ -277,7 +277,7 @@ def test_lane_axis_basename_only():
     _req(d, 1, 60, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
          body={"system": [{"type": "text", "text":
                "Primary working directory: c:\\\\old\\\\place\\nquoted stuff\\n"
-               "Primary working directory: d:\\\\Dev\\\\CoursIA-2 (was c:\\dev\\\\CoursIA-2)"}],
+               "Primary working directory: d:\\\\Dev\\\\alpha-lane-2 (was c:\\dev\\\\alpha-lane-2)"}],
                "messages": []})
     _resp(d, 1, 70, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 60)
     # meme machine, corps sans preambule CC -> seau (non-cc), pas un gap
@@ -288,7 +288,7 @@ def test_lane_axis_basename_only():
     # detail sub/dev/heures reste reserve aux hors home
     _req(d, 1, 62, "2026-11-09T06-10-00-000Z", "myia-ai-01",
          body={"system": [{"type": "text", "text":
-               "Primary working directory: d:\\\\Dev\\\\Argumentum"}], "messages": []})
+               "Primary working directory: d:\\\\Dev\\\\alpha-lane"}], "messages": []})
     _resp(d, 1, 72, "2026-11-09T06-10-04-000Z", "claude-opus-5-5", 62)
     # un natif non-Opus ne paie pas de lecture de corps : pas d'axe pour lui
     _req(d, 1, 63, "2026-11-09T06-15-00-000Z", "myia-po-2024", model="claude-sonnet-5-5")
@@ -297,10 +297,10 @@ def test_lane_axis_basename_only():
     assert code == 0, out
     po = _row(out, "myia-po-2024")
     assert po.split()[1:3] == ["3", "2"], f"po-2024 natives/opus wrong: {po}\n{out}"
-    assert "lanes=coursia-2:1 (non-cc):1" in po, f"lane axis wrong off-home: {po}"
+    assert "lanes=alpha-lane-2:1 (non-cc):1" in po, f"lane axis wrong off-home: {po}"
     assert "sub=0/2" in po and "dev=0b9b0d8c:2" in po, f"off-home detail lost: {po}"
     ai = _row(out, "myia-ai-01")
-    assert "lanes=argumentum:1" in ai, f"lane axis wrong on home row: {ai}"
+    assert "lanes=alpha-lane:1" in ai, f"lane axis wrong on home row: {ai}"
     assert "sub=" not in ai, f"home row must not carry off-home detail: {ai}"
     # LE CHEMIN NE SORT JAMAIS (arbitrage coordinateur 15/11) : ni le
     # dossier parent, ni l'unite, ni le marqueur plus ancien
@@ -323,7 +323,7 @@ def test_phase5_chunked_bodies_survive_lot_boundary():
              body={"system": [{"type": "text", "text":
                    ("x-anthropic-billing-header: cc_is_subagent=true;"
                     if sub else "x-anthropic-billing-header: cc_version=2.1.322;") +
-                   f"\nPrimary working directory: d:\\\\Dev\\\\CoursIA-{i % 3}"}],
+                   f"\nPrimary working directory: d:\\\\Dev\\\\alpha-lane-{i % 3}"}],
                    "messages": []})
         _resp(d, 1, 500 + i, "2026-11-09T06-01-00-000Z", "claude-opus-5-5", 100 + i)
     code, out = _run(d, "--since", "2026-11-09T00")
@@ -332,7 +332,7 @@ def test_phase5_chunked_bodies_survive_lot_boundary():
     assert po.split()[1:3] == ["40", "40"], f"chunk lost responses: {po}\n{out}"
     assert "sub=20/40" in po, f"chunk lost sub flags: {po}"
     assert "(corps illisible)" not in po, po
-    for lane, n in (("coursia-0", 13), ("coursia-1", 14), ("coursia-2", 13)):
+    for lane, n in (("alpha-lane-0", 13), ("alpha-lane-1", 14), ("alpha-lane-2", 13)):
         assert f"{lane}:{n}" in po, f"lane {lane} miscounted: {po}"
 
 
@@ -371,7 +371,7 @@ def test_unreadable_opus_body_lands_in_visible_bucket():
     _anchor(d)
     _req(d, 1, 80, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
          body={"system": [{"type": "text", "text":
-               "Primary working directory: d:\\\\Dev\\\\CoursIA"}], "messages": []})
+               "Primary working directory: d:\\\\Dev\\\\alpha-lane"}], "messages": []})
     _resp(d, 1, 90, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 80)
     req_path = os.path.join(d, "req-1-80-2026-11-09T06-00-00-000Z-direct.json")
     resps = [(datetime(2026, 11, 9, 6, 0, 5), 1,

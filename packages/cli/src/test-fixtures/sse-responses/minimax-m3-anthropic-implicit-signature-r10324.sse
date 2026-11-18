@@ -187,7 +187,7 @@ event: content_block_start
 data: {"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "call_56991f122a7c48909aebfafa", "name": "Bash", "input": {}}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"cd \\\"d:/Dev/CoursIA-c9684-search-4-duree\\\" && python scripts/notebook_tools/check_twin_parity.py --update --pair \\\"Search-4-LocalSearch\\\" --by \\\"myia-po-2023:CoursIA-2\\\" 2>&1 | tail -20\",\"description\":\"Per-pair rebaseline of Search-4-LocalSearch with new SHAs\"}"}}
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"cd \\\"d:/Dev/alpha-lane-search-4-duree\\\" && python scripts/notebook_tools/check_twin_parity.py --update --pair \\\"Search-4-LocalSearch\\\" --by \\\"myia-po-2023:CoursIA-2\\\" 2>&1 | tail -20\",\"description\":\"Per-pair rebaseline of Search-4-LocalSearch with new SHAs\"}"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":2}

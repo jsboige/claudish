@@ -166,7 +166,7 @@ def test_workspace_extraction():
     # Measured live: the marker is ECHOED in prose (quoted rule text, harness
     # summaries), yielding values like `CoursIA)` or a whole clause — which
     # split one session across two rows. Echoes are skipped, scanning continues.
-    echo_first = ('prose "Primary working directory: D:\\\\Dev\\\\CoursIA)\\n" '
+    echo_first = ('prose "Primary working directory: D:\\\\Dev\\\\alpha-lane)\\n" '
                   'then the real "Primary working directory: D:\\\\dev\\\\claudish\\n"')
     check("workspace: an echoed marker yielding a non-path is skipped",
           lc.workspace_of(echo_first) == "claudish", lc.workspace_of(echo_first))
