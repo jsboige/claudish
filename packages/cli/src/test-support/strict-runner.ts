@@ -237,10 +237,18 @@ export function runIsAccountable(run: SuiteRun): boolean {
  * running one file) — the kind of silent population loss this gate must never
  * green over, so the mismatch is PRINTED for the operator even though a
  * zero-test file can legitimately keep M off K by one.
+ *
+ * The LAST match wins: a nested bun-test child (a file spawning
+ * `bun test <one file>` with inherited stdio) prints its own summary EARLIER
+ * in the stream, and the first match would shadow the parent's final line —
+ * measured 18/11: partitions hosting `call-abort.test.ts` or
+ * `client-cancel.test.ts` echoed "1 file ran" for 50 delivered files.
  */
 export function ranLineFileCount(raw: string): number | null {
-  const m = raw.match(/^Ran \d+ tests? across (\d+) files?\./m);
-  return m ? Number(m[1]) : null;
+  const matches = raw.matchAll(/^Ran \d+ tests? across (\d+) files?\./gm);
+  let last: number | null = null;
+  for (const m of matches) last = Number(m[1]);
+  return last;
 }
 
 /**

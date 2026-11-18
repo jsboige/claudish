@@ -624,6 +624,23 @@ describe("parsePartitionArg / entryFile / ranLineFileCount / mergeEnvGates", () 
     expect(ranLineFileCount("bun test v1.3.14\n(no summary)")).toBeNull();
   });
 
+  test("ranLineFileCount takes the LAST Ran line — a nested child summary must not shadow the parent's", () => {
+    // Measured 18/11: a file spawning `bun test <one file>` with inherited
+    // stdio (call-abort, client-cancel) prints its own summary BEFORE the
+    // parent's final line; the first match echoed "1 file ran" for 50
+    // delivered files. The parent's summary is always printed last.
+    const raw = [
+      "(fail) something",
+      " 9 pass",
+      " 2 fail",
+      "Ran 11 tests across 1 file. [4.25s]",
+      " 624 pass",
+      " 24 fail",
+      "Ran 666 tests across 50 files. [22.64s]",
+    ].join("\n");
+    expect(ranLineFileCount(raw)).toBe(50);
+  });
+
   test("mergeEnvGates sums counts per class and ORs the budget flag", () => {
     expect(
       mergeEnvGates([
