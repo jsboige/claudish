@@ -37,7 +37,11 @@ if (process.env.CLAUDISH_W1_KIMI_CHILD !== "1") {
       ]);
       expect(exit, stdout + stderr).toBe(0);
       expect(stdout + stderr).toContain("0 fail");
-      process.stdout.write(stdout + stderr);
+      // NOT re-emitted to this process's stdout: the child's (fail) lines and
+      // its "Ran N tests" summary would mix into OUR output and break the
+      // strict runner's accounting (parsed entries vs bun's own counters —
+      // measured: partition 1 rendered 26 entries for fail=24). The diagnosis
+      // rides the expect() message above when the child is red.
       expect(existsSync(join(home, ".claudish", "kimi-device-id"))).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
