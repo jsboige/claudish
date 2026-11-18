@@ -1799,7 +1799,7 @@ describe("#679 — plan concurrency refusal skips, the usage wall stays a wall",
     setPatientBackoffTimingsForTests(null);
   }, 30_000);
 
-  test("K1302f (#1111): a plain 1302 burst on the NOMINAL no longer kills the turn — patience retries and the turn is served", async () => {
+  test("K1302h (#1111): a plain 1302 burst on the NOMINAL with NO cascade no longer kills the turn — patience retries and the turn is served", async () => {
     await spin();
     resetCascade({}); // no cascade steps: the nominal IS the last resort
     let nmCalls = 0;

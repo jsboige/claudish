@@ -77,6 +77,7 @@ import {
   classifyConcurrencyRefusal,
   CONCURRENCY_REFUSAL_SKIP_DETAIL,
   isStepSkipEligible,
+  isCascadeWalkEligible,
 } from "./shared/step-skip.js";
 import { StepBusyError } from "./shared/concurrency-limiter.js";
 import { extractSessionKey, isQuotaExhaustion } from "../fork/failover.js";
@@ -1378,7 +1379,19 @@ export class ComposedHandler implements ModelHandler {
       // frees in seconds and the first retry is 5s out.
       const transientContention =
         isTransientOverload(response.status, probeText) || concurrencyRefusal;
-      if (transientContention && !stepConcurrencyRefusal) {
+      // #1111 × #1109: on the nominal of a walk-armed cascade, a plain 1302
+      // belongs to the #781 walk — proxy-server diverts to the first servable
+      // step in SECONDS once this response surfaces. Patience here would
+      // starve the walk of its trigger (~5 min), and the 529 the patience
+      // path converts to would defeat the walk's 429-reading predicate. The
+      // mark is structural (never set on keyless/native/no-cascade/last-rung
+      // attempts), so the #1111 patience keeps exactly the paths the walk
+      // cannot take. Scope: the concurrency-refusal class only — the overload
+      // class keeps its patience-before-walk order, which the walk budget
+      // already accounts for (#348, ~365 s).
+      const walkOwnsIt =
+        concurrencyRefusal && isCascadeWalkEligible(c as unknown as object);
+      if (transientContention && !stepConcurrencyRefusal && !walkOwnsIt) {
         const recovered = await this.patientOverloadBackoff(doFetch);
         if (recovered) response = recovered;
         // null = exhausted → response stays the overload → !response.ok below → 529
@@ -1692,7 +1705,17 @@ export class ComposedHandler implements ModelHandler {
         // 429 the client reads as a usage wall. `concurrencyRefusal` was
         // computed at the top of this block; the busy annotation below already
         // rides the 529 for any step consumer (#679 wire, unchanged).
-        if (isTransientOverload(response.status, errorText) || concurrencyRefusal) {
+        // #1111 × #1109: on the nominal of a walk-armed cascade the 1302
+        // class must surface as the ANNOTATED 429, unconverted — the #781
+        // walk's predicate reads status 429 plus the #679 header and diverts
+        // in seconds (K1302f), and its kill-switch contract is the bare 429
+        // again (K1302g). Converting here would starve the one and revive the
+        // other through the 529's own walk-class. The overload class keeps
+        // the conversion: its patience-then-529 order is what the walk
+        // budget already accounts for (#348).
+        const walkOwnsRefusal =
+          concurrencyRefusal && isCascadeWalkEligible(c as unknown as object);
+        if (isTransientOverload(response.status, errorText) || (concurrencyRefusal && !walkOwnsRefusal)) {
           logStderr(
             `[Overload] [${this.provider.displayName}] HTTP ${response.status} transient overload → returning 529 overloaded_error (patient ~5min backoff exhausted)`
           );

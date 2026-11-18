@@ -142,6 +142,7 @@ import {
   readStepBusyWaitMs,
   markCascadeStepAttempt,
   markStepSkipEligible,
+  markCascadeWalkEligible,
   isConcurrencyRefusalWalk,
 } from "./handlers/shared/step-skip.js";
 import {
@@ -1862,6 +1863,21 @@ export async function createProxyServer(
           rule != null && stepIndex >= 0 && stepIndex < rule.steps.length - 1
         );
       }
+      // #1111 × #1109: a plain 1302 on the nominal of a walk-armed cascade
+      // belongs to the #781 walk (seconds), so composed-handler's patience
+      // yields. Mirror the walk's own PRE-response guards (nominal attempt,
+      // steps exist, native and keyless lanes excluded); kill switches are
+      // read by the walk predicate itself — with the walk off, its contract
+      // (K1302g) is the bare 429 again, and patience must not re-enter.
+      markCascadeWalkEligible(
+        c,
+        role != null &&
+          stepIndex === -1 &&
+          rule != null &&
+          rule.steps.length > 0 &&
+          !keylessNative &&
+          !(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`)
+      );
       // #654 — in-flight token budget per endpoint, evaluated BEFORE the
       // upstream call: a local engine saturates on CONTEXT, not request count
       // (six ~200K-token bodies ≈ 1.2M KV against 750,747 available — measured

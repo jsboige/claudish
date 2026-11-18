@@ -254,3 +254,30 @@ export function markStepSkipEligible(c: object, on: boolean): void {
 export function isStepSkipEligible(c: object): boolean {
   return stepSkipEligibleContexts.has(c);
 }
+
+// ── #1111 × #1109 — the patience gate yields to the #781 walk ─────────────────
+
+/**
+ * Whether THIS attempt is the nominal of a walk-armed cascade — the one case
+ * where a plain 1302 must NOT enter composed-handler's patient backoff: the
+ * #781 walk (proxy-server, `isConcurrencyRefusalWalk`) reads a 429 plus the
+ * #679 annotation and diverts to the first servable step in seconds. Patience
+ * first would starve the walk of its trigger (~5 min), and the 529 the
+ * patience path converts to would defeat the walk's 429-reading predicate.
+ *
+ * The mark is STRUCTURAL (nominal attempt, steps exist, not the excluded
+ * native/keyless lanes) and deliberately reads no kill switch: with the walk
+ * switches off, K1302g's contract is the bare 429 again, so patience must
+ * stay out of the way there too. The paths the walk cannot take (no cascade,
+ * last rung, keyless, native) keep the #1111 patience + 529.
+ */
+const cascadeWalkEligibleContexts = new WeakSet<object>();
+
+export function markCascadeWalkEligible(c: object, on: boolean): void {
+  if (on) cascadeWalkEligibleContexts.add(c);
+  else cascadeWalkEligibleContexts.delete(c);
+}
+
+export function isCascadeWalkEligible(c: object): boolean {
+  return cascadeWalkEligibleContexts.has(c);
+}
