@@ -254,6 +254,15 @@ Describe 'Get-OffsiteWriteVerdict' {
         (Get-OffsiteWriteVerdict -DestExists $true -DestBytes 1 -LocalBytes 2).Reason |
             Should -Match 'another producer'
     }
+    It 'rewrites a 0-byte destination with bytes to copy: dead upload, not a competing producer (#1113)' {
+        $v = Get-OffsiteWriteVerdict -DestExists $true -DestBytes 0 -LocalBytes 12345
+        $v.Action | Should -Be 'write'
+        $v.Reason | Should -Match 'dead upload'
+    }
+    It 'keeps a 0-byte destination against a 0-byte local file idempotent (equal sizes, degenerate but consistent)' {
+        (Get-OffsiteWriteVerdict -DestExists $true -DestBytes 0 -LocalBytes 0).Action |
+            Should -Be 'idempotent'
+    }
 }
 
 Describe 'compress-captures.ps1 off-site overwrite guard (#208)' {
