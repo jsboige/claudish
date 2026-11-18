@@ -1457,13 +1457,18 @@ Describe 'Invoke-GitBounded — dubious ownership (SYSTEM vs operator tree)' {
         else { Remove-Item Env:GIT_TEST_ASSUME_DIFFERENT_OWNER -ErrorAction SilentlyContinue }
     }
 
-    # HostBound (#1096): git foreign-ownership setup differs on hosted runners (no fleet
-    # safe.directory/config) — the control passes on seats. CI excludes it (counted in the log).
-    It 'POSITIVE CONTROL: without the workaround, foreign ownership IS refused (exit 128)' -Tag HostBound {
+    It 'POSITIVE CONTROL: without the workaround, foreign ownership IS refused (exit 128)' {
         # If this ever passes, GIT_TEST_ASSUME_DIFFERENT_OWNER stopped being
         # honored and the regression below is vacuous — a dead instrument
         # pretending to guard. This control is what keeps it honest.
-        $p = Start-Process -FilePath 'git' -ArgumentList @('-C', $script:Repo, 'rev-parse', 'HEAD') `
+        # #1096 portability: on hosted runners the control fails as
+        # "Expected 128, but got 0" (run 43802070885) — the image's protected
+        # config carries a safe.directory grant that rescues ANY tree even
+        # under GIT_TEST_ASSUME_DIFFERENT_OWNER=1. Measured 17/11 (po-2028):
+        # a wildcard grant flips the refusal to exit 0; the EMPTY value on the
+        # protected command line RESETS the list (exit 128 again), making the
+        # refusal deterministic on seats and hosted images alike.
+        $p = Start-Process -FilePath 'git' -ArgumentList @('-C', $script:Repo, '-c', 'safe.directory=', 'rev-parse', 'HEAD') `
             -NoNewWindow -PassThru -Wait
         $p.ExitCode | Should -Be 128
     }
