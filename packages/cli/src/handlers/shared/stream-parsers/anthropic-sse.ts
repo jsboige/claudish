@@ -24,7 +24,7 @@ import {
   policyRefusalNotice,
   POLICY_RETRY_BACKOFF_MS,
 } from "./policy-refusal.js";
-import { firstEventWatchdogWindowMs } from "../first-event-watchdog.js";
+import { firstEventExpiryMs } from "../first-event-watchdog.js";
 
 /**
  * Backoff ladder for the pre-visible transparent re-forward (#170).
@@ -1197,19 +1197,24 @@ export function createAnthropicPassthroughStream(
             // and leave the client with an orphan message_delta+message_stop
             // pair and no message_start (#1030 measured: pings forwarded, no
             // start, no error, nothing marked). The label names the
-            // confinement only when the watchdog is actually armed AND
-            // something (pings) was forwarded; with the watchdog off, a mute
-            // close keeps the generic empty-response wording — printing a
-            // confinement window that was never set would be a lie. Both
-            // wordings avoid every vocabulary isQuotaExhaustion matches
-            // (limit/quota/usage/exhausted): a retry-labeled confinement must
-            // never arm a cascade.
+            // confinement ONLY on the watchdog's expiry signal (see
+            // firstEventExpiredMs above — CR: a normal close must never wear
+            // it). Both wordings avoid every vocabulary isQuotaExhaustion
+            // matches (limit/quota/usage/exhausted): a confinement must never
+            // arm a cascade.
             if (!sawMessageStart && !forwardedNonPingData) {
               const synthId = `msg_${Date.now()}`;
-              const watchdogWindowMs = firstEventWatchdogWindowMs();
+              // Confined wording ONLY on the watchdog's own expiry signal
+              // (#1098 CR): read AT FINALIZATION, not at construction — the
+              // parser is built when the upstream headers arrive, the timer
+              // expires later, and this branch runs at the close it caused.
+              // The WeakMap record is filled before that close, so the value
+              // is here now; a normal close reads null and keeps the generic
+              // empty-response wording, however armed the watchdog is.
+              const firstEventExpiredMs = firstEventExpiryMs(response) ?? 0;
               const emptyResponseText =
-                watchdogWindowMs > 0 && forwardedAnyData
-                  ? `[Upstream confined — no first useful event within ${watchdogWindowMs}ms: stream closed, please retry]`
+                firstEventExpiredMs > 0 && forwardedAnyData
+                  ? `[Upstream confined — no first useful event within ${firstEventExpiredMs}ms: stream closed, please retry]`
                   : "[Error: The model returned an empty response. This is usually transient — a momentary provider load or rate limit, NOT a context-size problem. Please retry. If it recurs repeatedly on a very large conversation, then try /compact.]";
               // JSON.stringify, same rule as finalizeWithError (S4-a): a quote
               // in a custom-endpoint model name must not break the client.

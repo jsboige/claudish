@@ -89,6 +89,29 @@ export function firstEventWatchdogWindowMs(): number {
 }
 
 /**
+ * Internal signal: the watchdog's timer ACTUALLY expired (#1098 CR).
+ *
+ * The wrapper returns synchronously and the timer fires asynchronously, so
+ * the expiry cannot ride a header (a Response constructor COPIES its headers,
+ * and a header value is a string snapshot — both measured 18/11). The record
+ * lives in a module WeakMap keyed by the wrapped Response itself: object
+ * identity survives the return, the timer fills the record before closing,
+ * and the downstream parser — constructed synchronously at that close,
+ * receiving THIS Response object from ComposedHandler — reads the filled
+ * value. null = the watchdog never expired, however armed it was: a finite
+ * pings-only close must never wear the confined label.
+ */
+export interface FirstEventExpiry {
+  windowMs: number | null;
+}
+const expiryByResponse = new WeakMap<Response, FirstEventExpiry>();
+
+/** The parser-side reader: the expiry window, or null when nothing expired. */
+export function firstEventExpiryMs(response: Response): number | null {
+  return expiryByResponse.get(response)?.windowMs ?? null;
+}
+
+/**
  * Wrap an upstream SSE `Response` so that a stream admitted with 200 but
  * producing no `data:` line within the watchdog window is closed instead of
  * being held open. Byte-for-byte passthrough otherwise; never throws.
@@ -103,6 +126,8 @@ export function withFirstUsefulEventWatchdog(response: Response, label: string):
   let sawUseful = false;
   let finished = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  // The expiry record, keyed by the returned Response (see firstEventExpiryMs).
+  const expiry: FirstEventExpiry = { windowMs: null };
 
   const clearTimer = () => {
     if (timer !== null) {
@@ -116,6 +141,9 @@ export function withFirstUsefulEventWatchdog(response: Response, label: string):
       timer = setTimeout(() => {
         if (sawUseful || finished) return;
         finished = true;
+        // Fill the record in place BEFORE closing: the downstream parser is
+        // constructed synchronously at the close and reads the filled value.
+        expiry.windowMs = windowMs;
         clearTimer();
         log(
           `[FirstEvent] watchdog: no useful event within ${windowMs}ms (${label}) — cancelling upstream; downstream parser finalizes synthetically`,
@@ -189,11 +217,13 @@ export function withFirstUsefulEventWatchdog(response: Response, label: string):
     },
   });
 
-  return new Response(stream, {
+  const wrapped = new Response(stream, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
   });
+  expiryByResponse.set(wrapped, expiry);
+  return wrapped;
 }
 
 /**
