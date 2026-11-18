@@ -24,6 +24,7 @@ import {
   policyRefusalNotice,
   POLICY_RETRY_BACKOFF_MS,
 } from "./policy-refusal.js";
+import { firstEventExpiryMs } from "../first-event-watchdog.js";
 
 /**
  * Backoff ladder for the pre-visible transparent re-forward (#170).
@@ -165,6 +166,17 @@ export function createAnthropicPassthroughStream(
         // of the server_tool_use fix: same-name variables in nested scopes are
         // two variables).
         let forwardedAnyData = false;
+        // #1098 — a ping frame is FORWARDED (it is a data line) but is not
+        // client-visible CONTENT. The first-event watchdog confines a
+        // mute-but-200 upstream whose only output was pings; the synthetic
+        // well-formed turn in the finalization below must fire for that stream
+        // too, where the #286 gate (`!forwardedAnyData`) used to skip it and
+        // leave the orphan message_delta+message_stop pair (#1030's
+        // measurement: 10 pings, no start, no error, nothing marked). Set at
+        // the emitDataLine chokepoint from the caller's parsed type; an
+        // UNKNOWN schema forwarded stays "content" here (conservative — #286
+        // doctrine: what was forwarded is client-visible whatever it is).
+        let forwardedNonPingData = false;
         const flushPendingEvent = () => {
           if (pendingEventLine !== null && !isClosed) {
             controller.enqueue(encoder.encode(pendingEventLine + "\n"));
@@ -181,7 +193,7 @@ export function createAnthropicPassthroughStream(
          * before the client, so an incoherent pair it relays is a dead turn.
          * A frame that is already coherent is forwarded byte-for-byte.
          */
-        const emitDataLine = (text: string) => {
+        const emitDataLine = (text: string, parsedType?: string) => {
           const frame = coherenceEnabled
             ? reconcileFrame(pendingEventLine, text)
             : passthroughFrame(pendingEventLine, text);
@@ -201,6 +213,13 @@ export function createAnthropicPassthroughStream(
             // FORWARDED is client-visible whatever its schema. See the flag's
             // declaration for why the parser-state gates below need it.
             forwardedAnyData = true;
+            // #1098 — when the caller has ALREADY parsed the frame, say which
+            // type it was: only `ping` is forwarded-but-not-content. An absent
+            // parsedType (unparseable pass-through, synthetic lines) stays
+            // "content" — conservative, per the #286 doctrine above.
+            if (parsedType === undefined || parsedType !== "ping") {
+              forwardedNonPingData = true;
+            }
           }
         };
         /** Mark the current frame as dropped: header and blank separator go too. */
@@ -811,9 +830,9 @@ export function createAnthropicPassthroughStream(
                         log(
                           `[AnthropicSSE] content_block_start index ${data.index} remapped to ${expected} (filtered, model=${opts.modelName})`
                         );
-                        emitDataLine("data: " + JSON.stringify({ ...data, index: expected }));
+                        emitDataLine("data: " + JSON.stringify({ ...data, index: expected }), data.type);
                       } else {
-                        emitDataLine(line);
+                        emitDataLine(line, data.type);
                       }
                     } else {
                       if (data.type === "content_block_stop") lastBlockOpen = false;
@@ -837,10 +856,10 @@ export function createAnthropicPassthroughStream(
                         finalIdx === data.index
                           ? line
                           : "data: " + JSON.stringify({ ...data, index: finalIdx });
-                      emitDataLine(payload);
+                      emitDataLine(payload, data.type);
                     }
                   } else {
-                    emitDataLine(line);
+                    emitDataLine(line, data.type);
                   }
                 } catch {
                   // Unparseable — pass through
@@ -960,9 +979,9 @@ export function createAnthropicPassthroughStream(
                             `[AnthropicSSE] content_block_start index ${data.index} remapped to ${expected} (model=${opts.modelName})`
                           );
                           const remapped = { ...data, index: expected };
-                          emitDataLine("data: " + JSON.stringify(remapped));
+                          emitDataLine("data: " + JSON.stringify(remapped), data.type);
                         } else {
-                          emitDataLine(line);
+                          emitDataLine(line, data.type);
                         }
                         trackIndex(expected);
                       } else {
@@ -1000,11 +1019,11 @@ export function createAnthropicPassthroughStream(
                           finalIdx === data.index
                             ? line
                             : "data: " + JSON.stringify({ ...data, index: finalIdx });
-                        emitDataLine(payload);
+                        emitDataLine(payload, data.type);
                       }
                     } else {
                       // No index field — pass through as-is
-                      emitDataLine(line);
+                      emitDataLine(line, data.type);
                     }
 
                     // Usage/debug tracking
@@ -1171,8 +1190,32 @@ export function createAnthropicPassthroughStream(
             // appending "[Error: The model returned an empty response…]" AFTER a
             // complete, delivered body is a lie — the terminal message_stop tail
             // below still closes the stream (never-hang intact).
-            if (!sawMessageStart && !forwardedAnyData) {
+            // #1098 — ping frames are forwarded but are not CONTENT (see
+            // forwardedNonPingData's declaration): a stream whose only output
+            // was pings — the exact shape the first-event watchdog confines —
+            // used to skip this trio through the old `!forwardedAnyData` gate
+            // and leave the client with an orphan message_delta+message_stop
+            // pair and no message_start (#1030 measured: pings forwarded, no
+            // start, no error, nothing marked). The label names the
+            // confinement ONLY on the watchdog's expiry signal (see
+            // firstEventExpiredMs above — CR: a normal close must never wear
+            // it). Both wordings avoid every vocabulary isQuotaExhaustion
+            // matches (limit/quota/usage/exhausted): a confinement must never
+            // arm a cascade.
+            if (!sawMessageStart && !forwardedNonPingData) {
               const synthId = `msg_${Date.now()}`;
+              // Confined wording ONLY on the watchdog's own expiry signal
+              // (#1098 CR): read AT FINALIZATION, not at construction — the
+              // parser is built when the upstream headers arrive, the timer
+              // expires later, and this branch runs at the close it caused.
+              // The WeakMap record is filled before that close, so the value
+              // is here now; a normal close reads null and keeps the generic
+              // empty-response wording, however armed the watchdog is.
+              const firstEventExpiredMs = firstEventExpiryMs(response) ?? 0;
+              const emptyResponseText =
+                firstEventExpiredMs > 0 && forwardedAnyData
+                  ? `[Upstream confined — no first useful event within ${firstEventExpiredMs}ms: stream closed, please retry]`
+                  : "[Error: The model returned an empty response. This is usually transient — a momentary provider load or rate limit, NOT a context-size problem. Please retry. If it recurs repeatedly on a very large conversation, then try /compact.]";
               // JSON.stringify, same rule as finalizeWithError (S4-a): a quote
               // in a custom-endpoint model name must not break the client.
               controller.enqueue(encoder.encode(
@@ -1214,7 +1257,7 @@ export function createAnthropicPassthroughStream(
                     index: 0,
                     delta: {
                       type: "text_delta",
-                      text: "[Error: The model returned an empty response. This is usually transient — a momentary provider load or rate limit, NOT a context-size problem. Please retry. If it recurs repeatedly on a very large conversation, then try /compact.]",
+                      text: emptyResponseText,
                     },
                   }) +
                   "\n\n"
