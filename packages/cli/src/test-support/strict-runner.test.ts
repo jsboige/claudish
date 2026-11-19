@@ -30,6 +30,7 @@ import {
   parsePartitionArg,
   parseRunOutput,
   planPartitions,
+  populationEchoOverCounts,
   populationGapUnexplained,
   ranLineFileCount,
   realSuiteRunner,
@@ -982,6 +983,74 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     expect(out).toContain("POPULATION GAP in confirmation");
     expect(out).toContain("never ran");
     expect(out).not.toContain("flaky tail");
+  });
+
+  // ─── Population over-count guard (file 19d item 1, review #1114 second review) ──
+
+  test("an over-counting echo (3 attested / 2 delivered) refuses --learn: exit 3 and NO baseline (review witness)", () => {
+    chdirTmp();
+    // The second review's exact shape: 2 files delivered, an otherwise
+    // accountable summary whose echo says "Ran N tests across 3 files". The
+    // old `>=` read "3 >= 2" as coverage, --learn printed "EXPLAINED by 0
+    // files", wrote an EMPTY baseline and returned 0 — three files cannot
+    // attest the execution of exactly the two delivered.
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: () => ({ raw: outputFor([], 3) }), // 0 entries, echo says 3 files
+    };
+    const { code, out } = captureStdout(() =>
+      main(["--learn", "--partition=50"], neverRunner, deps)
+    );
+    expect(code).toBe(3);
+    expect(out).toContain("POPULATION OVER-COUNT");
+    // the refusal states WHY an over-count is not coverage, not just "3 != 2"
+    expect(out).toContain("cannot attest this run's population");
+    expect(existsSync(join(process.cwd(), BASELINE_PATH))).toBe(false);
+  });
+
+  test("the CONFIRMATION pass holds the same over-count gate — no flaky verdict from an echo that outruns its delivery", () => {
+    chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
+    let pass = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        pass += 1;
+        if (fs[0] === "a.test.ts") {
+          // first pass: healthy echo + a fresh entry; confirmation: 2 attested /
+          // 1 delivered with entries naming only that file — NEW1's absence
+          // would otherwise read as "flaky, did not reproduce"
+          if (pass === 1)
+            return { raw: outputFor(["a.test.ts > a1", "a.test.ts > NEW1"], fs.length) };
+          return { raw: outputFor(["a.test.ts > a1"], fs.length + 1) };
+        }
+        return { raw: outputFor([], fs.length) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("POPULATION OVER-COUNT in confirmation");
+    expect(out).not.toContain("flaky tail");
+  });
+
+  test("over-count carve-out: an echo the ENTRIES explain (ghost file) is NOT refused here — the re-run-everything fallback owns it", () => {
+    // 1 delivered, entries name a.test.ts + a file outside the delivery, echo
+    // == 2 == entry-file count: the extra file left a trace, this is the
+    // ghost shape the no-blind-spot fallback re-runs everything for. The new
+    // gate must not preempt it (only an echo beyond BOTH delivery and entries
+    // is a refusal), and the under-count side stays with the gap guard.
+    const ghostRaw = outputFor(["a.test.ts > a1", "unmapped/ghost.test.ts > g1"]);
+    const parsed = parseRunOutput(ghostRaw);
+    expect(ranLineFileCount(ghostRaw)).toBe(2); // echo == entry-file count
+    expect(populationEchoOverCounts(["a.test.ts"], ranLineFileCount(ghostRaw), parsed)).toBe(false);
+    // the review witness shape, by contrast, IS an over-count on both axes
+    const witnessRaw = outputFor([], 3);
+    expect(
+      populationEchoOverCounts(
+        ["a.test.ts", "b.test.ts"],
+        ranLineFileCount(witnessRaw),
+        parseRunOutput(witnessRaw)
+      )
+    ).toBe(true);
   });
 
   test("portable concrete control: realSuiteRunner's per-file selection runs TWO real Bun test files and the echo covers both", () => {

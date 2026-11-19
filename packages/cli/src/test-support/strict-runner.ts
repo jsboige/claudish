@@ -288,8 +288,34 @@ export function populationGapUnexplained(
   parsed: SuiteRun
 ): string[] {
   if (ranFiles === null) return [...delivered]; // unknown population: never a baseline
-  if (ranFiles >= delivered.length) return []; // echo covers the delivery (or a child inflated it)
+  if (ranFiles >= delivered.length) return []; // nothing missing (an over-count is refused below first)
   return missingRunnableFiles(delivered, parsed).unexplained;
+}
+
+/**
+ * Review #1114, second review: an echo that attests MORE files than were
+ * delivered is not coverage — it is no attestation of this run at all. The
+ * review's witness: deliver a.test.ts + b.test.ts, parse an otherwise
+ * accountable "Ran N tests across 3 files" — the old `>=` read that as "the
+ * echo covers the delivery", --learn wrote the empty union as a baseline and
+ * returned 0. Three files cannot attest the execution of exactly two.
+ *
+ * One shape is deliberately NOT refused here: when the extra count is exactly
+ * explained by the entries themselves (an entry names a file outside the
+ * delivery — the "ghost" of the no-blind-spot fallback), the echo matches the
+ * entry-file count and the reviewed re-run-everything path owns the case.
+ * So the refusal fires only when the echo outruns BOTH the delivery and every
+ * file the entries name: no trace at all accounts for the extra files, the
+ * summary describes another population.
+ */
+export function populationEchoOverCounts(
+  delivered: string[],
+  ranFiles: number | null,
+  parsed: SuiteRun
+): boolean {
+  if (ranFiles === null) return false; // unknown population: the gap guard owns it
+  const entryFiles = new Set(parsed.entries.map(entryFile));
+  return ranFiles > delivered.length && ranFiles > entryFiles.size;
 }
 
 /**
@@ -796,6 +822,24 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
     }
     const delivered = partitions[i].length;
     const ranFiles = ranLineFileCount(run.raw);
+    if (populationEchoOverCounts(partitions[i], ranFiles, parsed)) {
+      // Review #1114, second review: the echo attests more files than were
+      // delivered AND more than the entries themselves name — nothing accounts
+      // for the extra count, so the summary describes another population. The
+      // old `>=` read this as coverage and --learn consecrated the union (or
+      // its emptiness) as a baseline with exit 0.
+      process.stdout.write(
+        `[STRICT] 🔴 POPULATION OVER-COUNT in partition ${i + 1}/${partitions.length}: bun reports ` +
+          `${ranFiles} file(s) ran, ${delivered} delivered — the echo attests more files than were ` +
+          `handed to it and more than the entries name; it cannot attest this run's population.\n`
+      );
+      process.stdout.write(
+        "[STRICT]   Refusing: no baseline is written from an echo that outruns its delivery. " +
+          "The echo reads the LAST Ran line; a count beyond both the delivery and the entries " +
+          "describes some other run.\n"
+      );
+      return 3;
+    }
     const unexplained = populationGapUnexplained(partitions[i], ranFiles, parsed);
     if (unexplained.length > 0) {
       // Review #1114 (file 19b item 1): an echo below the delivery used to be a
@@ -911,6 +955,17 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
         // flaky (absent from the re-run) instead of unexplained. An unexplained
         // gap here is a refusal, not a verdict.
         const ranFiles2 = ranLineFileCount(run2.raw);
+        if (populationEchoOverCounts(partitions[i], ranFiles2, parsed2)) {
+          // Review #1114, second review: same gate as the first pass — no
+          // entry is classified flaky from an echo that outruns its delivery.
+          process.stdout.write(
+            `[STRICT] 🔴 POPULATION OVER-COUNT in confirmation of partition ${i + 1}/${partitions.length}: ` +
+              `${ranFiles2} file(s) ran / ${partitions[i].length} delivered — the echo attests more ` +
+              "than this run delivered and more than the entries name. No entry is classified flaky " +
+              "from an echo that outruns its delivery.\n"
+          );
+          return 3;
+        }
         const unexplained2 = populationGapUnexplained(partitions[i], ranFiles2, parsed2);
         if (unexplained2.length > 0) {
           process.stdout.write(
