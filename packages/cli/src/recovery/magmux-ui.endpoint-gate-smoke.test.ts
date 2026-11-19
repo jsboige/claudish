@@ -19,7 +19,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Socket, UnixSocketListener } from "bun";
-import { joinEpisode } from "./coordinator.js";
+import { closeAllEpisodes, joinEpisode } from "./coordinator.js";
 import type { EpisodeSeed } from "./coordinator.js";
 import {
   __resetUiStateForTests,
@@ -149,6 +149,7 @@ function smokeSeed(): EpisodeSeed {
 
 let savedMagmuxSock: string | undefined;
 let f: MinimalMagmux | null = null;
+let episode: ReturnType<typeof joinEpisode> | null = null;
 
 beforeAll(() => {
   // A developer running this inside magmux must never have the suite draw on
@@ -162,12 +163,24 @@ afterAll(() => {
 });
 
 afterEach(async () => {
+  // Cross-file state leak (CI run 44532601904, hermetic macOS 2/3): the smoke
+  // ran before coordinator.test.ts in the same bun process and its open
+  // episode survived into `episodeCount()` there (Expected 1 / Received 2).
+  // Coordinator state is process-global; a test file that opens episodes
+  // closes them, mirroring magmux-ui.test.ts's own afterEach.
+  __resetUiStateForTests();
+  try {
+    episode?.leave();
+  } catch {
+    // already closed
+  }
+  episode = null;
+  closeAllEpisodes();
   try {
     await shutdownRecoveryUi();
   } catch {
     // not installed in every test
   }
-  __resetUiStateForTests();
   f?.stop();
   f = null;
 });
@@ -191,6 +204,7 @@ describe("B16: endpoint gate vs a live listener", () => {
 
       installRecoveryUi(f.path);
       const h = joinEpisode(smokeSeed());
+      episode = h;
 
       const bannered = await eventually(() => f !== null && f.received.length > 0);
       expect(bannered).toBe(true); // the banner MUST land: the listener is live
