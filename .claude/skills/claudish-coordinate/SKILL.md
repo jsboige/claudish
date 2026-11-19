@@ -1,6 +1,6 @@
 ---
 name: claudish-coordinate
-description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8h, modèle choisi par le user) — files profondes aux workers, reviews/merges exigeants, santé hub/relais/sidecar, trafic et leak-policy Anthropic, arbitrages au user, bilan [DONE]. À invoquer au réveil du cron ou sur demande du user.
+description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 4h, modèle choisi par le user) — files profondes aux workers, reviews/merges exigeants, santé hub/relais/sidecar, trafic et leak-policy Anthropic, arbitrages au user, bilan [DONE]. À invoquer au réveil du cron ou sur demande du user.
 ---
 
 # Cycle de coordination claudish — myia-ai-01
@@ -11,8 +11,7 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 8
 
 ## Cadence et mandats
 
-- **Cron `37 */8 * * *`** (heure locale : 00:37, 08:37, 16:37 — user 04/11, « passe stp sur un cycle de 8h pour
-  économiser les tokens Anthropic »). **Le modèle est le choix du user** : Opus depuis le 13/11 vers
+- **Cron `37 */4 * * *`** (heure locale, mandat user 19/11 ; remplace le cycle 8 h du 04/11). Avant de réarmer depuis une autre session, faire confirmer le retrait de l'ancien cron par la session qui le porte. **Le modèle est le choix du user** : Opus depuis le 13/11 vers
   13:15Z (même session, modèle changé au sélecteur), Fable le 13/11 au matin (id de rôle `claude-fable[1m]`,
   sans version), Opus du 04/11 au 13/11. Le cron hérite du modèle de la session qui l'arme : vérifier le
   modèle avant tout réarmement ; un changement au sélecteur dans la même session garde le même cron.
@@ -62,8 +61,8 @@ chiffre ou verdict → `docs/reference/measurement-protocol.md` · relais/hub �
 `CronList`. Si le job est absent, le réarmer **immédiatement** :
 
 ```
-CronCreate(cron: "37 */8 * * *",
-           prompt: "Cycle de coordination du workspace claudish (myia-ai-01, rôle coordinateur). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute intégralement le cycle qu'il décrit, phases 0 à 7. Mandat user du 18/09 : endosser le rôle de coordinateur — faire avancer les issues en dispatchant une file PROFONDE (~10 grains ordonnés, avec grains de repli) à chacun des 4 workers (po-2023, po-2024, po-2025, po-2027 — mandats user 04/10 et 05/10, Phase 4c), et faire des reviews/merges exigeants. Aucun cycle idle.",
+CronCreate(cron: "37 */4 * * *",
+           prompt: "Cycle de coordination claudish (myia-ai-01). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute les phases 0 à 7 : santé, production et files profondes des cinq workers, revues exigeantes, mesure Z.AI et suivi Swift/MiniMax. Aucun cycle idle.",
            recurring: true)
 ```
 
@@ -213,6 +212,7 @@ bilan contient :
 - le **tableau d'avancement mesuré** (user, 04/10) : PRs mergées/fermées/ouvertes depuis le cycle
   précédent ; chaque PR ouverte — qui la tient et son âge (toute PR > 24 h nommée) ; issues actionnables
   sans activité ≥ 7 j ; issues en dérive (enquête sans livrable, cas #298) ;
+- Z.AI et rendement Swift/MiniMax : [tableau de pilotage #445](reference.md#tableau-de-pilotage-445--mandat-du-1911) ;
 - l'état du cron (Phase 7).
 
 ### Phase 7 — Cron (sortie, CRITIQUE)
