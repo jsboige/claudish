@@ -16,13 +16,24 @@ parser behavior. Three verdicts, always naming the file:
 
 Classification is by `event:` line primarily (every Anthropic-wire block carries
 one), falling back to the data payload's JSON `type` when the event line is
-absent. The control never touches a parser, the network, or a model.
+absent. Only DELIVERABLE frames count: a block whose `event:` line has no
+`data:` line dispatches nothing on the wire and certifies nothing here — a bare
+`event: message_start` + `event: message_stop` pair is NOT a terminal pair
+(#1119 review). The control never touches a parser, the network, or a model.
+
+Input scope (measured, pinned in the self-test): CRLF line endings are
+normalized to LF before splitting (same verdicts as the LF twin); a payload
+split across several `data:` lines is classified by its `event:` line — the
+JSON-`type` fallback reads single-line payloads only. Production parsers are
+untouched.
 
 Usage:
   python scripts/sse_cardinality_check.py FILE [FILE ...]   # verdict per file
   python scripts/sse_cardinality_check.py --self-test        # reproducible proof:
-      builds a valid, a truncated and a terminal-less response in a temp dir and
-      asserts the three verdicts (exit 0 iff all as contracted).
+      builds every contract case in a temp dir (valid, truncated, terminal-less,
+      bare event lines without data, guard-removed mutation, CRLF twin,
+      multi-line data, mixed CLI exit) and asserts each verdict
+      (exit 0 iff all as contracted).
 
 Exit code: 0 when every checked file is PASS (self-test: all verdicts expected),
 1 otherwise. INVALID_INPUT counts as a rejection: the caller wanted a valid
@@ -39,8 +50,20 @@ TERMINAL_EVENTS = ("message_delta", "message_stop")
 OPEN_EVENTS = ("message_start",)
 
 
+def _has_data(block_lines: list[str]) -> bool:
+    """A deliverable frame carries a `data:` line (guard, #1119 review).
+
+    Without data, SSE dispatches no event: a bare `event: message_stop` line
+    certifies nothing. The self-test's mutation section proves the pin fails
+    when this guard is removed.
+    """
+    return any(line.startswith("data:") for line in block_lines)
+
+
 def _classify(block_lines: list[str]) -> str | None:
-    """Event name of a block: the `event:` line, else the data payload's type."""
+    """Event name of a DELIVERABLE block: `event:` line, else the data type."""
+    if not _has_data(block_lines):
+        return None
     event_name = None
     for line in block_lines:
         if line.startswith("event:") and event_name is None:
@@ -72,6 +95,10 @@ def check_file(path: Path) -> str:
         # cut before the frame was dispatched. A fixture ending on a single
         # trailing \n (block separator missing) is the same truncation.
         return f"{path}: INVALID_INPUT (truncated: last block has no blank-line separator)"
+
+    # CRLF normalization: a CRLF capture is the same response as its LF twin.
+    # replace() keeps the \n count, so line numbers stay the file's own.
+    raw = raw.replace("\r\n", "\n")
 
     blocks: list[tuple[int, list[str]]] = []
     current: list[str] = []
@@ -141,7 +168,7 @@ def _expect(verdict: str, want: str, label: str) -> bool:
 
 
 def self_test() -> int:
-    """Build the three contract cases in a temp dir and assert their verdicts."""
+    """Build every contract case in a temp dir and assert its verdict."""
     results = []
     with tempfile.TemporaryDirectory(prefix="sse-oracle-") as tmp:
         tmp_path = Path(tmp)
@@ -166,10 +193,74 @@ def self_test() -> int:
             _expect(check_file(terminal_less), "VIOLATION", "terminal-less complete response flagged")
         )
 
-    if all(results):
-        print("self-test: 3/3 verdicts as contracted")
+        # #1119 review: bare `event:` lines without any `data:` line must NOT
+        # certify a terminal pair — without data, SSE delivers no event. Exact
+        # verdict asserted, not just the class.
+        bare = tmp_path / "bare-events-no-data.sse"
+        bare.write_text("event: message_start\n\nevent: message_stop\n\n", encoding="utf-8")
+        expected_bare = "VIOLATION: terminal-pair (starts=0 stops=0)"
+        verdict_bare = check_file(bare)
+        got_bare = verdict_bare.split(": ", 1)[1] if ": " in verdict_bare else verdict_bare
+        ok = got_bare == expected_bare
+        results.append(ok)
+        print(f"  [{'OK' if ok else 'FAIL'}] bare event lines without data rejected")
+        print(f"        expected exactly: {expected_bare}")
+        print(f"        got: {got_bare}")
+
+        # Mutation: with the deliverability guard removed, the same file PASSES
+        # — which is the bug the review caught. Patching the guard out at
+        # runtime proves the pin above is what fails; restored immediately.
+        original_has_data = _has_data
+        globals()["_has_data"] = lambda _lines: True
+        try:
+            results.append(
+                _expect(check_file(bare), "PASS", "mutation: guard removed flips the pin to PASS")
+            )
+        finally:
+            globals()["_has_data"] = original_has_data
+
+        # CRLF twin: same response, CRLF line endings — same verdict.
+        crlf = tmp_path / "valid-response-crlf.sse"
+        crlf.write_text(VALID_SSE.replace("\n", "\r\n"), encoding="utf-8")
+        results.append(_expect(check_file(crlf), "PASS", "CRLF fixture same verdict as LF"))
+
+        # Multi-line data payload: split across two `data:` lines. The `event:`
+        # line classifies it (the JSON fallback is single-line only — documented
+        # scope, pinned here).
+        multiline = tmp_path / "multiline-data.sse"
+        multiline.write_text(
+            VALID_SSE.replace(
+                'data: {"type": "message_start", "message": {"id": "m1"}}\n',
+                'data: {"type": "message_start",\n'
+                'data:  "message": {"id": "m1"}}\n',
+            ),
+            encoding="utf-8",
+        )
+        results.append(
+            _expect(check_file(multiline), "PASS", "multi-line data classified via event line")
+        )
+
+        # Mixed CLI: one PASS file + one VIOLATION file — both named in the
+        # output, exit code non-zero.
+        cli_violating = tmp_path / "cli-terminal-less.sse"
+        cli_violating.write_text(VALID_SSE.rsplit("event: message_stop", 1)[0], encoding="utf-8")
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = main([str(valid), str(cli_violating)])
+        out = buf.getvalue()
+        ok = code == 1 and str(valid) in out and str(cli_violating) in out
+        results.append(ok)
+        print(f"  [{'OK' if ok else 'FAIL'}] CLI mixed: exit={code}, both files named")
+
+    passed = sum(1 for r in results if r)
+    total = len(results)
+    if passed == total:
+        print(f"self-test: {passed}/{total} assertions as contracted")
         return 0
-    print("self-test: FAILED")
+    print(f"self-test: FAILED ({passed}/{total})")
     return 1
 
 
