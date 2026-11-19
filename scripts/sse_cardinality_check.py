@@ -27,6 +27,18 @@ split across several `data:` lines is classified by its `event:` line — the
 JSON-`type` fallback reads single-line payloads only. Production parsers are
 untouched.
 
+The two fixture classes (#19b item 7): a PROVIDER-raw fixture is a parser
+INPUT — it may legitimately lack a native message_start (the parser synthesizes
+one, #1014), so a terminal-pair VIOLATION on it describes the provider stream
+and is NOT a client-conformance failure. A CLIENT-output fixture is what a
+client actually received and is judged as conformance. Label by provenance and
+citation: cite the fixture path and its SHA, never paste a capture into this
+repository to illustrate either class.
+
+Offline cost (#19b item 8): the self-test runs with no network and no model —
+measured 200 ms wall per invocation on win32 / Python 3.13 (interpreter startup
+included), 12 assertions.
+
 Usage:
   python scripts/sse_cardinality_check.py FILE [FILE ...]   # verdict per file
   python scripts/sse_cardinality_check.py --self-test        # reproducible proof:
@@ -207,9 +219,11 @@ def self_test() -> int:
         print(f"        expected exactly: {expected_bare}")
         print(f"        got: {got_bare}")
 
-        # Mutation: with the deliverability guard removed, the same file PASSES
-        # — which is the bug the review caught. Patching the guard out at
-        # runtime proves the pin above is what fails; restored immediately.
+        # Mutation (#19b item 2): with the deliverability guard removed, the
+        # same file PASSES — which is the bug the review caught. The mutation
+        # is ISOLATED: production source is never edited, the patch lives only
+        # in this self-test frame and is restored in `finally`, and identity of
+        # the restored function is asserted — then the pin must flip back.
         original_has_data = _has_data
         globals()["_has_data"] = lambda _lines: True
         try:
@@ -218,11 +232,46 @@ def self_test() -> int:
             )
         finally:
             globals()["_has_data"] = original_has_data
+        restored = globals()["_has_data"] is original_has_data
+        results.append(restored)
+        print(f"  [{'OK' if restored else 'FAIL'}] mutation restored: production guard identity intact")
+        if restored:
+            results.append(
+                _expect(check_file(bare), "VIOLATION", "mutation reverted: pin fails again")
+            )
 
-        # CRLF twin: same response, CRLF line endings — same verdict.
+        # CRLF twin (#19b item 1): write BYTES. Path.write_text translates every
+        # "\n" to os.linesep on Windows, so a string already carrying "\r\n"
+        # lands on disk as "\r\r\n" — the twin would not be the file this label
+        # claims. write_bytes keeps it faithful; the on-disk assert pins it.
         crlf = tmp_path / "valid-response-crlf.sse"
-        crlf.write_text(VALID_SSE.replace("\n", "\r\n"), encoding="utf-8")
+        crlf.write_bytes(VALID_SSE.replace("\n", "\r\n").encode("utf-8"))
+        crlf_raw = crlf.read_bytes()
+        no_crcrlf = b"\r\r\n" not in crlf_raw
+        results.append(no_crcrlf)
+        print(f"  [{'OK' if no_crcrlf else 'FAIL'}] CRLF fixture on disk carries no CRCRLF")
+        if not no_crcrlf:
+            print(f"        got: {crlf_raw[:60]!r}")
         results.append(_expect(check_file(crlf), "PASS", "CRLF fixture same verdict as LF"))
+
+        # Inverted order (#19b item 3): stop BEFORE start. The counts end at
+        # 1/1, so count equality alone would pass this file — the orphan guard
+        # is what flags it. Exact verdict asserted, not just the class.
+        inverted = tmp_path / "inverted-order.sse"
+        inverted.write_bytes(
+            b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+            b'event: message_start\ndata: {"type": "message_start", "message": {"id": "m1"}}\n\n'
+        )
+        expected_inv = (
+            "VIOLATION: terminal-pair (starts=1 stops=1, first orphan terminal 'message_stop' at line 1)"
+        )
+        verdict_inv = check_file(inverted)
+        got_inv = verdict_inv.split(": ", 1)[1] if ": " in verdict_inv else verdict_inv
+        ok = got_inv == expected_inv
+        results.append(ok)
+        print(f"  [{'OK' if ok else 'FAIL'}] inverted order (stop before start) flagged by orphan guard")
+        print(f"        expected exactly: {expected_inv}")
+        print(f"        got: {got_inv}")
 
         # Multi-line data payload: split across two `data:` lines. The `event:`
         # line classifies it (the JSON fallback is single-line only — documented
