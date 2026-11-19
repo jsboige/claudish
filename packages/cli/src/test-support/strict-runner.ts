@@ -252,6 +252,47 @@ export function ranLineFileCount(raw: string): number | null {
 }
 
 /**
+ * The files a partition delivered but bun's population echo never counted, and
+ * whether each is EXPLAINED. The only explained shape is an inspected file with
+ * no runnable test: it died at module load (a `load error` entry names it) or
+ * carries zero tests (its header prints, no entry exists). Anything else — a
+ * missing file with a PASSING body would leave no trace either — is an
+ * UNEXPLAINED population loss: the union the runner just compared is not the
+ * population it delivered. Review #1114 (file 19b item 1): a delivered set of
+ * 10 files echoed "Ran 1 test across 1 file" and --learn wrote an EMPTY
+ * baseline with exit 0. This classification is what turns that silent loss
+ * into a named refusal instead.
+ */
+export function missingRunnableFiles(
+  delivered: string[],
+  parsed: SuiteRun
+): { missing: string[]; unexplained: string[] } {
+  const seen = new Set(parsed.entries.map(entryFile));
+  const missing = delivered.filter((f) => !seen.has(f));
+  const loadDead = missing.filter((f) =>
+    parsed.entries.some((e) => e.startsWith(`${f}: load error`))
+  );
+  return { missing, unexplained: missing.filter((f) => !loadDead.includes(f)) };
+}
+
+/**
+ * One gate, both passes (file 19b items 1+2): a population echo that does not
+ * match the delivered set is a refusal (exit 3) UNLESS every missing file is an
+ * inspected-without-runnable-test one. Returns the unexplained list (empty =
+ * the gap is fully explained). `ranFiles === null` means the echo is absent —
+ * the population is UNKNOWN, which is unexplained by definition.
+ */
+export function populationGapUnexplained(
+  delivered: string[],
+  ranFiles: number | null,
+  parsed: SuiteRun
+): string[] {
+  if (ranFiles === null) return [...delivered]; // unknown population: never a baseline
+  if (ranFiles >= delivered.length) return []; // echo covers the delivery (or a child inflated it)
+  return missingRunnableFiles(delivered, parsed).unexplained;
+}
+
+/**
  * The reproduction rule: a fresh entry that reproduces on the confirmation
  * run is a regression whatever the count; one that does not is noise. This is
  * the property the body names ("a different test each time") — a count-based
@@ -757,10 +798,34 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
     }
     const delivered = partitions[i].length;
     const ranFiles = ranLineFileCount(run.raw);
-    if (ranFiles !== null && ranFiles !== delivered) {
+    const unexplained = populationGapUnexplained(partitions[i], ranFiles, parsed);
+    if (unexplained.length > 0) {
+      // Review #1114 (file 19b item 1): an echo below the delivery used to be a
+      // warning, and --learn then wrote the EMPTY union as the baseline with
+      // exit 0 — a silent population loss consecrated as the reference. The gap
+      // is now a refusal: no baseline is written, no verdict is drawn, and every
+      // unexplained file is named. The ONLY tolerated gap is the named set of
+      // files inspected without a runnable test (module-load death).
       process.stdout.write(
-        `[STRICT] ⚠ population echo: bun reports ${ranFiles} file(s) ran, partition delivered ${delivered} — ` +
-          "a file with no runnable test can explain ±1; a persistent gap on every partition means the multi-file union does not hold.\n"
+        `[STRICT] 🔴 POPULATION GAP in partition ${i + 1}/${partitions.length}: bun reports ` +
+          `${ranFiles ?? "NO Ran line"} file(s) ran, ${delivered} delivered — ` +
+          `${unexplained.length} file(s) are UNEXPLAINED (not a module-load death):\n`
+      );
+      for (const f of unexplained) process.stdout.write(`[STRICT]   · ${f}\n`);
+      process.stdout.write(
+        "[STRICT]   Refusing: no baseline is written from an unexplained population loss. " +
+          "Fix the delivery (paths the engine never received) or the echo, then re-run.\n"
+      );
+      return 3;
+    }
+    if (ranFiles !== null && ranFiles !== delivered) {
+      const explained = partitions[i].filter((f) =>
+        parsed.entries.some((e) => e.startsWith(`${f}: load error`))
+      );
+      process.stdout.write(
+        `[STRICT] ℹ population echo: ${ranFiles} ran / ${delivered} delivered — the gap is ` +
+          `EXPLAINED by ${explained.length} file(s) inspected without a runnable test (module-load death): ` +
+          `${explained.join(", ")}\n`
       );
     }
     observedPerPartition.push([...new Set(parsed.entries)].sort());
@@ -841,6 +906,22 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
             "confirmation pass",
             run2.raw
           );
+          return 3;
+        }
+        // File 19b item 2: the confirmation pass must hold the SAME population
+        // gate — otherwise an entry whose file never ran would be classified
+        // flaky (absent from the re-run) instead of unexplained. An unexplained
+        // gap here is a refusal, not a verdict.
+        const ranFiles2 = ranLineFileCount(run2.raw);
+        const unexplained2 = populationGapUnexplained(partitions[i], ranFiles2, parsed2);
+        if (unexplained2.length > 0) {
+          process.stdout.write(
+            `[STRICT] 🔴 POPULATION GAP in confirmation of partition ${i + 1}/${partitions.length}: ` +
+              `${ranFiles2 ?? "NO Ran line"} file(s) ran / ${partitions[i].length} delivered — ` +
+              `${unexplained2.length} UNEXPLAINED (not a module-load death). No entry is classified ` +
+              "flaky from a population that never ran:\n"
+          );
+          for (const f of unexplained2) process.stdout.write(`[STRICT]   · ${f}\n`);
           return 3;
         }
         for (const e of parsed2.entries) if (!baseline.fails.includes(e)) fresh2Set.add(e);

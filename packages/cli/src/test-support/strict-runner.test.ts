@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
  * through REAL bun output, not hand-written lines (review 2026-10-01).
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUDGET_FOOTER_MARKER, manifestFooter } from "./env-gate";
@@ -30,6 +30,7 @@ import {
   parsePartitionArg,
   parseRunOutput,
   planPartitions,
+  populationGapUnexplained,
   ranLineFileCount,
   realSuiteRunner,
   resolveWallClock,
@@ -301,7 +302,7 @@ describe("diffAgainstBaseline", () => {
 });
 
 /** Build a bun-shaped output for exactly these entries (self-checked below). */
-function outputFor(entries: string[]): string {
+function outputFor(entries: string[], ranFilesOverride?: number): string {
   const lines: string[] = ["bun test v1.3.14"];
   let file = "";
   let loadErrors = 0;
@@ -330,7 +331,7 @@ function outputFor(entries: string[]): string {
   lines.push(
     ` ${namedFails + loadErrors} fail`,
     `${loadErrors} error`,
-    `Ran ${entries.length} tests across ${new Set(entries.map((e) => (e.includes(": load error") ? e.slice(0, e.indexOf(":")) : e.split(" > ")[0]))).size} files. [10.00ms]`
+    `Ran ${entries.length} tests across ${ranFilesOverride ?? new Set(entries.map((e) => (e.includes(": load error") ? e.slice(0, e.indexOf(":")) : e.split(" > ")[0]))).size} files. [10.00ms]`
   );
   return lines.join("\n");
 }
@@ -702,7 +703,7 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
       runPartition: (fs) => {
         invocations.push(fs);
         const entries = fs.flatMap((f) => (entriesByFile[f] ?? []).map((n) => `${f} > ${n}`));
-        return { raw: outputFor(entries) };
+        return { raw: outputFor(entries, fs.length) };
       },
     };
   }
@@ -723,7 +724,7 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
           ...(baselineFails[f] ?? []).map((n) => `${f} > ${n}`),
           ...(freshByFile[f] ?? []).map((n) => `${f} > ${n}`),
         ]);
-        return { raw: outputFor(entries) };
+        return { raw: outputFor(entries, fs.length) };
       },
     };
   }
@@ -766,7 +767,7 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
         // partition 1 (c+d) dies mid-run — partial output only
         if (i === 1)
           return { raw: "c.test.ts:\n(fail) partial [1ms]", killed: true, errorCode: "ETIMEDOUT" };
-        return { raw: outputFor([]) };
+        return { raw: outputFor([], fs.length) };
       },
     };
     const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
@@ -860,9 +861,9 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
         if (fs[0] === "a.test.ts") {
           seenA += 1;
           const fresh = seenA <= 2 ? ["a.test.ts > NEW1"] : [];
-          return { raw: outputFor(["a.test.ts > a1", ...fresh]) };
+          return { raw: outputFor(["a.test.ts > a1", ...fresh], fs.length) };
         }
-        return { raw: outputFor([]) };
+        return { raw: outputFor([], fs.length) };
       },
     };
     const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
@@ -882,9 +883,9 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
           seenA += 1;
           // FLAKY appears on the first pass only
           const fresh = seenA === 1 ? ["a.test.ts > FLAKY"] : [];
-          return { raw: outputFor(["a.test.ts > a1", ...fresh]) };
+          return { raw: outputFor(["a.test.ts > a1", ...fresh], fs.length) };
         }
-        return { raw: outputFor([]) };
+        return { raw: outputFor([], fs.length) };
       },
     };
     const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
@@ -915,4 +916,82 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     // the ghost reproduces every time (it is in every re-run of partition a) → regression
     expect(code).toBe(1);
   });
+
+  // ─── Population-gap guard (file 19b items 1+2+3, review #1114) ────────────
+
+  test("an UNEXPLAINED population gap refuses --learn: exit 3 and NO baseline file is written (review defect)", () => {
+    chdirTmp();
+    // The review's exact shape: 10 files delivered, the engine ran 1 — the echo
+    // is a hard mismatch and the missing 9 left no trace (a silent union loss).
+    const files = Array.from({ length: 10 }, (_, i) => `f${i}.test.ts`);
+    const deps: PartitionDeps = {
+      listFiles: () => files,
+      runPartition: () => ({ raw: outputFor([], 1) }), // 1 ran, 10 delivered
+    };
+    const { code, out } = captureStdout(() => main(["--learn", "--partition=50"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("POPULATION GAP");
+    expect(out).toContain("UNEXPLAINED");
+    // the refusal names the lost files — "a gap" alone tells no one what vanished
+    expect(out).toContain("f0.test.ts");
+    // NO baseline file was written — the empty union must never become the reference
+    expect(existsSync(join(process.cwd(), BASELINE_PATH))).toBe(false);
+  });
+
+  test("a gap fully EXPLAINED by module-load-dead files is NOT a refusal (learn proceeds, the gap is named)", () => {
+    chdirTmp();
+    // a carries a real fail; b died at module load (a load-error entry names it,
+    // and bun does NOT count it in the echo) → delivered 2, ran 1, explained.
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: () => ({
+        raw: outputFor(["a.test.ts > a1", "b.test.ts: load error #1"], 1),
+      }),
+    };
+    const { code, out } = captureStdout(() => main(["--learn", "--partition=50"], neverRunner, deps));
+    expect(code).toBe(0);
+    expect(out).toContain("EXPLAINED");
+    expect(out).toContain("b.test.ts");
+    expect(existsSync(join(process.cwd(), BASELINE_PATH))).toBe(true);
+  });
+
+  test("the CONFIRMATION pass holds the same gap guard — an entry whose file never ran is never classified flaky", () => {
+    chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
+    let pass = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        pass += 1;
+        if (fs[0] === "a.test.ts") {
+          // first pass: a runs, carries a1 + a FRESH entry
+          if (pass === 1) return { raw: outputFor(["a.test.ts > a1", "a.test.ts > NEW1"], fs.length) };
+          // confirmation pass: a's output loses its echo (delivered 1, ran 0) —
+          // NEW1 absent would otherwise read as "flaky, did not reproduce"
+          return { raw: outputFor([], 0) };
+        }
+        return { raw: outputFor([], fs.length) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("POPULATION GAP in confirmation");
+    expect(out).toContain("never ran");
+    expect(out).not.toContain("flaky tail");
+  });
+
+  test("portable concrete control: realSuiteRunner's per-file selection runs TWO real Bun test files and the echo covers both", () => {
+    // File 19b item 4: a real `bun test ./a ./b` invocation, no learn. Two
+    // minimal real files in a tmp tree, run through the PRODUCTION runner's
+    // file-list path, and the Ran echo must count BOTH. This is the concrete
+    // witness that the multi-file union holds on this seat's bun.
+    const d = mkdtempSync(join(tmpdir(), "strict-sel-"));
+    tmpDirs.push(d);
+    writeFileSync(join(d, "one.test.ts"), 'import { test, expect } from "bun:test"; test("one", () => { expect(1).toBe(1); });\n');
+    writeFileSync(join(d, "two.test.ts"), 'import { test, expect } from "bun:test"; test("two", () => { expect(2).toBe(2); });\n');
+    const run = realSuiteRunner(d, { testFiles: ["one.test.ts", "two.test.ts"] })();
+    expect(run.killed ?? false).toBe(false);
+    const parsed = parseRunOutput(run.raw);
+    expect(ranLineFileCount(run.raw)).toBe(2);
+    expect(populationGapUnexplained(["one.test.ts", "two.test.ts"], ranLineFileCount(run.raw), parsed)).toEqual([]);
+  }, 30_000);
 });
