@@ -537,9 +537,9 @@ function currentSha(): string {
 }
 
 function printVerdict(v: StrictVerdict, hadBaseline: boolean): void {
-  const line = (s: string) => process.stdout.write(s + "\n");
+  const line = (s: string) => process.stdout.write(`${s}\n`);
   line("");
-  line("── [STRICT] end-of-run manifest " + "─".repeat(20));
+  line(`── [STRICT] end-of-run manifest ${"─".repeat(20)}`);
   if (v.envGates.length > 0) {
     const total = v.envGates.reduce((s, e) => s + e.notExecuted, 0);
     const budget = v.envGates.filter((e) => e.budget);
@@ -665,10 +665,9 @@ function printCrashedPartition(
   detail: string,
   raw: string
 ): void {
-  const line = (s: string) => process.stdout.write(s + "\n");
+  const line = (s: string) => process.stdout.write(`${s}\n`);
   line(
-    `[STRICT] 🔴 PARTITION ${index + 1}/${total} ${kind === "killed" ? "RUN KILLED" : "UNACCOUNTABLE"} (${detail}) — ` +
-      `its keys are UNKNOWN, never "zero fails": no verdict can be drawn while any partition is missing. Files:`
+    `[STRICT] 🔴 PARTITION ${index + 1}/${total} ${kind === "killed" ? "RUN KILLED" : "UNACCOUNTABLE"} (${detail}) — its keys are UNKNOWN, never "zero fails": no verdict can be drawn while any partition is missing. Files:`
   );
   for (const f of files) line(`[STRICT]   · ${f}`);
   const tail = raw
@@ -742,8 +741,7 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
   const manifest = baseline?.partition;
   if (!learn && baseline && manifest === undefined) {
     process.stdout.write(
-      "[STRICT] 🔴 NO VERDICT — the baseline was captured WITHOUT partitions; a partitioned verify cuts a different " +
-        `population. Re-learn with --partition=${n} (learn and verify must run the same mode and size).\n`
+      `[STRICT] 🔴 NO VERDICT — the baseline was captured WITHOUT partitions; a partitioned verify cuts a different population. Re-learn with --partition=${n} (learn and verify must run the same mode and size).\n`
     );
     return 3;
   }
@@ -845,7 +843,7 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
       fails: observed,
       partition: { n, boundaries },
     };
-    writeFileSync(join(cwd, BASELINE_PATH), JSON.stringify(baseline, null, 2) + "\n", "utf-8");
+    writeFileSync(join(cwd, BASELINE_PATH), `${JSON.stringify(baseline, null, 2)}\n`, "utf-8");
     process.stdout.write(
       `[STRICT] baseline captured: ${observed.length} fail(s) on ${baseline.sha} → ${BASELINE_PATH}\n` +
         `[STRICT] partition manifest recorded: n=${n}, ${partitions.length} slice(s).\n` +
@@ -916,10 +914,7 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
         const unexplained2 = populationGapUnexplained(partitions[i], ranFiles2, parsed2);
         if (unexplained2.length > 0) {
           process.stdout.write(
-            `[STRICT] 🔴 POPULATION GAP in confirmation of partition ${i + 1}/${partitions.length}: ` +
-              `${ranFiles2 ?? "NO Ran line"} file(s) ran / ${partitions[i].length} delivered — ` +
-              `${unexplained2.length} UNEXPLAINED (not a module-load death). No entry is classified ` +
-              "flaky from a population that never ran:\n"
+            `[STRICT] 🔴 POPULATION GAP in confirmation of partition ${i + 1}/${partitions.length}: ${ranFiles2 ?? "NO Ran line"} file(s) ran / ${partitions[i].length} delivered — ${unexplained2.length} UNEXPLAINED (not a module-load death). No entry is classified flaky from a population that never ran:\n`
           );
           for (const f of unexplained2) process.stdout.write(`[STRICT]   · ${f}\n`);
           return 3;
@@ -963,10 +958,7 @@ export function main(
   const parsed1 = parseRunOutput(run1.raw);
   if (!runIsAccountable(parsed1)) {
     process.stdout.write(
-      `[STRICT] 🔴 NO VERDICT — parsed entries (${parsed1.entries.length}) do not account for bun's own ` +
-        `counters (fail=${parsed1.fail}, error=${parsed1.error}, ran-line ${parsed1.ranLinePresent ? "present" : "ABSENT"}).\n` +
-        "[STRICT]   A gap means the parser is blind to a failure shape (module-load death, truncated " +
-        "output past maxBuffer) — trusting it would print a false green. Fix the parser, re-run.\n"
+      `[STRICT] 🔴 NO VERDICT — parsed entries (${parsed1.entries.length}) do not account for bun's own counters (fail=${parsed1.fail}, error=${parsed1.error}, ran-line ${parsed1.ranLinePresent ? "present" : "ABSENT"}).\n[STRICT]   A gap means the parser is blind to a failure shape (module-load death, truncated output past maxBuffer) — trusting it would print a false green. Fix the parser, re-run.\n`
     );
     return 3;
   }
@@ -978,7 +970,7 @@ export function main(
       capturedAt: new Date().toISOString(),
       fails: observed,
     };
-    writeFileSync(join(cwd, BASELINE_PATH), JSON.stringify(baseline, null, 2) + "\n", "utf-8");
+    writeFileSync(join(cwd, BASELINE_PATH), `${JSON.stringify(baseline, null, 2)}\n`, "utf-8");
     process.stdout.write(
       `[STRICT] baseline captured: ${observed.length} fail(s) on ${baseline.sha} → ${BASELINE_PATH}\n`
     );

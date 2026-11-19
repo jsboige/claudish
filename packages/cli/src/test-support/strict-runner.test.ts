@@ -928,7 +928,9 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
       listFiles: () => files,
       runPartition: () => ({ raw: outputFor([], 1) }), // 1 ran, 10 delivered
     };
-    const { code, out } = captureStdout(() => main(["--learn", "--partition=50"], neverRunner, deps));
+    const { code, out } = captureStdout(() =>
+      main(["--learn", "--partition=50"], neverRunner, deps)
+    );
     expect(code).toBe(3);
     expect(out).toContain("POPULATION GAP");
     expect(out).toContain("UNEXPLAINED");
@@ -948,7 +950,9 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
         raw: outputFor(["a.test.ts > a1", "b.test.ts: load error #1"], 1),
       }),
     };
-    const { code, out } = captureStdout(() => main(["--learn", "--partition=50"], neverRunner, deps));
+    const { code, out } = captureStdout(() =>
+      main(["--learn", "--partition=50"], neverRunner, deps)
+    );
     expect(code).toBe(0);
     expect(out).toContain("EXPLAINED");
     expect(out).toContain("b.test.ts");
@@ -964,7 +968,8 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
         pass += 1;
         if (fs[0] === "a.test.ts") {
           // first pass: a runs, carries a1 + a FRESH entry
-          if (pass === 1) return { raw: outputFor(["a.test.ts > a1", "a.test.ts > NEW1"], fs.length) };
+          if (pass === 1)
+            return { raw: outputFor(["a.test.ts > a1", "a.test.ts > NEW1"], fs.length) };
           // confirmation pass: a's output loses its echo (delivered 1, ran 0) —
           // NEW1 absent would otherwise read as "flaky, did not reproduce"
           return { raw: outputFor([], 0) };
@@ -986,12 +991,20 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     // witness that the multi-file union holds on this seat's bun.
     const d = mkdtempSync(join(tmpdir(), "strict-sel-"));
     tmpDirs.push(d);
-    writeFileSync(join(d, "one.test.ts"), 'import { test, expect } from "bun:test"; test("one", () => { expect(1).toBe(1); });\n');
-    writeFileSync(join(d, "two.test.ts"), 'import { test, expect } from "bun:test"; test("two", () => { expect(2).toBe(2); });\n');
+    writeFileSync(
+      join(d, "one.test.ts"),
+      'import { test, expect } from "bun:test"; test("one", () => { expect(1).toBe(1); });\n'
+    );
+    writeFileSync(
+      join(d, "two.test.ts"),
+      'import { test, expect } from "bun:test"; test("two", () => { expect(2).toBe(2); });\n'
+    );
     const run = realSuiteRunner(d, { testFiles: ["one.test.ts", "two.test.ts"] })();
     expect(run.killed ?? false).toBe(false);
     const parsed = parseRunOutput(run.raw);
     expect(ranLineFileCount(run.raw)).toBe(2);
-    expect(populationGapUnexplained(["one.test.ts", "two.test.ts"], ranLineFileCount(run.raw), parsed)).toEqual([]);
+    expect(
+      populationGapUnexplained(["one.test.ts", "two.test.ts"], ranLineFileCount(run.raw), parsed)
+    ).toEqual([]);
   }, 30_000);
 });
