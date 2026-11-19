@@ -28,7 +28,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { spawnSync } from "node:child_process";
 import { existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Socket, UnixSocketListener } from "bun";
 import { resetRecoveryClock, setRecoveryClock } from "./clock.js";
 import {
@@ -1345,6 +1345,57 @@ describe("B15: shutdownRecoveryUi", () => {
       expect(f.opened).toBe(connectionsBefore);
       expect(lease(h2.episodeId)).toBe(false);
       expect(lease(h.episodeId)).toBe(false);
+    },
+    SOCKET_TEST_TIMEOUT
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// B16 — the endpoint gate against a LIVE listener (win32 fs-node probe)
+// ───────────────────────────────────────────────────────────────────────────
+
+describe("B16: endpoint gate vs a live listener", () => {
+  test(
+    "B16: a live magmux socket whose path has no fs node still receives the banner (Bun.listen creates no node on win32)",
+    async () => {
+      const f = startFake();
+      // #1115 (measured 19/11, bun 1.3.14 win32): existsSync(socketPath) is
+      // FALSE while the listener is alive — Bun.listen binds AF_UNIX without
+      // creating a filesystem node. A gate that requires existsSync(sock)
+      // before connecting therefore refuses a LIVE magmux on every win32 seat.
+      // POSIX guarantee to preserve: a bound unix socket IS an fs node there,
+      // so this test is just as green (and the dead-path refusal in B10 stays).
+      const sockExists = existsSync(f.path);
+      console.error(
+        `B16-PROBE platform=${process.platform} bun=${Bun.version} socketFsNodeExists=${sockExists}`
+      );
+
+      installRecoveryUi(f.path);
+      const h = open();
+
+      await awaitBanner(f); // the banner MUST land: the listener is live
+      await until(() => lease(h.episodeId), "the lease from a live socket with no fs node");
+      expect(describeLease(h.episodeId).connected).toBe(true);
+    },
+    SOCKET_TEST_TIMEOUT
+  );
+
+  test(
+    "B16: the SOCKET node is absent after listen while its PARENT directory stays visible — separate existence questions",
+    async () => {
+      const f = startFake();
+      // Two different answers, never collapsed into one: a missing PARENT means
+      // the listener could never bind; a missing SOCKET node on a live listener
+      // means the OS exposes no fs node for it (win32). The gate must only ever
+      // need the connection, not the node.
+      expect(existsSync(dirname(f.path))).toBe(true);
+      const sockExists = existsSync(f.path);
+      console.error(
+        `B16-PROBE-2 platform=${process.platform} socketFsNode=${sockExists} parentDir=true`
+      );
+      if (process.platform !== "win32") expect(sockExists).toBe(true); // POSIX guarantee
+      await settle(50);
+      expect(f.liveConnections).toBe(0); // nobody connected; listener still bound
     },
     SOCKET_TEST_TIMEOUT
   );
