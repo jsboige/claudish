@@ -154,11 +154,16 @@ def read_pinned_tree(repo: Path, pin: str) -> set[str]:
     if rev.returncode != 0:
         raise InstrumentError(f"pinned ref unresolvable: {pin} (fetch it or pass --pin)")
     sha = rev.stdout.strip()
-    ls = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "--name-only", sha],
+    # -z + core.quotePath=false: with the default, git QUOTES any non-ASCII path
+    # ("...Cr\303\251ateur..."), so endswith('.ipynb') silently drops it — an
+    # accented -CSharp twin would vanish from cs and its Python source would
+    # become a false orphan, which is the exact class this selector closes.
+    ls = subprocess.run(["git", "-C", str(repo), "-c", "core.quotePath=false",
+                         "ls-tree", "-r", "-z", "--name-only", sha],
                         capture_output=True, text=True, encoding="utf-8")
     if ls.returncode != 0:
         raise InstrumentError(f"git ls-tree failed on {pin} — refusing to read an empty tree")
-    return {norm(p) for p in ls.stdout.splitlines() if p.endswith(".ipynb")}
+    return {norm(p) for p in ls.stdout.split("\0") if p.endswith(".ipynb")}
 
 
 def run_selection(repo: Path, identity: Identity, inflight_queues: list[str],
@@ -189,6 +194,8 @@ def run_selection(repo: Path, identity: Identity, inflight_queues: list[str],
         p = tmp_root / q / "grains.jsonl"
         if p.exists():
             for line in p.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue          # an in-flight blank line is not a defect
                 g = json.loads(line)
                 for k in ("notebook", "source_nb"):
                     if g.get(k):

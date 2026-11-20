@@ -99,16 +99,110 @@ class SelectionTests(unittest.TestCase):
             # so the Python notebook is a real orphan and stays available.
             self.assertIn("Series/T-01-Python.ipynb", result["avail"])
 
-    def test_git_read_failure_is_not_an_empty_tree(self):
-        """A failed Git read refuses; it never yields 'every notebook is orphan'."""
+    def test_blank_line_in_grains_jsonl_is_skipped(self):
+        """Review (not blocking): a blank line raised a bare JSONDecodeError
+        traceback instead of a clean run — the in-flight queue stays readable."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            repo = make_repo(root)
+            q = root / "lane-q"
+            q.mkdir()
+            (q / "grains.jsonl").write_text(
+                '{"notebook": "Series/T-01-Python.ipynb"}\n\n', encoding="utf-8")
             identity = FakeIdentity([("pulls?state=open", []), ("issues?state=open", [])])
-            with self.assertRaises(ns.InstrumentError):
-                ns.run_selection(root / "not-a-git-repo", identity, [], root, pin="HEAD")
+            result = ns.run_selection(repo, identity, ["lane-q"], root, pin="HEAD")
+            self.assertEqual(result["counts"]["inflight"], 1,
+                             "the real line still counts; the blank line is ignored")
+            self.assertNotIn("Series/T-01-Python.ipynb", result["avail"])
+
+    def test_ls_tree_failure_is_not_an_empty_tree(self):
+        """M3 (review at 3bf48f1f): the SECOND Git read carries this PR's claim.
+
+        The not-a-git-repo test above only reaches the rev-parse branch; a
+        monkeypatched subprocess.run that passes the first call and fails the
+        second pins the ls-tree branch itself.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            real_run = subprocess.run
+            sha = git(repo, "rev-parse", "HEAD").strip()
+            calls = []
+
+            class Done:
+                def __init__(self, rc, out="", err=""):
+                    self.returncode, self.stdout, self.stderr = rc, out, err
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                if len(calls) == 1:
+                    return Done(0, sha + "\n")
+                return Done(128, "", "fatal: simulated ls-tree failure")
+
+            ns.subprocess.run = fake_run
+            try:
+                with self.assertRaises(ns.InstrumentError) as cm:
+                    ns.read_pinned_tree(repo, "HEAD")
+            finally:
+                ns.subprocess.run = real_run
+            self.assertEqual(len(calls), 2, "the failure must land on the ls-tree call")
+            self.assertIn("ls-tree", str(cm.exception),
+                          "the refusal names the read that failed")
+
+    def test_accented_csharp_twin_is_member_of_the_pinned_tree(self):
+        """Non-ASCII paths: git quotes them by default, so endswith('.ipynb') drops
+        them. An accented -CSharp twin would vanish from cs and its Python source
+        would become a false orphan — the exact class this selector closes."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            accented = "Series/Créateur-01-CSharp.ipynb"
+            (repo / "Series" / "Créateur-01-CSharp.ipynb").write_text("{}", encoding="utf-8")
+            (repo / "Series" / "Créateur-01-Python.ipynb").write_text("{}", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "accented pair")
+            # premise: the default rendering really does quote the path
+            quoted = git(repo, "ls-tree", "-r", "--name-only", "HEAD")
+            self.assertIn('"Series/Cr', quoted, "premise: default ls-tree quotes non-ASCII")
+            files = ns.read_pinned_tree(repo, "HEAD")
+            self.assertIn(accented, files, "the accented twin must be a member")
+            identity = FakeIdentity([("pulls?state=open", []), ("issues?state=open", [])])
+            result = ns.run_selection(repo, identity, [], root, pin="HEAD")
+            self.assertEqual(result["counts"]["cs"], 1)
+            self.assertNotIn("Series/Créateur-01-Python.ipynb", result["avail"],
+                             "a false orphan here would ship a duplicate twin")
 
 
 class ProofTests(unittest.TestCase):
+    def test_identity_gh_failure_is_sanitized(self):
+        """M6 (review at 3bf48f1f): Identity.gh() is the process that CARRIES GH_TOKEN.
+
+        Only forge_token() had a pin. A fake gh that prints a marker on stderr and
+        exits non-zero pins the second sanitization: status + endpoint, never the
+        child's stderr.
+        """
+        import os
+        import sys
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            if sys.platform == "win32":
+                fake = root / "gh-fake.bat"
+                fake.write_text("@echo off\r\necho SUPERSECRET-GH-xyz 1>&2\r\nexit /b 4\r\n",
+                                encoding="utf-8")
+            else:
+                fake = root / "gh-fake"
+                fake.write_text("#!/bin/sh\necho SUPERSECRET-GH-xyz >&2\nexit 4\n",
+                                encoding="utf-8")
+                os.chmod(fake, 0o755)
+            identity = ns.Identity(str(fake), "tok-never-printed", "app")
+            with self.assertRaises(ns.InstrumentError) as cm:
+                identity.gh(["api", "repos/o/r/pulls?state=open"])
+            text = str(cm.exception)
+            self.assertNotIn("SUPERSECRET", text, "gh stderr must never reach the error")
+            self.assertNotIn("tok-never-printed", text, "the token must never be echoed")
+            self.assertIn("rc=4", text, "the status is the operator's signal")
+            self.assertIn("repos/o/r/pulls", text, "the endpoint names where it failed")
+
     def test_forge_failure_is_sanitized(self):
         """A credential-bearing child's output never reaches the error text."""
         with tempfile.TemporaryDirectory() as td:
