@@ -1290,10 +1290,22 @@ function Get-ContainerRelaunchDecision {
         [switch]$DryRun
     )
 
+    # Guarded reads, mirroring the engine ladder (2026-11-20 kill-test): a state
+    # file written before R0 shipped carries NONE of the three Container* keys,
+    # and a bare `$State.ContainerStoppedFailures` under Set-StrictMode throws
+    # PropertyNotFoundStrict — observed live on po-2028 (task.out, 20/11 22:00Z),
+    # where the throw kept the counter at zero and R0 could never reach its
+    # threshold. Absent key = first sighting = 0.
+    $cFails = 0
+    if ($State.ContainsKey('ContainerStoppedFailures') -and $null -ne $State.ContainerStoppedFailures) { $cFails = [int]$State.ContainerStoppedFailures }
+    $cSinceDown = 0
+    if ($State.ContainsKey('ContainerRelaunchSinceDown') -and $null -ne $State.ContainerRelaunchSinceDown) { $cSinceDown = [int]$State.ContainerRelaunchSinceDown }
+    $lAction = $null
+    if ($State.ContainsKey('LastContainerActionUtc')) { $lAction = $State.LastContainerActionUtc }
     $next = @{
-        ContainerStoppedFailures   = [int]$State.ContainerStoppedFailures
-        LastContainerActionUtc     = $State.LastContainerActionUtc
-        ContainerRelaunchSinceDown = [int]$State.ContainerRelaunchSinceDown
+        ContainerStoppedFailures   = $cFails
+        LastContainerActionUtc     = $lAction
+        ContainerRelaunchSinceDown = $cSinceDown
     }
 
     # Not this class: only a FULLY dead loopback on an UP engine with a STOPPED
@@ -1323,7 +1335,10 @@ function Get-ContainerRelaunchDecision {
     }
 
     $next.ContainerStoppedFailures++
-    $sinceAction = ($NowUtc - $State.LastContainerActionUtc).TotalMinutes
+    # Guarded read via $lAction: a legacy state file has no
+    # LastContainerActionUtc key (kill-test 20/11). Absent = no action ever =
+    # the cooldown has always elapsed.
+    $sinceAction = ($NowUtc - $(if ($null -ne $lAction) { [datetime]$lAction } else { [datetime]::MinValue })).TotalMinutes
 
     if ($next.ContainerStoppedFailures -lt $ConsecutiveStoppedFailures) {
         $action = 'pending'; $reason = "container stopped ($($next.ContainerStoppedFailures)/$ConsecutiveStoppedFailures) — counting"
@@ -1336,7 +1351,10 @@ function Get-ContainerRelaunchDecision {
         # as long as the container stayed absent — the docstring's "Terminal:
         # said its line; the cooldown bounds the repeats" was false for absent.
         $action = 'container_absent'; $reason = 'container absent — escalate, never try to start a container that is not there'
-    } elseif ($State.ContainerRelaunchSinceDown -ge 1) {
+    } elseif ($next.ContainerRelaunchSinceDown -ge 1) {
+        # Read off $next (guarded at the top), never $State directly: a legacy
+        # state file carries no Container* key and the bare read throws under
+        # Set-StrictMode (kill-test 20/11).
         $action = 'r0_after_relaunch'; $reason = 'R0 already fired once this episode and the container re-exited — escalate, never a start-loop (re_exited_after_start)'
     } else {
         $action = 'r0_start'; $reason = 'container stopped on a healthy engine — the measured read path: docker start claudish-proxy'
@@ -1349,10 +1367,12 @@ function Get-ContainerRelaunchDecision {
         $next.ContainerStoppedFailures = 0
     }
     if ($DryRun) {
+        # Input state unchanged — rebuilt from the guarded locals, not from
+        # unguarded $State reads (a legacy file has no Container* keys).
         $next = @{
-            ContainerStoppedFailures   = [int]$State.ContainerStoppedFailures
-            LastContainerActionUtc     = $State.LastContainerActionUtc
-            ContainerRelaunchSinceDown = [int]$State.ContainerRelaunchSinceDown
+            ContainerStoppedFailures   = $cFails
+            LastContainerActionUtc     = $lAction
+            ContainerRelaunchSinceDown = $cSinceDown
         }
     }
     return [PSCustomObject]@{ Action = $action; NextState = $next; SinceActionMin = $sinceAction; Reason = $reason }

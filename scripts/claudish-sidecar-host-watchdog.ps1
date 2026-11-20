@@ -664,19 +664,37 @@ $containerState = 'unknown'
 if ($verdict -eq 'LOOPBACK_DEAD' -and $engine -eq 'up') {
     $containerState = Get-ClaudishContainerState -ContainerName $ContainerName
 }
-$r0 = Get-ContainerRelaunchDecision -State $State `
-    -LoopbackVerdict $verdict `
-    -EngineVerdict $engine `
-    -ContainerState $containerState `
-    -DrainInFlight (Test-DrainInFlight) `
-    -NowUtc ([DateTimeOffset]::UtcNow).UtcDateTime `
-    -DryRun:$DryRun
+# Deployment half of #1126 (kill-test 20/11, po-2028): the .ps1 shipped with
+# `Copy-Item`, but the MODULE copy in `$HOME\.claudish\bin\lib\` was never
+# refreshed — `Get-ContainerRelaunchDecision` was absent, every tick paid a
+# CommandNotFoundException that PowerShell treated as non-terminating, $r0
+# stayed $null, and R0 was inert for 24 consecutive LOOPBACK_DEAD ticks with
+# NO line to show for it. The presence check turns that silent failure into an
+# explicit escalation line, and the null guards keep the rest of the tick
+# (state save, log line) sound even when the module is stale.
+$r0 = $null
+if (Get-Command Get-ContainerRelaunchDecision -ErrorAction SilentlyContinue) {
+    $r0 = Get-ContainerRelaunchDecision -State $State `
+        -LoopbackVerdict $verdict `
+        -EngineVerdict $engine `
+        -ContainerState $containerState `
+        -DrainInFlight (Test-DrainInFlight) `
+        -NowUtc ([DateTimeOffset]::UtcNow).UtcDateTime `
+        -DryRun:$DryRun
+} else {
+    $actions += 'R0_UNAVAILABLE_MODULE_STALE deploy=copy scripts\lib\claudish-engine.psm1 $HOME\.claudish\bin\lib\'
+}
 # Fold the R0 next-state back into the shared state table (the engine ladder
 # above already produced $State with its own fields; R0 owns the three
 # Container* keys).
-$State.ContainerStoppedFailures   = $r0.NextState.ContainerStoppedFailures
-$State.LastContainerActionUtc     = $r0.NextState.LastContainerActionUtc
-$State.ContainerRelaunchSinceDown = $r0.NextState.ContainerRelaunchSinceDown
+if ($r0 -and $r0.NextState) {
+    $State.ContainerStoppedFailures   = $r0.NextState.ContainerStoppedFailures
+    $State.LastContainerActionUtc     = $r0.NextState.LastContainerActionUtc
+    $State.ContainerRelaunchSinceDown = $r0.NextState.ContainerRelaunchSinceDown
+}
+if (-not $r0) {
+    # stale module: nothing to switch on; the escalation line above said it.
+} else {
 switch ($r0.Action) {
     'r0_start' {
         if ($DryRun) {
@@ -724,6 +742,7 @@ switch ($r0.Action) {
         $actions += "R0_PENDING stopped=$($State.ContainerStoppedFailures)/2"
     }
     # not_this_class: no line (the common case — container running or engine path owns it).
+}
 }
 
 # A dry run measures; it must not move the state machine (its failure counters

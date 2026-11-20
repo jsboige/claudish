@@ -247,3 +247,30 @@ Describe 'R0 -ContainerName wiring (the sidecar is not claudish-proxy everywhere
         $script:Source | Should -Match 'R0_DOCKER_START_CONTAINER_BEGIN container=\$containerState name=\$ContainerName'
     }
 }
+
+Describe 'R0 deployment half: stale module and legacy state must never be silent' {
+    # 2026-11-20 kill-test on po-2028 (#1126 proof #3): the .ps1 was deployed
+    # but the MODULE copy under $HOME\.claudish\bin\lib\ was not — every tick
+    # paid a CommandNotFoundException, $r0 stayed null and R0 was inert for 24
+    # consecutive LOOPBACK_DEAD ticks with no line to show for it. Two pins:
+    # the presence guard exists in the script, and a legacy state hashtable
+    # (no Container* keys) drives the decision without throwing.
+    BeforeAll {
+        $script:WatchdogPath2 = Join-Path $PSScriptRoot '..\claudish-sidecar-host-watchdog.ps1'
+        $script:Source2 = Get-Content $script:WatchdogPath2 -Raw
+    }
+
+    It 'the R0 decision call is guarded by a presence check with an explicit escalation line' {
+        $script:Source2 | Should -Match 'Get-Command Get-ContainerRelaunchDecision -ErrorAction SilentlyContinue'
+        $script:Source2 | Should -Match 'R0_UNAVAILABLE_MODULE_STALE deploy=copy scripts\\lib\\claudish-engine\.psm1'
+    }
+
+    It 'a legacy state hashtable (no Container* keys) counts a first sighting instead of throwing' {
+        $t = Invoke-R0 -State @{}
+        $t.Action | Should -Be 'pending'
+        $t.NextState.ContainerStoppedFailures | Should -Be 1
+        $t.NextState.ContainerRelaunchSinceDown | Should -Be 0
+        $t2 = Invoke-R0 -State $t.NextState
+        $t2.Action | Should -Be 'r0_start'
+    }
+}
