@@ -35,9 +35,27 @@ if (process.env.CLAUDISH_W1_KIMI_CHILD !== "1") {
         new Response(child.stderr).text(),
         child.exited,
       ]);
-      expect(exit, stdout + stderr).toBe(0);
-      expect(stdout + stderr).toContain("0 fail");
-      process.stdout.write(stdout + stderr);
+      // bun prints an expect() custom message (and a toContain diff) on
+      // failure — embedding the RAW child output would leak its "(fail)" lines
+      // and "Ran N tests" summary into THIS process's console and break the
+      // strict runner's accounting (measured: partition 1 rendered 26 parsed
+      // entries for bun's fail=24). The digest keeps only count lines, which
+      // no strict parser pattern can match; rerun this file directly for the
+      // full child diff.
+      const childOut = stdout + stderr;
+      const childDigest =
+        childOut
+          .split(/\r?\n/)
+          .filter((line) => /^\s*\d+ (pass|fail|skip|error)\b/.test(line))
+          .join(" / ") || "no summary rendered";
+      expect(
+        exit,
+        `child exit ${exit}; child summary [${childDigest}] — rerun this file directly for the full diff`
+      ).toBe(0);
+      expect(
+        childOut.includes("0 fail"),
+        `child reported failures [${childDigest}] — rerun this file directly`
+      ).toBe(true);
       expect(existsSync(join(home, ".claudish", "kimi-device-id"))).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });

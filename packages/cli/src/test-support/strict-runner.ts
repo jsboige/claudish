@@ -35,17 +35,31 @@
  * that reproduces is a regression whatever the count, one that does not is
  * noise.
  *
+ * Partitioned mode (#641 C3, opt-in): `--partition[=N]` runs the population in
+ * N-file slices (sorted paths, cut by COUNT — a per-directory cut leaves the
+ * root at 151 files, three directories at 119-131, all inside the crash zone
+ * measured at 176 files / ~1.3 GB RSS). Each partition is its own `bun test`
+ * process with its own wall clock; a partition that crashes or cannot be
+ * accounted for refuses the verdict (exit 3) naming the partition and its
+ * files — its keys are unknown, never "zero fails". The baseline records the
+ * partition size and boundaries; a verify with a different size (or a
+ * single-process baseline) refuses until re-learned in the same mode.
+ *
  * Usage:
  *   bun run packages/cli/src/test-support/strict-runner.ts            # compare
  *   bun run packages/cli/src/test-support/strict-runner.ts --learn    # capture
+ *   bun run packages/cli/src/test-support/strict-runner.ts --learn --partition=50
+ *   bun run packages/cli/src/test-support/strict-runner.ts --partition=50
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { BUDGET_FOOTER_MARKER } from "./env-gate";
 
 export const BASELINE_PATH = ".test-strict-baseline.json";
 const DEFAULT_TEST_TIMEOUT_MS = 15_000;
+/** The population the monolithic mode points `bun test` at (see realSuiteRunner). */
+export const TEST_ROOT = "packages/cli/src";
 
 export interface StrictBaseline {
   /** commit the baseline was captured on, for staleness checks */
@@ -53,6 +67,12 @@ export interface StrictBaseline {
   capturedAt: string;
   /** failing entries, sorted: "file > describe > test" or "file: load error #N" */
   fails: string[];
+  /**
+   * Present iff the baseline was captured with --partition: the slice size and
+   * the first file of each slice. Learn and verify must cut the same
+   * population — a verify at a different N (or without partitions) refuses.
+   */
+  partition?: PartitionManifest;
 }
 
 export interface EnvGateSummaryEntry {
@@ -210,6 +230,110 @@ export function runIsAccountable(run: SuiteRun): boolean {
 }
 
 /**
+ * The `Ran N tests across M files` line's M. The partitioned mode uses it as a
+ * population echo: bun was handed exactly K files, so M is the only in-output
+ * witness of how many of them actually ran. A persistent M < K on every
+ * partition would mean the multi-arg union does not hold (each call would be
+ * running one file) — the kind of silent population loss this gate must never
+ * green over, so the mismatch is PRINTED for the operator even though a
+ * zero-test file can legitimately keep M off K by one.
+ *
+ * The LAST match wins: a nested bun-test child (a file spawning
+ * `bun test <one file>` with inherited stdio) prints its own summary EARLIER
+ * in the stream, and the first match would shadow the parent's final line —
+ * measured 18/11: partitions hosting `call-abort.test.ts` or
+ * `client-cancel.test.ts` echoed "1 file ran" for 50 delivered files.
+ */
+export function ranLineFileCount(raw: string): number | null {
+  const matches = raw.matchAll(/^Ran \d+ tests? across (\d+) files?\./gm);
+  let last: number | null = null;
+  for (const m of matches) last = Number(m[1]);
+  return last;
+}
+
+/**
+ * The files a partition delivered but bun's population echo never counted, and
+ * whether each is EXPLAINED. The only explained shape is an inspected file with
+ * no runnable test: it died at module load (a `load error` entry names it) or
+ * carries zero tests (its header prints, no entry exists). Anything else — a
+ * missing file with a PASSING body would leave no trace either — is an
+ * UNEXPLAINED population loss: the union the runner just compared is not the
+ * population it delivered. Review #1114 (file 19b item 1): a delivered set of
+ * 10 files echoed "Ran 1 test across 1 file" and --learn wrote an EMPTY
+ * baseline with exit 0. This classification is what turns that silent loss
+ * into a named refusal instead.
+ */
+export function missingRunnableFiles(
+  delivered: string[],
+  parsed: SuiteRun
+): { missing: string[]; unexplained: string[] } {
+  const seen = new Set(parsed.entries.map(entryFile));
+  const missing = delivered.filter((f) => !seen.has(f));
+  const loadDead = missing.filter((f) =>
+    parsed.entries.some((e) => e.startsWith(`${f}: load error`))
+  );
+  return { missing, unexplained: missing.filter((f) => !loadDead.includes(f)) };
+}
+
+/**
+ * One gate, both passes (file 19b items 1+2): a population echo that does not
+ * match the delivered set is a refusal (exit 3) UNLESS every missing file is an
+ * inspected-without-runnable-test one. Returns the unexplained list (empty =
+ * the gap is fully explained). `ranFiles === null` means the echo is absent —
+ * the population is UNKNOWN, which is unexplained by definition.
+ */
+export function populationGapUnexplained(
+  delivered: string[],
+  ranFiles: number | null,
+  parsed: SuiteRun
+): string[] {
+  if (ranFiles === null) return [...delivered]; // unknown population: never a baseline
+  if (ranFiles >= delivered.length) return []; // nothing missing (an over-count is refused below first)
+  return missingRunnableFiles(delivered, parsed).unexplained;
+}
+
+/**
+ * Review #1114, second review: an echo that attests MORE files than were
+ * delivered is not coverage — it is no attestation of this run at all. The
+ * review's witness: deliver a.test.ts + b.test.ts, parse an otherwise
+ * accountable "Ran N tests across 3 files" — the old `>=` read that as "the
+ * echo covers the delivery", --learn wrote the empty union as a baseline and
+ * returned 0. Three files cannot attest the execution of exactly two.
+ *
+ * This predicate stays NUMERIC: it fires only when the echo outruns BOTH the
+ * delivery and every file the entries name (no trace at all accounts for the
+ * extra count). The shape where the echo IS consistent with the entries but
+ * an entry names a file outside the delivery is a FOREIGN entry, not an
+ * over-count — foreignEntryFiles owns that case (third review).
+ */
+export function populationEchoOverCounts(
+  delivered: string[],
+  ranFiles: number | null,
+  parsed: SuiteRun
+): boolean {
+  if (ranFiles === null) return false; // unknown population: the gap guard owns it
+  const entryFiles = new Set(parsed.entries.map(entryFile));
+  return ranFiles > delivered.length && ranFiles > entryFiles.size;
+}
+
+/**
+ * Review #1114, third review (file 20a): an entry naming a file OUTSIDE the
+ * delivery is a foreign population. Its witness: 1 delivered a.test.ts,
+ * accountable output with failed entries for a.test.ts AND ghost.test.ts,
+ * echo 2 — learn wrote BOTH into the baseline and returned 0, because the
+ * count guards all pass (echo == entry-file count >= delivery) and the
+ * re-run-everything fallback lives only on the verify path, never reached in
+ * learn. A foreign entry is refused everywhere it is parsed: no baseline
+ * write, no verdict, and on confirmation a foreign population is never
+ * evidence of non-reproduction (a ghost cannot re-appear in a partition it
+ * was never delivered to, so its absence would read as flaky).
+ */
+export function foreignEntryFiles(delivered: string[], parsed: SuiteRun): string[] {
+  const owned = new Set(delivered);
+  return [...new Set(parsed.entries.map(entryFile))].filter((f) => !owned.has(f)).sort();
+}
+
+/**
  * The reproduction rule: a fresh entry that reproduces on the confirmation
  * run is a regression whatever the count; one that does not is noise. This is
  * the property the body names ("a different test each time") — a count-based
@@ -299,6 +423,93 @@ export function resolveWallClockMs(env: NodeJS.ProcessEnv = process.env): number
 }
 
 /**
+ * Partitioned mode (#641 C3). Measured on the synchronized v14 head: the full
+ * population dies around 176 files / ~1.3 GB RSS, and a per-DIRECTORY cut does
+ * not bound the slice (src root 151, providers 131, handlers 119 — three
+ * directories at 68-86 % of the crash point). The cut is therefore by COUNT:
+ * the sorted file list is sliced into blocks of at most N, so no slice can
+ * exceed N however any directory is populated.
+ */
+export const DEFAULT_PARTITION_SIZE = 50;
+
+export interface PartitionManifest {
+  /** slice size the baseline was captured with (`--partition=N`) */
+  n: number;
+  /** first file of each slice, in order — the cut points of the capture */
+  boundaries: string[];
+}
+
+/** Slice a SORTED file list into consecutive blocks of at most N files. */
+export function planPartitions(files: string[], n: number): string[][] {
+  if (!Number.isInteger(n) || n <= 0)
+    throw new Error(`planPartitions: n must be a positive integer, got ${n}`);
+  const out: string[][] = [];
+  for (let i = 0; i < files.length; i += n) out.push(files.slice(i, i + n));
+  return out;
+}
+
+const TEST_FILE_RE = /\.test\.[cm]?[jt]sx?$/;
+
+/**
+ * The population the partitioned mode runs: every test file under TEST_ROOT,
+ * sorted, forward slashes. Sorted so `--learn` and the verdict cut the SAME
+ * population for a given N (determinism is the whole point of recording
+ * boundaries in the baseline).
+ */
+export function enumerateTestFiles(root: string): string[] {
+  const out: string[] = [];
+  const walk = (dir: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(join(dir, e.name));
+      else if (TEST_FILE_RE.test(e.name)) out.push(join(dir, e.name).replace(/\\/g, "/"));
+    }
+  };
+  walk(root);
+  out.sort();
+  return out;
+}
+
+/**
+ * Parse `--partition` (default size) / `--partition=N`. Returns "invalid" for
+ * a malformed value so main() can refuse BEFORE enumerating anything — a
+ * usage error must never fall back to a silent single-process run.
+ */
+export function parsePartitionArg(argv: string[]): { n: number } | "invalid" | null {
+  for (const a of argv) {
+    if (a === "--partition") return { n: DEFAULT_PARTITION_SIZE };
+    if (a.startsWith("--partition=")) {
+      const n = Number(a.slice("--partition=".length));
+      if (!Number.isInteger(n) || n <= 0) return "invalid";
+      return { n };
+    }
+  }
+  return null;
+}
+
+/** The file a parsed entry belongs to ("f > name" / "f: load error #N"). */
+export function entryFile(entry: string): string {
+  const gt = entry.indexOf(" > ");
+  if (gt !== -1) return entry.slice(0, gt);
+  return entry.split(": load error")[0];
+}
+
+/** Merge per-partition ENV-GATE summaries: counts sum, budget flag ORs. */
+export function mergeEnvGates(perPartition: EnvGateSummaryEntry[][]): EnvGateSummaryEntry[] {
+  const byClass = new Map<string, EnvGateSummaryEntry>();
+  for (const list of perPartition) {
+    for (const e of list) {
+      const prev = byClass.get(e.classId);
+      byClass.set(e.classId, {
+        classId: e.classId,
+        notExecuted: (prev?.notExecuted ?? 0) + e.notExecuted,
+        budget: (prev?.budget ?? false) || e.budget,
+      });
+    }
+  }
+  return [...byClass.values()].sort((a, b) => b.notExecuted - a.notExecuted);
+}
+
+/**
  * The real suite runner. Bounded by default: an unbounded suite cannot back a
  * review verdict (a single network-hanging test stalls it past any usable wall
  * clock — measured 2026-09-29: unbounded run looped >35 min, bounded finished
@@ -325,22 +536,23 @@ export function resolveWallClockMs(env: NodeJS.ProcessEnv = process.env): number
  */
 export function realSuiteRunner(
   cwd: string,
-  opts: { testPath?: string; wallClockMs?: number } = {}
+  opts: { testPath?: string; testFiles?: string[]; wallClockMs?: number } = {}
 ): SuiteRunner {
   return () => {
     const wall =
       opts.wallClockMs !== undefined
         ? { ms: opts.wallClockMs, source: "injected" as const }
         : resolveWallClock();
+    // Exact-file addressing, NOT filters: a bare `bun test <path>` arg is a
+    // regex filter over discovered files, so a partition passed that way could
+    // select the wrong population. The `./`-prefixed form addresses each file
+    // exactly (measured quirk, bun 1.3.x) — one arg per file of the partition.
+    const targets = opts.testFiles
+      ? opts.testFiles.map((f) => `./${f}`)
+      : [opts.testPath ?? TEST_ROOT];
     const r = spawnSync(
       process.execPath,
-      [
-        "test",
-        opts.testPath ?? "packages/cli/src",
-        "--timeout",
-        String(DEFAULT_TEST_TIMEOUT_MS),
-        "--isolate",
-      ],
+      ["test", ...targets, "--timeout", String(DEFAULT_TEST_TIMEOUT_MS), "--isolate"],
       {
         encoding: "utf-8",
         maxBuffer: 64 * 1024 * 1024,
@@ -366,9 +578,9 @@ function currentSha(): string {
 }
 
 function printVerdict(v: StrictVerdict, hadBaseline: boolean): void {
-  const line = (s: string) => process.stdout.write(s + "\n");
+  const line = (s: string) => process.stdout.write(`${s}\n`);
   line("");
-  line("── [STRICT] end-of-run manifest " + "─".repeat(20));
+  line(`── [STRICT] end-of-run manifest ${"─".repeat(20)}`);
   if (v.envGates.length > 0) {
     const total = v.envGates.reduce((s, e) => s + e.notExecuted, 0);
     const budget = v.envGates.filter((e) => e.budget);
@@ -479,10 +691,370 @@ function printKill(
   }
 }
 
+/**
+ * A crashed or unaccountable partition refuses the verdict AND names itself:
+ * its keys are unknown (a crash can hide any number of fails), so the runner
+ * must never let the remaining partitions' green stand in for the whole. The
+ * file list is printed in full — "partition 3/9" alone tells the operator
+ * nothing about which population is unknown.
+ */
+function printCrashedPartition(
+  kind: "killed" | "unaccountable",
+  index: number,
+  total: number,
+  files: string[],
+  detail: string,
+  raw: string
+): void {
+  const line = (s: string) => process.stdout.write(`${s}\n`);
+  line(
+    `[STRICT] 🔴 PARTITION ${index + 1}/${total} ${kind === "killed" ? "RUN KILLED" : "UNACCOUNTABLE"} (${detail}) — its keys are UNKNOWN, never "zero fails": no verdict can be drawn while any partition is missing. Files:`
+  );
+  for (const f of files) line(`[STRICT]   · ${f}`);
+  const tail = raw
+    .split(/\r?\n/)
+    .filter((l) => l.trim() !== "" && !l.startsWith("[ENV-GATE]"))
+    .slice(-15);
+  if (tail.length > 0) {
+    line("[STRICT] last output lines of the partition:");
+    for (const l of tail) line(`[STRICT] | ${l.slice(0, 160)}`);
+  }
+}
+
+/** Injectable partition execution, so the partition wiring is unit-testable. */
+export interface PartitionDeps {
+  /** The population, sorted (defaults to enumerateTestFiles(TEST_ROOT)). */
+  listFiles: () => string[];
+  /** Run one partition's files as its own bounded `bun test` process. */
+  runPartition: (
+    files: string[],
+    index: number,
+    total: number
+  ) => { raw: string; killed?: boolean; errorCode?: string };
+}
+
+function defaultPartitionDeps(cwd: string): PartitionDeps {
+  return {
+    listFiles: () => enumerateTestFiles(TEST_ROOT),
+    runPartition: (files) => realSuiteRunner(cwd, { testFiles: files })(),
+  };
+}
+
+/**
+ * Partitioned main (#641 C3): same verdict discipline as the single-process
+ * main, applied per partition. Every partition must come back accountable or
+ * the whole run refuses; the observed population is the UNION of the
+ * partitions' entries; the confirmation re-run visits ONLY the partitions that
+ * hosted fresh entries (the others just ran clean — re-running them buys
+ * nothing but wall clock). Learn records the partition manifest so a later
+ * verify can prove it cut the same population.
+ */
+function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number {
+  const learn = argv.includes("--learn");
+  const cwd = process.cwd();
+
+  const files = deps.listFiles();
+  if (files.length === 0) {
+    process.stdout.write("[STRICT] 🔴 NO TEST FILES found to partition.\n");
+    return 3;
+  }
+  const partitions = planPartitions(files, n);
+  const boundaries = partitions.map((p) => p[0]);
+  process.stdout.write(
+    `[STRICT] partitioned mode: ${files.length} test file(s) → ${partitions.length} partition(s) of ≤${n}\n`
+  );
+
+  const partitionOf = new Map<string, number>();
+  partitions.forEach((p, i) => {
+    for (const f of p) partitionOf.set(f, i);
+  });
+
+  // Fail fast on mode mismatch BEFORE burning the partitions: a verify whose
+  // baseline cannot be compared against is knowable from the baseline alone.
+  // (Not parsed in learn mode — same as the single-process main, a corrupted
+  // old baseline must never block capturing a fresh one.)
+  const bp = join(cwd, BASELINE_PATH);
+  const hadBaseline = existsSync(bp);
+  const baseline: StrictBaseline | null =
+    !learn && hadBaseline
+      ? (JSON.parse(readFileSync(bp, "utf-8") as string) as StrictBaseline)
+      : null;
+  const manifest = baseline?.partition;
+  if (!learn && baseline && manifest === undefined) {
+    process.stdout.write(
+      `[STRICT] 🔴 NO VERDICT — the baseline was captured WITHOUT partitions; a partitioned verify cuts a different population. Re-learn with --partition=${n} (learn and verify must run the same mode and size).\n`
+    );
+    return 3;
+  }
+  if (manifest !== undefined && manifest.n !== n) {
+    process.stdout.write(
+      `[STRICT] 🔴 NO VERDICT — baseline was partitioned at N=${manifest.n}, this verify runs N=${n}. ` +
+        `Learn and verify must cut the same population: re-learn at N=${n} or verify at N=${manifest.n}.\n`
+    );
+    return 3;
+  }
+  if (
+    manifest !== undefined &&
+    JSON.stringify(manifest.boundaries) !== JSON.stringify(boundaries)
+  ) {
+    process.stdout.write(
+      "[STRICT] ⚠ boundary drift — this tree's cut points differ from the baseline's (files added/removed/renamed " +
+        "since the capture). Entries still compare by name; re-learn to refresh the manifest.\n"
+    );
+  }
+
+  const observedPerPartition: string[][] = [];
+  const envGatesPerPartition: EnvGateSummaryEntry[][] = [];
+  const wallPerPartition: number[] = [];
+
+  for (let i = 0; i < partitions.length; i++) {
+    const t0 = Date.now();
+    const run = deps.runPartition(partitions[i], i, partitions.length);
+    const ms = Date.now() - t0;
+    wallPerPartition.push(ms);
+    if (run.killed) {
+      printCrashedPartition(
+        "killed",
+        i,
+        partitions.length,
+        partitions[i],
+        `${run.errorCode ?? "killed"}, wall ${ms} ms`,
+        run.raw
+      );
+      return 3;
+    }
+    const parsed = parseRunOutput(run.raw);
+    if (!runIsAccountable(parsed)) {
+      printCrashedPartition(
+        "unaccountable",
+        i,
+        partitions.length,
+        partitions[i],
+        `entries (${parsed.entries.length}) do not account for bun's counters (fail=${parsed.fail}, error=${parsed.error}, ran-line ${parsed.ranLinePresent ? "present" : "ABSENT"})`,
+        run.raw
+      );
+      return 3;
+    }
+    const delivered = partitions[i].length;
+    const ranFiles = ranLineFileCount(run.raw);
+    if (populationEchoOverCounts(partitions[i], ranFiles, parsed)) {
+      // Review #1114, second review: the echo attests more files than were
+      // delivered AND more than the entries themselves name — nothing accounts
+      // for the extra count, so the summary describes another population. The
+      // old `>=` read this as coverage and --learn consecrated the union (or
+      // its emptiness) as a baseline with exit 0.
+      process.stdout.write(
+        `[STRICT] 🔴 POPULATION OVER-COUNT in partition ${i + 1}/${partitions.length}: bun reports ` +
+          `${ranFiles} file(s) ran, ${delivered} delivered — the echo attests more files than were ` +
+          `handed to it and more than the entries name; it cannot attest this run's population.\n`
+      );
+      process.stdout.write(
+        "[STRICT]   Refusing: no baseline is written from an echo that outruns its delivery. " +
+          "The echo reads the LAST Ran line; a count beyond both the delivery and the entries " +
+          "describes some other run.\n"
+      );
+      return 3;
+    }
+    const unexplained = populationGapUnexplained(partitions[i], ranFiles, parsed);
+    if (unexplained.length > 0) {
+      // Review #1114 (file 19b item 1): an echo below the delivery used to be a
+      // warning, and --learn then wrote the EMPTY union as the baseline with
+      // exit 0 — a silent population loss consecrated as the reference. The gap
+      // is now a refusal: no baseline is written, no verdict is drawn, and every
+      // unexplained file is named. The ONLY tolerated gap is the named set of
+      // files inspected without a runnable test (module-load death).
+      process.stdout.write(
+        `[STRICT] 🔴 POPULATION GAP in partition ${i + 1}/${partitions.length}: bun reports ` +
+          `${ranFiles ?? "NO Ran line"} file(s) ran, ${delivered} delivered — ` +
+          `${unexplained.length} file(s) are UNEXPLAINED (not a module-load death):\n`
+      );
+      for (const f of unexplained) process.stdout.write(`[STRICT]   · ${f}\n`);
+      process.stdout.write(
+        "[STRICT]   Refusing: no baseline is written from an unexplained population loss. " +
+          "Fix the delivery (paths the engine never received) or the echo, then re-run.\n"
+      );
+      return 3;
+    }
+    const foreign = foreignEntryFiles(partitions[i], parsed);
+    if (foreign.length > 0) {
+      // Review #1114, third review (file 20a): an entry naming a file outside
+      // the delivery is a foreign population. The witness: 1 delivered, failed
+      // entries for a.test.ts AND ghost.test.ts, echo 2 — every count guard
+      // passes and --learn wrote the ghost INTO the baseline with exit 0. The
+      // old no-blind-spot fallback lives only on the verify path, so learn
+      // never reached it. Refused here, both modes, before anything is
+      // consecrated: no baseline write, no verdict.
+      process.stdout.write(
+        `[STRICT] 🔴 FOREIGN POPULATION in partition ${i + 1}/${partitions.length}: entries name ` +
+          `${foreign.length} file(s) outside the delivery:\n`
+      );
+      for (const f of foreign) process.stdout.write(`[STRICT]   · ${f}\n`);
+      process.stdout.write(
+        "[STRICT]   Refusing: an entry from a file that was never delivered is not this run's " +
+          "population — no baseline is written and no verdict is drawn from it.\n"
+      );
+      return 3;
+    }
+    if (ranFiles !== null && ranFiles !== delivered) {
+      const explained = partitions[i].filter((f) =>
+        parsed.entries.some((e) => e.startsWith(`${f}: load error`))
+      );
+      process.stdout.write(
+        `[STRICT] ℹ population echo: ${ranFiles} ran / ${delivered} delivered — the gap is ` +
+          `EXPLAINED by ${explained.length} file(s) inspected without a runnable test (module-load death): ` +
+          `${explained.join(", ")}\n`
+      );
+    }
+    observedPerPartition.push([...new Set(parsed.entries)].sort());
+    envGatesPerPartition.push(parsed.envGates);
+    process.stdout.write(
+      `[STRICT] partition ${i + 1}/${partitions.length} done in ${ms} ms — ${parsed.entries.length} fail entr(ies)\n`
+    );
+  }
+
+  const observed = [...new Set(observedPerPartition.flat())].sort();
+  const envGates = mergeEnvGates(envGatesPerPartition);
+
+  if (learn) {
+    const baseline: StrictBaseline = {
+      sha: currentSha(),
+      capturedAt: new Date().toISOString(),
+      fails: observed,
+      partition: { n, boundaries },
+    };
+    writeFileSync(join(cwd, BASELINE_PATH), `${JSON.stringify(baseline, null, 2)}\n`, "utf-8");
+    process.stdout.write(
+      `[STRICT] baseline captured: ${observed.length} fail(s) on ${baseline.sha} → ${BASELINE_PATH}\n` +
+        `[STRICT] partition manifest recorded: n=${n}, ${partitions.length} slice(s).\n` +
+        `[STRICT] wall: total ${wallPerPartition.reduce((s, w) => s + w, 0)} ms, slowest partition ${Math.max(...wallPerPartition)} ms.\n`
+    );
+    return 0;
+  }
+
+  const verdict: StrictVerdict = {
+    observed,
+    resolved: [],
+    regressions: [],
+    flakyTail: [],
+    confirmed: false,
+    envGates,
+    exitCode: 0,
+  };
+
+  if (baseline) {
+    const { fresh, resolved } = diffAgainstBaseline(observed, baseline);
+    verdict.resolved = resolved;
+    if (fresh.length > 0) {
+      const rerun = new Set<number>();
+      for (const entry of fresh) {
+        const idx = partitionOf.get(entryFile(entry));
+        if (idx === undefined) {
+          // Foreign entries are refused at the FIRST pass (foreignEntryFiles),
+          // so an unmapped fresh file cannot reach here — this is defence in
+          // depth, not a retry-all: never confirm from a population we do not
+          // own. The old re-run-everything fallback was retired with that
+          // refusal (review #1114, third review).
+          process.stdout.write(
+            `[STRICT] 🔴 FRESH ENTRY OUTSIDE THE POPULATION: ${entry} — no partition owns ` +
+              `${entryFile(entry)}. Refusing: no verdict is drawn from an unowned file.\n`
+          );
+          return 3;
+        }
+        rerun.add(idx);
+      }
+      process.stdout.write(
+        `[STRICT] ${fresh.length} fresh entr(ies) — re-running ${rerun.size}/${partitions.length} partition(s) (reproduction rule)…\n`
+      );
+      const fresh2Set = new Set<string>();
+      for (const i of [...rerun].sort((a, b) => a - b)) {
+        const run2 = deps.runPartition(partitions[i], i, partitions.length);
+        if (run2.killed) {
+          printCrashedPartition(
+            "killed",
+            i,
+            partitions.length,
+            partitions[i],
+            `confirmation pass, ${run2.errorCode ?? "killed"}`,
+            run2.raw
+          );
+          return 3;
+        }
+        const parsed2 = parseRunOutput(run2.raw);
+        if (!runIsAccountable(parsed2)) {
+          printCrashedPartition(
+            "unaccountable",
+            i,
+            partitions.length,
+            partitions[i],
+            "confirmation pass",
+            run2.raw
+          );
+          return 3;
+        }
+        // File 19b item 2: the confirmation pass must hold the SAME population
+        // gate — otherwise an entry whose file never ran would be classified
+        // flaky (absent from the re-run) instead of unexplained. An unexplained
+        // gap here is a refusal, not a verdict.
+        const ranFiles2 = ranLineFileCount(run2.raw);
+        if (populationEchoOverCounts(partitions[i], ranFiles2, parsed2)) {
+          // Review #1114, second review: same gate as the first pass — no
+          // entry is classified flaky from an echo that outruns its delivery.
+          process.stdout.write(
+            `[STRICT] 🔴 POPULATION OVER-COUNT in confirmation of partition ${i + 1}/${partitions.length}: ` +
+              `${ranFiles2} file(s) ran / ${partitions[i].length} delivered — the echo attests more ` +
+              "than this run delivered and more than the entries name. No entry is classified flaky " +
+              "from an echo that outruns its delivery.\n"
+          );
+          return 3;
+        }
+        const unexplained2 = populationGapUnexplained(partitions[i], ranFiles2, parsed2);
+        if (unexplained2.length > 0) {
+          process.stdout.write(
+            `[STRICT] 🔴 POPULATION GAP in confirmation of partition ${i + 1}/${partitions.length}: ${ranFiles2 ?? "NO Ran line"} file(s) ran / ${partitions[i].length} delivered — ${unexplained2.length} UNEXPLAINED (not a module-load death). No entry is classified flaky from a population that never ran:\n`
+          );
+          for (const f of unexplained2) process.stdout.write(`[STRICT]   · ${f}\n`);
+          return 3;
+        }
+        const foreign2 = foreignEntryFiles(partitions[i], parsed2);
+        if (foreign2.length > 0) {
+          // Review #1114, third review: a foreign population is never evidence
+          // of non-reproduction — a ghost cannot re-appear in a partition it
+          // was never delivered to, so its absence here would read as flaky.
+          process.stdout.write(
+            `[STRICT] 🔴 FOREIGN POPULATION in confirmation of partition ${i + 1}/${partitions.length}: ` +
+              `entries name file(s) outside the delivery (${foreign2.join(", ")}). No entry is ` +
+              "classified flaky from a population that was never delivered.\n"
+          );
+          return 3;
+        }
+        for (const e of parsed2.entries) if (!baseline.fails.includes(e)) fresh2Set.add(e);
+      }
+      const split = splitFreshByReproduction(fresh, [...fresh2Set]);
+      verdict.regressions = split.regressions;
+      verdict.flakyTail = split.flakyTail;
+      verdict.confirmed = true;
+      verdict.exitCode = split.regressions.length > 0 ? 1 : 0;
+    }
+  }
+
+  printVerdict(verdict, hadBaseline);
+  return baseline ? verdict.exitCode : 2;
+}
+
 export function main(
   argv: string[],
-  runSuite: SuiteRunner = realSuiteRunner(process.cwd())
+  runSuite: SuiteRunner = realSuiteRunner(process.cwd()),
+  partitionDeps: PartitionDeps = defaultPartitionDeps(process.cwd())
 ): number {
+  const partition = parsePartitionArg(argv);
+  if (partition === "invalid") {
+    process.stdout.write(
+      "[STRICT] 🔴 --partition expects a positive integer (--partition or --partition=N). No run started.\n"
+    );
+    return 3;
+  }
+  if (partition !== null) return mainPartitioned(argv, partition.n, partitionDeps);
+
   const learn = argv.includes("--learn");
   const cwd = process.cwd();
 
@@ -494,10 +1066,7 @@ export function main(
   const parsed1 = parseRunOutput(run1.raw);
   if (!runIsAccountable(parsed1)) {
     process.stdout.write(
-      `[STRICT] 🔴 NO VERDICT — parsed entries (${parsed1.entries.length}) do not account for bun's own ` +
-        `counters (fail=${parsed1.fail}, error=${parsed1.error}, ran-line ${parsed1.ranLinePresent ? "present" : "ABSENT"}).\n` +
-        "[STRICT]   A gap means the parser is blind to a failure shape (module-load death, truncated " +
-        "output past maxBuffer) — trusting it would print a false green. Fix the parser, re-run.\n"
+      `[STRICT] 🔴 NO VERDICT — parsed entries (${parsed1.entries.length}) do not account for bun's own counters (fail=${parsed1.fail}, error=${parsed1.error}, ran-line ${parsed1.ranLinePresent ? "present" : "ABSENT"}).\n[STRICT]   A gap means the parser is blind to a failure shape (module-load death, truncated output past maxBuffer) — trusting it would print a false green. Fix the parser, re-run.\n`
     );
     return 3;
   }
@@ -509,7 +1078,7 @@ export function main(
       capturedAt: new Date().toISOString(),
       fails: observed,
     };
-    writeFileSync(join(cwd, BASELINE_PATH), JSON.stringify(baseline, null, 2) + "\n", "utf-8");
+    writeFileSync(join(cwd, BASELINE_PATH), `${JSON.stringify(baseline, null, 2)}\n`, "utf-8");
     process.stdout.write(
       `[STRICT] baseline captured: ${observed.length} fail(s) on ${baseline.sha} → ${BASELINE_PATH}\n`
     );
