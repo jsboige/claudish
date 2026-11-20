@@ -47,6 +47,13 @@ def make_repo(root: Path) -> Path:
     return repo
 
 
+class Raw:
+    """A gh payload returned verbatim (--jq output is text, not JSON)."""
+
+    def __init__(self, text):
+        self.text = text
+
+
 class FakeIdentity:
     """Stands in for a real gh identity. Routes are matched in order."""
 
@@ -59,7 +66,7 @@ class FakeIdentity:
         self.calls += 1
         for key, payload in self.routes:
             if key in path:
-                return json.dumps(payload)
+                return payload.text if isinstance(payload, Raw) else json.dumps(payload)
         raise AssertionError(f"unexpected gh call: {path}")
 
 
@@ -179,6 +186,193 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(result["counts"]["cs"], 1)
             self.assertNotIn("Series/Créateur-01-Python.ipynb", result["avail"],
                              "a false orphan here would ship a duplicate twin")
+
+
+def add_claim_script(repo: Path, rc: int = 0) -> None:
+    """A stand-in for check_lane_claim.py: run_preflight runs it from the repo root."""
+    d = repo / "scripts"
+    d.mkdir(exist_ok=True)
+    (d / "check_lane_claim.py").write_text(f"import sys\nsys.exit({rc})\n", encoding="utf-8")
+
+
+TARGET = "Series/T-01-CSharp.ipynb"
+BODY = Raw("- Cible C# : `" + TARGET + "`\n")
+
+
+class PreflightTests(unittest.TestCase):
+    """#1130 review at 1da0421a: the bar must be pinned by what it claims.
+
+    Every test is offline: gh is faked at the Identity boundary, the pinned tree
+    is a throwaway repo, the claim organ is a throwaway script.
+    """
+
+    def routes(self, comments=None, pulls=None, files=None, body=BODY):
+        r = [("issues/1/comments", comments if comments is not None else []),
+             ("pulls?state=open", pulls if pulls is not None else []),
+             ("issues/1", body)]
+        if files is not None:
+            r.insert(0, ("pulls/7/files", files))
+        return r
+
+    def test_free_when_no_measurement_speaks(self):
+        """The base case: a real orphan, no marker, no PR, claim clear -> FREE."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            report = ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                      "myia-po-2028:claudish", [], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "FREE", report[1])
+            self.assertEqual(report[1]["reasons"], [])
+            self.assertEqual(report[1]["target"], TARGET)
+
+    def test_blocks_on_target_in_the_pinned_main_tree(self):
+        """Measurement (a): a twin already committed is taken, on the PINNED tree."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            (repo / "Series" / "T-01-CSharp.ipynb").write_text("{}", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "twin")
+            report = ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                      "myia-po-2028:claudish", [], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "BLOCKED")
+            self.assertIn("target-in-main", report[1]["reasons"])
+
+    def test_blocks_on_a_delivered_marker_from_my_own_lane(self):
+        """Founding case (20/11, #27508/#27509): the marker is MY lane's, and the
+        claim registry said CLEAR. The bar must still block."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            comments = [{"body": "[DELIVERED] PR #27562 carries this grain.",
+                         "created_at": "2026-11-20T14:00:00Z"}]
+            report = ns.run_preflight(repo, FakeIdentity(self.routes(comments=comments)), [1],
+                                      "myia-po-2028:claudish", [], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "BLOCKED")
+            self.assertIn("delivered-marker", report[1]["reasons"])
+            self.assertEqual(report[1]["last_delivered"], "2026-11-20T14:00:00Z")
+
+    def test_blocks_on_a_target_on_a_later_pr_files_page(self):
+        """Measurement (c) reads ALL pages: a full page 1 must not hide page 2."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            page1 = [{"filename": f"Series/filler-{i}.ipynb"} for i in range(100)]
+            page2 = [{"filename": TARGET}]
+
+            class PagedIdentity(FakeIdentity):
+                def gh(self, args):
+                    path = args[1]
+                    self.calls += 1
+                    # endswith, NOT 'in': "page=1" is a substring of "page=196965"
+                    # and the substring form once sent api_all into an unbounded
+                    # page walk (the very defect API_MAX_PAGES now bounds).
+                    if "pulls/7/files" in path and path.endswith("page=1"):
+                        return json.dumps(page1)
+                    if "pulls/7/files" in path and path.endswith("page=2"):
+                        return json.dumps(page2)
+                    for key, payload in self.routes:
+                        if key in path:
+                            return payload.text if isinstance(payload, Raw) else json.dumps(payload)
+                    raise AssertionError(f"unexpected gh call: {path}")
+
+            report = ns.run_preflight(repo, PagedIdentity(self.routes(pulls=[{"number": 7}])), [1],
+                                      "myia-po-2028:claudish", [], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "BLOCKED")
+            self.assertIn("target-in-open-pr#7", report[1]["reasons"])
+
+    def test_blocks_on_the_claim_registry(self):
+        """Measurement (d): a non-zero claim verdict blocks and names its rc."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 1)
+            report = ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                      "myia-po-2028:claudish", [], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "BLOCKED")
+            self.assertIn("claim-blocked(rc=1)", report[1]["reasons"])
+
+    def test_a_failed_git_read_refuses_instead_of_free(self):
+        """An unresolvable pin raises: it NEVER degrades to 'absent from main'."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            with self.assertRaises(ns.InstrumentError):
+                ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                 "myia-po-2028:claudish", [], root, pin="origin/absent")
+
+    def test_a_failed_gh_call_refuses_instead_of_free(self):
+        class DeadIdentity:
+            calls = 0
+
+            def gh(self, args):
+                raise ns.InstrumentError("gh failed (app) rc=4 endpoint=issues/1")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            with self.assertRaises(ns.InstrumentError):
+                ns.run_preflight(repo, DeadIdentity(), [1], "myia-po-2028:claudish", [],
+                                 root, pin="HEAD")
+
+    def test_the_gate_never_serves_the_pr_files_cache(self):
+        """The 15-min cache re-opens the race the bar exists for: under
+        require_free it is IGNORED; the reporting path serves it WITH its age."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            (root / "pr-files-cache.json").write_text(json.dumps({TARGET: 999}), encoding="utf-8")
+            identity = FakeIdentity(self.routes())
+            gate = ns.run_preflight(repo, identity, [1], "myia-po-2028:claudish", [], root,
+                                    pin="HEAD", require_free=True)
+            self.assertEqual(gate[1]["verdict"], "FREE",
+                             "the gate must re-read the PR list, never the cache")
+            report = ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                      "myia-po-2028:claudish", [], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "BLOCKED")
+            self.assertIn("target-in-open-pr#999", report[1]["reasons"])
+            self.assertIn("pr_files_cache_age_s", report[1],
+                          "a cached verdict must carry its age")
+
+    def test_an_endpoint_that_never_shortens_its_pages_refuses(self):
+        """api_all is BOUNDED: an endpoint answering exactly 100 items forever
+        (measured 20/11 via a page-substring matching bug) must raise, not hang."""
+        full = [{"filename": f"f-{i}.ipynb"} for i in range(100)]
+
+        class NeverShort(FakeIdentity):
+            def gh(self, args):
+                self.calls += 1
+                return json.dumps(full)
+
+        ident = NeverShort([("pulls?state=open", [])])
+        with self.assertRaises(ns.InstrumentError) as cm:
+            ns.api_all(ident, "repos/jsboige/CoursIA/pulls/7/files")
+        self.assertIn("pagination refused", str(cm.exception))
+        self.assertLessEqual(ident.calls, ns.API_MAX_PAGES + 1)
+
+    def test_preflight_requires_a_lane(self):
+        """No machine-specific default in a fleet organ: --lane or $NBCODER_LANE."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            orig = (ns.forge_token, ns.resolve_gh)
+            ns.forge_token = lambda *a, **k: "tok"
+            ns.resolve_gh = lambda: "gh"
+            try:
+                rc = ns.main(["--repo", str(repo), "--preflight", "1",
+                              "--tmp-root", str(root)])
+            finally:
+                ns.forge_token, ns.resolve_gh = orig
+            self.assertEqual(rc, ns.EXIT_DEFECT)
+            self.assertFalse(Path(root / "pr-files-cache.json").exists(),
+                             "the refusal must land before any measurement")
 
 
 class ProofTests(unittest.TestCase):
