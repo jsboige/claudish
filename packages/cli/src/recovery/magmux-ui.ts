@@ -41,7 +41,6 @@
  * its `ai-docs/feature-request-status-line.md`.
  */
 
-import { existsSync } from "node:fs";
 import { type Socket, connect as netConnect } from "node:net";
 import { log } from "../logger.js";
 import { findOwnPane } from "../pane/own-pane.js";
@@ -84,13 +83,22 @@ let explicitControlSock: string | null = null;
  *
  * It answers a launch-order question and gates only the banner. It must never
  * gate whether a retry happens.
+ *
+ * WHY NOT existsSync(sock) (#1115): a unix socket bind creates a filesystem
+ * node on POSIX, but bun's Bun.listen({unix}) creates NO node on win32 —
+ * existsSync() answers false about a LIVE listener (measured 19/11, bun
+ * 1.3.14). The liveness question is answered by connecting (connectControl),
+ * which degrades to the same documented no-banner path for a dead path; the
+ * only cost of dropping the node gate is one refused connect per dead path,
+ * once, logged. The POSIX guarantee (bound socket = fs node) is pinned by
+ * B16; the dead-path refusal stays pinned by B10.
  */
 function resolveControlEndpoint(): { sock: string; wrapped: boolean } | null {
-  if (explicitControlSock && existsSync(explicitControlSock)) {
+  if (explicitControlSock) {
     return { sock: explicitControlSock, wrapped: true };
   }
   const ambient = process.env.MAGMUX_SOCK;
-  if (ambient && existsSync(ambient)) return { sock: ambient, wrapped: false };
+  if (ambient) return { sock: ambient, wrapped: false };
   return null;
 }
 
