@@ -174,7 +174,10 @@ function Read-WdState {
     # on (review #639 point 1: the old silent catch reset EngineFailures to 0
     # on every run, R2/R3 unreachable on a fresh host).
     if (-not (Test-Path $StatePath)) {
-        return @{ EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue; EngineActionsSinceDown = 0 }
+        return @{
+            EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue; EngineActionsSinceDown = 0
+            ContainerStoppedFailures = 0; LastContainerActionUtc = [datetime]::MinValue; ContainerRelaunchSinceDown = 0
+        }
     }
     try {
         $json = Get-Content $StatePath -Raw
@@ -246,6 +249,48 @@ function Test-DockerEngine {
     }
     if ($p.ExitCode -eq 0) { return 'up' }
     return 'down'
+}
+
+function Get-ClaudishContainerState {
+    # Returns 'running','exited','created','restarting','paused','absent' or
+    # 'unknown'. Bounded like Test-DockerEngine: a .NET Process handle, pipes
+    # read after exit. Only paid while BOTH loopback families are dead AND the
+    # engine is up — that is the only shape where R0 could act (a container
+    # stop is invisible to the engine probe: engine stays 'up', #2767 14/11).
+    # A launch failure or a docker CLI error reads 'unknown' — never 'absent':
+    # treating an unprobeable daemon as "no container" would escalate a phantom.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'docker'
+    $psi.Arguments = 'inspect -f {{.State.Status}} claudish-proxy'
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        Write-WdLog "container_probe_launch_error $($_.Exception.Message)"
+        return 'unknown'
+    }
+    if (-not $p.WaitForExit(15000)) {
+        try { $p.Kill() } catch { }
+        return 'unknown'
+    }
+    $out = ($p.StandardOutput.ReadToEnd()).Trim()
+    if ($p.ExitCode -ne 0) {
+        # docker inspect exits non-zero with "No such object" when the container
+        # does not exist; any OTHER error is an unprobeable daemon, not absence.
+        $err = ($p.StandardError.ReadToEnd())
+        if ($err -match '(?i)no such (object|container)') { return 'absent' }
+        return 'unknown'
+    }
+    switch -Regex ($out) {
+        '^running$'    { return 'running' }
+        '^exited$'     { return 'exited' }
+        '^created$'    { return 'created' }
+        '^restarting$' { return 'restarting' }
+        '^paused$'     { return 'paused' }
+        default        { return 'unknown' }
+    }
 }
 
 function Test-DrainInFlight {
@@ -589,20 +634,96 @@ switch ($decision.Action) {
     }
 }
 
+# The verdict must see BOTH families (2026-10-25): a dead IPv4 leg while
+# [::1] serves is the shape that hangs every agent whose base URL is
+# http://127.0.0.1:3000 - TCP establishes, nothing answers, no timeout trips.
+# Read as HEALTHY for 16 h before this fix. Computed BEFORE the R0 rung and the
+# state write: R0 keys off the full-dead shape.
+$verdict = Get-LoopbackVerdict -Ipv4Alive $ipv4Alive -Ipv6Alive $ipv6Alive
+
+# --- R0: container STOPPED on a healthy engine (#2767, 20/11). The 14/11
+# kill-test blind spot: a neighbour `docker stop claudish-proxy` left the
+# container exited ~70 min with engine=up and BOTH loopbacks dead — R1 needs v4
+# alive, R2/R3 need the ENGINE down, so nothing fired. R0's only actuator is
+# `docker start claudish-proxy` (the container's own start is the proven
+# rebuild half). Decision layer is PURE (Get-ContainerRelaunchDecision); this
+# block pays the container probe ONLY on the full-dead + engine-up shape, then
+# maps the action to a line or the one actuator.
+$containerState = 'unknown'
+if ($verdict -eq 'LOOPBACK_DEAD' -and $engine -eq 'up') {
+    $containerState = Get-ClaudishContainerState
+}
+$r0 = Get-ContainerRelaunchDecision -State $State `
+    -LoopbackVerdict $verdict `
+    -EngineVerdict $engine `
+    -ContainerState $containerState `
+    -DrainInFlight (Test-DrainInFlight) `
+    -NowUtc ([DateTimeOffset]::UtcNow).UtcDateTime `
+    -DryRun:$DryRun
+# Fold the R0 next-state back into the shared state table (the engine ladder
+# above already produced $State with its own fields; R0 owns the three
+# Container* keys).
+$State.ContainerStoppedFailures   = $r0.NextState.ContainerStoppedFailures
+$State.LastContainerActionUtc     = $r0.NextState.LastContainerActionUtc
+$State.ContainerRelaunchSinceDown = $r0.NextState.ContainerRelaunchSinceDown
+switch ($r0.Action) {
+    'r0_start' {
+        if ($DryRun) {
+            $actions += "DRYRUN_R0_DOCKER_START_CONTAINER container=$containerState"
+        } else {
+            Write-WdLog "action=R0_DOCKER_START_CONTAINER_BEGIN container=$containerState"
+            $actions += "R0_DOCKER_START_CONTAINER container=$containerState"
+            try {
+                $sp = Start-Process -FilePath 'docker' -ArgumentList @('start', 'claudish-proxy') -PassThru -NoNewWindow
+                if (-not $sp.WaitForExit(60000)) {
+                    try { $sp.Kill() } catch { }
+                    $actions += 'R0_START_KILLED_AFTER_60s'
+                } elseif ($sp.ExitCode -ne 0) {
+                    $actions += "R0_ESCALATE_CONTAINER_DOWN reason=start_failed exit=$($sp.ExitCode)"
+                } else {
+                    Start-Sleep -Seconds 5
+                    $v4After = Test-HttpAlive -Url "http://127.0.0.1:$Port/health" -TimeoutSec 8
+                    $v6After = Test-HttpAlive -Url "http://[::1]:$Port/health" -TimeoutSec 8
+                    $actions += "R0_REPROBE v4_alive=$v4After v6_alive=$v6After"
+                    if ($v4After) { $ipv4Alive = $true }
+                    if ($v6After) { $ipv6Alive = $true }
+                    $verdict = Get-LoopbackVerdict -Ipv4Alive $ipv4Alive -Ipv6Alive $ipv6Alive
+                    if (-not $v4After -and -not $v6After) {
+                        $actions += 'R0_ESCALATE_CONTAINER_DOWN reason=re_exited_after_start'
+                    }
+                }
+            } catch {
+                $actions += "R0_ESCALATE_CONTAINER_DOWN reason=start_failed err=$($_.Exception.Message)"
+            }
+        }
+    }
+    'container_absent' {
+        $actions += 'R0_ESCALATE_CONTAINER_DOWN reason=container_absent'
+    }
+    'r0_after_relaunch' {
+        $actions += 'R0_ESCALATE_CONTAINER_DOWN reason=re_exited_after_start'
+    }
+    'guard_drain' {
+        $actions += "R0_GUARD_DRAIN_IN_FLIGHT stopped=$($State.ContainerStoppedFailures)"
+    }
+    'guard_cooldown' {
+        $actions += "R0_GUARD_COOLDOWN since_last_action_min=$([int]$r0.SinceActionMin)"
+    }
+    'pending' {
+        $actions += "R0_PENDING stopped=$($State.ContainerStoppedFailures)/2"
+    }
+    # not_this_class: no line (the common case — container running or engine path owns it).
+}
+
 # A dry run measures; it must not move the state machine (its failure counters
 # and cooldown would then fire on the next real run as if work had been done).
 # The decision layer already returns the input state unchanged under -DryRun;
 # this guard is the belt on the write half.
 if (-not $DryRun) { Write-WdState -State $State }
-# The verdict must see BOTH families (2026-10-25): a dead IPv4 leg while
-# [::1] serves is the shape that hangs every agent whose base URL is
-# http://127.0.0.1:3000 - TCP establishes, nothing answers, no timeout trips.
-# Read as HEALTHY for 16 h before this fix.
-$verdict = Get-LoopbackVerdict -Ipv4Alive $ipv4Alive -Ipv6Alive $ipv6Alive
 $detail = ($actions -join '; ')
 # copy_mtime names WHICH file executed: on 2026-10-24 a branch switch removed
 # the script from the working tree and every scheduled run died at launch
 # (powershell -File on an absent path) with no line to show for it.
 $copyMtime = ''
 try { $copyMtime = (Get-Item $PSCommandPath).LastWriteTimeUtc.ToString('o') } catch { }
-Write-WdLog ("verdict=$verdict v6=$ipv6Alive v4=$ipv4Alive engine=$engine curl=$curlHttp port=$Port pid=$PID copy_mtime=$copyMtime" + (Get-MemoryWitness) + $(if ($detail) { " actions=$detail" } else { '' }))
+Write-WdLog ("verdict=$verdict v6=$ipv6Alive v4=$ipv4Alive engine=$engine container=$containerState curl=$curlHttp port=$Port pid=$PID copy_mtime=$copyMtime" + (Get-MemoryWitness) + $(if ($detail) { " actions=$detail" } else { '' }))
