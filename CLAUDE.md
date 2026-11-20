@@ -69,6 +69,7 @@ Adding an aggregator resolver: implement `ModelCatalogResolver` in `providers/ca
 
 **Stream parser selection — 3-tier priority, in this order**: `transport.overrideStreamFormat()` → `modelAdapter.getStreamFormat()` → `providerAdapter.getStreamFormat()`. Parsers in `handlers/shared/stream-parsers/`: `openai-sse` (most providers), `anthropic-sse` (MiniMax/Kimi direct), `gemini-sse`, `ollama-jsonl`, `openai-responses-sse` (Codex).
 
+- **`x-claudish-served-model` names the concrete that served (#1128)** — value = the exact string the capture records (composed: `bareModelName`; native: post-pin `payload.model`), both ingresses; **omitted when unknown — never guessed** (synthetic answers, refusals, transport fallback). Any NEW response rebuild on a serving path must carry it across (`carryServedModelHeader`, the #229 pattern).
 - **Add a provider**: one entry in `PROVIDER_PROFILES` (`providers/provider-profiles.ts`).
 - **Add a model**: a ModelTranslator adapter, registered in `adapters/dialect-manager.ts`.
 - **Verify wiring**: `claudish --probe <model>` prints the full composition.

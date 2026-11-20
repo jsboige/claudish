@@ -4,6 +4,7 @@ import { log, maskCredential } from "../logger.js";
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
 import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { createResponseCapture, appendUpstreamError } from "./shared/response-capture.js";
+import { setServedModel } from "./shared/served-model-header.js";
 import { requestNumberFor } from "../fork/middleware/request-logger.js";
 import { recordSessionBudgetOutput } from "../fork/session-budget.js";
 import { recordLaneBudgetOutput } from "../fork/lane-budget.js";
@@ -450,7 +451,7 @@ export class NativeHandler implements ModelHandler {
           }
         };
 
-        return c.body(
+        const streamResponse = c.body(
           new ReadableStream<Uint8Array>({
             start(controller) {
               pump = runPump(controller);
@@ -483,6 +484,10 @@ export class NativeHandler implements ModelHandler {
             },
           }
         );
+        // #1128: the concrete is `target` — post-pin payload.model, the same
+        // string the native capture records (createResponseCapture above).
+        setServedModel(streamResponse, target);
+        return streamResponse;
       }
 
       // Handle JSON
@@ -516,7 +521,9 @@ export class NativeHandler implements ModelHandler {
         responseHeaders["anthropic-version"] = anthropicResponse.headers.get("anthropic-version")!;
       }
 
-      return c.json(data, { status: anthropicResponse.status as any, headers: responseHeaders });
+      const jsonResponse = c.json(data, { status: anthropicResponse.status as any, headers: responseHeaders });
+      setServedModel(jsonResponse, target); // #1128: the concrete that served — post-pin payload.model
+      return jsonResponse;
     } catch (error) {
       log(`[Native] Fetch Error: ${error}`);
       return c.json(wrapAnthropicError(500, String(error)), 500);
