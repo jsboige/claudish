@@ -1028,6 +1028,24 @@ function ConvertTo-WatchdogStateJson {
         lastEngineActionUtc   = $last
         engineActionsSinceDown = [int]$State.EngineActionsSinceDown
     }
+    # R0 container-relaunch state (added 20/11 #2767). Defaults are defensive:
+    # a state file written before R0 existed must decode to "never acted",
+    # not throw on a missing key under Set-StrictMode. The WRITER is defensive
+    # too: a caller may pass an engine-only table (no Container* keys at all,
+    # e.g. the legacy Write-WdState contract) — a hashtable returns $null for an
+    # absent key on a plain read but Set-StrictMode throws on the property
+    # access, so gate every Container* read on ContainsKey.
+    $cFails = 0
+    if ($State.ContainsKey('ContainerStoppedFailures') -and $null -ne $State.ContainerStoppedFailures) { $cFails = [int]$State.ContainerStoppedFailures }
+    $cSince = 0
+    if ($State.ContainsKey('ContainerRelaunchSinceDown') -and $null -ne $State.ContainerRelaunchSinceDown) { $cSince = [int]$State.ContainerRelaunchSinceDown }
+    $lastC = $null
+    if ($State.ContainsKey('LastContainerActionUtc') -and $null -ne $State.LastContainerActionUtc -and $State.LastContainerActionUtc -ne [datetime]::MinValue) {
+        $lastC = $State.LastContainerActionUtc.ToUniversalTime().ToString('o')
+    }
+    $obj.containerStoppedFailures    = $cFails
+    $obj.lastContainerActionUtc      = $lastC
+    $obj.containerRelaunchSinceDown  = $cSince
     return ($obj | ConvertTo-Json)
 }
 
@@ -1082,10 +1100,28 @@ function ConvertFrom-WatchdogStateJson {
     if ($raw.PSObject.Properties['engineFailures'] -and $null -ne $raw.engineFailures) { $failures = [int]$raw.engineFailures }
     $sinceDown = 0
     if ($raw.PSObject.Properties['engineActionsSinceDown'] -and $null -ne $raw.engineActionsSinceDown) { $sinceDown = [int]$raw.engineActionsSinceDown }
+    # R0 container-relaunch fields (added 20/11 #2767). Defensive reads: a
+    # pre-R0 state file carries none of these keys and must decode to the
+    # documented "never acted" defaults, not throw under Set-StrictMode.
+    $cLast = [datetime]::MinValue
+    $cStampRaw = $null
+    if ($raw.PSObject.Properties['lastContainerActionUtc']) { $cStampRaw = $raw.lastContainerActionUtc }
+    if ($null -ne $cStampRaw -and "$cStampRaw" -ne '') {
+        if ($cStampRaw -is [datetime]) { $cLast = $cStampRaw.ToUniversalTime() }
+        elseif ($cStampRaw -is [DateTimeOffset]) { $cLast = $cStampRaw.UtcDateTime }
+        else { $cLast = [DateTimeOffset]::Parse([string]$cStampRaw, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
+    }
+    $cFailures = 0
+    if ($raw.PSObject.Properties['containerStoppedFailures'] -and $null -ne $raw.containerStoppedFailures) { $cFailures = [int]$raw.containerStoppedFailures }
+    $cSince = 0
+    if ($raw.PSObject.Properties['containerRelaunchSinceDown'] -and $null -ne $raw.containerRelaunchSinceDown) { $cSince = [int]$raw.containerRelaunchSinceDown }
     return @{
         EngineFailures         = $failures
         LastEngineActionUtc    = $lastAction
         EngineActionsSinceDown = $sinceDown
+        ContainerStoppedFailures   = $cFailures
+        LastContainerActionUtc     = $cLast
+        ContainerRelaunchSinceDown = $cSince
     }
 }
 
@@ -1193,6 +1229,130 @@ function Get-EngineWatchdogDecision {
             EngineFailures         = [int]$State.EngineFailures
             LastEngineActionUtc    = $State.LastEngineActionUtc
             EngineActionsSinceDown = [int]$State.EngineActionsSinceDown
+        }
+    }
+    return [PSCustomObject]@{ Action = $action; NextState = $next; SinceActionMin = $sinceAction; Reason = $reason }
+}
+
+function Get-ContainerRelaunchDecision {
+    <#
+        .SYNOPSIS
+            PURE rung R0 of the sidecar host watchdog: the container is STOPPED
+            while the docker ENGINE is up. One stopped-container sighting in,
+            one action + next state out. No I/O, no clock (NowUtc injected), no
+            actuation — pinnable on both interpreters without touching a daemon.
+
+        WHY THIS RUNG EXISTS (myia-po-2028, kill-test 14/11): a neighbour lane's
+        `docker stop claudish-proxy` (roo-extensions #2767 kill-test, no finally)
+        left the container exited for ~70 min. The host watchdog logged
+        LOOPBACK_DEAD v6+v4 dead with engine=up the whole time and did NOTHING:
+        R1 needs IPv4 alive, R2/R3 need the ENGINE down — a merely STOPPED
+        container on a healthy engine was a blind spot. R0 closes it: the only
+        actuator is `docker start claudish-proxy`, the cheapest recovery there
+        is, and the container's OWN start is the proven rebuild half (unlike
+        R2's distro teardown, #172 AC4 does not block it).
+
+        Trigger shape (ALL must hold, decision 20/11 #2767 R0):
+          - LoopbackVerdict LOOPBACK_DEAD (v6 AND v4 both dead)
+          - EngineVerdict up  (a down/hang/unknown engine is R2/R3's class, not
+            R0's — starting a container on a dead engine is pointless)
+          - ContainerState exited | created  (running = not this class;
+            absent = escalate, never try to start a container that is not there)
+          - no drain in flight (a drain owns the lifecycle deliberately)
+
+        Order is load-bearing, each rung named for what preempts it:
+          not_this_class      loopback not fully dead, engine not up, or
+                              container running — R0 stands down, counters reset
+          guard_drain         a claudish-drain owns the lifecycle right now
+          pending             consecutive stopped sightings < threshold: count,
+                              touch nothing (2 ticks before acting)
+          guard_cooldown      last R0 action younger than the cooldown
+          container_absent    no container to start: ESCALATE, never act
+          r0_after_relaunch   R0 already fired once this episode and the
+                              container re-exited: ESCALATE (once per episode,
+                              never a start-loop on a container that will not
+                              stay up — the re_exited_after_start case)
+          r0_start            the measured read path: docker start claudish-proxy
+
+        Terminal rungs stamp the cooldown clock and reset the consecutive
+        counter. DryRun computes the same action but returns the input state
+        UNCHANGED: a dry run measures, it must not move the state machine.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][ValidateSet('HEALTHY', 'LOOPBACK4_DOWN', 'LOOPBACK6_DOWN', 'LOOPBACK_DEAD')][string]$LoopbackVerdict,
+        [Parameter(Mandatory)][ValidateSet('up', 'down', 'hang', 'unknown')][string]$EngineVerdict,
+        [Parameter(Mandatory)][ValidateSet('running', 'exited', 'created', 'restarting', 'paused', 'absent', 'unknown')][string]$ContainerState,
+        [Parameter(Mandatory)][bool]$DrainInFlight,
+        [Parameter(Mandatory)][datetime]$NowUtc,
+        [int]$ConsecutiveStoppedFailures = 2,
+        [int]$RelaunchCooldownMin = 30,
+        [switch]$DryRun
+    )
+
+    $next = @{
+        ContainerStoppedFailures   = [int]$State.ContainerStoppedFailures
+        LastContainerActionUtc     = $State.LastContainerActionUtc
+        ContainerRelaunchSinceDown = [int]$State.ContainerRelaunchSinceDown
+    }
+
+    # Not this class: only a FULLY dead loopback on an UP engine with a STOPPED
+    # container is R0's. Everything else stands down and resets the consecutive
+    # counter — but KEEPS the episode marker (ContainerRelaunchSinceDown) and the
+    # cooldown stamp: a container that came back up must not erase the fact that
+    # R0 already spent its one shot this episode.
+    $isStopped = $ContainerState -in @('exited', 'created')
+    $shape = ($LoopbackVerdict -eq 'LOOPBACK_DEAD') -and ($EngineVerdict -eq 'up') -and ($isStopped -or $ContainerState -eq 'absent')
+    if (-not $shape) {
+        $next.ContainerStoppedFailures = 0
+        # A container observed RUNNING and healthy closes the episode: the next
+        # stop is a NEW episode and R0 gets its one shot back.
+        if ($ContainerState -eq 'running' -and $LoopbackVerdict -eq 'HEALTHY') {
+            $next.ContainerRelaunchSinceDown = 0
+        }
+        $reason = "not R0 class (loopback=$LoopbackVerdict engine=$EngineVerdict container=$ContainerState)"
+        $result = [PSCustomObject]@{ Action = 'not_this_class'; NextState = $next; SinceActionMin = $null; Reason = $reason }
+        return $result
+    }
+
+    if ($DrainInFlight) {
+        return [PSCustomObject]@{
+            Action = 'guard_drain'; NextState = $next; SinceActionMin = $null
+            Reason = 'a claudish-drain owns the container lifecycle — recovery of a deliberate gesture is not this watchdog'
+        }
+    }
+
+    $next.ContainerStoppedFailures++
+    $sinceAction = ($NowUtc - $State.LastContainerActionUtc).TotalMinutes
+
+    if ($next.ContainerStoppedFailures -lt $ConsecutiveStoppedFailures) {
+        $action = 'pending'; $reason = "container stopped ($($next.ContainerStoppedFailures)/$ConsecutiveStoppedFailures) — counting"
+    } elseif ($sinceAction -lt $RelaunchCooldownMin) {
+        $action = 'guard_cooldown'; $reason = "last R0 action ${sinceAction} min ago < ${RelaunchCooldownMin} min"
+    } elseif ($ContainerState -eq 'absent') {
+        # AFTER the cooldown (review #1126): absent is terminal, so testing it
+        # first stamped the cooldown clock and reset the counter, then the next
+        # tick re-escalated every 2 ticks (~10 min at the /5 min cadence) for
+        # as long as the container stayed absent — the docstring's "Terminal:
+        # said its line; the cooldown bounds the repeats" was false for absent.
+        $action = 'container_absent'; $reason = 'container absent — escalate, never try to start a container that is not there'
+    } elseif ($State.ContainerRelaunchSinceDown -ge 1) {
+        $action = 'r0_after_relaunch'; $reason = 'R0 already fired once this episode and the container re-exited — escalate, never a start-loop (re_exited_after_start)'
+    } else {
+        $action = 'r0_start'; $reason = 'container stopped on a healthy engine — the measured read path: docker start claudish-proxy'
+        $next.ContainerRelaunchSinceDown++
+    }
+
+    if ($action -notin @('pending', 'guard_drain', 'guard_cooldown')) {
+        # Terminal: said its line; the cooldown bounds the repeats.
+        $next.LastContainerActionUtc = ([DateTimeOffset]$NowUtc).UtcDateTime
+        $next.ContainerStoppedFailures = 0
+    }
+    if ($DryRun) {
+        $next = @{
+            ContainerStoppedFailures   = [int]$State.ContainerStoppedFailures
+            LastContainerActionUtc     = $State.LastContainerActionUtc
+            ContainerRelaunchSinceDown = [int]$State.ContainerRelaunchSinceDown
         }
     }
     return [PSCustomObject]@{ Action = $action; NextState = $next; SinceActionMin = $sinceAction; Reason = $reason }
@@ -3158,6 +3318,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-WatchdogStateJson'
     'ConvertFrom-WatchdogStateJson'
     'Get-EngineWatchdogDecision'
+    'Get-ContainerRelaunchDecision'
     'Select-WslrelaySquatters'
     'Get-LoopbackVerdict'
     'Get-CurlHttpProbeVerdict'
