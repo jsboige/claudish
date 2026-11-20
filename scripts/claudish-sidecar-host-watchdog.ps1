@@ -109,6 +109,13 @@
 .PARAMETER EngineCooldownMin
     Minutes between R2/R3 attempts (default 30).
 
+.PARAMETER ContainerName
+    Name of the sidecar container R0 probes and starts (default
+    'claudish-proxy', the po-2028 name). The sidecar is 'claudish-sidecar'
+    on ai-01, po-2024 and po-2027 (fleet-state.md) — same convention as
+    claudish-drain.ps1 -ContainerName: the default names this seat's
+    container, every other seat passes its own.
+
 .PARAMETER DryRun
     Probes run for real (read-only); remediations print [DRYRUN] instead of
     executing.
@@ -144,6 +151,7 @@ param(
     [string]$ClaudishHome = (Join-Path $env:USERPROFILE '.claudish'),
     [int]$ConsecutiveEngineFailures = 2,
     [int]$EngineCooldownMin = 30,
+    [string]$ContainerName = 'claudish-proxy',
     [switch]$DryRun
 )
 
@@ -259,9 +267,12 @@ function Get-ClaudishContainerState {
     # stop is invisible to the engine probe: engine stays 'up', #2767 14/11).
     # A launch failure or a docker CLI error reads 'unknown' — never 'absent':
     # treating an unprobeable daemon as "no container" would escalate a phantom.
+    # $ContainerName: 'claudish-proxy' here but 'claudish-sidecar' on ai-01,
+    # po-2024 and po-2027 — the probe must name the seat's actual container.
+    param([string]$ContainerName = 'claudish-proxy')
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'docker'
-    $psi.Arguments = 'inspect -f {{.State.Status}} claudish-proxy'
+    $psi.Arguments = "inspect -f {{.State.Status}} $ContainerName"
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
@@ -651,7 +662,7 @@ $verdict = Get-LoopbackVerdict -Ipv4Alive $ipv4Alive -Ipv6Alive $ipv6Alive
 # maps the action to a line or the one actuator.
 $containerState = 'unknown'
 if ($verdict -eq 'LOOPBACK_DEAD' -and $engine -eq 'up') {
-    $containerState = Get-ClaudishContainerState
+    $containerState = Get-ClaudishContainerState -ContainerName $ContainerName
 }
 $r0 = Get-ContainerRelaunchDecision -State $State `
     -LoopbackVerdict $verdict `
@@ -669,12 +680,12 @@ $State.ContainerRelaunchSinceDown = $r0.NextState.ContainerRelaunchSinceDown
 switch ($r0.Action) {
     'r0_start' {
         if ($DryRun) {
-            $actions += "DRYRUN_R0_DOCKER_START_CONTAINER container=$containerState"
+            $actions += "DRYRUN_R0_DOCKER_START_CONTAINER container=$containerState name=$ContainerName"
         } else {
-            Write-WdLog "action=R0_DOCKER_START_CONTAINER_BEGIN container=$containerState"
-            $actions += "R0_DOCKER_START_CONTAINER container=$containerState"
+            Write-WdLog "action=R0_DOCKER_START_CONTAINER_BEGIN container=$containerState name=$ContainerName"
+            $actions += "R0_DOCKER_START_CONTAINER container=$containerState name=$ContainerName"
             try {
-                $sp = Start-Process -FilePath 'docker' -ArgumentList @('start', 'claudish-proxy') -PassThru -NoNewWindow
+                $sp = Start-Process -FilePath 'docker' -ArgumentList @('start', $ContainerName) -PassThru -NoNewWindow
                 if (-not $sp.WaitForExit(60000)) {
                     try { $sp.Kill() } catch { }
                     $actions += 'R0_START_KILLED_AFTER_60s'

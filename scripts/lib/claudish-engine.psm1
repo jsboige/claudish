@@ -1327,10 +1327,15 @@ function Get-ContainerRelaunchDecision {
 
     if ($next.ContainerStoppedFailures -lt $ConsecutiveStoppedFailures) {
         $action = 'pending'; $reason = "container stopped ($($next.ContainerStoppedFailures)/$ConsecutiveStoppedFailures) — counting"
-    } elseif ($ContainerState -eq 'absent') {
-        $action = 'container_absent'; $reason = 'container absent — escalate, never try to start a container that is not there'
     } elseif ($sinceAction -lt $RelaunchCooldownMin) {
         $action = 'guard_cooldown'; $reason = "last R0 action ${sinceAction} min ago < ${RelaunchCooldownMin} min"
+    } elseif ($ContainerState -eq 'absent') {
+        # AFTER the cooldown (review #1126): absent is terminal, so testing it
+        # first stamped the cooldown clock and reset the counter, then the next
+        # tick re-escalated every 2 ticks (~10 min at the /5 min cadence) for
+        # as long as the container stayed absent — the docstring's "Terminal:
+        # said its line; the cooldown bounds the repeats" was false for absent.
+        $action = 'container_absent'; $reason = 'container absent — escalate, never try to start a container that is not there'
     } elseif ($State.ContainerRelaunchSinceDown -ge 1) {
         $action = 'r0_after_relaunch'; $reason = 'R0 already fired once this episode and the container re-exited — escalate, never a start-loop (re_exited_after_start)'
     } else {

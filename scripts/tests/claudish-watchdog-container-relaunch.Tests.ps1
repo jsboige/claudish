@@ -1,4 +1,4 @@
-<#
+﻿<#
     Seam pins for the PURE rung R0 of the sidecar host watchdog
     (Get-ContainerRelaunchDecision in scripts/lib/claudish-engine.psm1) and the
     container half of the state codec.
@@ -112,6 +112,17 @@ Describe 'R0 container-relaunch ladder (the 14/11 kill-test blind spot)' {
         $t.NextState.ContainerRelaunchSinceDown | Should -Be 0
     }
 
+    It 'absent INSIDE the cooldown gives guard_cooldown (the cooldown bounds absent repeats too)' {
+        # Review #1126: absent tested BEFORE the cooldown stamped the clock,
+        # reset the counter, then re-escalated every 2 ticks (~10 min at the
+        # /5 min cadence) for as long as the container stayed absent. The
+        # cooldown comes first; absent is still terminal once it can speak.
+        $s = New-CState -Fails 1 -Stamp $script:Now
+        $t = Invoke-R0 -State $s -Container 'absent'
+        $t.Action | Should -Be 'guard_cooldown'
+        $t.NextState.ContainerRelaunchSinceDown | Should -Be 0
+    }
+
     It 'container UNKNOWN (unprobeable daemon) is NOT absent - never a phantom escalate' {
         $t = Invoke-R0 -State (New-CState) -Container 'unknown'
         $t.Action | Should -Be 'not_this_class'
@@ -195,5 +206,44 @@ Describe 'R0 state codec round-trip (container fields)' {
         ($json | ConvertFrom-Json).lastContainerActionUtc | Should -BeNullOrEmpty
         $back = ConvertFrom-WatchdogStateJson -Json $json
         $back.LastContainerActionUtc | Should -Be ([datetime]::MinValue)
+    }
+}
+
+Describe 'R0 -ContainerName wiring (the sidecar is not claudish-proxy everywhere)' {
+    # Review #1126 blocking 2: the probe and the start hard-coded
+    # 'claudish-proxy', but the container is 'claudish-sidecar' on ai-01,
+    # po-2024 and po-2027 — on those seats R0 would escalate a phantom
+    # container_absent instead of starting the container that is right there.
+    # Source-level pins: the script's main body is not callable from Pester
+    # (it probes the host), so we pin the wiring where it is written.
+
+    BeforeAll {
+        $script:WatchdogPath = Join-Path $PSScriptRoot '..\claudish-sidecar-host-watchdog.ps1'
+        $script:Source = Get-Content $script:WatchdogPath -Raw
+    }
+
+    It 'the script exposes -ContainerName with the claudish-proxy default' {
+        $script:Source | Should -Match '(?m)^\s*\[string\]\$ContainerName = ''claudish-proxy'',\r?$'
+    }
+
+    It 'the PROBE uses the parameter, not a hard-coded name' {
+        $script:Source | Should -Match 'inspect -f \{\{\.State\.Status\}\} \$ContainerName'
+        $script:Source | Should -Match 'Get-ClaudishContainerState -ContainerName \$ContainerName'
+        # No functional hard-code left: the only remaining literal mentions
+        # are the param default, its doc, the function's own default and the
+        # historical narrative of the 14/11 incident.
+        $functional = ($script:Source -split "`n") | Where-Object {
+            $_ -match 'claudish-proxy' -and $_ -notmatch 'ContainerName' -and
+            $_ -notmatch 'po-2028 name|ai-01|# |kill-test|`docker'
+        }
+        $functional | Should -BeNullOrEmpty
+    }
+
+    It 'the START actuator uses the parameter' {
+        $script:Source | Should -Match ([regex]::Escape("@('start', `$ContainerName)"))
+    }
+
+    It 'the R0 log lines name the container' {
+        $script:Source | Should -Match 'R0_DOCKER_START_CONTAINER_BEGIN container=\$containerState name=\$ContainerName'
     }
 }
