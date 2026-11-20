@@ -181,6 +181,18 @@ function quotaWall(): Response {
   );
 }
 
+/** The z.ai request-concurrency refusal on the wire (#679/#781): HTTP 429,
+ *  `error.code 1302` in the body. ComposedHandler classifies the BODY and the
+ *  re-enveloped response reaches the cascade carrying the busy;code=1302
+ *  annotation — the walk opens through isConcurrencyRefusalWalk, exactly the
+ *  hub-measured shape of #1124. Stub key: endpointStatus[ep] = 1302. */
+function concurrencyRefusal429(): Response {
+  return new Response(
+    JSON.stringify({ error: { code: "1302", message: "Rate limit reached for requests" } }),
+    { status: 429, headers: { "content-type": "application/json", "retry-after": "1" } }
+  );
+}
+
 /** GLM Coding's real shape: a 429 whose body names the overload (isTransientOverload
  *  matches, so it is an overload — NOT a burst). */
 function overload429(): Response {
@@ -354,6 +366,7 @@ beforeEach(() => {
     calls[which] = (calls[which] ?? 0) + 1;
     if (endpointDelay[which]) await new Promise((r) => setTimeout(r, endpointDelay[which]));
     const status = endpointStatus[which] ?? (which === "nm" ? 529 : 200);
+    if (status === 1302) return concurrencyRefusal429();
     if (status === 402) return quotaWall();
     if (status === 529) return overload529();
     if (status === 429) return burst429[which] ? burst429Resp() : overload429();
@@ -1211,6 +1224,47 @@ describe("#598 — a walk into a connection-dead step advances once (RED until t
     // And the wall the CONCURRENT request made is untouched by this result:
     // a success credits the owner, it never disarms a bucket (TTL owns that).
     expect(isBucketWalled(bucketOfTr)).toBe(true);
+  }, 30_000);
+});
+
+// ─── #1124 — a walk step's own quota refusal is recorded on the STEP ─────
+//
+// Hub-measured 18-20/11: every 1302 opens the #299-B/#781 walk, rung 0
+// (mistral) answers 402 budget-exhausted, but the walk writes NO state —
+// nobody else records the fact either — so firstServable finds the dead
+// rung "servable" forever. 3 441 useless round-trips, rung 1 never reached,
+// the client eats the 429. The fix: a quota-class death of a WALK STEP
+// benches that step (markStepFailed, per-step backoff, concrete-bound
+// #331). Nothing on the nominal: no arm, no wall, no pin. W31 holds — no
+// advance in THIS request; the NEXT one skips the benched rung.
+describe("#1124 — the walk's rung-0 quota wall benches the rung, not the role", () => {
+  test("W35: walk rung 0 answers a quota wall → rung marked (WALK-MARK), next request serves rung 1", async () => {
+    await spin();
+    resetWalk();
+    endpointStatus.nm = 1302;
+    endpointStatus.s0 = 402;
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(429);
+    expect(calls.nm).toBe(1);
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(0); // W31 holds: no advance in the SAME request
+    expect(
+      failoverLog.some(
+        (l) =>
+          l.includes("[Failover] WALK-MARK sonnet step 0") &&
+          l.includes("s0-ep@fake-s0") &&
+          l.includes("quota-class 402")
+      )
+    ).toBe(true);
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(200);
+    expect(await r2.text()).toContain("Hello from the cascade.");
+    expect(calls.s0).toBe(1); // unchanged — the dead rung is never re-paid
+    expect(calls.s1).toBe(1);
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
   }, 30_000);
 });
 
