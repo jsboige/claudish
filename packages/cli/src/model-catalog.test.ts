@@ -151,6 +151,14 @@ afterAll(() => {
 // ─── Group 1: Model Catalog Unit Tests ───────────────────────────────────────
 
 describe("Group 1: Model Catalog — lookupModel()", () => {
+  // The resolver's in-memory catalog is process-global, and lookupModel()
+  // falls back to it on a disk miss (#222 c). Any earlier test file that
+  // warmed it (a real catalog carries glm-5) turns the cold-start case below
+  // into a memory hit — red on main 844710aec, order-dependent. Group 1 is
+  // about the disk cache alone, so it starts from an empty memory catalog.
+  beforeEach(() => setMemCatalogForTests(null));
+  afterEach(() => setMemCatalogForTests(null));
+
   test("MiniMax-M2.7 alias → contextWindow 204800, supportsVision false", () => {
     const entry = lookupModel("MiniMax-M2.7", mockCachePath);
     expect(entry).toBeDefined();
