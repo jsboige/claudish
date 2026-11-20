@@ -23,6 +23,7 @@ import {
   diffAgainstBaseline,
   entryFile,
   enumerateTestFiles,
+  foreignEntryFiles,
   main,
   mergeEnvGates,
   normalizeFailLine,
@@ -894,7 +895,11 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     expect(out).toContain("did NOT reproduce");
   });
 
-  test("a fresh entry whose file maps to NO partition falls back to re-running everything (no blind spot)", () => {
+  test("a FOREIGN entry refuses the first pass (verify path too): exit 3, the foreign file named — no verdict from a population that was never delivered", () => {
+    // Review #1114, third review: the old no-blind-spot fallback (re-run
+    // everything) lived only on the verify path, and learn never reached it —
+    // it is retired. A foreign entry is refused wherever it is parsed; the
+    // retry-all escape hatch no longer exists to reach.
     chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
     const deps = depsWithFresh(
       ["a.test.ts", "b.test.ts"],
@@ -911,11 +916,13 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
       return r;
     };
     const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
-    // conservative path: re-run ALL partitions (2) + first pass (2) = 4 invocations
-    expect(deps.invocations.length).toBe(4);
-    expect(out).toContain("re-running 2/2 partition(s)");
-    // the ghost reproduces every time (it is in every re-run of partition a) → regression
-    expect(code).toBe(1);
+    expect(code).toBe(3);
+    expect(out).toContain("FOREIGN POPULATION");
+    // the refusal names the foreign file — "a population" alone tells no one what leaked in
+    expect(out).toContain("unmapped/ghost.test.ts");
+    // no retry-all was ever armed: the first pass refuses before any re-run
+    expect(out).not.toContain("re-running");
+    expect(deps.invocations.length).toBe(1); // partition a only (the ghost carrier), partition b never ran
   });
 
   // ─── Population-gap guard (file 19b items 1+2+3, review #1114) ────────────
@@ -1032,17 +1039,22 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     expect(out).not.toContain("flaky tail");
   });
 
-  test("over-count carve-out: an echo the ENTRIES explain (ghost file) is NOT refused here — the re-run-everything fallback owns it", () => {
+  test("carve-out division of labor: an entry-explained echo is NOT an over-count — the ghost is a FOREIGN entry, refused by its own guard", () => {
     // 1 delivered, entries name a.test.ts + a file outside the delivery, echo
-    // == 2 == entry-file count: the extra file left a trace, this is the
-    // ghost shape the no-blind-spot fallback re-runs everything for. The new
-    // gate must not preempt it (only an echo beyond BOTH delivery and entries
-    // is a refusal), and the under-count side stays with the gap guard.
+    // == 2 == entry-file count: numerically consistent, so populationEchoOverCounts
+    // rightly declines it (only an echo beyond BOTH delivery and entries is an
+    // over-count). The ghost is not tolerated anywhere though — since review
+    // #1114's third return, foreignEntryFiles owns that shape (the retired
+    // retry-all fallback used to).
     const ghostRaw = outputFor(["a.test.ts > a1", "unmapped/ghost.test.ts > g1"]);
     const parsed = parseRunOutput(ghostRaw);
     expect(ranLineFileCount(ghostRaw)).toBe(2); // echo == entry-file count
     expect(populationEchoOverCounts(["a.test.ts"], ranLineFileCount(ghostRaw), parsed)).toBe(false);
-    // the review witness shape, by contrast, IS an over-count on both axes
+    // the SAME parsed run is caught by the foreign guard: the two predicates
+    // partition the defect space without overlap or hole
+    expect(foreignEntryFiles(["a.test.ts"], parsed)).toEqual(["unmapped/ghost.test.ts"]);
+    // the review-2 witness shape, by contrast, IS an over-count on both axes
+    // (and names nothing foreign — zero entries to name)
     const witnessRaw = outputFor([], 3);
     expect(
       populationEchoOverCounts(
@@ -1051,6 +1063,56 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
         parseRunOutput(witnessRaw)
       )
     ).toBe(true);
+  });
+
+  // ─── Foreign population guard (file 20a items 1+2+3, review #1114 third return) ──
+
+  test("a foreign entry refuses --learn: exit 3 and NO baseline — the review-3 witness (1 delivered, ghost written into the baseline, was exit 0)", () => {
+    chdirTmp();
+    // The third review's exact shape on 33955107: 1 delivered a.test.ts,
+    // accountable output with failed entries for a.test.ts AND ghost.test.ts,
+    // echo 2. Every count guard passed (echo == entry-file count), the old
+    // retry-all fallback lives only on the verify path, so --learn wrote BOTH
+    // entries into the baseline and returned 0.
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts"],
+      runPartition: () => ({
+        raw: outputFor(["a.test.ts > a1", "ghost.test.ts > g1"]), // echo 2, accountable
+      }),
+    };
+    const { code, out } = captureStdout(() =>
+      main(["--learn", "--partition=2"], neverRunner, deps)
+    );
+    expect(code).toBe(3);
+    expect(out).toContain("FOREIGN POPULATION");
+    expect(out).toContain("ghost.test.ts");
+    expect(existsSync(join(process.cwd(), BASELINE_PATH))).toBe(false);
+  });
+
+  test("the CONFIRMATION pass holds the same foreign gate — a ghost in the re-run is never evidence of non-reproduction", () => {
+    chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
+    let pass = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        pass += 1;
+        if (fs[0] === "a.test.ts") {
+          // first pass: clean echo + a fresh entry; confirmation: the re-run of
+          // partition a carries a ghost entry — NEW1's absence would otherwise
+          // read as "flaky, did not reproduce" from a population that was
+          // never delivered
+          if (pass === 1)
+            return { raw: outputFor(["a.test.ts > a1", "a.test.ts > NEW1"], fs.length) };
+          return { raw: outputFor(["a.test.ts > a1", "ghost.test.ts > g1"]) }; // echo 2 == entry-file count: count guards all pass
+        }
+        return { raw: outputFor([], fs.length) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
+    expect(code).toBe(3);
+    expect(out).toContain("FOREIGN POPULATION in confirmation");
+    expect(out).toContain("ghost.test.ts");
+    expect(out).not.toContain("flaky tail");
   });
 
   test("portable concrete control: realSuiteRunner's per-file selection runs TWO real Bun test files and the echo covers both", () => {

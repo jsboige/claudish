@@ -300,13 +300,11 @@ export function populationGapUnexplained(
  * echo covers the delivery", --learn wrote the empty union as a baseline and
  * returned 0. Three files cannot attest the execution of exactly two.
  *
- * One shape is deliberately NOT refused here: when the extra count is exactly
- * explained by the entries themselves (an entry names a file outside the
- * delivery — the "ghost" of the no-blind-spot fallback), the echo matches the
- * entry-file count and the reviewed re-run-everything path owns the case.
- * So the refusal fires only when the echo outruns BOTH the delivery and every
- * file the entries name: no trace at all accounts for the extra files, the
- * summary describes another population.
+ * This predicate stays NUMERIC: it fires only when the echo outruns BOTH the
+ * delivery and every file the entries name (no trace at all accounts for the
+ * extra count). The shape where the echo IS consistent with the entries but
+ * an entry names a file outside the delivery is a FOREIGN entry, not an
+ * over-count — foreignEntryFiles owns that case (third review).
  */
 export function populationEchoOverCounts(
   delivered: string[],
@@ -316,6 +314,23 @@ export function populationEchoOverCounts(
   if (ranFiles === null) return false; // unknown population: the gap guard owns it
   const entryFiles = new Set(parsed.entries.map(entryFile));
   return ranFiles > delivered.length && ranFiles > entryFiles.size;
+}
+
+/**
+ * Review #1114, third review (file 20a): an entry naming a file OUTSIDE the
+ * delivery is a foreign population. Its witness: 1 delivered a.test.ts,
+ * accountable output with failed entries for a.test.ts AND ghost.test.ts,
+ * echo 2 — learn wrote BOTH into the baseline and returned 0, because the
+ * count guards all pass (echo == entry-file count >= delivery) and the
+ * re-run-everything fallback lives only on the verify path, never reached in
+ * learn. A foreign entry is refused everywhere it is parsed: no baseline
+ * write, no verdict, and on confirmation a foreign population is never
+ * evidence of non-reproduction (a ghost cannot re-appear in a partition it
+ * was never delivered to, so its absence would read as flaky).
+ */
+export function foreignEntryFiles(delivered: string[], parsed: SuiteRun): string[] {
+  const owned = new Set(delivered);
+  return [...new Set(parsed.entries.map(entryFile))].filter((f) => !owned.has(f)).sort();
 }
 
 /**
@@ -860,6 +875,26 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
       );
       return 3;
     }
+    const foreign = foreignEntryFiles(partitions[i], parsed);
+    if (foreign.length > 0) {
+      // Review #1114, third review (file 20a): an entry naming a file outside
+      // the delivery is a foreign population. The witness: 1 delivered, failed
+      // entries for a.test.ts AND ghost.test.ts, echo 2 — every count guard
+      // passes and --learn wrote the ghost INTO the baseline with exit 0. The
+      // old no-blind-spot fallback lives only on the verify path, so learn
+      // never reached it. Refused here, both modes, before anything is
+      // consecrated: no baseline write, no verdict.
+      process.stdout.write(
+        `[STRICT] 🔴 FOREIGN POPULATION in partition ${i + 1}/${partitions.length}: entries name ` +
+          `${foreign.length} file(s) outside the delivery:\n`
+      );
+      for (const f of foreign) process.stdout.write(`[STRICT]   · ${f}\n`);
+      process.stdout.write(
+        "[STRICT]   Refusing: an entry from a file that was never delivered is not this run's " +
+          "population — no baseline is written and no verdict is drawn from it.\n"
+      );
+      return 3;
+    }
     if (ranFiles !== null && ranFiles !== delivered) {
       const explained = partitions[i].filter((f) =>
         parsed.entries.some((e) => e.startsWith(`${f}: load error`))
@@ -911,16 +946,22 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
     verdict.resolved = resolved;
     if (fresh.length > 0) {
       const rerun = new Set<number>();
-      let unknownFile = false;
       for (const entry of fresh) {
         const idx = partitionOf.get(entryFile(entry));
-        if (idx === undefined) unknownFile = true;
-        else rerun.add(idx);
+        if (idx === undefined) {
+          // Foreign entries are refused at the FIRST pass (foreignEntryFiles),
+          // so an unmapped fresh file cannot reach here — this is defence in
+          // depth, not a retry-all: never confirm from a population we do not
+          // own. The old re-run-everything fallback was retired with that
+          // refusal (review #1114, third review).
+          process.stdout.write(
+            `[STRICT] 🔴 FRESH ENTRY OUTSIDE THE POPULATION: ${entry} — no partition owns ` +
+              `${entryFile(entry)}. Refusing: no verdict is drawn from an unowned file.\n`
+          );
+          return 3;
+        }
+        rerun.add(idx);
       }
-      // An entry whose file maps to no partition should be impossible (every
-      // entry came out of one of them) — if a path shape ever drifts, fall
-      // back to re-running everything rather than confirming from a blind spot.
-      if (unknownFile) for (let i = 0; i < partitions.length; i++) rerun.add(i);
       process.stdout.write(
         `[STRICT] ${fresh.length} fresh entr(ies) — re-running ${rerun.size}/${partitions.length} partition(s) (reproduction rule)…\n`
       );
@@ -972,6 +1013,18 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
             `[STRICT] 🔴 POPULATION GAP in confirmation of partition ${i + 1}/${partitions.length}: ${ranFiles2 ?? "NO Ran line"} file(s) ran / ${partitions[i].length} delivered — ${unexplained2.length} UNEXPLAINED (not a module-load death). No entry is classified flaky from a population that never ran:\n`
           );
           for (const f of unexplained2) process.stdout.write(`[STRICT]   · ${f}\n`);
+          return 3;
+        }
+        const foreign2 = foreignEntryFiles(partitions[i], parsed2);
+        if (foreign2.length > 0) {
+          // Review #1114, third review: a foreign population is never evidence
+          // of non-reproduction — a ghost cannot re-appear in a partition it
+          // was never delivered to, so its absence here would read as flaky.
+          process.stdout.write(
+            `[STRICT] 🔴 FOREIGN POPULATION in confirmation of partition ${i + 1}/${partitions.length}: ` +
+              `entries name file(s) outside the delivery (${foreign2.join(", ")}). No entry is ` +
+              "classified flaky from a population that was never delivered.\n"
+          );
           return 3;
         }
         for (const e of parsed2.entries) if (!baseline.fails.includes(e)) fresh2Set.add(e);
