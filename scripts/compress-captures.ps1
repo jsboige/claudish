@@ -48,18 +48,26 @@
   Show what would be archived/deleted without changing anything.
 
 .NOTES
-  Installed on this machine as the nightly Task Scheduler job
-  "ClaudishCaptureCompaction" (daily 02:47 local — moved off 04:17 on
-  2026-08-20: the 60-70 min run collided with the 04:00 container restart —
-  runs as the interactive user, StartWhenAvailable to catch up missed runs).
+  Installed on the hub as the nightly Task Scheduler job
+  "ClaudishCaptureCompaction" — measured 21/11: the hub fires at 00:47Z
+  every night (02:47 local in summer/UTC+2, 01:47 in winter/UTC+1 — the
+  old "02:47 local" note was summer time). The trigger hour is PER-SEAT:
+  the recipe below registers LOCAL 02:47; the deployed hub task carries
+  00:47Z. Moved off 04:17 on 2026-08-20: the 60-70 min run collided with
+  the 04:00 container restart. Runs as the interactive user,
+  StartWhenAvailable to catch up missed runs.
   Re-create it with:
 
     $action  = New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' `
                  -Argument '-NoProfile -ExecutionPolicy Bypass -File "d:\Dev\claudish\scripts\compress-captures.ps1"'
     $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]'02:47')
+    # 6 h, not 3: the worst measured day (38.8 GB loose, hub night 20/11)
+    # packed + verified in 4 h 18 — a 3 h limit kills exactly that night
+    # (#1138), and 6 h leaves ~40% margin over the worst day without
+    # parking a wedged run all morning. The live hub task carries PT12H.
     $set     = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
                  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                 -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew
+                 -ExecutionTimeLimit (New-TimeSpan -Hours 6) -MultipleInstances IgnoreNew
     $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName 'ClaudishCaptureCompaction' -Action $action `
                  -Trigger $trigger -Settings $set -Principal $princ -Force
@@ -111,7 +119,13 @@ param(
   # #389: how many manifest entries the nightly sha re-check verifies per run
   # (deterministic rotation; 3 by default, 0 disables). Each entry re-hashed is
   # one DriveFS hydration, so keep this small.
-  [int]$ShaCheckCount = 3
+  [int]$ShaCheckCount = 3,
+  # #1138: heartbeat interval (seconds) while a 7z call runs — one PROGRESS
+  # line per interval, plus one before every call. The 20/11 hub night packed
+  # 38.8 GB in 4 h 18 with -bso0/-bsp0: four hours of journal silence is what
+  # made a healthy run read as stalled. 0 disables the during-call heartbeat
+  # (the before-call line stays). Tests set 1 to pin it without waiting.
+  [int]$ProgressHeartbeatSec = 3600
 )
 
 $ErrorActionPreference = "Stop"
@@ -132,6 +146,66 @@ function Log([string]$msg) {
   $line = "{0:yyyy-MM-ddTHH:mm:ssZ} {1}" -f (Get-Date).ToUniversalTime(), $msg
   Write-Host $line
   try { Add-Content -LiteralPath $logFile -Value $line -Encoding utf8 } catch {}
+}
+
+# --- #1138: every 7z call is announced, and a long one beats a heartbeat ------
+# Why Start-Process + poll instead of `& $SevenZip ...`: an engine event or
+# timer cannot fire while the pipeline is blocked on a native call under
+# PS 5.1, so the heartbeat has to come from a poll loop around a child
+# process. Exit code flows back from $p.ExitCode; -NoNewWindow keeps the
+# (silent: -bso0 -bsp0) console stream where it was. Elements containing
+# spaces are pre-quoted: PS 5.1's -ArgumentList joins with spaces verbatim.
+function Invoke-SevenZipLogged([string]$Label, [string[]]$Argv) {
+  Log ("PROGRESS {0}: 7z {1}" -f $Label, ($Argv -join ' '))
+  $quoted = $Argv | ForEach-Object { if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ } }
+  $argString = $quoted -join ' '
+  # A .cmd/.bat 7z (a stub, or a seat's shim) cannot be exec'd by
+  # CreateProcess directly: route through cmd.exe /c. pwsh 7 tolerates a bare
+  # .cmd, PS 5.1 does not (measured 21/11: the pack died mid-call and the
+  # journal lost the outcome line). Real .exe paths never take this branch.
+  $exe = $SevenZip
+  if ($SevenZip -match '\.(cmd|bat)$') {
+    $exe = $env:ComSpec
+    if ($SevenZip -match '\s') { $SevenZip = '"{0}"' -f $SevenZip }
+    $argString = '/c {0} {1}' -f $SevenZip, $argString
+  }
+  # Raw System.Diagnostics.Process, NOT Start-Process -PassThru: on this
+  # fleet's PS 5.1 the cmdlet's returned object NEVER yields ExitCode (null in
+  # every shape -- with WaitForExit, with Refresh, measured 21/11: both rc's
+  # read blank and a healthy pack was quarantined as a failed night). The raw
+  # Process object answers ExitCode correctly under 5.1 and pwsh 7 alike.
+  # UseShellExecute=$false + no redirects: the child inherits our console, so
+  # its output keeps flowing to whatever this run was redirected to.
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $exe
+  # #1145 review — the list file carries BARE names and the script resolves
+  # them from the PS location (Push-Location $CaptureDir). A raw Process does
+  # NOT inherit that location: it starts in [Environment]::CurrentDirectory,
+  # which Push-Location never moves -- measured 21/11 on ai-01 with a real
+  # 7z: every night hit "cannot find listed file" and went QUARANTINE. Pass
+  # the caller's location explicitly.
+  $psi.WorkingDirectory = (Get-Location).ProviderPath
+  $psi.Arguments = $argString
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  # $t0, never the Process's StartTime: under PS 5.1 a Process whose child
+  # has died hands back a StartTime that breaks op_Subtraction (measured
+  # 21/11 -- the second heartbeat killed the whole run with
+  # $ErrorActionPreference = Stop).
+  $t0 = Get-Date
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $lastHb = $t0
+  while (-not $p.HasExited) {
+    Start-Sleep -Milliseconds 250
+    if ($ProgressHeartbeatSec -gt 0 -and ((Get-Date) - $lastHb).TotalSeconds -ge $ProgressHeartbeatSec) {
+      $lastHb = Get-Date
+      Log ("PROGRESS {0}: still running ({1:N0} s elapsed)" -f $Label, [int]((Get-Date) - $t0).TotalSeconds)
+    }
+  }
+  # WaitForExit synchronizes the exit code (instant here -- the loop already
+  # saw the process gone).
+  $p.WaitForExit()
+  return $p.ExitCode
 }
 
 # --- Q85 / #1095 review: an unset Drive root must COUNT, not vanish ----------
@@ -320,8 +394,7 @@ foreach ($day in $daysToArchive) {
     # `a` on a VALID canonical is a legitimate incremental update (measured
     # 35:1 on a re-run), so this acts only when the probe is RED.
     if (Test-Path -LiteralPath $archivePath) {
-      & $SevenZip t -bso0 -bsp0 "$archivePath" | Out-Null
-      $preRc = $LASTEXITCODE
+      $preRc = Invoke-SevenZipLogged -Label ("probe {0}" -f $day) -Argv @('t', '-bso0', '-bsp0', $archivePath)
       if ($preRc -ne 0) {
         $q = Invoke-ArchiveQuarantine -Path $archivePath
         if ($q.Ok) {
@@ -356,10 +429,8 @@ foreach ($day in $daysToArchive) {
       # NB: no `--` here — 7-Zip's `--` stops @listfile parsing too, which would
       # make it treat the list as a literal filename. The archive path and the
       # @list arg are both safe (no leading `-`), so `--` is unnecessary.
-      & $SevenZip a -t7z -m0=lzma2 -mx=9 -md=32m -mfb=273 -mmt=8 -bso0 -bsp0 "$archivePath" "@$listFile" | Out-Null
-      $addRc = $LASTEXITCODE
-      & $SevenZip t -bso0 -bsp0 "$archivePath" | Out-Null
-      $testRc = $LASTEXITCODE
+      $addRc  = Invoke-SevenZipLogged -Label ("pack {0}" -f $day) -Argv @('a', '-t7z', '-m0=lzma2', '-mx=9', '-md=32m', '-mfb=273', '-mmt=8', '-bso0', '-bsp0', $archivePath, "@$listFile")
+      $testRc = Invoke-SevenZipLogged -Label ("verify {0}" -f $day) -Argv @('t', '-bso0', '-bsp0', $archivePath)
     } finally {
       Pop-Location
       Remove-Item -LiteralPath $listFile -Force -ErrorAction SilentlyContinue
@@ -555,10 +626,10 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
     # for an OLD day the loose originals are long gone, so renaming its only
     # copy on a possibly-transient test failure would hide the day from every
     # reader without helping anyone — the log line is the escalation.
-    & $SevenZip t -bso0 -bsp0 "$($arch.FullName)" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $gateRc = Invoke-SevenZipLogged -Label ("verify {0}" -f $arch.BaseName) -Argv @('t', '-bso0', '-bsp0', $arch.FullName)
+    if ($gateRc -ne 0) {
       $errors++
-      Log ("REFUSE {0}: local archive fails 7z t (rc={1}) -> NOT uploaded, kept local for review" -f $arch.BaseName, $LASTEXITCODE)
+      Log ("REFUSE {0}: local archive fails 7z t (rc={1}) -> NOT uploaded, kept local for review" -f $arch.BaseName, $gateRc)
       continue
     }
     try {
