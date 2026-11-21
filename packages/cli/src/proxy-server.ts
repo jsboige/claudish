@@ -2543,6 +2543,35 @@ export async function createProxyServer(
                 if (advanced.served) return advanced.served;
               }
             }
+            // #1124: the walk's step died QUOTA-class — its own plan is walled,
+            // and that fact belongs in the step's own record. The #299-B
+            // contract (a transient walk writes no state) is right for the
+            // TRANSPORT class it was drawn from, but a 402/429-that-names-a-wall
+            // is not transient: the step will answer the same wall on every
+            // re-pick, and nobody else records it — the walk deliberately
+            // doesn't, and the nominal's own cascade was never entered.
+            // Measured on the hub 18-20/11: 3 441 dead round-trips to the
+            // first servable rung (Mistral on the seats that exclude Terra),
+            // the next rung never reached, the client eating the 429 each
+            // time. Mark THE STEP (per-step backoff, concrete-bound #331) —
+            // never the nominal: no arm, no wall, no pin. W31 holds: no
+            // advance in THIS request; the NEXT one skips the benched rung.
+            // Kill switch CLAUDISH_FAILOVER_WALK_MARK=0 restores the stateless
+            // walk (read per request; a misclassification is then reversible
+            // without a redeploy).
+            if (
+              isQuotaExhaustion(firstFailure.status, firstFailure.errBody) &&
+              (process.env.CLAUDISH_FAILOVER_WALK_MARK || "").trim() !== "0"
+            ) {
+              const walkWhy = `HTTP ${firstFailure.status} (quota-class) from walk step ${walk.stepIndex} (${walk.concrete})`;
+              markStepFailed(walkRole, walk.stepIndex, walkWhy, parseResetAtFromBody(firstFailure.errBody), {
+                concrete: walk.concrete,
+              });
+              log(
+                `[Failover] WALK-MARK ${walkRole} step ${walk.stepIndex} (${walk.concrete}) quota-class ${firstFailure.status}`,
+                true // forceConsole — countable marker (#1124)
+              );
+            }
           }
           return response;
         }
