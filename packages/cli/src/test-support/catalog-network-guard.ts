@@ -22,16 +22,24 @@
  * `_memCache` stays cold, and resolution falls back to the same
  * disk/passthrough paths an offline seat exercises.
  *
- * Scope, deliberately narrow:
- * - Only the REAL remote host is blocked, matched exactly. `CLAUDISH_CATALOG_URL`
- *   pointed at a LOCAL server is a documented, legitimate integration-test
- *   pattern (openrouter.ts header) — loopback overrides pass through.
- * - Only the catalog endpoint. The other background warms at proxy spin
- *   (pricing, recommended models) write to the sandboxed home, not to module
- *   state no test reads — out of scope here.
+ * Scope: the REAL models-index HOST, every path (review blocking 2, #1135):
+ * the match is on the host, and that host serves more than the catalog —
+ * `queryModels` + the recommended-models fetch (model-loader.ts) and
+ * `errorReportIngest` (mcp-server.ts) ride the same host. No test should
+ * reach that host on any path, so the refusal is host-wide on purpose.
+ * What still passes:
+ * - `CLAUDISH_CATALOG_URL` pointed at a LOCAL server — a documented,
+ *   legitimate integration-test pattern (openrouter.ts header); loopback
+ *   overrides pass through.
+ * - Everything off that host (the other background warms at proxy spin write
+ *   to the sandboxed home, not to module state a test reads).
  * - A test file that assigns its own `globalThis.fetch` stub REPLACES this
  *   wrapper entirely (last write wins) and serves its own fixtures — the
  *   hermetic suites (openrouter.test.ts) are unaffected by design.
+ *
+ * Input shapes (review blocking 1): fetch accepts a string, a `Request` (it
+ * has `.url`), or a `URL` object — which has `.href`, NOT `.url`. All three
+ * are extracted before matching, so no input shape can slip past the guard.
  */
 
 /** The real models-index host — the only host this guard refuses. */
@@ -63,7 +71,9 @@ export function armCatalogNetworkGuard(): void {
   const real = (globalThis as any).fetch;
   if (!real || (real as any).__claudishCatalogGuard) return;
   const wrapped = async (input: any, init?: any) => {
-    const url = typeof input === "string" ? input : String(input?.url ?? "");
+    // string | Request (.url) | URL (.href — never .url, review blocking 1)
+    const url =
+      input instanceof URL ? input.href : typeof input === "string" ? input : String(input?.url ?? "");
     if (isRealCatalogUrl(url)) {
       blockedCount++;
       throw new TypeError(CATALOG_GUARD_MESSAGE);

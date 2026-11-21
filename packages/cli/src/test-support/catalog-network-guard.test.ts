@@ -39,6 +39,20 @@ describe("catalog network guard (#1133 upstream — the real-catalog leak class)
     expect(firebaseCatalogUrl()).toBe(REAL_CATALOG_URL);
   }, 10_000);
 
+  // Review blocking 1 (#1135): a URL object has .href, never .url — the first
+  // extraction missed it and the request passed through to the real fetch.
+  test("a fetch called with a URL OBJECT is refused too (no input shape slips past)", async () => {
+    const before = catalogGuardBlockedCount();
+    let err: unknown = null;
+    try {
+      await fetch(new URL(REAL_CATALOG_URL));
+    } catch (e) {
+      err = e;
+    }
+    expect(String(err)).toContain(CATALOG_GUARD_MESSAGE);
+    expect(catalogGuardBlockedCount()).toBe(before + 1);
+  }, 10_000);
+
   test("a resolver warm under the guard leaves the memory catalog COLD — the cross-file leak is dead", async () => {
     resetOpenRouterCatalogForTests();
     const before = catalogGuardBlockedCount();
