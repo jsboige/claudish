@@ -41,14 +41,50 @@ BeforeAll {
 
 Describe 'compress-captures progress lines (#1138)' {
     BeforeAll {
-        # A FAKE 7z: sleeps ~2 s (two pings of 1 s), ignores its arguments,
-        # exits 0, writes nothing. The script honours an -SevenZip that exists
-        # (#214), so the pack/verify/probe paths all run through it while the
-        # journal carries the PROGRESS lines this pin asserts. -ProgressHeartbeatSec 1
-        # makes the during-call heartbeat fire without waiting an hour.
+        # A FAKE 7z that behaves like the real one where #1145's review bit:
+        # it READS its @listfile and refuses (exit /b 2) when a listed BARE
+        # name does not exist in ITS OWN working directory -- exactly what a
+        # raw System.Diagnostics.Process breaks when nobody passes
+        # $psi.WorkingDirectory (Push-Location moves the PS location, never
+        # [Environment]::CurrentDirectory). On 'a' it then sleeps ~2 s (the
+        # heartbeat window), writes a 6-byte archive, exits 0; on 't' it
+        # answers from file existence. Sandbox paths carry no spaces by
+        # construction.
         $script:FakeDir = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("cc-prog-" + [guid]::NewGuid().ToString('N')))
         $script:Fake7z = Join-Path $script:FakeDir 'fake7z.cmd'
-        [System.IO.File]::WriteAllText($script:Fake7z, "@echo off`r`nping -n 3 127.0.0.1 >nul`r`nexit /b 0`r`n", (New-Object System.Text.UTF8Encoding($false)))
+        $fakeBody = @(
+            '@echo off'
+            'setlocal EnableDelayedExpansion'
+            'set "MODE=%~1"'
+            'set "TARGET="'
+            'set "LAST="'
+            'for %%F in (%*) do ('
+            '  if /i "%%~xF"==".7z" set "TARGET=%%~fF"'
+            '  set "LAST=%%~F"'
+            ')'
+            'set "AT=!LAST:~0,1!"'
+            'if "!AT!"=="@" ('
+            '  set "LF=!LAST:~1!"'
+            '  if not exist "!LF!" exit /b 3'
+            '  for /f "usebackq delims=" %%N in ("!LF!") do ('
+            '    if not exist "%%~N" exit /b 2'
+            '  )'
+            ')'
+            'if /i "!MODE!"=="a" goto add'
+            'if /i "!MODE!"=="t" goto test'
+            'exit /b 1'
+            ':add'
+            'if not defined TARGET exit /b 1'
+            'ping -n 3 127.0.0.1 >nul'
+            'echo fake> "!TARGET!"'
+            'exit /b 0'
+            ':test'
+            'if not defined TARGET exit /b 2'
+            'if not exist "!TARGET!" exit /b 2'
+            'exit /b 0'
+            ''
+        ) -join "`r`n"
+        [System.IO.File]::WriteAllText($script:Fake7z, $fakeBody, (New-Object System.Text.ASCIIEncoding))
     }
     AfterAll {
         Remove-Item -Recurse -Force $script:FakeDir -ErrorAction SilentlyContinue
@@ -68,10 +104,14 @@ Describe 'compress-captures progress lines (#1138)' {
             $rc = $LASTEXITCODE
             $logLines = @(Get-Content -LiteralPath $out)
             $logTxt = $logLines -join "`n"
-            # The fake writes no archive, so the night counts the pack as failed
-            # (rc=1) — the fixture's contract, asserted so a silent change in the
-            # error accounting cannot mask what this pin is about: the lines.
-            $rc | Should -Be 1
+            # The fake now WRITES the archive and reads its listfile, so the
+            # night must COMPLETE (rc=0, OK line, nothing quarantined). This is
+            # also the #1145 discriminator: without $psi.WorkingDirectory the
+            # fake cannot resolve the bare names, exits 2, and the night is
+            # quarantined -- the pin goes red with the fake alone, no real 7z
+            # needed on the seat.
+            $rc | Should -Be 0
+            $logTxt | Should -Not -Match 'QUARANTINE'
             # 1. BEFORE each call: the pack is announced with its argv.
             $logTxt | Should -Match 'PROGRESS pack 2026-11-01: 7z a -t7z -m0=lzma2'
             # 2. WHILE a call runs: at least one heartbeat line (fake sleeps ~2 s,
@@ -79,10 +119,10 @@ Describe 'compress-captures progress lines (#1138)' {
             $logTxt | Should -Match 'PROGRESS pack 2026-11-01: still running \(\d+ s elapsed\)'
             # 3. Order: the announcement precedes the day's outcome line.
             $packIdx = ($logLines | Select-String -Pattern 'PROGRESS pack 2026-11-01: 7z a ').LineNumber
-            $errIdx  = ($logLines | Select-String -Pattern 'ERROR 2026-11-01: 7z add').LineNumber
+            $okIdx   = ($logLines | Select-String -Pattern 'OK +2026-11-01:').LineNumber
             $packIdx | Should -Not -BeNullOrEmpty
-            $errIdx  | Should -Not -BeNullOrEmpty
-            ($packIdx[0] -lt $errIdx[0]) | Should -BeTrue
+            $okIdx   | Should -Not -BeNullOrEmpty
+            ($packIdx[0] -lt $okIdx[0]) | Should -BeTrue
             # 4. The verify call is announced too (before-each-call, not just the pack).
             $logTxt | Should -Match 'PROGRESS verify 2026-11-01: 7z t -bso0'
         }

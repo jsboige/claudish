@@ -178,6 +178,13 @@ function Invoke-SevenZipLogged([string]$Label, [string[]]$Argv) {
   # its output keeps flowing to whatever this run was redirected to.
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = $exe
+  # #1145 review — the list file carries BARE names and the script resolves
+  # them from the PS location (Push-Location $CaptureDir). A raw Process does
+  # NOT inherit that location: it starts in [Environment]::CurrentDirectory,
+  # which Push-Location never moves -- measured 21/11 on ai-01 with a real
+  # 7z: every night hit "cannot find listed file" and went QUARANTINE. Pass
+  # the caller's location explicitly.
+  $psi.WorkingDirectory = (Get-Location).ProviderPath
   $psi.Arguments = $argString
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
