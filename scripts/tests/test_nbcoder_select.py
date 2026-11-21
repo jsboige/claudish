@@ -203,6 +203,43 @@ TARGET = "Series/T-01-CSharp.ipynb"
 BODY = Raw("- Cible C# : `" + TARGET + "`\n")
 
 
+RUST_TARGET = "MyIA.AI.Notebooks/Search/Part2-CSP/CSP-10-Optimisation-Z3-Rust.ipynb"
+RUST_BODY = Raw(
+    "- Source : `MyIA.AI.Notebooks/Search/Part2-CSP/CSP-10-Optimisation-Z3.ipynb`"
+    " (26 cellules, 9 code)\n"
+    "- Cible : `" + RUST_TARGET + "` (à créer) — suffixe `-Rust`,"
+    " kernelspec canonique `rust`\n")
+
+
+class IssueTargetTests(unittest.TestCase):
+    """21/11: the coordinator's Rust portage spec (`Cible :`, no language
+    suffix, #27718) must resolve its target — the C#-only matcher refused it
+    (`no-target-in-body`), and the Rust tir had to pass the bar by hand."""
+
+    def test_csharp_bullet_still_resolves(self):
+        self.assertEqual(ns.issue_target(BODY.text), TARGET)
+
+    def test_rust_portage_bullet_resolves(self):
+        self.assertEqual(ns.issue_target(RUST_BODY.text), RUST_TARGET)
+
+    def test_source_line_is_never_the_target(self):
+        """A Source-only body (no Cible line) resolves nothing — the portage
+        SOURCE notebook must not be read as a delivery target."""
+        src_only = RUST_BODY.text.splitlines()[0] + "\n"
+        self.assertIsNone(ns.issue_target(src_only))
+
+    def test_heading_marker_resolves(self):
+        """The documented `## Cible C#` heading shape stays accepted."""
+        self.assertEqual(ns.issue_target("## Cible C# : `" + TARGET + "`\n"),
+                         TARGET)
+
+    def test_plain_prose_mention_is_not_a_marker(self):
+        """`Cible` mid-sentence (e.g. 'la cible C# est …') does not match —
+        only a line LED by the word does."""
+        self.assertIsNone(ns.issue_target(
+            "Le notebook cible C# `" + TARGET + "` sera cree par le grain.\n"))
+
+
 class PreflightTests(unittest.TestCase):
     """#1130 review at 1da0421a: the bar must be pinned by what it claims.
 
@@ -229,6 +266,18 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(report[1]["verdict"], "FREE", report[1])
             self.assertEqual(report[1]["reasons"], [])
             self.assertEqual(report[1]["target"], TARGET)
+
+    def test_rust_portage_body_passes_the_bar(self):
+        """21/11 (#27718): the coordinator's Rust spec shape resolves its target
+        through the FULL bar — the hand-passed 4-way check becomes reproducible."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            report = ns.run_preflight(repo, FakeIdentity(self.routes(body=RUST_BODY)), [1],
+                                      "myia-po-2028:claudish", [], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "FREE", report[1])
+            self.assertEqual(report[1]["target"], RUST_TARGET)
 
     def test_blocks_on_target_in_the_pinned_main_tree(self):
         """Measurement (a): a twin already committed is taken, on the PINNED tree."""
