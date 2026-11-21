@@ -13,15 +13,23 @@
  *   streaming and JSON, value byte-equal to the capture's `model=` line on
  *   the same request — the bare id (`fake-flash`), NOT the provider-prefixed
  *   route target (`sm-ep@fake-flash`).
+ * - AC1+AC2 on the NATIVE lane (review N1-N3): intercepted api.anthropic.com,
+ *   Anthropic-shaped dummy credential, a `claude-opus-5` request whose #218 pin
+ *   maps opus→`claude-opus-5-5` — so the header must name the POST-PIN id (≠
+ *   requested) and be byte-equal to the native capture's `model=` line
+ *   (`parser=native`, the same `target` string createResponseCapture records).
  * - AC4: under an armed cascade the value is the FINAL step's concrete (the
  *   402 first step never reaches the client); an unroutable request (terminal
  *   400) carries NO header — omitted, never guessed.
  * - AC5: every value asserted by exact equality with a routing-table id —
  *   nothing credential-shaped can satisfy these assertions.
  * - AC6: unchanged SSE bytes end-to-end (content + [DONE] / message_stop).
+ *   The native pins assert the same on the passthrough lane (byte tap).
  *
  * Mutation proof: delete the markServedModel call sites, the route
- * withServedModelHeader wraps, or the carry calls — each red below.
+ * withServedModelHeader wraps, the carry calls, or the native setServedModel
+ * marks — each red below (the C1 transport-fallback omission guard is pinned
+ * in served-model-header.test.ts).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -58,6 +66,9 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
   "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
+  // #218 pin knobs — a host setting must not disable or re-point the pin the
+  // native pins below measure (kill switch off / auto-adoption).
+  "CLAUDISH_NATIVE_MODEL_PIN", "CLAUDISH_NATIVE_PIN_AUTO",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -68,6 +79,56 @@ const realFetch = globalThis.fetch;
 const CONCRETE = "fake-flash";
 const STEP_WALL = "sm-a@fake-a";
 const STEP_SERVE = `sm-ep@${CONCRETE}`;
+
+// ---- native lane (review N1-N3) ------------------------------------------------
+// The #218 pin the native pins exercise: request `claude-opus-5`, modelMap maps
+// the opus role onto `claude-opus-5-5` — a claude-* target, so the lane stays
+// native AND resolveNativeModelPin rewrites payload.model (deterministic case
+// of native-pin-auto.test.ts:198; map target ≠ requested, no auto-adoption).
+const NATIVE_REQUESTED = "claude-opus-5";
+const NATIVE_PINNED = "claude-opus-5-5";
+// A literal non-secret dummy (native-handler-sse-capture.test.ts): it only has
+// to satisfy the Anthropic-shape predicate so the #296 refusal does not fire.
+const NATIVE_DUMMY_KEY = "sk-ant-stub-not-a-real-credential";
+
+/** Which shape the api.anthropic.com stub answers for the next native request
+ * (the interceptor cannot see the client's stream flag once the body may be
+ * compressed — #909 — so the test sets the mode explicitly). */
+let nativeStubMode: "sse" | "json" = "sse";
+let nativeCalls = 0;
+
+/** A complete Anthropic SSE turn — the bytes the passthrough relays verbatim. */
+function nativeUpstreamSSE(): string {
+  return (
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_native_stub","type":"message","role":"assistant","model":' +
+    JSON.stringify(NATIVE_PINNED) +
+    ',"content":[],"stop_reason":null,"usage":{"input_tokens":11,"output_tokens":1}}}\n\n' +
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n' +
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Native passthrough says hi."}}\n\n' +
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":6}}\n\n' +
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  );
+}
+
+function nativeUpstreamJSON(): Response {
+  return new Response(
+    JSON.stringify({
+      id: "msg_native_stub",
+      type: "message",
+      role: "assistant",
+      model: NATIVE_PINNED,
+      content: [{ type: "text", text: "Native JSON says hi." }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 11, output_tokens: 7 },
+    }),
+    {
+      status: 200,
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01" },
+    }
+  );
+}
 
 function fakeUpstreamSSE(): Response {
   // The proxy always drives the upstream in streaming mode, so the fake only
@@ -122,10 +183,28 @@ beforeEach(() => {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
+  nativeStubMode = "sse";
+  nativeCalls = 0;
   // Intercept only the proxy→endpoint leg; the client→proxy leg (the leg under
   // test) keeps the real fetch.
   globalThis.fetch = (async (input: any, init: any) => {
     const url = typeof input === "string" ? input : String(input?.url ?? "");
+    // The native lane's origin is hardcoded (native-handler.ts) — the only way
+    // in is the fetch stub, same as native-handler-sse-capture.test.ts.
+    if (url.startsWith("https://api.anthropic.com")) {
+      nativeCalls++;
+      if (nativeStubMode === "json") return nativeUpstreamJSON();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(nativeUpstreamSSE()));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream", "anthropic-version": "2023-06-01" },
+      });
+    }
     if (url.startsWith(WALL_BASE)) return fakeUpstreamQuotaWall();
     if (url.startsWith(SERVE_BASE)) return fakeUpstreamSSE();
     return realFetch(input, init);
@@ -154,23 +233,23 @@ afterEach(async () => {
   resetFailoverForTests();
 });
 
-async function spin(failoverEnv?: Record<string, string>): Promise<void> {
+async function spin(failoverEnv?: Record<string, string>, modelMap?: Record<string, string>): Promise<void> {
   activeProxy = await createProxyServer(
     PROXY_PORT,
     undefined,
     undefined,
     false,
     undefined,
-    undefined,
+    modelMap,
     { quiet: true }
   );
   resetFailoverForTests(failoverEnv);
 }
 
-async function askMessages(model: string, stream: boolean): Promise<Response> {
+async function askMessages(model: string, stream: boolean, extraHeaders: Record<string, string> = {}): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}/v1/messages`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "connection": "close" },
+    headers: { "Content-Type": "application/json", "connection": "close", ...extraHeaders },
     body: JSON.stringify({
       model,
       stream,
@@ -301,5 +380,78 @@ describe("#1128 — x-claudish-served-model on the wire", () => {
 
     expect(res.status).toBe(403);
     expect(res.headers.get(SERVED_MODEL_HEADER)).toBeNull();
+  }, 30_000);
+});
+
+describe("#1128 — native lane: the POST-PIN concrete (review N1-N3)", () => {
+  // The #218 pin needs the role map IN the server (a createProxyServer arg,
+  // never config.json): request `claude-opus-5`, modelMap opus→`claude-opus-5-5`.
+  const NATIVE_SPIN = () => spin(undefined, { opus: NATIVE_PINNED });
+
+  test("streaming: header = the post-pin id (≠ the requested one), passthrough bytes intact", async () => {
+    await NATIVE_SPIN();
+    const res = await askMessages(NATIVE_REQUESTED, true, { "x-api-key": NATIVE_DUMMY_KEY });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    // One upstream call, at the hardcoded origin — and the header names the
+    // version that ANSWERED (post-#218-pin), not the one asked for.
+    expect(nativeCalls).toBe(1);
+    expect(res.headers.get(SERVED_MODEL_HEADER)).toBe(NATIVE_PINNED);
+    expect(NATIVE_PINNED).not.toBe(NATIVE_REQUESTED); // the pin is real, not vacuous
+
+    const text = await res.text();
+    expect(text).toContain("Native passthrough says hi.");
+    expect(text).toContain("message_stop");
+  }, 30_000);
+
+  test("non-streaming: header = the post-pin id on the JSON shape too", async () => {
+    nativeStubMode = "json";
+    await NATIVE_SPIN();
+    const res = await askMessages(NATIVE_REQUESTED, false, { "x-api-key": NATIVE_DUMMY_KEY });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get(SERVED_MODEL_HEADER)).toBe(NATIVE_PINNED);
+    const body: any = await res.json();
+    expect(body.content?.[0]?.text).toBe("Native JSON says hi.");
+  }, 30_000);
+
+  test("AC2 native: header byte-equal to the native capture's model= line on the SAME request", async () => {
+    const capDir = mkdtempSync(join(tmpdir(), "claudish-sm-native-"));
+    process.env.CLAUDISH_CAPTURE_DIR = capDir;
+    try {
+      await NATIVE_SPIN();
+      const res = await askMessages(NATIVE_REQUESTED, true, { "x-api-key": NATIVE_DUMMY_KEY });
+      expect(res.status).toBe(200);
+      const header = res.headers.get(SERVED_MODEL_HEADER);
+      const text = await res.text(); // drain the passthrough → the capture finalizes
+      expect(text).toContain("message_stop");
+
+      expect(header).toBe(NATIVE_PINNED);
+      // The capture finalizes asynchronously once the pump drains; poll for it
+      // (bounded), same contract as native-handler-sse-capture.test.ts.
+      const deadline = Date.now() + 3000;
+      let files: string[] = [];
+      while (Date.now() < deadline) {
+        try {
+          files = readdirSync(capDir).filter((f) => f.startsWith("resp-"));
+        } catch {
+          files = [];
+        }
+        if (files.length > 0) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(files.length).toBeGreaterThan(0);
+      // Every native capture names the same string the header carries — and it
+      // is the capture's OWN label (`-native-<model>.sse`) that proves it is
+      // the pinned id, the same `target` createResponseCapture records.
+      const models = captureModels(capDir);
+      expect(models.length).toBeGreaterThan(0);
+      for (const m of models) expect(m).toBe(header!);
+      expect(files[0]).toContain(`-native-${NATIVE_PINNED}.sse`);
+    } finally {
+      delete process.env.CLAUDISH_CAPTURE_DIR;
+      try { rmSync(capDir, { recursive: true, force: true }); } catch {}
+    }
   }, 30_000);
 });
