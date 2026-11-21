@@ -4,7 +4,7 @@
  * Run: bun test packages/cli/src/providers/catalog-resolvers/openrouter.test.ts
  */
 
-import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, afterAll, mock } from "bun:test";
 
 // We need to test the resolver's resolveSync logic with controlled cache state.
 // The resolver uses module-level _memCache, so we import the class and inject test data.
@@ -860,4 +860,42 @@ describe("OpenRouterCatalogResolver.refreshCatalog — page walk (#635 AC4)", ()
       coverage: { pages: 2, fetched: 3, serverTotal: 3, complete: true },
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// #1139 — the mock.module above is PROCESS-GLOBAL and Bun neither undoes it
+// nor replaces an already-registered mock (measured: a second mock.module on
+// the same specifier leaves the first in place). Until this block, any file
+// sharing this bun process and importing the real cache module saw
+// readAllModelsCache => null forever: model-catalog.test.ts Group 1 writes a
+// REAL tmp file, then reads undefined — 6 deterministic reds whenever
+// openrouter.test.ts ran first (measured 21/11, seat po-2023; CI's effective
+// order hid it). What CAN be restored is the exported functions' BEHAVIOR:
+// the mocked module object stays, but re-pointing the two mock fns'
+// implementations at a fresh REAL instance (the "?real" query dodges the
+// interception and loads a second module object — all-models-cache is pure
+// functions plus a path constant, so the copy behaves identically) makes
+// every later caller read and write the REAL disk again. The self-check below
+// is the PIN: drop the two mockImplementation lines and the afterAll itself
+// goes red.
+// ---------------------------------------------------------------------------
+afterAll(async () => {
+  const spec = "../all-models-cache.js?real";
+  const real = await import(spec);
+  mockRead.mockImplementation(real.readAllModelsCache as unknown as () => null);
+  mockWrite.mockImplementation(real.writeAllModelsCache as unknown as (_data: unknown) => void);
+  const { writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const probe = join(tmpdir(), `all-models-restore-1139-${process.pid}.json`);
+  try {
+    writeFileSync(probe, JSON.stringify({ version: 2, lastUpdated: "1970-01-01", entries: [], models: [] }), "utf-8");
+    const restored = await import("../all-models-cache.js");
+    const disk = restored.readAllModelsCache(probe);
+    if (!disk || !Array.isArray(disk.entries)) {
+      throw new Error("#1139 restore failed: readAllModelsCache still answers the mock after afterAll");
+    }
+  } finally {
+    rmSync(probe, { force: true });
+  }
 });
