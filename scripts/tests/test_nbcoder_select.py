@@ -99,6 +99,14 @@ class SelectionTests(unittest.TestCase):
             # so the Python notebook is a real orphan and stays available.
             self.assertIn("Series/T-01-Python.ipynb", result["avail"])
 
+    def test_git_read_failure_is_not_an_empty_tree(self):
+        """A failed Git read refuses; it never yields 'every notebook is orphan'."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            identity = FakeIdentity([("pulls?state=open", []), ("issues?state=open", [])])
+            with self.assertRaises(ns.InstrumentError):
+                ns.run_selection(root / "not-a-git-repo", identity, [], root, pin="HEAD")
+
     def test_blank_line_in_grains_jsonl_is_skipped(self):
         """Review (not blocking): a blank line raised a bare JSONDecodeError
         traceback instead of a clean run — the in-flight queue stays readable."""
