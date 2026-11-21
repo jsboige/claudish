@@ -157,6 +157,8 @@ tunnel never appear. Joined to `/health`'s `instanceId` + `uptimeSec` for proces
 `instanceId` change *bounds* a replacement between two observations; it does not date it, absent a
 corroborating timestamped event.
 
+**`/health` also publishes `version` (#1140)** — the running build, same value `packages/cli/src/version.ts` ships (bumped in lockstep with `packages/cli/package.json` by `generate-version.ts`). This is where a **fleet-rollout verification artifact reads the build it probed**: the rule demands the live path, never the change's intent, and `instanceId` + `uptimeSec` name the *process* while `version` names the *code* — a stale container (previous image) reads as a version mismatch, not as a passing probe. Additive field; nothing gates on it.
+
 **`/health` also publishes `eventLoopMax60sMs` (windowed max, retires), `eventLoopBlockedMs5m`
 (floored sum of lag over ~5 min — weighs a block by its length) and `eventLoopMaxMs` (cumulative
 high-water since start) — the #587 gate instrument** for the "relays flip AUTONOMOUS while the hub
