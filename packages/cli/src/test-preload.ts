@@ -49,6 +49,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { presetRefusal } from "./test-sandbox";
+import { armCatalogNetworkGuard } from "./test-support/catalog-network-guard";
 import { armCaptureHermeticity } from "./test-support/capture-hermeticity";
 import { armRepoEnvFileNeutralizer } from "./test-support/env-file-neutralizer";
 
@@ -115,6 +116,17 @@ for (const name of readdirSync(tmpdir())) {
 // before anything can mistake them for an environment to protect. Mechanism:
 // test-support/env-file-neutralizer.ts.
 armRepoEnvFileNeutralizer();
+
+// Catalog network guard (#1133 upstream, 2026-11-21): every proxy a test
+// spins fires a background catalog warm, and the route files that don't stub
+// their fetch were sending it to the REAL models-index endpoint — the live
+// catalog (1 056 entries measured, glm-5 @ 204800 included) then leaked into
+// the process-global memory catalog and reddened model-catalog Group 1's
+// cold-start case on order/timing luck (main 844710aec, docs-only flip).
+// The guard refuses the real remote host in-process; local overrides and
+// per-file fetch stubs pass through untouched. Mechanism + pins:
+// test-support/catalog-network-guard.ts / .test.ts.
+armCatalogNetworkGuard();
 
 // Capture hermeticity (2026-11-08, three test files wrote into a seat's REAL
 // capture dir under an ambient CLAUDISH_CAPTURE_DIR): swap the ambient dir for
