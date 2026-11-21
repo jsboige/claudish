@@ -231,15 +231,25 @@ def run_selection(repo: Path, identity: Identity, inflight_queues: list[str],
 DELIVERED = "[DELIVERED]"
 
 
+# Marker line of a grain spec: first word (after `#`-heading / `-`-bullet
+# decoration) is `Cible`. Two shapes coexist, both measured on real bodies:
+# the 20/11 C# template (`- Cible C# : \`...-CSharp.ipynb\``) and the
+# coordinator's Rust portage spec (`- Cible : \`...-Rust.ipynb\``, #27718 —
+# no language suffix). A `Source :` line never matches (different first word),
+# which is what keeps the portage SOURCE from being read as the target.
+CIBLE_LINE = re.compile(r"^\s*(?:#+\s*|-\s*)?Cible\b")
+
+
 def issue_target(body: str) -> str | None:
-    """The C# twin a grain issue asks for: the `.ipynb` named on its `Cible C#` line.
+    """The twin notebook a grain issue asks for: the `.ipynb` on its `Cible` line.
 
     Bodies vary ('a creer', 'a créer', path between backticks) — the marker line is
-    the stable part across the 20/11 grain template (`## Cible C#` followed by a
-    backticked path). A template change is caught by a test, not in production.
+    the stable part across templates (C# 20/11 and Rust portage 21/11, both
+    bullets carrying the backticked target on the SAME line). A template change
+    is caught by a test, not in production.
     """
     for line in (body or "").splitlines():
-        if "Cible C#" in line:
+        if CIBLE_LINE.match(line):
             found = IPYNB.findall(line)
             if found:
                 return norm(found[-1])
