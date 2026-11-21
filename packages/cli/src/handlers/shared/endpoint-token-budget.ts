@@ -39,6 +39,8 @@
  * both change what the client receives and need their own design.
  */
 
+import { transferServedModel } from "./served-model-header.js";
+
 /** A request whose estimate exceeds this counts against the big-concurrency
  *  cap (#654: "N concurrent requests over 100K tokens"). Below it, a request
  *  is bounded by the endpoint's request-count limiter, which is the right
@@ -406,9 +408,16 @@ export function withBudgetRelease<T extends Response>(response: T, release: () =
       return reader.cancel(reason);
     },
   });
-  return new Response(tracked, {
+  const wrapped = new Response(tracked, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
   }) as T;
+  // #1142: this rebuild gives the response a NEW object identity — the
+  // served-model side-channel (#1128) is keyed by that identity and would be
+  // lost between the handler's mark and the route's apply (both wrap sites in
+  // handleWithCascade route through here). Carry the entry; an unknown value
+  // stays absent — never re-derived.
+  transferServedModel(response, wrapped);
+  return wrapped;
 }

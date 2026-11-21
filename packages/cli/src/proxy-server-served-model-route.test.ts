@@ -66,6 +66,10 @@ const SANDBOX_ENV_KEYS = [
   "CLAUDISH_NO_ANTHROPIC", "CLAUDISH_FAILOVER_ACTIVE",
   "CLAUDISH_PROXY_KEY", "CLAUDISH_PROXY_KEY_PREVIOUS",
   "CLAUDISH_CAPTURE_DIR",
+  // #1142 pins — the endpoint budget knob for the serving endpoint (`sm-ep`
+  // normalizes to SM_EP); a host setting must not leak a lease into the
+  // other pins, and the pins' own knob must not leak back to the host.
+  "CLAUDISH_ENDPOINT_TOKEN_BUDGET_SM_EP",
   // #218 pin knobs — a host setting must not disable or re-point the pin the
   // native pins below measure (kill switch off / auto-adoption).
   "CLAUDISH_NATIVE_MODEL_PIN", "CLAUDISH_NATIVE_PIN_AUTO",
@@ -370,6 +374,47 @@ describe("#1128 — x-claudish-served-model on the wire", () => {
     // Block 0 is the onset notice (inContent on /v1/messages); the model's own
     // answer rides the later blocks — assert it is there, notice and all.
     expect(JSON.stringify(body.content)).toContain("Hello from the concrete.");
+  }, 30_000);
+
+  test("#1142 — budget-leased NOMINAL attempt: the header survives withBudgetRelease", async () => {
+    // The #654 lease makes handleWithCascade wrap the handler's Response
+    // (withBudgetRelease rebuilds it — fresh object identity) at the
+    // nominal-attempt site BEFORE the route applies the side-channel lookup.
+    // Before #1142 the WeakMap entry died with the inner object and this
+    // header was omitted on every budget-leased endpoint.
+    process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_SM_EP = "1000000";
+    try {
+      await spin();
+      const res = await askMessages(STEP_SERVE, true);
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get(SERVED_MODEL_HEADER)).toBe(CONCRETE);
+      const text = await res.text();
+      expect(text).toContain("message_stop");
+    } finally {
+      delete process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_SM_EP;
+    }
+  }, 30_000);
+
+  test("#1142 — budget-leased WALK step: the header survives withBudgetRelease", async () => {
+    // Same seam, walk site: the cascade's serving step takes the lease and
+    // the walk's return path wraps at the same withBudgetRelease call — the
+    // concrete of the step that ACTUALLY served must still reach the client.
+    process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_SM_EP = "1000000";
+    try {
+      await spin({
+        CLAUDISH_FAILOVER_SONNET: `${STEP_WALL}>${STEP_SERVE}`,
+        CLAUDISH_FAILOVER_ACTIVE: "sonnet",
+      });
+      const res = await askMessages("claude-sonnet-5", false);
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get(SERVED_MODEL_HEADER)).toBe(CONCRETE);
+      const body: any = await res.json();
+      expect(JSON.stringify(body.content)).toContain("Hello from the concrete.");
+    } finally {
+      delete process.env.CLAUDISH_ENDPOINT_TOKEN_BUDGET_SM_EP;
+    }
   }, 30_000);
 
   test("AC4 — #296 native refusal: NO header (omitted, never guessed)", async () => {
