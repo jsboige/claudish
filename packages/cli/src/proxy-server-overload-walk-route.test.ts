@@ -1266,6 +1266,56 @@ describe("#1124 — the walk's rung-0 quota wall benches the rung, not the role"
     expect(isFailoverActive("sonnet")).toBe(false);
     expect(isBucketWalled(bucketOfNominal())).toBe(false);
   }, 30_000);
+
+  // CR blocking 1 (#1125 c.7034073287): the negative side of the quota/transport
+  // distinction was unpinned — mutation M2 (guard widened to EVERY walk-step
+  // failure) stayed 39/39 green, i.e. nothing would go red if an overloaded step
+  // got benched for 10 min then 30 min... W36 pins the #299-B contract this PR
+  // carves its single exception into: a TRANSPORT-class step death writes no
+  // state, and the next request re-picks the same step.
+  test("W36: walk step 0 dies TRANSPORT-class (529) → no WALK-MARK, no bench — the next request re-picks step 0", async () => {
+    await spin();
+    resetWalk();
+    endpointStatus.nm = 1302;
+    endpointStatus.s0 = 529; // transport-class: the walk's own founding contract
+    const r1 = await postMessage("claude-sonnet-5");
+    expect(r1.status).toBe(429); // the ORIGINAL overload surfaces (#299-B)
+    expect(calls.s0).toBe(1);
+    expect(calls.s1).toBe(0); // no advance — a 529 is not connection-class
+    expect(failoverLog.some((l) => l.includes("WALK-MARK"))).toBe(false);
+    expect(isFailoverActive("sonnet")).toBe(false); // no arm
+    expect(isBucketWalled(bucketOfNominal())).toBe(false); // no wall
+    const r2 = await postMessage("claude-sonnet-5");
+    expect(r2.status).toBe(429); // still the surfaced overload
+    expect(calls.s0).toBe(2); // THE PIN: the rung was NOT benched — re-picked
+    expect(calls.s1).toBe(0);
+    expect(failoverLog.some((l) => l.includes("WALK-MARK"))).toBe(false);
+    expect(isFailoverActive("sonnet")).toBe(false);
+    expect(isBucketWalled(bucketOfNominal())).toBe(false);
+  }, 30_000);
+
+  // The stateless walk is one explicit 0 away (review not-blocking 1, #1125):
+  // the mark writes failure state from a path designed stateless, so a
+  // misclassification must be reversible without a redeploy. The switch is
+  // read per request, container-injected (compose-env-coverage cross-checks
+  // the compose line).
+  test("W37: kill switch CLAUDISH_FAILOVER_WALK_MARK=0 — the quota wall surfaces stateless, rung re-picked", async () => {
+    await spin();
+    resetWalk();
+    process.env.CLAUDISH_FAILOVER_WALK_MARK = "0";
+    try {
+      endpointStatus.nm = 1302;
+      endpointStatus.s0 = 402; // the exact W35 shape — quota-class
+      const r1 = await postMessage("claude-sonnet-5");
+      expect(r1.status).toBe(429);
+      expect(failoverLog.some((l) => l.includes("WALK-MARK"))).toBe(false);
+      const r2 = await postMessage("claude-sonnet-5");
+      expect(r2.status).toBe(429);
+      expect(calls.s0).toBe(2); // no bench under the switch — re-picked
+    } finally {
+      delete process.env.CLAUDISH_FAILOVER_WALK_MARK;
+    }
+  }, 30_000);
 });
 
 // ─── predicate pins ───────────────────────────────────────────────────────────
