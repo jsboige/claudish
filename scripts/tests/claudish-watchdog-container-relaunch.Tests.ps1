@@ -274,3 +274,48 @@ Describe 'R0 deployment half: stale module and legacy state must never be silent
         $t2.Action | Should -Be 'r0_start'
     }
 }
+
+Describe 'R0 pipeline seam: the engine rung feeds the R0 rung (kill-test 21/11)' {
+    <#
+        The 21/11 kill-test on myia-po-2028 (docker stop 17:11:44Z): the host
+        watchdog REPLACES its whole state with the engine rung's NextState,
+        then calls R0 on the result. The engine NextState carried ONLY the
+        Engine* keys, so ContainerStoppedFailures was erased in flight every
+        tick — R0 re-counted the stop from zero forever (R0_PENDING 1/2 at
+        17:15, 17:20 and 17:25, state file pinned at 1) and the outage went
+        17 minutes unrelaunched until a manual docker start. The engine rung's
+        NextState must carry the container keys through; R0 owns them
+        downstream.
+    #>
+
+    It 'a full state through the ENGINE rung keeps its container keys - R0 fires on the second sighting' {
+        $s = @{
+            EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue; EngineActionsSinceDown = 0
+            ContainerStoppedFailures = 1; LastContainerActionUtc = $script:StampAgo60; ContainerRelaunchSinceDown = 0
+        }
+        $eng = Get-EngineWatchdogDecision -State $s -EngineVerdict 'up' -NowUtc $script:Now -DrainInFlight $false -BackendPresent $true -WslVerdict 'ok' -HostWatchdogPresent $false
+        $eng.Action | Should -Be 'reset'
+        $r0 = Invoke-R0 -State ([hashtable]$eng.NextState)
+        $r0.Action | Should -Be 'r0_start' -Because 'the second sighting must arm, not re-count from zero'
+    }
+
+    It 'the engine DRY-RUN next state is the input state unchanged INCLUDING the container keys' {
+        $s = @{
+            EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue; EngineActionsSinceDown = 0
+            ContainerStoppedFailures = 1; LastContainerActionUtc = $script:StampAgo60; ContainerRelaunchSinceDown = 2
+        }
+        $eng = Get-EngineWatchdogDecision -State $s -EngineVerdict 'down' -NowUtc $script:Now -DrainInFlight $false -BackendPresent $true -WslVerdict 'ok' -HostWatchdogPresent $false -DryRun
+        $eng.NextState.ContainerStoppedFailures   | Should -Be 1
+        $eng.NextState.ContainerRelaunchSinceDown | Should -Be 2
+    }
+
+    It 'the episode marker survives the engine rung - a re-exited container escalates instead of re-arming' {
+        $s = @{
+            EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue; EngineActionsSinceDown = 0
+            ContainerStoppedFailures = 1; LastContainerActionUtc = $script:StampAgo60; ContainerRelaunchSinceDown = 1
+        }
+        $eng = Get-EngineWatchdogDecision -State $s -EngineVerdict 'up' -NowUtc $script:Now -DrainInFlight $false -BackendPresent $true -WslVerdict 'ok' -HostWatchdogPresent $false
+        $r0 = Invoke-R0 -State ([hashtable]$eng.NextState)
+        $r0.Action | Should -Be 'r0_after_relaunch' -Because 'the once-per-episode marker must not be erased in flight'
+    }
+}

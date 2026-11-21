@@ -1180,6 +1180,16 @@ function Get-EngineWatchdogDecision {
         LastEngineActionUtc    = $State.LastEngineActionUtc
         EngineActionsSinceDown = [int]$State.EngineActionsSinceDown
     }
+    # NextState is the FULL next state (kill-test 21/11, po-2028): the host
+    # watchdog REPLACES its whole state with this object before the R0 rung
+    # reads it, so a 3-key NextState dropped ContainerStoppedFailures /
+    # LastContainerActionUtc / ContainerRelaunchSinceDown in flight — R0
+    # re-counted every stop from zero (R0_PENDING 1/2 forever) and a real
+    # 17-minute outage went unrelaunched. R0 owns these keys downstream; here
+    # they only ride through untouched.
+    foreach ($k in 'ContainerStoppedFailures', 'LastContainerActionUtc', 'ContainerRelaunchSinceDown') {
+        if ($State.ContainsKey($k) -and $null -ne $State[$k]) { $next[$k] = $State[$k] }
+    }
 
     if ($EngineVerdict -eq 'up') {
         $next.EngineFailures = 0
@@ -1224,11 +1234,17 @@ function Get-EngineWatchdogDecision {
     if ($DryRun) {
         # A dry run measures; it must not move the state machine (its failure
         # counters and cooldown would fire on the next real run as if work
-        # had been done). The action above is still the honest one.
+        # had been done). The action above is still the honest one. The
+        # container keys ride through here too — "input state unchanged"
+        # means ALL of it (kill-test 21/11: the dry-run half was the second
+        # site that dropped them).
         $next = @{
             EngineFailures         = [int]$State.EngineFailures
             LastEngineActionUtc    = $State.LastEngineActionUtc
             EngineActionsSinceDown = [int]$State.EngineActionsSinceDown
+        }
+        foreach ($k in 'ContainerStoppedFailures', 'LastContainerActionUtc', 'ContainerRelaunchSinceDown') {
+            if ($State.ContainsKey($k) -and $null -ne $State[$k]) { $next[$k] = $State[$k] }
         }
     }
     return [PSCustomObject]@{ Action = $action; NextState = $next; SinceActionMin = $sinceAction; Reason = $reason }
