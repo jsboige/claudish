@@ -36,6 +36,7 @@ import {
   NOTICE_HEADER,
   noticeToHeaderValue,
 } from "../../handlers/shared/failover-stream-notice.js";
+import { SERVED_MODEL_HEADER } from "../../handlers/shared/served-model-header.js";
 
 // ── fetch mock ─────────────────────────────────────────────────────
 const realFetch = globalThis.fetch;
@@ -2359,6 +2360,73 @@ describe("#229 — relay carries the failover-notice header across both branches
     expect(out!.headers.get(NOTICE_HEADER)).toBe(noticeToHeaderValue(NOTICE));
     const text = await out!.text();
     expect(text).toContain("message_stop"); // stream passthrough intact under the header
+  });
+});
+
+// ── #1128: the relay must not be where the hub's served-model header dies ────
+// Same two branches as #229 above: a NOMINAL sidecar relays the hub's concrete
+// verbatim (AC3); an AUTONOMOUS one runs the local pipeline and sets its own —
+// nothing to test here for that branch. The hub's value is opaque to the relay
+// (a routing-table id), carried byte-for-byte.
+
+describe("#1128 — relay carries the served-model header across both branches", () => {
+  function openAIContext(): any {
+    const c = mockForwardContext({ "x-claudish-machine": "myia-po-2024" });
+    (c.req as any).path = "/v1/chat/completions";
+    return c;
+  }
+
+  it("non-stream branch: the buffered rebuild keeps the hub-set served-model header", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ id: "x", choices: [{ message: { role: "assistant", content: "hi" } }] }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          [SERVED_MODEL_HEADER]: "hub-served-concrete",
+        },
+      });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const out = await forwardToUpstream(openAIContext(), { model: "glm-5.2", stream: false, messages: [] }, state);
+
+    expect(out).not.toBeNull();
+    expect(out!.headers.get(SERVED_MODEL_HEADER)).toBe("hub-served-concrete");
+    const body: any = await out!.json();
+    expect(body.choices[0].message.content).toBe("hi"); // body intact under the header
+  });
+
+  it("stream branch: the passthrough rebuild keeps the hub-set served-model header", async () => {
+    const sse = [
+      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { content: [] } })}\n\n`,
+      `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } })}\n\n`,
+      `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const hub = sseResponse(sse);
+    const headers = new Headers(hub.headers);
+    headers.set(SERVED_MODEL_HEADER, "hub-served-concrete");
+    fetchImpl = async () => new Response(hub.body, { status: hub.status, headers });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const out = await forwardToUpstream(openAIContext(), { model: "glm-5.2", stream: true, messages: [] }, state);
+
+    expect(out).not.toBeNull();
+    expect(out!.headers.get(SERVED_MODEL_HEADER)).toBe("hub-served-concrete");
+    const text = await out!.text();
+    expect(text).toContain("message_stop"); // stream passthrough intact under the header
+  });
+
+  it("no hub value (the omission case): nothing is invented on either branch", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ id: "x", choices: [{ message: { role: "assistant", content: "hi" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const out = await forwardToUpstream(openAIContext(), { model: "glm-5.2", stream: false, messages: [] }, state);
+
+    expect(out).not.toBeNull();
+    expect(out!.headers.get(SERVED_MODEL_HEADER)).toBeNull(); // omitted, never guessed
   });
 });
 

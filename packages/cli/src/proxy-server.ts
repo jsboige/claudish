@@ -175,6 +175,10 @@ import {
   carryNoticeHeader,
   noticePolicyForIngress,
 } from "./handlers/shared/failover-stream-notice.js";
+import {
+  carryServedModelHeader,
+  withServedModelHeader,
+} from "./handlers/shared/served-model-header.js";
 
 /**
  * Routing failures are TERMINAL — no provider can serve the request (missing
@@ -3386,7 +3390,12 @@ export async function createProxyServer(
 
       // Route through the budget-failover cascade (nominal → step0 → step1 …),
       // then inject onset/recovery notices. See handleWithCascade / applyFailoverNotices.
-      const response = await handleWithCascade(c, body, body.model, requestBucket);
+      // #1128: apply the served-model header right after the cascade, before the
+      // notices — every downstream rebuild copies existing headers, so an early
+      // set survives to the wire. Unmarked responses (synthetic answers,
+      // refusals, cascade-exhaustion errors) return untouched: omitted, never
+      // guessed.
+      const response = withServedModelHeader(await handleWithCascade(c, body, body.model, requestBucket));
       const noticed = await applyFailoverNotices(
         response,
         requestRole,
@@ -3604,7 +3613,9 @@ export async function createProxyServer(
       // client) — the notice rides the response header, NOT the content, so an
       // empty model output stays visibly empty instead of being masked by the
       // notice-as-answer.
-      let response = await handleWithCascade(c, anthropicBody, anthropicBody.model, requestBucket);
+      let response = withServedModelHeader(
+        await handleWithCascade(c, anthropicBody, anthropicBody.model, requestBucket)
+      );
       response = await applyFailoverNotices(
         response,
         requestRole,
@@ -3640,17 +3651,25 @@ export async function createProxyServer(
         // #229 review: both translations below rebuild their headers from
         // scratch, which is where the notice header set above used to die —
         // consumed (dedup + recovery-budget side effects) then never delivered.
-        return carryNoticeHeader(
+        // #1128: the served-model header dies at the same seam — carried the
+        // same way (carryServedModelHeader), around the notice carry.
+        return carryServedModelHeader(
           response,
-          createOpenAIChatStreamFromAnthropic(response, anthropicBody.model)
+          carryNoticeHeader(
+            response,
+            createOpenAIChatStreamFromAnthropic(response, anthropicBody.model)
+          )
         );
       }
       const message = await response.json();
-      return carryNoticeHeader(
+      return carryServedModelHeader(
         response,
-        c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
-          headers: { "Content-Type": "application/json" },
-        })
+        carryNoticeHeader(
+          response,
+          c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
+            headers: { "Content-Type": "application/json" },
+          })
+        )
       );
     } catch (e) {
       log(`[Proxy] /v1/chat/completions error: ${e}`);

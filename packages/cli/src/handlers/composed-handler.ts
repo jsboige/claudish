@@ -27,6 +27,7 @@ import { MiddlewareManager, GeminiThoughtSignatureMiddleware } from "../middlewa
 import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
 import { clientRequestedThinking } from "./shared/client-thinking.js";
 import { clientAttributionEnabled, clientAttributionHeaders } from "./shared/client-attribution.js";
+import { setServedModel } from "./shared/served-model-header.js";
 import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { filterIdentity } from "./shared/openai-compat.js";
@@ -546,6 +547,22 @@ export class ComposedHandler implements ModelHandler {
   private applyClientAttribution(c: Context, headers: Record<string, string>): void {
     if (!this.provider.clientAttribution || !clientAttributionEnabled()) return;
     Object.assign(headers, clientAttributionHeaders(c));
+  }
+
+  /**
+   * #1128 — record the concrete this handler served, keyed on the response
+   * object (WeakMap side-channel, shared/served-model-header.ts). The value
+   * is the SAME string every stream parser is constructed with
+   * (`bareModelName`), which is what the capture records — AC2 byte-equality
+   * by construction. One exception: a transport fallback that changed the
+   * model mid-flight (`getActiveModelName()` — gemini-codeassist is the only
+   * implementer) makes capture and truth disagree; the header is omitted
+   * there rather than publish a value the corpus cannot corroborate (AC4).
+   */
+  private markServedModel(response: Response): void {
+    const active = this.provider.getActiveModelName?.();
+    if (active !== undefined && active !== this.bareModelName) return;
+    setServedModel(response, this.bareModelName);
   }
 
   async handle(c: Context, payload: any): Promise<Response> {
@@ -2028,14 +2045,17 @@ export class ComposedHandler implements ModelHandler {
     // proxied/composed model. See collect-sse-message.ts.
     const wantsStreaming = payload?.stream === true;
     if (wantsStreaming) {
+      this.markServedModel(streamResponse);
       return streamResponse;
     }
 
     const message = await collectAnthropicSseToMessage(streamResponse, this.bareModelName);
 
-    return c.json(message, {
+    const jsonResponse = c.json(message, {
       headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
     });
+    this.markServedModel(jsonResponse);
+    return jsonResponse;
   }
 
   /**
