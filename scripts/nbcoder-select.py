@@ -204,14 +204,19 @@ def run_selection(repo: Path, identity: Identity, inflight_queues: list[str],
     inflight: set[str] = set()
     for q in inflight_queues:
         p = tmp_root / q / "grains.jsonl"
-        if p.exists():
-            for line in p.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue          # an in-flight blank line is not a defect
-                g = json.loads(line)
-                for k in ("notebook", "source_nb"):
-                    if g.get(k):
-                        inflight.add(norm(g[k]))
+        # Fail-closed (the #1120 class): a NAMED queue whose grains.jsonl is
+        # absent is a read failure (typo in the state-dir name), never
+        # 'nothing in flight'. A finished queue is retired by removing its
+        # whole state-dir AND dropping the --inflight name, not the file alone.
+        if not p.exists():
+            raise InstrumentError(f"in-flight queue absent: {p} (typo in --inflight?)")
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue          # an in-flight blank line is not a defect
+            g = json.loads(line)
+            for k in ("notebook", "source_nb"):
+                if g.get(k):
+                    inflight.add(norm(g[k]))
 
     blocked = taken_pr | taken_iss | inflight
     avail = [f for f in orphans if twin(f) not in blocked and f not in blocked]
@@ -286,14 +291,16 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
     inflight: set[str] = set()
     for q in inflight_queues:
         p = tmp_root / q / "grains.jsonl"
-        if p.exists():
-            for line in p.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                g = json.loads(line)
-                for k in ("notebook", "source_nb"):
-                    if g.get(k):
-                        inflight.add(norm(g[k]))
+        # Same fail-closed read as run_selection: absent queue == read failure.
+        if not p.exists():
+            raise InstrumentError(f"in-flight queue absent: {p} (typo in --inflight?)")
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            g = json.loads(line)
+            for k in ("notebook", "source_nb"):
+                if g.get(k):
+                    inflight.add(norm(g[k]))
 
     report: dict = {}
     for n in issues:
@@ -310,7 +317,9 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
             if target in inflight:
                 reasons.append("target-inflight")
         comments = api_all(identity, f"repos/jsboige/CoursIA/issues/{n}/comments")
-        delivered = [c for c in comments if (c.get("body") or "").startswith(DELIVERED)]
+        # lstrip(): the marker is written bare at column 0 by the harness, but a
+        # human hand may indent or bold it — the marker itself is the contract.
+        delivered = [c for c in comments if (c.get("body") or "").lstrip().startswith(DELIVERED)]
         if delivered:
             reasons.append("delivered-marker")
         # cwd=repo: check_lane_claim.py resolves the registry and tracked paths

@@ -12,12 +12,16 @@ throwaway script. The two named CR scenarios are pinned first:
 
 Run: python -m unittest discover -s scripts/tests -p "test_nbcoder_select.py"
 """
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE.parent / "nbcoder-select.py"
@@ -358,21 +362,100 @@ class PreflightTests(unittest.TestCase):
         self.assertLessEqual(ident.calls, ns.API_MAX_PAGES + 1)
 
     def test_preflight_requires_a_lane(self):
-        """No machine-specific default in a fleet organ: --lane or $NBCODER_LANE."""
+        """No machine-specific default in a fleet organ: --lane or $NBCODER_LANE.
+
+        CR Q7 (re-review at 99b22965): the old fixture passed by accident — the
+        pinned-tree read failed first (no origin/main) and returned the same
+        EXIT_DEFECT. Here the pinned read SUCCEEDS (--pin HEAD), $NBCODER_LANE
+        is scrubbed, and a fake gh that records + fails loudly sits behind the
+        guard: if the guard is bypassed, the marker appears and the stderr says
+        something else — both turn this test red.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            bindir = root / "bin"
+            bindir.mkdir()
+            marker = root / "gh-was-called"
+            ghbat = bindir / "gh.bat"
+            ghbat.write_bytes(b'@echo off\r\ntype nul > "' + str(marker).encode("ascii")
+                              + b'"\r\nexit 1\r\n')
+            orig = (ns.forge_token, ns.resolve_gh)
+            ns.forge_token = lambda *a, **k: "tok"
+            ns.resolve_gh = lambda: str(ghbat)
+            env = {k: v for k, v in os.environ.items() if k != "NBCODER_LANE"}
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with mock.patch.dict(os.environ, env, clear=True):
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = ns.main(["--repo", str(repo), "--preflight", "1",
+                                      "--tmp-root", str(root), "--pin", "HEAD"])
+            finally:
+                ns.forge_token, ns.resolve_gh = orig
+            self.assertEqual(rc, ns.EXIT_DEFECT)
+            self.assertIn("needs a lane", err.getvalue(),
+                          "the refusal must be the guard's own words")
+            self.assertFalse(marker.exists(),
+                             "the guard must stop the run before any gh call")
+
+    def test_main_turns_an_instrument_error_into_exit_defect(self):
+        """CR Q4: a caller sees only main(). run_preflight raising must land as
+        EXIT_DEFECT with NO report on stdout — a refused run never prints a
+        verdict a caller could parse as a measurement."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             repo = make_repo(root)
             orig = (ns.forge_token, ns.resolve_gh)
             ns.forge_token = lambda *a, **k: "tok"
             ns.resolve_gh = lambda: "gh"
+            out, err = io.StringIO(), io.StringIO()
             try:
-                rc = ns.main(["--repo", str(repo), "--preflight", "1",
-                              "--tmp-root", str(root)])
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = ns.main(["--repo", str(repo), "--preflight", "1",
+                                  "--lane", "myia-po-2028:claudish",
+                                  "--tmp-root", str(root), "--pin", "origin/absent"])
             finally:
                 ns.forge_token, ns.resolve_gh = orig
             self.assertEqual(rc, ns.EXIT_DEFECT)
-            self.assertFalse(Path(root / "pr-files-cache.json").exists(),
-                             "the refusal must land before any measurement")
+            self.assertIn("pinned ref unresolvable", err.getvalue())
+            self.assertNotIn("verdict", out.getvalue(),
+                             "a refused run must not print a report")
+
+    def test_blocks_on_a_grain_in_an_inflight_queue(self):
+        """CR Q5: target-inflight is one of the bars. A target sitting in a
+        sibling state-dir's grains.jsonl must BLOCK, not read as free."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            qdir = root / "w9a"
+            qdir.mkdir()
+            (qdir / "grains.jsonl").write_text(
+                json.dumps({"issue": 7, "notebook": TARGET,
+                            "source_nb": "Series/T-01-Python.ipynb"}) + "\n",
+                encoding="utf-8")
+            report = ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                      "myia-po-2028:claudish", ["w9a"], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "BLOCKED", report[1])
+            self.assertIn("target-inflight", report[1]["reasons"])
+
+    def test_an_absent_inflight_queue_refuses(self):
+        """CR Q5: a NAMED queue with no grains.jsonl is a read failure (typo in
+        --inflight), never 'nothing in flight' — the #1120 failed-read class.
+        A finished queue is retired with its whole state-dir name, not by
+        deleting the file alone."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            with self.assertRaises(ns.InstrumentError) as cm:
+                ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                 "myia-po-2028:claudish", ["typo-name"], root, pin="HEAD")
+            self.assertIn("in-flight queue absent", str(cm.exception))
+            with self.assertRaises(ns.InstrumentError):
+                ns.run_selection(repo, FakeIdentity([("pulls?state=open", []),
+                                                     ("issues?state=open", [])]),
+                                 ["typo-name"], root, pin="HEAD")
 
 
 class ProofTests(unittest.TestCase):
