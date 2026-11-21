@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
     compress-captures.ps1 exit contract (#1013 g7).
 
@@ -37,6 +37,75 @@ if (-not $sevenZip) {
 BeforeAll {
     $script:RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     $script:CompactionScript = Join-Path $script:RepoRoot 'scripts\compress-captures.ps1'
+}
+
+Describe 'compress-captures progress lines (#1138)' {
+    BeforeAll {
+        # A FAKE 7z: sleeps ~2 s (two pings of 1 s), ignores its arguments,
+        # exits 0, writes nothing. The script honours an -SevenZip that exists
+        # (#214), so the pack/verify/probe paths all run through it while the
+        # journal carries the PROGRESS lines this pin asserts. -ProgressHeartbeatSec 1
+        # makes the during-call heartbeat fire without waiting an hour.
+        $script:FakeDir = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("cc-prog-" + [guid]::NewGuid().ToString('N')))
+        $script:Fake7z = Join-Path $script:FakeDir 'fake7z.cmd'
+        [System.IO.File]::WriteAllText($script:Fake7z, "@echo off`r`nping -n 3 127.0.0.1 >nul`r`nexit /b 0`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    }
+    AfterAll {
+        Remove-Item -Recurse -Force $script:FakeDir -ErrorAction SilentlyContinue
+    }
+
+    It 'logs a PROGRESS line before each 7z call and a heartbeat while one runs' {
+        $tmp = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("cc-prog-run-" + [guid]::NewGuid().ToString('N')))
+        try {
+            $cap  = Join-Path $tmp 'captures'; $arch = Join-Path $tmp 'arch'
+            New-Item -ItemType Directory -Force -Path $cap, $arch | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $cap 'req-1-1-2026-11-01T00-00-00-000Z-pin.json'), '{}', (New-Object System.Text.UTF8Encoding($false)))
+            $out = Join-Path $tmp 'run.out'
+            $host_ = (Get-Process -Id $PID).Path
+            & $host_ -NoProfile -ExecutionPolicy Bypass -File $script:CompactionScript `
+                -CaptureDir $cap -ArchiveDir $arch -MachineTag 'pintest' `
+                -KeepDays 1 -ShaCheckCount 0 -SevenZip $script:Fake7z -ProgressHeartbeatSec 1 *> $out
+            $rc = $LASTEXITCODE
+            $logLines = @(Get-Content -LiteralPath $out)
+            $logTxt = $logLines -join "`n"
+            # The fake writes no archive, so the night counts the pack as failed
+            # (rc=1) — the fixture's contract, asserted so a silent change in the
+            # error accounting cannot mask what this pin is about: the lines.
+            $rc | Should -Be 1
+            # 1. BEFORE each call: the pack is announced with its argv.
+            $logTxt | Should -Match 'PROGRESS pack 2026-11-01: 7z a -t7z -m0=lzma2'
+            # 2. WHILE a call runs: at least one heartbeat line (fake sleeps ~2 s,
+            #    interval 1 s — measured margin, no wall-clock dependence beyond it).
+            $logTxt | Should -Match 'PROGRESS pack 2026-11-01: still running \(\d+ s elapsed\)'
+            # 3. Order: the announcement precedes the day's outcome line.
+            $packIdx = ($logLines | Select-String -Pattern 'PROGRESS pack 2026-11-01: 7z a ').LineNumber
+            $errIdx  = ($logLines | Select-String -Pattern 'ERROR 2026-11-01: 7z add').LineNumber
+            $packIdx | Should -Not -BeNullOrEmpty
+            $errIdx  | Should -Not -BeNullOrEmpty
+            ($packIdx[0] -lt $errIdx[0]) | Should -BeTrue
+            # 4. The verify call is announced too (before-each-call, not just the pack).
+            $logTxt | Should -Match 'PROGRESS verify 2026-11-01: 7z t -bso0'
+        }
+        finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+    }
+
+    It 'heartbeat 0 disables the during-call line but keeps the before-call one' {
+        $tmp = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("cc-prog-off-" + [guid]::NewGuid().ToString('N')))
+        try {
+            $cap  = Join-Path $tmp 'captures'; $arch = Join-Path $tmp 'arch'
+            New-Item -ItemType Directory -Force -Path $cap, $arch | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $cap 'req-1-1-2026-11-01T00-00-00-000Z-pin.json'), '{}', (New-Object System.Text.UTF8Encoding($false)))
+            $out = Join-Path $tmp 'run.out'
+            $host_ = (Get-Process -Id $PID).Path
+            & $host_ -NoProfile -ExecutionPolicy Bypass -File $script:CompactionScript `
+                -CaptureDir $cap -ArchiveDir $arch -MachineTag 'pintest' `
+                -KeepDays 1 -ShaCheckCount 0 -SevenZip $script:Fake7z -ProgressHeartbeatSec 0 *> $out
+            $logTxt = (Get-Content -LiteralPath $out) -join "`n"
+            $logTxt | Should -Match 'PROGRESS pack 2026-11-01: 7z a -t7z'
+            $logTxt | Should -Not -Match 'still running'
+        }
+        finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+    }
 }
 
 Describe 'compress-captures exit code (#1013 g7)' {
