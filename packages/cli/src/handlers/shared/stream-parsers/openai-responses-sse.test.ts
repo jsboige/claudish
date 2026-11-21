@@ -1409,7 +1409,7 @@ describe("#1039 — multi-call: every tool_use block reaches the client with com
   }
 
   test("(j) INTERLEAVED deltas keyed by item_id+output_index land whole on their own blocks (sole carrier)", async () => {
-    const { output } = await runStreamCollect([
+    const events = [
       ...twoAddedEvents(),
       ...interleavedDeltas(),
       ...twoDoneItems(false),
@@ -1417,18 +1417,22 @@ describe("#1039 — multi-call: every tool_use block reaches the client with com
         type: "response.completed",
         response: { usage: { input_tokens: 10, output_tokens: 67 } },
       },
-    ]);
+    ];
+    // The interleaving contract lives on the INPUT, asserted before the
+    // parser runs: the delta events really alternate fc_1,fc_2,… — that is
+    // what makes this fixture interleaved, and what a contiguous rewrite of
+    // interleavedDeltas() would silently undo. The parser's OUTPUT order is
+    // deliberately NOT pinned: today's #1043 behaviour interleaves two open
+    // blocks on the Anthropic wire, and a later change that serializes them
+    // (buffer B until A stops) would be legal, not a regression.
+    const deltaItemIds = events
+      .filter((e: any) => e.type === "response.function_call_arguments.delta")
+      .map((e: any) => e.item_id);
+    expect(deltaItemIds).toEqual(["fc_1", "fc_2", "fc_1", "fc_2", "fc_1", "fc_2"]);
+    const { output } = await runStreamCollect(events);
     const blocks = toolBlocks(output);
     expect(blocks.map((b) => b.input)).toEqual(TWO_CALLS.map((c) => c.args));
     expect(blocks.every((b) => b.lastDeltaSeq > 0 && b.lastDeltaSeq < b.stopSeq)).toBe(true);
-    // The wire really alternates: block indices of the input_json_delta
-    // events, in stream order, must be 0,1,0,1,0,1 — this is what makes the
-    // fixture interleaved, and what a contiguous rewrite would silently undo.
-    const deltaIdx = [...output.matchAll(/event: content_block_delta\ndata: ([^\n]*)/g)]
-      .map((m) => JSON.parse(m[1]))
-      .filter((d) => d.delta?.type === "input_json_delta")
-      .map((d) => d.index);
-    expect(deltaIdx).toEqual([0, 1, 0, 1, 0, 1]);
   });
 
   test("(k) the buffered stream:false path assembles the same interleaved inputs", async () => {
@@ -1463,6 +1467,17 @@ describe("#1039 — multi-call: every tool_use block reaches the client with com
     const body = readFileSync(
       join(__dirname, "..", "..", "..", "test-fixtures", "sse-responses", "responses-multicall-interleaved.sse")
     );
+    // Same interleaving contract as (j), on the FILE's own delta lines — the
+    // hand-built artifact is checked against a contiguous rewrite of itself,
+    // independently of how the parser emits its output blocks.
+    const sseDeltaItemIds = body
+      .toString()
+      .split("\n")
+      .filter((l) => l.startsWith("data: "))
+      .map((l) => JSON.parse(l.slice(6)))
+      .filter((e: any) => e.type === "response.function_call_arguments.delta")
+      .map((e: any) => e.item_id);
+    expect(sseDeltaItemIds).toEqual(["fc_1", "fc_2", "fc_1", "fc_2", "fc_1", "fc_2"]);
     const stream = new ReadableStream({
       start(controller) {
         controller.enqueue(new Uint8Array(body));
