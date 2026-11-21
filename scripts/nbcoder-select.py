@@ -53,10 +53,12 @@ IPYNB = re.compile(r"`([A-Za-z0-9_./" + BS + r"-]+\.ipynb)`")
 EXIT_OK = 0
 EXIT_DEFECT = 2
 EXIT_APP_UNAVAILABLE = 3
+EXIT_NOT_FREE = 4
 
 DEFAULT_APP_ID = "5751481"  # coursia-lane-po-2028
 DEFAULT_PEM = "~/.secrets/github-apps/coursia-lane-po-2028.pem"
 DEFAULT_PIN = "origin/main"
+API_MAX_PAGES = 100
 
 
 class InstrumentError(RuntimeError):
@@ -121,9 +123,16 @@ class Identity:
 
 
 def api_all(identity: Identity, path: str) -> list:
+    """Paginate a list endpoint to exhaustion — BOUNDED.
+
+    A page cap, not a trust: an endpoint that keeps answering exactly 100 items
+    (measured 20/11: a matching bug in a fake turned `page=1` into a substring
+    of `page=196965` and the loop ran unbounded) must refuse, never hang. The
+    real ceilings are far below (a PR caps at 3 000 files = 30 pages).
+    """
     items: list = []
     page = 1
-    while True:
+    while page <= API_MAX_PAGES:
         chunk = json.loads(identity.gh(["api", f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}"]))
         if not chunk:
             return items
@@ -131,6 +140,9 @@ def api_all(identity: Identity, path: str) -> list:
         if len(chunk) < 100:
             return items
         page += 1
+    raise InstrumentError(
+        f"api pagination refused after {API_MAX_PAGES} pages: {path} — an endpoint "
+        "that never shortens its pages is an instrument defect, not a corpus")
 
 
 def norm(p: str) -> str:
@@ -192,14 +204,19 @@ def run_selection(repo: Path, identity: Identity, inflight_queues: list[str],
     inflight: set[str] = set()
     for q in inflight_queues:
         p = tmp_root / q / "grains.jsonl"
-        if p.exists():
-            for line in p.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue          # an in-flight blank line is not a defect
-                g = json.loads(line)
-                for k in ("notebook", "source_nb"):
-                    if g.get(k):
-                        inflight.add(norm(g[k]))
+        # Fail-closed (the #1120 class): a NAMED queue whose grains.jsonl is
+        # absent is a read failure (typo in the state-dir name), never
+        # 'nothing in flight'. A finished queue is retired by removing its
+        # whole state-dir AND dropping the --inflight name, not the file alone.
+        if not p.exists():
+            raise InstrumentError(f"in-flight queue absent: {p} (typo in --inflight?)")
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue          # an in-flight blank line is not a defect
+            g = json.loads(line)
+            for k in ("notebook", "source_nb"):
+                if g.get(k):
+                    inflight.add(norm(g[k]))
 
     blocked = taken_pr | taken_iss | inflight
     avail = [f for f in orphans if twin(f) not in blocked and f not in blocked]
@@ -209,6 +226,119 @@ def run_selection(repo: Path, identity: Identity, inflight_queues: list[str],
         "open_issues": len(iss), "taken_issue": len(taken_iss),
         "inflight": len(inflight), "available": len(avail),
     }}
+
+
+DELIVERED = "[DELIVERED]"
+
+
+def issue_target(body: str) -> str | None:
+    """The C# twin a grain issue asks for: the `.ipynb` named on its `Cible C#` line.
+
+    Bodies vary ('a creer', 'a créer', path between backticks) — the marker line is
+    the stable part across the 20/11 grain template (`## Cible C#` followed by a
+    backticked path). A template change is caught by a test, not in production.
+    """
+    for line in (body or "").splitlines():
+        if "Cible C#" in line:
+            found = IPYNB.findall(line)
+            if found:
+                return norm(found[-1])
+    return None
+
+
+def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
+                  inflight_queues: list[str], tmp_root: Path, pin: str = DEFAULT_PIN,
+                  require_free: bool = False) -> dict:
+    """Per named issue: may a grain be queued? FOUR measurements, each opposable.
+
+    Measured 20/11 (po-2028:claudish): `check_lane_claim.py` answers 'CLEAR: no
+    OTHER lane claims #N' — it says nothing about MY OWN lane having already
+    delivered the grain. #27508/#27509 came back CLEAR while open PRs #27562 and
+    #27515 already carried their targets; two duplicate drivers were launched and
+    killed. This mode closes that gap and names, per issue:
+      (a) the target already present in the PINNED tree (read_pinned_tree — a
+          failed Git read refuses, it never reads as 'absent from main');
+      (b) a [DELIVERED] marker in the thread (ANY lane, my own included);
+      (c) the target in an OPEN PR's changed files, ALL pages (api_all);
+      (d) the lane registry's claim verdict.
+    A grain is FREE only when none of them speaks.
+
+    The PR-file scan is the expensive part (~1 call per open PR). Its cache is
+    DISABLED under require_free: the gate path must not serve a verdict older
+    than a sibling lane's PR — that race is the reason the bar exists. In the
+    plain reporting path the cache is 15 min and its age is recorded per entry.
+    """
+    files = read_pinned_tree(repo, pin)
+    cache = tmp_root / "pr-files-cache.json"
+    taken_pr: dict[str, int] = {}
+    cache_age_s: int | None = None
+    if not require_free and cache.exists() and time.time() - cache.stat().st_mtime < 900:
+        try:
+            taken_pr = {k: int(v) for k, v in json.loads(cache.read_text(encoding="utf-8")).items()}
+            cache_age_s = int(time.time() - cache.stat().st_mtime)
+        except Exception:
+            taken_pr = {}
+    if not taken_pr:
+        prs = api_all(identity, "repos/jsboige/CoursIA/pulls?state=open")
+        for pr in prs:
+            for f in api_all(identity, f"repos/jsboige/CoursIA/pulls/{pr['number']}/files"):
+                fn = norm(f["filename"])
+                if fn.endswith(".ipynb"):
+                    taken_pr.setdefault(fn, pr["number"])
+        if not require_free:
+            cache.write_text(json.dumps(taken_pr), encoding="utf-8")
+
+    inflight: set[str] = set()
+    for q in inflight_queues:
+        p = tmp_root / q / "grains.jsonl"
+        # Same fail-closed read as run_selection: absent queue == read failure.
+        if not p.exists():
+            raise InstrumentError(f"in-flight queue absent: {p} (typo in --inflight?)")
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            g = json.loads(line)
+            for k in ("notebook", "source_nb"):
+                if g.get(k):
+                    inflight.add(norm(g[k]))
+
+    report: dict = {}
+    for n in issues:
+        body = identity.gh(["api", f"repos/jsboige/CoursIA/issues/{n}", "--jq", ".body"])
+        target = issue_target(body)
+        reasons: list[str] = []
+        if not target:
+            reasons.append("no-target-in-body")
+        else:
+            if target in files:
+                reasons.append("target-in-main")
+            if target in taken_pr:
+                reasons.append(f"target-in-open-pr#{taken_pr[target]}")
+            if target in inflight:
+                reasons.append("target-inflight")
+        comments = api_all(identity, f"repos/jsboige/CoursIA/issues/{n}/comments")
+        # lstrip(): the marker is written bare at column 0 by the harness, but a
+        # human hand may indent or bold it — the marker itself is the contract.
+        delivered = [c for c in comments if (c.get("body") or "").lstrip().startswith(DELIVERED)]
+        if delivered:
+            reasons.append("delivered-marker")
+        # cwd=repo: check_lane_claim.py resolves the registry and tracked paths
+        # against the repository root; run from elsewhere it answers rc=2 (measured
+        # 20/11 — a BLOCKED verdict for every issue, including FREE ones).
+        claim = subprocess.run([sys.executable, str(repo / "scripts" / "check_lane_claim.py"),
+                                str(n), "--lane", lane], cwd=str(repo),
+                               capture_output=True, text=True, encoding="utf-8")
+        claim_verdict = "clear" if claim.returncode == 0 else f"blocked(rc={claim.returncode})"
+        if claim.returncode != 0:
+            reasons.append("claim-" + claim_verdict)
+        report[n] = {"target": target,
+                     "verdict": "FREE" if not reasons else "BLOCKED",
+                     "reasons": reasons,
+                     "claim": claim_verdict,
+                     "last_delivered": delivered[-1]["created_at"] if delivered else None}
+        if cache_age_s is not None:
+            report[n]["pr_files_cache_age_s"] = cache_age_s
+    return report
 
 
 def bucket(identity: Identity) -> dict:
@@ -260,6 +390,15 @@ def main(argv: list[str] | None = None) -> int:
                          "default): run selection under the ambient shared account, write the dump")
     ap.add_argument("--witness", action="store_true",
                     help="refusal self-test: expect exit 3 on an unavailable App, zero network calls")
+    ap.add_argument("--preflight", metavar="N[,N...]",
+                    help="bar a named issue list before queueing grains: target-in-main (pinned tree), "
+                         "[DELIVERED] marker, target in an open PR (all pages), claim verdict")
+    ap.add_argument("--lane", default=os.environ.get("NBCODER_LANE"),
+                    help="lane identity handed to check_lane_claim.py (required with --preflight; "
+                         "default: $NBCODER_LANE — no machine-specific default in a fleet organ)")
+    ap.add_argument("--require-free", action="store_true",
+                    help="with --preflight: exit 4 when any issue is not FREE, and never serve the "
+                         "PR-files cache (a sibling lane's PR inside the window must be visible)")
     args = ap.parse_args(argv)
 
     repo = Path(args.repo)
@@ -307,6 +446,26 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_APP_UNAVAILABLE
     identity = Identity(gh, token, "app")
     print(f"App token forged (process-local, {len(token)} chars, never displayed)", file=sys.stderr)
+
+    if args.preflight:
+        if not args.lane:
+            print("instrument defect: --preflight needs a lane (pass --lane or set NBCODER_LANE)",
+                  file=sys.stderr)
+            return EXIT_DEFECT
+        issues = [int(x) for x in args.preflight.replace(",", " ").split()]
+        try:
+            report = run_preflight(repo, identity, issues, args.lane, args.inflight, tmp_root,
+                                   args.pin, require_free=args.require_free)
+        except InstrumentError as e:
+            # A failed Git read or gh call refuses: it never reads as FREE.
+            print(f"instrument defect: {e}", file=sys.stderr)
+            return EXIT_DEFECT
+        print(json.dumps(report, ensure_ascii=False, indent=1))
+        blocked = [n for n, v in report.items() if v["verdict"] != "FREE"]
+        if args.require_free and blocked:
+            print(f"PREFLIGHT REFUSED: {len(blocked)} issue(s) not FREE: {blocked}", file=sys.stderr)
+            return EXIT_NOT_FREE
+        return EXIT_OK
 
     evidence: dict = {"forged": True, "app_id": args.app_id, "pin": args.pin,
                       "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
