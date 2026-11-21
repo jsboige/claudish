@@ -111,7 +111,9 @@ Describe 'compress-captures.ps1 wiring' {
     It 'gates on the policy BEFORE it enumerates or archives anything' {
         $text  = Get-Content -LiteralPath $script:ScriptPath -Raw
         $gate  = $text.IndexOf('Get-CaptureArchivePolicy')
-        $pack  = $text.IndexOf('$SevenZip a -t7z')
+        # #1138: the direct 7z invocations went through Invoke-SevenZipLogged;
+        # the pack call site still carries the 'a -t7z' argv, now as a labeled helper call.
+        $pack  = $text.IndexOf('-Label ("pack {0}" -f $day)')
         $enum  = $text.IndexOf('enumerate loose captures')
         $gate | Should -BeGreaterThan 0
         $gate | Should -BeLessThan $enum
@@ -565,7 +567,8 @@ exit /b 0
     It 'wiring: the integrity gate runs BEFORE the re-upload Copy-Item' {
         $text = Get-Content -LiteralPath $script:ScriptPath -Raw
         $reup  = $text.IndexOf('re-upload pass')
-        $gate  = $text.IndexOf('& $SevenZip t', $reup)
+        # #1138: re-anchored on the helper call that wraps the gate's `7z t`.
+        $gate  = $text.IndexOf('-Label ("verify {0}" -f $arch.BaseName)', $reup)
         $copy  = $text.IndexOf('Copy-Item -LiteralPath $arch.FullName', $reup)
         $reup | Should -BeGreaterThan 0
         $gate | Should -BeGreaterThan 0
@@ -1342,7 +1345,8 @@ exit /b 0
     It 'wiring: the pre-pack probe sits BEFORE the pack, and the loose purge AFTER the off-site copy' {
         $text = Get-Content -LiteralPath $script:ScriptPath -Raw
         $probe = $text.IndexOf('canonical archive fails 7z t')
-        $pack  = $text.IndexOf('& $SevenZip a -t7z')
+        # #1138: re-anchored on the helper call that wraps the pack's `7z a -t7z`.
+        $pack  = $text.IndexOf('-Label ("pack {0}" -f $day)')
         $probe | Should -BeGreaterThan 0
         $pack  | Should -BeGreaterThan 0
         $probe | Should -BeLessThan $pack
