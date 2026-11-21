@@ -86,3 +86,25 @@ export function carryServedModelHeader(from: Response, to: Response): Response {
     headers,
   });
 }
+
+/**
+ * #1142 — carry the SIDE-CHANNEL entry across a rebuild that happens between
+ * the handler's mark and the route's apply. `withBudgetRelease` rebuilds the
+ * Response inside handleWithCascade (the nominal-attempt site and the walk
+ * site); the WeakMap is keyed by object identity, so without this the entry
+ * dies with the inner object and the header vanishes on budget-leased
+ * endpoints. Sibling of `carryServedModelHeader` (which moves the REAL
+ * header across a translation rebuild); this one moves the entry itself.
+ * No entry on `from` → nothing set on `to`: unknown stays omitted, the value
+ * is never re-derived here. Never throws.
+ */
+export function transferServedModel(from: Response, to: Response): void {
+  try {
+    const model = servedModels.get(from);
+    if (model === undefined) return;
+    servedModels.set(to, model);
+  } catch {
+    // Same contract as setServedModel: the side-channel never takes the
+    // response path down.
+  }
+}
