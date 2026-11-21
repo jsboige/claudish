@@ -49,6 +49,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { presetRefusal } from "./test-sandbox";
+import { armCatalogNetworkGuard, catalogGuardBlockedCount } from "./test-support/catalog-network-guard";
 import { armCaptureHermeticity } from "./test-support/capture-hermeticity";
 import { armRepoEnvFileNeutralizer } from "./test-support/env-file-neutralizer";
 
@@ -116,6 +117,17 @@ for (const name of readdirSync(tmpdir())) {
 // test-support/env-file-neutralizer.ts.
 armRepoEnvFileNeutralizer();
 
+// Catalog network guard (#1133 upstream, 2026-11-21): every proxy a test
+// spins fires a background catalog warm, and the route files that don't stub
+// their fetch were sending it to the REAL models-index endpoint — the live
+// catalog (1 056 entries measured, glm-5 @ 204800 included) then leaked into
+// the process-global memory catalog and reddened model-catalog Group 1's
+// cold-start case on order/timing luck (main 844710aec, docs-only flip).
+// The guard refuses the real remote host in-process; local overrides and
+// per-file fetch stubs pass through untouched. Mechanism + pins:
+// test-support/catalog-network-guard.ts / .test.ts.
+armCatalogNetworkGuard();
+
 // Capture hermeticity (2026-11-08, three test files wrote into a seat's REAL
 // capture dir under an ambient CLAUDISH_CAPTURE_DIR): swap the ambient dir for
 // a per-run tmp sandbox BEFORE any test, and fail the run at the end if a
@@ -128,6 +140,16 @@ armCaptureHermeticity();
 // In preset mode the sandbox IS the launcher-provided HOME (a whole runner
 // dir on CI) — never rmtree a HOME; clean only the .claudish state inside it.
 afterAll(() => {
+  // Catalog-guard leak report (review non-blocking, #1135): a blocked count
+  // above zero means some test file TRIED to reach the real models-index host
+  // this run — the guard stopped it, but the file is worth finding. Printed
+  // only when non-zero, so a healthy run stays silent.
+  try {
+    const blocked = catalogGuardBlockedCount();
+    if (blocked > 0) {
+      console.warn(`[test preload] catalog network guard refused ${blocked} fetch(es) to the real models-index host this run — a test file is not hermetic (test-support/catalog-network-guard.ts)`);
+    }
+  } catch {}
   try {
     if (preset) {
       rmSync(join(sandbox, ".claudish"), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
