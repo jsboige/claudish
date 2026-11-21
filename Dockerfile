@@ -16,7 +16,12 @@ COPY packages/cli/scripts ./packages/cli/scripts
 # Install deps (skip lockfile — partial workspace)
 RUN bun install --production --no-save
 
-# Generate version file
+# #1140 — the git revision this image is built from (compose build.args feeds
+# it from `git rev-parse HEAD`; "unknown" outside the docker path). Placed here
+# so an arg change busts only this RUN's cache onward, not bun install above.
+ARG CLAUDISH_REVISION=unknown
+
+# Generate version file (bakes VERSION + REVISION into src/version.ts)
 RUN bun run packages/cli/scripts/generate-version.ts 2>/dev/null || true
 
 # Expose proxy port

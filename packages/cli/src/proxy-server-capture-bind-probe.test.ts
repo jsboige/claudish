@@ -22,7 +22,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
-import { VERSION } from "./version.js";
+import { REVISION, VERSION } from "./version.js";
 import {
   CAPTURE_PROBE_TTL_ENV,
   captureBindProbeSettleForTests,
@@ -127,5 +127,12 @@ describe("#1140 /health carries the running build version", () => {
     });
     const h = await health();
     expect(h.version).toBe(VERSION);
+    // #1140 r2 — VERSION cannot name a build on this fork (no release bumps),
+    // so /health also carries the image's git revision, baked at BUILD time by
+    // generate-version.ts from the Dockerfile's CLAUDISH_REVISION arg. In this
+    // unit run the arg is absent ⇒ the generator's documented fallback.
+    expect(h.revision).toBe(REVISION);
+    expect(typeof h.revision).toBe("string");
+    expect(h.revision.length).toBeGreaterThan(0);
   });
 });
