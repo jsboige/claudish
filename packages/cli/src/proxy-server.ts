@@ -89,6 +89,12 @@ import { registerForkExtensions, resolveInboundKeys, stripBillingHeaderFromBody,
 import { collectRoutedBareNames } from "./fork/middleware/proxy-auth.js";
 import { forwardToUpstream, readRequestBody, relayHealthFields, requestLoopedBack, HOPS_HEADER, type RelayState } from "./fork/server/relay.js";
 import { getInstanceId } from "./instance-id.js";
+// #1140 — /health names the running build so a relay verification artifact
+// can say WHICH code it probed (fleet-rollout rule: read from the live path,
+// never from the change's intent). Same value the CLI ships (version.ts is
+// the generate-version.ts output the release bumps in lockstep with
+// packages/cli/package.json — what CI publishes is what /health answers).
+import { REVISION, VERSION } from "./version.js";
 import {
   initFailover,
   isQuotaExhaustion,
@@ -3003,6 +3009,15 @@ export async function createProxyServer(
         role,
         upstream,
         instanceId: getInstanceId(),
+        // #1140 — additive; nothing gates on it and older parsers ignore it.
+        version: VERSION,
+        // #1140 — the BUILD's git revision (Dockerfile ARG → generated
+        // version.ts). On this fork VERSION cannot tell two images apart (no
+        // release bumps; a thousand commits shipped as "7.1.2" since
+        // 2026-05), so THIS is the field a fleet-rollout artifact reads to
+        // name the build it probed. "unknown" = built outside the arg-fed
+        // docker path.
+        revision: REVISION,
         // #306 review — the drain reads THIS to confirm the proxy actually
         // sees its flag (drain home vs container mount can differ; a VM clock
         // skew can expire a fresh flag). The reason, never the flag content.

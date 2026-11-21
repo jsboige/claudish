@@ -18,7 +18,16 @@ x-logging: &default-logging
 
 services:
   claudish-proxy:
-    build: .
+    # #1140 — build args (not runtime env): CLAUDISH_REVISION lands in the
+    # generated src/version.ts at BUILD time, so the value names the image's
+    # commit. The deploying script exports it from `git rev-parse HEAD`
+    # (install-sidecar.ps1 does; the hub operator exports it in the build
+    # window). Absent → "unknown", which is itself a readable answer: an
+    # image built outside the arg-fed path.
+    build:
+      context: .
+      args:
+        CLAUDISH_REVISION: ${CLAUDISH_REVISION:-unknown}
     container_name: ${CLAUDISH_CONTAINER_NAME:-claudish-proxy}
     restart: unless-stopped
     logging: *default-logging

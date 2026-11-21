@@ -393,6 +393,21 @@ if ($WriteEnvOnly) {
 
 # ── 4. Build + start ────────────────────────────────────────────────
 Write-Step "docker compose up -d --build"
+# #1140 — feed the image's git revision (compose build.args → generated
+# version.ts → /health `revision`). Own guarded scope, NO stderr redirect:
+# under script-wide 'Stop' a bare git call whose stderr fires would terminate
+# the installer, so Continue wraps it and any failure (no repo, no git)
+# leaves the honest 'unknown'. The env dies with this process — nothing
+# downstream inherits it.
+$claudishRevision = 'unknown'
+$prevRevEap = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $revOut = git -C $RepoDir rev-parse HEAD
+    if ($LASTEXITCODE -eq 0 -and $revOut) { $claudishRevision = "$revOut".Trim() }
+} catch { $claudishRevision = 'unknown' } finally { $ErrorActionPreference = $prevRevEap }
+$env:CLAUDISH_REVISION = $claudishRevision
+Write-Host "BUILD REVISION: $claudishRevision"
 Push-Location $RepoDir
 $prevEap = $ErrorActionPreference
 try {
