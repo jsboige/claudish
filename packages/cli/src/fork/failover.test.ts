@@ -54,6 +54,8 @@ import {
   NATIVE_BUCKET,
   recordServedStepForNotices,
   servedStepForNotices,
+  aliasOnlyExplicitPin,
+  isBucketWalled,
 } from "./failover.js";
 import type { DelegationOwner, FailoverStep } from "./failover.js";
 import { route } from "../providers/routing-rules.js";
@@ -408,6 +410,93 @@ describe("failover — machine-scoped config arm (role@machine)", () => {
     expect(machineArmBucket("haiku", "myia-po-2027")).toBeUndefined();
     expect(isFailoverActive("haiku")).toBe(false);
   });
+});
+
+// #1150(b): arms never divert an alias-only explicit pin; walls still do.
+// The measured incident (20/11): nb_coder pinning `mmc@MiniMax-M3.1-Flash`
+// was diverted by `haiku@myia-po-2028` for 12/12 requests. Three zeros say no
+// live traffic relies on the arm side; the wall side is what aliases are for.
+describe("failover — #1150(b) explicit pins exempt from config arms, not walls", () => {
+  const PIN_SETUP = {
+    CLAUDISH_FAILOVER_HAIKU: "vllm-myia@qwen3.6-35b-a3b>role:sonnet",
+    CLAUDISH_FAILOVER_HAIKU_LABEL: "Swift local>Sonnet role",
+    CLAUDISH_FAILOVER_HAIKU_DIRECTION: "degraded>improved",
+    CLAUDISH_FAILOVER_SONNET: "mistral@glm-5.3",
+    CLAUDISH_FAILOVER_ROLE_MODELS: "minimax-m3:haiku",
+  } as NodeJS.ProcessEnv;
+  const PIN = "minimax-coding@MiniMax-M3.1-Flash"; // alias carries the role; no role keyword
+  const BARE = "MiniMax-M3.1-Flash"; // same alias, no explicit provider
+
+  it("aliasOnlyExplicitPin classifies exactly the pin shape — keyword ids and bare names are not pins", () => {
+    // The shape test itself is state-free; the alias classification below needs
+    // the aliases loaded (beforeEach wipes them).
+    expect(aliasOnlyExplicitPin(PIN)).toBe(true);
+    expect(aliasOnlyExplicitPin(BARE)).toBe(false); // no explicit provider
+    expect(aliasOnlyExplicitPin("or@anthropic/claude-sonnet-2026")).toBe(false); // role keyword: current behavior, out of #1150 scope
+    expect(aliasOnlyExplicitPin(null)).toBe(false);
+    expect(aliasOnlyExplicitPin(undefined)).toBe(false);
+    initFailover({ ...PIN_SETUP });
+    expect(roleFromModelName(PIN)).toBe("haiku"); // the alias is what carries the role
+  });
+
+  it("AC1 — a machine-scoped arm never diverts the pin: no grant bucket, nominal resolves", () => {
+    initFailover({ ...PIN_SETUP, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    // The route computes the request bucket as machineArmBucket ?? real bucket.
+    expect(machineArmBucket("haiku", "myia-po-2027", PIN)).toBeUndefined(); // arm grant skipped for the pin
+    const pinDecision = classifyNominalBucket(PIN, () => false); // explicit provider ⇒ the bucket variant
+    const bucket = machineArmBucket("haiku", "myia-po-2027", PIN) ?? ("bucket" in pinDecision ? pinDecision.bucket : undefined);
+    expect(bucket).toBe("minimax-coding"); // the pin's real provider bucket — what walls read
+    expect(resolveFailoverTarget("haiku", bucket, undefined, "myia-po-2027", PIN)).toEqual({
+      step: null,
+      stepIndex: -1,
+    });
+    // The machine-blind aggregate reading is unchanged (banner/health world):
+    expect(
+      resolveFailoverTarget("haiku", machineArmBucket("haiku", "myia-po-2027")).step?.target
+    ).toBe("vllm-myia@qwen3.6-35b-a3b");
+  });
+
+  it("AC2 — a wall on the pin's own provider bucket still walks the cascade", () => {
+    initFailover({ ...PIN_SETUP, CLAUDISH_FAILOVER_AUTO: "1", CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    armFailover("haiku", "HTTP 402", "minimax-coding");
+    expect(isBucketWalled("minimax-coding")).toBe(true);
+    const wallDecision = classifyNominalBucket(PIN, () => false); // explicit provider ⇒ the bucket variant
+    const bucket = machineArmBucket("haiku", "myia-po-2027", PIN) ?? ("bucket" in wallDecision ? wallDecision.bucket : undefined);
+    expect(bucket).toBe("minimax-coding"); // without the machineArmBucket guard this reads machine:myia-po-2027 and the wall goes blind
+    const resolved = resolveFailoverTarget("haiku", bucket, undefined, "myia-po-2027", PIN);
+    expect(resolved.step?.target).toBe("vllm-myia@qwen3.6-35b-a3b");
+  });
+
+  it("AC3 — the bare alias name under the same arm is still diverted", () => {
+    initFailover({ ...PIN_SETUP, CLAUDISH_FAILOVER_ACTIVE: "haiku@myia-po-2027" });
+    expect(aliasOnlyExplicitPin(BARE)).toBe(false);
+    expect(machineArmBucket("haiku", "myia-po-2027", BARE)).toBe("machine:myia-po-2027");
+    expect(
+      resolveFailoverTarget("haiku", "machine:myia-po-2027", undefined, "myia-po-2027", BARE).step?.target
+    ).toBe("vllm-myia@qwen3.6-35b-a3b");
+  });
+
+  it("AC4 — a role-wide arm exempts the pin too, while the aggregate reading stays diverted", () => {
+    initFailover({ ...PIN_SETUP, CLAUDISH_FAILOVER_ACTIVE: "haiku" });
+    expect(isFailoverActive("haiku")).toBe(true); // the banner still announces the arm
+    expect(resolveFailoverTarget("haiku", "minimax-coding", undefined, undefined, PIN)).toEqual({
+      step: null,
+      stepIndex: -1,
+    });
+    expect(resolveFailoverTarget("haiku", undefined, undefined, undefined, PIN)).toEqual({
+      step: null,
+      stepIndex: -1,
+    });
+  });
+
+  // Mutations (each executed, each observed red — 22/11):
+  //  - neutralizing armExempt at resolveFailoverTarget turns AC4 red (the
+  //    role-wide arm holds on ANY bucket, only the exemption stops it; AC1
+  //    survives it thanks to the machineArmBucket guard alone — the machine
+  //    arm never held a real provider bucket).
+  //  - dropping the guard in machineArmBucket turns AC1 AND AC2 red — the pin
+  //    keys on machine:myia-po-2027, the arm diverts it again, and the wall on
+  //    minimax-coding goes blind (the request serves the walled nominal).
 });
 
 // ── #693 — per-machine step exclusion ──────────────────────────────────────────

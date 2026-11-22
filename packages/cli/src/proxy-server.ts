@@ -996,7 +996,12 @@ export async function createProxyServer(
     const role = roleFromModelName(requestedModel);
     if (!role || !getFailoverRule(role)) return undefined;
     return (
-      machineArmBucket(role, c.req.header("x-claudish-machine")) ?? (await nominalBucketOfModel(requestedModel))
+      // #1150(b): an explicit provider@model pin matched only via a
+      // CLAUDISH_FAILOVER_ROLE_MODELS alias is exempt from the config-arm
+      // grant — machineArmBucket returns undefined so the pin's real
+      // provider bucket (nominalBucketOfModel below) stays what walls read.
+      machineArmBucket(role, c.req.header("x-claudish-machine"), requestedModel) ??
+      (await nominalBucketOfModel(requestedModel))
     );
   };
 
@@ -1169,7 +1174,9 @@ export async function createProxyServer(
       // #275: the diversion test is bucket-scoped — compute this request's
       // nominal bucket (unless the caller — the cascade loop — already did).
       const bucket = nominalBucket ?? (await nominalBucketOfModel(requestedModel));
-      const resolved = resolveFailoverTargetForSession(role, sessionKey, bucket, skipSteps, machine);
+      // #1150(b): arms never divert an alias-only explicit pin — requestedModel
+      // threads down so resolveFailoverTarget can exempt it (walls still apply).
+      const resolved = resolveFailoverTargetForSession(role, sessionKey, bucket, skipSteps, machine, requestedModel);
       if (resolved.step && resolved.step.target !== target) {
         log(
           `[Proxy] Failover: role '${role}' [${bucket}] ${target} → ${resolved.step.target} step[${resolved.stepIndex}] (${resolved.step.label})`
@@ -1630,7 +1637,7 @@ export async function createProxyServer(
       const resolved = override && rule
         ? { step: rule.steps[override.stepIndex], stepIndex: override.stepIndex }
         : role && !keylessNative
-          ? resolveFailoverTargetForSession(role, sessionKey, bucket, skippedSteps, machineHeader)
+          ? resolveFailoverTargetForSession(role, sessionKey, bucket, skippedSteps, machineHeader, requestedModel)
           : { step: null, stepIndex: -1 };
       const { stepIndex } = resolved;
       // #274 (review 29/09): when this attempt serves a role-step's DELEGATION,
