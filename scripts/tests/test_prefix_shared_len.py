@@ -1,7 +1,9 @@
 """Pins for prefix-shared-len.py (#640 repli / #1152 option (b) recon).
 
 Each test names the guard it defends — removing the guarded line in the
-instrument must make at least one of these red.
+instrument must make at least one of these red. Review c.7073760064:
+the sampling order (M2 reverse=False stayed green) and the echoed-user_id
+claim were unpinned; both are now.
 """
 import importlib.util
 import os
@@ -13,14 +15,16 @@ _SPEC = importlib.util.spec_from_file_location(
 psi = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(psi)
 
-
 ENV = ('{"ts": "2026-11-22T01:00:00Z", "src": "direct", "machine": "myia-po-2023", '
        '"model": "claude-sonnet-5-5", "pid": 1, "workspace": "claudish", "lane": "", '
        '"body": {"metadata": {"user_id": "{\\"device_id\\":\\"d1\\",\\"session_id\\":\\"S1\\"}"}')
+# ENV ends INSIDE the body object (metadata closed) so that CONV_A/B add
+# "messages" as a body key and close body + envelope — valid JSON, because
+# measure() json-parses the files for the msgs metric.
 TS2 = ENV.replace("2026-11-22T01:00:00Z", "2026-11-22T01:05:00Z")
-CONV_A = ENV + ', "messages": [{"role": "user", "content": "turn one"}]}'
+CONV_A = ENV + ', "messages": [{"role": "user", "content": "turn one"}]}}'
 CONV_B = TS2 + ', "messages": [{"role": "user", "content": "turn one"}, '
-CONV_B += '{"role": "assistant", "content": "answer"}, {"role": "user", "content": "turn two"}]}'
+CONV_B += '{"role": "assistant", "content": "answer"}, {"role": "user", "content": "turn two"}]}}'
 
 
 def test_session_of_reads_metadata_user_id():
@@ -30,6 +34,20 @@ def test_session_of_reads_metadata_user_id():
     # JSON string inside the body), stable across both files
     assert "device_id" in psi.session_of(CONV_A)
     assert psi.session_of(CONV_A) == psi.session_of(CONV_B)
+
+
+def test_session_of_escaped_user_id_echo_does_not_match():
+    # Guard (review #1153 point 3): a `"user_id"` ECHOED inside a
+    # conversation message is JSON-escaped (\"user_id\"), and the backslash
+    # before the closing quote breaks USER_ID_RE — leftmost search must
+    # therefore skip the echo (which occurs BEFORE the metadata here) and
+    # return the real session key.
+    echoed = ('{"ts": "t", "machine": "m", "body": {"messages": [{"role": "user", '
+              '"content": "billing says \\"user_id\\": \\"EVIL\\" in this message"}], '
+              '"metadata": {"user_id": "{\\"session_id\\":\\"S1\\"}"}}}')
+    got = psi.session_of(echoed)
+    assert got != "EVIL"
+    assert "S1" in got
 
 
 def test_session_of_absent_key_is_noid_never_dropped():
@@ -46,6 +64,27 @@ def test_lcp_bytes_exact():
     assert psi.lcp_bytes(b"abc", b"xyz") == 0
     assert psi.lcp_bytes(b"abc", b"abcdef") == 3
     assert psi.lcp_bytes(b"", b"abc") == 0
+
+
+def test_sample_orders_by_filename_ts_not_name():
+    # Guard (review #1153 point 1 / mutation M2): "newest first" is the
+    # filename TS group, not the reverse name. Two inversion shapes here:
+    #   pid     — req-2-7 (23:00, OLDEST) sorts FIRST by reverse name;
+    #   counter — "9999" > "10000" as strings, so the 01:00 file beats the
+    #             02:00 file by name too.
+    # True newest-first: C (02:00), B (01:00), A (23:00). A reverse-name
+    # sort returns A, B, C — with --limit 1 it picks the OLDEST file.
+    A = "req-2-7-2026-11-21T23-00-00-000Z-direct.json"
+    B = "req-1-9999-2026-11-22T01-00-00-000Z-direct.json"
+    C = "req-1-10000-2026-11-22T02-00-00-000Z-direct.json"
+    with tempfile.TemporaryDirectory() as td:
+        for fn in (A, B, C):
+            with open(os.path.join(td, fn), "wb") as fh:
+                fh.write(CONV_A.encode("utf-8"))
+        got1 = psi.sample(td, 1, None)
+        got2 = psi.sample(td, 2, None)
+    assert [os.path.basename(p) for p in got1] == [C], "limit 1 must take the ts-newest, not the name-first"
+    assert [os.path.basename(p) for p in got2] == [C, B]
 
 
 def test_measure_pairs_only_within_a_session():
@@ -66,13 +105,36 @@ def test_measure_pairs_only_within_a_session():
     assert nopair == 1          # the S2 singleton
     assert len(pairs) == 1      # only the S1 consecutive pair
     p = pairs[0]
-    # The files open with {"ts": "...T01:0" and diverge at the MINUTE digit
-    # (00 vs 05) — the LCP is byte-level and stops exactly there: it must NOT
-    # reach the identical conversation region that follows the differing ts.
+    # The RAW files open with {"ts": "...T01:0" and diverge at the MINUTE
+    # digit (00 vs 05) — the raw LCP is byte-level and stops exactly there.
     shared_expected = psi.lcp_bytes(CONV_A.encode("utf-8"), CONV_B.encode("utf-8"))
     assert shared_expected < 30
-    assert p["shared_bytes"] == shared_expected
+    assert p["shared_bytes_raw"] == shared_expected
     assert p["newer_bytes"] > p["older_bytes"]
+
+
+def test_body_offset_lcp_and_shared_leading_messages():
+    # Guard (review #1153 point 2): the measurement must reach the
+    # conversation, not die at the envelope's ts digit.
+    #   body  — LCP from each file's own "body" offset: the shared head
+    #           (metadata + messages[0]) is past the envelope, so it MUST
+    #           exceed the raw LCP.
+    #   msgs  — CONV_B = CONV_A's history + 2 new entries: exactly ONE
+    #           identical leading messages[] entry, with nonzero bytes.
+    with tempfile.TemporaryDirectory() as td:
+        for i, raw in enumerate([CONV_A.encode("utf-8"), CONV_B.encode("utf-8")]):
+            with open(os.path.join(td, f"req-1-{i}-2026-11-22T01-0{i}-00-000Z-direct.json"),
+                      "wb") as fh:
+                fh.write(raw)
+        paths = [os.path.join(td, fn) for fn in sorted(os.listdir(td))]
+        pairs, _s, _n = psi.measure(paths)
+    assert len(pairs) == 1
+    p = pairs[0]
+    assert p["shared_bytes_body"] is not None
+    assert p["shared_bytes_body"] > p["shared_bytes_raw"] + 100, \
+        "the body LCP must run deep into the shared conversation head"
+    assert p["shared_messages"] == 1, "turn one is shared; answer/turn two are new"
+    assert p["shared_messages_bytes_canon"] > 0
 
 
 def test_measure_orders_by_ts_then_name():
