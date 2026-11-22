@@ -1,6 +1,6 @@
 ---
 name: claudish-coordinate
-description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 4h, modèle choisi par le user) — files profondes aux workers, reviews/merges exigeants, santé hub/relais/sidecar, trafic et leak-policy Anthropic, arbitrages au user, bilan [DONE]. À invoquer au réveil du cron ou sur demande du user.
+description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 6h, modèle choisi par le user) — files profondes aux workers, reviews/merges exigeants, santé hub/relais/sidecar, trafic et leak-policy Anthropic, arbitrages au user, bilan [DONE]. À invoquer au réveil du cron ou sur demande du user.
 ---
 
 # Cycle de coordination claudish — myia-ai-01
@@ -11,7 +11,7 @@ description: Cycle de coordination claudish sur myia-ai-01 (coordinateur, cron 4
 
 ## Cadence et mandats
 
-- **Cron `37 */4 * * *`** (heure locale, mandat user 19/11 ; remplace le cycle 8 h du 04/11). Avant de réarmer depuis une autre session, faire confirmer le retrait de l'ancien cron par la session qui le porte. **Le modèle est le choix du user** : Opus depuis le 13/11 vers
+- **Cron `37 */6 * * *`** (heure locale, user 22/11 : reculer le mur Opus ; remplace le 4 h du 19/11). Avant de réarmer depuis une autre session, faire confirmer le retrait de l'ancien cron par la session qui le porte. **Le modèle est le choix du user** : Opus depuis le 13/11 vers
   13:15Z (même session, modèle changé au sélecteur), Fable le 13/11 au matin (id de rôle `claude-fable[1m]`,
   sans version), Opus du 04/11 au 13/11. Le cron hérite du modèle de la session qui l'arme : vérifier le
   modèle avant tout réarmement ; un changement au sélecteur dans la même session garde le même cron.
@@ -61,7 +61,7 @@ chiffre ou verdict → `docs/reference/measurement-protocol.md` · relais/hub �
 `CronList`. Si le job est absent, le réarmer **immédiatement** :
 
 ```
-CronCreate(cron: "37 */4 * * *",
+CronCreate(cron: "37 */6 * * *",
            prompt: "Cycle de coordination claudish (myia-ai-01). Lis d:\claudish\.claude\skills\claudish-coordinate\SKILL.md et exécute les phases 0 à 7 : santé, production et files profondes des cinq workers, revues exigeantes, mesure Z.AI et suivi Swift/MiniMax. Aucun cycle idle.",
            recurring: true)
 ```
