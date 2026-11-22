@@ -357,6 +357,12 @@ def _load_blind_spot():
     return _load_lib("blind_spot")
 
 
+def _load_partial_parts():
+    """Parties de jour #1152 c (declaration PARTIAL + extraction exacte) —
+    lib partagee avec traffic-consumption.py et billed-attrib.py."""
+    return _load_lib("partial_parts")
+
+
 _SF = None
 _CWD = None
 NON_CC_LANE = "(non-cc)"
@@ -408,27 +414,33 @@ def main():
 
     req_index = collections.defaultdict(list)
     resps = []
+
+    def _index_capture(n, path):
+        """One capture file — loose OR extracted from a day part (#1152 c) —
+        into the same dual index. The window bound lives HERE so the part
+        merge (below) filters exactly like the loose scan."""
+        if n.startswith("req-") and n.endswith(".json"):
+            m = REQ_RE.match(n)
+            if m:
+                dt = fname_dt(m.group(3), m.group(4))
+                # the req filename pads the counter to 4 digits (req-1-0100-...)
+                # while the resp header says reqN=100: key on the integer, or
+                # every request below 1000 after a restart stays unpaired
+                req_index[(m.group(1), int(m.group(2)))].append((dt, path))
+        elif n.startswith("resp-") and "-native-" in n and n.endswith(".sse"):
+            m = RESP_RE.match(n)
+            if not m:
+                return
+            dt = fname_dt(m.group(2), m.group(3))
+            if since and dt < since:
+                return
+            if until and dt >= until:
+                return
+            resps.append((dt, m.group(1), path))
+
     with os.scandir(a.captures_dir) as it:
         for e in it:
-            n = e.name
-            if n.startswith("req-") and n.endswith(".json"):
-                m = REQ_RE.match(n)
-                if m:
-                    dt = fname_dt(m.group(3), m.group(4))
-                    # the req filename pads the counter to 4 digits (req-1-0100-...)
-                    # while the resp header says reqN=100: key on the integer, or
-                    # every request below 1000 after a restart stays unpaired
-                    req_index[(m.group(1), int(m.group(2)))].append((dt, e.path))
-            elif n.startswith("resp-") and "-native-" in n and n.endswith(".sse"):
-                m = RESP_RE.match(n)
-                if not m:
-                    continue
-                dt = fname_dt(m.group(2), m.group(3))
-                if since and dt < since:
-                    continue
-                if until and dt >= until:
-                    continue
-                resps.append((dt, m.group(1), e.path))
+            _index_capture(e.name, e.path)
     # #933 — l'angle mort AUTONOMOUS se declare AVANT tout verdict lane : le
     # check est corpus-level, il ne depend pas des captures natives. Une fenetre
     # sans AUCUNE capture native est precisement le cas outillage-aveugle — le
@@ -449,12 +461,77 @@ def main():
         print(line)
     print()
 
+    # #1152 c — a day packed into parts is no longer on loose disk. In
+    # --leak-policy mode the verdict must be EXACT (decision AC 4): members of
+    # the parts overlapping the window are extracted and indexed like loose
+    # captures. Any other mode DECLARES the undercount (PARTIAL line) instead
+    # of letting a packed day read as "no traffic".
+    _pp = _load_partial_parts()
+    _parts = _pp.parts_in_window(a.captures_dir, w_start, w_end)
+    _merged = ()
+    _scratch = None
+    if _parts and a.leak_policy:
+        import shutil
+        import tempfile
+        # NOTE: the scratch must OUTLIVE this block — leak_policy opens the
+        # extracted files below. Its rmtree rides the leak_policy call's
+        # finally, never here (measured: deleting here swallowed the whole
+        # verdict — every read_head came back None).
+        _scratch = tempfile.mkdtemp(prefix="claudish-parts-")
+
+        def _keep(b):
+            # same bounds as _index_capture (since/until, None = unbounded)
+            # — the merge must filter EXACTLY like the loose scan, the
+            # w_start/w_end day filter already chose which parts.
+            if not b.startswith(("req-", "resp-")):
+                return False
+            if b.startswith("req-"):
+                m = REQ_RE.match(b)
+                if not m:
+                    return False
+                dt = fname_dt(m.group(3), m.group(4))
+            else:
+                m = RESP_RE.match(b)
+                if not m:
+                    return False
+                dt = fname_dt(m.group(2), m.group(3))
+            if since and dt < since:
+                return False
+            if until and dt >= until:
+                return False
+            return True
+        _ok = []
+        for r in _parts:
+            try:
+                for fp in _pp.read_members([r["path"]], _scratch, keep=_keep):
+                    _index_capture(os.path.basename(fp), fp)
+                _ok.append(r["path"])
+            except Exception as exc:
+                # unreadable part / py7zr missing: that part stays a
+                # DECLARED undercount, never a silent one
+                print(f"warning: part {r['fname']} unreadable ({exc})"
+                      " -> counted as PARTIAL", file=sys.stderr)
+        _merged = tuple(_ok)
+    for line in _pp.section(a.captures_dir, w_start, w_end, merged_paths=_merged):
+        print(line)
+    if _merged or _pp.parts_in_window(a.captures_dir, w_start, w_end):
+        print()
+
     if not resps:
+        if _scratch:
+            import shutil
+            shutil.rmtree(_scratch, ignore_errors=True)
         print("Aucune capture native dans la fenetre.", file=sys.stderr)
         return 1
     resps.sort()
     if a.leak_policy:
-        return leak_policy(resps, req_index, a.opus_home, workers=a.workers)
+        try:
+            return leak_policy(resps, req_index, a.opus_home,
+                               workers=a.workers)
+        finally:
+            if _scratch:
+                import shutil
+                shutil.rmtree(_scratch, ignore_errors=True)
 
     ws = collections.defaultdict(lambda: {
         "n": 0, "out": 0, "in": 0, "cr": 0, "cc": 0,

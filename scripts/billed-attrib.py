@@ -63,6 +63,19 @@ def _load_blind_spot():
     return mod
 
 
+def _load_partial_parts():
+    """Parties de jour #1152 c (declaration PARTIAL) — lib partagee avec
+    native-consumption.py et traffic-consumption.py, une seule copie."""
+    import importlib.util
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / "partial_parts.py"
+    spec = importlib.util.spec_from_file_location("partial_parts", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def main():
     argv = [x for x in sys.argv[1:]]
     fleet = []
@@ -114,6 +127,15 @@ def main():
         for _line in _bs.render(D, w_start, w_end, fleet, reconcile_dir=_rdir):
             print(_line)
         print()
+        # #1152 c — un jour packed en parties est absent du corpus loose que
+        # ce lecteur scanne : l'undercount se DECLARE (ligne PARTIAL), il ne
+        # se lit jamais comme un total.
+        _pp = _load_partial_parts()
+        _sect = _pp.section(D, w_start, w_end)
+        for _line in _sect:
+            print(_line)
+        if _sect:
+            print()
     except ValueError:
         pass  # jours non ISO (ex. ailleurs) : la section se tait, le rapport vit
 
