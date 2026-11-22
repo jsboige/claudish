@@ -377,6 +377,17 @@ async function awaitBanner(
   );
 }
 
+/**
+ * One `ps -o ppid=` query — POSIX-only by construction. On win32 there is no
+ * `ps`: the spawn fails, stdout stays empty and this returns null, which is
+ * what fails B12's grandparent case there (#1137). The production walk stops
+ * the same way on win32 (`own-pane.ts` `ancestorPids()` catch-breaks its own
+ * `ps` right after `process.ppid`), so ancestry at depth >= 2 is not a
+ * production path on win32 either: the two measured layouts (claudish as the
+ * pane process, claudish as the pane shell's child) match at depth 0 and 1,
+ * which `process.pid`/`process.ppid` cover on every platform. Resolving a
+ * grandparent pid on win32 would be possible (CIM `Win32_Process`).
+ */
 function ancestorOf(pid: number): number | null {
   const r = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], { env: { ...process.env } });
   const n = Number.parseInt(String(r.stdout ?? "").trim(), 10);
@@ -1084,7 +1095,10 @@ describe("B12: ambient magmux found through MAGMUX_SOCK", () => {
     ["its grandparent", () => ancestorOf(process.ppid)],
   ];
   for (const [who, pidOf] of targets) {
-    test(
+    // win32: the grandparent case needs `ps` twice over (this helper + the
+    // production walk it exercises), and neither exists there — see
+    // ancestorOf's docstring. Depths 0 and 1 stay covered on every platform.
+    test.skipIf(who === "its grandparent" && process.platform === "win32")(
       `B12: sends 'list' and draws only on the pane whose pid is ${who}`,
       async () => {
         const target = pidOf();
