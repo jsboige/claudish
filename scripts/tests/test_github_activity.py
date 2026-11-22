@@ -1,29 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Pins pour github-activity.py (#1161, stage 1).
+"""Pins pour github-activity.py (#1161) — chemin fragment anonyme par defaut.
 
 Chaque pin defend une lecture qu'une implementation plausible obtient FAUX :
 
-  1. DECOUPE — les tranches de <= 366 jours couvrent la fenetre SANS trou ni
-     recouvrement (un jour compte une fois, un trou sous-compte).
-  2. BORNES INCLUSIVES — une fenetre de 7 jours fait 7 jours, pas 6.
-  3. CLIP DES SEMAINES DEBORDANTES — GitHub rend des semaines pleines : un
-     jour avant la borne demandee est EXCLU du total fenetre (sinon deux
-     fenetres adjacentes comptent deux fois le jour de couture).
-  4. FUSION MULTI-TRANCHES — jours dedupliques par date, totaux SOMMES.
-  5. DEGRADATION BRUYANTE — erreur GraphQL, user null, non-JSON : ValueError
-     avec le detail. Jamais un rapport vide qui se lirait « zero activite ».
-  6. RENDU — total, moyenne/jour, ligne tendance 7 j seulement quand la
-     fenetre la permet (jamais de tendance fabriquee sur 5 jours).
+  1. LE COMPTE VIT DANS LE TOOL-TIP jume (for=<id> <-> id=<id>), pas dans le
+     <td> : « No contributions » = 0, « 1 contribution » singulier, « 1,234
+     contributions » virgule de milliers, balise interne dans le tip.
+  2. L'ORDRE DES ATTRIBUTS du <td> n'est pas garanti (mesure : data-date
+     AVANT id sur le fragment reel) — chaque attribut est cherche libre.
+  3. AUTO-CONTROLE H2 : la somme parsee est confrontee au total du MEME
+     fragment — ecart > 0,5 % rendu, jamais silencieux.
+  4. DEGRADATION BRUYANTE — un fragment sans jour lisible (structure
+     GitHub changee), une erreur GraphQL, user null : message exact.
+     Jamais un rapport vide qui se lirait « zero activite ».
+  5. FENETRES — annees civiles chevauchantes fusionnees, jours dedupliques,
+     clip aux bornes demandees (fenetres adjacentes sans double-compte).
+  6. PAGE HTML — auto-suffisante : donnees embarquees, AUCUN http(s) dans
+     src/href a l'ouverture ; la cellule porte son compte en title ;
+     le warning d'ecart H2 est rendu.
+  7. SOURCE — le chemin defaut est fragment-anonyme (zero quota GraphQL) ;
+     les totaux par type n'existent QUE sur --graphql, dit tel quel.
+  8. REPLI FENETRE — sans argument de fenetre : annee glissante ; avec
+     --days 1 : 1 jour (le repli ne l'avale pas).
 
 Run: python scripts/tests/test_github_activity.py
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
-from datetime import date, timedelta
+import tempfile
+from datetime import date, datetime, timedelta, timezone
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -48,50 +59,78 @@ def check(name, cond, detail=""):
         FAILS.append(name)
 
 
-def resp(days, cal_total=None, **totals):
-    """Reponse GraphQL façon gh api graphql — clés littérales du serveur."""
-    cal_total = cal_total if cal_total is not None else sum(days.values())
-    body = {
-        "data": {"user": {"login": "x", "contributionsCollection": {
-            "contributionCalendar": {
-                "totalContributions": cal_total,
-                "weeks": [
-                    {"contributionDays": [
-                        {"date": d, "contributionCount": c}
-                        for d, c in sorted(days.items())
-                    ]}]},
-            "totalCommitContributions": totals.get("commit", 0),
-            "totalPullRequestContributions": totals.get("pr", 0),
-            "totalIssueContributions": totals.get("issue", 0),
-            "totalPullRequestReviewContributions": totals.get("review", 0),
-            "totalRepositoryContributions": totals.get("repo", 0),
-        }}},
-    }
-    return json.dumps(body)
+def td(day, level, count_text, order="date-first"):
+    """Une cellule + son tool-tip jume, ordre d'attributs parametrable."""
+    cid = f"contribution-day-component-0-{day.replace('-', '')[-4:]}"
+    if order == "date-first":          # ordre mesure sur le fragment reel
+        tag = (f'<td tabindex="0" data-ix="0" data-date="{day}" '
+               f'id="{cid}" data-level="{level}" role="gridcell" '
+               f'class="ContributionCalendar-day"></td>')
+    else:                              # variante id-first
+        tag = (f'<td tabindex="0" id="{cid}" data-date="{day}" '
+               f'data-level="{level}" role="gridcell" '
+               f'class="ContributionCalendar-day"></td>')
+    tip = (f'<tool-tip for="{cid}" data-direction="n">{count_text}</tool-tip>')
+    return tag + tip
 
 
-print("window_chunks — couverture sans trou ni recouvrement")
-chunks = ga.window_chunks(date(2026, 1, 1), date(2026, 1, 30))
-check("30 jours = 1 tranche", len(chunks) == 1, f"(got {len(chunks)})")
-check("bornes inclusives (7 jours font 7 jours)",
-      (ga.window_chunks(date(2026, 1, 1), date(2026, 1, 7))[0][1]
-       - ga.window_chunks(date(2026, 1, 1), date(2026, 1, 7))[0][0]).days == 6)
-chunks2 = ga.window_chunks(date(2024, 1, 1), date(2026, 3, 15))
-covered = []
-for a, b in chunks2:
-    check_len = (b - a).days + 1 <= 366
-    if not check_len:
-        check("tranche <= 366 jours", False, f"({a} -> {b})")
-    covered.extend([a + timedelta(days=n) for n in range((b - a).days + 1)])
-check("multi-annee couverte sans trou ni doublon",
-      len(covered) == len(set(covered)) == (date(2026, 3, 15) - date(2024, 1, 1)).days + 1,
-      f"({len(covered)} jours, {len(set(covered))} uniques)")
+FRAG = (
+    '<h2 id="js-contribution-activity-description" class="f4">\n'
+    '      1,235\n'
+    '      contributions\n        in the last year\n    </h2>\n'
+    + td("2026-11-18", 0, "No contributions on November 18th.")
+    + td("2026-11-19", 1, "1 contribution on November 19th.")
+    + td("2026-11-20", 4, "1,234 contributions on November 20th.",
+         order="id-first")
+    # tool-tip avec balise interne + cellule sans tool-tip (exclue)
+    + '<td data-date="2026-11-21" id="contribution-day-component-1-0" '
+      'data-level="2" class="ContributionCalendar-day"></td>'
+    + '<tool-tip for="contribution-day-component-1-0">'
+      '<b>400</b> contributions on November 21st.</tool-tip>'
+    + '<td data-date="2026-11-22" id="contribution-day-component-1-1" '
+      'data-level="0" class="ContributionCalendar-day"></td>'
+)
 
-print("parse_response — extraction et degradation bruyante")
-r = ga.parse_response(resp({"2026-11-20": 5, "2026-11-21": 7}, commit=5, pr=7))
-check("jours extraits", [d["date"] for d in r["days"]] == ["2026-11-20", "2026-11-21"])
-check("totaux par type extraits", r["totals"]["totalCommitContributions"] == 5
-      and r["totals"]["totalPullRequestContributions"] == 7)
+print("parse_fragment — le compte vit dans le tool-tip jume")
+p = ga.parse_fragment(FRAG)
+check("zero / singulier / virgule de milliers / balise interne",
+      p["days"] == {"2026-11-18": 0, "2026-11-19": 1, "2026-11-20": 1234,
+                    "2026-11-21": 400},
+      f"(got {p['days']})")
+check("cellule sans tool-tip exclue (pas un 0 fabrique)",
+      "2026-11-22" not in p["days"])
+check("niveaux extraits (couleur de page)", p["levels"]["2026-11-20"] == 4)
+check("total H2 extrait (virgule de milliers)", p["h2_total"] == 1235,
+      f"(got {p['h2_total']})")
+
+print("crosscheck_h2 — auto-controle du fragment contre lui-meme")
+w = ga.crosscheck_h2({"days": {"a": 1235}, "h2_total": 1235})
+check("exactitude rendue ok", w["ok"] and w["rel"] == 0)
+w2 = ga.crosscheck_h2({"days": {"a": 1000}, "h2_total": 1235})
+check("ecart > 0,5 % rendu PAS ok (jamais silencieux)",
+      not w2["ok"] and w2["rel"] > 0.005)
+check("H2 absent -> pas de faux verdict", ga.crosscheck_h2({"days": {}, "h2_total": None}) is None)
+
+print("parse_fragment — degradation bruyante")
+try:
+    ga.parse_fragment("<html>502 Bad Gateway</html>")
+    check("fragment illisible -> ValueError", False, "(aucune exception)")
+except ValueError as exc:
+    check("fragment illisible -> ValueError nomme la cause", "sans jour" in str(exc))
+
+print("parse_response (GraphQL) — extraction et degradation")
+GQ = json.dumps({"data": {"user": {"contributionsCollection": {
+    "contributionCalendar": {"totalContributions": 3, "weeks": [
+        {"contributionDays": [
+            {"date": "2026-11-01", "contributionCount": 2},
+            {"date": "2026-11-02", "contributionCount": 1}]}]},
+    "totalCommitContributions": 2, "totalPullRequestContributions": 1,
+    "totalIssueContributions": 0, "totalPullRequestReviewContributions": 0,
+    "totalRepositoryContributions": 0}}}})
+r = ga.parse_response(GQ)
+check("jours + totaux par type extraits",
+      r["days"] == {"2026-11-01": 2, "2026-11-02": 1}
+      and r["totals"]["totalCommitContributions"] == 2)
 for name, text in (
     ("erreur GraphQL remonte le message",
      json.dumps({"errors": [{"message": "rate limit exceeded"}]})),
@@ -103,41 +142,164 @@ for name, text in (
         ga.parse_response(text)
         check(name, False, "(aucune exception)")
     except ValueError as exc:
-        check(name, len(str(exc)) > 0, f"(message vide)")
+        check(name, len(str(exc)) > 0, "(message vide)")
 
-print("merge_reports — clip des semaines debordantes + fusion")
-# La semaine GraphQL deborde avant la borne : 2026-10-31 est hors fenetre.
-r1 = ga.parse_response(resp({"2026-10-31": 100, "2026-11-01": 10,
-                             "2026-11-02": 20}, commit=30))
-m = ga.merge_reports([r1], date(2026, 11, 1), date(2026, 11, 2))
-check("jour d'avant-veille de borne exclu du total fenetre",
-      m["sum_days"] == 30, f"(got {m['sum_days']})")
-check("le jour exclu n'est pas dans days",
-      [d["date"] for d in m["days"]] == ["2026-11-01", "2026-11-02"])
-# Deux tranches : le jour de couture ne compte pas deux fois.
-r2 = ga.parse_response(resp({"2026-11-03": 40, "2026-11-04": 50}, pr=90))
-m2 = ga.merge_reports([r1, r2], date(2026, 11, 1), date(2026, 11, 4))
-check("fusion multi-tranches : total somme, jours uniques",
-      m2["sum_days"] == 120 and len(m2["days"]) == 4,
-      f"(total {m2['sum_days']}, {len(m2['days'])} jours)")
-check("totaux par type sommes entre tranches",
-      m2["totals"]["totalCommitContributions"] == 30
-      and m2["totals"]["totalPullRequestContributions"] == 90)
-check("span_days = fenetre demandee, pas les semaines rendues",
-      m2["span_days"] == 4, f"(got {m2['span_days']})")
+print("fenetres — annees civiles, fusion, clip")
+check("annees chevauchantes",
+      ga.years_spanning(date(2025, 12, 1), date(2026, 1, 31)) == [2025, 2026])
+frag_a = {"days": {"2025-12-30": 5, "2025-12-31": 6, "2026-01-01": 7},
+          "levels": {"2025-12-30": 1}}
+frag_b = {"days": {"2026-01-01": 7, "2026-01-02": 8}, "levels": {}}
+merged = ga.merge_parsed({2025: frag_a, 2026: frag_b},
+                         date(2025, 12, 31), date(2026, 1, 1))
+check("clip aux bornes + dedoublonne par date",
+      merged["days"] == {"2025-12-31": 6, "2026-01-01": 7},
+      f"(got {merged['days']})")
+check("totaux par type absents du chemin fragment", merged["totals"] is None)
+gq_parsed = ga.parse_response(GQ)
+merged_gq = ga.merge_parsed({None: gq_parsed}, date(2026, 11, 1), date(2026, 11, 2))
+check("totaux portes par la source graphql",
+      merged_gq["totals"]["totalPullRequestContributions"] == 1)
+s = ga.summarize(merged["days"], date(2025, 12, 31), date(2026, 1, 1))
+check("sommaire : somme + fenetre inclusive + actifs",
+      s["sum"] == 13 and s["span_days"] == 2 and s["active"] == 2,
+      f"(got {s})")
 
-print("render_text — total, moyenne, tendance honnete")
-rep14 = {"days": [{"date": f"2026-11-{d:02d}", "count": 10} for d in range(1, 15)],
-         "calendar_total": 999, "totals": {f: 0 for f in ga.TOTAL_FIELDS},
-         "sum_days": 140, "span_days": 14}
-out = ga.render_text("jsboige", date(2026, 11, 1), date(2026, 11, 14), rep14, 1)
-check("total et moyenne/jour rendus", "140" in out and "10/j" in out, f"(got {out!r})")
-check("tendance 7 j rendue quand >= 14 jours", "7 derniers jours: 70" in out)
-rep5 = {"days": [{"date": f"2026-11-{d:02d}", "count": 10} for d in range(1, 6)],
-        "calendar_total": 50, "totals": {f: 0 for f in ga.TOTAL_FIELDS},
-        "sum_days": 50, "span_days": 5}
-out5 = ga.render_text("jsboige", date(2026, 11, 1), date(2026, 11, 5), rep5, 1)
-check("pas de tendance fabriquee sur 5 jours", "7 derniers jours" not in out5)
+print("render_text — source dite, totaux absents dits")
+out = ga.render_text("jsboige", date(2026, 11, 16), date(2026, 11, 22),
+                     {"days": [{"date": f"2026-11-{d}", "count": 100}
+                               for d in range(16, 23)],
+                      "sum": 700, "span_days": 7, "active": 7},
+                     "fragment-anonyme", None, None)
+check("source fragment affichee", "source: fragment-anonyme" in out)
+check("absence de totaux par type dite (--graphql nomme)",
+      "--graphql" in out)
+out_w = ga.render_text("x", date(2026, 1, 1), date(2026, 1, 2),
+                       {"days": [], "sum": 0, "span_days": 2, "active": 0},
+                       "fragment-anonyme", None,
+                       {"parsed": 100, "h2": 150, "rel": 0.33, "ok": False})
+check("ecart H2 rendu avec mise en garde", "MEFIE-TOI" in out_w and "33.00%" in out_w)
+
+print("render_html — page auto-suffisante")
+page = ga.render_html("jsboige", date(2026, 11, 16), date(2026, 11, 22),
+                      {"days": [{"date": "2026-11-20", "count": 1234}],
+                       "sum": 1234, "span_days": 7, "active": 1},
+                      {"2026-11-20": 4}, "fragment-anonyme",
+                      {"parsed": 1234, "h2": 1234, "rel": 0.0, "ok": True},
+                      "2026-11-22 18:00 UTC")
+check("cellule datée avec compte en title",
+      'title="2026-11-20: 1234"' in page)
+check("aucune ressource externe a l'ouverture",
+      "http://" not in page and "https://" not in page)
+check("exactitude H2 rendue", "exact" in page)
+page_w = ga.render_html("x", date(2026, 1, 1), date(2026, 1, 2),
+                        {"days": [], "sum": 0, "span_days": 2, "active": 0},
+                        {}, "fragment-anonyme",
+                        {"parsed": 100, "h2": 150, "rel": 0.33, "ok": False},
+                        "t")
+check("warning d'ecart rendu dans la page", "ecart 33.00%" in page_w)
+
+print("main — fenetres CLI, repli, degradation exit 2")
+backup_fetch = ga.fetch_fragment
+FETCH_CALLS = []
+
+
+def _fake_fragment(login, year=None):
+    """Fragment aujourd'hui-relatif : les pins de fenetre ne sont pas des
+    bombes a retardement (une date fixe quitte la fenetre --days un jour).
+    Enregistre chaque vue demandee (None = sans parametres)."""
+    FETCH_CALLS.append((login, year))
+    if login == "gone":
+        raise ValueError("fragment HTTP 404 pour gone")
+    today = datetime.now(timezone.utc).date()
+    parts = ['<h2 id="js-contribution-activity-description">120 '
+             'contributions in the last year</h2>']
+    for n in range(10):
+        d = (today - timedelta(days=n)).isoformat()
+        parts.append(td(d, 3 if n % 2 else 1, f"{n + 1} contributions on x."))
+    return ga.parse_fragment("".join(parts))
+
+
+ga.fetch_fragment = _fake_fragment
+argv_backup = sys.argv
+try:
+    out = io.StringIO()
+    sys.argv = ["github-activity.py", "--days", "3", "--json"]
+    with contextlib.redirect_stdout(out):
+        rc = ga.main()
+    d = json.loads(out.getvalue())
+    check("exit 0, source fragment-anonyme, clip 3 jours",
+          rc == 0 and d["source"] == "fragment-anonyme"
+          and d["span_days"] == 3 and len(d["days"]) == 3,
+          f"(span {d['span_days']}, {len(d['days'])} jours)")
+    check("h2_crosscheck present dans --json",
+          d["h2_crosscheck"]["h2"] == 120 and "parsed" in d["h2_crosscheck"])
+    check("fenetre dans l'annee glissante -> vue SANS parametres (1 fetch)",
+          len(FETCH_CALLS) == 1 and FETCH_CALLS[0] == ("jsboige", None),
+          f"(got {FETCH_CALLS})")
+
+    out2 = io.StringIO()
+    sys.argv = ["github-activity.py", "--json"]          # sans fenetre
+    with contextlib.redirect_stdout(out2):
+        rc2 = ga.main()
+    d2 = json.loads(out2.getvalue())
+    trailing = (datetime.now(timezone.utc).date()
+                - timedelta(days=364)).isoformat()
+    check("defaut = annee glissante 365 j (1 fetch)",
+          rc2 == 0 and d2["span_days"] == 365 and d2["from"] == trailing,
+          f"(span {d2['span_days']}, from {d2['from']})")
+
+    out3 = io.StringIO()
+    sys.argv = ["github-activity.py", "--days", "1", "--json"]
+    with contextlib.redirect_stdout(out3):
+        rc3 = ga.main()
+    d3 = json.loads(out3.getvalue())
+    check("--days 1 = 1 jour (le repli ne l'avale pas)",
+          rc3 == 0 and d3["span_days"] == 1, f"(span {d3['span_days']})")
+
+    tmpdir = tempfile.mkdtemp(prefix="gha-html-")
+    page_path = os.path.join(tmpdir, "page.html")
+    out4 = io.StringIO()
+    sys.argv = ["github-activity.py", "--days", "5", "--html", page_path]
+    with contextlib.redirect_stdout(out4):
+        rc4 = ga.main()
+    body = open(page_path, encoding="utf-8").read()
+    check("--html ecrit la page", rc4 == 0 and os.path.getsize(page_path) > 0
+          and "<!DOCTYPE html>" in body)
+
+    err = io.StringIO()
+    sys.argv = ["github-activity.py", "--login", "gone", "--days", "3"]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc5 = ga.main()
+    except SystemExit as e:
+        rc5 = e.code
+    check("degradation : exit 2, cause sur stderr",
+          rc5 == 2 and "404" in err.getvalue(),
+          f"(rc {rc5}, stderr {err.getvalue()!r})")
+
+    sys.argv = ["github-activity.py", "--nonsense"]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc6 = ga.main()
+    except SystemExit as e:
+        rc6 = e.code
+    check("argument inconnu : exit 64", rc6 == 64, f"(rc {rc6})")
+
+    print("fetch_window — fenetre HISTORIQUE -> vues parametrees par annee")
+    FETCH_CALLS.clear()
+    old = date(2024, 2, 1)
+    ga.fetch_window("jsboige", old, date(2024, 3, 15))
+    check("annee hors glissante -> vue parametree 2024",
+          FETCH_CALLS == [("jsboige", 2024)], f"(got {FETCH_CALLS})")
+    FETCH_CALLS.clear()
+    ga.fetch_window("jsboige", date(2026, 1, 1),
+                    datetime.now(timezone.utc).date())
+    check("annee civile courante incluse dans la glissante -> sans params",
+          FETCH_CALLS == [("jsboige", None)], f"(got {FETCH_CALLS})")
+finally:
+    ga.fetch_fragment = backup_fetch
+    sys.argv = argv_backup
 
 print()
 if FAILS:
