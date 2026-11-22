@@ -866,6 +866,17 @@ export function roleFromModelName(model: string | undefined): FailoverRole | nul
  * alias-only pin, current behavior. Three measured zeros (po-2027 seat,
  * off-site archives, hub census 9 557) say no live traffic relies on the arm
  * side today; the wall side is what aliases exist for.
+ *
+ * Known boundary (review c.7076134370, left as-is): under a ROLE-WIDE arm
+ * (`ACTIVE=haiku`, no machine), a session that first sends the bare alias
+ * name is diverted and dwell-pinned on the role's bucket — which, role-wide,
+ * is the same bucket the pin's own provider walls key on — and a later
+ * explicit pin in that session gets the arm's dwell pin served back: the
+ * dwell HOLD branch does not re-read isFailoverActive. No measured traffic
+ * mixes the two spellings in one session under one role, and no role-wide
+ * arm is used on the fleet today. Machine-scoped arms do not share this:
+ * their pin lives in `machine:<name>`, a foreign bucket for the pin request
+ * (pinned by route test R1 in proxy-server-machine-arm-route.test.ts).
  */
 export function aliasOnlyExplicitPin(model: string | undefined | null): boolean {
   if (!model) return false;
