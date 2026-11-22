@@ -363,23 +363,42 @@ def test_turn_composition_tags_part_rows():
         with open(daya, "wb") as fh:
             fh.write(b"synthetic")
 
-        fake = os.path.join(td, "fake7z.cmd")
-        # the `e -so` branch must emit the member bodies — a cmd file cannot
-        # easily carry them inline, so the fake types them from a side file
+        # the `e -so` branch must emit the member bodies — the fake cannot
+        # easily carry them inline, so it types them from a side file
         with open(os.path.join(td, "stream.bin"), "wb") as fh:
             fh.write(body)
-        with open(fake, "w", encoding="ascii", newline="\r\n") as fh:
-            fh.write("@echo off\r\n"
-                     "if /i \"%~1\"==\"l\" (\r\n"
-                     f"  echo Path = req-1-0001-{day}T06-00-00-000Z-direct.json\r\n"
-                     f"  echo Path = req-1-0002-{day}T06-01-00-000Z-direct.json\r\n"
-                     "  exit /b 0\r\n"
-                     ")\r\n"
-                     "if /i \"%~1\"==\"e\" (\r\n"
-                     f"  type \"{os.path.join(td, 'stream.bin')}\"\r\n"
-                     "  exit /b 0\r\n"
-                     ")\r\n"
-                     "exit /b 1\r\n")
+        # portable fake: a .cmd on Windows, a #!/bin/sh twin on POSIX (CI's
+        # scripts-tests job runs ubuntu — a .cmd there is a PermissionError)
+        if os.name == "nt":
+            fake = os.path.join(td, "fake7z.cmd")
+            with open(fake, "w", encoding="ascii", newline="\r\n") as fh:
+                fh.write("@echo off\r\n"
+                         "if /i \"%~1\"==\"l\" (\r\n"
+                         f"  echo Path = req-1-0001-{day}T06-00-00-000Z-direct.json\r\n"
+                         f"  echo Path = req-1-0002-{day}T06-01-00-000Z-direct.json\r\n"
+                         "  exit /b 0\r\n"
+                         ")\r\n"
+                         "if /i \"%~1\"==\"e\" (\r\n"
+                         f"  type \"{os.path.join(td, 'stream.bin')}\"\r\n"
+                         "  exit /b 0\r\n"
+                         ")\r\n"
+                         "exit /b 1\r\n")
+        else:
+            fake = os.path.join(td, "fake7z.sh")
+            stream = os.path.join(td, "stream.bin")
+            with open(fake, "w", encoding="ascii", newline="\n") as fh:
+                fh.write("#!/bin/sh\n"
+                         "if [ \"$1\" = \"l\" ]; then\n"
+                         f"  echo 'Path = req-1-0001-{day}T06-00-00-000Z-direct.json'\n"
+                         f"  echo 'Path = req-1-0002-{day}T06-01-00-000Z-direct.json'\n"
+                         "  exit 0\n"
+                         "fi\n"
+                         "if [ \"$1\" = \"e\" ]; then\n"
+                         f"  cat '{stream}'\n"
+                         "  exit 0\n"
+                         "fi\n"
+                         "exit 1\n")
+            os.chmod(fake, 0o755)
 
         out_path = os.path.join(td, "out.json")
         argv_backup = sys.argv

@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
     compress-captures.ps1 slot mode (#1152 c — rolling loose window).
 
