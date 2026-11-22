@@ -33,6 +33,7 @@ BeforeAll {
     function Invoke-SlotRun {
         param(
             [string]$CapDir, [string]$ArchDir,
+            [string]$GdDir,
             [string]$SevenZip,
             [switch]$SlotMode,
             [int]$W = 6,
@@ -42,11 +43,25 @@ BeforeAll {
         $args_ = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:CompactionScript,
                    '-CaptureDir', $CapDir, '-ArchiveDir', $ArchDir,
                    '-SevenZip', $SevenZip, '-ProgressHeartbeatSec', 0,
-                   '-MachineTag', 'testtag')
+                   '-MachineTag', 'testtag',
+                   '-GDriveDir', $GdDir)
         if ($SlotMode) {
             $args_ += @('-SlotMode', '-RollingWindowHours', $W, '-MinLooseAgeMinutes', $MinAge)
         }
-        & $shell @args_ 2>&1 | ForEach-Object { "$_" }
+        # Hermetic (review c.7083536044): without BOTH the explicit -GDriveDir
+        # and a cleared root, a seat where CLAUDISH_GDRIVE_ROOT is set resolves
+        # GDriveDir to the REAL off-site store (compress-captures.ps1:170-171)
+        # and the test deposits there -- measured on ai-01, 3 stray files and
+        # pin 3 red under both interpreters (the quarantine purge then sees
+        # off-site canonicals). Same save/clear/restore as the exit suite.
+        $savedRoot = $env:CLAUDISH_GDRIVE_ROOT
+        $env:CLAUDISH_GDRIVE_ROOT = $null
+        try {
+            & $shell @args_ 2>&1 | ForEach-Object { "$_" }
+        }
+        finally {
+            $env:CLAUDISH_GDRIVE_ROOT = $savedRoot
+        }
     }
 
     function New-CaptureFixture {
@@ -117,8 +132,8 @@ AfterAll {
 Describe 'compress-captures slot mode (#1152 c)' {
     BeforeEach {
         $tmp = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ("cc-slot-run-" + [guid]::NewGuid().ToString('N')))
-        $script:Cap = Join-Path $tmp 'captures'; $script:Arch = Join-Path $tmp 'arch'
-        New-Item -ItemType Directory -Force -Path $script:Cap, $script:Arch | Out-Null
+        $script:Cap = Join-Path $tmp 'captures'; $script:Arch = Join-Path $tmp 'arch'; $script:Gd = Join-Path $tmp 'gdrive'
+        New-Item -ItemType Directory -Force -Path $script:Cap, $script:Arch, $script:Gd | Out-Null
         # A "now" anchored INSIDE the test: every fixture ts derives from it,
         # so the W window (6 h) has deterministic young/old sides.
         $script:NowUtc = (Get-Date).ToUniversalTime()
@@ -135,7 +150,7 @@ Describe 'compress-captures slot mode (#1152 c)' {
         $youngFn = (New-CaptureFixture -Dir $script:Cap -Ts $youngTs | Split-Path -Leaf)
         $day = $oldTs.Substring(0, 10)
 
-        $null = Invoke-SlotRun -CapDir $script:Cap -ArchDir $script:Arch -SevenZip $script:Fake7z -SlotMode
+        $null = Invoke-SlotRun -CapDir $script:Cap -ArchDir $script:Arch -GdDir $script:Gd -SevenZip $script:Fake7z -SlotMode
 
         $parts = @(Get-ChildItem -LiteralPath $script:Arch -Filter "captures-$day-p*.7z" -File)
         $parts.Count | Should -Be 1
@@ -149,6 +164,15 @@ Describe 'compress-captures slot mode (#1152 c)' {
         # Loose originals: old removed, young kept.
         (Test-Path -LiteralPath (Join-Path $script:Cap $oldFn)) | Should -BeFalse
         (Test-Path -LiteralPath (Join-Path $script:Cap $youngFn)) | Should -BeTrue
+        # Hermeticity pinned (review c.7083536044): the off-site deposit lands
+        # in the TEST's gdrive dir -- the part and its sha256 manifest, nothing
+        # else -- so a future edit dropping -GDriveDir or the cleared root turns
+        # THIS red (the deposit goes missing or picks up strangers) instead of
+        # leaking silently into the real store.
+        $gdFiles = @(Get-ChildItem -LiteralPath $script:Gd -Recurse -File)
+        $gdFiles.Count | Should -Be 2
+        ($gdFiles | Where-Object { $_.Name -match '^captures-.+-p\d{4}-testtag\.7z$' }).Count | Should -Be 1
+        ($gdFiles | Where-Object { $_.Name -eq 'captures-sha256-testtag.jsonl' }).Count | Should -Be 1
     }
 
     It 'never packs a capture whose mtime is younger than the guard, whatever its filename says' {
@@ -156,7 +180,7 @@ Describe 'compress-captures slot mode (#1152 c)' {
         $oldTs = $script:NowUtc.AddHours(-10).ToString('yyyy-MM-ddTHH-mm-ss-000Z')
         $fn = (New-CaptureFixture -Dir $script:Cap -Ts $oldTs -FreshMtime | Split-Path -Leaf)
 
-        $null = Invoke-SlotRun -CapDir $script:Cap -ArchDir $script:Arch -SevenZip $script:Fake7z -SlotMode
+        $null = Invoke-SlotRun -CapDir $script:Cap -ArchDir $script:Arch -GdDir $script:Gd -SevenZip $script:Fake7z -SlotMode
 
         @(Get-ChildItem -LiteralPath $script:Arch -Filter 'captures-*-p*.7z' -File).Count | Should -Be 0
         (Test-Path -LiteralPath (Join-Path $script:Cap $fn)) | Should -BeTrue
@@ -166,7 +190,7 @@ Describe 'compress-captures slot mode (#1152 c)' {
         $oldTs = $script:NowUtc.AddHours(-10).ToString('yyyy-MM-ddTHH-mm-ss-000Z')
         $fn = (New-CaptureFixture -Dir $script:Cap -Ts $oldTs | Split-Path -Leaf)
 
-        $out = Invoke-SlotRun -CapDir $script:Cap -ArchDir $script:Arch -SevenZip $script:Fake7zFailTest -SlotMode
+        $out = Invoke-SlotRun -CapDir $script:Cap -ArchDir $script:Arch -GdDir $script:Gd -SevenZip $script:Fake7zFailTest -SlotMode
 
         ($out -join "`n") | Should -Match 'KEEPING loose files'
         (Test-Path -LiteralPath (Join-Path $script:Cap $fn)) | Should -BeTrue
@@ -184,7 +208,7 @@ Describe 'compress-captures slot mode (#1152 c)' {
         $todayTs = $script:NowUtc.Date.ToString('yyyy-MM-ddT00-00-00-000Z')
         $fn = (New-CaptureFixture -Dir $script:Cap -Ts $todayTs | Split-Path -Leaf)
 
-        $null = Invoke-SlotRun -CapDir $script:Cap -ArchDir $script:Arch -SevenZip $script:Fake7z
+        $null = Invoke-SlotRun -CapDir $script:Cap -ArchDir $script:Arch -GdDir $script:Gd -SevenZip $script:Fake7z
 
         @(Get-ChildItem -LiteralPath $script:Arch -Filter 'captures-*.7z' -File).Count | Should -Be 0
         (Test-Path -LiteralPath (Join-Path $script:Cap $fn)) | Should -BeTrue
