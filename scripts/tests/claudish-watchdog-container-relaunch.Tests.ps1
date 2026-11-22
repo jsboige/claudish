@@ -319,3 +319,39 @@ Describe 'R0 pipeline seam: the engine rung feeds the R0 rung (kill-test 21/11)'
         $r0.Action | Should -Be 'r0_after_relaunch' -Because 'the once-per-episode marker must not be erased in flight'
     }
 }
+
+Describe 'engine rung NextState: shallow copy of the WHOLE input state (#1149)' {
+    <#
+        #1147 carried the three R0 keys through by NAMING them — a key added
+        later to any rung would be dropped in flight again, which is exactly
+        the 21/11 kill-test failure class (R0 frozen at 1/2, 17-minute
+        outage). #1149: the engine rung starts from a SHALLOW COPY of its
+        input and rewrites only the Engine* keys it owns — no other rung's
+        key name may appear in Get-EngineWatchdogDecision. FutureRungKey
+        below stands for every key a future rung may add.
+    #>
+
+    It 'an UNKNOWN key (FutureRungKey=7) survives the BASE path - and the copy does not alias the input' {
+        $s = @{
+            EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue; EngineActionsSinceDown = 0
+            ContainerStoppedFailures = 0; LastContainerActionUtc = [datetime]::MinValue; ContainerRelaunchSinceDown = 0
+            FutureRungKey = 7
+        }
+        $eng = Get-EngineWatchdogDecision -State $s -EngineVerdict 'down' -NowUtc $script:Now -DrainInFlight $false -BackendPresent $true -WslVerdict 'ok' -HostWatchdogPresent $false
+        $eng.Action | Should -Be 'pending'
+        $eng.NextState.FutureRungKey | Should -Be 7 -Because 'a key this rung does not own must ride through untouched'
+        $eng.NextState.EngineFailures | Should -Be 1 -Because 'the rung still owns and moves its own counters'
+        $s.EngineFailures | Should -Be 0 -Because 'the copy must not alias the input table - the dry-run guarantee rests on it'
+    }
+
+    It 'an UNKNOWN key (FutureRungKey=7) survives the DRY-RUN path' {
+        $s = @{
+            EngineFailures = 0; LastEngineActionUtc = [datetime]::MinValue; EngineActionsSinceDown = 0
+            ContainerStoppedFailures = 0; LastContainerActionUtc = [datetime]::MinValue; ContainerRelaunchSinceDown = 0
+            FutureRungKey = 7
+        }
+        $eng = Get-EngineWatchdogDecision -State $s -EngineVerdict 'down' -NowUtc $script:Now -DrainInFlight $false -BackendPresent $true -WslVerdict 'ok' -HostWatchdogPresent $false -DryRun
+        $eng.NextState.FutureRungKey | Should -Be 7
+        $eng.NextState.EngineFailures | Should -Be 0 -Because 'a dry run measures; it must not move the state machine'
+    }
+}
