@@ -287,6 +287,40 @@ function captureModels(dir: string): string[] {
     );
 }
 
+/**
+ * Bounded poll for the capture's `resp-` files. `done()` schedules a
+ * FIRE-AND-FORGET `writeFile` (response-capture.ts "Fire-and-forget" note),
+ * so the file lands at a later tick than the response the test already
+ * holds — under CI load that tick can trail the read (run 45155677831 on
+ * #1178: `models.length` 0, then the teardown `rmSync` raced the write into
+ * `[resp] capture write error: ENOENT`). Poll with a deadline, never a
+ * fixed sleep: the green path resolves on the first pass. Shared by the
+ * composed and native AC2 pins and by the teardown drain below.
+ */
+async function waitForRespFiles(dir: string, timeoutMs = 3000): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs;
+  let files: string[] = [];
+  while (Date.now() < deadline) {
+    try {
+      files = readdirSync(dir).filter((f) => f.startsWith("resp-"));
+    } catch {
+      files = [];
+    }
+    if (files.length > 0) return files;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return files;
+}
+
+/**
+ * Teardown drain: never `rmSync` a capture dir while a fire-and-forget
+ * write may still be in flight — the ENOENT half of the #1178 CI race.
+ * Bounded by the same deadline; a no-op once the files have landed.
+ */
+async function drainCaptureDir(dir: string): Promise<void> {
+  await waitForRespFiles(dir, 3000);
+}
+
 // ---- the pins -----------------------------------------------------------------
 
 describe("#1128 — x-claudish-served-model on the wire", () => {
@@ -326,6 +360,10 @@ describe("#1128 — x-claudish-served-model on the wire", () => {
       expect(body.content?.[0]?.text).toBe("Hello from the concrete.");
 
       expect(header).toBeTruthy();
+      // The capture write is fire-and-forget: poll for it (bounded), the
+      // same contract the native AC2 twin below already pins.
+      const files = await waitForRespFiles(capDir);
+      expect(files.length).toBeGreaterThan(0);
       const models = captureModels(capDir);
       expect(models.length).toBeGreaterThan(0);
       // Every response capture for this request names the same string the
@@ -334,6 +372,7 @@ describe("#1128 — x-claudish-served-model on the wire", () => {
       expect(models).toContain(CONCRETE);
     } finally {
       delete process.env.CLAUDISH_CAPTURE_DIR;
+      await drainCaptureDir(capDir);
       try { rmSync(capDir, { recursive: true, force: true }); } catch {}
     }
   }, 30_000);
@@ -474,18 +513,9 @@ describe("#1128 — native lane: the POST-PIN concrete (review N1-N3)", () => {
 
       expect(header).toBe(NATIVE_PINNED);
       // The capture finalizes asynchronously once the pump drains; poll for it
-      // (bounded), same contract as native-handler-sse-capture.test.ts.
-      const deadline = Date.now() + 3000;
-      let files: string[] = [];
-      while (Date.now() < deadline) {
-        try {
-          files = readdirSync(capDir).filter((f) => f.startsWith("resp-"));
-        } catch {
-          files = [];
-        }
-        if (files.length > 0) break;
-        await new Promise((r) => setTimeout(r, 25));
-      }
+      // (bounded), same contract as native-handler-sse-capture.test.ts —
+      // factored into waitForRespFiles, shared with the composed AC2 twin.
+      const files = await waitForRespFiles(capDir);
       expect(files.length).toBeGreaterThan(0);
       // Every native capture names the same string the header carries — and it
       // is the capture's OWN label (`-native-<model>.sse`) that proves it is
@@ -496,6 +526,7 @@ describe("#1128 — native lane: the POST-PIN concrete (review N1-N3)", () => {
       expect(files[0]).toContain(`-native-${NATIVE_PINNED}.sse`);
     } finally {
       delete process.env.CLAUDISH_CAPTURE_DIR;
+      await drainCaptureDir(capDir);
       try { rmSync(capDir, { recursive: true, force: true }); } catch {}
     }
   }, 30_000);
