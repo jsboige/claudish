@@ -219,21 +219,30 @@ def bucket_of(info):
     return "other"
 
 
-def load_requests(cdir, cutoff_dt):
+def load_requests(cdir, cutoff_dt, seen=None):
     """(pid, reqN) -> liste horodatee de dicts {ts, machine, ep, wl}.
 
     On ne lit que la TETE du fichier : machine + bloc billing system sont
     toujours en debut de corps (system precede messages/tools sur le wire
     anthropique). Le JSON complet (jusqu'a 1 Mo) ne sert a rien ici.
+
+    seen (#1180) : noms deja consommes par une autre racine de corpus — mute
+    ici, partage avec la boucle resp de main(), pour que l'union de plusieurs
+    `--dir` soit dedupliquee par NOM de fichier (premiere racine gagne).
     """
+    if seen is None:
+        seen = set()
     reqs = defaultdict(list)
     for fn in os.listdir(cdir):
+        if fn in seen:
+            continue
         m = REQ_FN.match(fn)
         if not m:
             continue
         dt = capture_dt(m.group(3))
         if dt is None or dt < cutoff_dt:
             continue
+        seen.add(fn)
         try:
             with open(os.path.join(cdir, fn), "rb") as fh:
                 head = fh.read(REQ_HEAD_BYTES).decode("utf-8", errors="replace")
@@ -359,7 +368,11 @@ def build_days(per_day, corpus_dir, cutoff_dt, now_dt, reqs, fleet,
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--hours", type=float, default=24.0)
-    ap.add_argument("--dir", default=os.environ.get("CLAUDISH_CAPTURE_DIR", r"D:\claudish-captures"))
+    ap.add_argument("--dir", action="append", default=None,
+                    help="racine du corpus de captures ; REPETABLE (#1180) — "
+                         "union dedupliquee par nom de fichier, premiere racine "
+                         "gagne. Defaut : $CLAUDISH_CAPTURE_DIR ou "
+                         "D:\\claudish-captures")
     ap.add_argument("--json", action="store_true", help="sortie JSON machine-lisible (Phase 3)")
     ap.add_argument("--machines", action="store_true", help="rollup supplementaire par lane x machine")
     ap.add_argument("--harness-lanes", action="store_true",
@@ -378,11 +391,27 @@ def main():
                          "JSON, et table par jour en mode texte — le contrat lu "
                          "par activity-cost-join.py (partial/blind compris)")
     args = ap.parse_args()
+    # #1180 — `--dir` repetable : la PREMIERE racine reste le corpus de
+    # reference (archive/ et reconcile/ gardent leur sens), les suivantes
+    # n'ajoutent que leurs captures loose.
+    dirs = args.dir or [os.environ.get("CLAUDISH_CAPTURE_DIR",
+                                       r"D:\claudish-captures")]
+    cdir = dirs[0]
 
     cutoff = datetime.now(timezone.utc).timestamp() - args.hours * 3600
     cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
 
-    reqs = load_requests(args.dir, cutoff_dt)
+    seen = set()
+    reqs = defaultdict(list)
+    for _d in dirs:
+        try:
+            for k, v in load_requests(_d, cutoff_dt, seen=seen).items():
+                reqs[k].extend(v)
+        except OSError as exc:
+            print(f"warning: capture dir unreadable ({exc}) -> not covered",
+                  file=sys.stderr)
+    for v in reqs.values():
+        v.sort(key=lambda d: d["ts"])
 
     lanes = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
     machines = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
@@ -394,9 +423,24 @@ def main():
     n_resp = n_paired = n_unpaired = n_nousage = 0
     first_dt = last_dt = None
 
-    for fn in os.listdir(args.dir):
-        if not (fn.startswith("resp-") and fn.endswith(".sse")):
+    # #1180 — resp de toutes les racines, union dedupliquee par nom de
+    # fichier (premiere racine gagne) ; une racine illisible se declare.
+    _resp_files = []
+    for _d in dirs:
+        try:
+            _names = os.listdir(_d)
+        except OSError as exc:
+            print(f"warning: capture dir unreadable ({exc}) -> not covered",
+                  file=sys.stderr)
             continue
+        for fn in _names:
+            if fn in seen:
+                continue
+            seen.add(fn)
+            if fn.startswith("resp-") and fn.endswith(".sse"):
+                _resp_files.append((_d, fn))
+
+    for _d, fn in _resp_files:
         rm = RESP_FN.match(fn)
         if not rm:
             continue
@@ -408,7 +452,7 @@ def main():
             first_dt = dt
         if last_dt is None or dt > last_dt:
             last_dt = dt
-        path = os.path.join(args.dir, fn)
+        path = os.path.join(_d, fn)
         try:
             txt = read_head_tail(path)
         except OSError:
@@ -467,7 +511,7 @@ def main():
     bs = _load_blind_spot()
     _rdir = args.reconcile_dir or bs.default_reconcile_dir()
     _nominal = Counter(v["machine"] for lst in reqs.values() for v in lst)
-    blind = bs.assess(args.dir, cutoff_dt, now_dt, fleet,
+    blind = bs.assess(cdir, cutoff_dt, now_dt, fleet,
                       reconcile_dir=_rdir, nominal_counts=_nominal)
 
     # #1152 c — un jour packed en parties est absent du corpus loose que ce
@@ -475,7 +519,8 @@ def main():
     # jamais comme un total. La lecture exacte est le merge de
     # native-consumption --leak-policy.
     pp = _load_partial_parts()
-    partial = pp.assess(args.dir, cutoff_dt, now_dt)
+    # #1180 — union des racines, dedupliquee par nom de partie
+    partial = pp.assess_many(dirs, cutoff_dt, now_dt)
 
     days = (build_days(per_day, args.dir, cutoff_dt, now_dt, reqs, fleet, _rdir)
             if args.per_day else None)
@@ -507,8 +552,9 @@ def main():
     else:
         couv = "couverture (aucune resp dans la fenetre)"
     print(f"fenetre: {args.hours}h demandees | {couv}")
+    print(f"COVERAGE dirs={len(dirs)}")
     print(f"resp: {n_resp} | appariees: {n_paired} | non appariees: {n_unpaired} | sans usage: {n_nousage}")
-    for _line in pp.section(args.dir, cutoff_dt, now_dt, res=partial):
+    for _line in pp.section(cdir, cutoff_dt, now_dt, res=partial):
         print(_line)
     print()
     hdr = f"{'lane':24} {'bucket':12} {'req':>6} {'in_tok':>13} {'out_tok':>12} {'cache_rd':>13} {'cache_wr':>12} {'hit%':>5} {'in/h':>13} {'out/h':>12}"
@@ -559,7 +605,7 @@ def main():
     # #933 : la section se render meme sans --machines — une absence lue comme
     # un 0 est le mensonge que ce rapport existe pour empecher.
     print()
-    for line in bs.render(args.dir, cutoff_dt, now_dt, fleet,
+    for line in bs.render(cdir, cutoff_dt, now_dt, fleet,
                           reconcile_dir=_rdir, res=blind):
         print(line)
 
