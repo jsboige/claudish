@@ -9,6 +9,11 @@ Usage:
   python scripts/traffic-consumption.py --hours 3
   python scripts/traffic-consumption.py --hours 24 --machines
   python scripts/traffic-consumption.py --hours 24 --json      # pour le join Phase 3
+  python scripts/traffic-consumption.py --per-day --json       # serie par jour (#1161)
+  python scripts/traffic-consumption.py --from-archive 2026-11-22
+      # #1161 — UN jour lu depuis son archive, UNE fois, ajoute a la serie
+      # persistante (~/.claudish/traffic-days.json). Corpus du hub : en creux
+      # 05-07Z seulement, un jour par appel.
 
 PIEGES encodes (mesures Epic #41 + harness-injection-measure.py) :
 1) (pid, reqN) n'est PAS unique — le compteur repart a 0 a chaque redemarrage
@@ -46,7 +51,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
@@ -219,7 +227,7 @@ def bucket_of(info):
     return "other"
 
 
-def load_requests(cdir, cutoff_dt, seen=None):
+def load_requests(cdir, cutoff_dt, seen=None, until_dt=None):
     """(pid, reqN) -> liste horodatee de dicts {ts, machine, ep, wl}.
 
     On ne lit que la TETE du fichier : machine + bloc billing system sont
@@ -229,6 +237,9 @@ def load_requests(cdir, cutoff_dt, seen=None):
     seen (#1180) : noms deja consommes par une autre racine de corpus — mute
     ici, partage avec la boucle resp de main(), pour que l'union de plusieurs
     `--dir` soit dedupliquee par NOM de fichier (premiere racine gagne).
+
+    until_dt : borne haute EXCLUSIVE (None = pas de borne) — le mode
+    --from-archive (#1161) lit un JOUR, [minuit, minuit).
     """
     if seen is None:
         seen = set()
@@ -241,6 +252,8 @@ def load_requests(cdir, cutoff_dt, seen=None):
             continue
         dt = capture_dt(m.group(3))
         if dt is None or dt < cutoff_dt:
+            continue
+        if until_dt is not None and dt >= until_dt:
             continue
         seen.add(fn)
         try:
@@ -280,12 +293,13 @@ def fmt_int(n):
 
 
 def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
-               reconcile_dir):
+               reconcile_dir, opened=False, only=False):
     """Serie par JOUR UTC (#1161 stage 2, grain producteur) — la consommation
     que `activity-cost-join.py` met en regard des contributions GitHub.
 
     -> [{"date", "n", "in", "out", "cache_create", "cache_read",
-         "partial"?, "blind"?}]
+         "partial"?, "partial_reasons"?, "blind"?, "blind_machines"?,
+         "source"?, "archive"?, "loose_residual"?}]
 
     Un jour n'est emis que s'il PORTE une mesure (resp lue) ou une
     DECLARATION (partie de jour / archive de jour, #1152 c) : un jour sans
@@ -300,8 +314,15 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
 
     partial : jour courant (pas fini), premier jour de la fenetre (coupe au
     cutoff, pas a minuit), et tout jour dont les captures sont packees en
-    parties ou en archive de jour — ce lecteur ne les ouvre pas (la lecture
-    exacte est native-consumption --leak-policy). Jamais ratio-able.
+    parties ou en archive de jour — en lecture LOOSE ce lecteur ne les ouvre
+    pas (la lecture exacte est native-consumption --leak-policy). Jamais
+    ratio-able.
+
+    opened : l'appelant A ouvert les parties et l'archive du jour (mode
+    --from-archive) : les declarations « packe » ne sont alors pas un non-lu,
+    la ligne porte source="archive" (provenance ajoutee par l'appelant).
+    only : n'emettre que les jours PORTEURS d'une mesure — le mode
+    --from-archive lit UN jour, il n'emet pas les declarations des autres.
 
     blind : predicat de lib/blind_spot.py applique au JOUR (machine de la
     flotte a 0 nominal ET 0 archive ce jour = inconnu, pas zero) ; archives
@@ -311,23 +332,24 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
     pp = _load_partial_parts()
     part_days = Counter()
     arch_days = set()
-    seen = set()
-    for _d in corpus_dirs:
-        try:
-            names = os.listdir(pp.archive_dir(_d))
-        except OSError:
-            continue
-        for fn in names:
-            if fn in seen:
+    if not (opened and only):
+        seen = set()
+        for _d in corpus_dirs:
+            try:
+                names = os.listdir(pp.archive_dir(_d))
+            except OSError:
                 continue
-            seen.add(fn)
-            m = pp.PART_FN.match(fn)
-            if m:
-                part_days[m.group("day")] += 1
-                continue
-            m = pp.DAY_ARCHIVE_FN.match(fn)
-            if m:
-                arch_days.add(m.group(1))
+            for fn in names:
+                if fn in seen:
+                    continue
+                seen.add(fn)
+                m = pp.PART_FN.match(fn)
+                if m:
+                    part_days[m.group("day")] += 1
+                    continue
+                m = pp.DAY_ARCHIVE_FN.match(fn)
+                if m:
+                    arch_days.add(m.group(1))
 
     bs = _load_blind_spot()
     archives = bs.outage_archives(cdir, reconcile_dir)
@@ -347,7 +369,7 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
     declared = {d for d in part_days if d >= cutoff_day}
     declared |= {d for d in arch_days if d >= cutoff_day}
     days = []
-    for day in sorted(set(per_day) | declared):
+    for day in (sorted(per_day) if only else sorted(set(per_day) | declared)):
         tot = per_day.get(day) or dict(n=0, inp=0, out=0, cread=0, ccre=0)
         row = {"date": day, "n": tot["n"], "in": tot["inp"], "out": tot["out"],
                "cache_create": tot["ccre"], "cache_read": tot["cread"]}
@@ -356,10 +378,11 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
             reasons.append("current-day")
         if day == cutoff_day and not starts_at_midnight:
             reasons.append("window-start")
-        if part_days.get(day):
-            reasons.append(f"packed:{part_days[day]}-parts")
-        if day in arch_days:
-            reasons.append("day-archive")
+        if not opened:
+            if part_days.get(day):
+                reasons.append(f"packed:{part_days[day]}-parts")
+            if day in arch_days:
+                reasons.append("day-archive")
         if reasons:
             row["partial"] = True
             row["partial_reasons"] = reasons
@@ -373,51 +396,29 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
         if blind_m:
             row["blind"] = True
             row["blind_machines"] = blind_m
+        if opened:
+            row["source"] = "archive"
         days.append(row)
     return days
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--hours", type=float, default=24.0)
-    ap.add_argument("--dir", action="append", default=None,
-                    help="racine du corpus de captures ; REPETABLE (#1180) — "
-                         "union dedupliquee par nom de fichier, premiere racine "
-                         "gagne. Defaut : $CLAUDISH_CAPTURE_DIR ou "
-                         "D:\\claudish-captures")
-    ap.add_argument("--json", action="store_true", help="sortie JSON machine-lisible (Phase 3)")
-    ap.add_argument("--machines", action="store_true", help="rollup supplementaire par lane x machine")
-    ap.add_argument("--harness-lanes", action="store_true",
-                    help="rollup supplementaire par lane harnais (#1055 — champ "
-                         "enveloppe 'lane', ex. nb-coder ; les requetes sans lane "
-                         "harnais sont exclues du rollup, pas de la table principale)")
-    ap.add_argument("--fleet", default="",
-                    help="machines sidecar attendues (separees par des virgules) — "
-                         "active l'avertissement d'angle mort AUTONOMOUS (#933)")
-    ap.add_argument("--reconcile-dir", default="",
-                    help="dossier des archives outage-*.7z (defaut : GDrive du "
-                         "script de reconciliation, env CLAUDISH_RECONCILE_DIR ; "
-                         "<corpus>/reconcile reste source additionnelle, #940)")
-    ap.add_argument("--per-day", action="store_true",
-                    help="serie par jour UTC (#1161 stage 2) : cle `days` du "
-                         "JSON, et table par jour en mode texte — le contrat lu "
-                         "par activity-cost-join.py (partial/blind compris)")
-    args = ap.parse_args()
-    # #1180 — `--dir` repetable : la PREMIERE racine reste le corpus de
-    # reference (archive/ et reconcile/ gardent leur sens), les suivantes
-    # n'ajoutent que leurs captures loose.
-    dirs = args.dir or [os.environ.get("CLAUDISH_CAPTURE_DIR",
-                                       r"D:\claudish-captures")]
-    cdir = dirs[0]
+def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
+    """LE scan : l'union des racines (#1180), dedupliquee par NOM de fichier
+    (premiere racine gagne). Une seule copie des regles de lecture — la
+    fenetre loose et le mode --from-archive passent tous les deux par ici.
 
-    cutoff = datetime.now(timezone.utc).timestamp() - args.hours * 3600
-    cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
+    until_dt : borne haute EXCLUSIVE de la fenetre (None = pas de borne) ;
+    le mode --from-archive lit un JOUR, [minuit, minuit).
 
+    -> {"files", "lanes", "machines", "hlanes", "per_day", "reqs",
+        "first_dt", "last_dt"}
+    """
     seen = set()
     reqs = defaultdict(list)
     for _d in dirs:
         try:
-            for k, v in load_requests(_d, cutoff_dt, seen=seen).items():
+            for k, v in load_requests(_d, cutoff_dt, seen=seen,
+                                      until_dt=until_dt).items():
                 reqs[k].extend(v)
         except OSError as exc:
             print(f"warning: capture dir unreadable ({exc}) -> not covered",
@@ -431,7 +432,9 @@ def main():
     # suffit pas (deux sieges peuvent porter le meme harnais), la machine seule
     # ne distingue pas le harnais du reste du siege.
     hlanes = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
-    per_day = defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0))
+    # NE PAS appeler cette variable per_day : le parametre est le boolean, et un
+    # defaultdict VIDE est faux : `if per_day:` n'accumulerait jamais.
+    by_day = defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)) if per_day else {}
     n_resp = n_paired = n_unpaired = n_nousage = 0
     first_dt = last_dt = None
 
@@ -458,6 +461,8 @@ def main():
             continue
         dt = capture_dt(rm.group(1))
         if dt is None or dt < cutoff_dt:
+            continue
+        if until_dt is not None and dt >= until_dt:
             continue
         n_resp += 1
         if first_dt is None or dt < first_dt:
@@ -495,8 +500,8 @@ def main():
         # lane harnais declaree (une absence n'est pas un 0 mesurable).
         if info.get("hlane"):
             keys.append((hlanes, f"{info['hlane']} | {info['machine'] or 'direct'}"))
-        if args.per_day:
-            drow = per_day[dt.date().isoformat()]
+        if per_day:
+            drow = by_day[dt.date().isoformat()]
             drow["n"] += 1
             drow["inp"] += inp
             drow["out"] += out
@@ -510,40 +515,31 @@ def main():
             r["cread"] += cread
             r["ccre"] += ccre
 
-    span_h = ((last_dt - first_dt).total_seconds() / 3600) if (first_dt and last_dt and last_dt > first_dt) else args.hours
+    return {"files": {"resp": n_resp, "paired": n_paired, "unpaired": n_unpaired,
+                      "no_usage": n_nousage},
+            "lanes": lanes, "machines": machines, "hlanes": hlanes,
+            "per_day": by_day, "reqs": reqs,
+            "first_dt": first_dt, "last_dt": last_dt}
 
-    # #933 — l'angle mort AUTONOMOUS se declare, il ne se lit pas comme un 0 :
-    # fleet declaree (+ archives outage, dossier GDrive du script de
-    # reconciliation) avec 0 nominal et 0 archive dans la fenetre = BLIND.
-    # Coram la fenetre DEMANDEE (cutoff -> maintenant). Les comptes nominaux
-    # viennent de load_requests (il a deja lu chaque tete req-* pour
-    # l'appariement) — pas de relecture (#940).
-    fleet = [m.strip() for m in args.fleet.split(",") if m.strip()]
-    now_dt = datetime.now(timezone.utc)
-    bs = _load_blind_spot()
-    _rdir = args.reconcile_dir or bs.default_reconcile_dir()
-    _nominal = Counter(v["machine"] for lst in reqs.values() for v in lst)
-    blind = bs.assess(cdir, cutoff_dt, now_dt, fleet,
-                      reconcile_dir=_rdir, nominal_counts=_nominal)
 
-    # #1152 c — un jour packed en parties est absent du corpus loose que ce
-    # lecteur scanne : l'undercount se DECLARE (ligne PARTIAL), il ne se lit
-    # jamais comme un total. La lecture exacte est le merge de
-    # native-consumption --leak-policy.
-    pp = _load_partial_parts()
-    # #1180 — union des racines, dedupliquee par nom de partie
-    partial = pp.assess_many(dirs, cutoff_dt, now_dt)
-
-    days = (build_days(per_day, dirs, cutoff_dt, now_dt, reqs, fleet, _rdir)
-            if args.per_day else None)
+def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet,
+                rdir, blind, partial, days,
+                day_title="== par jour UTC (--per-day, #1161) ==",
+                day_provenance=False, extra=None):
+    """Le rapport (JSON ou texte) d'UN scan — rendu une seule fois, partage par
+    la fenetre loose et le mode --from-archive (qui ajoute sa cle `series`)."""
+    lanes, machines, hlanes = res["lanes"], res["machines"], res["hlanes"]
+    first_dt, last_dt = res["first_dt"], res["last_dt"]
+    span_h = ((last_dt - first_dt).total_seconds() / 3600) if (first_dt and last_dt and last_dt > first_dt) else window_hours
+    files = res["files"]
 
     if args.json:
-        print(json.dumps({
-            "window_hours": args.hours,
+        doc = {
+            "window_hours": window_hours,
             "covered_from": first_dt.isoformat() if first_dt else None,
             "covered_to": last_dt.isoformat() if last_dt else None,
             "covered_span_hours": round(span_h, 3),
-            "files": {"resp": n_resp, "paired": n_paired, "unpaired": n_unpaired, "no_usage": n_nousage},
+            "files": files,
             "lanes": {k: v for k, v in lanes.items()},
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
             "harness_lanes": {k: v for k, v in hlanes.items()} if args.harness_lanes else None,
@@ -552,7 +548,10 @@ def main():
                                "days": partial["days"]}
                               if partial["partial"] else None),
             "days": days,
-        }, indent=2))
+        }
+        if extra:
+            doc.update(extra)
+        print(json.dumps(doc, indent=2))
         return
 
     total_out = sum(r["out"] for b in lanes.values() for r in b.values())
@@ -563,9 +562,10 @@ def main():
         couv = f"couverture {first_dt:%H:%M} -> {last_dt:%H:%M}Z ({span_h:.2f} h)"
     else:
         couv = "couverture (aucune resp dans la fenetre)"
-    print(f"fenetre: {args.hours}h demandees | {couv}")
+    print(f"fenetre: {window_hours}h demandees | {couv}")
     print(f"COVERAGE dirs={len(dirs)}")
-    print(f"resp: {n_resp} | appariees: {n_paired} | non appariees: {n_unpaired} | sans usage: {n_nousage}")
+    print(f"resp: {files['resp']} | appariees: {files['paired']} | non appariees: {files['unpaired']} | sans usage: {files['no_usage']}")
+    pp = _load_partial_parts()
     for _line in pp.section(cdir, cutoff_dt, now_dt, res=partial):
         print(_line)
     print()
@@ -617,34 +617,505 @@ def main():
     # #933 : la section se render meme sans --machines — une absence lue comme
     # un 0 est le mensonge que ce rapport existe pour empecher.
     print()
+    bs = _load_blind_spot()
     for line in bs.render(cdir, cutoff_dt, now_dt, fleet,
-                          reconcile_dir=_rdir, res=blind):
+                          reconcile_dir=rdir, res=blind):
         print(line)
 
     if days is not None:
-        print("\n== par jour UTC (--per-day, #1161) ==")
-        if not days:
-            print("  aucune mesure ni declaration de jour dans la fenetre — "
-                  "serie vide, pas une consommation nulle")
-        else:
-            dhdr = (f"{'date':12} {'req':>6} {'in_tok':>13} {'out_tok':>12} "
-                    f"{'cache_rd':>13} {'cache_wr':>12}  flags")
-            print(dhdr)
-            print("-" * len(dhdr))
-            for d in days:
-                flags = list(d.get("partial_reasons") or [])
-                if d.get("blind"):
-                    flags.append("BLIND:" + ",".join(d.get("blind_machines") or []))
-                print(f"{d['date']:12} {d['n']:>6} {fmt_int(d['in']):>13} "
-                      f"{fmt_int(d['out']):>12} {fmt_int(d['cache_read']):>13} "
-                      f"{fmt_int(d['cache_create']):>12}  "
-                      f"{','.join(flags) if flags else '-'}")
-            print("lecture: un jour `partial` (jour courant, coupe de fenetre, "
-                  "parties/archive non ouvertes) ou BLIND n'est jamais ratio — "
-                  "il nomme un non-mesure, pas un zero.")
+        print_days(days, day_title, provenance=day_provenance)
 
     print(f"\ntotal out_tok fenetre: {fmt_int(total_out)} | debit moyen out: {fmt_int(int(total_out / span_h))}/h")
 
 
+def print_days(days, title, provenance=False):
+    """La serie par jour, en texte — tableau, regle de lecture, et (mode
+    --from-archive) une ligne de provenance par jour lu depuis son archive."""
+    print("\n" + title)
+    if not days:
+        print("  aucune mesure ni declaration de jour dans la fenetre — "
+              "serie vide, pas une consommation nulle")
+        return
+    dhdr = (f"{'date':12} {'req':>6} {'in_tok':>13} {'out_tok':>12} "
+            f"{'cache_rd':>13} {'cache_wr':>12}  flags")
+    print(dhdr)
+    print("-" * len(dhdr))
+    for d in days:
+        flags = list(d.get("partial_reasons") or [])
+        if d.get("blind"):
+            flags.append("BLIND:" + ",".join(d.get("blind_machines") or []))
+        print(f"{d['date']:12} {d['n']:>6} {fmt_int(d['in']):>13} "
+              f"{fmt_int(d['out']):>12} {fmt_int(d['cache_read']):>13} "
+              f"{fmt_int(d['cache_create']):>12}  "
+              f"{','.join(flags) if flags else '-'}")
+    print("lecture: un jour `partial` (jour courant, coupe de fenetre, "
+          "parties/archive non ouvertes) ou BLIND n'est jamais ratio — "
+          "il nomme un non-mesure, pas un zero.")
+    if provenance:
+        print_provenance(days)
+
+
+def print_provenance(days):
+    """Une ligne par jour lu depuis son archive : de quelle archive, quand,
+    combien de membres, combien de loose fusionne — la trace de la lecture."""
+    for d in days:
+        a = d.get("archive")
+        if d.get("source") != "archive" or not a:
+            continue
+        files = ", ".join(f"{n} ({fmt_int(s)} o)" for n, s in a.get("files", []))
+        print(f"provenance {d['date']} : {files} ; lue le {a.get('read_at')} ; "
+              f"{a.get('members', '?')} membres ; residu loose du jour fusionne : "
+              f"{d.get('loose_residual', 0)} fichier(s)")
+
+
+# ---------------------------------------------------------------------------
+# #1161 stage 2 — --from-archive : UN jour, lu UNE fois, dans la serie
+# ---------------------------------------------------------------------------
+
+SERIES_SCHEMA = "traffic-days/1"
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ARCHIVE_TITLE = "== serie par jour UTC (--from-archive, #1161) =="
+
+
+def default_series_path():
+    """La serie persistante vit avec les autres etats durables du harnais
+    (~/.claudish : cache catalogue, journaux, watermarks) — jamais dans le
+    depot, jamais dans le corpus lu."""
+    return os.path.join(os.path.expanduser("~"), ".claudish", "traffic-days.json")
+
+
+def default_extract_root():
+    """<depot>/.tmp (gitignore, le disque du depot) ; sinon le dossier
+    temporaire du systeme."""
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".tmp")
+    try:
+        os.makedirs(root, exist_ok=True)
+        return root
+    except OSError:
+        return tempfile.gettempdir()
+
+
+def day_arg(value):
+    """Type argparse de --from-archive : UN jour ISO, valide."""
+    if not DAY_RE.match(value):
+        raise argparse.ArgumentTypeError(f"jour attendu au format YYYY-MM-DD, recu {value!r}")
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"jour invalide : {value!r}")
+    return value
+
+
+def load_series(path):
+    """-> (series, erreur|None). Absent -> serie vide. Present mais illisible
+    ou d'un autre schema -> erreur : rien n'est alors ecrit par-dessus."""
+    if not os.path.exists(path):
+        return {"schema": SERIES_SCHEMA, "updated": None, "days": []}, None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return None, f"serie illisible ({path}) : {exc} — rien n'est ecrit"
+    ok = (isinstance(doc, dict) and doc.get("schema") == SERIES_SCHEMA
+          and isinstance(doc.get("days"), list)
+          and all(isinstance(r, dict) and isinstance(r.get("date"), str)
+                  for r in doc["days"]))
+    if not ok:
+        return None, (f"serie d'un autre schema ({path}) : attendu schema={SERIES_SCHEMA} "
+                      f"et days=[{{date, ...}}] — rien n'est ecrit par-dessus")
+    return doc, None
+
+
+def write_series(path, series):
+    """Remplacement ATOMIQUE : fichier temporaire dans le meme dossier, puis
+    os.replace — la serie n'est jamais a moitie ecrite."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(series, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def free_space_ok(need, free):
+    """Le volume DECLARE tient dans l'espace libre — marge de 5 % + 1 Gio.
+    Un disque plein a mi-extraction n'est pas un echec de lecture, c'est un
+    disque du poste pris en otage : la garde est AVANT la premiere ecriture."""
+    return free >= int(need * 1.05) + (1 << 30)
+
+
+def day_member_filter(day):
+    """keep(basename) des membres du jour — la regle de groupement de
+    compress-captures.ps1 ($rx), mot pour mot : le JOUR DU NOM de fichier
+    (premiere date suivie de T, avant l'heure). C'est ce filtre qui borne ce
+    que read_members extrait."""
+    rx = re.compile(r"^(?:req|resp)-.*?(\d{4}-\d{2}-\d{2})T\d{2}-\d{2}-\d{2}")
+
+    def keep(base):
+        m = rx.match(base)
+        return m is not None and m.group(1) == day
+    return keep
+
+
+def day_archive_paths(dirs, pp, day):
+    """Archives du jour = union des racines dedupliquee par NOM (premiere
+    racine gagne), la regle de assess_many — une archive copiee sur deux
+    disques est UNE archive. Triees par nom : la provenance est stable."""
+    out, seen = [], set()
+    for d in dirs:
+        for p in pp.day_archives_for(d, day):
+            name = os.path.basename(p)
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(p)
+    return sorted(out, key=os.path.basename)
+
+
+def declared_members(paths, keep):
+    """LISTING seul (en-tete 7z, aucun membre decomprime) : -> (nb de membres
+    que `keep` garde, octets declares). Sert la garde d'espace disque et la
+    provenance. py7zr manquant -> ImportError ; archive illisible -> l'erreur
+    de py7zr. L'extraction, elle, reste lib/partial_parts.read_members."""
+    import py7zr
+
+    n = total = 0
+    for path in paths:
+        with py7zr.SevenZipFile(path) as z:
+            for info in z.list():
+                if info.is_directory or not keep(os.path.basename(info.filename)):
+                    continue
+                n += 1
+                total += info.uncompressed
+    return n, total
+
+
+def archive_set(paths):
+    """[(nom, taille)] des archives du jour — l'etat EXACT qui decide si un
+    jour deja lu doit l'etre a nouveau : un fichier de plus, un octet de
+    plus (des retardataires rajoutes par la passe nocturne suivante) = une
+    autre archive."""
+    return [[os.path.basename(p), os.path.getsize(p)] for p in paths]
+
+
+def from_archive(args, dirs, pp, bs):
+    """#1161 stage 2 — `--from-archive <jour>` : lit UN jour depuis son
+    archive, UNE seule fois, et l'ajoute a la serie persistante.
+
+    Forme (b) incrementale (decision du coordinateur, File 23d) : le corpus
+    loose du hub ne porte que le jour courant ; un jour passe ne se lit que
+    depuis son archive (~0,75 Gio de SMB par jour). Donc UN jour par appel,
+    jamais plusieurs, et sur le corpus du hub en creux 05-07Z seulement — le
+    CLI n'accepte qu'un jour : « plusieurs jours d'un coup » ne s'ecrit pas.
+
+    Contrat :
+      - le jour = ses captures telles que le packer les a groupees (archive
+        de jour + parties du jour, union des racines) PLUS ce qui du jour
+        reste loose dans les racines (un retardataire retenu ouvert a la
+        passe nocturne) — sinon la ligne sous-compterait sans le dire ;
+      - les regles de lecture sont celles du scan loose (collect) : aucune
+        seconde copie des decomptes ;
+      - un jour deja present, lu de la meme archive (memes noms ET memes
+        tailles), n'est PAS relu : sortie 0, zero octet lu du corpus ;
+      - une archive qui a CHANGE depuis la lecture n'est pas relue d'office
+        (sortie 2, la ligne est conservee) : --reread l'exige ;
+      - aucune archive pour le jour = sortie 2, jamais une ligne a zero.
+
+    Sortie 0 : jour lu, ou jour deja present. Sortie 2 : rien lu.
+    """
+    day = args.from_archive
+    cdir = dirs[0]
+    jm = args.json
+
+    def say(text):
+        """Progression et verdicts : stdout en mode texte, stderr en mode
+        --json (stdout reste du JSON pur)."""
+        print(text, file=sys.stderr if jm else sys.stdout, flush=True)
+
+    def refuse(text):
+        print(f"traffic-consumption: {text}", file=sys.stderr)
+        return 2
+
+    def show_series():
+        if jm:
+            print(json.dumps({"series": meta, "days": series["days"]}, indent=2))
+        else:
+            print_days(series["days"], ARCHIVE_TITLE, provenance=True)
+
+    series_path = args.series_file or default_series_path()
+    series, err = load_series(series_path)
+    if err:
+        return refuse(err)
+
+    paths = day_archive_paths(dirs, pp, day)
+    cur = archive_set(paths)
+    row0 = next((r for r in series["days"] if r["date"] == day), None)
+    status = "read"
+    prev = []
+    if row0 is not None and row0.get("source") == "archive":
+        prev = [list(x) for x in (row0.get("archive") or {}).get("files", [])]
+        if prev == cur:
+            status = "already-present"
+        elif args.reread:
+            status = "reread"
+        else:
+            status = "archive-changed"
+
+    meta = {"path": series_path, "schema": SERIES_SCHEMA, "day": day,
+            "status": status, "days_in_series": len(series["days"])}
+
+    if status == "already-present":
+        a = row0.get("archive") or {}
+        read = ", ".join(f"{n} ({fmt_int(s)} o)" for n, s in a.get("files", []))
+        say(f"lecture archive {day} : DEJA PRESENTE dans la serie — pas relue "
+            f"(zero octet lu du corpus)")
+        say(f"  lue le {a.get('read_at')} de {read}")
+        say(f"  serie : {series_path} ({len(series['days'])} jour(s))")
+        show_series()
+        return 0
+
+    if status == "archive-changed":
+        def _names(files):
+            return ", ".join(f"{n} ({fmt_int(s)} o)" for n, s in files) or "(absente)"
+        say(f"lecture archive {day} : ARCHIVE CHANGEE depuis la lecture — pas relue, "
+            f"la ligne de la serie est conservee telle que lue")
+        say(f"  lue         : {_names(prev)}")
+        say(f"  aujourd'hui : {_names(cur)}")
+        resid0 = row0.get("loose_residual", 0)
+        if resid0:
+            say(f"  la ligne avait fusionne {resid0} fichier(s) loose du jour : l'ajout "
+                f"peut n'etre que leur repacking")
+        say("  --reread pour relire (un jour, une lecture de plus sur le corpus)")
+        meta["read_from"] = prev
+        show_series()
+        return 2
+
+    if not paths:
+        say(f"lecture archive {day} : AUCUNE ARCHIVE — ni archive de jour ni partie "
+            f"sous {pp.archive_dir(cdir)} (jour encore loose, ou hors retention) : "
+            f"rien a lire, pas une consommation nulle")
+        show_series()
+        return 2
+
+    d0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    d1 = d0 + timedelta(days=1)
+    now_dt = datetime.now(timezone.utc)
+    if d0 >= now_dt:
+        say(f"lecture archive {day} : jour a venir — rien a lire")
+        show_series()
+        return 2
+    until_dt = min(d1, now_dt)
+    fleet = [m.strip() for m in args.fleet.split(",") if m.strip()]
+    rdir = args.reconcile_dir or bs.default_reconcile_dir()
+    keep = day_member_filter(day)
+
+    try:
+        n_members, need = declared_members(paths, keep)
+    except ImportError:
+        return refuse("py7zr est requis pour --from-archive (pip install --user py7zr) — "
+                      "il vit dans le site utilisateur : ne pas lancer l'outil sous python -I")
+    except Exception as exc:  # noqa: BLE001 — l'archive se NOMME, elle ne relance pas
+        return refuse(f"archive du jour illisible ({', '.join(n for n, _ in cur)}) : "
+                      f"{type(exc).__name__}: {exc} — rien n'est ecrit dans la serie")
+    if not n_members:
+        return refuse(f"archive(s) du jour sans aucun membre req-/resp- a son nom "
+                      f"({', '.join(n for n, _ in cur)}) — rien a lire, pas une "
+                      f"consommation nulle")
+
+    root = args.extract_root or default_extract_root()
+    try:
+        free = shutil.disk_usage(root).free
+    except OSError as exc:
+        return refuse(f"racine d'extraction illisible ({root}) : {exc}")
+    if not free_space_ok(need, free):
+        return refuse(f"espace insuffisant sur {root} : {fmt_int(need)} o declares a "
+                      f"extraire, {fmt_int(free)} o libres (marge 5 % + 1 Gio) — rien "
+                      f"n'est ecrit ; --extract-root <disque>")
+
+    dest = os.path.join(root, "traffic-days", day)
+    if os.path.isdir(dest):
+        # un run tue laisse l'extraction derriere lui (le finally n'a pas
+        # tourne). Regenerable : l'archive du jour est la, lue plus bas.
+        say(f"extraction interrompue retrouvee sous {dest} — remplacee")
+        shutil.rmtree(dest, ignore_errors=True)
+        if os.path.exists(dest):
+            return refuse(f"extraction interrompue sous {dest} impossible a supprimer — "
+                          f"rien n'est ecrit ; a liberer a la main")
+    try:
+        os.makedirs(dest)
+    except OSError as exc:
+        return refuse(f"racine d'extraction inutilisable ({dest}) : {exc}")
+
+    t0 = time.time()
+    resid = 0
+    try:
+        say(f"lecture archive {day} : {status.upper()} — {len(paths)} archive(s) "
+            f"({', '.join(fmt_int(s) + ' o' for _, s in cur)}) ; {n_members} membres "
+            f"({fmt_int(need)} o declares) a extraire vers {dest}")
+        try:
+            pp.read_members(paths, dest, keep=keep)
+        except Exception as exc:  # noqa: BLE001 — echec de lecture, pas une ligne
+            return refuse(f"extraction echouee ({type(exc).__name__}: {exc}) — rien "
+                          f"n'est ecrit dans la serie")
+        t1 = time.time()
+        say(f"  extrait en {t1 - t0:.0f} s")
+
+        # residu loose du jour (retardataires de la passe nocturne) : copie
+        # locale, l'archive gagne sur l'homonyme — le scan reste 100 % local.
+        for _d in dirs:
+            try:
+                names = os.listdir(_d)
+            except OSError as exc:
+                say(f"  warning: racine illisible ({exc}) — son residu loose du jour "
+                    f"n'est pas dans la ligne")
+                continue
+            for fn in names:
+                if not keep(fn) or os.path.exists(os.path.join(dest, fn)):
+                    continue
+                try:
+                    shutil.copy2(os.path.join(_d, fn), os.path.join(dest, fn))
+                    resid += 1
+                except OSError as exc:
+                    say(f"  warning: residu loose {fn} illisible ({exc})")
+        say(f"  residu loose du jour fusionne : {resid} fichier(s)")
+
+        res = collect([dest], d0, until_dt=until_dt, per_day=True)
+        t2 = time.time()
+        say(f"  scanne en {t2 - t1:.0f} s : {res['files']['resp']} resp, "
+            f"{res['files']['paired']} appariees, {res['files']['unpaired']} non appariees")
+
+        rows = build_days(res["per_day"], dirs, d0, now_dt, res["reqs"], fleet, rdir,
+                          opened=True, only=True)
+        if not rows:
+            return refuse(f"aucune reponse lue pour le {day} ({n_members} membres "
+                          f"extraits) — rien n'est ecrit : pas une consommation nulle")
+        row = rows[0]
+        read_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        row["archive"] = {"files": cur, "read_at": read_at, "members": n_members,
+                          "declared_bytes": need,
+                          "seconds": {"extract": round(t1 - t0, 1),
+                                      "scan": round(t2 - t1, 1)}}
+        row["loose_residual"] = resid
+        series["days"] = sorted([r for r in series["days"] if r["date"] != day] + [row],
+                                key=lambda r: r["date"])
+        series["updated"] = read_at
+        try:
+            write_series(series_path, series)
+        except OSError as exc:
+            return refuse(f"serie non ecrite ({series_path}) : {exc}")
+    finally:
+        shutil.rmtree(dest, ignore_errors=True)
+        if os.path.exists(dest):
+            print(f"traffic-consumption: WARNING extraction non supprimee : {dest} "
+                  f"({fmt_int(need)} o declares) — a liberer a la main", file=sys.stderr)
+
+    meta["days_in_series"] = len(series["days"])
+    meta["loose_residual"] = resid
+    say(f"  serie : {series_path} ({len(series['days'])} jour(s)) — {day} "
+        f"{'remplace' if row0 is not None else 'ajoute'}")
+    _nominal = Counter(v["machine"] for lst in res["reqs"].values() for v in lst)
+    blind = bs.assess(cdir, d0, until_dt, fleet, reconcile_dir=rdir,
+                      nominal_counts=_nominal)
+    # les parties du jour sont LUES ici : une partie mergee n'est plus un
+    # sous-compte (merged_paths), le verdict PARTIAL ne la nomme pas.
+    partial = pp.assess_many(dirs, d0, until_dt, merged_paths=paths)
+    emit_report(res, args=args, dirs=dirs, cdir=cdir, cutoff_dt=d0, now_dt=until_dt,
+                window_hours=24.0, fleet=fleet, rdir=rdir, blind=blind,
+                partial=partial, days=series["days"], day_title=ARCHIVE_TITLE,
+                day_provenance=True, extra={"series": meta})
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--hours", type=float, default=24.0)
+    ap.add_argument("--dir", action="append", default=None,
+                    help="racine du corpus de captures ; REPETABLE (#1180) — "
+                         "union dedupliquee par nom de fichier, premiere racine "
+                         "gagne. Defaut : $CLAUDISH_CAPTURE_DIR ou "
+                         "D:\\claudish-captures")
+    ap.add_argument("--json", action="store_true", help="sortie JSON machine-lisible (Phase 3)")
+    ap.add_argument("--machines", action="store_true", help="rollup supplementaire par lane x machine")
+    ap.add_argument("--harness-lanes", action="store_true",
+                    help="rollup supplementaire par lane harnais (#1055 — champ "
+                         "enveloppe 'lane', ex. nb-coder ; les requetes sans lane "
+                         "harnais sont exclues du rollup, pas de la table principale)")
+    ap.add_argument("--fleet", default="",
+                    help="machines sidecar attendues (separees par des virgules) — "
+                         "active l'avertissement d'angle mort AUTONOMOUS (#933)")
+    ap.add_argument("--reconcile-dir", default="",
+                    help="dossier des archives outage-*.7z (defaut : GDrive du "
+                         "script de reconciliation, env CLAUDISH_RECONCILE_DIR ; "
+                         "<corpus>/reconcile reste source additionnelle, #940)")
+    ap.add_argument("--per-day", action="store_true",
+                    help="serie par jour UTC (#1161 stage 2) : cle `days` du "
+                         "JSON, et table par jour en mode texte — le contrat lu "
+                         "par activity-cost-join.py (partial/blind compris)")
+    ap.add_argument("--from-archive", metavar="YYYY-MM-DD", default=None, type=day_arg,
+                    help="(#1161 stage 2) lit UN jour depuis son archive (archive "
+                         "de jour + parties du jour, union des racines, plus ce qui "
+                         "du jour reste loose) et l'ajoute a la serie persistante ; "
+                         "implique --per-day, --hours ignore. Un jour deja present "
+                         "n'est PAS relu. UN jour par appel — sur le corpus du hub, "
+                         "en creux 05-07Z seulement")
+    ap.add_argument("--series-file", default=None, metavar="FILE",
+                    help="serie persistante, schema traffic-days/1 (defaut : "
+                         + default_series_path() + ") — le fichier que "
+                         "activity-cost-join.py --consumption lit")
+    ap.add_argument("--extract-root", default=None, metavar="DIR",
+                    help="racine LOCALE de l'extraction du jour (defaut : <depot>/.tmp, "
+                         "sinon le dossier temporaire) ; supprimee en fin de lecture")
+    ap.add_argument("--reread", action="store_true",
+                    help="relire un jour deja present dont l'archive a change depuis la "
+                         "lecture (sans lui : sortie 2, rien n'est relu)")
+    args = ap.parse_args()
+    # #1180 — `--dir` repetable : la PREMIERE racine reste le corpus de
+    # reference (archive/ et reconcile/ gardent leur sens), les suivantes
+    # n'ajoutent que leurs captures loose.
+    dirs = args.dir or [os.environ.get("CLAUDISH_CAPTURE_DIR",
+                                       r"D:\claudish-captures")]
+    cdir = dirs[0]
+    pp = _load_partial_parts()
+    bs = _load_blind_spot()
+
+    if args.from_archive:
+        return from_archive(args, dirs, pp, bs)
+
+    cutoff = datetime.now(timezone.utc).timestamp() - args.hours * 3600
+    cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
+
+    res = collect(dirs, cutoff_dt, per_day=args.per_day)
+    reqs = res["reqs"]
+
+    # #933 — l'angle mort AUTONOMOUS se declare, il ne se lit pas comme un 0 :
+    # fleet declaree (+ archives outage, dossier GDrive du script de
+    # reconciliation) avec 0 nominal et 0 archive dans la fenetre = BLIND.
+    # Coram la fenetre DEMANDEE (cutoff -> maintenant). Les comptes nominaux
+    # viennent de load_requests (il a deja lu chaque tete req-* pour
+    # l'appariement) — pas de relecture (#940).
+    fleet = [m.strip() for m in args.fleet.split(",") if m.strip()]
+    now_dt = datetime.now(timezone.utc)
+    _rdir = args.reconcile_dir or bs.default_reconcile_dir()
+    _nominal = Counter(v["machine"] for lst in reqs.values() for v in lst)
+    blind = bs.assess(cdir, cutoff_dt, now_dt, fleet,
+                      reconcile_dir=_rdir, nominal_counts=_nominal)
+
+    # #1152 c — un jour packed en parties est absent du corpus loose que ce
+    # lecteur scanne : l'undercount se DECLARE (ligne PARTIAL), il ne se lit
+    # jamais comme un total. La lecture exacte est le merge de
+    # native-consumption --leak-policy.
+    # #1180 — union des racines, dedupliquee par nom de partie
+    partial = pp.assess_many(dirs, cutoff_dt, now_dt)
+
+    days = (build_days(res["per_day"], dirs, cutoff_dt, now_dt, reqs, fleet, _rdir)
+            if args.per_day else None)
+
+    emit_report(res, args=args, dirs=dirs, cdir=cdir, cutoff_dt=cutoff_dt,
+                now_dt=now_dt, window_hours=args.hours, fleet=fleet, rdir=_rdir,
+                blind=blind, partial=partial, days=days)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
