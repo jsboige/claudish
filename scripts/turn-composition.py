@@ -42,7 +42,7 @@ corpus; each reads the minimum bytes that carry its answer.
 Usage
 -----
   python scripts/turn-composition.py envelope --dir D:\\claudish-captures --label now
-  python scripts/turn-composition.py envelope --dir D:\\claudish-autopsy\\july05 --label july
+  python scripts/turn-composition.py envelope --dir .tmp\\autopsy\\july05 --label july
   python scripts/turn-composition.py history  --dir D:\\claudish-captures --label now --limit 400
   python scripts/turn-composition.py nudge    --dir D:\\claudish-captures --label now --limit 400
   python scripts/turn-composition.py archive --archives "<gdrive>\\...\\captures-2026-07-*.7z" --label july
