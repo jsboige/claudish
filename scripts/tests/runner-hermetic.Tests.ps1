@@ -8,7 +8,8 @@
     clear/restore (the exit/slot suites) covers the scripts THEY call; the
     runner reset (#1166) is the net for every future suite that forgets.
 
-    Four pins (the fourth answers ai-01's file-23a addendum):
+    Five pins (the fourth answers ai-01's file-23a addendum; the fifth answers
+    the #1167 coordinator review, c.7093151774):
       1. the wrapper run-pester.ps1, executed under an ARMED sentinel root,
          leaves that sentinel EMPTY (child env form cleared) and RESTORES the
          seat env on exit;
@@ -25,6 +26,13 @@
          measures the destructive premise, so a suite combining -GDriveDir
          with a REAL -ArchiveDir knows exactly what it arms. Sentinel dirs
          only; the fake off-site copy is planted byte-identical BY the test.
+      5. BEHAVIOURAL pin for run-pester51.ps1 (pin 2 is source-only, and the
+         review's mutation M2 — reset line removed from the 5.1 runner —
+         SURVIVED it): a real powershell.exe child runs the 5.1 runner on a
+         throwaway probe suite; the probe must see an EMPTY root and pattern,
+         and the calling process must see the seat values RESTORED after the
+         call (the CI leg dot-calls this file, so the finally restore must
+         hold in-process).
 
     Everything runs in temp dirs; the sentinel is NOT the seat's real store.
 #>
@@ -85,6 +93,23 @@ BeforeAll {
             -ProgressHeartbeatSec 0 -MachineTag 'testtag' 2>&1 | ForEach-Object { "$_" }
     }
 
+    function New-ProbeSuite {
+        # A throwaway Pester suite that dumps the env ITS Invoke-Pester
+        # session actually sees. Shared by the 7.x wrapper pin (pin 1) and
+        # the 5.1 behavioural pin (pin 5, #1167 review).
+        param([string]$Dir, [string]$OutFile)
+        $probe = Join-Path $Dir 'probe.Tests.ps1'
+        $probeBody = @(
+            "Describe 'env probe' {"
+            "  It 'dumps env' {"
+            "    @{ root = [Environment]::GetEnvironmentVariable('CLAUDISH_GDRIVE_ROOT'); watch = [Environment]::GetEnvironmentVariable('CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN') } | ConvertTo-Json | Set-Content -LiteralPath '$OutFile' -Encoding UTF8"
+            "  }"
+            "}"
+        )
+        [System.IO.File]::WriteAllLines($probe, $probeBody, [System.Text.Encoding]::UTF8)
+        return $probe
+    }
+
     function New-OldCapture {
         param([string]$Dir)
         New-Item -ItemType Directory -Force -Path $Dir | Out-Null
@@ -112,16 +137,8 @@ Describe 'runner hermeticity (#1166)' {
             # file's dir would recurse into ourselves).
             $emptyDir = Join-Path $sentinel 'emptytests'
             New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
-            $probe = Join-Path $emptyDir 'probe.Tests.ps1'
             $outFile = Join-Path $sentinel 'child-env.json'
-            $probeBody = @(
-                "Describe 'env probe' {"
-                "  It 'dumps env' {"
-                "    @{ root = [Environment]::GetEnvironmentVariable('CLAUDISH_GDRIVE_ROOT'); watch = [Environment]::GetEnvironmentVariable('CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN') } | ConvertTo-Json | Set-Content -LiteralPath '$outFile' -Encoding UTF8"
-                "  }"
-                "}"
-            )
-            [System.IO.File]::WriteAllLines($probe, $probeBody, [System.Text.Encoding]::UTF8)
+            New-ProbeSuite -Dir $emptyDir -OutFile $outFile | Out-Null
             $env:CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN = 'sentinel-pattern'
             & $script:Wrapper -Path $emptyDir *> $null
             $childEnv = Get-Content -LiteralPath $outFile -Raw | ConvertFrom-Json
@@ -143,6 +160,51 @@ Describe 'runner hermeticity (#1166)' {
         $src | Should -Match 'CLAUDISH_GDRIVE_ROOT'
         $src | Should -Match 'CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN'
         $src | Should -Match 'finally'
+    }
+
+    It 'run-pester51.ps1 CLEARS the armed root in a real 5.1 child and RESTORES it (behavioural, #1167 review)' {
+        # Coordinator CR c.7093151774: the source pin above lets a mutant
+        # that NAMES the variables but no longer clears them pass (mutation
+        # M2, reset line removed from the 5.1 runner, SURVIVED it). This pin
+        # EXECUTES run-pester51.ps1 under a real powershell.exe child:
+        #   - the probe suite (inside the child's Invoke-Pester) must see an
+        #     EMPTY root and pattern => the reset really ran;
+        #   - the calling 5.1 process must see the seat values AGAIN after
+        #     the call => the finally restore holds in-process (the CI leg
+        #     dot-calls this runner, a leak would outlive the run).
+        if (-not (Get-Command powershell.exe -ErrorAction SilentlyContinue)) {
+            Set-ItResult -Skipped -Because 'powershell.exe absent on this runner: the 5.1 lane cannot exist here'
+            return
+        }
+        $sentinel = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-herm51-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $sentinel | Out-Null
+        $savedRoot = $env:CLAUDISH_GDRIVE_ROOT
+        $savedWatch = $env:CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN
+        try {
+            $emptyDir = Join-Path $sentinel 'emptytests'
+            New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
+            $outFile = Join-Path $sentinel 'child-env51.json'
+            New-ProbeSuite -Dir $emptyDir -OutFile $outFile | Out-Null
+            $afterFile = Join-Path $sentinel 'after-env51.json'
+            $env:CLAUDISH_GDRIVE_ROOT = $sentinel
+            $env:CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN = 'sentinel-pattern'
+            # Single-quoted layout on purpose: $env: must reach the child
+            # UNEXPANDED (double quotes would interpolate the parent's values
+            # into the command text).
+            $cmd = "& '{0}' -Path '{1}'; @{{ root = `$env:CLAUDISH_GDRIVE_ROOT; watch = `$env:CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN }} | ConvertTo-Json | Set-Content -LiteralPath '{2}' -Encoding UTF8" -f $script:Runner51, $emptyDir, $afterFile
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $cmd *> $null
+            $childEnv = Get-Content -LiteralPath $outFile -Raw | ConvertFrom-Json
+            $childEnv.root | Should -BeNullOrEmpty
+            $childEnv.watch | Should -BeNullOrEmpty
+            $afterEnv = Get-Content -LiteralPath $afterFile -Raw | ConvertFrom-Json
+            $afterEnv.root | Should -Be $sentinel
+            $afterEnv.watch | Should -Be 'sentinel-pattern'
+        }
+        finally {
+            $env:CLAUDISH_GDRIVE_ROOT = $savedRoot
+            $env:CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN = $savedWatch
+            Remove-Item -Recurse -Force $sentinel -ErrorAction SilentlyContinue
+        }
     }
 
     It 'DATE PARAMETERS: explicit -GDriveDir arms the local retention purge (KeepLocalDays=0 deletes off-site-confirmed archives)' {
@@ -186,7 +248,8 @@ Describe 'runner hermeticity (#1166)' {
         }
     }
 
-    It 'MUTATION PREMISE: armed root + NO reset = an off-site deposit (red if the underlying behavior changed)' {        $sentinel = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-herm-armed-" + [guid]::NewGuid().ToString('N'))
+    It 'MUTATION PREMISE: armed root + NO reset = an off-site deposit (red if the underlying behavior changed)' {
+        $sentinel = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-herm-armed-" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $sentinel | Out-Null
         $cap = Join-Path $sentinel 'captures'; $arch = Join-Path $sentinel 'arch'
         New-OldCapture -Dir $cap | Out-Null
