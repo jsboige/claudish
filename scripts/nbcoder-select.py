@@ -306,6 +306,16 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
     than a sibling lane's PR — that race is the reason the bar exists. In the
     plain reporting path the cache is 15 min and its age is recorded per entry.
     """
+    # 23/11: the claim leg used to answer 'blocked(rc=2)' for EVERY issue when
+    # --repo pointed anywhere but the CoursIA checkout (the script path does not
+    # exist there, python exits 2, and a non-zero rc read as a blocking claim).
+    # That is the 'instrument unreachable = clean slate' inversion: a bar that
+    # cannot measure must refuse, never report a claim it never read.
+    claim_script = repo / "scripts" / "check_lane_claim.py"
+    if not claim_script.is_file():
+        raise InstrumentError(
+            f"claim organ absent: {claim_script} — pass --repo (or $NBCODER_REPO) pointing at "
+            f"the CoursIA checkout; a missing organ never reads as a claim verdict")
     files = read_pinned_tree(repo, pin)
     cache = tmp_root / "pr-files-cache.json"
     taken_pr: dict[str, int] = {}
@@ -357,13 +367,31 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
         claim = subprocess.run([sys.executable, str(repo / "scripts" / "check_lane_claim.py"),
                                 str(n), "--lane", lane], cwd=str(repo),
                                capture_output=True, text=True, encoding="utf-8")
-        claim_verdict = "clear" if claim.returncode == 0 else f"blocked(rc={claim.returncode})"
+        # check_lane_claim.py contract (issue mode): 0 ok / 1 blocked (other lane, or the
+        # weekly EPIC cap) / 2 io-or-gh error **or a NOT_SCOPED blocker** -- without
+        # `--paths` the organ cannot prove disjointness, so a legacy `blocking_lanes`
+        # entry lands on 2 (#11755, measured 23/11 on #27108). Both mean 'not clear',
+        # so the verdict stays fail-closed; it now NAMES which of the two it was and
+        # carries the organ's own first stderr line, where the blocking lane is written.
+        if claim.returncode == 2:
+            claim_verdict = "blocked(rc=2: not-scoped-or-io)"
+        elif claim.returncode == 0:
+            claim_verdict = "clear"
+        else:
+            claim_verdict = f"blocked(rc={claim.returncode})"
+        claim_note = ""
+        if claim.returncode != 0:
+            for line in (claim.stderr or "").splitlines():
+                if line.strip() and not line.startswith("  "):
+                    claim_note = line.strip()[:160]
+                    break
         if claim.returncode != 0:
             reasons.append("claim-" + claim_verdict)
         report[n] = {"target": target,
                      "verdict": "FREE" if not reasons else "BLOCKED",
                      "reasons": reasons,
                      "claim": claim_verdict,
+                     **({"claim_note": claim_note} if claim_note else {}),
                      "last_delivered": delivered[-1]["created_at"] if delivered else None}
         if cache_age_s is not None:
             report[n]["pr_files_cache_age_s"] = cache_age_s
