@@ -198,7 +198,7 @@ def count_nominal_by_machine(corpus_dir, window_start, window_end,
 
 def assess(corpus_dir, window_start, window_end, fleet_extra=(),
            reconcile_dir=None, nominal_counts=None,
-           workers=DEFAULT_HEAD_WORKERS):
+           workers=DEFAULT_HEAD_WORKERS, archives=None):
     """-> {machine: {"nominal": n, "archives": n, "blind": bool}}, + "" inclus.
 
     "" (direct) est rapporte mais jamais BLIND : un client direct du hub n'a
@@ -210,8 +210,14 @@ def assess(corpus_dir, window_start, window_end, fleet_extra=(),
     MEME fenetre (traffic-consumption.py lit deja chaque tete req-* pour
     l'appariement — lui faire relire est le cout releve mesure sur UNC, #940).
     None -> census locale (tetes 400 o des seuls req-* dans la fenetre).
+
+    archives : resultat DEJA calcule de outage_archives(). Un lecteur qui rend
+    PLUSIEURS fenetres (serie par jour, traffic-consumption --per-day) liste
+    les dossiers d'archives une fois, pas une par fenetre ; le predicat BLIND
+    reste celui d'ici, jamais recopie chez l'appelant. None -> liste locale.
     """
-    archives = outage_archives(corpus_dir, reconcile_dir)
+    if archives is None:
+        archives = outage_archives(corpus_dir, reconcile_dir)
     fleet = set(m for m in fleet_extra if m)
     fleet |= set(archives)
     if nominal_counts is None:

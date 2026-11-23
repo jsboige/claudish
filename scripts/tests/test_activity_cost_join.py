@@ -116,6 +116,9 @@ def main():
                  con([{"date": "2026-11-20", "out": 100, "partial": True}]),
                  today="2026-11-23")
     check("partial consommation", "partial" in row(j, "2026-11-20")["flags"])
+    # AC #1161 stage-2 (b) : une consommation partiale ne se ratio PAS en
+    # silence — le drapeau seul ne suffirait pas si un ratio sortait quand meme.
+    check("partial consommation sans ratio", row(j, "2026-11-20")["ratio"] is None)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     j = acj.join(act({today: 3}), con([{"date": today, "out": 10}]))
     r = row(j, today)

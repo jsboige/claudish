@@ -47,7 +47,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 
 REQ_FN = re.compile(r"^req-(\d+)-(\d+)-(.+)\.json$")
@@ -270,6 +270,92 @@ def fmt_int(n):
     return f"{n:,}".replace(",", " ")
 
 
+def build_days(per_day, corpus_dir, cutoff_dt, now_dt, reqs, fleet,
+               reconcile_dir):
+    """Serie par JOUR UTC (#1161 stage 2, grain producteur) — la consommation
+    que `activity-cost-join.py` met en regard des contributions GitHub.
+
+    -> [{"date", "n", "in", "out", "cache_create", "cache_read",
+         "partial"?, "blind"?}]
+
+    Un jour n'est emis que s'il PORTE une mesure (resp loose dans la fenetre)
+    ou une DECLARATION (partie de jour / archive de jour, #1152 c) : un jour
+    sans rien n'est pas un zero de consommation, il est absent — le joiner le
+    nomme `activity-only` au lieu d'inventer un inEq nul.
+
+    partial : jour courant (pas fini), premier jour de la fenetre (coupe au
+    cutoff, pas a minuit), et tout jour dont les captures sont packees en
+    parties ou en archive de jour — ce lecteur ne les ouvre pas (la lecture
+    exacte est native-consumption --leak-policy). Jamais ratio-able.
+
+    blind : predicat de lib/blind_spot.py applique au JOUR (machine de la
+    flotte a 0 nominal ET 0 archive ce jour = inconnu, pas zero) ; archives
+    listees UNE fois pour toute la serie, la regle reste celle de la lib.
+    """
+    pp = _load_partial_parts()
+    part_days = Counter()
+    arch_days = set()
+    try:
+        names = os.listdir(pp.archive_dir(corpus_dir))
+    except OSError:
+        names = []
+    for fn in names:
+        m = pp.PART_FN.match(fn)
+        if m:
+            part_days[m.group("day")] += 1
+            continue
+        m = pp.DAY_ARCHIVE_FN.match(fn)
+        if m:
+            arch_days.add(m.group(1))
+
+    bs = _load_blind_spot()
+    archives = bs.outage_archives(corpus_dir, reconcile_dir)
+
+    nom_by_day = defaultdict(Counter)
+    for lst in reqs.values():
+        for r in lst:
+            dt = capture_dt(r["ts"])
+            if dt is not None:
+                nom_by_day[dt.date().isoformat()][r["machine"]] += 1
+
+    today = now_dt.date().isoformat()
+    cutoff_day = cutoff_dt.date().isoformat()
+    midnight = cutoff_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    starts_at_midnight = cutoff_dt == midnight
+
+    declared = {d for d in part_days if d >= cutoff_day}
+    declared |= {d for d in arch_days if d >= cutoff_day}
+    days = []
+    for day in sorted(set(per_day) | declared):
+        tot = per_day.get(day) or dict(n=0, inp=0, out=0, cread=0, ccre=0)
+        row = {"date": day, "n": tot["n"], "in": tot["inp"], "out": tot["out"],
+               "cache_create": tot["ccre"], "cache_read": tot["cread"]}
+        reasons = []
+        if day == today:
+            reasons.append("current-day")
+        if day == cutoff_day and not starts_at_midnight:
+            reasons.append("window-start")
+        if part_days.get(day):
+            reasons.append(f"packed:{part_days[day]}-parts")
+        if day in arch_days:
+            reasons.append("day-archive")
+        if reasons:
+            row["partial"] = True
+            row["partial_reasons"] = reasons
+        d0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        d1 = d0 + timedelta(days=1)
+        res = bs.assess(corpus_dir, max(d0, cutoff_dt), min(d1, now_dt), fleet,
+                        reconcile_dir=reconcile_dir,
+                        nominal_counts=dict(nom_by_day.get(day, {})),
+                        archives=archives)
+        blind_m = sorted(m for m, r in res.items() if r["blind"])
+        if blind_m:
+            row["blind"] = True
+            row["blind_machines"] = blind_m
+        days.append(row)
+    return days
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--hours", type=float, default=24.0)
@@ -287,6 +373,10 @@ def main():
                     help="dossier des archives outage-*.7z (defaut : GDrive du "
                          "script de reconciliation, env CLAUDISH_RECONCILE_DIR ; "
                          "<corpus>/reconcile reste source additionnelle, #940)")
+    ap.add_argument("--per-day", action="store_true",
+                    help="serie par jour UTC (#1161 stage 2) : cle `days` du "
+                         "JSON, et table par jour en mode texte — le contrat lu "
+                         "par activity-cost-join.py (partial/blind compris)")
     args = ap.parse_args()
 
     cutoff = datetime.now(timezone.utc).timestamp() - args.hours * 3600
@@ -300,6 +390,7 @@ def main():
     # suffit pas (deux sieges peuvent porter le meme harnais), la machine seule
     # ne distingue pas le harnais du reste du siege.
     hlanes = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
+    per_day = defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0))
     n_resp = n_paired = n_unpaired = n_nousage = 0
     first_dt = last_dt = None
 
@@ -348,6 +439,13 @@ def main():
         # lane harnais declaree (une absence n'est pas un 0 mesurable).
         if info.get("hlane"):
             keys.append((hlanes, f"{info['hlane']} | {info['machine'] or 'direct'}"))
+        if args.per_day:
+            drow = per_day[dt.date().isoformat()]
+            drow["n"] += 1
+            drow["inp"] += inp
+            drow["out"] += out
+            drow["cread"] += cread
+            drow["ccre"] += ccre
         for table, key in keys:
             r = table[key][bucket]
             r["n"] += 1
@@ -379,6 +477,9 @@ def main():
     pp = _load_partial_parts()
     partial = pp.assess(args.dir, cutoff_dt, now_dt)
 
+    days = (build_days(per_day, args.dir, cutoff_dt, now_dt, reqs, fleet, _rdir)
+            if args.per_day else None)
+
     if args.json:
         print(json.dumps({
             "window_hours": args.hours,
@@ -393,6 +494,7 @@ def main():
             "partial_parts": ({"partial": partial["partial"],
                                "days": partial["days"]}
                               if partial["partial"] else None),
+            "days": days,
         }, indent=2))
         return
 
@@ -460,6 +562,28 @@ def main():
     for line in bs.render(args.dir, cutoff_dt, now_dt, fleet,
                           reconcile_dir=_rdir, res=blind):
         print(line)
+
+    if days is not None:
+        print("\n== par jour UTC (--per-day, #1161) ==")
+        if not days:
+            print("  aucune mesure ni declaration de jour dans la fenetre — "
+                  "serie vide, pas une consommation nulle")
+        else:
+            dhdr = (f"{'date':12} {'req':>6} {'in_tok':>13} {'out_tok':>12} "
+                    f"{'cache_rd':>13} {'cache_wr':>12}  flags")
+            print(dhdr)
+            print("-" * len(dhdr))
+            for d in days:
+                flags = list(d.get("partial_reasons") or [])
+                if d.get("blind"):
+                    flags.append("BLIND:" + ",".join(d.get("blind_machines") or []))
+                print(f"{d['date']:12} {d['n']:>6} {fmt_int(d['in']):>13} "
+                      f"{fmt_int(d['out']):>12} {fmt_int(d['cache_read']):>13} "
+                      f"{fmt_int(d['cache_create']):>12}  "
+                      f"{','.join(flags) if flags else '-'}")
+            print("lecture: un jour `partial` (jour courant, coupe de fenetre, "
+                  "parties/archive non ouvertes) ou BLIND n'est jamais ratio — "
+                  "il nomme un non-mesure, pas un zero.")
 
     print(f"\ntotal out_tok fenetre: {fmt_int(total_out)} | debit moyen out: {fmt_int(int(total_out / span_h))}/h")
 
