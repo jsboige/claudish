@@ -25,6 +25,10 @@ This file pins the PRODUCER of that shape:
       never forgotten; `--per-day` changes the `days` key and NOTHING else
       (so a key another reader adds to the JSON — `coverage` — is carried,
       never dropped).
+  P8  #1180 (review ai-01) — `COVERAGE dirs=<read>/<requested> uncovered=…`
+      counts the roots READ; the JSON carries `coverage {requested, covered,
+      uncovered}` with and without --per-day; an unreadable root makes every
+      emitted day `partial` (`uncovered-roots:N`), so the join refuses it.
 
 Run: python scripts/tests/test_traffic_consumption_per_day.py
 """
@@ -232,6 +236,48 @@ def main():
               by2.get(d1))
         check("une seule racine : ce jour reste absent (l'union ne fabrique rien)",
               gap not in by, sorted(by))
+
+        print("P8 — #1180 (review ai-01, finding 1) : la COVERAGE compte les racines LUES")
+        missing = os.path.join(tmp, "no-such-root")
+        out = run([root, root2, missing], "--per-day", "--json")
+        check("rc=0 (une racine illisible ne tue pas le rapport)",
+              out.returncode == 0, out.stderr[-400:])
+        want = {"requested": [root, root2, missing], "covered": [root, root2],
+                "uncovered": [missing]}
+        doc8 = json.loads(out.stdout)
+        check("cle `coverage` = {requested, covered, uncovered}",
+              doc8.get("coverage") == want, doc8.get("coverage"))
+        plain8 = json.loads(run([root, root2, missing], "--json").stdout)
+        check("meme `coverage` sans --per-day", plain8.get("coverage") == want,
+              plain8.get("coverage"))
+        by8 = {d["date"]: d for d in doc8["days"]}
+        check("chaque jour emis est partial, raison `uncovered-roots:1`",
+              bool(by8) and all(d.get("partial") is True
+                                and "uncovered-roots:1" in d.get("partial_reasons", [])
+                                for d in by8.values()), by8)
+        check("l'avertissement par racine reste sur stderr",
+              "capture dir unreadable" in out.stderr, out.stderr[-300:])
+        line = next((ln for ln in run([root, root2, missing], "--per-day").stdout.splitlines()
+                     if ln.startswith("COVERAGE ")), "")
+        check("stdout : COVERAGE dirs=2/3 uncovered=<racine>",
+              line == f"COVERAGE dirs=2/3 uncovered={missing}", line)
+        cov2 = json.loads(run([root, root2], "--per-day", "--json").stdout).get("coverage")
+        check("toutes lues : `uncovered` vide",
+              cov2 == {"requested": [root, root2], "covered": [root, root2], "uncovered": []}, cov2)
+        line = next((ln for ln in run([root, root2], "--per-day").stdout.splitlines()
+                     if ln.startswith("COVERAGE ")), "")
+        check("stdout : COVERAGE dirs=2/2, pas de `uncovered=`", line == "COVERAGE dirs=2/2", line)
+        # le refus se lit jusqu'au join : le document a demi lu ne donne aucun ratio
+        prod8 = os.path.join(tmp, "consumption-half.json")
+        with open(prod8, "w") as fh:
+            fh.write(json.dumps(doc8))
+        joined = subprocess.run(
+            [sys.executable, "-I", _JOIN, "--activity", act,
+             "--consumption", prod8, "--json"], capture_output=True, text=True)
+        rows8 = {r["date"]: r for r in json.loads(joined.stdout)["rows"]}
+        check("joiner : aucun ratio sur un document lu d'un demi-corpus",
+              joined.returncode == 0 and all(r["ratio"] is None and "partial" in r["flags"]
+                                             for r in rows8.values()), rows8)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

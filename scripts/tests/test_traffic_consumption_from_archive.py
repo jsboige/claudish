@@ -24,6 +24,9 @@ un jour déjà présent n'est pas relu."
   A9  several roots — the day's archives are the union deduplicated by name
   A10 ratio-able — the series file feeds activity-cost-join (AC c), the day
       gets a ratio and no partial flag
+  A11 coverage (#1180, review ai-01) — the report and the persisted row carry
+      the same `coverage {requested, covered, uncovered}`; an unreadable root
+      refuses BEFORE the archive is opened (a poison archive stays unopened)
 
 Real py7zr archives, real subprocess runs — py7zr lives in the user site on
 the seats, so neither this process nor its children run under `-I`.
@@ -434,6 +437,63 @@ def main():
         check("le jour sans consommation est nomme activity-only, pas un zero",
               "activity-only" in rows[OTHER]["flags"] and rows[OTHER]["ratio"] is None,
               rows.get(OTHER))
+
+        print("A11 — couverture (#1180, review ai-01) : la ligne persiste ce qu'elle a "
+              "lu ; une racine illisible refuse AVANT de payer")
+        work11 = os.path.join(tmp, "w11")
+        os.makedirs(work11)
+        series11 = os.path.join(work11, "traffic-days.json")
+        out = read_day(root9, series11, work11)
+        check("rc=0", out.returncode == 0, out.stderr[-400:])
+        doc = json.loads(out.stdout)
+        one = {"requested": [root9], "covered": [root9], "uncovered": []}
+        check("cle `coverage` du rapport = {requested, covered, uncovered}",
+              doc.get("coverage") == one, doc.get("coverage"))
+        row11, _ = row_of(series11)
+        check("la ligne de la serie porte le MEME objet (elle persiste seule)",
+              row11.get("coverage") == one, row11.get("coverage"))
+        series11b = os.path.join(work11, "traffic-days-b.json")
+        txt = run(root9, series11b, work11, "--from-archive", DAY, roots=[root9, root9b])
+        check("deux racines lues : rc=0", txt.returncode == 0, txt.stderr[-400:])
+        check("stdout : COVERAGE dirs=2/2, sans `uncovered=`",
+              "COVERAGE dirs=2/2" in txt.stdout and "uncovered=" not in txt.stdout,
+              txt.stdout[:300])
+        check("provenance : racines du corpus couvertes 2/2",
+              "racines du corpus couvertes 2/2" in txt.stdout, txt.stdout[-700:])
+        two = {"requested": [root9, root9b], "covered": [root9, root9b], "uncovered": []}
+        check("la ligne porte ses deux racines",
+              row_of(series11b)[0].get("coverage") == two, row_of(series11b)[0].get("coverage"))
+        ghost = os.path.join(tmp, "ghost-root")            # absente : illisible
+        # 2e racine illisible, archive VALABLE sous la 1re : sans le refus, le
+        # jour serait lu et INSCRIT — une ligne d'un demi-corpus, sans trace.
+        series11c = os.path.join(work11, "traffic-days-c.json")
+        out = read_day(root9, series11c, work11, roots=[root9, ghost])
+        check("2e racine illisible : rc=2", out.returncode == 2, (out.returncode, out.stderr[-300:]))
+        check("2e racine : refus qui nomme la racine, 'rien n'est ecrit', aucune serie, stdout vide",
+              ghost in out.stderr and "racine de corpus illisible" in out.stderr
+              and "rien n'est ecrit" in out.stderr and not os.path.exists(series11c)
+              and out.stdout == "", (out.stderr[-400:], os.path.exists(series11c), out.stdout[:100]))
+        # 1re racine illisible, archive POISON de meme longueur sous la 2e (A2) :
+        # toute ouverture echouerait sur « archive du jour illisible » — le
+        # refus doit nommer la RACINE, preuve que l'archive n'a pas ete ouverte.
+        root11 = build(tmp, n=2, name="corpus11")
+        arch11 = os.path.join(root11, "archive", f"captures-{DAY}.7z")
+        size11 = os.path.getsize(arch11)
+        with open(arch11, "r+b") as fh:
+            fh.seek(32)
+            fh.write(b"\x00" * (size11 - 32))
+        assert os.path.getsize(arch11) == size11
+        series11d = os.path.join(work11, "traffic-days-d.json")
+        out = read_day(ghost, series11d, work11, roots=[ghost, root11])
+        check("1re racine illisible : rc=2", out.returncode == 2, (out.returncode, out.stderr[-300:]))
+        check("1re racine : l'archive POISON n'a pas ete ouverte (le refus nomme la racine)",
+              ghost in out.stderr and "racine de corpus illisible" in out.stderr
+              and "archive du jour illisible" not in out.stderr
+              and "extrait en" not in out.stderr, out.stderr[-500:])
+        check("1re racine : aucune serie ecrite", not os.path.exists(series11d), series11d)
+        left = os.path.join(work11, "traffic-days")
+        check("aucune extraction laissee", not os.path.exists(left) or os.listdir(left) == [],
+              os.listdir(left) if os.path.exists(left) else "-")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

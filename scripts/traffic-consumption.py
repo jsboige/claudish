@@ -292,14 +292,51 @@ def fmt_int(n):
     return f"{n:,}".replace(",", " ")
 
 
+def root_coverage(dirs, errors=None):
+    """(#1180, review ai-01 finding 1) ce que le lecteur a VU des racines
+    demandees — pas ce qu'on lui a demande. Une racine est couverte si son
+    `listdir` reussit ; celle qui leve (absente, hors d'acces) est
+    `uncovered` et se nomme sur STDOUT, pas seulement sur stderr : un lecteur
+    qui ne lit que stdout verrait sinon `dirs=2` — l'angle mort que #1180
+    existe pour interdire.
+
+    -> {"requested": [racines], "covered": [racines], "uncovered": [racines]}
+    errors (dict, optionnel) : rempli {racine: "<Type>: <message>"} pour les
+    racines non couvertes — le texte de l'erreur sert au refus, jamais a la
+    cle `coverage` (sa forme est celle de la review : trois listes).
+    """
+    covered, uncovered = [], []
+    for d in dirs:
+        try:
+            os.listdir(d)
+        except OSError as exc:
+            uncovered.append(d)
+            if errors is not None:
+                errors[d] = f"{type(exc).__name__}: {exc}"
+        else:
+            covered.append(d)
+    return {"requested": list(dirs), "covered": covered, "uncovered": uncovered}
+
+
+def coverage_line(coverage):
+    """`COVERAGE dirs=<lues>/<demandees>[ uncovered=<racine>,<racine>]` —
+    le nombre de racines LUES sur le nombre DEMANDEES ; les non-lues sont
+    nommées sur la ligne."""
+    line = (f"COVERAGE dirs={len(coverage['covered'])}/"
+            f"{len(coverage['requested'])}")
+    if coverage["uncovered"]:
+        line += " uncovered=" + ",".join(coverage["uncovered"])
+    return line
+
+
 def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
-               reconcile_dir, opened=False, only=False):
+               reconcile_dir, opened=False, only=False, coverage=None):
     """Serie par JOUR UTC (#1161 stage 2, grain producteur) — la consommation
     que `activity-cost-join.py` met en regard des contributions GitHub.
 
     -> [{"date", "n", "in", "out", "cache_create", "cache_read",
          "partial"?, "partial_reasons"?, "blind"?, "blind_machines"?,
-         "source"?, "archive"?, "loose_residual"?}]
+         "source"?, "archive"?, "loose_residual"?, "coverage"?}]
 
     Un jour n'est emis que s'il PORTE une mesure (resp lue) ou une
     DECLARATION (partie de jour / archive de jour, #1152 c) : un jour sans
@@ -327,6 +364,9 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
     blind : predicat de lib/blind_spot.py applique au JOUR (machine de la
     flotte a 0 nominal ET 0 archive ce jour = inconnu, pas zero) ; archives
     listees UNE fois pour toute la serie, la regle reste celle de la lib.
+    coverage (#1180) : objet de root_coverage. Une racine NON LUE marque
+    CHAQUE jour `uncovered-roots:<n>` — le jour vient d'un corpus a demi lu,
+    le joiner le refuse comme tout `partial` ; jamais un ratio en silence.
     """
     cdir = corpus_dirs[0]
     pp = _load_partial_parts()
@@ -383,6 +423,8 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
                 reasons.append(f"packed:{part_days[day]}-parts")
             if day in arch_days:
                 reasons.append("day-archive")
+        if coverage and coverage["uncovered"]:
+            reasons.append(f"uncovered-roots:{len(coverage['uncovered'])}")
         if reasons:
             row["partial"] = True
             row["partial_reasons"] = reasons
@@ -523,11 +565,13 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
 
 
 def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet,
-                rdir, blind, partial, days,
+                rdir, blind, partial, days, coverage,
                 day_title="== par jour UTC (--per-day, #1161) ==",
                 day_provenance=False, extra=None):
     """Le rapport (JSON ou texte) d'UN scan — rendu une seule fois, partage par
-    la fenetre loose et le mode --from-archive (qui ajoute sa cle `series`)."""
+    la fenetre loose et le mode --from-archive (qui ajoute sa cle `series`).
+    coverage : l'objet de root_coverage — cle `coverage` du JSON et ligne
+    `COVERAGE` du texte, les deux comptent les racines LUES, pas demandees."""
     lanes, machines, hlanes = res["lanes"], res["machines"], res["hlanes"]
     first_dt, last_dt = res["first_dt"], res["last_dt"]
     span_h = ((last_dt - first_dt).total_seconds() / 3600) if (first_dt and last_dt and last_dt > first_dt) else window_hours
@@ -540,6 +584,7 @@ def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet
             "covered_to": last_dt.isoformat() if last_dt else None,
             "covered_span_hours": round(span_h, 3),
             "files": files,
+            "coverage": coverage,
             "lanes": {k: v for k, v in lanes.items()},
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
             "harness_lanes": {k: v for k, v in hlanes.items()} if args.harness_lanes else None,
@@ -563,7 +608,7 @@ def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet
     else:
         couv = "couverture (aucune resp dans la fenetre)"
     print(f"fenetre: {window_hours}h demandees | {couv}")
-    print(f"COVERAGE dirs={len(dirs)}")
+    print(coverage_line(coverage))
     print(f"resp: {files['resp']} | appariees: {files['paired']} | non appariees: {files['unpaired']} | sans usage: {files['no_usage']}")
     pp = _load_partial_parts()
     for _line in pp.section(cdir, cutoff_dt, now_dt, res=partial):
@@ -657,15 +702,21 @@ def print_days(days, title, provenance=False):
 
 def print_provenance(days):
     """Une ligne par jour lu depuis son archive : de quelle archive, quand,
-    combien de membres, combien de loose fusionne — la trace de la lecture."""
+    combien de membres, combien de loose fusionne, de combien de racines du
+    corpus — la trace de la lecture."""
     for d in days:
         a = d.get("archive")
         if d.get("source") != "archive" or not a:
             continue
         files = ", ".join(f"{n} ({fmt_int(s)} o)" for n, s in a.get("files", []))
+        cov = d.get("coverage")
+        roots = ""
+        if cov:
+            roots = (f" ; racines du corpus couvertes {len(cov['covered'])}/"
+                     f"{len(cov['requested'])}")
         print(f"provenance {d['date']} : {files} ; lue le {a.get('read_at')} ; "
               f"{a.get('members', '?')} membres ; residu loose du jour fusionne : "
-              f"{d.get('loose_residual', 0)} fichier(s)")
+              f"{d.get('loose_residual', 0)} fichier(s){roots}")
 
 
 # ---------------------------------------------------------------------------
@@ -820,7 +871,11 @@ def from_archive(args, dirs, pp, bs):
         tailles), n'est PAS relu : sortie 0, zero octet lu du corpus ;
       - une archive qui a CHANGE depuis la lecture n'est pas relue d'office
         (sortie 2, la ligne est conservee) : --reread l'exige ;
-      - aucune archive pour le jour = sortie 2, jamais une ligne a zero.
+      - aucune archive pour le jour = sortie 2, jamais une ligne a zero ;
+      - une racine du corpus ILLISIBLE (#1180) = sortie 2 AVANT toute lecture :
+        la ligne persiste, un jour lu d'un demi-corpus n'est pas une mesure,
+        et le refus ne coute pas la lecture ; la ligne ecrite porte `coverage`
+        (racines demandees / lues / non lues), comme le rapport.
 
     Sortie 0 : jour lu, ou jour deja present. Sortie 2 : rien lu.
     """
@@ -836,6 +891,13 @@ def from_archive(args, dirs, pp, bs):
     def refuse(text):
         print(f"traffic-consumption: {text}", file=sys.stderr)
         return 2
+
+    why = {}
+    cov = root_coverage(dirs, why)
+    if cov["uncovered"]:
+        return refuse("racine de corpus illisible — un jour lu d'un demi-corpus "
+                      "n'est pas une mesure (#1180), rien n'est ecrit : "
+                      + " ; ".join(f"{r} ({why[r]})" for r in cov["uncovered"]))
 
     def show_series():
         if jm:
@@ -986,7 +1048,7 @@ def from_archive(args, dirs, pp, bs):
             f"{res['files']['paired']} appariees, {res['files']['unpaired']} non appariees")
 
         rows = build_days(res["per_day"], dirs, d0, now_dt, res["reqs"], fleet, rdir,
-                          opened=True, only=True)
+                          opened=True, only=True, coverage=cov)
         if not rows:
             return refuse(f"aucune reponse lue pour le {day} ({n_members} membres "
                           f"extraits) — rien n'est ecrit : pas une consommation nulle")
@@ -997,6 +1059,9 @@ def from_archive(args, dirs, pp, bs):
                           "seconds": {"extract": round(t1 - t0, 1),
                                       "scan": round(t2 - t1, 1)}}
         row["loose_residual"] = resid
+        # la ligne persiste seule (le rapport non) : elle garde ce qu'elle a
+        # ete lue — racines demandees, lues, non lues (#1180, review ai-01)
+        row["coverage"] = cov
         series["days"] = sorted([r for r in series["days"] if r["date"] != day] + [row],
                                 key=lambda r: r["date"])
         series["updated"] = read_at
@@ -1022,8 +1087,8 @@ def from_archive(args, dirs, pp, bs):
     partial = pp.assess_many(dirs, d0, until_dt, merged_paths=paths)
     emit_report(res, args=args, dirs=dirs, cdir=cdir, cutoff_dt=d0, now_dt=until_dt,
                 window_hours=24.0, fleet=fleet, rdir=rdir, blind=blind,
-                partial=partial, days=series["days"], day_title=ARCHIVE_TITLE,
-                day_provenance=True, extra={"series": meta})
+                partial=partial, days=series["days"], coverage=cov,
+                day_title=ARCHIVE_TITLE, day_provenance=True, extra={"series": meta})
     return 0
 
 
@@ -1087,6 +1152,9 @@ def main():
 
     res = collect(dirs, cutoff_dt, per_day=args.per_day)
     reqs = res["reqs"]
+    # #1180 (review ai-01) — les racines LUES se comptent sur stdout et dans
+    # le JSON ; une racine illisible marque chaque jour (build_days).
+    cov = root_coverage(dirs)
 
     # #933 — l'angle mort AUTONOMOUS se declare, il ne se lit pas comme un 0 :
     # fleet declaree (+ archives outage, dossier GDrive du script de
@@ -1108,12 +1176,13 @@ def main():
     # #1180 — union des racines, dedupliquee par nom de partie
     partial = pp.assess_many(dirs, cutoff_dt, now_dt)
 
-    days = (build_days(res["per_day"], dirs, cutoff_dt, now_dt, reqs, fleet, _rdir)
+    days = (build_days(res["per_day"], dirs, cutoff_dt, now_dt, reqs, fleet, _rdir,
+                       coverage=cov)
             if args.per_day else None)
 
     emit_report(res, args=args, dirs=dirs, cdir=cdir, cutoff_dt=cutoff_dt,
                 now_dt=now_dt, window_hours=args.hours, fleet=fleet, rdir=_rdir,
-                blind=blind, partial=partial, days=days)
+                blind=blind, partial=partial, days=days, coverage=cov)
     return 0
 
 
