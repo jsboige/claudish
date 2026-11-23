@@ -23,6 +23,15 @@ Chaque pin defend une lecture qu'une implementation plausible obtient FAUX :
      les totaux par type n'existent QUE sur --graphql, dit tel quel.
   8. REPLI FENETRE — sans argument de fenetre : annee glissante ; avec
      --days 1 : 1 jour (le repli ne l'avale pas).
+  9. COUVERTURE (CR #1162) — un jour que le fragment ne rend pas est
+     ABSENT, jamais « 0 contribution » : il est nomme, ni actif ni
+     inactif, et une couverture nulle sort en exit 2 sans rapport.
+ 10. TENDANCE — les N derniers jours CALENDAIRES ; un trou dans la
+     fenetre supprime la somme au lieu d'additionner autour, un trou plus
+     ancien retire la comparaison.
+
+GHA_MODULE=<autre revision> rejoue ces pins contre un autre script (preuve
+qu'un pin est rouge sur l'ancien).
 
 Run: python scripts/tests/test_github_activity.py
 """
@@ -46,7 +55,11 @@ def _load(name, path):
     return mod
 
 
-ga = _load("github_activity", os.path.join(_HERE, "..", "github-activity.py"))
+# GHA_MODULE permet de rejouer CES pins contre une autre revision du script —
+# c'est ainsi qu'on prouve qu'un pin est ROUGE sur l'ancien (mutations, CR).
+ga = _load("github_activity",
+           os.environ.get("GHA_MODULE")
+           or os.path.join(_HERE, "..", "github-activity.py"))
 
 FAILS = []
 
@@ -166,25 +179,23 @@ check("sommaire : somme + fenetre inclusive + actifs",
       f"(got {s})")
 
 print("render_text — source dite, totaux absents dits")
-out = ga.render_text("jsboige", date(2026, 11, 16), date(2026, 11, 22),
-                     {"days": [{"date": f"2026-11-{d}", "count": 100}
-                               for d in range(16, 23)],
-                      "sum": 700, "span_days": 7, "active": 7},
-                     "fragment-anonyme", None, None)
+s14 = ga.summarize({f"2026-11-{d:02d}": 100 for d in range(9, 23)},
+                   date(2026, 11, 9), date(2026, 11, 22))
+out = ga.render_text("jsboige", date(2026, 11, 9), date(2026, 11, 22),
+                     s14, "fragment-anonyme", None, None)
 check("source fragment affichee", "source: fragment-anonyme" in out)
 check("absence de totaux par type dite (--graphql nomme)",
       "--graphql" in out)
-out_w = ga.render_text("x", date(2026, 1, 1), date(2026, 1, 2),
-                       {"days": [], "sum": 0, "span_days": 2, "active": 0},
+s_empty = ga.summarize({}, date(2026, 1, 1), date(2026, 1, 2))
+out_w = ga.render_text("x", date(2026, 1, 1), date(2026, 1, 2), s_empty,
                        "fragment-anonyme", None,
                        {"parsed": 100, "h2": 150, "rel": 0.33, "ok": False})
 check("ecart H2 rendu avec mise en garde", "MEFIE-TOI" in out_w and "33.00%" in out_w)
 
 print("render_html — page auto-suffisante")
+s_h = ga.summarize({"2026-11-20": 1234}, date(2026, 11, 16), date(2026, 11, 22))
 page = ga.render_html("jsboige", date(2026, 11, 16), date(2026, 11, 22),
-                      {"days": [{"date": "2026-11-20", "count": 1234}],
-                       "sum": 1234, "span_days": 7, "active": 1},
-                      {"2026-11-20": 4}, "fragment-anonyme",
+                      s_h, {"2026-11-20": 4}, "fragment-anonyme",
                       {"parsed": 1234, "h2": 1234, "rel": 0.0, "ok": True},
                       "2026-11-22 18:00 UTC")
 check("cellule datée avec compte en title",
@@ -193,11 +204,57 @@ check("aucune ressource externe a l'ouverture",
       "http://" not in page and "https://" not in page)
 check("exactitude H2 rendue", "exact" in page)
 page_w = ga.render_html("x", date(2026, 1, 1), date(2026, 1, 2),
-                        {"days": [], "sum": 0, "span_days": 2, "active": 0},
+                        ga.summarize({}, date(2026, 1, 1), date(2026, 1, 2)),
                         {}, "fragment-anonyme",
                         {"parsed": 100, "h2": 150, "rel": 0.33, "ok": False},
                         "t")
 check("warning d'ecart rendu dans la page", "ecart 33.00%" in page_w)
+
+print("couverture — un jour ABSENT n'est pas un jour a zero (CR #1162)")
+# Fenetre 17->23/11 ; le 19 est absent ; le 18 a REELLEMENT zero contribution.
+part = {"2026-11-17": 100, "2026-11-18": 0, "2026-11-20": 200,
+        "2026-11-21": 300, "2026-11-22": 50, "2026-11-23": 10}
+sc = ga.summarize(part, date(2026, 11, 17), date(2026, 11, 23))
+check("couverture comptee : 6 lus / 7 demandes",
+      sc.get("covered") == 6 and sc.get("span_days") == 7, f"(got {sc})")
+check("le jour absent est nomme", sc.get("absent") == ["2026-11-19"],
+      f"(got {sc.get('absent')})")
+check("absent ni actif ni inactif : 5 actifs sur 6 lus (le 18 est un vrai zero)",
+      sc.get("active") == 5, f"(got {sc.get('active')})")
+out_c = ga.render_text("x", date(2026, 11, 17), date(2026, 11, 23), sc,
+                       "fragment-anonyme", None, None)
+check("ligne de couverture en texte, absent != 0",
+      "couverture: 6/7" in out_c and "2026-11-19" in out_c
+      and "absent != 0" in out_c, f"(got {out_c!r})")
+page_c = ga.render_html("x", date(2026, 11, 17), date(2026, 11, 23), sc,
+                        {}, "fragment-anonyme", None, "t")
+check("page HTML : couverture dite + cellule de trou dessinee",
+      "couverture : 6/7" in page_c and "absent (hors fragment)" in page_c)
+
+print("tendance — jours CALENDAIRES, jamais de somme autour d'un trou")
+full = {f"2026-11-{d:02d}": 10 for d in range(9, 23)}     # 14 jours pleins
+tr_full = (ga.summarize(full, date(2026, 11, 9), date(2026, 11, 22))
+           .get("trend") or {})
+check("14 j pleins : 7 j = 70, precedent = 70",
+      tr_full.get("complete") is True and tr_full.get("sum") == 70
+      and tr_full.get("prev_sum") == 70, f"(got {tr_full})")
+hole = {k: v for k, v in full.items() if k != "2026-11-19"}   # trou dans les 7 j
+sh = ga.summarize(hole, date(2026, 11, 9), date(2026, 11, 22))
+tr_hole = sh.get("trend") or {}
+check("trou dans les 7 derniers -> somme nulle-part, le trou nomme",
+      tr_hole.get("complete") is False and tr_hole.get("sum") is None
+      and tr_hole.get("absent") == ["2026-11-19"], f"(got {tr_hole})")
+out_h = ga.render_text("x", date(2026, 11, 9), date(2026, 11, 22), sh,
+                      "fragment-anonyme", None, None)
+check("texte : 'incomplet' + le trou, aucun chiffre de tendance",
+      "7 derniers jours: incomplet" in out_h and "2026-11-19" in out_h,
+      f"(got {out_h!r})")
+old_hole = {k: v for k, v in full.items() if k != "2026-11-10"}  # trou anterieur
+tr_old = (ga.summarize(old_hole, date(2026, 11, 9), date(2026, 11, 22))
+          .get("trend") or {})
+check("trou hors des 7 j : 7 j = 70, comparaison retiree (pas un faux delta)",
+      tr_old.get("complete") is True and tr_old.get("sum") == 70
+      and tr_old.get("prev_sum") is None, f"(got {tr_old})")
 
 print("main — fenetres CLI, repli, degradation exit 2")
 backup_fetch = ga.fetch_fragment
@@ -256,6 +313,41 @@ try:
     d3 = json.loads(out3.getvalue())
     check("--days 1 = 1 jour (le repli ne l'avale pas)",
           rc3 == 0 and d3["span_days"] == 1, f"(span {d3['span_days']})")
+
+    # --- fragment d'un jour de RETARD (la forme que GitHub rend juste apres
+    # minuit ou depuis un cache) : la fenetre n'est plus couverte.
+    def _fake_stale(login, year=None):
+        FETCH_CALLS.append((login, year))
+        today = datetime.now(timezone.utc).date()
+        parts = ['<h2 id="js-contribution-activity-description">7 '
+                 'contributions in the last year</h2>']
+        for n in range(1, 8):                     # la veille et avant, pas aujourd'hui
+            d = (today - timedelta(days=n)).isoformat()
+            parts.append(td(d, 1, "1 contribution on x."))
+        return ga.parse_fragment("".join(parts))
+
+    ga.fetch_fragment = _fake_stale
+    err_c = io.StringIO()
+    out_c = io.StringIO()
+    sys.argv = ["github-activity.py", "--days", "1"]
+    try:
+        with contextlib.redirect_stdout(out_c), contextlib.redirect_stderr(err_c):
+            rc_c = ga.main()
+    except SystemExit as e:
+        rc_c = e.code
+    check("fenetre non couverte -> exit 2, aucun rapport qui lirait zero",
+          rc_c == 2 and "couverture nulle" in err_c.getvalue()
+          and out_c.getvalue() == "",
+          f"(rc {rc_c}, err {err_c.getvalue()!r}, out {out_c.getvalue()!r})")
+
+    out_c2 = io.StringIO()
+    sys.argv = ["github-activity.py", "--days", "7"]
+    with contextlib.redirect_stdout(out_c2):
+        rc_c2 = ga.main()
+    got_c2 = out_c2.getvalue()
+    check("un jour de retard -> couverture 6/7 nommee, pas 'zero contribution'",
+          rc_c2 == 0 and "couverture: 6/7" in got_c2, f"(rc {rc_c2}, got {got_c2!r})")
+    ga.fetch_fragment = _fake_fragment
 
     tmpdir = tempfile.mkdtemp(prefix="gha-html-")
     page_path = os.path.join(tmpdir, "page.html")

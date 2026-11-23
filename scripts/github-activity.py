@@ -37,9 +37,17 @@ Sortie :
                      jointure stage 2 (activite-par-coût avec les
                      lecteurs de consommation)
 
+Couverture EXPLICITE (CR #1162) : un jour de la fenetre que le fragment ne
+rend pas est ABSENT, jamais « 0 contribution » — il n'est ni actif ni
+inactif, une ligne le nomme (texte, JSON, page). Couverture nulle -> exit 2
+avec un message, comme toute lecture aveugle. La tendance porte sur les N
+derniers jours CALENDAIRES et se taît sur un trou plutot que d'additionner
+autour.
+
 Degradation BRUYANTE : HTTP != 200, fragment sans jour, erreur GraphQL,
 login inconnu -> message exact sur stderr + exit 2. Jamais un rapport
-vide qui se lirait « zero activite ».
+vide qui se lirait « zero activite ». Un 502 du fragment anonyme est
+frequent par rafales : relancer plus tard, ce n'est pas une panne locale.
 
 Usage:
   python scripts/github-activity.py --html %TEMP%/jsboige.html   # annee glissante
@@ -263,11 +271,58 @@ def merge_parsed(parsed_by_year, d_from, d_to):
 
 
 def summarize(days, d_from, d_to):
-    ordered = sorted(days)
-    return {"days": [{"date": d, "count": days[d]} for d in ordered],
-            "sum": sum(days.values()),
-            "span_days": (d_to - d_from).days + 1,
-            "active": sum(1 for c in days.values() if c)}
+    """Resume la fenetre — un jour ABSENT n'est ni actif ni inactif.
+
+    Couverture explicite (CR #1162) : le fragment peut ne pas couvrir toute
+    la fenetre demandee (cache d'un jour de retard au passage de minuit,
+    vue parametree qui rend l'annee glissante). Sans ce compteur, ces jours
+    se lisaient « 0 contribution » — exactement le rapport vide que le
+    corps de #1161 interdit, et stage 2 en ferait un faux « zero sortie a
+    plein cout ».
+    """
+    span = (d_to - d_from).days + 1
+    expected = [(d_from + timedelta(days=k)).isoformat() for k in range(span)]
+    present = [d for d in expected if d in days]
+    absent = [d for d in expected if d not in days]
+    return {"days": [{"date": d, "count": days[d]} for d in sorted(present)],
+            "sum": sum(days[d] for d in present),
+            "span_days": span,
+            "covered": len(present),
+            "absent": absent,
+            "active": sum(1 for d in present if days[d]),
+            "trend": calendar_trend(days, d_from, d_to)}
+
+
+def calendar_trend(days, d_from, d_to):
+    """Tendance sur les N derniers jours CALENDAIRES de la fenetre (N<=7).
+
+    Jamais sur les N derniers jours PARSES : un trou ferait remonter la
+    fenetre par-dela lui et la somme melangerait deux periodes. Un jour
+    absent rend la somme nulle-part (`complete: False`) : on nomme le trou
+    au lieu d'additionner autour.
+    """
+    span = (d_to - d_from).days + 1
+    n = min(7, span)
+    last = [(d_to - timedelta(days=k)).isoformat() for k in range(n - 1, -1, -1)]
+    absent = [d for d in last if d not in days]
+    if absent:
+        return {"n": n, "complete": False, "sum": None, "absent": absent,
+                "prev_sum": None}
+    prev_sum = None
+    if span >= n + 7:
+        prev = [(d_to - timedelta(days=k)).isoformat()
+                for k in range(n + 6, n - 1, -1)]
+        if all(d in days for d in prev):
+            prev_sum = sum(days[d] for d in prev)
+    return {"n": n, "complete": True, "sum": sum(days[d] for d in last),
+            "absent": [], "prev_sum": prev_sum}
+
+
+def absent_label(dates, limit=5):
+    """Liste compacte des jours absents (une annee de trous tient en 1 ligne)."""
+    if len(dates) <= limit:
+        return ", ".join(dates)
+    return ", ".join(dates[:limit]) + f" … (+{len(dates) - limit})"
 
 
 # ---- rendus --------------------------------------------------------------
@@ -276,9 +331,14 @@ def render_text(login, d_from, d_to, s, source, totals, warn):
     lines = [
         f"{login} | {d_from} -> {d_to} ({s['span_days']} j) | source: {source}",
         f"contributions fenetre: {s['sum']:,} "
-        f"({s['sum'] / max(1, s['span_days']):.0f}/j ; "
-        f"{s['active']} j actifs / {s['span_days']})",
+        f"({s['sum'] / max(1, s['covered']):.0f}/j ; "
+        f"{s['active']} j actifs / {s['covered']} j lus)",
     ]
+    if s["covered"] < s["span_days"]:
+        lines.append(
+            f"couverture: {s['covered']}/{s['span_days']} j lus — absent(s): "
+            f"{absent_label(s['absent'])} (absent != 0 : ni actif ni inactif, "
+            f"aucun chiffre ne le compte)")
     if warn is not None:
         lines.append(f"H2 fragment: {warn['h2']:,} vs parse {warn['parsed']:,} "
                      f"(ecart {warn['rel']:.2%}){' OK' if warn['ok'] else ' — MEFIE-TOI'}")
@@ -292,14 +352,17 @@ def render_text(login, d_from, d_to, s, source, totals, warn):
     if top:
         lines.append("top jours: " + " | ".join(f"{d['date']} {d['count']}"
                                                 for d in top))
-    n = len(s["days"])
-    if n >= 7:
-        last7 = sum(d["count"] for d in s["days"][-7:])
-        prev7 = sum(d["count"] for d in s["days"][-14:-7]) if n >= 14 else None
+    tr = s["trend"]
+    label = "7 derniers jours" if tr["n"] == 7 else f"{tr['n']} derniers jours"
+    if not tr["complete"]:
+        lines.append(f"{label}: incomplet — absent(s): {absent_label(tr['absent'])} "
+                     f"(pas de somme autour d'un trou)")
+    else:
         trend = ""
-        if prev7 is not None:
-            trend = f" (7 j precedent: {prev7:,}, {last7 - prev7:+,})"
-        lines.append(f"7 derniers jours: {last7:,}{trend}")
+        if tr["prev_sum"] is not None:
+            trend = (f" ({tr['n']} j precedent: {tr['prev_sum']:,}, "
+                     f"{tr['sum'] - tr['prev_sum']:+,})")
+        lines.append(f"{label}: {tr['sum']:,}{trend}")
     return "\n".join(lines)
 
 
@@ -320,15 +383,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
  table {{ border-collapse: collapse; font-size: .85rem; }}
  td, th {{ border: 1px solid #d0d7de; padding: 3px 10px; text-align: left; }}
  .warn {{ color: #9a6700; }}
+ .cell.absent {{ background: repeating-linear-gradient(45deg,#fff,#fff 2px,
+                 #d0d7de 2px, #d0d7de 4px); }}
 </style></head><body>
 <h1>{login} — activite GitHub</h1>
 <p class="meta">fenetre {d_from} &rarr; {d_to} · source {source} ·
 genere le {generated} · instrument local claudish (#1161), aucun appel a l'ouverture</p>
 <div class="stats">
  <div class="stat"><b>{total:,}</b><span>contributions ({per_day:.0f}/j)</span></div>
- <div class="stat"><b>{active}</b><span>jours actifs / {span}</span></div>
- <div class="stat"><b>{last7:,}</b><span>7 derniers jours{trend}</span></div>
+ <div class="stat"><b>{active}</b><span>jours actifs / {covered} j lus</span></div>
+ <div class="stat"><b>{last7}</b><span>{trend_label}{trend}</span></div>
 </div>
+{coverage_html}
 {warn_html}
 <div class="grid">{cells}</div>
 <table>{top_rows}</table>
@@ -339,20 +405,36 @@ fragment public — <code>--graphql</code> pour les obtenir.</p>
 
 
 def render_html(login, d_from, d_to, s, levels, source, warn, generated):
+    by_date = {d["date"]: d["count"] for d in s["days"]}
     cells = []
-    for d in s["days"]:
-        lvl = min(4, levels.get(d["date"], 4 if d["count"] else 0))
-        color = LEVEL_COLORS[lvl]
-        cells.append(f'<div class="cell" style="background:{color}" '
-                     f'title="{d["date"]}: {d["count"]}"></div>')
+    for k in range(s["span_days"]):
+        iso = (d_from + timedelta(days=k)).isoformat()
+        if iso not in by_date:      # trou : dessine, jamais confondu avec 0
+            cells.append('<div class="cell absent" title="'
+                         f'{iso} : absent (hors fragment)"></div>')
+            continue
+        c = by_date[iso]
+        lvl = min(4, levels.get(iso, 4 if c else 0))
+        cells.append(f'<div class="cell" style="background:{LEVEL_COLORS[lvl]}" '
+                     f'title="{iso}: {c}"></div>')
     top = sorted(s["days"], key=lambda x: -x["count"])[:10]
     rows = "".join(f"<tr><td>{d['date']}</td><td>{d['count']:,}</td></tr>"
                    for d in top)
-    n = len(s["days"])
-    last7 = sum(d["count"] for d in s["days"][-7:]) if n >= 7 else s["sum"]
-    prev7 = (sum(d["count"] for d in s["days"][-14:-7])
-             if n >= 14 else None)
-    trend = f" ({last7 - prev7:+,} vs 7 j precedent)" if prev7 is not None else ""
+    tr = s["trend"]
+    trend_label = ("7 derniers jours" if tr["n"] == 7
+                   else f"{tr['n']} derniers jours")
+    if tr["complete"]:
+        last7 = f"{tr['sum']:,}"
+        trend = (f" ({tr['sum'] - tr['prev_sum']:+,} vs {tr['n']} j precedent)"
+                 if tr["prev_sum"] is not None else "")
+    else:
+        last7 = "—"
+        trend = f" (incomplet : {len(tr['absent'])} j absent(s), pas de somme)"
+    coverage_html = ""
+    if s["covered"] < s["span_days"]:
+        coverage_html = (f'<p class="warn">couverture : {s["covered"]}/{s["span_days"]} '
+                         f'jours lus — absent(s) {absent_label(s["absent"])}. '
+                         f'Un jour absent n\'est ni actif ni inactif : absent &ne; 0.</p>')
     warn_html = ""
     if warn is not None and not warn["ok"]:
         warn_html = (f'<p class="warn">auto-controle : parse {warn["parsed"]:,} '
@@ -363,8 +445,9 @@ def render_html(login, d_from, d_to, s, levels, source, warn, generated):
     return HTML_TEMPLATE.format(
         login=login, d_from=d_from, d_to=d_to, source=source,
         generated=generated, total=s["sum"],
-        per_day=s["sum"] / max(1, s["span_days"]), active=s["active"],
-        span=s["span_days"], last7=last7, trend=trend,
+        per_day=s["sum"] / max(1, s["covered"]), active=s["active"],
+        covered=s["covered"], span=s["span_days"], last7=last7,
+        trend_label=trend_label, trend=trend, coverage_html=coverage_html,
         cells="".join(cells), top_rows=rows, warn_html=warn_html)
 
 
@@ -442,6 +525,14 @@ def main():
 
     merged = merge_parsed(parsed_by_year, d_from, d_to)
     s = summarize(merged["days"], d_from, d_to)
+    if s["covered"] == 0:
+        # Lecture aveugle : rien a rapporter, et surtout pas « 0 contribution ».
+        sys.stderr.write(
+            f"github-activity: couverture nulle — aucun jour lu dans la fenetre "
+            f"{d_from} -> {d_to} (source {source}). Absent n'est pas zero : "
+            f"aucun rapport. Reessayer plus tard (le fragment anonyme repond "
+            f"502 par rafales).\n")
+        sys.exit(2)
 
     if html_path:
         generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -454,6 +545,10 @@ def main():
         print(json.dumps({"login": login, "from": d_from.isoformat(),
                           "to": d_to.isoformat(), "source": source,
                           "span_days": s["span_days"], "total": s["sum"],
+                          "coverage": {"covered": s["covered"],
+                                       "span_days": s["span_days"],
+                                       "absent": s["absent"]},
+                          "trend_7d": s["trend"],
                           "totals": merged["totals"],
                           "h2_crosscheck": warn,
                           "days": s["days"]}, ensure_ascii=False))
