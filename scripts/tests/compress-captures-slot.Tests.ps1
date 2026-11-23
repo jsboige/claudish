@@ -44,7 +44,13 @@ BeforeAll {
                    '-CaptureDir', $CapDir, '-ArchiveDir', $ArchDir,
                    '-SevenZip', $SevenZip, '-ProgressHeartbeatSec', 0,
                    '-MachineTag', 'testtag',
-                   '-GDriveDir', $GdDir)
+                   '-GDriveDir', $GdDir,
+                   # Retention never purges a fixture (CR c.7088215899): -GDriveDir
+                   # arms the local purge, default KeepLocalDays=0 cuts at today
+                   # 00:00Z, and a now-10h fixture lands on the previous day --
+                   # pin 1 goes red every day between 00:00Z and ~10:00Z, CI
+                   # included. Negative = purge disabled (compress-captures.ps1:727).
+                   '-KeepLocalDays', '-1')
         if ($SlotMode) {
             $args_ += @('-SlotMode', '-RollingWindowHours', $W, '-MinLooseAgeMinutes', $MinAge)
         }
