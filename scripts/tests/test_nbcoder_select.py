@@ -299,6 +299,36 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(report[1]["reasons"], [])
             self.assertEqual(report[1]["target"], TARGET)
 
+    def test_absent_claim_organ_refuses_instead_of_blocking(self):
+        """23/11: with --repo pointing anywhere but the CoursIA checkout, the claim
+        leg ran a non-existent script, python exited 2, and EVERY issue came back
+        `claim-blocked` — a bar that could not measure reporting a claim it never
+        read. The organ now refuses up front."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)          # deliberately NO check_lane_claim.py
+            with self.assertRaises(ns.InstrumentError):
+                ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                 "myia-po-2028:claudish", [], root, pin="HEAD")
+
+    def test_claim_rc2_names_the_cause_and_stays_fail_closed(self):
+        """#11755: without `--paths` the claim organ cannot prove disjointness, so a
+        legacy `blocking_lanes` entry exits 2 — the same code as an io error. The
+        report names which of the two it was and carries the organ's own stderr line
+        (where the blocking lane is written), and the verdict stays BLOCKED."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 2)
+            (repo / "scripts" / "check_lane_claim.py").write_text(
+                "import sys\nsys.stderr.write('Blocked-by: myia-po-2027:CoursIA-2\\n')\n"
+                "sys.exit(2)\n", encoding="utf-8")
+            report = ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                      "myia-po-2028:claudish", [], root, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "BLOCKED", report[1])
+            self.assertEqual(report[1]["claim"], "blocked(rc=2: not-scoped-or-io)")
+            self.assertIn("myia-po-2027:CoursIA-2", report[1]["claim_note"])
+
     def test_reporting_path_survives_an_absent_tmp_root(self):
         """23/11: the default tmp-root under %TEMP% had been swept; the plain
         reporting path crashed writing its PR-file cache. It now creates it."""
@@ -499,6 +529,7 @@ class PreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             repo = make_repo(root)
+            add_claim_script(repo, 0)   # 23/11: reach the Git read, not the absent-organ guard
             orig = (ns.forge_token, ns.resolve_gh)
             ns.forge_token = lambda *a, **k: "tok"
             ns.resolve_gh = lambda: "gh"
