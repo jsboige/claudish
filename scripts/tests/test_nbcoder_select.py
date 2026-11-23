@@ -267,6 +267,19 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(report[1]["reasons"], [])
             self.assertEqual(report[1]["target"], TARGET)
 
+    def test_reporting_path_survives_an_absent_tmp_root(self):
+        """23/11: the default tmp-root under %TEMP% had been swept; the plain
+        reporting path crashed writing its PR-file cache. It now creates it."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            add_claim_script(repo, 0)
+            absent = root / "swept" / "nbcoder-select"
+            report = ns.run_preflight(repo, FakeIdentity(self.routes()), [1],
+                                      "myia-po-2028:claudish", [], absent, pin="HEAD")
+            self.assertEqual(report[1]["verdict"], "FREE", report[1])
+            self.assertTrue((absent / "pr-files-cache.json").is_file())
+
     def test_rust_portage_body_passes_the_bar(self):
         """21/11 (#27718): the coordinator's Rust spec shape resolves its target
         through the FULL bar — the hand-passed 4-way check becomes reproducible."""

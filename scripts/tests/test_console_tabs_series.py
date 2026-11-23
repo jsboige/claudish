@@ -122,6 +122,104 @@ def test_extract_does_not_take_the_zai_mcp_quota_for_the_five_hour_one():
     assert "used" not in got, got
 
 
+# Fixtures for the three shapes met on 2026-11-22 (#1163) — SYNTHETIC values only,
+# never a real console figure: the numbers below were chosen to be obviously fake.
+QWEN_LINES = [
+    "TokenPlan",
+    "Remaining Days",
+    "Plan Quota",
+    "Usage Statistics",
+    "Monthly Usage",
+    "Will reset at 2099-01-12 00:00:00 (UTC+8)",
+    "42.5%",
+    "0%",
+    "100%",
+    "Quota Add-on",
+    "Quota Statistics",
+    "Purchase Add-on Quota",
+]
+
+MISTRAL_LINES = [
+    "Usage",
+    "Limites",
+    "Utilisation de l'organisation",
+    "Coût total estimé",
+    "12,34€",
+    "Coûts",
+    "Tout l'usage est affiché dans UTC+1",
+]
+
+OPENAI_FR_LINES = [
+    "Limits",
+    "Utilisation",
+    "Limites de débit",
+    "Utilisateurs",
+    "Tous les utilisateurs",
+    "111 222 333",
+    "44 555",
+    "5,67 $US",
+    "Spend limit",
+    "8,90 $US / 100,00 $US",
+]
+
+
+def test_extract_reads_the_qwen_monthly_usage_as_a_used_share():
+    # The QwenCloud Token Plan prints its monthly figure BARE, anchored only by the
+    # "Monthly Usage" header (and the reset line between them) — no per-line pattern
+    # can honestly read it. Semantics proven from the ordered series (#1163): the
+    # value sits at 100% while the plan is walled and climbs after the reset, so it
+    # is a USED share — putting it in `pct` (remaining) would flip the column's
+    # meaning mid-series, the exact #834 objection.
+    got = tabs.extract(QWEN_LINES)
+    assert got.get("used") == "42.5", got
+    assert "pct" not in got, got
+
+
+def test_extract_reads_the_qwen_absolute_reset_date():
+    # "Will reset at <date> (UTC+8)" is an ENGLISH absolute reset: neither the
+    # relative `reset` (dans|in Nh) nor the French absolute `reset_at`
+    # ("Réinitialisation le …") could read it.
+    got = tabs.extract(QWEN_LINES)
+    assert got.get("reset_at") == "2099-01-12 00:00:00", got
+
+
+def test_extract_ignores_a_bare_percent_without_the_monthly_anchor():
+    # Positive control: the bare `%` is only trusted under its "Monthly Usage"
+    # anchor — anywhere else it stays absent (the #834 rule, unchanged).
+    got = tabs.extract(["Usage Statistics", "42.5%"])
+    assert "used" not in got and "pct" not in got, got
+
+
+def test_extract_reads_eur_amounts_in_their_own_key():
+    # The Mistral console prints its estimated cost in euros. A € is not a $:
+    # folding it into `usd` would mislabel the currency, so it gets its own key.
+    got = tabs.extract(MISTRAL_LINES)
+    assert got.get("eur") == "12,34", got
+    assert "usd" not in got, got
+
+
+def test_extract_reads_usd_from_the_french_suffix_form():
+    # The OpenAI platform's French UI prints the symbol AFTER the amount with a
+    # decimal comma ("5,67 $US"); the English UI's "$12.04" reads fine. Same
+    # console, same field — the extractor must read both or it goes mute every
+    # time the operator's UI language flips.
+    got = tabs.extract(OPENAI_FR_LINES)
+    assert got.get("usd") == "5,67", got
+
+
+def test_series_renders_the_eur_column():
+    # A eur value the table cannot display would be as lost as one it cannot
+    # extract — the column is part of the fix, not decoration.
+    _with_ledger([
+        {"ts": "2026-11-22T12:00:00Z", "provider": "mistral-studio", "status": "ok",
+         "lines": MISTRAL_LINES, "provenance": "verbatim tab-07"},
+    ])
+    rc, out = _run(tabs.cmd_series, provider=None, days=None, json=False)
+    assert rc == 0, out
+    assert "12,34" in out, out
+    assert "€" in out, out
+
+
 # --- log(): ts is the instant of OBSERVATION --------------------------------
 
 

@@ -823,6 +823,19 @@ export function areFailoverRulesLoaded(): boolean {
 }
 
 /**
+ * The role keyword inside a client name, if any — the four words Claude Code
+ * speaks in ("claude-opus-5", "claude-3-5-haiku-…"). Shared by the classifier
+ * and the #1150(b) pin test so the two can never drift on what a keyword is.
+ */
+function roleKeywordOf(m: string): FailoverRole | null {
+  if (m.includes("opus")) return "opus";
+  if (m.includes("sonnet")) return "sonnet";
+  if (m.includes("haiku")) return "haiku";
+  if (m.includes("fable")) return "fable";
+  return null;
+}
+
+/**
  * Which role a client-requested model name belongs to. Substring on the CLIENT name
  * (Claude Code speaks in roles: "claude-opus-5", "claude-3-5-haiku-…") even when the
  * proxy serves something else. Single definition so the routing hook and the auto-arm
@@ -830,16 +843,46 @@ export function areFailoverRulesLoaded(): boolean {
  */
 export function roleFromModelName(model: string | undefined): FailoverRole | null {
   const m = (model || "").toLowerCase();
-  if (m.includes("opus")) return "opus";
-  if (m.includes("sonnet")) return "sonnet";
-  if (m.includes("haiku")) return "haiku";
-  if (m.includes("fable")) return "fable";
+  const keyword = roleKeywordOf(m);
+  if (keyword) return keyword;
   // Fall back to deployment-specific aliases: a client that names the nominal
   // model directly ("glm-5.2") instead of a role keyword must still be cascaded.
   for (const alias of roleAliases) {
     if (m.includes(alias.pattern)) return alias.role;
   }
   return null;
+}
+
+/**
+ * #1150(b): an explicit `provider@model` pin whose role would come only from a
+ * CLAUDISH_FAILOVER_ROLE_MODELS alias — never from a role keyword. A config-arm
+ * (`CLAUDISH_FAILOVER_ACTIVE`) never diverts such a request: an arm is an
+ * operator's decision about a role, a pin is a client's decision about a model
+ * (measured 20/11: nb_coder pinning `mmc@MiniMax-M3.1-Flash` was diverted by
+ * `haiku@myia-po-2028` to the haiku cascade for 12/12 requests). The
+ * bucket-wall protection (#275) is untouched — a pin keeps its cascade while
+ * its own provider bucket is walled. An explicit id that ALSO names a role
+ * keyword (`or@anthropic/claude-sonnet-…`) is out of scope (#1150): not an
+ * alias-only pin, current behavior. Three measured zeros (po-2027 seat,
+ * off-site archives, hub census 9 557) say no live traffic relies on the arm
+ * side today; the wall side is what aliases exist for.
+ *
+ * Known boundary (review c.7076134370, left as-is): under a ROLE-WIDE arm
+ * (`ACTIVE=haiku`, no machine), a session that first sends the bare alias
+ * name is diverted and dwell-pinned on the role's bucket — which, role-wide,
+ * is the same bucket the pin's own provider walls key on — and a later
+ * explicit pin in that session gets the arm's dwell pin served back: the
+ * dwell HOLD branch does not re-read isFailoverActive. No measured traffic
+ * mixes the two spellings in one session under one role, and no role-wide
+ * arm is used on the fleet today. Machine-scoped arms do not share this:
+ * their pin lives in `machine:<name>`, a foreign bucket for the pin request
+ * (pinned by route test R1 in proxy-server-machine-arm-route.test.ts).
+ */
+export function aliasOnlyExplicitPin(model: string | undefined | null): boolean {
+  if (!model) return false;
+  const parsed = parseModelSpec(model.trim());
+  if (!parsed.isExplicitProvider) return false;
+  return roleKeywordOf(model.toLowerCase()) === null;
 }
 
 /** The configured cascade for a role, armed or not. */
@@ -1359,10 +1402,20 @@ export function resolveFailoverTarget(
    * for this machine. Machine-blind callers (canary, notices, banner) keep
    * the global walk.
    */
-  machine?: string | null
+  machine?: string | null,
+  /**
+   * #1150(b): the model id the CLIENT asked for, when the caller knows it. An
+   * alias-only explicit pin (`mmc@MiniMax-M3.1-Flash` under
+   * `ROLE_MODELS minimax-m3:haiku`) is never diverted by a config-arm — walls
+   * still divert it, so the request keys on its real provider bucket and walks
+   * the role's cascade only while that bucket is walled. Undefined for every
+   * machine-blind/aggregate caller: unchanged behavior.
+   */
+  requestedModel?: string | null
 ): { step: FailoverStep | null; stepIndex: number } {
   const rule = rules.get(role);
-  if (!rule || !isFailoverActive(role, bucket)) return { step: null, stepIndex: -1 };
+  const armExempt = requestedModel != null && aliasOnlyExplicitPin(requestedModel);
+  if (!rule || !isFailoverActive(role, bucket, armExempt)) return { step: null, stepIndex: -1 };
   const excluded = excludedStepsForMachine(role, machine);
   const resolved = resolveSkippingFailed(role, rule, mergeSkips(skipSteps, excluded), excluded);
   if (resolved.stepIndex >= 0 && bucket !== undefined) {
@@ -1575,14 +1628,19 @@ export function resolveFailoverTargetForSession(
   /** #693: the request's X-Claudish-Machine — its config-declared step
    * exclusions apply to the walk, to pin holds, and to #619 recovery yields
    * alike (a recovered step this machine may not serve is not news for it). */
-  machine?: string | null
+  machine?: string | null,
+  /** #1150(b): the client-requested model id — threaded to the underlying
+   * resolveFailoverTarget so an alias-only explicit pin is never diverted by a
+   * config-arm on this path either (the dwell pins a WALL wrote are legitimate
+   * protection and hold unchanged). */
+  requestedModel?: string | null
 ): { step: FailoverStep | null; stepIndex: number } {
   const rule = rules.get(role);
   if (!rule) return { step: null, stepIndex: -1 };
   const excluded = excludedStepsForMachine(role, machine);
   const effSkips = mergeSkips(skipSteps, excluded);
   const dwell = sessionDwellMs;
-  if (!sessionKey || dwell <= 0) return resolveFailoverTarget(role, bucket, effSkips, machine);
+  if (!sessionKey || dwell <= 0) return resolveFailoverTarget(role, bucket, effSkips, machine, requestedModel);
 
   const now = Date.now();
   const pins = dwellPins.get(role);
@@ -1709,7 +1767,7 @@ export function resolveFailoverTargetForSession(
     } // end of the non-skipped pin branch (#431 else)
   }
 
-  const resolved = resolveFailoverTarget(role, bucket, effSkips, machine);
+  const resolved = resolveFailoverTarget(role, bucket, effSkips, machine, requestedModel);
   if (pinnedDiedNonQuota) {
     // #276: yield WITHOUT re-pinning. The tombstone keeps the sibling resolution
     // of this same cascade attempt (the loop resolves twice per attempt) from
@@ -1990,8 +2048,16 @@ export function isBucketWalled(bucket: string): boolean {
  * Without `bucket` (banner, health, tests): any wall or role-wide config-arm of
  * the role diverts — a machine arm never does, it concerns one machine's requests.
  */
-export function isFailoverActive(role: FailoverRole, bucket?: string): boolean {
-  if (configArmHolding(role, bucket)) return true;
+export function isFailoverActive(
+  role: FailoverRole,
+  bucket?: string,
+  /** #1150(b): true for a request whose model is an alias-only explicit pin —
+   * the config-arm branch is skipped, walls still divert. Undefined for every
+   * aggregate reader (banner, health, notices, state machines): they speak
+   * about the role, not about one request's spelling. */
+  armExempt?: boolean
+): boolean {
+  if (!armExempt && configArmHolding(role, bucket)) return true;
   if (bucket !== undefined) return isBucketWalled(bucket) || isBucketWalled(LEGACY_ROLE_WIDE_BUCKET);
   if (isBucketWalled(LEGACY_ROLE_WIDE_BUCKET)) return true;
   for (const b of walled.keys()) {
@@ -2006,7 +2072,16 @@ export function isFailoverActive(role: FailoverRole, bucket?: string): boolean {
  * caller then computes the nominal's real bucket as usual. Computed once at the
  * route, like the #275 bucket, so the cascade and the notices agree.
  */
-export function machineArmBucket(role: FailoverRole, machine: string | null | undefined): string | undefined {
+export function machineArmBucket(
+  role: FailoverRole,
+  machine: string | null | undefined,
+  /** #1150(b): the model id the CLIENT asked for. An alias-only explicit pin
+   * gets no machine-arm bucket on two counts: the arm must not divert it, and
+   * keying it on `machine:<name>` would hide its real provider bucket from
+   * the walls — the protection a pin keeps. */
+  requestedModel?: string | null
+): string | undefined {
+  if (requestedModel != null && aliasOnlyExplicitPin(requestedModel)) return undefined;
   const m = (machine || "").trim().toLowerCase();
   if (!m || !configArmedMachines.get(role)?.has(m)) return undefined;
   return `${MACHINE_BUCKET_PREFIX}${m}`;
