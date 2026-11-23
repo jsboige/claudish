@@ -288,6 +288,21 @@ function captureModels(dir: string): string[] {
 }
 
 /**
+ * The capture's header line — the first thing `done()` writes. A `resp-` file
+ * is readable only once this line has landed (see `waitForRespFiles`).
+ */
+const RESP_HEADER_LANDED = /^# parser=\S+ model=\S+/m;
+
+/** True once the capture file holds its header line; a file still being written reads false. */
+function respFileLanded(dir: string, file: string): boolean {
+  try {
+    return RESP_HEADER_LANDED.test(readFileSync(join(dir, file), "utf-8"));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Bounded poll for the capture's `resp-` files. `done()` schedules a
  * FIRE-AND-FORGET `writeFile` (response-capture.ts "Fire-and-forget" note),
  * so the file lands at a later tick than the response the test already
@@ -296,6 +311,12 @@ function captureModels(dir: string): string[] {
  * `[resp] capture write error: ENOENT`). Poll with a deadline, never a
  * fixed sleep: the green path resolves on the first pass. Shared by the
  * composed and native AC2 pins and by the teardown drain below.
+ *
+ * The predicate is the CONTENT, not the listing: `writeFile` creates the
+ * file (O_CREAT|O_TRUNC) before the content lands, so a `resp-` file can be
+ * listed while still empty — and `captureModels` reads the content. Waiting
+ * for existence alone reproduced the CI signature (`Expected: > 0`,
+ * `Received: 0`) under a write delayed past its open (PR #1179 review).
  */
 async function waitForRespFiles(dir: string, timeoutMs = 3000): Promise<string[]> {
   const deadline = Date.now() + timeoutMs;
@@ -306,7 +327,7 @@ async function waitForRespFiles(dir: string, timeoutMs = 3000): Promise<string[]
     } catch {
       files = [];
     }
-    if (files.length > 0) return files;
+    if (files.length > 0 && files.every((f) => respFileLanded(dir, f))) return files;
     await new Promise((r) => setTimeout(r, 25));
   }
   return files;
