@@ -8,7 +8,7 @@
     clear/restore (the exit/slot suites) covers the scripts THEY call; the
     runner reset (#1166) is the net for every future suite that forgets.
 
-    Three pins:
+    Four pins (the fourth answers ai-01's file-23a addendum):
       1. the wrapper run-pester.ps1, executed under an ARMED sentinel root,
          leaves that sentinel EMPTY (child env form cleared) and RESTORES the
          seat env on exit;
@@ -16,7 +16,15 @@
          both entry points reach Invoke-Pester, the CI pwsh leg included);
       3. MUTATION PIN, red on its own premise: with an ARMED root and NO
          runner reset, the sentinel would receive a file — this is the same
-         proof under which removing the wrapper's reset makes pin 1 fail.
+         proof under which removing the wrapper's reset makes pin 1 fail;
+      4. DATE-DEPENDENT PARAMETERS: -GDriveDir passed EXPLICITLY in a test
+         also arms the local retention purge (KeepLocalDays=0 default,
+         compress-captures.ps1:727-746): an archive older than the cutoff,
+         confirmed off-site at the same size, is DELETED locally. The runner
+         env reset cannot help there (the parameter is explicit): this pin
+         measures the destructive premise, so a suite combining -GDriveDir
+         with a REAL -ArchiveDir knows exactly what it arms. Sentinel dirs
+         only; the fake off-site copy is planted byte-identical BY the test.
 
     Everything runs in temp dirs; the sentinel is NOT the seat's real store.
 #>
@@ -137,8 +145,48 @@ Describe 'runner hermeticity (#1166)' {
         $src | Should -Match 'finally'
     }
 
-    It 'MUTATION PREMISE: armed root + NO reset = an off-site deposit (red if the underlying behavior changed)' {
-        $sentinel = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-herm-armed-" + [guid]::NewGuid().ToString('N'))
+    It 'DATE PARAMETERS: explicit -GDriveDir arms the local retention purge (KeepLocalDays=0 deletes off-site-confirmed archives)' {
+        # ai-01 file 23a: the inventory must cover date-dependent PARAMETERS,
+        # not only env vars. With -GDriveDir explicit, compress-captures.ps1
+        # runs its retention purge (:727-746) with KeepLocalDays=0 by default:
+        # cutoff = todayUTC, so ANY archive of a past day whose off-site copy
+        # exists at the same size is deleted from -ArchiveDir. A suite passing
+        # its REAL ArchiveDir next to a sentinel -GDriveDir would delete real
+        # history. Everything below lives in sentinel temp dirs.
+        $sentinel = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-herm-retent-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $sentinel | Out-Null
+        $cap = Join-Path $sentinel 'captures'; $arch = Join-Path $sentinel 'arch'
+        $gd = Join-Path $sentinel 'Backups-Cloud\claudish'
+        New-Item -ItemType Directory -Force -Path $gd | Out-Null
+        New-OldCapture -Dir $cap | Out-Null
+        $fake7z = New-Fake7z -Dir $sentinel
+        $savedRoot = $env:CLAUDISH_GDRIVE_ROOT
+        Remove-Item Env:CLAUDISH_GDRIVE_ROOT -ErrorAction SilentlyContinue
+        try {
+            # Plant an old local archive AND its byte-identical off-site copy:
+            # exactly the purge precondition of :738. 2026-11-01 is 22 days
+            # old, strictly before the KeepLocalDays=0 cutoff (todayUTC).
+            $oldName = 'captures-2026-11-01-testtag.7z'
+            $oldArch = Join-Path $arch $oldName
+            New-Item -ItemType Directory -Force -Path $arch | Out-Null
+            [System.IO.File]::WriteAllText($oldArch, 'oldarchive', (New-Object System.Text.ASCIIEncoding))
+            [System.IO.File]::WriteAllText((Join-Path $gd $oldName), 'oldarchive', (New-Object System.Text.ASCIIEncoding))
+            $shell = (Get-Process -Id $PID).Path
+            & $shell -NoProfile -ExecutionPolicy Bypass -File $script:Compaction `
+                -CaptureDir $cap -ArchiveDir $arch -SevenZip $fake7z -GDriveDir $gd `
+                -ProgressHeartbeatSec 0 -MachineTag 'testtag' 2>&1 | ForEach-Object { "$_" } | Out-Null
+            # The destructive premise, measured: the old archive is GONE.
+            (Test-Path -LiteralPath $oldArch) | Should -BeFalse
+            # Its off-site copy survives (the purge never deletes off-site).
+            (Test-Path -LiteralPath (Join-Path $gd $oldName)) | Should -BeTrue
+        }
+        finally {
+            if ($null -ne $savedRoot) { $env:CLAUDISH_GDRIVE_ROOT = $savedRoot }
+            Remove-Item -Recurse -Force $sentinel -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'MUTATION PREMISE: armed root + NO reset = an off-site deposit (red if the underlying behavior changed)' {        $sentinel = Join-Path ([System.IO.Path]::GetTempPath()) ("cc-herm-armed-" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $sentinel | Out-Null
         $cap = Join-Path $sentinel 'captures'; $arch = Join-Path $sentinel 'arch'
         New-OldCapture -Dir $cap | Out-Null
