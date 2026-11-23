@@ -60,7 +60,7 @@ def _snapshots(mapping):
 
 
 def _absent(shared_path, machine):
-    return {"exists": False, "newest": None, "age_h": None, "files": 0}
+    return {"exists": False, "tree_exists": False, "newest": None, "age_h": None, "files": 0}
 
 
 def _probe(proc, user, user_error=None, snapshot_fn=None, case_insensitive=True):
@@ -105,6 +105,26 @@ def test_the_same_tree_under_separator_trailing_slash_and_case_differences_is_no
                           snapshot_fn=_snapshots({r"\\gdrive\Drive\Shared\Tree\RooSync": present}))
     assert report["verdict"] == "SAME", report
     assert code == 0, report
+
+
+def test_a_doubled_separator_is_not_a_fork():
+    # T4, and the mutation ai-01's sweep found alive (M6, CR c.7093302681):
+    # drop the `//` collapse and two spellings of ONE tree compare unequal.
+    # A doubled separator is a spelling, not a second directory. The existing
+    # separator pin cannot see this — its two spellings both start `//` after
+    # the backslash swap, so they agree even with the collapse removed.
+    present = {"exists": True, "newest": "2026-11-23T04:00:00Z", "age_h": 2.0, "files": 3}
+    report, code = _probe(r"\\gdrive\Drive\Shared\Tree\RooSync",
+                          "//gdrive//Drive///Shared/Tree/RooSync",
+                          snapshot_fn=_snapshots({r"\\gdrive\Drive\Shared\Tree\RooSync": present}))
+    assert report["verdict"] == "SAME", report
+    assert code == 0, report
+
+
+def test_normalize_path_collapses_doubled_separators():
+    # Same property at the smallest site, so a future refactor of probe() cannot
+    # lose it silently.
+    assert fork.normalize_path("a//b///c\\d", case_insensitive=False) == "a/b/c/d"
 
 
 def test_case_differences_are_a_fork_when_the_host_is_case_sensitive():
@@ -158,6 +178,27 @@ def test_agreeing_names_that_exist_nowhere_are_unmeasurable():
     report, code = _probe(TREE_OLD, TREE_OLD)
     assert report["verdict"] != "SAME", report
     assert code == 2, report
+
+
+def test_a_tree_without_this_machines_configs_names_the_right_absence():
+    # Nit c.7093302681: the SAME escalation used to say "no such tree exists"
+    # even when the tree is there and only `configs/<machine>` is missing.
+    no_configs = {"exists": False, "tree_exists": True, "newest": None, "age_h": None, "files": 0}
+    report, code = _probe(TREE_OLD, TREE_OLD,
+                          snapshot_fn=_snapshots({TREE_OLD: no_configs}))
+    assert report["verdict"] == "UNMEASURABLE" and code == 2, report
+    assert "configs/test-seat" in report["reason"], report["reason"]
+    assert "no such tree exists" not in report["reason"], report["reason"]
+
+
+def test_the_output_declares_which_process_the_process_layer_reads():
+    # CR 2: the process layer is the env THIS PROBE inherited, never the MCP
+    # host's own — a report that stays silent reads as if it had read the host.
+    report, _ = _probe(TREE_OLD, TREE_NEW)
+    assert "proxy for the MCP host" in report["process_source"], report["process_source"]
+    out = fork.render(report)
+    assert "proxy for the MCP host" in out, out
+    assert "never read" in out, out
 
 
 def test_an_empty_string_counts_as_unset_with_its_own_wording():

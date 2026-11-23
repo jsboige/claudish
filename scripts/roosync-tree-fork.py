@@ -3,12 +3,20 @@ r"""roosync-tree-fork.py — do this seat's two env layers name the SAME RooSync
 
 WHY THIS EXISTS (measured 2026-11-22/23 on myia-po-2024, #1136 -> #1168):
 `ROOSYNC_SHARED_PATH` names the tree RooSync reads and writes, and on a seat it
-can name TWO DIFFERENT TREES depending on the layer you ask. The running MCP
-host process holds the 2025 chain; the User environment scope holds the 2026
-chain. Both directories exist, with disjoint content at the same write instants
-(one carries a `v1.2.0-*` snapshot and no standalone `claude-settings`; the other
-the standalone and no `v1.2.0`). The variable was repointed at the User scope;
-the process predates the repoint and keeps publishing into the old tree.
+can name TWO DIFFERENT TREES depending on the layer you ask. The process that
+runs this instrument inherits the 2025 chain from its session; the User
+environment scope holds the 2026 chain. Both directories exist, with disjoint
+content at the same write instants (one carries a `v1.2.0-*` snapshot and no
+standalone `claude-settings`; the other the standalone and no `v1.2.0`). The
+variable was repointed at the User scope; the process predates the repoint and
+keeps publishing into the old tree.
+
+Which process is "the process" (T9): the `process` layer is the environment
+THIS PROBE INHERITS from the session that launched it — never the MCP host's own
+environment, which no process can read from outside. It is a PROXY for the host
+(a host started before a repoint still holds the old value, and so does the shell
+that launches this probe), and the output says so on every run. What the host
+publishes is established by reading the trees, not by this layer alone.
 
 Nothing on the fleet sees this class. `settings-matrix.py` reads whichever path
 it is handed (`--shared` / `ROOSYNC_SHARED_PATH`, scripts/settings-matrix.py:503)
@@ -63,6 +71,11 @@ TRAPS (each one produces a wrong-but-plausible answer if you skip it)
      above the tree name is ever printed — the drive letter and every directory
      under it are replaced by `<gdrive>/…`. The report dict itself carries no
      raw path either, only labels.
+  T9 The `process` layer is the environment THIS PROBE INHERITS from its own
+     session — not the MCP host's environment, which cannot be read from
+     outside that process. It is a proxy for the host (both predate a repoint
+     the same way), and every output says so; never quote it as "the host's
+     value" (CR 23b, c.7093302681).
 
 USAGE
   python scripts/roosync-tree-fork.py                 # this seat, human output
@@ -222,7 +235,10 @@ def snapshot_report(shared_path, machine: str, now: datetime, limit: int = DEFAU
     if newest is not None:
         age_h = round((now - newest).total_seconds() / 3600.0, 1)
     return {
+        # `exists` is about THIS MACHINE's configs dir; `tree_exists` keeps the
+        # two absences apart — a missing tree is not a missing configs/<machine>.
         "exists": configs.is_dir(),
+        "tree_exists": Path(shared_path).is_dir(),
         "newest": _iso(newest),
         "age_h": age_h,
         "files": files,
@@ -298,7 +314,13 @@ def probe(*, process_value, user_value, user_error, machine, now, snapshot_fn,
         others = [s for s in existing if s is not winner]
         delta_h = None
         if others and winner.get("age_h") is not None:
-            runner_up = min(others, key=lambda s: s.get("age_h") or float("inf"))
+            # 0.0 is a legitimate age (a write this instant); only None means
+            # "unknown", so the key must test None rather than truthiness.
+            def _age_key(s):
+                age = s.get("age_h")
+                return float("inf") if age is None else age
+
+            runner_up = min(others, key=_age_key)
             if runner_up.get("age_h") is not None:
                 delta_h = round(runner_up["age_h"] - winner["age_h"], 1)
         freshest = {
@@ -311,16 +333,28 @@ def probe(*, process_value, user_value, user_error, machine, now, snapshot_fn,
         notes.append("a tree exists but holds no readable file; its age is unknown, not zero")
 
     # SAME needs a tree that is actually here — otherwise nothing was established.
+    # Name the real absence: a missing tree and a tree without this machine's
+    # configs are two different findings, and the reason must not conflate them.
     if verdict == "SAME" and not any(s.get("exists") for s in snapshots):
         verdict = "UNMEASURABLE"
-        reason = ("both layers name the same tree, but no such tree exists on this "
-                  "seat: which tree holds the snapshots here is unmeasured")
+        if any(s.get("tree_exists") for s in snapshots):
+            reason = ("both layers name the same tree, but it holds no configs/%s on "
+                      "this seat: which tree carries this machine's snapshots is "
+                      "unmeasured" % machine)
+        else:
+            reason = ("both layers name the same tree, but no such tree exists on this "
+                      "seat: which tree holds the snapshots here is unmeasured")
 
     report = {
         "probe": "roosync-tree-fork",
         "variable": VAR,
         "machine": machine,
         "host": sys.platform,
+        # T9, on every output: the process layer is what this probe inherited.
+        "process_source": (
+            "the environment this probe inherited from its own session — a proxy "
+            "for the MCP host, whose own environment is never read"
+        ),
         "layers": layers,
         "verdict": verdict,
         "reason": reason,
@@ -341,6 +375,10 @@ def _consoles_word(layer: str) -> str:
 def render(report: dict) -> str:
     lines = [
         "roosync-tree-fork — seat %s (%s)" % (report["machine"], report["host"]),
+        # T9: say WHICH process the process layer reads, on every run, or the
+        # report reads as if it had inspected the MCP host itself.
+        "layers    process = %s" % report.get(
+            "process_source", "the environment this probe inherited from its session"),
     ]
     width = max(len(s.get("tree") or "") for s in report["snapshots"]) if report["snapshots"] else 0
     width = max(width, 12)
