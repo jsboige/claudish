@@ -312,6 +312,16 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(report[1]["verdict"], "FREE", report[1])
             self.assertTrue((absent / "pr-files-cache.json").is_file())
 
+    def test_dump_avail_creates_an_absent_parent(self):
+        """23/11 (file 23b): --corpus-check's subprocess writes avail-shared.json
+        through dump_avail into a --tmp-root that may not exist — same class as
+        #1165. Without the mkdir the dump crashes with FileNotFoundError."""
+        with tempfile.TemporaryDirectory() as td:
+            absent = Path(td) / "swept" / "nbcoder-select" / "avail-shared.json"
+            ns.dump_avail(str(absent), ["MyIA.AI.Notebooks/X.ipynb"])
+            data = json.loads(absent.read_text(encoding="utf-8"))
+            self.assertEqual(data["avail"], ["MyIA.AI.Notebooks/X.ipynb"])
+
     def test_rust_portage_body_passes_the_bar(self):
         """21/11 (#27718): the coordinator's Rust spec shape resolves its target
         through the FULL bar — the hand-passed 4-way check becomes reproducible."""

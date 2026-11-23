@@ -376,7 +376,12 @@ def bucket(identity: Identity) -> dict:
 
 
 def dump_avail(path: str, avail: list[str]) -> None:
-    Path(path).write_text(
+    # Both call sites write under --tmp-root (--shared-corpus-dump subprocess and
+    # --out): the root may legitimately not exist yet (swept %TEMP%, fresh dir),
+    # same class as the PR-file cache (#1165) — create it, never crash the dump.
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
         json.dumps({"generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "avail": avail},
                    ensure_ascii=False, indent=0), encoding="utf-8")
 
