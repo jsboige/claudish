@@ -178,6 +178,49 @@ def read_pinned_tree(repo: Path, pin: str) -> set[str]:
     return {norm(p) for p in ls.stdout.split("\0") if p.endswith(".ipynb")}
 
 
+def resolve_inflight(tmp_root: Path, inflight_queues: list[str]) -> set[str]:
+    """Targets a named state-dir already covers. Two accepted shapes.
+
+    Fail-closed (the #1120 class): a NAMED state-dir whose grains cannot be
+    read is a read failure (typo in the name), never 'nothing in flight'. A
+    finished queue is retired by removing its whole state-dir AND dropping the
+    --inflight name, not one file alone.
+
+    The shapes, because the live directories carry neither name the first
+    revision expected (#1170, measured 23/11: zero grains.jsonl under
+    .tmp/nbst while every state-dir holds state.json + scheduler.jsonl — the
+    single-shape read therefore refused every real state-dir):
+      * grains.jsonl — an explicit queue copy, when a launcher writes one;
+      * state.json   — the scheduler's own status file; its grain keys are
+                       "<issue>:<notebook>" and ARE the authority on what a
+                       state-dir has taken.
+    """
+    inflight: set[str] = set()
+    for q in inflight_queues:
+        d = tmp_root / q
+        p = d / "grains.jsonl"
+        if p.exists():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue          # an in-flight blank line is not a defect
+                g = json.loads(line)
+                for k in ("notebook", "source_nb"):
+                    if g.get(k):
+                        inflight.add(norm(g[k]))
+            continue
+        st = d / "state.json"
+        if st.exists():
+            s = json.loads(st.read_text(encoding="utf-8"))
+            for key in (s.get("grains") or {}):
+                _, _, nb = key.partition(":")      # "#<issue>:<notebook>"
+                if nb:
+                    inflight.add(norm(nb))
+            continue
+        raise InstrumentError(
+            f"in-flight queue absent: neither {p} nor {st} (typo in --inflight?)")
+    return inflight
+
+
 def run_selection(repo: Path, identity: Identity, inflight_queues: list[str],
                   tmp_root: Path, pin: str = DEFAULT_PIN) -> dict:
     """4-way verified availability. Every gh call rides the given identity."""
@@ -201,22 +244,7 @@ def run_selection(repo: Path, identity: Identity, inflight_queues: list[str],
         for t in IPYNB.findall(i.get("body") or ""):
             taken_iss.add(norm(t))
 
-    inflight: set[str] = set()
-    for q in inflight_queues:
-        p = tmp_root / q / "grains.jsonl"
-        # Fail-closed (the #1120 class): a NAMED queue whose grains.jsonl is
-        # absent is a read failure (typo in the state-dir name), never
-        # 'nothing in flight'. A finished queue is retired by removing its
-        # whole state-dir AND dropping the --inflight name, not the file alone.
-        if not p.exists():
-            raise InstrumentError(f"in-flight queue absent: {p} (typo in --inflight?)")
-        for line in p.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue          # an in-flight blank line is not a defect
-            g = json.loads(line)
-            for k in ("notebook", "source_nb"):
-                if g.get(k):
-                    inflight.add(norm(g[k]))
+    inflight = resolve_inflight(tmp_root, inflight_queues)
 
     blocked = taken_pr | taken_iss | inflight
     avail = [f for f in orphans if twin(f) not in blocked and f not in blocked]
@@ -301,19 +329,7 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(taken_pr), encoding="utf-8")
 
-    inflight: set[str] = set()
-    for q in inflight_queues:
-        p = tmp_root / q / "grains.jsonl"
-        # Same fail-closed read as run_selection: absent queue == read failure.
-        if not p.exists():
-            raise InstrumentError(f"in-flight queue absent: {p} (typo in --inflight?)")
-        for line in p.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            g = json.loads(line)
-            for k in ("notebook", "source_nb"):
-                if g.get(k):
-                    inflight.add(norm(g[k]))
+    inflight = resolve_inflight(tmp_root, inflight_queues)
 
     report: dict = {}
     for n in issues:
