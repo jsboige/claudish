@@ -25,6 +25,17 @@
   removes the loose copies. Never deletes anything without a verified archive
   (7z t == 0).
 
+  SLOT MODE (#1152 c, opt-in via -SlotMode — the default is unchanged): the
+  rolling loose window. Captures younger than -RollingWindowHours (default 6)
+  stay loose; older ones are packed into a day PART
+  captures-YYYY-MM-DD-pHHMM[-<tag>].7z (HHMM = the pass's UTC time), with the
+  SAME verify-before-delete discipline as the nightly pass. A file whose mtime
+  is younger than -MinLooseAgeMinutes (default 30) is never packed: a
+  resp-*.sse may still be open. The nightly pass stays the day's final pass
+  (a day's history = its parts + its canonical archive), and the sha manifest
+  records each part as its own entry. Arming the slot cadence on the hub is a
+  separate [PROPOSAL] (po-2025) — this script only provides the mode.
+
   Single writer: a pid-bearing lock file (<ArchiveDir>\.compress-captures.lock)
   makes a second run -- typically a manual one during the scheduled night --
   exit without touching anything, instead of both packing the same canonical
@@ -125,7 +136,26 @@ param(
   # 38.8 GB in 4 h 18 with -bso0/-bsp0: four hours of journal silence is what
   # made a healthy run read as stalled. 0 disables the during-call heartbeat
   # (the before-call line stays). Tests set 1 to pin it without waiting.
-  [int]$ProgressHeartbeatSec = 3600
+  [int]$ProgressHeartbeatSec = 3600,
+  # --- #1152 (c): slot mode, the rolling loose window -------------------------
+  # OFF by default: the nightly day archive is the fleet's proven path and
+  # stays exactly what a run without -SlotMode does. When set, this run packs
+  # the loose captures OLDER than -RollingWindowHours into a day PART
+  # captures-<day>-p<HHMM>[-<tag>].7z (HHMM = this pass's UTC time, day = the
+  # FILE's filename day) instead of packing completed days. The nightly pass
+  # remains the day's final pass: whatever the slot passes left loose (the W
+  # window tail, held files, stragglers) is the nightly pass's input, and the
+  # day's history = its parts + its canonical archive. KeepDays is ignored for
+  # selection in slot mode (the W window rules); retention (KeepLocalDays)
+  # applies to parts as to day archives.
+  [switch]$SlotMode,
+  # W: captures younger than this stay loose (hours). 6 = the coordinator's
+  # decision (c.7076270061): expected peak W+3h of growth.
+  [int]$RollingWindowHours = 6,
+  # A file whose mtime is younger than this is NEVER packed in slot mode: a
+  # resp-*.sse may still be open (the writer holds it; CPython's open() does
+  # not share FILE_SHARE_DELETE). 30 minutes per the decision.
+  [int]$MinLooseAgeMinutes = 30
 )
 
 $ErrorActionPreference = "Stop"
@@ -299,26 +329,61 @@ Log ("SEVENZIP {0} (source={1})" -f $SevenZip, $sevenZipResolved.Source)
 if (-not (Test-Path -LiteralPath $CaptureDir)) { Log "FATAL: capture dir not found: $CaptureDir"; exit 2 }
 if (-not (Test-Path -LiteralPath $ArchiveDir)) { New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null }
 
-# Cutoff: archive any day strictly older than (todayUTC - (KeepDays-1)).
-$cutoff = (Get-Date).ToUniversalTime().Date.AddDays(-([Math]::Max(0, $KeepDays - 1)))
-Log "START compaction CaptureDir=$CaptureDir KeepDays=$KeepDays cutoff(UTC)=$($cutoff.ToString('yyyy-MM-dd'))"
+# --- mode selection (#1152 c) -------------------------------------------------
+# Nightly (the default, unchanged): archive any day strictly older than
+# (todayUTC - (KeepDays-1)). Slot mode: archive the loose captures OLDER than
+# the rolling W window, whatever their day, grouped by filename day so each
+# slice lands in ITS day's part. Both paths feed the SAME pack loop below —
+# only the target set and the archive name differ.
+$nowUtc = (Get-Date).ToUniversalTime()
+$slotHHmm = ''
+if ($SlotMode) {
+  $slotHHmm = $nowUtc.ToString('HHmm')
+  $ageCutoff = $nowUtc.AddHours(-[Math]::Max(0, $RollingWindowHours))
+  $mtimeCutoff = $nowUtc.AddMinutes(-[Math]::Max(0, $MinLooseAgeMinutes))
+  Log ("START slot compaction CaptureDir=$CaptureDir W={0}h mtimeGuard={1}min slot(UTC)={2}" -f $RollingWindowHours, $MinLooseAgeMinutes, $slotHHmm)
+} else {
+  $cutoff = $nowUtc.Date.AddDays(-([Math]::Max(0, $KeepDays - 1)))
+  Log "START compaction CaptureDir=$CaptureDir KeepDays=$KeepDays cutoff(UTC)=$($cutoff.ToString('yyyy-MM-dd'))"
+}
 
 # --- enumerate loose captures, group by their filename date (UTC) ------------
 $rx = '^(req|resp)-.*?(?<d>\d{4}-\d{2}-\d{2})T\d{2}-\d{2}-\d{2}'
+$rxTs = '^(req|resp)-.*?(?<ts>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})'
 $loose = Get-ChildItem -LiteralPath $CaptureDir -File | Where-Object { $_.Name -match $rx }
 if (-not $loose) { Log "nothing to do (0 loose capture files)"; Log ("END (errors={0})" -f $errors); exit $errors }
 
 $byDay = @{}
+$slotSkippedYoung = 0; $slotSkippedFreshMtime = 0
 foreach ($f in $loose) {
   if ($f.Name -match $rx) {
+    # Capture the day group NOW: the slot block below re-matches and resets
+    # $matches (same trap the lib's Get-CapturePartialInfo documents).
     $d = $matches['d']
+    if ($SlotMode) {
+      # The filename ts is the capture time (the writer derives it from the
+      # request); the mtime is the write time. Age keys on the FILENAME ts —
+      # a copy or a re-touch must not move a capture out of (or into) the
+      # window — while the still-open guard keys on MTIME, the only signal
+      # that says "a writer may hold this file right now".
+      if (-not ($f.Name -match $rxTs)) { continue }
+      $ts = [datetime]::ParseExact($matches['ts'], 'yyyy-MM-ddTHH-mm-ss', [System.Globalization.CultureInfo]::InvariantCulture)
+      if ($ts -ge $ageCutoff) { $slotSkippedYoung++; continue }
+      if ($f.LastWriteTimeUtc -gt $mtimeCutoff) { $slotSkippedFreshMtime++; continue }
+    }
     if (-not $byDay.ContainsKey($d)) { $byDay[$d] = New-Object System.Collections.ArrayList }
     [void]$byDay[$d].Add($f)
   }
 }
 
-$daysToArchive = $byDay.Keys | Where-Object { [datetime]::ParseExact($_, 'yyyy-MM-dd', $null) -lt $cutoff } | Sort-Object
-if (-not $daysToArchive) { Log "nothing to do (no completed past days; newest is kept loose)"; Log ("END (errors={0})" -f $errors); exit $errors }
+if ($SlotMode) {
+  $daysToArchive = $byDay.Keys | Sort-Object
+  Log ("SLOT selection: {0} day-group(s) eligible; skipped {1} file(s) younger than W, {2} file(s) with a fresh mtime (<{3} min, never packed)" -f $byDay.Count, $slotSkippedYoung, $slotSkippedFreshMtime, $MinLooseAgeMinutes)
+  if (-not $daysToArchive) { Log "nothing to do (no loose capture older than the W window)"; Log ("END (errors={0})" -f $errors); exit $errors }
+} else {
+  $daysToArchive = $byDay.Keys | Where-Object { [datetime]::ParseExact($_, 'yyyy-MM-dd', $null) -lt $cutoff } | Sort-Object
+  if (-not $daysToArchive) { Log "nothing to do (no completed past days; newest is kept loose)"; Log ("END (errors={0})" -f $errors); exit $errors }
+}
 
 # --- single-writer lock (#741) ------------------------------------------------
 # Everything below MUTATES the archive directory, and two runs can reach it at
@@ -382,7 +447,12 @@ $totalRaw = 0L; $totalArch = 0L; $totalFiles = 0   # $errors is seeded above (Q8
 foreach ($day in $daysToArchive) {
   $files = $byDay[$day]
   $rawBytes = ($files | Measure-Object -Property Length -Sum).Sum
-  $archivePath = Join-Path $ArchiveDir (Get-CaptureArchiveName -Day $day -MachineTag $MachineTag)
+  # Slot mode packs this slice into the DAY'S PART named for this pass; the
+  # nightly path keeps the day's canonical. Everything downstream (probe,
+  # quarantine, pack, verify, off-site, loose purge) is name-agnostic.
+  $archiveLeaf = if ($SlotMode) { Get-CapturePartName -Day $day -SlotHHmm $slotHHmm -MachineTag $MachineTag }
+                 else           { Get-CaptureArchiveName -Day $day -MachineTag $MachineTag }
+  $archivePath = Join-Path $ArchiveDir $archiveLeaf
 
   if ($PSCmdlet.ShouldProcess("$($files.Count) files for $day", "7z archive -> $archivePath then purge loose after the off-site copy")) {
     # --- #741: probe the canonical BEFORE appending to it -------------------
@@ -574,7 +644,9 @@ foreach ($day in $daysToArchive) {
 # archive dir, is left exactly where it is and said out loud — never guessed at.
 if (Test-Path -LiteralPath $ArchiveDir) {
   foreach ($stray in (Get-ChildItem -LiteralPath $CaptureDir -Filter 'captures-*.7z' -File)) {
-    if (-not (Get-CaptureArchiveDay -Name $stray.Name)) { continue }
+    # Day archive OR day part (#1152 c): both belong in the archive dir; the
+    # part parsers reject the other's spelling, so accept either shape.
+    if (-not (Get-CaptureArchiveDay -Name $stray.Name) -and -not (Get-CapturePartInfo -Name $stray.Name)) { continue }
     if ((Get-CaptureArchiveMachineTag -Name $stray.Name) -ne $MachineTag) { continue }
     $strayTarget = Join-Path $ArchiveDir $stray.Name
     if (Test-Path -LiteralPath $strayTarget) {
@@ -729,7 +801,11 @@ if ($KeepLocalDays -ge 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDi
   $purged = 0; $purgeSkipped = 0
   foreach ($arch in (Get-ChildItem -LiteralPath $ArchiveDir -Filter 'captures-*.7z' -File)) {
     if ((Get-CaptureArchiveMachineTag -Name $arch.Name) -ne $MachineTag) { continue }
+    # Day archive or day part (#1152 c): both age by the day they encode, both
+    # need the same off-site proof before a local delete. Tag parsing is
+    # part-aware (see the lib), so the ownership filter above already owns both.
     $archDay = Get-CaptureArchiveDay -Name $arch.Name
+    if (-not $archDay) { $archDay = (Get-CapturePartInfo -Name $arch.Name).Day }
     if (-not $archDay) { continue }   # unparseable name: skip, never guess before deleting
     $dayDate = [datetime]::ParseExact($archDay, 'yyyy-MM-dd', $null)
     if ($dayDate -ge $purgeCutoff) { continue }   # within retention window

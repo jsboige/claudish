@@ -2413,17 +2413,80 @@ function Get-CaptureArchiveDay {
         not one of ours. The retention purge keys on this, so a name it cannot
         parse must be SKIPPED rather than guessed at — deleting on a guess is
         the failure this whole region exists to prevent.
+
+        A DAY PART (#1152 c) is not the day archive: `captures-<day>-p<HHMM>`
+        would otherwise parse as day+tag here (tag `p1200-myia-po-2025`), so
+        part names are rejected FIRST — the day's canonical keeps its single
+        meaning, and the part-aware passes key on Get-CapturePartInfo instead.
     #>
     param([Parameter(Mandatory)][string]$Name)
+    if (Get-CapturePartInfo -Name $Name) { return $null }
     if ($Name -match '^captures-(\d{4}-\d{2}-\d{2})(?:-[A-Za-z0-9._-]+)?\.7z$') { return $matches[1] }
     return $null
 }
 
 function Get-CaptureArchiveMachineTag {
-    <# The machine tag an archive name carries, or '' for a legacy untagged name. #>
+    <#
+        The machine tag an archive name carries, or '' for a legacy untagged
+        name. For a DAY PART (#1152 c) this returns the part's OWN tag — the
+        ownership filters of the re-upload and retention passes must treat a
+        part as this machine's archive (they upload and purge it under the
+        same proof gates as a day archive), which the pre-part parsing broke
+        structurally: `captures-<day>-p1200-<tag>.7z` parsed as tag
+        `p1200-<tag>`, never matched this run's tag, and parts were silently
+        never re-uploaded.
+    #>
     param([Parameter(Mandatory)][string]$Name)
+    $part = Get-CapturePartInfo -Name $Name
+    if ($part) { return $part.Tag }
     if ($Name -match '^captures-\d{4}-\d{2}-\d{2}-([A-Za-z0-9._-]+)\.7z$') { return $matches[1] }
     return ''
+}
+
+function Get-CapturePartName {
+    <#
+        Day-part archive name (#1152 c, slot mode): the slice a rolling pass
+        packs, `captures-<day>-p<HHMM>[-<tag>].7z` where HHMM is the pass time
+        (UTC). The `-p\d{4}` segment is what the parsers recognise a part by;
+        no fleet machine tag matches `^p\d{4}$`, and the writer is the only
+        producer of these names, so the lexical family is unambiguous on this
+        fleet (documented convention, checked first in every parser).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Day,
+        [Parameter(Mandatory)][string]$SlotHHmm,
+        [string]$MachineTag = ''
+    )
+    if ($Day -notmatch '^\d{4}-\d{2}-\d{2}$') {
+        throw "Get-CapturePartName: Day must be yyyy-MM-dd, got '$Day'"
+    }
+    if ($SlotHHmm -notmatch '^\d{4}$') {
+        throw "Get-CapturePartName: SlotHHmm must be HHmm (4 digits), got '$SlotHHmm'"
+    }
+    if ([string]::IsNullOrWhiteSpace($MachineTag)) { return "captures-$Day-p$SlotHHmm.7z" }
+    if ($MachineTag -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        throw "Get-CapturePartName: MachineTag must match ^[A-Za-z0-9][A-Za-z0-9._-]*$, got '$MachineTag'"
+    }
+    return "captures-$Day-p$SlotHHmm-$MachineTag.7z"
+}
+
+function Get-CapturePartInfo {
+    <#
+        The facts a day-part name encodes — {Day, Slot, Tag} — or $null when
+        the name is not a part. Checked BEFORE the day-archive parsers
+        everywhere (see Get-CaptureArchiveDay): `captures-<day>-p1200-<tag>`
+        is a part of `<day>` with tag `<tag>`, not a day archive tagged
+        `p1200-<tag>`.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    if ($Name -match '^captures-(\d{4}-\d{2}-\d{2})-p(\d{4})(?:-([A-Za-z0-9._-]+))?\.7z$') {
+        return [pscustomobject]@{
+            Day  = $matches[1]
+            Slot = $matches[2]
+            Tag  = $matches[3]
+        }
+    }
+    return $null
 }
 
 function Get-CapturePartialInfo {
@@ -2448,6 +2511,17 @@ function Get-CapturePartialInfo {
     }
     # Capture the group BEFORE calling out — the nested -match below resets $matches.
     $canonical = $matches[1]
+    # A part canonical (#1152 c) carries its own day+tag: Get-CaptureArchiveDay
+    # rejects part names by design, so resolve the part first and fall through
+    # to the day-archive path only for a true canonical.
+    $part = Get-CapturePartInfo -Name $canonical
+    if ($part) {
+        return [pscustomobject]@{
+            Day       = $part.Day
+            Canonical = $canonical
+            Tag       = $part.Tag
+        }
+    }
     $day = Get-CaptureArchiveDay -Name $canonical
     if (-not $day) { return $null }
     return [pscustomobject]@{
@@ -3296,6 +3370,8 @@ Export-ModuleMember -Function @(
     'Get-CaptureArchiveName'
     'Get-CaptureArchiveDay'
     'Get-CaptureArchiveMachineTag'
+    'Get-CapturePartName'
+    'Get-CapturePartInfo'
     'Get-CapturePartialInfo'
     'Get-CaptureArchivePolicy'
     'Get-OffsiteWriteVerdict'
