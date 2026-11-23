@@ -279,7 +279,7 @@ def fmt_int(n):
     return f"{n:,}".replace(",", " ")
 
 
-def build_days(per_day, corpus_dir, cutoff_dt, now_dt, reqs, fleet,
+def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
                reconcile_dir):
     """Serie par JOUR UTC (#1161 stage 2, grain producteur) — la consommation
     que `activity-cost-join.py` met en regard des contributions GitHub.
@@ -287,10 +287,16 @@ def build_days(per_day, corpus_dir, cutoff_dt, now_dt, reqs, fleet,
     -> [{"date", "n", "in", "out", "cache_create", "cache_read",
          "partial"?, "blind"?}]
 
-    Un jour n'est emis que s'il PORTE une mesure (resp loose dans la fenetre)
-    ou une DECLARATION (partie de jour / archive de jour, #1152 c) : un jour
-    sans rien n'est pas un zero de consommation, il est absent — le joiner le
+    Un jour n'est emis que s'il PORTE une mesure (resp lue) ou une
+    DECLARATION (partie de jour / archive de jour, #1152 c) : un jour sans
+    rien n'est pas un zero de consommation, il est absent — le joiner le
     nomme `activity-only` au lieu d'inventer un inEq nul.
+
+    corpus_dirs : racines du corpus (#1180). Les DECLARATIONS sont l'union
+    des racines dedupliquee par NOM — la premiere racine gagne, comme
+    assess_many : un jour packe sur un second disque n'est pas oublie, une
+    partie presente deux fois n'est pas comptee deux fois. L'angle mort
+    (archives outage, repertoire reconcile) se lit sous la PREMIERE racine.
 
     partial : jour courant (pas fini), premier jour de la fenetre (coupe au
     cutoff, pas a minuit), et tout jour dont les captures sont packees en
@@ -301,24 +307,30 @@ def build_days(per_day, corpus_dir, cutoff_dt, now_dt, reqs, fleet,
     flotte a 0 nominal ET 0 archive ce jour = inconnu, pas zero) ; archives
     listees UNE fois pour toute la serie, la regle reste celle de la lib.
     """
+    cdir = corpus_dirs[0]
     pp = _load_partial_parts()
     part_days = Counter()
     arch_days = set()
-    try:
-        names = os.listdir(pp.archive_dir(corpus_dir))
-    except OSError:
-        names = []
-    for fn in names:
-        m = pp.PART_FN.match(fn)
-        if m:
-            part_days[m.group("day")] += 1
+    seen = set()
+    for _d in corpus_dirs:
+        try:
+            names = os.listdir(pp.archive_dir(_d))
+        except OSError:
             continue
-        m = pp.DAY_ARCHIVE_FN.match(fn)
-        if m:
-            arch_days.add(m.group(1))
+        for fn in names:
+            if fn in seen:
+                continue
+            seen.add(fn)
+            m = pp.PART_FN.match(fn)
+            if m:
+                part_days[m.group("day")] += 1
+                continue
+            m = pp.DAY_ARCHIVE_FN.match(fn)
+            if m:
+                arch_days.add(m.group(1))
 
     bs = _load_blind_spot()
-    archives = bs.outage_archives(corpus_dir, reconcile_dir)
+    archives = bs.outage_archives(cdir, reconcile_dir)
 
     nom_by_day = defaultdict(Counter)
     for lst in reqs.values():
@@ -353,7 +365,7 @@ def build_days(per_day, corpus_dir, cutoff_dt, now_dt, reqs, fleet,
             row["partial_reasons"] = reasons
         d0 = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         d1 = d0 + timedelta(days=1)
-        res = bs.assess(corpus_dir, max(d0, cutoff_dt), min(d1, now_dt), fleet,
+        res = bs.assess(cdir, max(d0, cutoff_dt), min(d1, now_dt), fleet,
                         reconcile_dir=reconcile_dir,
                         nominal_counts=dict(nom_by_day.get(day, {})),
                         archives=archives)
@@ -522,7 +534,7 @@ def main():
     # #1180 — union des racines, dedupliquee par nom de partie
     partial = pp.assess_many(dirs, cutoff_dt, now_dt)
 
-    days = (build_days(per_day, args.dir, cutoff_dt, now_dt, reqs, fleet, _rdir)
+    days = (build_days(per_day, dirs, cutoff_dt, now_dt, reqs, fleet, _rdir)
             if args.per_day else None)
 
     if args.json:

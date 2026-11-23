@@ -20,6 +20,11 @@ This file pins the PRODUCER of that shape:
       ratio row, and the partial days come out flagged without a ratio
       (AC a + b of the #1161 stage-2 grain).
   P6  the text mode renders the same series and names the reasons.
+  P7  #1180 — the day DECLARATIONS are the UNION of the corpus roots
+      (deduplicated by part name): a day packed on a second disk is declared,
+      never forgotten; `--per-day` changes the `days` key and NOTHING else
+      (so a key another reader adds to the JSON — `coverage` — is carried,
+      never dropped).
 
 Run: python scripts/tests/test_traffic_consumption_per_day.py
 """
@@ -76,45 +81,58 @@ def stamp(dt):
 
 
 def build_corpus(tmp):
-    """Days relative to now so the pins hold at any run hour.
+    """Days relative to now so the pins hold at any run hour (--hours 96).
 
-    d0 = today-3 (window start under --hours 72), d1 = today-2 (packed part,
-    NO loose capture), d2 = today-1 (interior, loose -> ratio-able),
-    d3 = today (loose at `now`, current day)."""
+    d0 = today-4 (window start: ONE capture 2 min after the cutoff, so the
+    day is cut off at the cutoff whatever the hour — a fixed clock time
+    would leave the window after 23:00Z), gap = today-3 (NOTHING: absent,
+    never a zero), d1 = today-2 (packed part, NO loose capture), d2 = today-1
+    (interior, loose -> ratio-able), d3 = today (loose at `now`, current day)."""
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    d0, d1, d2, d3 = (now.date() - timedelta(days=n) for n in (3, 2, 1, 0))
+    d0, gap, d1, d2, d3 = (now.date() - timedelta(days=n)
+                           for n in (4, 3, 2, 1, 0))
     root = os.path.join(tmp, "corpus")
     arch = os.path.join(root, "archive")
     os.makedirs(arch)
     # d1: its captures live in a day part this reader does not open
     open(os.path.join(arch, f"captures-{d1}-p1147.7z"), "wb").close()
-    pair(root, 1, 1, stamp(datetime.combine(d0, datetime.min.time()).replace(
-        hour=23, tzinfo=timezone.utc)))
+    pair(root, 1, 1, stamp(now - timedelta(hours=96) + timedelta(minutes=2)))
     pair(root, 1, 2, stamp(datetime.combine(d2, datetime.min.time()).replace(
         hour=12, tzinfo=timezone.utc)))
     pair(root, 1, 3, stamp(now))
-    return root, [d.isoformat() for d in (d0, d1, d2, d3)]
+    return root, [d.isoformat() for d in (d0, gap, d1, d2, d3)]
 
 
-def run(root, *extra):
+def run(roots, *extra):
+    roots = [roots] if isinstance(roots, str) else list(roots)
     # --reconcile-dir vers un dossier inexistant : hermetique (aucune archive
     # outage hors-site ne vient peupler la flotte du poste qui lance le test).
-    args = [sys.executable, "-I", _TOOL, "--dir", root, "--hours", "72",
-            "--reconcile-dir", os.path.join(root, "no-reconcile"), *extra]
-    return subprocess.run(args, capture_output=True, text=True)
+    args = [sys.executable, "-I", _TOOL, "--hours", "96",
+            "--reconcile-dir", os.path.join(roots[0], "no-reconcile")]
+    for r in roots:
+        args += ["--dir", r]
+    return subprocess.run(args + list(extra), capture_output=True, text=True)
 
 
 def main():
     tmp = tempfile.mkdtemp(prefix="perday-")
     try:
-        root, (d0, d1, d2, d3) = build_corpus(tmp)
+        root, (d0, gap, d1, d2, d3) = build_corpus(tmp)
 
         print("P1 — contrat de forme et valeurs (une ligne par jour mesure)")
         out = run(root, "--per-day", "--json")
         check("rc=0", out.returncode == 0, out.stderr[-400:])
-        days = json.loads(out.stdout)["days"]
+        doc = json.loads(out.stdout)
+        days = doc["days"]
         by = {d["date"]: d for d in days}
         check("jours tries", [d["date"] for d in days] == sorted(by), days)
+        plain = json.loads(run(root, "--json").stdout)
+        check("--per-day change `days` et RIEN d'autre (meme jeu de cles)",
+              set(doc) == set(plain) and
+              all(doc[k] == plain[k] for k in plain if k != "days"),
+              (sorted(set(doc) ^ set(plain)),
+               [k for k in plain if k != "days" and doc.get(k) != plain[k]]))
+        check("sans --per-day, `days` = null", plain["days"] is None, plain.get("days"))
         for key in ("n", "in", "out", "cache_create", "cache_read"):
             check(f"cle {key} presente", key in by[d2], by.get(d2))
         check("out du triple coherent", by[d2]["out"] == 123, by.get(d2))
@@ -137,7 +155,6 @@ def main():
         check("jour interieur NON partial", "partial" not in by[d2], by.get(d2))
 
         print("P3 — un jour sans rien est ABSENT, pas un zero")
-        gap = (datetime.fromisoformat(d1) - timedelta(days=1)).isoformat()
         check("jour vide non emis", gap not in by, sorted(by))
         zero_days = [d["date"] for d in days if d["n"] == 0]
         check("un zero n'apparait que DECLARE (parts/archive)",
@@ -161,9 +178,9 @@ def main():
             fh.write(run(root, "--per-day", "--json").stdout)
         now = datetime.now(timezone.utc)
         activity = {
-            "login": "jsboige", "from": (now.date() - timedelta(days=3)).isoformat(),
-            "to": d3, "source": "fragment", "span_days": 4,
-            "coverage": {"covered": 4, "span_days": 4, "absent": []},
+            "login": "jsboige", "from": d0, "to": d3, "source": "fragment",
+            "span_days": 5,
+            "coverage": {"covered": 5, "span_days": 5, "absent": []},
             "days": [{"date": d2, "count": 12}, {"date": d3, "count": 5}],
         }
         act = os.path.join(tmp, "activity.json")
@@ -192,6 +209,29 @@ def main():
         os.makedirs(empty)
         check("absence de jour = serie vide dite",
               "aucune mesure ni declaration de jour" in run(empty, "--per-day").stdout)
+
+        print("P7 — #1180 : les declarations sont l'UNION des racines")
+        root2 = os.path.join(tmp, "corpus2")
+        arch2 = os.path.join(root2, "archive")
+        os.makedirs(arch2)
+        # packed ONLY on the second root: the loose union (root1) carries
+        # nothing of that day — it must still be DECLARED, never forgotten
+        open(os.path.join(arch2, f"captures-{gap}-p0900.7z"), "wb").close()
+        # the same part NAME as root1's: ONE part, not two
+        open(os.path.join(arch2, f"captures-{d1}-p1147.7z"), "wb").close()
+        out = run([root, root2], "--per-day", "--json")
+        check("rc=0", out.returncode == 0, out.stderr[-400:])
+        by2 = {d["date"]: d for d in json.loads(out.stdout)["days"]}
+        check("jour packe sur la 2e racine : declare",
+              by2.get(gap, {}).get("partial") is True and
+              "packed:1-parts" in by2.get(gap, {}).get("partial_reasons", []),
+              by2.get(gap))
+        check("partie de meme nom sur 2 racines = UNE",
+              by2.get(d1, {}).get("partial_reasons", []).count("packed:1-parts") == 1
+              and not any("2-parts" in r for r in by2.get(d1, {}).get("partial_reasons", [])),
+              by2.get(d1))
+        check("une seule racine : ce jour reste absent (l'union ne fabrique rien)",
+              gap not in by, sorted(by))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
