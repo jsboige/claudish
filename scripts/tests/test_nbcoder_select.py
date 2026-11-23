@@ -134,6 +134,38 @@ class SelectionTests(unittest.TestCase):
                              "the real line still counts; the blank line is ignored")
             self.assertNotIn("Series/T-01-Python.ipynb", result["avail"])
 
+    def test_state_json_is_read_when_no_grains_jsonl_exists(self):
+        """#1170, measured 23/11: zero grains.jsonl under .tmp/nbst while every
+        live state-dir holds state.json + scheduler.jsonl. The single-shape read
+        refused every REAL state-dir — so the scheduler's own status file is the
+        second accepted shape, its grain keys ("<issue>:<notebook>") the
+        authority on what the dir has taken."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            q = root / "o6"
+            q.mkdir()
+            (q / "state.json").write_text(json.dumps({"grains": {
+                "#123:Series/T-01-Python.ipynb": {"status": "running"},
+                "#124:Series/T-02-Python.ipynb": {"status": "failed"},
+            }}), encoding="utf-8")
+            identity = FakeIdentity([("pulls?state=open", []), ("issues?state=open", [])])
+            result = ns.run_selection(repo, identity, ["o6"], root, pin="HEAD")
+            self.assertEqual(result["counts"]["inflight"], 2)
+            self.assertNotIn("Series/T-01-Python.ipynb", result["avail"],
+                             "a running grain's target is not free")
+
+    def test_a_dir_with_neither_shape_still_refuses(self):
+        """The fail-closed class is preserved: widening the accepted shapes must
+        not turn a typo in --inflight into 'nothing in flight'."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = make_repo(root)
+            (root / "empty-q").mkdir()
+            identity = FakeIdentity([("pulls?state=open", []), ("issues?state=open", [])])
+            with self.assertRaises(ns.InstrumentError):
+                ns.run_selection(repo, identity, ["empty-q"], root, pin="HEAD")
+
     def test_ls_tree_failure_is_not_an_empty_tree(self):
         """M3 (review at 3bf48f1f): the SECOND Git read carries this PR's claim.
 
