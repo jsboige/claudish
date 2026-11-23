@@ -56,22 +56,32 @@ def _resp(d, pid, rank, stamp, model, reqN, hdr_pid=None):
         f.write('event: message_start\ndata: {"type":"message_start"}\n\n')
 
 
-def _run(d, *extra):
+def _run(d, *extra, _ioencoding="utf-8"):
+    # #1175: the child's stdout contract must NOT depend on the seat. Without
+    # PYTHONIOENCODING a piped child encodes with locale.getpreferredencoding()
+    # (= cp1252 on the po-2027 seat) while the script prints '—'/'\x97' and
+    # '·'/'\xb7'; decoding that as strict utf-8 raised UnicodeDecodeError,
+    # stdout became None, and p.stdout + p.stderr raised TypeError instead of
+    # reporting the assertion. errors="replace" + (or "") is the structural
+    # net: this reader ALWAYS returns text, whatever bytes the child emits.
     empty = tempfile.mkdtemp(prefix="leak-rdir-")
     p = subprocess.run(
         [sys.executable, _SCRIPT, "--leak-policy", "--captures-dir", d,
          "--reconcile-dir", empty, *extra],
-        capture_output=True, text=True, encoding="utf-8")
-    return p.returncode, p.stdout + p.stderr
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": _ioencoding})
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
-def _run_full(d, *extra):
+def _run_full(d, *extra, _ioencoding="utf-8"):
+    # Same contract as _run (#1175).
     empty = tempfile.mkdtemp(prefix="full-rdir-")
     p = subprocess.run(
         [sys.executable, _SCRIPT, "--captures-dir", d,
          "--reconcile-dir", empty, *extra],
-        capture_output=True, text=True, encoding="utf-8")
-    return p.returncode, p.stdout + p.stderr
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": _ioencoding})
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
 def _ws_sub(out):
@@ -435,6 +445,26 @@ def test_full_mode_and_leak_policy_agree_on_sub():
     assert code == 0, out
     assert _ws_sub(out) == "1", \
         f"full mode and leak-policy disagree on the same corpus (#1051):\n{out}"
+
+
+def test_non_utf8_child_output_never_raises():
+    # #1175 (file 23b item 3): pin the structural net, on ANY seat. The child
+    # is FORCED to cp1252 — the po-2027 seat's real default, where the report's
+    # '—' (0x97) and '·' (0xb7) made a strict utf-8 decode raise, stdout come
+    # back None, and `p.stdout + p.stderr` die with TypeError instead of the
+    # assertion message. A reader that always returns text keeps the ASCII
+    # contract of every assertion intact (the decorative bytes are replaced).
+    d = tempfile.mkdtemp(prefix="leak-cp1252-")
+    _anchor(d)
+    _req(d, 1, 7, "2026-11-09T06-00-00-000Z", "myia-ai-01")
+    _resp(d, 1, 900, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 7)
+    code, out = _run(d, "--since", "2026-11-09T00", _ioencoding="cp1252")
+    assert isinstance(out, str) and out, \
+        "reader must return text from a non-utf8 child, never crash on decode"
+    assert "Leak-policy" in out, out
+    code_full, out_full = _run_full(d, _ioencoding="cp1252")
+    assert isinstance(out_full, str) and out_full, \
+        "full-mode reader must return text from a non-utf8 child too"
 
 
 if __name__ == "__main__":
