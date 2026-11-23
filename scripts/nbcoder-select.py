@@ -296,6 +296,9 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
                 if fn.endswith(".ipynb"):
                     taken_pr.setdefault(fn, pr["number"])
         if not require_free:
+            # 23/11: a %TEMP% sweep removed the default tmp-root and the bar died on
+            # this write AFTER paying the whole PR scan -- create the directory first.
+            cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(taken_pr), encoding="utf-8")
 
     inflight: set[str] = set()
