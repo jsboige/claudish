@@ -85,7 +85,7 @@ jobs:
         run: |
           $n = (Get-ChildItem -Recurse ./scripts/tests -Filter *.Tests.ps1 | Select-String -Pattern '-Tag HostBound' -SimpleMatch).Count
           Write-Host "HOSTBOUND-EXCLUDED: $n test(s) tagged HostBound skipped on CI (pass on seats; diagnosis: #1096)"
-          Invoke-Pester ./scripts/tests -Output Detailed -CI -ExcludeTagFilter HostBound
+          & ./scripts/tests/run-pester.ps1 -ExcludeTagFilter HostBound
       - name: Pester suite (powershell 5.1, hermetic runner)
         if: matrix.shell == 'powershell'
         shell: powershell
