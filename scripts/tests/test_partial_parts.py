@@ -236,12 +236,17 @@ def test_leak_policy_identical_before_after_packing():
 
     def run(td):
         empty = tempfile.mkdtemp(prefix="pp-rdir-")
+        # #1175: pin the child's byte contract (see test_native_leak_policy):
+        # without PYTHONIOENCODING the report's '—'/'·' come out cp1252 on a
+        # Windows seat and a strict utf-8 decode kills the run before the
+        # assertion; errors="replace" + (or "") always returns text.
         p = subprocess.run(
             [sys.executable, os.path.join(_HERE, "..", "native-consumption.py"),
              "--leak-policy", "--captures-dir", td,
              "--reconcile-dir", empty, "--since", "2026-11-09T00"],
-            capture_output=True, text=True, encoding="utf-8")
-        return p.returncode, p.stdout + p.stderr
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
 
     with tempfile.TemporaryDirectory() as td:
         build(td)
@@ -283,8 +288,9 @@ def test_leak_policy_partial_when_part_unreadable():
             [sys.executable, os.path.join(_HERE, "..", "native-consumption.py"),
              "--leak-policy", "--captures-dir", td,
              "--reconcile-dir", empty, "--since", "2026-11-09T00"],
-            capture_output=True, text=True, encoding="utf-8")
-        out = p.stdout + p.stderr
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        out = (p.stdout or "") + (p.stderr or "")
         assert "PARTIAL" in out, out
         assert "unreadable" in out, out
 
