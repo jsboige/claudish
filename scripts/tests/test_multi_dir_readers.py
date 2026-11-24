@@ -10,8 +10,11 @@ Pinned here:
      files lived in one (native-consumption + traffic-consumption);
   2. a file present in BOTH directories is counted once — the union is
      deduplicated by filename, first directory wins;
-  3. the reader DECLARES how many directories it actually covered
-     (`COVERAGE dirs=N`), so a missing directory is never silent;
+  3. the reader DECLARES how many directories it actually READ
+     (`COVERAGE dirs=<read>/<asked> uncovered=<path>`), on stdout — a
+     directory that could not be read is never silent, in the text run nor
+     in `traffic-consumption.py --json` (`coverage` key), and a run that
+     read NO directory exits 2;
   4. the leak-policy verdict on ONE directory is IDENTICAL before and after
      the change — adding an empty second directory changes the coverage line
      and nothing else in the verdict.
@@ -19,8 +22,10 @@ Pinned here:
 Run: python scripts/tests/test_multi_dir_readers.py
 """
 
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,11 +41,19 @@ STAMP = "2026-11-23T10-00-00-000Z"
 RESP_STAMP = "2026-11-23T10-00-05-000Z"
 
 
+_TMP = []   # roots created by the running test, removed when it returns
+
+
+def _tmp(prefix):
+    d = tempfile.mkdtemp(prefix=prefix)
+    _TMP.append(d)
+    return d
+
+
 def _req(d, pid, n, machine, stamp=STAMP, model="claude-opus-5-5"):
     env = {"ts": stamp, "src": "direct", "machine": machine, "model": model,
            "body": {"model": model,
                     "messages": [{"role": "user", "content": "hi"}]}}
-    import json
     with open(os.path.join(d, f"req-{pid}-{n}-{stamp}-direct.json"),
               "w", encoding="utf-8") as f:
         json.dump(env, f)
@@ -54,25 +67,49 @@ def _resp(d, pid, rank, model, reqN, stamp=RESP_STAMP):
                 '"message":{"usage":{"input_tokens":10,"output_tokens":5}}}\n\n')
 
 
-def _run_native(*dirs, leak=False):
-    empty = tempfile.mkdtemp(prefix="md-rdir-")
+def _native_argv(*dirs, leak=False):
+    empty = _tmp(prefix="md-rdir-")
     argv = [sys.executable, _NATIVE, "--reconcile-dir", empty]
     if leak:
         argv.append("--leak-policy")
     for d in dirs:
         argv += ["--captures-dir", d]
-    p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
-    return p.returncode, p.stdout + p.stderr
+    return argv
 
 
-def _run_traffic(*dirs):
-    empty = tempfile.mkdtemp(prefix="md-trdir-")
+def _traffic_argv(*dirs):
+    empty = _tmp(prefix="md-trdir-")
     argv = [sys.executable, _TRAFFIC, "--hours", "720",
             "--reconcile-dir", empty]
     for d in dirs:
         argv += ["--dir", d]
+    return argv
+
+
+def _sh(argv):
     p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
-    return p.returncode, p.stdout + p.stderr
+    return p.returncode, p.stdout, p.stderr
+
+
+def _run_native(*dirs, leak=False):
+    """(rc, stdout, stderr) — the streams stay apart: a pin on what a reader
+    of STDOUT sees must not be satisfied by a line that only stderr carries."""
+    return _sh(_native_argv(*dirs, leak=leak))
+
+
+def _run_traffic(*dirs, json_out=False):
+    argv = _traffic_argv(*dirs)
+    if json_out:
+        argv.append("--json")
+    return _sh(argv)
+
+
+def _coverage_line(stdout):
+    """The COVERAGE line as a reader of STDOUT sees it ('' = absent)."""
+    for line in stdout.splitlines():
+        if line.startswith("COVERAGE "):
+            return line
+    return ""
 
 
 def _pair_count(out):
@@ -92,72 +129,163 @@ def _traffic_counts(out):
 # --------------------------------------------------------------- 1. split pair
 
 def test_native_split_pair_across_two_dirs_pairs():
-    a = tempfile.mkdtemp(prefix="md-a-")
-    b = tempfile.mkdtemp(prefix="md-b-")
+    a = _tmp(prefix="md-a-")
+    b = _tmp(prefix="md-b-")
     _req(a, 1, 7, "myia-ai-01")
     _resp(b, 1, 900, "claude-opus-5-5", 7)   # request in A, response in B
-    code, out = _run_native(a, b)
-    assert code == 0, out
-    assert _pair_count(out) == (1, 0), out
+    code, out, err = _run_native(a, b)
+    assert code == 0, out + err
+    assert _pair_count(out) == (1, 0), out + err
 
 
 def test_traffic_split_pair_across_two_dirs_pairs():
-    a = tempfile.mkdtemp(prefix="md-tr-a-")
-    b = tempfile.mkdtemp(prefix="md-tr-b-")
+    a = _tmp(prefix="md-tr-a-")
+    b = _tmp(prefix="md-tr-b-")
     _req(a, 1, 7, "myia-ai-01")
     _resp(b, 1, 900, "claude-opus-5-5", 7)
-    code, out = _run_traffic(a, b)
-    assert code == 0, out
-    assert _traffic_counts(out) == (1, 1, 0), out
+    code, out, err = _run_traffic(a, b)
+    assert code == 0, out + err
+    assert _traffic_counts(out) == (1, 1, 0), out + err
 
 
 # ------------------------------------------------------------ 2. dedup by name
 
 def test_native_a_duplicated_file_is_counted_once():
-    a = tempfile.mkdtemp(prefix="md-dup-a-")
-    b = tempfile.mkdtemp(prefix="md-dup-b-")
+    a = _tmp(prefix="md-dup-a-")
+    b = _tmp(prefix="md-dup-b-")
     _req(a, 1, 7, "myia-ai-01")
     _resp(a, 1, 900, "claude-opus-5-5", 7)
     # same basename in the second directory (a partial copy, an rsync overlap)
     _resp(b, 1, 900, "claude-opus-5-5", 7)
-    code, out = _run_native(a, b)
-    assert code == 0, out
-    assert _pair_count(out) == (1, 0), out
+    code, out, err = _run_native(a, b)
+    assert code == 0, out + err
+    assert _pair_count(out) == (1, 0), out + err
 
 
 def test_traffic_a_duplicated_file_is_counted_once():
-    a = tempfile.mkdtemp(prefix="md-tr-dup-a-")
-    b = tempfile.mkdtemp(prefix="md-tr-dup-b-")
+    a = _tmp(prefix="md-tr-dup-a-")
+    b = _tmp(prefix="md-tr-dup-b-")
     _req(a, 1, 7, "myia-ai-01")
     _resp(a, 1, 900, "claude-opus-5-5", 7)
     _resp(b, 1, 900, "claude-opus-5-5", 7)
-    code, out = _run_traffic(a, b)
-    assert code == 0, out
-    assert _traffic_counts(out) == (1, 1, 0), out
+    code, out, err = _run_traffic(a, b)
+    assert code == 0, out + err
+    assert _traffic_counts(out) == (1, 1, 0), out + err
 
 
 # ---------------------------------------------------------------- 3. coverage
+#
+# `COVERAGE dirs=<read>/<asked>` names what the reader actually READ. The
+# number asked for is not a coverage: a second root that does not exist yet
+# must not read as a corpus that was read and happened to be empty.
 
-def test_native_declares_how_many_dirs_it_covered():
-    a = tempfile.mkdtemp(prefix="md-cov-a-")
-    b = tempfile.mkdtemp(prefix="md-cov-b-")
+def _populated():
+    """One root carrying a pair, plus a sibling path that does not exist —
+    the shape of a second root before anything has moved into it."""
+    a = _tmp(prefix="md-cov-")
     _req(a, 1, 7, "myia-ai-01")
     _resp(a, 1, 900, "claude-opus-5-5", 7)
-    _, one = _run_native(a)
-    _, two = _run_native(a, b)
-    assert "COVERAGE dirs=1" in one, one
-    assert "COVERAGE dirs=2" in two, two
+    return a, a + "-missing"
+
+
+def test_native_declares_how_many_dirs_it_covered():
+    a, _ = _populated()
+    b = _tmp(prefix="md-cov-b-")
+    _req(b, 2, 7, "myia-po-2024")
+    _, one, _ = _run_native(a)
+    _, two, _ = _run_native(a, b)
+    assert _coverage_line(one) == "COVERAGE dirs=1/1", one
+    assert _coverage_line(two) == "COVERAGE dirs=2/2", two
 
 
 def test_traffic_declares_how_many_dirs_it_covered():
-    a = tempfile.mkdtemp(prefix="md-tr-cov-a-")
-    b = tempfile.mkdtemp(prefix="md-tr-cov-b-")
-    _req(a, 1, 7, "myia-ai-01")
-    _resp(a, 1, 900, "claude-opus-5-5", 7)
-    _, one = _run_traffic(a)
-    _, two = _run_traffic(a, b)
-    assert "COVERAGE dirs=1" in one, one
-    assert "COVERAGE dirs=2" in two, two
+    a, _ = _populated()
+    b = _tmp(prefix="md-tr-cov-b-")
+    _req(b, 2, 7, "myia-po-2024")
+    _, one, _ = _run_traffic(a)
+    _, two, _ = _run_traffic(a, b)
+    assert _coverage_line(one) == "COVERAGE dirs=1/1", one
+    assert _coverage_line(two) == "COVERAGE dirs=2/2", two
+
+
+def test_native_an_unreadable_root_is_uncovered_on_stdout():
+    """CR #1181 finding 1 — the count is what was read, and the root that
+    could not be is named on the SAME stdout line. A pipe reading stdout
+    only must see it: the stderr warning carries the errno, not the verdict."""
+    a, missing = _populated()
+    code, out, err = _run_native(a, missing)
+    assert code == 0, out + err
+    assert _coverage_line(out) == f"COVERAGE dirs=1/2 uncovered={missing}",         (_coverage_line(out), err[-400:])
+    assert "warning: capture dir unreadable" in err, err
+    # the root that WAS read still yields its pair
+    assert _pair_count(out) == (1, 0), out + err
+
+
+def test_traffic_an_unreadable_root_is_uncovered_on_stdout():
+    a, missing = _populated()
+    code, out, err = _run_traffic(a, missing)
+    assert code == 0, out + err
+    assert _coverage_line(out) == f"COVERAGE dirs=1/2 uncovered={missing}",         (_coverage_line(out), err[-400:])
+    assert "warning: capture dir unreadable" in err, err
+    # listed ONCE: one warning for the request heads and the responses both
+    assert err.count("warning: capture dir unreadable") == 1, err
+    assert _traffic_counts(out) == (1, 1, 0), out + err
+
+
+def test_a_file_given_as_a_root_is_uncovered():
+    """`listdir`/`scandir` raise on a file: the slip of passing one capture
+    instead of its directory is a root that was not read, not a crash."""
+    a, _ = _populated()
+    a_file = os.path.join(a, "req-1-7-" + STAMP + "-direct.json")
+    code, out, err = _run_native(a, a_file)
+    assert _coverage_line(out) == f"COVERAGE dirs=1/2 uncovered={a_file}",         (_coverage_line(out), err[-400:])
+    code, out, err = _run_traffic(a, a_file)
+    assert _coverage_line(out) == f"COVERAGE dirs=1/2 uncovered={a_file}",         (_coverage_line(out), err[-400:])
+
+
+def test_a_readable_second_root_is_read_when_the_first_is_not():
+    """The first root is the corpus of reference (archive/, reconcile/). With
+    it unreadable those mean nothing — but the captures of the roots that CAN
+    be read are still counted, and the line still names the one that could not."""
+    a, missing = _populated()
+    want = f"COVERAGE dirs=1/2 uncovered={missing}"
+    code, out, err = _run_native(missing, a)
+    assert (code, _coverage_line(out)) == (0, want), (code, out, err)
+    assert _pair_count(out) == (1, 0), out + err
+    code, out, err = _run_traffic(missing, a)
+    assert (code, _coverage_line(out)) == (0, want), (code, out, err)
+    assert _traffic_counts(out) == (1, 1, 0), out + err
+
+
+def test_traffic_json_carries_the_coverage():
+    """CR #1181 finding 2 — the machine-readable run declares the same
+    coverage as the text run. stdout stays pure JSON (the warning is stderr)."""
+    a, missing = _populated()
+    code, out, err = _run_traffic(a, missing, json_out=True)
+    assert code == 0, (code, out, err)
+    doc = json.loads(out)
+    assert doc.get("coverage") == {"requested": [a, missing], "covered": [a],
+                                   "uncovered": [missing]}, out
+    doc = json.loads(_run_traffic(a, json_out=True)[1])
+    assert doc.get("coverage") == {"requested": [a], "covered": [a],
+                                   "uncovered": []}, out
+
+
+def test_no_readable_root_is_not_an_exit_0():
+    """The limit of the count: 0 roots read. On main an unreadable only root
+    was a traceback (rc 1) — a run that read nothing must not exit 0 and
+    look like a corpus without traffic."""
+    a, missing = _populated()
+    code, out, err = _run_native(missing)
+    assert code == 2, (code, out, err)
+    assert _coverage_line(out) == f"COVERAGE dirs=0/1 uncovered={missing}",         (_coverage_line(out), err[-400:])
+    code, out, err = _run_traffic(missing)
+    assert code == 2, (code, out, err)
+    assert _coverage_line(out) == f"COVERAGE dirs=0/1 uncovered={missing}",         (_coverage_line(out), err[-400:])
+    code, out, err = _run_traffic(missing, json_out=True)
+    assert code == 2, (code, out, err)
+    assert json.loads(out).get("coverage") == {
+        "requested": [missing], "covered": [], "uncovered": [missing]}, out
 
 
 # ----------------------------------------------------- 4. no verdict regression
@@ -169,14 +297,15 @@ def _verdict(out):
 
 
 def test_leak_policy_verdict_is_identical_with_an_empty_second_dir():
-    a = tempfile.mkdtemp(prefix="md-lp-a-")
-    empty = tempfile.mkdtemp(prefix="md-lp-empty-")
+    a = _tmp(prefix="md-lp-a-")
+    empty = _tmp(prefix="md-lp-empty-")
     _req(a, 1, 7, "myia-ai-01")
     _resp(a, 1, 900, "claude-opus-5-5", 7)
-    c1, one = _run_native(a, leak=True)
-    c2, two = _run_native(a, empty, leak=True)
+    c1, one, e1 = _run_native(a, leak=True)
+    c2, two, e2 = _run_native(a, empty, leak=True)
     assert c1 == c2, (c1, c2, one, two)
     assert _verdict(one) == _verdict(two), (one, two)
+    assert e1 == e2, (e1, e2)
 
 
 if __name__ == "__main__":
@@ -190,4 +319,7 @@ if __name__ == "__main__":
         except AssertionError as exc:
             fails += 1
             print(f"FAIL {name}: {exc}")
+        finally:
+            while _TMP:
+                shutil.rmtree(_TMP.pop(), ignore_errors=True)
     sys.exit(1 if fails else 0)
