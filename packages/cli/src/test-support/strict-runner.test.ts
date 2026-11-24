@@ -1249,22 +1249,67 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     expect(out).not.toContain("NEW FAILING");
   });
 
-  test("a reproduced entry whose file dies when run ALONE stays NEW FAILING (an unreadable third run excuses nothing)", () => {
+  test("a reproduced entry whose file dies when run ALONE stays NEW FAILING, and the line names the reason (an unreadable third run excuses nothing)", () => {
     chdirTmp(partBaseline([], 2, ["a.test.ts"]));
     let pass = 0;
     const deps: PartitionDeps = {
       listFiles: () => ["a.test.ts", "b.test.ts"],
       runPartition: (fs) => {
         pass += 1;
+        // passes 1-2: the partition and its confirmation carry both entries;
+        // pass 3 = a alone (an injected errorCode), pass 4 = b alone (killed,
+        // no code — the `?? "killed"` fallback)
         if (pass === 3) return { raw: "", killed: true, errorCode: "ETIMEDOUT" };
-        return { raw: outputFor(["a.test.ts > NEW1"], fs.length) };
+        if (pass === 4) return { raw: "", killed: true };
+        return { raw: outputFor(["a.test.ts > NEW1", "b.test.ts > NEW2"], fs.length) };
       },
     };
     const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
     expect(code).toBe(1);
     expect(out).toContain("NEW FAILING");
     expect(out).not.toContain("context-sensitive");
-    expect(out).toContain("could not be read");
+    // The reason, not just the outcome: the generic "unaccountable output"
+    // line is reached by the same empty raw, so asserting only "could not be
+    // read" would let `if (run.killed)` be deleted with every pin still green
+    // (review ai-01 on #1184, second surviving mutant).
+    expect(out).toContain("could not be read (ETIMEDOUT)");
+    expect(out).toContain("could not be read (killed)");
+  });
+
+  test("an alone-run keyed to ANOTHER file excuses nothing: the entries stay NEW FAILING and the line names the mismatch (the ::group:: framing CI hit)", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts"]));
+    // Accountable counters, correct echo — the ONE thing wrong is that the
+    // entry belongs to ghost.test.ts, not to the file the run was given. This
+    // is the real CI shape (the parser strips `::group::`, so a framing
+    // variant can key entries to a foreign name and every count still adds up).
+    const foreignRaw = [
+      "::group::ghost.test.ts:",
+      "(fail) g1 [1.00ms]",
+      "",
+      " 1 fail",
+      " 0 error",
+      "Ran 1 test across 1 file. [10.00ms]",
+      "::endgroup::",
+    ].join("\n");
+    let pass = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        pass += 1;
+        if (pass === 3) return { raw: foreignRaw }; // pass 3 = a.test.ts ALONE
+        return { raw: outputFor(["a.test.ts > NEW1"], fs.length) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1);
+    // Without the foreign-entry guard, NEW1 is simply absent from `alone` and
+    // gets labeled CONTEXT-SENSITIVE — exit still 1, but the label sends the
+    // reader to the wrong suspect (review ai-01 on #1184, first surviving mutant).
+    expect(out).toContain("NEW FAILING");
+    expect(out).toContain("a.test.ts > NEW1");
+    expect(out).not.toContain("context-sensitive");
+    expect(out).toContain("alone-run of a.test.ts could not be read");
+    expect(out).toContain("population mismatch");
   });
 
   test("REAL defaultPartitionDeps wiring: an entry that reproduces in its partition and passes alone is CONTEXT-SENSITIVE, exit 1 — no injected runPartition", () => {
