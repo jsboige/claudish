@@ -89,8 +89,13 @@ def _traffic_argv(*dirs):
 
 
 def _sh(argv):
-    p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
-    return p.returncode, p.stdout, p.stderr
+    # errors="replace" is the #1176 contract: the child keeps its console
+    # encoding (no env can pin it under -I), so the strict utf-8 decoder
+    # used to raise inside the reader thread and hand back stdout=None
+    # (#1186). Assertions only match ASCII; decorative bytes replace cleanly.
+    p = subprocess.run(argv, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    return p.returncode, p.stdout or "", p.stderr or ""
 
 
 def _run_native(*dirs, leak=False):
