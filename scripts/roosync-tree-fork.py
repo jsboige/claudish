@@ -19,7 +19,7 @@ that launches this probe), and the output says so on every run. What the host
 publishes is established by reading the trees, not by this layer alone.
 
 Nothing on the fleet sees this class. `settings-matrix.py` reads whichever path
-it is handed (`--shared` / `ROOSYNC_SHARED_PATH`, scripts/settings-matrix.py:503)
+it is handed (`--shared` / `ROOSYNC_SHARED_PATH`, scripts/settings-matrix.py:532)
 and reports it as *the* tree: pointed at the process value it describes a tree
 nobody else reads and calls the picture complete. That is a blind spot of the
 reader, not of RooSync.

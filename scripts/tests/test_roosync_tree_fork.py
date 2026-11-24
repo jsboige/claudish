@@ -8,7 +8,7 @@ write instants. The repoint happened at the User scope; the process predates
 it and keeps publishing into the old tree.
 
 Nothing else on the fleet can see this: `settings-matrix.py` reads whichever
-path it is handed (`scripts/settings-matrix.py:503`) and reports it as *the*
+path it is handed (`scripts/settings-matrix.py:532`) and reports it as *the*
 tree. So the pins below hold one property above all others:
 
     `SAME` means COMPARED AND SAME. It never means "could not compare".
