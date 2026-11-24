@@ -923,9 +923,18 @@ def read_write_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict
             continue
         uses = [(uid, nm) + classify_tool_use(nm, inp)
                 for uid, nm, inp in assistant_tool_uses(payload)]
+        # What the workspace NAME cannot say: lanes on different machines share
+        # a checkout name (Swift on ai-01 and MiniMax on po-2028, the #445
+        # table). Both are read from the envelope — or, on a capture that is
+        # the body itself, from the body. `model` is the REQUESTED model, never
+        # a served one: this pass pairs no response.
+        machine = env.get("machine") if isinstance(env, dict) else None
+        model = env.get("model") if isinstance(env, dict) else None
         rows.append({"day": day, "ws": workspace_key(raw)[0], "session": session_key(raw),
                      "compacted": compaction_flagged(payload),
-                     "cron": cron_flagged(env, payload), "uses": uses})
+                     "cron": cron_flagged(env, payload), "uses": uses,
+                     "machine": machine if isinstance(machine, str) and machine else "",
+                     "model": model if isinstance(model, str) and model else ""})
     for p in list(on_disk.values()):
         if os.path.isfile(p):
             os.remove(p)
@@ -953,8 +962,11 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
             continue
         t = tours.setdefault((r["day"], r["ws"], r["session"]),
                              {"ids": {}, "compacted": False, "reqs": 0,
-                              "cron": False, "cron_rows": 0})
+                              "cron": False, "cron_rows": 0, "machine": "", "model": ""})
         t["reqs"] += 1
+        # a session is one machine's: the first row that names it speaks for the tour
+        t["machine"] = t["machine"] or r.get("machine") or ""
+        t["model"] = t["model"] or r.get("model") or ""
         t["compacted"] = t["compacted"] or r["compacted"]
         t["cron"] = t["cron"] or bool(r.get("cron"))
         t["cron_rows"] += 1 if r.get("cron") else 0
@@ -971,6 +983,27 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
             k = (ws, uid)
             if k not in first_seen or day < first_seen[k][0]:
                 first_seen[k] = (day, sess)
+
+    # The same tours under a second key (the #445 table, queue 24c): a workspace
+    # NAME is shared by lanes on different machines and the row above merges
+    # them. Additive — no key above changes. A PR creation follows its
+    # FIRST-SEEN tour here as it does per workspace, so the per-machine counts
+    # sum to the workspace's.
+    def by(ws: str, field: str, missing: str) -> dict:
+        acc: dict[str, dict] = {}
+        for (_day, ws2, sess), t in tours.items():
+            if ws2 != ws:
+                continue
+            a = acc.setdefault(t.get(field) or missing,
+                               {"tours": 0, "reqs": 0, "create_ids": set()})
+            a["tours"] += 1
+            a["reqs"] += t["reqs"]
+            for uid in t.get("creates", ()):
+                if first_seen[(ws, uid)][1] == sess:
+                    a["create_ids"].add(uid)
+        return {k: {"tours": a["tours"], "reqs": a["reqs"],
+                    "pr_create_counted": len(a["create_ids"])}
+                for k, a in sorted(acc.items(), key=lambda kv: (-kv[1]["tours"], kv[0]))}
     per_ws: dict[str, dict] = {}
     for (day, ws, sess), t in tours.items():
         w = per_ws.setdefault(ws, {"tours": 0, "zero": 0, "compacted": 0, "reqs": 0,
@@ -1061,6 +1094,8 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
             "pr_create_counted": len(w["create_ids"]),
             "pr_create_scaled": round(pr_scaled, 1),
             "cadence": cadence,
+            "by_machine": by(ws, "machine", "direct"),
+            "by_model": by(ws, "model", "(none)"),
         }
     per_day_detail: dict[str, dict] = collections.defaultdict(lambda: {"tours": 0, "zero": 0})
     for (day, ws, sess), t in tours.items():
@@ -1160,6 +1195,10 @@ def main(argv=None) -> int:
                       f" (zero {v['reqs_zero_est_per_day']})"
                       f"  pr_create={v['pr_create_counted']} (scaled {v['pr_create_scaled']})",
                       flush=True)
+                if len(v["by_machine"]) > 1:
+                    print(f"    {'':<24} by machine: " + " | ".join(
+                        f"{m} {b['tours']} tours, {b['pr_create_counted']} PR created"
+                        for m, b in v["by_machine"].items()), flush=True)
             print("    — cadence (C5) : cron = un tir lancé par cron ; la borne est "
                   "UNIDIRECTIONNELLE (TRAP C1 : cron sous-compte, human sur-compte)",
                   flush=True)
