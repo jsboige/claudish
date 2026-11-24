@@ -472,7 +472,7 @@ def main():
         couv = "couverture (aucune resp dans la fenetre)"
     print(f"fenetre: {args.hours}h demandees | {couv}")
     print(f"COVERAGE dirs={len(covered)}/{len(dirs)}"
-          + (f" uncovered={' | '.join(uncovered)}" if uncovered else ""))
+          + (f" uncovered={','.join(uncovered)}" if uncovered else ""))
     print(f"resp: {n_resp} | appariees: {n_paired} | non appariees: {n_unpaired} | sans usage: {n_nousage}")
     for _line in pp.section(cdir, cutoff_dt, now_dt, res=partial):
         print(_line)

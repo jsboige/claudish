@@ -484,7 +484,7 @@ def main():
     _bs = _load_blind_spot()
     _rdir = a.reconcile_dir or _bs.default_reconcile_dir()
     print(f"COVERAGE dirs={len(_covered)}/{len(_dirs)}"
-          + (f" uncovered={' | '.join(_uncovered)}" if _uncovered else ""))
+          + (f" uncovered={','.join(_uncovered)}" if _uncovered else ""))
     if not _covered:
         # sur main, une racine unique illisible etait un traceback (rc 1) :
         # rien n'a ete lu, un rc 0 le lirait comme un corpus sans trafic

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Pins: a capture corpus split across several directories (#1180).
 
-The hub started moving captures older than 60 min to a second root on
-2026-11-23 (po-2025, D: pressure). Both readers took ONE directory, so half a
+The hub is to move captures older than 60 min to a second root (#1180, ACK
+2026-11-23 — the overflow directory was still absent from the hub on 23/11
+20:09Z, so the move is planned). Both readers took ONE directory, so half a
 day could read as nothing while the reader said nothing about it.
 
 Pinned here:
@@ -14,7 +15,8 @@ Pinned here:
      (`COVERAGE dirs=<read>/<asked> uncovered=<path>`), on stdout — a
      directory that could not be read is never silent, in the text run nor
      in `traffic-consumption.py --json` (`coverage` key), and a run that
-     read NO directory exits 2;
+     read NO directory exits 2. Several unreadable directories are
+     COMMA-separated (the producer's shape, file 24a);
   4. the leak-policy verdict on ONE directory is IDENTICAL before and after
      the change — adding an empty second directory changes the coverage line
      and nothing else in the verdict.
@@ -215,7 +217,8 @@ def test_native_an_unreadable_root_is_uncovered_on_stdout():
     a, missing = _populated()
     code, out, err = _run_native(a, missing)
     assert code == 0, out + err
-    assert _coverage_line(out) == f"COVERAGE dirs=1/2 uncovered={missing}",         (_coverage_line(out), err[-400:])
+    want = f"COVERAGE dirs=1/2 uncovered={missing}"
+    assert _coverage_line(out) == want, (_coverage_line(out), err[-400:])
     assert "warning: capture dir unreadable" in err, err
     # the root that WAS read still yields its pair
     assert _pair_count(out) == (1, 0), out + err
@@ -225,7 +228,8 @@ def test_traffic_an_unreadable_root_is_uncovered_on_stdout():
     a, missing = _populated()
     code, out, err = _run_traffic(a, missing)
     assert code == 0, out + err
-    assert _coverage_line(out) == f"COVERAGE dirs=1/2 uncovered={missing}",         (_coverage_line(out), err[-400:])
+    want = f"COVERAGE dirs=1/2 uncovered={missing}"
+    assert _coverage_line(out) == want, (_coverage_line(out), err[-400:])
     assert "warning: capture dir unreadable" in err, err
     # listed ONCE: one warning for the request heads and the responses both
     assert err.count("warning: capture dir unreadable") == 1, err
@@ -238,9 +242,10 @@ def test_a_file_given_as_a_root_is_uncovered():
     a, _ = _populated()
     a_file = os.path.join(a, "req-1-7-" + STAMP + "-direct.json")
     code, out, err = _run_native(a, a_file)
-    assert _coverage_line(out) == f"COVERAGE dirs=1/2 uncovered={a_file}",         (_coverage_line(out), err[-400:])
+    want = f"COVERAGE dirs=1/2 uncovered={a_file}"
+    assert _coverage_line(out) == want, (_coverage_line(out), err[-400:])
     code, out, err = _run_traffic(a, a_file)
-    assert _coverage_line(out) == f"COVERAGE dirs=1/2 uncovered={a_file}",         (_coverage_line(out), err[-400:])
+    assert _coverage_line(out) == want, (_coverage_line(out), err[-400:])
 
 
 def test_a_readable_second_root_is_read_when_the_first_is_not():
@@ -255,6 +260,19 @@ def test_a_readable_second_root_is_read_when_the_first_is_not():
     code, out, err = _run_traffic(missing, a)
     assert (code, _coverage_line(out)) == (0, want), (code, out, err)
     assert _traffic_counts(out) == (1, 1, 0), out + err
+
+
+def test_two_unreadable_roots_are_comma_separated():
+    """File 24a item 1: `uncovered=a,b` — the shape po-2023's producer already
+    carries, so the two readers agree line for line. A path holds spaces, not
+    commas, so the list is splittable on ','."""
+    a, missing = _populated()
+    other = a + "-missing-too"
+    want = f"COVERAGE dirs=1/3 uncovered={missing},{other}"
+    code, out, err = _run_native(a, missing, other)
+    assert _coverage_line(out) == want, (_coverage_line(out), err[-400:])
+    code, out, err = _run_traffic(a, missing, other)
+    assert _coverage_line(out) == want, (_coverage_line(out), err[-400:])
 
 
 def test_traffic_json_carries_the_coverage():
@@ -278,10 +296,11 @@ def test_no_readable_root_is_not_an_exit_0():
     a, missing = _populated()
     code, out, err = _run_native(missing)
     assert code == 2, (code, out, err)
-    assert _coverage_line(out) == f"COVERAGE dirs=0/1 uncovered={missing}",         (_coverage_line(out), err[-400:])
+    want = f"COVERAGE dirs=0/1 uncovered={missing}"
+    assert _coverage_line(out) == want, (_coverage_line(out), err[-400:])
     code, out, err = _run_traffic(missing)
     assert code == 2, (code, out, err)
-    assert _coverage_line(out) == f"COVERAGE dirs=0/1 uncovered={missing}",         (_coverage_line(out), err[-400:])
+    assert _coverage_line(out) == want, (_coverage_line(out), err[-400:])
     code, out, err = _run_traffic(missing, json_out=True)
     assert code == 2, (code, out, err)
     assert json.loads(out).get("coverage") == {
