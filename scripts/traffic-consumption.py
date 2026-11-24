@@ -227,7 +227,7 @@ def bucket_of(info):
     return "other"
 
 
-def load_requests(cdir, cutoff_dt, seen=None, until_dt=None):
+def load_requests(cdir, cutoff_dt, seen=None, until_dt=None, names=None):
     """(pid, reqN) -> liste horodatee de dicts {ts, machine, ep, wl}.
 
     On ne lit que la TETE du fichier : machine + bloc billing system sont
@@ -240,11 +240,14 @@ def load_requests(cdir, cutoff_dt, seen=None, until_dt=None):
 
     until_dt : borne haute EXCLUSIVE (None = pas de borne) — le mode
     --from-archive (#1161) lit un JOUR, [minuit, minuit).
+    names : le contenu DEJA LISTE de `cdir` — collect() liste chaque racine une
+    fois pour etablir la couverture. Absent -> liste ici (contrat d'origine
+    des lecteurs qui importent cette fonction).
     """
     if seen is None:
         seen = set()
     reqs = defaultdict(list)
-    for fn in os.listdir(cdir):
+    for fn in (os.listdir(cdir) if names is None else names):
         if fn in seen:
             continue
         m = REQ_FN.match(fn)
@@ -292,7 +295,7 @@ def fmt_int(n):
     return f"{n:,}".replace(",", " ")
 
 
-def root_coverage(dirs, errors=None):
+def root_coverage(dirs, errors=None, listed=None):
     """(#1180, review ai-01 finding 1) ce que le lecteur a VU des racines
     demandees — pas ce qu'on lui a demande. Une racine est couverte si son
     `listdir` reussit ; celle qui leve (absente, hors d'acces) est
@@ -304,7 +307,16 @@ def root_coverage(dirs, errors=None):
     errors (dict, optionnel) : rempli {racine: "<Type>: <message>"} pour les
     racines non couvertes — le texte de l'erreur sert au refus, jamais a la
     cle `coverage` (sa forme est celle de la review : trois listes).
+    listed (#1181) : la liste qui a DEJA servi a lire, [(racine, noms)].
+    Presente -> la couverture est celle de CETTE lecture, pas d'une seconde
+    liste prise apres coup (une racine qui lache entre les deux se declarerait
+    couverte sans avoir ete lue).
     """
+    if listed is not None:
+        covered = [d for d, _names in listed]
+        read = set(covered)
+        return {"requested": list(dirs), "covered": covered,
+                "uncovered": [d for d in dirs if d not in read]}
     covered, uncovered = [], []
     for d in dirs:
         try:
@@ -453,18 +465,32 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
     le mode --from-archive lit un JOUR, [minuit, minuit).
 
     -> {"files", "lanes", "machines", "hlanes", "per_day", "reqs",
-        "first_dt", "last_dt"}
+        "first_dt", "last_dt", "coverage"}
     """
-    seen = set()
-    reqs = defaultdict(list)
+    # #1180 + review ai-01 sur #1181 — chaque racine est LISTEE une fois, ici.
+    # Une racine que listdir refuse est NON COUVERTE : collect() la nomme sur
+    # stderr, l'appelant la declare via root_coverage (ligne COVERAGE + cle
+    # `coverage` du JSON), jamais lue comme un corpus vide. Le dedup par nom de
+    # fichier est partage par les tetes req et la boucle resp (1re racine gagne).
+    listed = []        # (racine, noms) — une entree par racine LUE
     for _d in dirs:
         try:
-            for k, v in load_requests(_d, cutoff_dt, seen=seen,
-                                      until_dt=until_dt).items():
-                reqs[k].extend(v)
+            listed.append((_d, os.listdir(_d)))
         except OSError as exc:
             print(f"warning: capture dir unreadable ({exc}) -> not covered",
                   file=sys.stderr)
+    if not listed:
+        # sur main, une racine unique illisible etait un traceback (rc 1) :
+        # rien n'a ete lu, un rc 0 le lirait comme un corpus sans trafic
+        print("error: no capture dir could be read -> nothing was counted "
+              "(exit 2)", file=sys.stderr)
+
+    seen = set()
+    reqs = defaultdict(list)
+    for _d, _names in listed:
+        for k, v in load_requests(_d, cutoff_dt, seen=seen, until_dt=until_dt,
+                                  names=_names).items():
+            reqs[k].extend(v)
     for v in reqs.values():
         v.sort(key=lambda d: d["ts"])
 
@@ -480,16 +506,10 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
     n_resp = n_paired = n_unpaired = n_nousage = 0
     first_dt = last_dt = None
 
-    # #1180 — resp de toutes les racines, union dedupliquee par nom de
-    # fichier (premiere racine gagne) ; une racine illisible se declare.
+    # #1180 — resp de toutes les racines LUES, union dedupliquee par nom de
+    # fichier (premiere racine gagne).
     _resp_files = []
-    for _d in dirs:
-        try:
-            _names = os.listdir(_d)
-        except OSError as exc:
-            print(f"warning: capture dir unreadable ({exc}) -> not covered",
-                  file=sys.stderr)
-            continue
+    for _d, _names in listed:
         for fn in _names:
             if fn in seen:
                 continue
@@ -561,7 +581,8 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
                       "no_usage": n_nousage},
             "lanes": lanes, "machines": machines, "hlanes": hlanes,
             "per_day": by_day, "reqs": reqs,
-            "first_dt": first_dt, "last_dt": last_dt}
+            "first_dt": first_dt, "last_dt": last_dt,
+            "coverage": root_coverage(dirs, listed=listed)}
 
 
 def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet,
@@ -583,8 +604,10 @@ def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet
             "covered_from": first_dt.isoformat() if first_dt else None,
             "covered_to": last_dt.isoformat() if last_dt else None,
             "covered_span_hours": round(span_h, 3),
-            "files": files,
+            # #1180 — ce run a reellement lu `covered` parmi `requested` ;
+            # `uncovered` nomme les racines refusees par listdir
             "coverage": coverage,
+            "files": files,
             "lanes": {k: v for k, v in lanes.items()},
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
             "harness_lanes": {k: v for k, v in hlanes.items()} if args.harness_lanes else None,
@@ -1153,8 +1176,16 @@ def main():
     res = collect(dirs, cutoff_dt, per_day=args.per_day)
     reqs = res["reqs"]
     # #1180 (review ai-01) — les racines LUES se comptent sur stdout et dans
-    # le JSON ; une racine illisible marque chaque jour (build_days).
-    cov = root_coverage(dirs)
+    # le JSON ; une racine illisible marque chaque jour (build_days). La
+    # couverture est celle de la liste qui a servi a lire (#1181, une seule
+    # liste par racine) — jamais d'une seconde liste prise apres coup.
+    cov = res["coverage"]
+    # 2 = aucune racine demandee n'a pu etre lue (voir COVERAGE) : rien n'a
+    # ete compte, un rc 0 se lirait comme un corpus sans trafic
+    rc = 0 if cov["covered"] else 2
+    if rc:
+        print("error: no capture dir could be read -> nothing was counted "
+              "(exit 2)", file=sys.stderr)
 
     # #933 — l'angle mort AUTONOMOUS se declare, il ne se lit pas comme un 0 :
     # fleet declaree (+ archives outage, dossier GDrive du script de
@@ -1173,8 +1204,8 @@ def main():
     # lecteur scanne : l'undercount se DECLARE (ligne PARTIAL), il ne se lit
     # jamais comme un total. La lecture exacte est le merge de
     # native-consumption --leak-policy.
-    # #1180 — union des racines, dedupliquee par nom de partie
-    partial = pp.assess_many(dirs, cutoff_dt, now_dt)
+    # #1180 — union des racines LUES, dedupliquee par nom de partie
+    partial = pp.assess_many(cov["covered"], cutoff_dt, now_dt)
 
     days = (build_days(res["per_day"], dirs, cutoff_dt, now_dt, reqs, fleet, _rdir,
                        coverage=cov)
@@ -1183,7 +1214,7 @@ def main():
     emit_report(res, args=args, dirs=dirs, cdir=cdir, cutoff_dt=cutoff_dt,
                 now_dt=now_dt, window_hours=args.hours, fleet=fleet, rdir=_rdir,
                 blind=blind, partial=partial, days=days, coverage=cov)
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
