@@ -162,7 +162,7 @@ def outage_archives(corpus_dir, reconcile_dir=None):
 
 
 def count_nominal_by_machine(corpus_dir, window_start, window_end,
-                             workers=DEFAULT_HEAD_WORKERS):
+                             workers=DEFAULT_HEAD_WORKERS, skip_names=None):
     """{machine: n} des req-*.json dans la fenetre, par champ d'enveloppe.
 
     Tete de 400 octets : le champ machine vit en debut d'enveloppe (#98),
@@ -172,20 +172,30 @@ def count_nominal_by_machine(corpus_dir, window_start, window_end,
     #997 : les tetes passent par read_heads (pool borne, `workers` threads).
     Le resultat est identique a la passe serie — aggregation par cle, une
     tete illisible (None) vaut le `continue` de l'OSError serie.
+
+    skip_names (#1180) : noms de fichier deja comptes par une AUTRE racine de
+    corpus. Le lecteur passe le MEME set d'une racine a l'autre, qui est mute
+    ici : une capture presente dans deux racines compte une fois, comme
+    l'union du scan. None -> set local (comportement mono-racine inchange).
     """
     counts = {}
+    if skip_names is None:
+        skip_names = set()
     try:
         names = os.listdir(corpus_dir)
     except OSError:
         return counts
     jobs = []
     for fn in names:
+        if fn in skip_names:
+            continue
         m = REQ_FN.match(fn)
         if not m:
             continue
         dt = _parse_capture_ts(m.group(1))
         if dt is None or dt < window_start or dt >= window_end:
             continue
+        skip_names.add(fn)
         jobs.append(os.path.join(corpus_dir, fn))
     for head in read_heads(jobs, size=400, workers=workers):
         if head is None:
@@ -198,7 +208,7 @@ def count_nominal_by_machine(corpus_dir, window_start, window_end,
 
 def assess(corpus_dir, window_start, window_end, fleet_extra=(),
            reconcile_dir=None, nominal_counts=None,
-           workers=DEFAULT_HEAD_WORKERS):
+           workers=DEFAULT_HEAD_WORKERS, archives=None):
     """-> {machine: {"nominal": n, "archives": n, "blind": bool}}, + "" inclus.
 
     "" (direct) est rapporte mais jamais BLIND : un client direct du hub n'a
@@ -210,8 +220,14 @@ def assess(corpus_dir, window_start, window_end, fleet_extra=(),
     MEME fenetre (traffic-consumption.py lit deja chaque tete req-* pour
     l'appariement — lui faire relire est le cout releve mesure sur UNC, #940).
     None -> census locale (tetes 400 o des seuls req-* dans la fenetre).
+
+    archives : resultat DEJA calcule de outage_archives(). Un lecteur qui rend
+    PLUSIEURS fenetres (serie par jour, traffic-consumption --per-day) liste
+    les dossiers d'archives une fois, pas une par fenetre ; le predicat BLIND
+    reste celui d'ici, jamais recopie chez l'appelant. None -> liste locale.
     """
-    archives = outage_archives(corpus_dir, reconcile_dir)
+    if archives is None:
+        archives = outage_archives(corpus_dir, reconcile_dir)
     fleet = set(m for m in fleet_extra if m)
     fleet |= set(archives)
     if nominal_counts is None:

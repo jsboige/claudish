@@ -89,7 +89,11 @@ KNOWN_ROOTS = [
 
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--captures-dir", default=r"D:\claudish-captures")
+    ap.add_argument("--captures-dir", action="append", default=None,
+                    help="racine du corpus de captures ; REPETABLE (#1180) — un "
+                         "corpus reparti sur deux disques (captures deplacees "
+                         "vers un overflow) se lit en union dedupliquee par nom "
+                         "de fichier. Defaut : D:\\claudish-captures")
     ap.add_argument("--since", default="",
                     help="YYYY-MM-DD, YYYY-MM-DDTHH or full ISO like "
                          "2026-10-15T23:00:00Z (UTC, truncated to the hour, inclusive)")
@@ -409,11 +413,22 @@ def main():
     if a.selftest:
         selftest()
         return
+    # #1180 — `--captures-dir` est repetable : la PREMIERE racine reste le
+    # corpus de reference (son archive/ et son reconcile/ gardent leur sens),
+    # les suivantes n'ajoutent que leurs captures loose.
+    _dirs = a.captures_dir or [r"D:\claudish-captures"]
+    cdir = _dirs[0]
     since = fname_dt(a.since, "00") if a.since else None
     until = fname_dt(a.until, "00") if a.until else None
 
     req_index = collections.defaultdict(list)
     resps = []
+    # union dedupliquee par NOM de fichier, premiere racine gagne (#1180).
+    # Chaque racine est OUVERTE une fois, ici : une racine que scandir refuse
+    # est NON COUVERTE — nommee sur la ligne COVERAGE (stdout), jamais lue
+    # comme un corpus vide.
+    _seen = set()
+    _covered, _uncovered = [], []
 
     def _index_capture(n, path):
         """One capture file — loose OR extracted from a day part (#1152 c) —
@@ -438,9 +453,21 @@ def main():
                 return
             resps.append((dt, m.group(1), path))
 
-    with os.scandir(a.captures_dir) as it:
-        for e in it:
-            _index_capture(e.name, e.path)
+    for _d in _dirs:
+        try:
+            with os.scandir(_d) as it:
+                for e in it:
+                    if e.name in _seen:
+                        continue
+                    _seen.add(e.name)
+                    _index_capture(e.name, e.path)
+        except OSError as exc:
+            # une racine illisible n'est pas un corpus vide : elle se declare
+            _uncovered.append(_d)
+            print(f"warning: capture dir unreadable ({exc}) -> not covered",
+                  file=sys.stderr)
+        else:
+            _covered.append(_d)
     # #933 — l'angle mort AUTONOMOUS se declare AVANT tout verdict lane : le
     # check est corpus-level, il ne depend pas des captures natives. Une fenetre
     # sans AUCUNE capture native est precisement le cas outillage-aveugle — le
@@ -456,8 +483,30 @@ def main():
     w_end = (until if until else _now).replace(tzinfo=_tz.utc)
     _bs = _load_blind_spot()
     _rdir = a.reconcile_dir or _bs.default_reconcile_dir()
-    for line in _bs.render(a.captures_dir, w_start, w_end, fleet,
-                           reconcile_dir=_rdir, workers=a.workers):
+    print(f"COVERAGE dirs={len(_covered)}/{len(_dirs)}"
+          + (f" uncovered={','.join(_uncovered)}" if _uncovered else ""))
+    if not _covered:
+        # sur main, une racine unique illisible etait un traceback (rc 1) :
+        # rien n'a ete lu, un rc 0 le lirait comme un corpus sans trafic
+        print("error: no capture dir could be read -> nothing was counted "
+              "(exit 2)", file=sys.stderr)
+    # #1180 — les comptes nominaux sont SOMMES sur les racines LUES (le
+    # meme nom de fichier ne compte qu'une fois, d'une racine a l'autre) ;
+    # le verdict BLIND reste la regle unique de blind_spot.assess.
+    _skip = set()
+    _nominal = {}
+    for _d in _covered:
+        for _m, _n in _bs.count_nominal_by_machine(
+                _d, w_start, w_end, workers=a.workers,
+                skip_names=_skip).items():
+            _nominal[_m] = _nominal.get(_m, 0) + _n
+    # archives outage : lues sous la PREMIERE racine (+ --reconcile-dir) —
+    # les captures deplacees ne deplacent pas le dossier reconcile/.
+    _blind = _bs.assess(cdir, w_start, w_end, fleet,
+                        reconcile_dir=_rdir, nominal_counts=_nominal,
+                        workers=a.workers)
+    for line in _bs.render(cdir, w_start, w_end, fleet,
+                           reconcile_dir=_rdir, res=_blind, workers=a.workers):
         print(line)
     print()
 
@@ -467,10 +516,10 @@ def main():
     # captures. Any other mode DECLARES the undercount (PARTIAL line) instead
     # of letting a packed day read as "no traffic".
     _pp = _load_partial_parts()
-    _parts = _pp.parts_in_window(a.captures_dir, w_start, w_end)
+    _all_parts = _pp.assess_many(_covered, w_start, w_end)
     _merged = ()
     _scratch = None
-    if _parts and a.leak_policy:
+    if _all_parts["parts"] and a.leak_policy:
         import shutil
         import tempfile
         # NOTE: the scratch must OUTLIVE this block — leak_policy opens the
@@ -501,7 +550,7 @@ def main():
                 return False
             return True
         _ok = []
-        for r in _parts:
+        for r in _all_parts["parts"]:
             try:
                 for fp in _pp.read_members([r["path"]], _scratch, keep=_keep):
                     _index_capture(os.path.basename(fp), fp)
@@ -512,15 +561,21 @@ def main():
                 print(f"warning: part {r['fname']} unreadable ({exc})"
                       " -> counted as PARTIAL", file=sys.stderr)
         _merged = tuple(_ok)
-    for line in _pp.section(a.captures_dir, w_start, w_end, merged_paths=_merged):
+    _parts_res = _pp.assess_many(_covered, w_start, w_end, merged_paths=_merged)
+    for line in _pp.section(cdir, w_start, w_end, merged_paths=_merged,
+                            res=_parts_res):
         print(line)
-    if _merged or _pp.parts_in_window(a.captures_dir, w_start, w_end):
+    if _merged or _all_parts["parts"]:
         print()
 
     if not resps:
         if _scratch:
             import shutil
             shutil.rmtree(_scratch, ignore_errors=True)
+        if not _covered:
+            # deja dit sur stderr : aucune racine lisible — ce n'est pas
+            # une fenetre sans capture, le message d'origine mentirait
+            return 2
         print("Aucune capture native dans la fenetre.", file=sys.stderr)
         return 1
     resps.sort()

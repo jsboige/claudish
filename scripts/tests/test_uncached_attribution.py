@@ -509,12 +509,12 @@ def main() -> int:
                 "pin 14a: an extraction that breaks the volume floor must be refused"
             )
 
-        # It fits -> no refusal, and the measured free space is returned.
-        free_before, floor = ua.check_space(
-            tmp, 1, ua.DEFAULT_MIN_FREE_PCT, ua.DEFAULT_MIN_FREE_BYTES
-        )
+        # It fits -> no refusal, and the measured free space is returned. This
+        # pin is about the success path, not the production floor (14a/14f pin
+        # that): a zero floor keeps it green on a host already below 12 % free.
+        free_before, floor = ua.check_space(tmp, 1, 0, 0)
         _check(
-            free_before > 0 and floor > 0,
+            free_before > 0 and floor == 0,
             f"pin 14b: check_space must report free={free_before} floor={floor}",
         )
 

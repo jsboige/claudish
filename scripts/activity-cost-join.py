@@ -28,6 +28,10 @@ Reading rules (the recipe's bounds, implemented as pins):
   5. A `blind` consumption day (the #933 fleet blind spot) yields a BLIND
      row with no ratio — absence is named, not fabricated.
   6. One activity file carries one source; the header names it.
+  7. A consumption document that declares `coverage.uncovered` roots (#1180)
+     was read from half the corpus: every day it carries is `partial`, the
+     row's own flags notwithstanding — the join refuses, it never ratio-ables
+     a day read from part of the corpus.
 
 Exit: 0 on a report (even an all-flagged one), 2 on a blind read (no day
 readable at all, or an input without `days`) — "no report" is said out loud.
@@ -63,6 +67,12 @@ def join(activity, consumption, today=None):
     source = activity.get("source", "")
     to_day = activity.get("to")
     today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Rule 7 — the CONSUMPTION side's coverage is the reader's (#1180):
+    # {requested, covered, uncovered}, roots of the corpus. Unread roots mean
+    # every day of the document was read from part of the corpus.
+    _cov = consumption.get("coverage")
+    uncovered_c = (_cov.get("uncovered") if isinstance(_cov, dict) else None)
+    uncovered_c = list(uncovered_c) if isinstance(uncovered_c, list) else []
 
     rows = []
     for date in sorted(set(days_a) | set(days_c) | absent_a):
@@ -80,7 +90,7 @@ def join(activity, consumption, today=None):
         if c_day is not None:
             if c_day.get("blind"):
                 flags.append("BLIND")
-            if c_day.get("partial"):
+            if c_day.get("partial") or uncovered_c:
                 flags.append("partial")
             row["inEq"] = round(ineq(c_day), 3)
         if a_count is not None and c_day is not None:
@@ -103,6 +113,7 @@ def join(activity, consumption, today=None):
         rows.append(row)
     return {"source": SOURCE_LABELS.get(source, source or "inconnue"),
             "window": {"from": activity.get("from"), "to": to_day},
+            "uncovered_roots": len(uncovered_c),
             "rows": rows}
 
 
@@ -124,6 +135,10 @@ def render_text(joined):
           f"lignes marquees: {flagged}")
     print("lecture: un jour marque n'est jamais ratio — absent/blind/partial "
           "nomment un non-mesure, pas un zero.")
+    if joined.get("uncovered_roots"):
+        print(f"partial: {joined['uncovered_roots']} racine(s) du corpus declaree(s) "
+              "non lue(s) par le producteur (#1180) — chaque jour de ce document "
+              "vient d'un demi-corpus.")
     if not ratio_rows:
         print("attention: aucun jour ratio-able dans la fenetre (barometre "
               "aveugle, pas un resultat).")

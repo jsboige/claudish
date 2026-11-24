@@ -121,6 +121,28 @@ def day_archives_for(captures_dir, day):
     return out
 
 
+def assess_many(capture_dirs, w_start, w_end, merged_paths=()):
+    """assess() sur PLUSIEURS racines de corpus (#1180) — union dedupliquee
+    par NOM de partie : une partie deplacee d'une racine a l'autre est UNE
+    partie, pas deux. Un corpus reparti sur deux disques ne doit pas faire
+    compter deux fois le meme jour, ni en oublier un."""
+    if isinstance(capture_dirs, (str, os.PathLike)):
+        capture_dirs = [capture_dirs]
+    seen, parts = set(), []
+    for d in capture_dirs:
+        for r in parts_in_window(d, w_start, w_end):
+            if r["fname"] in seen:
+                continue
+            seen.add(r["fname"])
+            parts.append(r)
+    merged = set(os.path.normcase(os.path.abspath(p)) for p in merged_paths)
+    live = [r for r in parts
+            if os.path.normcase(os.path.abspath(r["path"])) not in merged]
+    days = sorted({r["day"] for r in live})
+    return {"partial": bool(live), "parts": live, "days": days,
+            "merged": len(merged)}
+
+
 def assess(captures_dir, w_start, w_end, merged_paths=()):
     """-> {"partial": bool, "parts": [records], "days": [..], "merged": n}.
 
@@ -128,12 +150,7 @@ def assess(captures_dir, w_start, w_end, merged_paths=()):
     read_members) — une partie mergee n'est plus un undercount, elle sort du
     verdict PARTIAL.
     """
-    merged = set(os.path.normcase(os.path.abspath(p)) for p in merged_paths)
-    parts = [r for r in parts_in_window(captures_dir, w_start, w_end)
-             if os.path.normcase(os.path.abspath(r["path"])) not in merged]
-    days = sorted({r["day"] for r in parts})
-    return {"partial": bool(parts), "parts": parts, "days": days,
-            "merged": len(merged)}
+    return assess_many([captures_dir], w_start, w_end, merged_paths=merged_paths)
 
 
 def render(captures_dir, w_start, w_end, merged_paths=(), res=None):
