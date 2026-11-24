@@ -112,9 +112,21 @@ BeforeAll {
             $cli += @("-$k", "$($Params[$k])")
         }
         if ($Params.ContainsKey('WhatIf')) { $cli += '-WhatIf' }
-        $o = & $script:Exe @cli 2>&1 | ForEach-Object { "$_" }
+        # 5.1 GOTCHA (#1096, same class as traffic-live.ps1:69-75): under
+        # $ErrorActionPreference='Stop' the `2>&1` merge turns the child's FIRST
+        # stderr line into a terminating NativeCommandError on pwsh 5.1 — the
+        # capture dies before any output is read. pwsh 7 does not do this. The
+        # capture must run under 'Continue', restored even on throw (try/finally).
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $o = & $script:Exe @cli 2>&1 | ForEach-Object { "$_" }
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
         if ($Out) { $Out.Value = @($o) }
-        return $LASTEXITCODE
+        return $code
     }
 }
 
@@ -165,6 +177,11 @@ Describe 'iis49-retention' {
     }
 
     Context 'guard: 7z t failure refuses (ACK G2)' {
+        # #1096 RESOLVED for this file: the six guard Its below were HostBound because the
+        # child-process capture in Invoke-Retention threw NativeCommandError on hosted 5.1
+        # (EAP='Stop' + `2>&1` — see the wrapper there). With the capture running under
+        # 'Continue' they pass on both CI legs; the tags are removed. HostBound remains on
+        # the other suites' seat-specific tests.
         It 'exits non-zero, purges nothing, writes no manifest' {
             $f = New-FakeSite
             $out = $null

@@ -56,22 +56,32 @@ def _resp(d, pid, rank, stamp, model, reqN, hdr_pid=None):
         f.write('event: message_start\ndata: {"type":"message_start"}\n\n')
 
 
-def _run(d, *extra):
+def _run(d, *extra, _ioencoding="utf-8"):
+    # #1175: the child's stdout contract must NOT depend on the seat. Without
+    # PYTHONIOENCODING a piped child encodes with locale.getpreferredencoding()
+    # (= cp1252 on the po-2027 seat) while the script prints '—'/'\x97' and
+    # '·'/'\xb7'; decoding that as strict utf-8 raised UnicodeDecodeError,
+    # stdout became None, and p.stdout + p.stderr raised TypeError instead of
+    # reporting the assertion. errors="replace" + (or "") is the structural
+    # net: this reader ALWAYS returns text, whatever bytes the child emits.
     empty = tempfile.mkdtemp(prefix="leak-rdir-")
     p = subprocess.run(
         [sys.executable, _SCRIPT, "--leak-policy", "--captures-dir", d,
          "--reconcile-dir", empty, *extra],
-        capture_output=True, text=True, encoding="utf-8")
-    return p.returncode, p.stdout + p.stderr
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": _ioencoding})
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
-def _run_full(d, *extra):
+def _run_full(d, *extra, _ioencoding="utf-8"):
+    # Same contract as _run (#1175).
     empty = tempfile.mkdtemp(prefix="full-rdir-")
     p = subprocess.run(
         [sys.executable, _SCRIPT, "--captures-dir", d,
          "--reconcile-dir", empty, *extra],
-        capture_output=True, text=True, encoding="utf-8")
-    return p.returncode, p.stdout + p.stderr
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": _ioencoding})
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
 def _ws_sub(out):
@@ -277,7 +287,7 @@ def test_lane_axis_basename_only():
     _req(d, 1, 60, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
          body={"system": [{"type": "text", "text":
                "Primary working directory: c:\\\\old\\\\place\\nquoted stuff\\n"
-               "Primary working directory: d:\\\\Dev\\\\CoursIA-2 (was c:\\dev\\\\CoursIA-2)"}],
+               "Primary working directory: d:\\\\Dev\\\\alpha-lane-2 (was c:\\dev\\\\alpha-lane-2)"}],
                "messages": []})
     _resp(d, 1, 70, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 60)
     # meme machine, corps sans preambule CC -> seau (non-cc), pas un gap
@@ -288,7 +298,7 @@ def test_lane_axis_basename_only():
     # detail sub/dev/heures reste reserve aux hors home
     _req(d, 1, 62, "2026-11-09T06-10-00-000Z", "myia-ai-01",
          body={"system": [{"type": "text", "text":
-               "Primary working directory: d:\\\\Dev\\\\Argumentum"}], "messages": []})
+               "Primary working directory: d:\\\\Dev\\\\alpha-lane"}], "messages": []})
     _resp(d, 1, 72, "2026-11-09T06-10-04-000Z", "claude-opus-5-5", 62)
     # un natif non-Opus ne paie pas de lecture de corps : pas d'axe pour lui
     _req(d, 1, 63, "2026-11-09T06-15-00-000Z", "myia-po-2024", model="claude-sonnet-5-5")
@@ -297,10 +307,10 @@ def test_lane_axis_basename_only():
     assert code == 0, out
     po = _row(out, "myia-po-2024")
     assert po.split()[1:3] == ["3", "2"], f"po-2024 natives/opus wrong: {po}\n{out}"
-    assert "lanes=coursia-2:1 (non-cc):1" in po, f"lane axis wrong off-home: {po}"
+    assert "lanes=alpha-lane-2:1 (non-cc):1" in po, f"lane axis wrong off-home: {po}"
     assert "sub=0/2" in po and "dev=0b9b0d8c:2" in po, f"off-home detail lost: {po}"
     ai = _row(out, "myia-ai-01")
-    assert "lanes=argumentum:1" in ai, f"lane axis wrong on home row: {ai}"
+    assert "lanes=alpha-lane:1" in ai, f"lane axis wrong on home row: {ai}"
     assert "sub=" not in ai, f"home row must not carry off-home detail: {ai}"
     # LE CHEMIN NE SORT JAMAIS (arbitrage coordinateur 15/11) : ni le
     # dossier parent, ni l'unite, ni le marqueur plus ancien
@@ -323,7 +333,7 @@ def test_phase5_chunked_bodies_survive_lot_boundary():
              body={"system": [{"type": "text", "text":
                    ("x-anthropic-billing-header: cc_is_subagent=true;"
                     if sub else "x-anthropic-billing-header: cc_version=2.1.322;") +
-                   f"\nPrimary working directory: d:\\\\Dev\\\\CoursIA-{i % 3}"}],
+                   f"\nPrimary working directory: d:\\\\Dev\\\\alpha-lane-{i % 3}"}],
                    "messages": []})
         _resp(d, 1, 500 + i, "2026-11-09T06-01-00-000Z", "claude-opus-5-5", 100 + i)
     code, out = _run(d, "--since", "2026-11-09T00")
@@ -332,7 +342,7 @@ def test_phase5_chunked_bodies_survive_lot_boundary():
     assert po.split()[1:3] == ["40", "40"], f"chunk lost responses: {po}\n{out}"
     assert "sub=20/40" in po, f"chunk lost sub flags: {po}"
     assert "(corps illisible)" not in po, po
-    for lane, n in (("coursia-0", 13), ("coursia-1", 14), ("coursia-2", 13)):
+    for lane, n in (("alpha-lane-0", 13), ("alpha-lane-1", 14), ("alpha-lane-2", 13)):
         assert f"{lane}:{n}" in po, f"lane {lane} miscounted: {po}"
 
 
@@ -371,7 +381,7 @@ def test_unreadable_opus_body_lands_in_visible_bucket():
     _anchor(d)
     _req(d, 1, 80, "2026-11-09T06-00-00-000Z", "myia-po-2024", device="0b9b0d8c",
          body={"system": [{"type": "text", "text":
-               "Primary working directory: d:\\\\Dev\\\\CoursIA"}], "messages": []})
+               "Primary working directory: d:\\\\Dev\\\\alpha-lane"}], "messages": []})
     _resp(d, 1, 90, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 80)
     req_path = os.path.join(d, "req-1-80-2026-11-09T06-00-00-000Z-direct.json")
     resps = [(datetime(2026, 11, 9, 6, 0, 5), 1,
@@ -435,6 +445,26 @@ def test_full_mode_and_leak_policy_agree_on_sub():
     assert code == 0, out
     assert _ws_sub(out) == "1", \
         f"full mode and leak-policy disagree on the same corpus (#1051):\n{out}"
+
+
+def test_non_utf8_child_output_never_raises():
+    # #1175 (file 23b item 3): pin the structural net, on ANY seat. The child
+    # is FORCED to cp1252 — the po-2027 seat's real default, where the report's
+    # '—' (0x97) and '·' (0xb7) made a strict utf-8 decode raise, stdout come
+    # back None, and `p.stdout + p.stderr` die with TypeError instead of the
+    # assertion message. A reader that always returns text keeps the ASCII
+    # contract of every assertion intact (the decorative bytes are replaced).
+    d = tempfile.mkdtemp(prefix="leak-cp1252-")
+    _anchor(d)
+    _req(d, 1, 7, "2026-11-09T06-00-00-000Z", "myia-ai-01")
+    _resp(d, 1, 900, "2026-11-09T06-00-05-000Z", "claude-opus-5-5", 7)
+    code, out = _run(d, "--since", "2026-11-09T00", _ioencoding="cp1252")
+    assert isinstance(out, str) and out, \
+        "reader must return text from a non-utf8 child, never crash on decode"
+    assert "Leak-policy" in out, out
+    code_full, out_full = _run_full(d, _ioencoding="cp1252")
+    assert isinstance(out_full, str) and out_full, \
+        "full-mode reader must return text from a non-utf8 child too"
 
 
 if __name__ == "__main__":

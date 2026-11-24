@@ -22,6 +22,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
+import { REVISION, VERSION } from "./version.js";
 import {
   CAPTURE_PROBE_TTL_ENV,
   captureBindProbeSettleForTests,
@@ -101,5 +102,37 @@ describe("#291 /health carries captureBindWrite", () => {
     await captureBindProbeSettleForTests();
     const second = await health();
     expect(second.captureBindWrite).toMatch(/^error:[A-Z]+/);
+  });
+});
+
+// #1140 — /health names the running build. The fleet-rollout verification
+// rule demands an artifact read from the LIVE path; before this field, a
+// verification could say WHAT it probed (status, gauges) but not WHICH code
+// answered — an artifact about intent, not about the fleet. The pin compares
+// the field against the very constant the release bumps (version.ts is
+// generated in lockstep with packages/cli/package.json), so a stale deploy
+// (container still on the previous image) reads as a version mismatch, not
+// as a passing probe.
+//
+// Mutation proof: delete the `version: VERSION,` line in the /health handler
+// ⇒ this test goes red (the wiring, not the constant, is what breaks —
+// version.ts has its own generate-script contract).
+describe("#1140 /health carries the running build version", () => {
+  test("version field === VERSION from version.ts (additive, nothing gates on it)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "route-1140-"));
+    scratch.push(dir);
+    process.env.CLAUDISH_CAPTURE_DIR = dir;
+    activeProxy = await createProxyServer(PROXY_PORT, undefined, undefined, false, undefined, undefined, {
+      quiet: true,
+    });
+    const h = await health();
+    expect(h.version).toBe(VERSION);
+    // #1140 r2 — VERSION cannot name a build on this fork (no release bumps),
+    // so /health also carries the image's git revision, baked at BUILD time by
+    // generate-version.ts from the Dockerfile's CLAUDISH_REVISION arg. In this
+    // unit run the arg is absent ⇒ the generator's documented fallback.
+    expect(h.revision).toBe(REVISION);
+    expect(typeof h.revision).toBe("string");
+    expect(h.revision.length).toBeGreaterThan(0);
   });
 });

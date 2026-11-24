@@ -8,7 +8,7 @@ so every tagged archive was invisible to it — and an invisible archive does no
 look like a defect, it looks like a quiet day. Measured on the live corpus
 before the fix (2026-09-22):
 
-    G:\Mon Drive\Backups-Cloud\claudish  141 files on disk, 105 visible
+    <gdrive>\Backups-Cloud\claudish    141 files on disk, 105 visible
                                          34 of 105 days under-counted
     D:\claudish-captures\archive          14 files on disk,   0 visible
                                          (every day tagged since #201)

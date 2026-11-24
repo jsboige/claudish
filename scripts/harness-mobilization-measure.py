@@ -55,7 +55,7 @@ Traps baked into the design (all hit during the first run, 16/10):
     undercounts the first turn of each conversation (same bias every lane).
   - Filename sort is lexicographic: req-1-10000-* sorts BEFORE req-1-9999-*.
     Parse timestamps from the name; never trust sorted()[-1] as "latest".
-  - Cited paths may contain spaces ("G:\\Mon Drive\\…"): the marker regex
+  - Cited paths may contain spaces ("D:\\audit work\\…"): the marker regex
     captures up to the " (" separator, never to the first whitespace.
 """
 
@@ -193,7 +193,7 @@ def selftest():
     red if its detection branch (Bash counting, dir containment, path-variant
     normalization, space-safe marker regex) is removed."""
     RULE = r"C:\Users\u\.claude\rules\a.md"
-    SPACE = r"G:\Mon Drive\projets\w.md"
+    SPACE = r"D:\audit work\projets\w.md"
 
     def doc(cited_paths, tool_name, tool_input):
         marker = "\n".join(f"Contents of {p} (12 lines)" for p in cited_paths)

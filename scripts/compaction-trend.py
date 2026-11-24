@@ -7,7 +7,7 @@ re-pays the full session context (harness block included, #23) to produce
 a summary; this makes that cost visible per Machine:Workspace:Harness.
 
     python scripts/compaction-trend.py --days 2026-09-13 2026-09-16
-        [--archives-dir "G:\\Mon Drive\\Backups-Cloud\\claudish"]
+        [--archives-dir <CLAUDISH_GDRIVE_ROOT>\\Backups-Cloud\\claudish]
         [--loose-dir D:\\claudish-captures] [--loose-date 2026-09-17]
         [--7z "C:\\Program Files\\NVIDIA Corporation\\NVIDIA App\\7z.exe"]
         [--top 15]
@@ -106,11 +106,20 @@ KNOWN_ROOTS = [
 ]
 
 
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--days", nargs="+", default=[],
                     help="archive dates YYYY-MM-DD, in order")
-    ap.add_argument("--archives-dir", default=r"G:\Mon Drive\Backups-Cloud\claudish")
+    ap.add_argument("--archives-dir", default=_gdrive("Backups-Cloud", "claudish"),
+                    help="capture archive root "
+                         "(default: $CLAUDISH_GDRIVE_ROOT/Backups-Cloud/claudish)")
     ap.add_argument("--loose-dir", default="",
                     help="dir holding the live (partial) day's captures")
     ap.add_argument("--loose-date", default="",
@@ -126,7 +135,11 @@ def parse_args():
                          "patterns (one stderr line per dir accepted); "
                          "default re-extracts any unmarked dir")
     ap.add_argument("--top", type=int, default=15)
-    return ap.parse_args()
+    args = ap.parse_args()
+    if not args.archives_dir:
+        ap.error("--archives-dir or CLAUDISH_GDRIVE_ROOT required "
+                 "(Q85: the Drive root is seat config, not a repo default)")
+    return args
 
 
 def fname_dt(date_h, minutes):

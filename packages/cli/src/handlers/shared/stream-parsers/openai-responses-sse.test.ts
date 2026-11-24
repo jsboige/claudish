@@ -1355,4 +1355,152 @@ describe("#1039 — multi-call: every tool_use block reaches the client with com
     const blocks = toolBlocks(output);
     expect(blocks.map((b) => b.input)).toEqual(CALLS.map((c) => c.args));
   });
+
+  // ─── #1039 closure — the INTERLEAVED documented shape ─────────────────────
+  //
+  // The coordinator's closure order (file 21a, 21/11): the natural hub trace
+  // never arrived (both sources dead — stdout hub retention ~3 d, --debug
+  // never armed in prod), so the fixture is built from the DOCUMENTED event
+  // shape instead. Every pin above delivers each call's deltas CONTIGUOUSLY
+  // (SEED included: fc_1,fc_1,fc_2,fc_2,fc_3,fc_3) — none exercises a stream
+  // where two calls' argument deltas ALTERNATE (fc_1,fc_2,fc_1,fc_2,…). A
+  // single-accumulator implementation (one "current arguments" buffer, or
+  // routing every delta to the most recently added call) assembles
+  // `{"city"{"tz"…}` per block on exactly that wire; contiguous deltas hide
+  // the class entirely. Documented delta/done identity: item_id +
+  // output_index, NO call_id field on the delta events.
+  const TWO_CALLS = [
+    { id: "fc_1", call_id: "call_1", name: "get_weather", args: '{"city":"Paris"}', fragments: ['{"city"', ':"', 'Paris"}'] },
+    { id: "fc_2", call_id: "call_2", name: "get_time", args: '{"tz":"Europe/Paris"}', fragments: ['{"tz"', ':"Europe', '/Paris"}'] },
+  ];
+
+  function twoAddedEvents() {
+    return TWO_CALLS.map((c, i) => ({
+      type: "response.output_item.added",
+      output_index: i,
+      item: { type: "function_call", id: c.id, call_id: c.call_id, name: c.name, arguments: "" },
+    }));
+  }
+
+  function interleavedDeltas() {
+    // A1, B1, A2, B2, A3, B3 — alternating by construction.
+    return TWO_CALLS[0].fragments.flatMap((_, k) =>
+      TWO_CALLS.map((c, i) => ({
+        type: "response.function_call_arguments.delta",
+        item_id: c.id,
+        output_index: i,
+        delta: c.fragments[k],
+      }))
+    );
+  }
+
+  function twoDoneItems(withArguments: boolean) {
+    return TWO_CALLS.map((c, i) => ({
+      type: "response.output_item.done",
+      output_index: i,
+      item: {
+        type: "function_call",
+        id: c.id,
+        call_id: c.call_id,
+        name: c.name,
+        ...(withArguments ? { arguments: c.args } : {}),
+      },
+    }));
+  }
+
+  test("(j) INTERLEAVED deltas keyed by item_id+output_index land whole on their own blocks (sole carrier)", async () => {
+    const events = [
+      ...twoAddedEvents(),
+      ...interleavedDeltas(),
+      ...twoDoneItems(false),
+      {
+        type: "response.completed",
+        response: { usage: { input_tokens: 10, output_tokens: 67 } },
+      },
+    ];
+    // The interleaving contract lives on the INPUT, asserted before the
+    // parser runs: the delta events really alternate fc_1,fc_2,… — that is
+    // what makes this fixture interleaved, and what a contiguous rewrite of
+    // interleavedDeltas() would silently undo. The parser's OUTPUT order is
+    // deliberately NOT pinned: today's #1043 behaviour interleaves two open
+    // blocks on the Anthropic wire, and a later change that serializes them
+    // (buffer B until A stops) would be legal, not a regression.
+    const deltaItemIds = events
+      .filter((e: any) => e.type === "response.function_call_arguments.delta")
+      .map((e: any) => e.item_id);
+    expect(deltaItemIds).toEqual(["fc_1", "fc_2", "fc_1", "fc_2", "fc_1", "fc_2"]);
+    const { output } = await runStreamCollect(events);
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual(TWO_CALLS.map((c) => c.args));
+    expect(blocks.every((b) => b.lastDeltaSeq > 0 && b.lastDeltaSeq < b.stopSeq)).toBe(true);
+  });
+
+  test("(k) the buffered stream:false path assembles the same interleaved inputs", async () => {
+    const events = [
+      ...twoAddedEvents(),
+      ...interleavedDeltas(),
+      ...twoDoneItems(false),
+      { type: "response.completed", response: { usage: { input_tokens: 10, output_tokens: 67 } } },
+    ];
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sseChunks(events)));
+        controller.close();
+      },
+    });
+    const response = new Response(stream, { headers: new Headers(SSE_HEADERS) });
+    const parserResponse = createResponsesStreamHandler(mockContext(), response, {
+      modelName: "gpt-5.6-sol",
+    }) as Response;
+    const message = await collectAnthropicSseToMessage(parserResponse, "gpt-5.6-sol");
+    const toolUses = message.content.filter((b: any) => b.type === "tool_use");
+    expect(toolUses.map((b: any) => b.input)).toEqual(TWO_CALLS.map((c) => JSON.parse(c.args)));
+    expect(message.stop_reason).toBe("tool_use");
+  });
+
+  test("(l) the per-spec interleaved fixture (all carriers at once) replays without re-emitting", async () => {
+    // responses-multicall-interleaved.sse: interleaved deltas AND the full
+    // strings on function_call_arguments.done, the done items and the
+    // completed output array — the realistic per-spec stream. The guards must
+    // hold UNDER interleaving: each input arrives exactly once (equality
+    // catches doubling) and no ARG-DONE-MISMATCH fires on the equal strings.
+    const body = readFileSync(
+      join(__dirname, "..", "..", "..", "test-fixtures", "sse-responses", "responses-multicall-interleaved.sse")
+    );
+    // Same interleaving contract as (j), on the FILE's own delta lines — the
+    // hand-built artifact is checked against a contiguous rewrite of itself,
+    // independently of how the parser emits its output blocks.
+    const sseDeltaItemIds = body
+      .toString()
+      .split("\n")
+      .filter((l) => l.startsWith("data: "))
+      .map((l) => JSON.parse(l.slice(6)))
+      .filter((e: any) => e.type === "response.function_call_arguments.delta")
+      .map((e: any) => e.item_id);
+    expect(sseDeltaItemIds).toEqual(["fc_1", "fc_2", "fc_1", "fc_2", "fc_1", "fc_2"]);
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(body));
+        controller.close();
+      },
+    });
+    const response = new Response(stream, { headers: new Headers(SSE_HEADERS) });
+    let output = "";
+    const lines = await captureStdout(() => {
+      const result = createResponsesStreamHandler(mockContext(), response, {
+        modelName: "gpt-5.6-sol",
+      }) as Response;
+      return result.body!.pipeTo(
+        new WritableStream({
+          write(chunk: Uint8Array) {
+            output += new TextDecoder().decode(chunk, { stream: true });
+          },
+        })
+      );
+    });
+    const blocks = toolBlocks(output);
+    expect(blocks.map((b) => b.input)).toEqual(TWO_CALLS.map((c) => c.args));
+    expect(output.match(/event: message_stop/g)?.length).toBe(1);
+    expect(lines.some((l) => l.includes("ARG-DONE-MISMATCH"))).toBe(false);
+  });
 });

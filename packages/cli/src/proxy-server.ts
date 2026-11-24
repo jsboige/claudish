@@ -89,6 +89,12 @@ import { registerForkExtensions, resolveInboundKeys, stripBillingHeaderFromBody,
 import { collectRoutedBareNames } from "./fork/middleware/proxy-auth.js";
 import { forwardToUpstream, readRequestBody, relayHealthFields, requestLoopedBack, HOPS_HEADER, type RelayState } from "./fork/server/relay.js";
 import { getInstanceId } from "./instance-id.js";
+// #1140 — /health names the running build so a relay verification artifact
+// can say WHICH code it probed (fleet-rollout rule: read from the live path,
+// never from the change's intent). Same value the CLI ships (version.ts is
+// the generate-version.ts output the release bumps in lockstep with
+// packages/cli/package.json — what CI publishes is what /health answers).
+import { REVISION, VERSION } from "./version.js";
 import {
   initFailover,
   isQuotaExhaustion,
@@ -142,6 +148,8 @@ import {
   readStepBusyWaitMs,
   markCascadeStepAttempt,
   markStepSkipEligible,
+  markCascadeWalkEligible,
+  isConcurrencyRefusalWalk,
 } from "./handlers/shared/step-skip.js";
 import {
   endpointPrefixOf,
@@ -173,6 +181,10 @@ import {
   carryNoticeHeader,
   noticePolicyForIngress,
 } from "./handlers/shared/failover-stream-notice.js";
+import {
+  carryServedModelHeader,
+  withServedModelHeader,
+} from "./handlers/shared/served-model-header.js";
 
 /**
  * Routing failures are TERMINAL — no provider can serve the request (missing
@@ -984,7 +996,12 @@ export async function createProxyServer(
     const role = roleFromModelName(requestedModel);
     if (!role || !getFailoverRule(role)) return undefined;
     return (
-      machineArmBucket(role, c.req.header("x-claudish-machine")) ?? (await nominalBucketOfModel(requestedModel))
+      // #1150(b): an explicit provider@model pin matched only via a
+      // CLAUDISH_FAILOVER_ROLE_MODELS alias is exempt from the config-arm
+      // grant — machineArmBucket returns undefined so the pin's real
+      // provider bucket (nominalBucketOfModel below) stays what walls read.
+      machineArmBucket(role, c.req.header("x-claudish-machine"), requestedModel) ??
+      (await nominalBucketOfModel(requestedModel))
     );
   };
 
@@ -1157,7 +1174,9 @@ export async function createProxyServer(
       // #275: the diversion test is bucket-scoped — compute this request's
       // nominal bucket (unless the caller — the cascade loop — already did).
       const bucket = nominalBucket ?? (await nominalBucketOfModel(requestedModel));
-      const resolved = resolveFailoverTargetForSession(role, sessionKey, bucket, skipSteps, machine);
+      // #1150(b): arms never divert an alias-only explicit pin — requestedModel
+      // threads down so resolveFailoverTarget can exempt it (walls still apply).
+      const resolved = resolveFailoverTargetForSession(role, sessionKey, bucket, skipSteps, machine, requestedModel);
       if (resolved.step && resolved.step.target !== target) {
         log(
           `[Proxy] Failover: role '${role}' [${bucket}] ${target} → ${resolved.step.target} step[${resolved.stepIndex}] (${resolved.step.label})`
@@ -1618,7 +1637,7 @@ export async function createProxyServer(
       const resolved = override && rule
         ? { step: rule.steps[override.stepIndex], stepIndex: override.stepIndex }
         : role && !keylessNative
-          ? resolveFailoverTargetForSession(role, sessionKey, bucket, skippedSteps, machineHeader)
+          ? resolveFailoverTargetForSession(role, sessionKey, bucket, skippedSteps, machineHeader, requestedModel)
           : { step: null, stepIndex: -1 };
       const { stepIndex } = resolved;
       // #274 (review 29/09): when this attempt serves a role-step's DELEGATION,
@@ -1847,7 +1866,35 @@ export async function createProxyServer(
           markCascadeStepAttempt(c, 0);
           markStepSkipEligible(c, false);
         }
+      } else if (role) {
+        // #1111 — kill switch off: the busy-wire markings stay off (today's
+        // behavior — the refusal MARKS the step), but the patience exemption
+        // still needs the attempt's step-ness. Without this, a non-last
+        // step's plain 1302 would pay the ~5-minute patient backoff before
+        // producing the very mark the switch was asked to restore
+        // (step-skip.ts: the step's whole job is to yield in seconds).
+        // isStepSkipEligible's only reader is composed-handler's patience
+        // gate; the skip itself is gated elsewhere, by the switch.
+        markStepSkipEligible(
+          c,
+          rule != null && stepIndex >= 0 && stepIndex < rule.steps.length - 1
+        );
       }
+      // #1111 × #1109: a plain 1302 on the nominal of a walk-armed cascade
+      // belongs to the #781 walk (seconds), so composed-handler's patience
+      // yields. Mirror the walk's own PRE-response guards (nominal attempt,
+      // steps exist, native and keyless lanes excluded); kill switches are
+      // read by the walk predicate itself — with the walk off, its contract
+      // (K1302g) is the bare 429 again, and patience must not re-enter.
+      markCascadeWalkEligible(
+        c,
+        role != null &&
+          stepIndex === -1 &&
+          rule != null &&
+          rule.steps.length > 0 &&
+          !keylessNative &&
+          !(bucket ?? "").startsWith(`${NATIVE_BUCKET}/`)
+      );
       // #654 — in-flight token budget per endpoint, evaluated BEFORE the
       // upstream call: a local engine saturates on CONTEXT, not request count
       // (six ~200K-token bodies ≈ 1.2M KV against 750,747 available — measured
@@ -2208,7 +2255,11 @@ export async function createProxyServer(
           // keyless invariant forbids, and its "no failure state" promise
           // would not make that spend legitimate.
           !keylessNative &&
-          isOverloadWalkClass(response.status, errBody)
+          // #781: a plain 1302 (z.ai plan concurrency, "Rate limit reached
+          // for requests") matches none of isTransientOverload's words, so it
+          // used to surface bare and stop the client's turn. Same walk, same
+          // no-state contract; kill switch CLAUDISH_FAILOVER_1302_WALK=0.
+          (isOverloadWalkClass(response.status, errBody) || isConcurrencyRefusalWalk(response))
         ) {
           overloadWalked = true;
           // #348: the walk is a recovery attempt paid out of the client's
@@ -2504,6 +2555,35 @@ export async function createProxyServer(
                 const advanced = await attemptWalkStep(nextWalk);
                 if (advanced.served) return advanced.served;
               }
+            }
+            // #1124: the walk's step died QUOTA-class — its own plan is walled,
+            // and that fact belongs in the step's own record. The #299-B
+            // contract (a transient walk writes no state) is right for the
+            // TRANSPORT class it was drawn from, but a 402/429-that-names-a-wall
+            // is not transient: the step will answer the same wall on every
+            // re-pick, and nobody else records it — the walk deliberately
+            // doesn't, and the nominal's own cascade was never entered.
+            // Measured on the hub 18-20/11: 3 441 dead round-trips to the
+            // first servable rung (Mistral on the seats that exclude Terra),
+            // the next rung never reached, the client eating the 429 each
+            // time. Mark THE STEP (per-step backoff, concrete-bound #331) —
+            // never the nominal: no arm, no wall, no pin. W31 holds: no
+            // advance in THIS request; the NEXT one skips the benched rung.
+            // Kill switch CLAUDISH_FAILOVER_WALK_MARK=0 restores the stateless
+            // walk (read per request; a misclassification is then reversible
+            // without a redeploy).
+            if (
+              isQuotaExhaustion(firstFailure.status, firstFailure.errBody) &&
+              (process.env.CLAUDISH_FAILOVER_WALK_MARK || "").trim() !== "0"
+            ) {
+              const walkWhy = `HTTP ${firstFailure.status} (quota-class) from walk step ${walk.stepIndex} (${walk.concrete})`;
+              markStepFailed(walkRole, walk.stepIndex, walkWhy, parseResetAtFromBody(firstFailure.errBody), {
+                concrete: walk.concrete,
+              });
+              log(
+                `[Failover] WALK-MARK ${walkRole} step ${walk.stepIndex} (${walk.concrete}) quota-class ${firstFailure.status}`,
+                true // forceConsole — countable marker (#1124)
+              );
             }
           }
           return response;
@@ -2936,6 +3016,15 @@ export async function createProxyServer(
         role,
         upstream,
         instanceId: getInstanceId(),
+        // #1140 — additive; nothing gates on it and older parsers ignore it.
+        version: VERSION,
+        // #1140 — the BUILD's git revision (Dockerfile ARG → generated
+        // version.ts). On this fork VERSION cannot tell two images apart (no
+        // release bumps; a thousand commits shipped as "7.1.2" since
+        // 2026-05), so THIS is the field a fleet-rollout artifact reads to
+        // name the build it probed. "unknown" = built outside the arg-fed
+        // docker path.
+        revision: REVISION,
         // #306 review — the drain reads THIS to confirm the proxy actually
         // sees its flag (drain home vs container mount can differ; a VM clock
         // skew can expire a fresh flag). The reason, never the flag content.
@@ -3352,7 +3441,12 @@ export async function createProxyServer(
 
       // Route through the budget-failover cascade (nominal → step0 → step1 …),
       // then inject onset/recovery notices. See handleWithCascade / applyFailoverNotices.
-      const response = await handleWithCascade(c, body, body.model, requestBucket);
+      // #1128: apply the served-model header right after the cascade, before the
+      // notices — every downstream rebuild copies existing headers, so an early
+      // set survives to the wire. Unmarked responses (synthetic answers,
+      // refusals, cascade-exhaustion errors) return untouched: omitted, never
+      // guessed.
+      const response = withServedModelHeader(await handleWithCascade(c, body, body.model, requestBucket));
       const noticed = await applyFailoverNotices(
         response,
         requestRole,
@@ -3570,7 +3664,9 @@ export async function createProxyServer(
       // client) — the notice rides the response header, NOT the content, so an
       // empty model output stays visibly empty instead of being masked by the
       // notice-as-answer.
-      let response = await handleWithCascade(c, anthropicBody, anthropicBody.model, requestBucket);
+      let response = withServedModelHeader(
+        await handleWithCascade(c, anthropicBody, anthropicBody.model, requestBucket)
+      );
       response = await applyFailoverNotices(
         response,
         requestRole,
@@ -3606,17 +3702,25 @@ export async function createProxyServer(
         // #229 review: both translations below rebuild their headers from
         // scratch, which is where the notice header set above used to die —
         // consumed (dedup + recovery-budget side effects) then never delivered.
-        return carryNoticeHeader(
+        // #1128: the served-model header dies at the same seam — carried the
+        // same way (carryServedModelHeader), around the notice carry.
+        return carryServedModelHeader(
           response,
-          createOpenAIChatStreamFromAnthropic(response, anthropicBody.model)
+          carryNoticeHeader(
+            response,
+            createOpenAIChatStreamFromAnthropic(response, anthropicBody.model)
+          )
         );
       }
       const message = await response.json();
-      return carryNoticeHeader(
+      return carryServedModelHeader(
         response,
-        c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
-          headers: { "Content-Type": "application/json" },
-        })
+        carryNoticeHeader(
+          response,
+          c.json(anthropicMessageToChatCompletion(message, anthropicBody.model), {
+            headers: { "Content-Type": "application/json" },
+          })
+        )
       );
     } catch (e) {
       log(`[Proxy] /v1/chat/completions error: ${e}`);

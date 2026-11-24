@@ -23,6 +23,7 @@ import {
   readEndpointBudgetKnobs,
   withBudgetRelease,
 } from "./endpoint-token-budget.js";
+import { SERVED_MODEL_HEADER, setServedModel, withServedModelHeader } from "./served-model-header.js";
 
 const scope = { machine: "m1", session: "s1" };
 
@@ -285,6 +286,35 @@ describe("endpoint-token-budget #654", () => {
     let n4 = 0;
     withBudgetRelease(new Response(null), () => n4++);
     expect(n4).toBe(1);
+  });
+
+  // ── #1142: the served-model side-channel survives the rebuild ────────────
+  test("withBudgetRelease — carries the served-model WeakMap entry onto the rebuilt Response (#1142)", async () => {
+    // The wrapper rebuilds the Response (fresh object identity) inside
+    // handleWithCascade — both the nominal-attempt site and the walk site.
+    // The #1128 side-channel is keyed by that identity: without the transfer
+    // the entry dies with the inner object and the header vanishes on every
+    // budget-leased endpoint. Mutation proof: delete the transferServedModel
+    // call in withBudgetRelease → both expects below go red.
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode("hi"));
+        c.close();
+      },
+    });
+    const inner = new Response(body, { status: 200 });
+    setServedModel(inner, "glm-5.3-flash");
+    const wrapped = withBudgetRelease(inner, () => {});
+    // The route's lookup runs on the WRAPPED object — it must still find the
+    // handler's mark.
+    expect(withServedModelHeader(wrapped).headers.get(SERVED_MODEL_HEADER)).toBe("glm-5.3-flash");
+
+    // Unknown stays omitted — the transfer never re-derives a value: an
+    // unmarked response comes out unmarked, header absent (AC4).
+    const plain = withBudgetRelease(new Response("hi"), () => {});
+    expect(withServedModelHeader(plain).headers.get(SERVED_MODEL_HEADER)).toBeNull();
+    await wrapped.text();
+    await plain.text();
   });
 
   // ── #663 r1: the error case at the raw-reader level, bytes kept ─────────

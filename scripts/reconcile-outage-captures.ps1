@@ -88,11 +88,18 @@ param(
   [string]$SevenZip   = "",
   [string[]]$SevenZipCandidates = @(),
   [switch]$NoSevenZipFallback,
-  [string]$GDriveDir  = "G:\Mon Drive\MyIA\backups\claudish-captures",
+  [string]$GDriveDir  = "",
   [switch]$Register
 )
 
 $ErrorActionPreference = "Stop"
+# Q85: the Drive mount is seat config — CLAUDISH_GDRIVE_ROOT + the shared
+# subpath. Empty stays empty = the documented "local staging only" path below.
+# String concat, NOT Join-Path (PS 5.1 validates the drive and would throw on
+# an unmounted root; Test-Path below is the graceful check).
+if (-not $GDriveDir -and $env:CLAUDISH_GDRIVE_ROOT) {
+  $GDriveDir = ($env:CLAUDISH_GDRIVE_ROOT.TrimEnd('\') + '\MyIA\backups\claudish-captures')
+}
 $ReconcileDir = Join-Path $CaptureDir "reconcile"
 $logFile = Join-Path $CaptureDir "reconcile.log"
 

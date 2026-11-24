@@ -4,11 +4,11 @@
 Each pin defends a reading that a plausible implementation gets WRONG, and that
 would silently manufacture a conclusion about WHERE the fleet's responses go:
 
-  1. PREVIOUS-DIRECTORY SUFFIX -- from ~2026-09-08 the environment preamble reads
-     `d:\\dev\\CoursIA (was c:\\dev\\CoursIA)`. Splitting on the separator without
-     dropping the suffix yields `coursia)`; measured on one day of that week, 38
-     of 300 sampled bodies landed in `coursia)`, 33 in `coursia-2)`, 13 in
-     `roo-extensions)`. Every workspace was split in two.
+  1. PREVIOUS-DIRECTORY SUFFIX -- from ~2026-09-08 the environment preamble can
+     read `d:\\dev\\<lane> (was c:\\dev\\<lane>)`. Splitting on the separator
+     without dropping the suffix yields `<lane>)`; measured on one day of that
+     week, 38 of 300 sampled bodies landed in a `)`-suffixed bucket, 33 in a
+     second workspace's, 13 in a third's. Every workspace was split in two.
   2. PATH SEGMENT ENDING IN `n` -- the escaped newline is `\\n` and a literal
      separator is also a backslash, so a naive search cuts `d:\\dev\\new` at `d:`.
      That artefact produced a `d:` workspace bucket in the first run.
@@ -87,18 +87,18 @@ def _body(escaped_marker: bytes, prefix: bytes = b"") -> bytes:
 
 
 def pin_plain_path():
-    key, cc = wsattr.workspace_key(_body(b"d:\\\\dev\\\\CoursIA"))
+    key, cc = wsattr.workspace_key(_body(b"d:\\\\dev\\\\alpha-lane"))
     _check(cc is True, "a body carrying the preamble is Claude Code traffic")
-    _check(key == "coursia", "plain path -> 'coursia', got %r" % key)
+    _check(key == "alpha-lane", "plain path -> 'alpha-lane', got %r" % key)
 
 
 def pin_previous_directory_suffix():
-    key, _ = wsattr.workspace_key(_body(b"d:\\\\dev\\\\CoursIA (was c:\\\\dev\\\\CoursIA)"))
-    _check(key == "coursia", "the `(was …)` suffix must be dropped, got %r" % key)
-    _check(key != "coursia)", "regression: `coursia)` splits one workspace into two buckets")
+    key, _ = wsattr.workspace_key(_body(b"d:\\\\dev\\\\alpha-lane (was c:\\\\dev\\\\alpha-lane)"))
+    _check(key == "alpha-lane", "the `(was …)` suffix must be dropped, got %r" % key)
+    _check(key != "alpha-lane)", "regression: `alpha-lane)` splits one workspace into two buckets")
 
-    key2, _ = wsattr.workspace_key(_body(b"c:\\\\dev\\\\CoursIA-2 (previously d:\\\\CoursIA-2)"))
-    _check(key2 == "coursia-2", "`(previously …)` is the same trap, got %r" % key2)
+    key2, _ = wsattr.workspace_key(_body(b"c:\\\\dev\\\\alpha-lane-2 (previously d:\\\\alpha-lane-2)"))
+    _check(key2 == "alpha-lane-2", "`(previously …)` is the same trap, got %r" % key2)
 
 
 def pin_path_truncated_before_a_segment_starting_with_n():

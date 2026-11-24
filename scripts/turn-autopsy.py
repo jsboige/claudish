@@ -25,7 +25,8 @@ Corpus
 ------
 Captures live in `D:\\claudish-captures` (loose = the live day) and
 `D:\\claudish-captures\\archive\\captures-YYYY-MM-DD.7z` (30-day local), then
-`G:\\Mon Drive\\Backups-Cloud\\claudish\\` (single home of history).
+`<gdrive>\\Backups-Cloud\\claudish\\` (single home of history; resolved from
+the seat's `CLAUDISH_GDRIVE_ROOT`).
 
 Filename grammar -- the free lunch, no body parse required:
 
@@ -40,9 +41,15 @@ Measured trap: **pre-#98 captures carry `machine` but NOT `entrypoint`,
 `workload` or `device_id8`** (verified on captures-2026-07-05). The tool must
 degrade: those fields come back `null`, never invented.
 
-Heavy-analysis rule (CLAUDE.md): extraction writes to D:, never C:, and a full
-day's decompression pegs the hub host -- prefer a bounded sample and the
-05-07Z trough for anything large.
+Scratch rule (CLAUDE.md, scratch v3 11/10): disposable artefacts go to a
+gitignored dir of the workspace first -- `SCRATCH_ROOT` defaults to
+`<repo>/.tmp/autopsy`, overridable with `AUTOPSY_TMP`. This replaces the
+October rule "extraction writes to D:, never C:" (#1172): that rule was
+written when the hub host's C: was tight, and on today's hub it aims a 7 GiB
+scratch at the volume in crisis (D: 2 % free, C: 37 % free on po-2025,
+measured 23/11). The historical lot `D:\\claudish-autopsy` is no longer
+written by default. A full day's decompression still pegs the hub host --
+prefer a bounded sample and the 05-07Z trough for anything large.
 > **Trap, measured 2026-10-09**: the lane must come out of the filename with a
 > STRICT timestamp pattern. A loose `(.+?)-([a-z0-9_.-]+)-(.+?)` split the
 > TIMESTAMP itself (`T`/`Z` are outside the class), manufacturing thousands of
@@ -67,7 +74,12 @@ from datetime import datetime, timezone
 SEVENZIP = os.environ.get(
     "SEVENZIP", r"D:\PortableApps\PortableApps\7-ZipPortable\App\7-Zip\7z.exe"
 )
-SCRATCH_ROOT = os.environ.get("AUTOPSY_TMP", r"D:\claudish-autopsy")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# #1172: `or` (not a get() default) so an EMPTY AUTOPSY_TMP falls back to the
+# repo scratch dir instead of makedirs("") — the old D:\ default is retired.
+SCRATCH_ROOT = os.environ.get("AUTOPSY_TMP") or os.path.join(
+    _REPO_ROOT, ".tmp", "autopsy"
+)
 
 # --- the grid -------------------------------------------------------------
 # Separated on purpose (ai-01, 2026-10-08): nature, result and confidence are
@@ -294,7 +306,7 @@ def pick_sample(cands: list[dict], n: int, seed: int,
 
 
 def local_copy(archive: str) -> str:
-    """Copy the archive to D: once, then extract from there.
+    """Copy the archive to the scratch root once, then extract from there.
 
     Measured 2026-10-09: a 48.5 MB July archive read straight off G: (DriveFS)
     took >10 min for three `7z e` calls, because every call re-reads the whole
@@ -669,7 +681,7 @@ def main() -> int:
     s.add_argument("--seed", type=int, default=328)
     s.add_argument("--stratify", choices=["none", "lane"], default="lane")
     s.add_argument("--out", required=True)
-    s.add_argument("--workdir", help="extraction dir (default: D:\\claudish-autopsy\\<era>-<seed>)")
+    s.add_argument("--workdir", help="extraction dir (default: <repo>/.tmp/autopsy/<era>-<seed>; override with AUTOPSY_TMP)")
     s.add_argument("--no-copy", action="store_true",
                    help="extract straight from the archive (skip the local copy)")
     s.add_argument("--reuse", action="store_true",

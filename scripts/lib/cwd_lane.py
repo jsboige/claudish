@@ -10,10 +10,10 @@ divergent, et celle qui diverge ment sans lever d'erreur.
 
 Les trois pieges, mesures sur corpus :
 
-  * SUFFIXE `(was ...)` — depuis ~2026-09-08 le preambule lit
-    `d:\\dev\\CoursIA (was c:\\dev\\CoursIA)`. Couper sur le separateur sans
-    retirer le suffixe rend `coursia)` : 38 des 300 corps echantillonnes
-    ce jour-la, chaque workspace coupe en deux.
+  * SUFFIXE `(was ...)` — depuis ~2026-09-08 le preambule peut lire
+    `d:\\dev\\alpha-lane (was c:\\dev\\alpha-lane)`. Couper sur le
+    separateur sans retirer le suffixe rend `alpha-lane)` : 38 des 300
+    corps echantillonnes ce jour-la, chaque workspace coupe en deux.
   * ANTISLASH AVANT LE `\\n` — un separateur litteral est `\\\\` et le
     saut de ligne JSON est `\\n` : dezapper `\\\\` EN PREMIER, sinon
     `d:\\dev\\new` se coupe en `d:`.

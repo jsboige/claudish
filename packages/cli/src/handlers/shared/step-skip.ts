@@ -106,6 +106,43 @@ export function classifyConcurrencyRefusal(status: number, bodyText: string): bo
 /** Skip detail for a concurrency refusal — the countable marker's payload. */
 export const CONCURRENCY_REFUSAL_SKIP_DETAIL = "code=1302";
 
+// ── #781 — a NOMINAL 1302 joins the #299-B one-shot walk ──────────────────────
+
+/**
+ * `CLAUDISH_FAILOVER_1302_WALK=0` restores the pre-#781 behavior: a 1302 on
+ * the nominal surfaces as the bare 429 again. Read per request, same "only an
+ * explicit 0 disarms" convention as every house kill switch. Independent of
+ * `CLAUDISH_FAILOVER_OVERLOAD_WALK`, which still gates the whole walk.
+ */
+export function concurrencyWalkDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.CLAUDISH_FAILOVER_1302_WALK || "").trim() === "0";
+}
+
+/**
+ * #781 (user answer to Q68, 01/11: status quo only while the client's own
+ * retries outlast the burst, otherwise option b — walk). Measured 17/11: the
+ * bursts outlast them, and clients stop their turn on the bare 429.
+ *
+ * Read from the #679 annotation, never from the body: by the time the cascade
+ * loop sees the nominal's response, ComposedHandler has re-enveloped the body
+ * into the Anthropic error shape, which no longer carries `error.code`. The
+ * header is the one place the code survives. Status 429 only: the
+ * concurrency-WORDED variant is already a 529 and already walk-class.
+ */
+export function isConcurrencyRefusalWalk(
+  response: Response,
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  if (concurrencyWalkDisabled(env)) return false;
+  if (response.status !== 429) return false;
+  const skip = readStepSkip(response);
+  if (skip?.reason !== "busy" || !skip.detail) return false;
+  return skip.detail
+    .split(";")
+    .map((t) => t.trim())
+    .includes(CONCURRENCY_REFUSAL_SKIP_DETAIL);
+}
+
 /** How long the 1302 check may spend reading a 429 body (see the call site). */
 const CONCURRENCY_BODY_READ_MS = 300;
 
@@ -216,4 +253,31 @@ export function markStepSkipEligible(c: object, on: boolean): void {
 
 export function isStepSkipEligible(c: object): boolean {
   return stepSkipEligibleContexts.has(c);
+}
+
+// ── #1111 × #1109 — the patience gate yields to the #781 walk ─────────────────
+
+/**
+ * Whether THIS attempt is the nominal of a walk-armed cascade — the one case
+ * where a plain 1302 must NOT enter composed-handler's patient backoff: the
+ * #781 walk (proxy-server, `isConcurrencyRefusalWalk`) reads a 429 plus the
+ * #679 annotation and diverts to the first servable step in seconds. Patience
+ * first would starve the walk of its trigger (~5 min), and the 529 the
+ * patience path converts to would defeat the walk's 429-reading predicate.
+ *
+ * The mark is STRUCTURAL (nominal attempt, steps exist, not the excluded
+ * native/keyless lanes) and deliberately reads no kill switch: with the walk
+ * switches off, K1302g's contract is the bare 429 again, so patience must
+ * stay out of the way there too. The paths the walk cannot take (no cascade,
+ * last rung, keyless, native) keep the #1111 patience + 529.
+ */
+const cascadeWalkEligibleContexts = new WeakSet<object>();
+
+export function markCascadeWalkEligible(c: object, on: boolean): void {
+  if (on) cascadeWalkEligibleContexts.add(c);
+  else cascadeWalkEligibleContexts.delete(c);
+}
+
+export function isCascadeWalkEligible(c: object): boolean {
+  return cascadeWalkEligibleContexts.has(c);
 }

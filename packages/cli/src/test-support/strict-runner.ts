@@ -47,6 +47,26 @@ import { BUDGET_FOOTER_MARKER } from "./env-gate";
 export const BASELINE_PATH = ".test-strict-baseline.json";
 const DEFAULT_TEST_TIMEOUT_MS = 15_000;
 
+/**
+ * The argv the strict run launches bun with. Exported so the hermeticity pin
+ * (env-file-hermeticity.test.ts) drives the REAL argv instead of a copy: a pin
+ * that restates the flags cannot notice one being removed (#1101).
+ *
+ * `--no-env-file` keeps the seat's gitignored repo-root `.env` out of the test
+ * runtime. Bun autoloads it (measured, bun 1.4.2: a `.env` in cwd reaches
+ * `process.env` and fails a probe test), and on a seat that file carries
+ * container-absolute values (`CLAUDISH_CAPTURE_DIR=/captures`,
+ * `CLAUDISH_OVERFLOW_CAPS_PATH=/var/cache/claudish/...`) that change what the
+ * suite measures. CI and fresh worktrees have no `.env`, so this flag makes
+ * the seat run measure the same population as CI (#1101).
+ */
+export function suiteSpawnArgs(
+  testPath: string = "packages/cli/src",
+  timeoutMs: number = DEFAULT_TEST_TIMEOUT_MS,
+): string[] {
+  return ["--no-env-file", "test", testPath, "--timeout", String(timeoutMs), "--isolate"];
+}
+
 export interface StrictBaseline {
   /** commit the baseline was captured on, for staleness checks */
   sha: string;
@@ -276,7 +296,7 @@ export function realSuiteRunner(
   return () => {
     const r = spawnSync(
       process.execPath,
-      ["test", opts.testPath ?? "packages/cli/src", "--timeout", String(DEFAULT_TEST_TIMEOUT_MS), "--isolate"],
+      suiteSpawnArgs(opts.testPath ?? "packages/cli/src", DEFAULT_TEST_TIMEOUT_MS),
       { encoding: "utf-8", maxBuffer: 64 * 1024 * 1024, cwd, timeout: opts.wallClockMs ?? WALL_CLOCK_MS },
     );
     const raw = (r.stdout ?? "") + (r.stderr ?? "");

@@ -8,7 +8,7 @@ to volume (more requests), weight (fatter responses), or churn (more
 compactions) instead of guessed at.
 
     python scripts/native-trend.py --days 2026-08-16 2026-09-06 2026-09-12
-        [--archives-dir "G:\\Mon Drive\\Backups-Cloud\\claudish"]
+        [--archives-dir <CLAUDISH_GDRIVE_ROOT>\\Backups-Cloud\\claudish]
         [--loose-dir D:\\claudish-captures] [--loose-date 2026-09-13]
         [--7z "C:\\Program Files\\NVIDIA Corporation\\NVIDIA App\\7z.exe"]
 
@@ -55,11 +55,20 @@ U_CC = re.compile(r'"cache_creation_input_tokens":\s*(\d+)')
 TX_D = re.compile(r'"text":\s*"((?:[^"\\]|\\.)*)"')
 
 
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--days", nargs="+", required=True,
                     help="archive dates YYYY-MM-DD, in order")
-    ap.add_argument("--archives-dir", default=r"G:\Mon Drive\Backups-Cloud\claudish")
+    ap.add_argument("--archives-dir", default=_gdrive("Backups-Cloud", "claudish"),
+                    help="capture archive root "
+                         "(default: $CLAUDISH_GDRIVE_ROOT/Backups-Cloud/claudish)")
     ap.add_argument("--loose-dir", default="")
     ap.add_argument("--loose-date", default="",
                     help="add the (partial) loose day from --loose-dir")
@@ -76,7 +85,11 @@ def parse_args():
                     help="accept a pre-marker extraction dir holding "
                          "resp-native members (one stderr line per dir "
                          "accepted); default re-extracts any unmarked dir")
-    return ap.parse_args()
+    args = ap.parse_args()
+    if not args.archives_dir:
+        ap.error("--archives-dir or CLAUDISH_GDRIVE_ROOT required "
+                 "(Q85: the Drive root is seat config, not a repo default)")
+    return args
 
 
 def extract_complete(d, trust_unmarked=False):

@@ -99,6 +99,12 @@ A `0` from this command is not yet an absence: after a log rotation Docker has s
 
 **Apply.** Count only lines that **end** with `→ AUTONOMOUS`; read `[Relay] forward failed …` as served-locally, not a flip; never call a one-request episode a brief outage — it is the weakest signal there is. Before publishing a series, ask the owner of the observed system for its deploy and restart windows; "I flipped N times" is measured, "the hub went down N times" is not, until each episode meets one of those windows.
 
+### An unexplained restart on a shared host — read the same-seat guard's journal BEFORE naming the actor
+
+**Why.** On 2026-11-19 the po-2023 relay restarted six times; local instruments (docker events rotated, watchdog log, drain-tick files, scheduled-task census) attributed only two. Four stayed "unknown actor" for two cycles — until the **vllm lane's cycle journal on the same seat** (`<vllm lane memory>/cycles-journal.md`) closed the census to the second. Each timestamp below names its event and its source: the relay container's deaths come from its own docker log, the guard's gestures from the guard's journal. F3: guard's Docker Desktop restart (mandate 18:39:22Z on engine mute, the 24/10 mandate), relay container dead 18:39:53Z. F4: guard's Docker Desktop restart 00:03:59Z, containers back 00:04:07Z — the relay's own restart 00:04:08Z, to the second. The two morning SIGTERMs sat inside their F1 engine-suffocation window (10:53→14:17Z, starting before the guard's first DEGRADED line at 10:58:14Z). A guard that restarts **Docker Desktop** takes every container on the host with it — a death with no SIGTERM line and a calm host is not a mystery class, it is a candidate neighbor's gesture.
+
+**Apply.** Before declaring an actor unknown on a multi-lane host, enumerate the same-seat lanes' guard/cycle journals and match the minute; a lane's own journal is primary evidence of its own gestures. Keep any residue honestly qualified (the F1 pair is mechanism-SUPPOSED: a backend relaunch restarting containers), not promoted to "established".
+
 ## Already covered elsewhere in this repository
 
 | Lesson | Where |

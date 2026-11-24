@@ -33,6 +33,7 @@ import type { RelayModeSnapshot } from "../../handlers/shared/relay-mode-snapsho
 import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-parsers/anthropic-sse.js";
 import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
 import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
+import { carryServedModelHeader } from "../../handlers/shared/served-model-header.js";
 import { isQuotaExhaustion } from "../failover.js";
 import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 
@@ -911,17 +912,22 @@ export async function forwardToUpstream(
     // SSE), so it always lands on this rebuild branch, whatever `stream` the
     // client asked for. Fixed literal set by our own hub — same as above.
     const laneRefusalMarker = res.headers.get("x-claudish-lane-refusal");
-    return carryNoticeHeader(
+    // #1128: the hub's served-model header rides the same rebuild-preservation
+    // family — a relayed /compact answer names its concrete like a streamed one.
+    return carryServedModelHeader(
       res,
-      new Response(text, {
-        status: res.status,
-        headers: {
-          "Content-Type": contentType || "application/json",
-          ...(retryAfter ? { "retry-after": retryAfter } : {}),
-          ...(drainFreezeMarker ? { "x-claudish-drain-freeze": drainFreezeMarker } : {}),
-          ...(laneRefusalMarker ? { "x-claudish-lane-refusal": laneRefusalMarker } : {}),
-        },
-      })
+      carryNoticeHeader(
+        res,
+        new Response(text, {
+          status: res.status,
+          headers: {
+            "Content-Type": contentType || "application/json",
+            ...(retryAfter ? { "retry-after": retryAfter } : {}),
+            ...(drainFreezeMarker ? { "x-claudish-drain-freeze": drainFreezeMarker } : {}),
+            ...(laneRefusalMarker ? { "x-claudish-lane-refusal": laneRefusalMarker } : {}),
+          },
+        })
+      )
     );
   }
 
@@ -971,17 +977,23 @@ export async function forwardToUpstream(
   // so the hub's failover-notice header (set by the hub's own /v1/chat/completions
   // translation) is carried across explicitly — a sidecar-relayed OpenAI client
   // must see the same notice signal a direct-to-hub client sees.
-  return carryNoticeHeader(
+  // #1128: the hub's served-model header dies at the same seam — carried the
+  // same way, so a NOMINAL sidecar relays the hub's concrete verbatim (an
+  // AUTONOMOUS sidecar runs the local pipeline and sets its own).
+  return carryServedModelHeader(
     res,
-    createAnthropicPassthroughStream(c, res, {
-      modelName: String(model),
-      capture: false,
-      retryUpstream: reforward,
-      // Relay-side TTFT: fetch dispatch → hub headers. The [ttft] marker this
-      // feeds is the measurement that splits "upstream slow to first byte"
-      // from "long generation" — the exact question the header deadline raises.
-      headerLatencyMs: Math.round(performance.now() - fetchStartedAt),
-    })
+    carryNoticeHeader(
+      res,
+      createAnthropicPassthroughStream(c, res, {
+        modelName: String(model),
+        capture: false,
+        retryUpstream: reforward,
+        // Relay-side TTFT: fetch dispatch → hub headers. The [ttft] marker this
+        // feeds is the measurement that splits "upstream slow to first byte"
+        // from "long generation" — the exact question the header deadline raises.
+        headerLatencyMs: Math.round(performance.now() - fetchStartedAt),
+      })
+    )
   );
 }
 

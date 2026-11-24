@@ -64,11 +64,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 READINGS = Path.home() / ".claudish" / "console-readings.jsonl"
-# The private Drive every fleet machine mounts, in claudish's own folder (the one that
-# already holds the capture archives). Overridable for a seat that mounts it elsewhere.
-SHARED_LEDGER = Path(os.environ.get(
-    "CLAUDISH_CONSOLE_LEDGER_SHARED",
-    r"G:\Mon Drive\Backups-Cloud\claudish\console-readings\console-readings.jsonl"))
+
+
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
+# The shared Drive copy, in claudish's own folder (the one that already holds the
+# capture archives). Overridable for a seat that mounts it elsewhere. Unset
+# CLAUDISH_GDRIVE_ROOT leaves it None — NOT Path(""), which is Path('.') and
+# .exists() True: a wrong-but-plausible "shared copy" would be the CWD.
+_shared = os.environ.get("CLAUDISH_CONSOLE_LEDGER_SHARED") or _gdrive(
+    "Backups-Cloud", "claudish", "console-readings", "console-readings.jsonl")
+SHARED_LEDGER = Path(_shared) if _shared else None
 
 # `role` says WHAT the console answers, which is the part every session lost.
 # `auth` documents how the session is held, so a lost cookie is diagnosed rather
@@ -259,13 +270,25 @@ FIELD_PATTERNS = [
     ("reset", re.compile(
         r"(?:r[ée]initialisation|reset)[^\n]{0,40}?(?:dans|in)\s+([0-9]+\s*[jhd]\s*(?:et\s*)?[0-9]*\s*h?)", re.I)),
     ("credits", re.compile(r"([0-9][0-9\s.,]{2,}?)\s*cr[ée]dits?", re.I)),
-    ("usd", re.compile(r"\$\s?([0-9][0-9.,]*)")),
+    # USD in both UI shapes of the same console (#1163): the English UI prints
+    # "$12.04" (symbol first, dot decimal), the French UI "5,67 $US" (symbol after,
+    # comma decimal). An extractor that reads only one goes mute every time the
+    # operator's UI language flips — measured on openai-api-payg: 759/958 dumps read
+    # while the French ones all fell to NON INTERPRÉTÉ. First alternative wins.
+    ("usd", re.compile(r"\$\s?([0-9][0-9.,]*)|([0-9][0-9.,]*)\s*\$US\b")),
+    # Euros are their own key, never folded into `usd` — a € is not a $, and a column
+    # that changes currency mid-series is the #834 defect with a different unit
+    # (#1163: the Mistral console prints "28,61€", every dump unread until now).
+    ("eur", re.compile(r"([0-9][0-9\s.,]{0,10}?)\s*€")),
     # USED, not remaining — its own column, never folded into `pct` (review #834's
     # objection applies in reverse: the two must not share a column). claude.ai prints
     # "73 % utilisés" for the weekly plan (measured 04/11, 88 rows unread until then).
     ("used", re.compile(r"(\d+(?:[.,]\d+)?)\s*%\s*(?:utilis[ée]e?s?|used)\b", re.I)),
     # An absolute reset ("Réinitialisation le vendredi 02:00") next to the relative one.
     ("reset_at", re.compile(r"r[ée]initialisation\s+le\s+([^\s\d]+\.?\s+\d{1,2}[:h]\s?\d{2})", re.I)),
+    # The English absolute reset (QwenCloud Token Plan: "Will reset at 2099-01-12
+    # 00:00:00 (UTC+8)") — same key, second shape, French form keeps precedence.
+    ("reset_at", re.compile(r"Will reset at\s+(\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}(?::\d{2})?)")),
 ]
 
 # Patterns that span lines, applied to the dump joined by "\n". Z.AI splits its 5-hour
@@ -273,11 +296,22 @@ FIELD_PATTERNS = [
 # can see; it is a USED share (the page's own wording: quota consumed).
 JOINED_PATTERNS = [
     ("used", re.compile(r"Quota de 5 heures\s*\n\s*(\d+(?:[.,]\d+)?)\s*\n\s*%", re.I)),
+    # QwenCloud Token Plan (#1163): the monthly figure is BARE ("42.5%") with no
+    # restants|utilisés|used anywhere near it — only the "Monthly Usage" header (and
+    # the optional reset line between them) anchors it. Semantics proven from the
+    # ordered series, not guessed: the value sits at 100% while the plan is walled
+    # and climbs after the reset — a USED share, never a `pct` (remaining).
+    ("used", re.compile(r"Monthly Usage\s*\n(?:Will reset at[^\n]*\n)?(\d+(?:[.,]\d+)?)\s*%", re.I)),
 ]
 
 
 def extract(lines) -> dict:
     """Pull declared fields out of a verbatim console dump; leave the rest absent."""
+    def _first_group(m):
+        # Patterns may carry alternation branches (#1163's usd): the value is the
+        # first capturing group that participated in the match.
+        return next((g for g in m.groups() if g is not None), None)
+
     out: dict = {}
     for key, pat in FIELD_PATTERNS:
         if key in out:
@@ -285,15 +319,19 @@ def extract(lines) -> dict:
         for line in lines:
             m = pat.search(line)
             if m:
-                out[key] = m.group(1).strip()
-                break
+                val = _first_group(m)
+                if val is not None:
+                    out[key] = val.strip()
+                    break
     joined = "\n".join(lines)
     for key, pat in JOINED_PATTERNS:
         if key in out:
             continue
         m = pat.search(joined)
         if m:
-            out[key] = m.group(1).strip()
+            val = _first_group(m)
+            if val is not None:
+                out[key] = val.strip()
     return out
 
 
@@ -305,6 +343,10 @@ def cmd_publish(args) -> int:
     """Mirror the local ledger to the shared copy, atomically, never shrinking it."""
     src = READINGS
     dest = Path(args.to) if getattr(args, "to", None) else SHARED_LEDGER
+    if dest is None:
+        print("aucune copie partagée configurée : ni --to, ni "
+              "CLAUDISH_CONSOLE_LEDGER_SHARED, ni CLAUDISH_GDRIVE_ROOT", file=sys.stderr)
+        return 1
     if not src.exists():
         print(f"aucun registre local à publier : {src}", file=sys.stderr)
         return 1
@@ -357,7 +399,7 @@ def resolve_ledger(explicit: str | None) -> Path:
         return Path(explicit)
     if READINGS.exists():
         return READINGS
-    if SHARED_LEDGER.exists():
+    if SHARED_LEDGER is not None and SHARED_LEDGER.exists():
         return SHARED_LEDGER
     return READINGS
 
@@ -366,7 +408,8 @@ def cmd_series(args) -> int:
     """Consolidate the ledger into one table over time."""
     ledger = resolve_ledger(getattr(args, "ledger", None))
     if not ledger.exists():
-        print(f"aucun relevé : {ledger} (ni copie partagée : {SHARED_LEDGER})", file=sys.stderr)
+        print(f"aucun relevé : {ledger} (ni copie partagée : "
+              f"{SHARED_LEDGER or '(non configurée)'})", file=sys.stderr)
         return 1
     rows = []
     for line in ledger.read_text(encoding="utf-8").splitlines():
@@ -410,12 +453,13 @@ def cmd_series(args) -> int:
                       fields.get("pct", "—"), fields.get("used", "—"),
                       fields.get("reset", fields.get("reset_at", "—")),
                       fields.get("credits", "—"), fields.get("usd", "—"),
+                      fields.get("eur", "—"),
                       r.get("status", "")))
     table.sort(key=lambda t: t[0])
     w = max([len(t[1]) for t in table] + [8])
-    print(f"{'ts':20}  {'provider':{w}}  {'reste%':>6}  {'util%':>5}  {'reset':>15}  {'crédits':>9}  {'$':>8}  état")
+    print(f"{'ts':20}  {'provider':{w}}  {'reste%':>6}  {'util%':>5}  {'reset':>15}  {'crédits':>9}  {'$':>8}  {'€':>8}  état")
     for t in table:
-        print(f"{t[0]:20}  {t[1]:{w}}  {t[2]:>6}  {t[3]:>5}  {t[4]:>15}  {t[5]:>9}  {t[6]:>8}  {t[7]}")
+        print(f"{t[0]:20}  {t[1]:{w}}  {t[2]:>6}  {t[3]:>5}  {t[4]:>15}  {t[5]:>9}  {t[6]:>8}  {t[7]:>8}  {t[8]}")
     print(f"\n{len(table)} relevé(s) — source : {ledger}")
     if unresolved:
         print("NON INTERPRÉTÉ (relevés présents, aucun champ reconnu) : "
@@ -445,7 +489,7 @@ def main(argv=None) -> int:
     sr.add_argument("--json", action="store_true")
     sr.add_argument("--ledger", help="lire ce fichier (par défaut : registre local, sinon copie partagée)")
     pb = sub.add_parser("publish", help="copie le registre vers le Drive partagé (atomique, jamais raccourci)")
-    pb.add_argument("--to", help=f"destination (défaut : {SHARED_LEDGER})")
+    pb.add_argument("--to", help=f"destination (défaut : {SHARED_LEDGER or '(non configurée)'})")
     a = p.parse_args(argv)
     if a.cmd == "list":
         return cmd_list(a.json)

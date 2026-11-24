@@ -25,6 +25,17 @@
   removes the loose copies. Never deletes anything without a verified archive
   (7z t == 0).
 
+  SLOT MODE (#1152 c, opt-in via -SlotMode — the default is unchanged): the
+  rolling loose window. Captures younger than -RollingWindowHours (default 6)
+  stay loose; older ones are packed into a day PART
+  captures-YYYY-MM-DD-pHHMM[-<tag>].7z (HHMM = the pass's UTC time), with the
+  SAME verify-before-delete discipline as the nightly pass. A file whose mtime
+  is younger than -MinLooseAgeMinutes (default 30) is never packed: a
+  resp-*.sse may still be open. The nightly pass stays the day's final pass
+  (a day's history = its parts + its canonical archive), and the sha manifest
+  records each part as its own entry. Arming the slot cadence on the hub is a
+  separate [PROPOSAL] (po-2025) — this script only provides the mode.
+
   Single writer: a pid-bearing lock file (<ArchiveDir>\.compress-captures.lock)
   makes a second run -- typically a manual one during the scheduled night --
   exit without touching anything, instead of both packing the same canonical
@@ -48,18 +59,26 @@
   Show what would be archived/deleted without changing anything.
 
 .NOTES
-  Installed on this machine as the nightly Task Scheduler job
-  "ClaudishCaptureCompaction" (daily 02:47 local — moved off 04:17 on
-  2026-08-20: the 60-70 min run collided with the 04:00 container restart —
-  runs as the interactive user, StartWhenAvailable to catch up missed runs).
+  Installed on the hub as the nightly Task Scheduler job
+  "ClaudishCaptureCompaction" — measured 21/11: the hub fires at 00:47Z
+  every night (02:47 local in summer/UTC+2, 01:47 in winter/UTC+1 — the
+  old "02:47 local" note was summer time). The trigger hour is PER-SEAT:
+  the recipe below registers LOCAL 02:47; the deployed hub task carries
+  00:47Z. Moved off 04:17 on 2026-08-20: the 60-70 min run collided with
+  the 04:00 container restart. Runs as the interactive user,
+  StartWhenAvailable to catch up missed runs.
   Re-create it with:
 
     $action  = New-ScheduledTaskAction -Execute 'C:\Program Files\PowerShell\7\pwsh.exe' `
                  -Argument '-NoProfile -ExecutionPolicy Bypass -File "d:\Dev\claudish\scripts\compress-captures.ps1"'
     $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]'02:47')
+    # 6 h, not 3: the worst measured day (38.8 GB loose, hub night 20/11)
+    # packed + verified in 4 h 18 — a 3 h limit kills exactly that night
+    # (#1138), and 6 h leaves ~40% margin over the worst day without
+    # parking a wedged run all morning. The live hub task carries PT12H.
     $set     = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd `
                  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                 -ExecutionTimeLimit (New-TimeSpan -Hours 3) -MultipleInstances IgnoreNew
+                 -ExecutionTimeLimit (New-TimeSpan -Hours 6) -MultipleInstances IgnoreNew
     $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName 'ClaudishCaptureCompaction' -Action $action `
                  -Trigger $trigger -Settings $set -Principal $princ -Force
@@ -90,7 +109,7 @@ param(
   # online-only by default (DriveFS does not hydrate what it wrote) — never
   # pin this folder for offline access, that would re-hydrate the whole
   # history onto local disk.
-  [string]$GDriveDir  = "G:\Mon Drive\Backups-Cloud\claudish",
+  [string]$GDriveDir  = "",
   # Local retention: archives older than this (in days) are purged from the
   # local ArchiveDir, BUT only after confirming the copy exists on GDrive.
   # GDrive keeps everything; this only bounds local disk usage.
@@ -111,18 +130,151 @@ param(
   # #389: how many manifest entries the nightly sha re-check verifies per run
   # (deterministic rotation; 3 by default, 0 disables). Each entry re-hashed is
   # one DriveFS hydration, so keep this small.
-  [int]$ShaCheckCount = 3
+  [int]$ShaCheckCount = 3,
+  # #1138: heartbeat interval (seconds) while a 7z call runs — one PROGRESS
+  # line per interval, plus one before every call. The 20/11 hub night packed
+  # 38.8 GB in 4 h 18 with -bso0/-bsp0: four hours of journal silence is what
+  # made a healthy run read as stalled. 0 disables the during-call heartbeat
+  # (the before-call line stays). Tests set 1 to pin it without waiting.
+  [int]$ProgressHeartbeatSec = 3600,
+  # --- #1152 (c): slot mode, the rolling loose window -------------------------
+  # OFF by default: the nightly day archive is the fleet's proven path and
+  # stays exactly what a run without -SlotMode does. When set, this run packs
+  # the loose captures OLDER than -RollingWindowHours into a day PART
+  # captures-<day>-p<HHMM>[-<tag>].7z (HHMM = this pass's UTC time, day = the
+  # FILE's filename day) instead of packing completed days. The nightly pass
+  # remains the day's final pass: whatever the slot passes left loose (the W
+  # window tail, held files, stragglers) is the nightly pass's input, and the
+  # day's history = its parts + its canonical archive. KeepDays is ignored for
+  # selection in slot mode (the W window rules); retention (KeepLocalDays)
+  # applies to parts as to day archives.
+  [switch]$SlotMode,
+  # W: captures younger than this stay loose (hours). 6 = the coordinator's
+  # decision (c.7076270061): expected peak W+3h of growth.
+  [int]$RollingWindowHours = 6,
+  # A file whose mtime is younger than this is NEVER packed in slot mode: a
+  # resp-*.sse may still be open (the writer holds it; CPython's open() does
+  # not share FILE_SHARE_DELETE). 30 minutes per the decision.
+  [int]$MinLooseAgeMinutes = 30
 )
 
 $ErrorActionPreference = "Stop"
 Import-Module (Join-Path $PSScriptRoot 'lib\claudish-engine.psm1') -Force -DisableNameChecking
 if (-not $ArchiveDir) { $ArchiveDir = Join-Path $CaptureDir "archive" }
+# Q85: the Drive mount is seat config — CLAUDISH_GDRIVE_ROOT + the shared
+# subpath, resolved only when the env names a root. Empty stays empty = the
+# documented "off-site deferred" path below, never a hardcoded repo default.
+# String concat, NOT Join-Path: Join-Path VALIDATES the drive on PS 5.1 and
+# throws when the mount is absent — an unmounted Drive must degrade to the
+# deferred path, not kill the local compaction.
+if (-not $GDriveDir -and $env:CLAUDISH_GDRIVE_ROOT) {
+  $GDriveDir = ($env:CLAUDISH_GDRIVE_ROOT.TrimEnd('\') + '\Backups-Cloud\claudish')
+}
 $logFile = Join-Path $CaptureDir "compaction.log"
 
 function Log([string]$msg) {
   $line = "{0:yyyy-MM-ddTHH:mm:ssZ} {1}" -f (Get-Date).ToUniversalTime(), $msg
   Write-Host $line
   try { Add-Content -LiteralPath $logFile -Value $line -Encoding utf8 } catch {}
+}
+
+# --- #1138: every 7z call is announced, and a long one beats a heartbeat ------
+# Why Start-Process + poll instead of `& $SevenZip ...`: an engine event or
+# timer cannot fire while the pipeline is blocked on a native call under
+# PS 5.1, so the heartbeat has to come from a poll loop around a child
+# process. Exit code flows back from $p.ExitCode; -NoNewWindow keeps the
+# (silent: -bso0 -bsp0) console stream where it was. Elements containing
+# spaces are pre-quoted: PS 5.1's -ArgumentList joins with spaces verbatim.
+function Invoke-SevenZipLogged([string]$Label, [string[]]$Argv) {
+  Log ("PROGRESS {0}: 7z {1}" -f $Label, ($Argv -join ' '))
+  $quoted = $Argv | ForEach-Object { if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ } }
+  $argString = $quoted -join ' '
+  # A .cmd/.bat 7z (a stub, or a seat's shim) cannot be exec'd by
+  # CreateProcess directly: route through cmd.exe /c. pwsh 7 tolerates a bare
+  # .cmd, PS 5.1 does not (measured 21/11: the pack died mid-call and the
+  # journal lost the outcome line). Real .exe paths never take this branch.
+  $exe = $SevenZip
+  if ($SevenZip -match '\.(cmd|bat)$') {
+    $exe = $env:ComSpec
+    if ($SevenZip -match '\s') { $SevenZip = '"{0}"' -f $SevenZip }
+    $argString = '/c {0} {1}' -f $SevenZip, $argString
+  }
+  # Raw System.Diagnostics.Process, NOT Start-Process -PassThru: on this
+  # fleet's PS 5.1 the cmdlet's returned object NEVER yields ExitCode (null in
+  # every shape -- with WaitForExit, with Refresh, measured 21/11: both rc's
+  # read blank and a healthy pack was quarantined as a failed night). The raw
+  # Process object answers ExitCode correctly under 5.1 and pwsh 7 alike.
+  # UseShellExecute=$false + no redirects: the child inherits our console, so
+  # its output keeps flowing to whatever this run was redirected to.
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $exe
+  # #1145 review — the list file carries BARE names and the script resolves
+  # them from the PS location (Push-Location $CaptureDir). A raw Process does
+  # NOT inherit that location: it starts in [Environment]::CurrentDirectory,
+  # which Push-Location never moves -- measured 21/11 on ai-01 with a real
+  # 7z: every night hit "cannot find listed file" and went QUARANTINE. Pass
+  # the caller's location explicitly.
+  $psi.WorkingDirectory = (Get-Location).ProviderPath
+  $psi.Arguments = $argString
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  # $t0, never the Process's StartTime: under PS 5.1 a Process whose child
+  # has died hands back a StartTime that breaks op_Subtraction (measured
+  # 21/11 -- the second heartbeat killed the whole run with
+  # $ErrorActionPreference = Stop).
+  $t0 = Get-Date
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $lastHb = $t0
+  while (-not $p.HasExited) {
+    Start-Sleep -Milliseconds 250
+    if ($ProgressHeartbeatSec -gt 0 -and ((Get-Date) - $lastHb).TotalSeconds -ge $ProgressHeartbeatSec) {
+      $lastHb = Get-Date
+      Log ("PROGRESS {0}: still running ({1:N0} s elapsed)" -f $Label, [int]((Get-Date) - $t0).TotalSeconds)
+    }
+  }
+  # WaitForExit synchronizes the exit code (instant here -- the loop already
+  # saw the process gone).
+  $p.WaitForExit()
+  return $p.ExitCode
+}
+
+# --- Q85 / #1095 review: an unset Drive root must COUNT, not vanish ----------
+# The root is SEAT configuration, which is why the repo default had to go. But
+# on a seat that has archived off-site before, an unset value is a
+# configuration REGRESSION, and a silent skip is exactly the degradation a
+# monitor keyed on `END (errors=N)` cannot see: the night logs a clean END
+# while no off-site copy was made and the retention purge (correctly) keeps
+# every local archive. The proof of history has two forms (see the block
+# below): a LOCAL marker written on every confirmed off-site copy — written
+# only after a size+sha confirmation, never on intent — and, retroactively,
+# the journal lines every past upload already left. A seat that never archived
+# off-site stays errors=0 (a fresh install owes nobody an off-site copy).
+$errors = 0
+$offSiteMarker = Join-Path $ArchiveDir '.offsite-state.json'
+function Set-OffSiteMarker([string]$MarkerPath, [string]$DestDir) {
+  $line = ("{0}|{1}" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), $DestDir)
+  try { [System.IO.File]::WriteAllText($MarkerPath, $line, (New-Object System.Text.UTF8Encoding($false))) } catch {}
+}
+if (-not $GDriveDir) {
+  # Two proofs of history, because the marker is NEW: an existing seat has
+  # uploaded for months and carries no marker yet, so the first night after
+  # this lands must already count. The journal line is the retroactive proof
+  # (every run writes it after a size+sha confirmation); the marker is the
+  # durable one (it survives log rotation and a deleted journal).
+  $offSiteProof = ''
+  if (Test-Path -LiteralPath $offSiteMarker) {
+    try { $offSiteProof = ([System.IO.File]::ReadAllText($offSiteMarker)).Trim() } catch {}
+  }
+  if (-not $offSiteProof -and (Test-Path -LiteralPath $logFile)) {
+    try {
+      $hit = Select-String -LiteralPath $logFile -Pattern 'GDRIVE .*(uploaded|re-uploaded|already current)' -List -ErrorAction Stop
+      if ($hit) { $offSiteProof = 'compaction.log: ' + $hit.Line.Trim() }
+    } catch {}
+  }
+  if ($offSiteProof) {
+    $errors++
+    Log ("ERROR GDriveDir unset but this seat archived off-site before ({0}) - off-site deferred, END counts this night as failed (Q85: the Drive root is seat config; set CLAUDISH_GDRIVE_ROOT)" -f $offSiteProof)
+  }
 }
 
 # #322/#741: move an unreadable or partial archive out of the CANONICAL name.
@@ -177,26 +329,61 @@ Log ("SEVENZIP {0} (source={1})" -f $SevenZip, $sevenZipResolved.Source)
 if (-not (Test-Path -LiteralPath $CaptureDir)) { Log "FATAL: capture dir not found: $CaptureDir"; exit 2 }
 if (-not (Test-Path -LiteralPath $ArchiveDir)) { New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null }
 
-# Cutoff: archive any day strictly older than (todayUTC - (KeepDays-1)).
-$cutoff = (Get-Date).ToUniversalTime().Date.AddDays(-([Math]::Max(0, $KeepDays - 1)))
-Log "START compaction CaptureDir=$CaptureDir KeepDays=$KeepDays cutoff(UTC)=$($cutoff.ToString('yyyy-MM-dd'))"
+# --- mode selection (#1152 c) -------------------------------------------------
+# Nightly (the default, unchanged): archive any day strictly older than
+# (todayUTC - (KeepDays-1)). Slot mode: archive the loose captures OLDER than
+# the rolling W window, whatever their day, grouped by filename day so each
+# slice lands in ITS day's part. Both paths feed the SAME pack loop below —
+# only the target set and the archive name differ.
+$nowUtc = (Get-Date).ToUniversalTime()
+$slotHHmm = ''
+if ($SlotMode) {
+  $slotHHmm = $nowUtc.ToString('HHmm')
+  $ageCutoff = $nowUtc.AddHours(-[Math]::Max(0, $RollingWindowHours))
+  $mtimeCutoff = $nowUtc.AddMinutes(-[Math]::Max(0, $MinLooseAgeMinutes))
+  Log ("START slot compaction CaptureDir=$CaptureDir W={0}h mtimeGuard={1}min slot(UTC)={2}" -f $RollingWindowHours, $MinLooseAgeMinutes, $slotHHmm)
+} else {
+  $cutoff = $nowUtc.Date.AddDays(-([Math]::Max(0, $KeepDays - 1)))
+  Log "START compaction CaptureDir=$CaptureDir KeepDays=$KeepDays cutoff(UTC)=$($cutoff.ToString('yyyy-MM-dd'))"
+}
 
 # --- enumerate loose captures, group by their filename date (UTC) ------------
 $rx = '^(req|resp)-.*?(?<d>\d{4}-\d{2}-\d{2})T\d{2}-\d{2}-\d{2}'
+$rxTs = '^(req|resp)-.*?(?<ts>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})'
 $loose = Get-ChildItem -LiteralPath $CaptureDir -File | Where-Object { $_.Name -match $rx }
-if (-not $loose) { Log "nothing to do (0 loose capture files)"; Log "END"; exit 0 }
+if (-not $loose) { Log "nothing to do (0 loose capture files)"; Log ("END (errors={0})" -f $errors); exit $errors }
 
 $byDay = @{}
+$slotSkippedYoung = 0; $slotSkippedFreshMtime = 0
 foreach ($f in $loose) {
   if ($f.Name -match $rx) {
+    # Capture the day group NOW: the slot block below re-matches and resets
+    # $matches (same trap the lib's Get-CapturePartialInfo documents).
     $d = $matches['d']
+    if ($SlotMode) {
+      # The filename ts is the capture time (the writer derives it from the
+      # request); the mtime is the write time. Age keys on the FILENAME ts —
+      # a copy or a re-touch must not move a capture out of (or into) the
+      # window — while the still-open guard keys on MTIME, the only signal
+      # that says "a writer may hold this file right now".
+      if (-not ($f.Name -match $rxTs)) { continue }
+      $ts = [datetime]::ParseExact($matches['ts'], 'yyyy-MM-ddTHH-mm-ss', [System.Globalization.CultureInfo]::InvariantCulture)
+      if ($ts -ge $ageCutoff) { $slotSkippedYoung++; continue }
+      if ($f.LastWriteTimeUtc -gt $mtimeCutoff) { $slotSkippedFreshMtime++; continue }
+    }
     if (-not $byDay.ContainsKey($d)) { $byDay[$d] = New-Object System.Collections.ArrayList }
     [void]$byDay[$d].Add($f)
   }
 }
 
-$daysToArchive = $byDay.Keys | Where-Object { [datetime]::ParseExact($_, 'yyyy-MM-dd', $null) -lt $cutoff } | Sort-Object
-if (-not $daysToArchive) { Log "nothing to do (no completed past days; newest is kept loose)"; Log "END"; exit 0 }
+if ($SlotMode) {
+  $daysToArchive = $byDay.Keys | Sort-Object
+  Log ("SLOT selection: {0} day-group(s) eligible; skipped {1} file(s) younger than W, {2} file(s) with a fresh mtime (<{3} min, never packed)" -f $byDay.Count, $slotSkippedYoung, $slotSkippedFreshMtime, $MinLooseAgeMinutes)
+  if (-not $daysToArchive) { Log "nothing to do (no loose capture older than the W window)"; Log ("END (errors={0})" -f $errors); exit $errors }
+} else {
+  $daysToArchive = $byDay.Keys | Where-Object { [datetime]::ParseExact($_, 'yyyy-MM-dd', $null) -lt $cutoff } | Sort-Object
+  if (-not $daysToArchive) { Log "nothing to do (no completed past days; newest is kept loose)"; Log ("END (errors={0})" -f $errors); exit $errors }
+}
 
 # --- single-writer lock (#741) ------------------------------------------------
 # Everything below MUTATES the archive directory, and two runs can reach it at
@@ -244,8 +431,8 @@ if (Test-Path -LiteralPath $lockPath) {
   }
   if ($lockVerdict.Action -eq 'wait') {
     Log ("LOCK held: {0} -> this run exits without touching anything (the holder is doing this night's work)" -f $lockVerdict.Reason)
-    Log "END (errors=0)"
-    exit 0
+    Log ("END (errors={0})" -f $errors)
+    exit $errors
   }
   if ($lockVerdict.Action -eq 'steal') { Log ("WARN  stale lock stolen: {0}" -f $lockVerdict.Reason) }
 }
@@ -255,12 +442,17 @@ try {
   Log ("WARN  cannot write the single-writer lock ({0}) - continuing, serialised by nothing but the scheduler" -f $_.Exception.Message)
 }
 
-$totalRaw = 0L; $totalArch = 0L; $totalFiles = 0; $errors = 0
+$totalRaw = 0L; $totalArch = 0L; $totalFiles = 0   # $errors is seeded above (Q85 precheck) and only ever increments
 
 foreach ($day in $daysToArchive) {
   $files = $byDay[$day]
   $rawBytes = ($files | Measure-Object -Property Length -Sum).Sum
-  $archivePath = Join-Path $ArchiveDir (Get-CaptureArchiveName -Day $day -MachineTag $MachineTag)
+  # Slot mode packs this slice into the DAY'S PART named for this pass; the
+  # nightly path keeps the day's canonical. Everything downstream (probe,
+  # quarantine, pack, verify, off-site, loose purge) is name-agnostic.
+  $archiveLeaf = if ($SlotMode) { Get-CapturePartName -Day $day -SlotHHmm $slotHHmm -MachineTag $MachineTag }
+                 else           { Get-CaptureArchiveName -Day $day -MachineTag $MachineTag }
+  $archivePath = Join-Path $ArchiveDir $archiveLeaf
 
   if ($PSCmdlet.ShouldProcess("$($files.Count) files for $day", "7z archive -> $archivePath then purge loose after the off-site copy")) {
     # --- #741: probe the canonical BEFORE appending to it -------------------
@@ -272,8 +464,7 @@ foreach ($day in $daysToArchive) {
     # `a` on a VALID canonical is a legitimate incremental update (measured
     # 35:1 on a re-run), so this acts only when the probe is RED.
     if (Test-Path -LiteralPath $archivePath) {
-      & $SevenZip t -bso0 -bsp0 "$archivePath" | Out-Null
-      $preRc = $LASTEXITCODE
+      $preRc = Invoke-SevenZipLogged -Label ("probe {0}" -f $day) -Argv @('t', '-bso0', '-bsp0', $archivePath)
       if ($preRc -ne 0) {
         $q = Invoke-ArchiveQuarantine -Path $archivePath
         if ($q.Ok) {
@@ -308,10 +499,8 @@ foreach ($day in $daysToArchive) {
       # NB: no `--` here — 7-Zip's `--` stops @listfile parsing too, which would
       # make it treat the list as a literal filename. The archive path and the
       # @list arg are both safe (no leading `-`), so `--` is unnecessary.
-      & $SevenZip a -t7z -m0=lzma2 -mx=9 -md=32m -mfb=273 -mmt=8 -bso0 -bsp0 "$archivePath" "@$listFile" | Out-Null
-      $addRc = $LASTEXITCODE
-      & $SevenZip t -bso0 -bsp0 "$archivePath" | Out-Null
-      $testRc = $LASTEXITCODE
+      $addRc  = Invoke-SevenZipLogged -Label ("pack {0}" -f $day) -Argv @('a', '-t7z', '-m0=lzma2', '-mx=9', '-md=32m', '-mfb=273', '-mmt=8', '-bso0', '-bsp0', $archivePath, "@$listFile")
+      $testRc = Invoke-SevenZipLogged -Label ("verify {0}" -f $day) -Argv @('t', '-bso0', '-bsp0', $archivePath)
     } finally {
       Pop-Location
       Remove-Item -LiteralPath $listFile -Force -ErrorAction SilentlyContinue
@@ -355,6 +544,7 @@ foreach ($day in $daysToArchive) {
             Log ("REFUSE {0}: off-site {1} -> local kept, purge will skip, NOT overwritten" -f $day, $verdict.Reason)
           } elseif ($verdict.Action -eq 'idempotent') {
             Log ("GDRIVE {0}: already current ({1} bytes), idempotent - no copy needed" -f $day, $archBytes)
+            Set-OffSiteMarker $offSiteMarker $GDriveDir
           } else {
             try {
               Copy-Item -LiteralPath $archivePath -Destination $GDriveDir -Force -ErrorAction Stop
@@ -378,6 +568,7 @@ foreach ($day in $daysToArchive) {
                            -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) `
                            -Extra @{ source = 'deposit' }
                   Log ("GDRIVE {0}: uploaded ({1:N1} MB, sha256 {2}.. recorded)" -f $day, ($archBytes/1MB), $shaDest.Substring(0,8))
+                  Set-OffSiteMarker $offSiteMarker $GDriveDir
                 }
               } else {
                 $errors++
@@ -453,7 +644,9 @@ foreach ($day in $daysToArchive) {
 # archive dir, is left exactly where it is and said out loud — never guessed at.
 if (Test-Path -LiteralPath $ArchiveDir) {
   foreach ($stray in (Get-ChildItem -LiteralPath $CaptureDir -Filter 'captures-*.7z' -File)) {
-    if (-not (Get-CaptureArchiveDay -Name $stray.Name)) { continue }
+    # Day archive OR day part (#1152 c): both belong in the archive dir; the
+    # part parsers reject the other's spelling, so accept either shape.
+    if (-not (Get-CaptureArchiveDay -Name $stray.Name) -and -not (Get-CapturePartInfo -Name $stray.Name)) { continue }
     if ((Get-CaptureArchiveMachineTag -Name $stray.Name) -ne $MachineTag) { continue }
     $strayTarget = Join-Path $ArchiveDir $stray.Name
     if (Test-Path -LiteralPath $strayTarget) {
@@ -494,6 +687,7 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
     }
     if ($verdict.Action -eq 'idempotent') {
       Log ("GDRIVE {0}: already current ({1} bytes), idempotent - no re-upload needed" -f $arch.BaseName, $arch.Length)
+      Set-OffSiteMarker $offSiteMarker $GDriveDir
       continue
     }
     # #322: the verdict only compares SIZES — it cannot know the local archive
@@ -504,10 +698,10 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
     # for an OLD day the loose originals are long gone, so renaming its only
     # copy on a possibly-transient test failure would hide the day from every
     # reader without helping anyone — the log line is the escalation.
-    & $SevenZip t -bso0 -bsp0 "$($arch.FullName)" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $gateRc = Invoke-SevenZipLogged -Label ("verify {0}" -f $arch.BaseName) -Argv @('t', '-bso0', '-bsp0', $arch.FullName)
+    if ($gateRc -ne 0) {
       $errors++
-      Log ("REFUSE {0}: local archive fails 7z t (rc={1}) -> NOT uploaded, kept local for review" -f $arch.BaseName, $LASTEXITCODE)
+      Log ("REFUSE {0}: local archive fails 7z t (rc={1}) -> NOT uploaded, kept local for review" -f $arch.BaseName, $gateRc)
       continue
     }
     try {
@@ -527,6 +721,7 @@ if ($GDriveDir -and (Test-Path -LiteralPath $ArchiveDir) -and (Test-Path -Litera
                    -RecordedUtc ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) `
                    -Extra @{ source = 'deposit' }
           Log ("GDRIVE {0}: re-uploaded ({1:N1} MB, was missing, sha256 {2}.. recorded)" -f $arch.BaseName, ($arch.Length/1MB), $shaDest.Substring(0,8))
+          Set-OffSiteMarker $offSiteMarker $GDriveDir
         }
       } else {
         $errors++
@@ -606,7 +801,11 @@ if ($KeepLocalDays -ge 0 -and $GDriveDir -and (Test-Path -LiteralPath $ArchiveDi
   $purged = 0; $purgeSkipped = 0
   foreach ($arch in (Get-ChildItem -LiteralPath $ArchiveDir -Filter 'captures-*.7z' -File)) {
     if ((Get-CaptureArchiveMachineTag -Name $arch.Name) -ne $MachineTag) { continue }
+    # Day archive or day part (#1152 c): both age by the day they encode, both
+    # need the same off-site proof before a local delete. Tag parsing is
+    # part-aware (see the lib), so the ownership filter above already owns both.
     $archDay = Get-CaptureArchiveDay -Name $arch.Name
+    if (-not $archDay) { $archDay = (Get-CapturePartInfo -Name $arch.Name).Day }
     if (-not $archDay) { continue }   # unparseable name: skip, never guess before deleting
     $dayDate = [datetime]::ParseExact($archDay, 'yyyy-MM-dd', $null)
     if ($dayDate -ge $purgeCutoff) { continue }   # within retention window

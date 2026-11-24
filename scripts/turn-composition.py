@@ -42,10 +42,10 @@ corpus; each reads the minimum bytes that carry its answer.
 Usage
 -----
   python scripts/turn-composition.py envelope --dir D:\\claudish-captures --label now
-  python scripts/turn-composition.py envelope --dir D:\\claudish-autopsy\\july05 --label july
+  python scripts/turn-composition.py envelope --dir .tmp\\autopsy\\july05 --label july
   python scripts/turn-composition.py history  --dir D:\\claudish-captures --label now --limit 400
   python scripts/turn-composition.py nudge    --dir D:\\claudish-captures --label now --limit 400
-  python scripts/turn-composition.py archive --archives "G:\\...\\captures-2026-07-*.7z" --label july
+  python scripts/turn-composition.py archive --archives "<gdrive>\\...\\captures-2026-07-*.7z" --label july
 
 Reading rules (the traps this tool was built against, all measured 29/10):
 
@@ -84,6 +84,19 @@ import re
 import statistics
 import subprocess
 import sys
+
+
+def _load_partial_parts():
+    """Nommage des parties de jour #1152 c — la regex vit dans la lib
+    partagee (une copie par semantique), pas dupliquee ici."""
+    import importlib.util
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / "partial_parts.py"
+    spec = importlib.util.spec_from_file_location("partial_parts", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d\d)[-:](\d\d)[-:](\d\d)")
 KEYS_RE = re.compile(
@@ -342,6 +355,13 @@ def cmd_archive(args):
     if not sevenzip:
         raise SystemExit("NO_7Z: no 7z binary found — pass --sevenzip")
 
+    # #1152 c — un jour complet est fait de ses parties + son archive de
+    # jour : le glob captures-<day>*.7z les attrape toutes et les compteurs
+    # agrege s'occupent de l'union. Ce qui manque au lecteur, c'est de
+    # DISTINGUER les lignes per_archive d'une partie (partielle par design)
+    # de celles d'une archive de jour incomplete (suspecte).
+    _pp = _load_partial_parts()
+
     archives = []
     for pattern in args.archives:
         archives.extend(sorted(glob.glob(pattern)))
@@ -402,8 +422,15 @@ def cmd_archive(args):
             per_day[day] += 1
             c_machine_model[(mach, mod)] += 1
             c_machine_day[(mach, day)] += 1
+        part_m = _pp.PART_FN.match(os.path.basename(archive))
         per_archive.append({
             "archive": archive,
+            # part info (None = day archive): slot is the pass's UTC HHMM,
+            # tag the machine tag. A part is partial BY DESIGN — its
+            # day_looks_complete=False is expected, not suspicious.
+            "part": ({"day": part_m.group("day"), "slot": part_m.group("slot"),
+                      "tag": part_m.group("tag") or ""}
+                     if part_m else None),
             "index_members": len(index_members),
             "stream_members": len(fields),
             "marker": marker_used,

@@ -78,18 +78,24 @@ BeforeAll {
         @{ sessions = @($Sessions) } | ConvertTo-Json -Depth 6 -Compress
     }
 
-    function Invoke-Watch([string]$Sandbox, [string]$HubConfig = '', [string]$ProjectsRoot = '', [switch]$NoScanSeam) {
+    function Invoke-Watch([string]$Sandbox, [string]$HubConfig = '', [string]$ProjectsRoot = '', [switch]$NoScanSeam,
+                          [string]$ExemptProjectPattern = '^d--dev-alpha-lane(--|$)') {
         # Child = production shape (task runs powershell.exe -File); seams + sandbox
         # ride -Command / the inherited environment. -RepoScripts points at an empty
         # dir (split-brain hook off), -HubConfig at a non-existent path (catalog skip,
         # except the catalog pin which provides its own fixture home).
         # -ProjectsRoot plants workspace identity in the sandbox (B3); -NoScanSeam
         # omits the -RunScan injection so the real scan-skip path is exercised (N2).
+        # -ExemptProjectPattern is ALWAYS passed (Q85: seat config, synthetic here) —
+        # explicit '' pins the unset frontier (kill unreachable), the default
+        # synthetic frontier covers the exempt fixtures without ever naming a real
+        # workspace folder in this repo.
         if (-not $HubConfig) { $HubConfig = "$Sandbox\no-hub-config.json" }
         $inner = "& '$($script:WatchPath)' -ClaudishHome '$Sandbox'" +
             " -ScanScript '$Sandbox\scan.py' -HubConfig '$HubConfig'"
         if (-not $NoScanSeam) { $inner += " -RunScan $script:SeamScan" }
         if ($ProjectsRoot) { $inner += " -ProjectsRoot '$ProjectsRoot'" }
+        $inner += " -ExemptProjectPattern '$ExemptProjectPattern'"
         $inner += " -RepoScripts '$Sandbox' -GetProcesses $script:SeamProcs" +
             " -StopProcess $script:SeamStop -GetSchTasks $script:SeamSchTasks -FetchCatalog $script:SeamCatalog"
         $prev = $env:WATCH_SB
@@ -275,14 +281,16 @@ Describe 'session-watch catalog unroll (CR B2-d, PS 5.1 vs 7)' {
 }
 
 Describe 'session-watch workspace frontier (CR B3)' {
-    # The reviewer's pin list verbatim: main CoursIA-2, worktree CoursIA-2, and
-    # unknown identity — each with consent PRESENT and a process positively
-    # bound — must yield ZERO StopProcess; a session outside the protected
-    # scope under the same conditions is the positive control (it MUST die).
+    # The reviewer's pin list, on synthetic folder names (Q85): main checkout,
+    # worktree, and unknown identity — each with consent PRESENT and a process
+    # positively bound — must yield ZERO StopProcess; a session outside the
+    # protected scope under the same conditions is the positive control (it
+    # MUST die). The exempt frontier itself is seat config, passed by
+    # Invoke-Watch as '^d--dev-alpha-lane(--|$)'.
     # (New-ArmedSandbox lives in the BeforeAll — Pester 6 scope isolation.)
 
-    It 'MAIN CoursIA-2 checkout: consent present, process positively bound -> exempt, ZERO StopProcess' {
-        $f = New-ArmedSandbox 'aaaac2d4-0000-0000-0000-000000000001' 'd--dev-CoursIA-2'
+    It 'MAIN exempt checkout: consent present, process positively bound -> exempt, ZERO StopProcess' {
+        $f = New-ArmedSandbox 'aaaac2d4-0000-0000-0000-000000000001' 'd--dev-alpha-lane'
         $r = Invoke-Watch $f.Sb -ProjectsRoot $f.Pr
         $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
         $kinds = @(Get-Journal $f.Sb | ForEach-Object { $_.kind })
@@ -293,8 +301,8 @@ Describe 'session-watch workspace frontier (CR B3)' {
         Get-StopCount $f.Sb | Should -Be 0
     }
 
-    It 'CoursIA-2 WORKTREE (capital-D project dir, the reviewer-named shape): same exemption, ZERO StopProcess' {
-        $f = New-ArmedSandbox 'bbbac2d4-0000-0000-0000-000000000002' 'D--dev-CoursIA-2--claude-worktrees-smartgrid-risk-17083'
+    It 'EXEMPT WORKTREE (capital-D project dir, the reviewer-named shape): same exemption, ZERO StopProcess' {
+        $f = New-ArmedSandbox 'bbbac2d4-0000-0000-0000-000000000002' 'D--dev-alpha-lane--claude-worktrees-smartgrid-risk-17083'
         $r = Invoke-Watch $f.Sb -ProjectsRoot $f.Pr
         $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
         $kinds = @(Get-Journal $f.Sb | ForEach-Object { $_.kind })
@@ -303,14 +311,26 @@ Describe 'session-watch workspace frontier (CR B3)' {
         (Get-Journal $f.Sb | Where-Object kind -eq 'exempt')[0].detail | Should -BeLike '*smartgrid-risk-17083*'
     }
 
-    It 'near-miss repo d--dev-CoursIA-20 (shares the prefix, is NOT CoursIA-2): positive control — consent + binding DO kill' {
-        $f = New-ArmedSandbox 'cccc42d4-0000-0000-0000-000000000003' 'd--dev-CoursIA-20'
+    It 'near-miss repo d--dev-alpha-lane0 (shares the prefix, is NOT the exempt workspace): positive control — consent + binding DO kill' {
+        $f = New-ArmedSandbox 'cccc42d4-0000-0000-0000-000000000003' 'd--dev-alpha-lane0'
         $r = Invoke-Watch $f.Sb -ProjectsRoot $f.Pr
         $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
         $kinds = @(Get-Journal $f.Sb | ForEach-Object { $_.kind })
         $kinds | Should -Not -Contain 'exempt'      # a permissive contains would have exempted it
         $kinds | Should -Contain 'killed'
         Get-StopCount $f.Sb | Should -Be 1
+    }
+
+    It 'exempt pattern UNSET: identity-established session never reaches ANY dominance branch — exempt-pattern-unset, ZERO StopProcess (Q85 safe default)' {
+        $f = New-ArmedSandbox 'e555c2d4-0000-0000-0000-000000000005' 'd--dev-alpha-lane'
+        $r = Invoke-Watch $f.Sb -ProjectsRoot $f.Pr -ExemptProjectPattern ''
+        $r.Code | Should -Be 0 -Because "child must exit clean; child output was: [$($r.Out)]"
+        $kinds = @(Get-Journal $f.Sb | ForEach-Object { $_.kind })
+        $kinds | Should -Contain 'exempt-pattern-unset'
+        $kinds | Should -Not -Contain 'exempt'
+        $kinds | Should -Not -Contain 'killed'
+        $kinds | Should -Not -Contain 'sol-majority'
+        Get-StopCount $f.Sb | Should -Be 0
     }
 
     It 'workspace identity UNESTABLISHED (transcript under no project dir): consent present, process positively bound -> no-workspace-identity, ZERO StopProcess' {

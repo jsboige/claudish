@@ -270,6 +270,59 @@ def pin_e2e_sample_and_stats():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _load_with_autopsy_tmp(value):
+    """Import a FRESH module instance with AUTOPSY_TMP set to `value`
+    (None = unset), restoring the caller's env afterwards. SCRATCH_ROOT is
+    resolved at import time, so a reload is the only way to pin the default."""
+    saved = os.environ.get("AUTOPSY_TMP")
+    if value is None:
+        os.environ.pop("AUTOPSY_TMP", None)
+    else:
+        os.environ["AUTOPSY_TMP"] = value
+    try:
+        spec = importlib.util.spec_from_file_location("taut_env", _TARGET)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        if saved is None:
+            os.environ.pop("AUTOPSY_TMP", None)
+        else:
+            os.environ["AUTOPSY_TMP"] = saved
+
+
+def pin_scratch_root_defaults_under_repo_tmp():
+    """#1172: the DEFAULT scratch is <repo>/.tmp/autopsy, never the retired
+    global lot D:\\claudish-autopsy (which aimed a 7 GiB write at po-2025's
+    D: at 2 % free)."""
+    mod = _load_with_autopsy_tmp(None)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(_TARGET)))
+    expected = os.path.join(repo, ".tmp", "autopsy")
+    _check(os.path.normcase(os.path.abspath(mod.SCRATCH_ROOT))
+           == os.path.normcase(expected),
+           "SCRATCH_ROOT default must be %r, got %r"
+           % (expected, mod.SCRATCH_ROOT))
+    _check("claudish-autopsy" not in mod.SCRATCH_ROOT,
+           "SCRATCH_ROOT must not point at the retired D: lot, got %r"
+           % mod.SCRATCH_ROOT)
+
+
+def pin_scratch_root_env_override():
+    """#1172: AUTOPSY_TMP still overrides; an EMPTY value falls back to the
+    default (the old get(key, default) form would have yielded '' and made
+    makedirs('') raise)."""
+    override = os.path.join(tempfile.gettempdir(), "taut-override-probe")
+    mod = _load_with_autopsy_tmp(override)
+    _check(mod.SCRATCH_ROOT == override,
+           "AUTOPSY_TMP must override the default, got %r" % mod.SCRATCH_ROOT)
+    mod = _load_with_autopsy_tmp("")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(_TARGET)))
+    _check(os.path.normcase(os.path.abspath(mod.SCRATCH_ROOT))
+           == os.path.normcase(os.path.join(repo, ".tmp", "autopsy")),
+           "an empty AUTOPSY_TMP must fall back to the default, got %r"
+           % mod.SCRATCH_ROOT)
+
+
 def main():
     pin_req_re_ip_chain_and_direct()
     pin_resp_re_lane()
@@ -282,7 +335,9 @@ def main():
     pin_trigger_text_blocks_still_fire()
     pin_pick_sample_bounded()
     pin_e2e_sample_and_stats()
-    print("test_turn_autopsy: 11 pins OK (target: %s)" % _TARGET)
+    pin_scratch_root_defaults_under_repo_tmp()
+    pin_scratch_root_env_override()
+    print("test_turn_autopsy: 13 pins OK (target: %s)" % _TARGET)
 
 
 if __name__ == "__main__":

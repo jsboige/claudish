@@ -10,10 +10,17 @@
  * outage is the provider's, but the embolism is ours.
  *
  * Definition (per the issue): a `: keep-alive` comment, an `event:` line or a
- * blank line is NOT a useful event — only a `data:` line with a non-empty
- * payload is. The window applies to the FIRST useful event only: once seen,
- * the timer is cleared and never rearmed, so a legitimate long thinking phase
- * (whose deltas are themselves data events) can never trip it.
+ * blank line is NOT a useful event — only a `data:` line whose payload is more
+ * than a ping frame is (#1030). The Anthropic wire's keep-alive is
+ * `event: ping` / `data: {"type":"ping"}` — it has a payload, so the original
+ * `/^data:\s*\S/m` test counted it as useful and cleared the timer for good;
+ * a stream admitted and then mute was never confined. Any other non-empty
+ * payload still counts (an unparseable one included: this guards a hang, it
+ * does not audit JSON). The window applies to the FIRST useful event only:
+ * once seen, the timer is cleared and never rearmed, so a legitimate long
+ * thinking phase (whose deltas are themselves data events) can never trip it.
+ * The parser re-emits its own pings down to the client, so an upstream ping
+ * needs no forwarding to keep the client link alive.
  *
  * On expiry the upstream reader is cancelled (frees the provider slot and the
  * socket) and the wrapper closes. The downstream stream parsers already
@@ -32,12 +39,76 @@ import { log } from "../../logger.js";
 
 const DEFAULT_WINDOW_MS = 300_000;
 
+/**
+ * Does this scan buffer carry a useful `data:` event? (#1030)
+ *
+ * A `data:` line whose payload parses to `{"type":"ping"}` is the Anthropic
+ * wire's keep-alive, not an event. Every other non-empty payload counts —
+ * including one this function cannot parse, because the watchdog's job is to
+ * confine a mute stream, not to validate JSON: a malformed-but-present payload
+ * is still an upstream that speaks, and confining it would change behaviour
+ * beyond the issue's scope.
+ */
+export function hasUsefulDataLine(buffer: string): boolean {
+  // #1097 CR — judge COMPLETE lines only. A chunk that ends inside a frame
+  // (TCP, TLS or the relay cuts bytes anywhere) leaves the trailing segment
+  // without its `\n`; judging it made a split ping — `data: {"ty` — count as
+  // useful (the truncated payload fails JSON.parse), clearing the timer for
+  // good. The segment is not dropped: it stays in the caller's scanBuffer and
+  // is judged the moment its newline arrives. An unparseable COMPLETE line
+  // still counts as useful (the watchdog confines a hang, it does not audit
+  // JSON).
+  const completeLines = buffer.endsWith("\n")
+    ? buffer
+    : buffer.slice(0, buffer.lastIndexOf("\n") + 1);
+  for (const line of completeLines.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload) continue;
+    if (payload.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed && typeof parsed === "object" && (parsed as { type?: unknown }).type === "ping") {
+          continue;
+        }
+      } catch {
+        /* unparseable payload: useful (see above) */
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
 export function firstEventWatchdogWindowMs(): number {
   const raw = process.env.CLAUDISH_FIRST_EVENT_TIMEOUT_MS;
   if (!raw) return DEFAULT_WINDOW_MS;
   const n = Number(raw);
   if (!Number.isFinite(n)) return DEFAULT_WINDOW_MS;
   return n;
+}
+
+/**
+ * Internal signal: the watchdog's timer ACTUALLY expired (#1098 CR).
+ *
+ * The wrapper returns synchronously and the timer fires asynchronously, so
+ * the expiry cannot ride a header (a Response constructor COPIES its headers,
+ * and a header value is a string snapshot — both measured 18/11). The record
+ * lives in a module WeakMap keyed by the wrapped Response itself: object
+ * identity survives the return, the timer fills the record before closing,
+ * and the downstream parser — constructed synchronously at that close,
+ * receiving THIS Response object from ComposedHandler — reads the filled
+ * value. null = the watchdog never expired, however armed it was: a finite
+ * pings-only close must never wear the confined label.
+ */
+export interface FirstEventExpiry {
+  windowMs: number | null;
+}
+const expiryByResponse = new WeakMap<Response, FirstEventExpiry>();
+
+/** The parser-side reader: the expiry window, or null when nothing expired. */
+export function firstEventExpiryMs(response: Response): number | null {
+  return expiryByResponse.get(response)?.windowMs ?? null;
 }
 
 /**
@@ -55,6 +126,8 @@ export function withFirstUsefulEventWatchdog(response: Response, label: string):
   let sawUseful = false;
   let finished = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  // The expiry record, keyed by the returned Response (see firstEventExpiryMs).
+  const expiry: FirstEventExpiry = { windowMs: null };
 
   const clearTimer = () => {
     if (timer !== null) {
@@ -68,6 +141,9 @@ export function withFirstUsefulEventWatchdog(response: Response, label: string):
       timer = setTimeout(() => {
         if (sawUseful || finished) return;
         finished = true;
+        // Fill the record in place BEFORE closing: the downstream parser is
+        // constructed synchronously at the close and reads the filled value.
+        expiry.windowMs = windowMs;
         clearTimer();
         log(
           `[FirstEvent] watchdog: no useful event within ${windowMs}ms (${label}) — cancelling upstream; downstream parser finalizes synthetically`,
@@ -94,12 +170,13 @@ export function withFirstUsefulEventWatchdog(response: Response, label: string):
             if (finished) break;
 
             if (!sawUseful && value) {
-              // Any `data:` line with a non-empty payload marks the stream
-              // healthy: SSE comments (`: keep-alive`) and `event:` lines
-              // never match. Keep the scan bounded — a mute-but-chatty
-              // upstream may stream kilobytes of comments.
+              // Any `data:` line carrying more than a ping frame marks the
+              // stream healthy: SSE comments (`: keep-alive`), `event:` lines
+              // and `data: {"type":"ping"}` never do (#1030 — the ping form
+              // used to disarm this timer for good). Keep the scan bounded —
+              // a mute-but-chatty upstream may stream kilobytes of frames.
               scanBuffer += decoder.decode(value, { stream: true });
-              if (/^data:\s*\S/m.test(scanBuffer)) {
+              if (hasUsefulDataLine(scanBuffer)) {
                 sawUseful = true;
                 clearTimer();
                 scanBuffer = "";
@@ -140,11 +217,13 @@ export function withFirstUsefulEventWatchdog(response: Response, label: string):
     },
   });
 
-  return new Response(stream, {
+  const wrapped = new Response(stream, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
   });
+  expiryByResponse.set(wrapped, expiry);
+  return wrapped;
 }
 
 /**

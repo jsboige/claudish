@@ -17,7 +17,8 @@ METHOD
   2. core(request) = its user-segment hashes with the harness set removed,
      ORDER PRESERVED (removal is positional, not by contiguous head).
   3. PARTITION the session's requests by `cc_is_subagent` — read from the
-     cc_version metadata line, never from a bare grep of the file (see trap 4).
+     billing-header SEGMENT via lib/subagent_flag.py (#1053), never from a
+     bare grep of the file (see trap 4).
   4. CHAIN by containment within each partition: B extends A iff A.core is a
      prefix of B.core (append-only). Compaction restarts a chain (history is
      replaced); that is a SEQUENTIAL break, not a fork.
@@ -38,8 +39,12 @@ SIX MEASURED TRAPS (each produced a wrong answer before being fixed)
       hours. Require a DEEP residual core (default >= 8 segments).
   T4  `cc_is_subagent` appears as PLAIN TEXT in the fleet's own CLAUDE.md (it
       documents the 2026-08-10 leak), so `'cc_is_subagent' in raw` is true for
-      almost every request. The real flag lives on the `cc_version=...` metadata
-      line. Read THAT line, not the file.
+      almost every request. The real flag rides the k=v run of an
+      `x-anthropic-billing-header:` segment — only that segment votes (last
+      one wins, JSON key as a no-segment fallback), via the shared predicate
+      of lib/subagent_flag.py since #1053. The pre-#1053 defense line-scoped
+      the `cc_version=` window, which still false-positives on an echo inside
+      that window.
   T5  THE one that matters: a Task sub-agent carries the PARENT's
       `metadata.user_id.session_id`. One session_id therefore legitimately holds
       the main conversation PLUS one disjoint conversation per concurrent
@@ -65,11 +70,8 @@ import glob
 import hashlib
 import json
 import os
-import re
 import sys
 
-CCVER_RE = re.compile(r"cc_version=[^\"\\]{0,240}")
-SUB_RE = re.compile(r"cc_is_subagent=true")
 DEFAULT_CAPTURES = r"D:\claudish-captures"
 DEFAULT_HARNESS_DF = 0.10   # a hash in >=10% of sampled requests is harness
 DEFAULT_MIN_CORE = 8        # a real conversation has deep residual history
@@ -111,12 +113,40 @@ def user_segments(path):
         return segments_of(json.load(fh))
 
 
+_SF = None
+
+
+def _load_sf():
+    """The #1051 shared predicate, loaded once per process (same loader
+    pattern as native-consumption.py / live-consumption.py)."""
+    global _SF
+    if _SF is None:
+        import importlib.util
+        from pathlib import Path
+
+        p = Path(__file__).resolve().parent / "lib" / "subagent_flag.py"
+        spec = importlib.util.spec_from_file_location("subagent_flag", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _SF = mod
+    return _SF
+
+
 def is_subagent(raw):
-    """T4 — the flag lives on the cc_version metadata line, not anywhere in the file."""
-    flag = False
-    for m in CCVER_RE.finditer(raw):
-        flag = bool(SUB_RE.search(m.group(0)))
-    return flag
+    """#1053: delegate to lib/subagent_flag.py — the billing-header SEGMENT
+    decides (last segment wins, JSON key only when no segment exists).
+
+    The old defense line-scoped `cc_is_subagent=true` to the `cc_version=`
+    metadata window, which still false-positives on a prose echo INSIDE that
+    window (T4: the fleet's own CLAUDE.md quotes the literal, so it rides the
+    system prompt of every claudish session). Segment rule: an echo has no
+    `x-anthropic-billing-header:` marker, so it cannot vote.
+
+    None ("no proof in this text") stays a MAIN turn: this instrument
+    partitions requests, it never guesses — same convention as
+    native-consumption.py's `_subagent_flag(raw) is True`.
+    """
+    return _load_sf().subagent_flag(raw) is True
 
 
 def secs(ts):

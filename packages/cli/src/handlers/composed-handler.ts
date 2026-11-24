@@ -27,6 +27,7 @@ import { MiddlewareManager, GeminiThoughtSignatureMiddleware } from "../middlewa
 import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
 import { clientRequestedThinking } from "./shared/client-thinking.js";
 import { clientAttributionEnabled, clientAttributionHeaders } from "./shared/client-attribution.js";
+import { setServedModel } from "./shared/served-model-header.js";
 import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { filterIdentity } from "./shared/openai-compat.js";
@@ -77,6 +78,7 @@ import {
   classifyConcurrencyRefusal,
   CONCURRENCY_REFUSAL_SKIP_DETAIL,
   isStepSkipEligible,
+  isCascadeWalkEligible,
 } from "./shared/step-skip.js";
 import { StepBusyError } from "./shared/concurrency-limiter.js";
 import { extractSessionKey, isQuotaExhaustion } from "../fork/failover.js";
@@ -545,6 +547,22 @@ export class ComposedHandler implements ModelHandler {
   private applyClientAttribution(c: Context, headers: Record<string, string>): void {
     if (!this.provider.clientAttribution || !clientAttributionEnabled()) return;
     Object.assign(headers, clientAttributionHeaders(c));
+  }
+
+  /**
+   * #1128 — record the concrete this handler served, keyed on the response
+   * object (WeakMap side-channel, shared/served-model-header.ts). The value
+   * is the SAME string every stream parser is constructed with
+   * (`bareModelName`), which is what the capture records — AC2 byte-equality
+   * by construction. One exception: a transport fallback that changed the
+   * model mid-flight (`getActiveModelName()` — gemini-codeassist is the only
+   * implementer) makes capture and truth disagree; the header is omitted
+   * there rather than publish a value the corpus cannot corroborate (AC4).
+   */
+  private markServedModel(response: Response): void {
+    const active = this.provider.getActiveModelName?.();
+    if (active !== undefined && active !== this.bareModelName) return;
+    setServedModel(response, this.bareModelName);
   }
 
   async handle(c: Context, payload: any): Promise<Response> {
@@ -1364,10 +1382,33 @@ export class ComposedHandler implements ModelHandler {
       // to the 529 the busy skip already rides — measured before this gate, a
       // concurrency-worded 1302 on a step burned the full patient spread and
       // THEN benched the step anyway.
+      const concurrencyRefusal = classifyConcurrencyRefusal(response.status, probeText);
       const stepConcurrencyRefusal =
-        isStepSkipEligible(c as unknown as object) &&
-        classifyConcurrencyRefusal(response.status, probeText);
-      if (isTransientOverload(response.status, probeText) && !stepConcurrencyRefusal) {
+        isStepSkipEligible(c as unknown as object) && concurrencyRefusal;
+      // #1111 — the plain 1302 wording ("Rate limit reached for requests")
+      // matches no isTransientOverload word, so an attempt with NO successor
+      // (nominal, last step, keyless, non-cascade) forwarded the provider's
+      // 429 to the client raw: Claude Code reads 429 as a usage wall and kills
+      // the turn (measured 17/11: two dead Argumentum turns, 136 burst lines
+      // in one transcript tail). The CODE is the contract (#679's own doctrine
+      // — the two wordings vary), and contention on a no-successor attempt is
+      // exactly what the patient loop below exists for: a concurrency slot
+      // frees in seconds and the first retry is 5s out.
+      const transientContention =
+        isTransientOverload(response.status, probeText) || concurrencyRefusal;
+      // #1111 × #1109: on the nominal of a walk-armed cascade, a plain 1302
+      // belongs to the #781 walk — proxy-server diverts to the first servable
+      // step in SECONDS once this response surfaces. Patience here would
+      // starve the walk of its trigger (~5 min), and the 529 the patience
+      // path converts to would defeat the walk's 429-reading predicate. The
+      // mark is structural (never set on keyless/native/no-cascade/last-rung
+      // attempts), so the #1111 patience keeps exactly the paths the walk
+      // cannot take. Scope: the concurrency-refusal class only — the overload
+      // class keeps its patience-before-walk order, which the walk budget
+      // already accounts for (#348, ~365 s).
+      const walkOwnsIt =
+        concurrencyRefusal && isCascadeWalkEligible(c as unknown as object);
+      if (transientContention && !stepConcurrencyRefusal && !walkOwnsIt) {
         const recovered = await this.patientOverloadBackoff(doFetch);
         if (recovered) response = recovered;
         // null = exhausted → response stays the overload → !response.ok below → 529
@@ -1675,7 +1716,23 @@ export class ComposedHandler implements ModelHandler {
         // HTTP 529 overloaded_error so the client retries with its own backoff,
         // NOT 429 (which the client reads as a quota wall and stops the turn).
         // (2026-06-25 patient-backoff.)
-        if (isTransientOverload(response.status, errorText)) {
+        // #1111 — the plain 1302 joins its concurrency-worded sibling here: by
+        // this point the patient backoff above has already exhausted on it, so
+        // sustained contention surfaces as 529 (client retries), never the raw
+        // 429 the client reads as a usage wall. `concurrencyRefusal` was
+        // computed at the top of this block; the busy annotation below already
+        // rides the 529 for any step consumer (#679 wire, unchanged).
+        // #1111 × #1109: on the nominal of a walk-armed cascade the 1302
+        // class must surface as the ANNOTATED 429, unconverted — the #781
+        // walk's predicate reads status 429 plus the #679 header and diverts
+        // in seconds (K1302f), and its kill-switch contract is the bare 429
+        // again (K1302g). Converting here would starve the one and revive the
+        // other through the 529's own walk-class. The overload class keeps
+        // the conversion: its patience-then-529 order is what the walk
+        // budget already accounts for (#348).
+        const walkOwnsRefusal =
+          concurrencyRefusal && isCascadeWalkEligible(c as unknown as object);
+        if (isTransientOverload(response.status, errorText) || (concurrencyRefusal && !walkOwnsRefusal)) {
           logStderr(
             `[Overload] [${this.provider.displayName}] HTTP ${response.status} transient overload → returning 529 overloaded_error (patient ~5min backoff exhausted)`
           );
@@ -1988,14 +2045,17 @@ export class ComposedHandler implements ModelHandler {
     // proxied/composed model. See collect-sse-message.ts.
     const wantsStreaming = payload?.stream === true;
     if (wantsStreaming) {
+      this.markServedModel(streamResponse);
       return streamResponse;
     }
 
     const message = await collectAnthropicSseToMessage(streamResponse, this.bareModelName);
 
-    return c.json(message, {
+    const jsonResponse = c.json(message, {
       headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
     });
+    this.markServedModel(jsonResponse);
+    return jsonResponse;
   }
 
   /**
@@ -2348,10 +2408,14 @@ export class ComposedHandler implements ModelHandler {
   private async patientOverloadBackoff(
     doFetch: () => Promise<Response>
   ): Promise<Response | null> {
-    const maxRetries = 6;
+    const maxRetries = patientBackoffTimings.maxRetries;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       const backoffMs =
-        Math.min(5000 * 2 ** attempt, 150000) + Math.floor(Math.random() * 1000);
+        Math.min(patientBackoffTimings.baseDelayMs * 2 ** attempt, 150000) +
+        // Jitter capped at 20% of the base so the test hook (base in
+        // milliseconds) is not paying seconds of jitter per retry; at the
+        // production base of 5s the cap is the original 1000ms — unchanged.
+        Math.min(Math.floor(Math.random() * 1000), patientBackoffTimings.baseDelayMs * 0.2);
       log(
         `[Overload] [${this.provider.displayName}] transient overload (HTTP) — patient retry ${attempt + 1}/${maxRetries} in ${(backoffMs / 1000).toFixed(1)}s`,
         true // forceConsole — operational event, must be visible without --debug
@@ -2361,7 +2425,13 @@ export class ComposedHandler implements ModelHandler {
         const retryResp = await doFetch();
         if (retryResp.ok) return retryResp; // recovered
         const retryText = await retryResp.clone().text();
-        if (!isTransientOverload(retryResp.status, retryText)) {
+        // #1111 — a retried plain 1302 is still the same contention, not a
+        // "morphed" error: without this clause the first retried 1302 would
+        // exit the loop as non-transient and surface the raw 429 anyway.
+        if (
+          !isTransientOverload(retryResp.status, retryText) &&
+          !classifyConcurrencyRefusal(retryResp.status, retryText)
+        ) {
           // Morphed into a non-transient error (e.g. 500) — stop retrying and
           // let the caller surface the real error rather than masking it as 529.
           return retryResp;
@@ -2417,6 +2487,21 @@ export function isTransientOverload(status: number, errorText: string): boolean 
     );
   }
   return false;
+}
+
+/**
+ * #1111 — test hook for the patient backoff's REAL sleeps. The production
+ * spread is 6 retries over ~5 minutes; a sustained-refusal pin cannot pay
+ * that. Shrinking the base delay and retry count keeps the loop's SHAPE
+ * (retry → still-transient check → give up → null → 529) under
+ * milliseconds. Production code never calls the setter.
+ */
+const patientBackoffTimings = { maxRetries: 6, baseDelayMs: 5000 };
+export function setPatientBackoffTimingsForTests(
+  t: Partial<{ maxRetries: number; baseDelayMs: number }> | null
+): void {
+  if (t) Object.assign(patientBackoffTimings, t);
+  else Object.assign(patientBackoffTimings, { maxRetries: 6, baseDelayMs: 5000 });
 }
 
 /**

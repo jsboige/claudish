@@ -186,6 +186,22 @@ if _saved_rdir is None:
           bs.default_reconcile_dir() == bs.GDRIVE_RECONCILE_DIR,
           bs.default_reconcile_dir())
 
+print("lib — _gdrive : la racine Drive derive de CLAUDISH_GDRIVE_ROOT (Q85)")
+_saved_gd = os.environ.get("CLAUDISH_GDRIVE_ROOT")
+try:
+    os.environ["CLAUDISH_GDRIVE_ROOT"] = os.path.join("Y:", "gdrive")
+    check("gdrive-root derivation",
+          bs._gdrive("MyIA", "backups") == os.path.join("Y:", "gdrive", "MyIA", "backups"),
+          bs._gdrive("MyIA", "backups"))
+    del os.environ["CLAUDISH_GDRIVE_ROOT"]
+    check("unset gdrive root yields '' (no wrong-but-plausible glob)",
+          bs._gdrive("MyIA") == "", repr(bs._gdrive("MyIA")))
+finally:
+    if _saved_gd is None:
+        os.environ.pop("CLAUDISH_GDRIVE_ROOT", None)
+    else:
+        os.environ["CLAUDISH_GDRIVE_ROOT"] = _saved_gd
+
 print("lib — #997 : read_heads rend les resultats dans l'ordre des entrees")
 with tempfile.TemporaryDirectory() as td:
     paths = []

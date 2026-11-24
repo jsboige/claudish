@@ -10,13 +10,13 @@ names the working directory.
 
 Marker contract (measured 2026-11-03 on capture archives 2026-07-27 .. 09-07):
 
-    Primary working directory: d:\\dev\\CoursIA
+    Primary working directory: d:\\dev\\<lane-workspace>
     - Is a git repository: true
     - Platform: win32
 
 and, in the SAME field from ~2026-09-08, the previous directory too:
 
-    Primary working directory: d:\\dev\\CoursIA (was c:\\dev\\CoursIA)
+    Primary working directory: d:\\dev\\<lane-workspace> (was c:\\dev\\<lane-workspace>)
 
 ⚠ TRAP 1 — the ` (was …)` suffix. Splitting the line on the separator before
 dropping that suffix yields `coursia)` as a workspace key. Measured on ONE day of
@@ -164,7 +164,17 @@ NON_CC = "(non-cc)"
 UNPARSED = "(unparsed)"
 ROOT = "(root)"
 NO_SESSION = "(no-session)"
-DEFAULT_DIRS = (r"D:\claudish-captures\archive", r"G:\Mon Drive\Backups-Cloud\claudish")
+def _gdrive(*parts):
+    """Drive-rooted subpath from CLAUDISH_GDRIVE_ROOT ('' when unset). Q85:
+    the Drive mount is seat config, never a hardcoded repo default."""
+    root = os.environ.get("CLAUDISH_GDRIVE_ROOT", "").strip()
+    return os.path.join(root, *parts) if root else ""
+
+
+# Local archive always; the Drive root appends only when the seat sets
+# CLAUDISH_GDRIVE_ROOT (an empty entry would glob the CWD — never shipped).
+DEFAULT_DIRS = tuple(d for d in (r"D:\claudish-captures\archive",
+                                 _gdrive("Backups-Cloud", "claudish")) if d)
 
 
 def _load_lib(name):
@@ -395,6 +405,48 @@ def archive_for(day: str, dirs) -> str | None:
     return None
 
 
+def _load_partial_parts():
+    """Nommage des parties de jour #1152 c — la regex vit dans la lib
+    partagee (une copie par semantique), pas dupliquee ici."""
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / "partial_parts.py"
+    spec = importlib.util.spec_from_file_location("partial_parts", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+PART_FN = _load_partial_parts().PART_FN
+
+
+def archives_for(day: str, dirs) -> list[str]:
+    """#1152 c — a COMPLETE day is its day archive PLUS its parts, parts in
+    slot order after it (the nightly pass stays the day's final pass,
+    decision c.7076270061). Day archive: first dir wins (precedence, as
+    archive_for). Parts: deduped by filename across dirs (the Drive copy of
+    a local part is a backup, not a second capture). [] = day nowhere."""
+    out: list[str] = []
+    day_path = archive_for(day, dirs)
+    if day_path:
+        out.append(day_path)
+    parts: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for d in dirs:
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for fn in names:
+            m = PART_FN.match(fn)
+            if m and m.group("day") == day and fn not in seen:
+                seen.add(fn)
+                parts.append((m.group("slot"), m.group("tag") or "",
+                              os.path.join(d, fn)))
+    out.extend(p for _, _, p in sorted(parts))
+    return out
+
+
 def request_names(path: str) -> list[str]:
     import py7zr
 
@@ -412,12 +464,19 @@ def sample_period(days: list[str], dirs, per_period: int) -> tuple[dict[str, lis
     by_day: dict[str, list[str]] = {}
     missing: list[str] = []
     for day in days:
-        p = archive_for(day, dirs)
-        if not p:
+        paths = archives_for(day, dirs)
+        if not paths:
             missing.append(day)
             by_day[day] = []
             continue
-        by_day[day] = request_names(p)
+        # #1152 c: a day made of parts contributes its members from every
+        # part — deduped by name (a crashed pack/verify window could leave a
+        # capture both loose and packed; counting it twice would inflate the
+        # stride estimator's totals).
+        names: set[str] = set()
+        for p in paths:
+            names.update(request_names(p))
+        by_day[day] = sorted(names)
     totals = {d: len(v) for d, v in by_day.items()}
     total = sum(totals.values())
     if total == 0:
@@ -434,24 +493,25 @@ def sample_period(days: list[str], dirs, per_period: int) -> tuple[dict[str, lis
 
 
 def read_bodies(day: str, names: list[str], dirs, scratch: str) -> list[bytes]:
-    path = archive_for(day, dirs)
-    if not path or not names:
+    paths = archives_for(day, dirs)
+    if not paths or not names:
         return []
     import py7zr
 
     out: list[bytes] = []
-    with py7zr.SevenZipFile(path) as z:
-        available = set(z.getnames())
-        targets = [n for n in names if n in available]
-        if not targets:
-            return []
-        z.extract(targets=targets, path=scratch)
-    for n in targets:
-        fp = os.path.join(scratch, n)
-        if os.path.isfile(fp):
-            with open(fp, "rb") as f:
-                out.append(f.read())
-            os.remove(fp)
+    for path in paths:
+        with py7zr.SevenZipFile(path) as z:
+            available = set(z.getnames())
+            targets = [n for n in names if n in available]
+            if not targets:
+                continue
+            z.extract(targets=targets, path=scratch)
+        for n in targets:
+            fp = os.path.join(scratch, n)
+            if os.path.isfile(fp):
+                with open(fp, "rb") as f:
+                    out.append(f.read())
+                os.remove(fp)
     return out
 
 
@@ -463,29 +523,44 @@ def read_tour_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict]
     never crosses an archive (day) boundary in practice; a missing resp is
     reported as `no_resp`, not guessed from a neighbour.
     """
-    path = archive_for(day, dirs)
-    if not path or not names:
+    paths = archives_for(day, dirs)
+    if not paths or not names:
         return []
     import py7zr
 
     rows: list[dict] = []
-    with py7zr.SevenZipFile(path) as z:
-        available = {os.path.basename(n): n for n in z.getnames()}
-        # one pass over the archive index: {resp prefix -> archive path}
-        resp_index: dict[str, str] = {}
-        for base in available:
-            m = re.match(r"^(resp-\d+-r\d+-)", base)
-            if m:
-                resp_index.setdefault(m.group(1), available[base])
-        targets = [available[n] for n in names if n in available]
-        resp_targets = []
-        for n in targets:
-            pref = resp_prefix_for(os.path.basename(n))
-            if pref and pref in resp_index:
-                resp_targets.append(resp_index[pref])
-        if not targets:
-            return []
-        z.extract(targets=targets + resp_targets, path=scratch)
+    # #1152 c: a day may span several archives (its parts + the day
+    # archive). One indexing pass over ALL of them first — {basename:
+    # (archive, member)} and {resp prefix: member} — then per-archive
+    # extraction batches. The req/resp pair normally lives in the same part
+    # (both files are packed by the same pass), but the index never ASSUMES
+    # it: a pair split across parts still extracts whole.
+    where: dict[str, tuple[str, str]] = {}
+    resp_member: dict[str, str] = {}
+    for path in paths:
+        with py7zr.SevenZipFile(path) as z:
+            for n in z.getnames():
+                base = os.path.basename(n)
+                where.setdefault(base, (path, n))
+                m = re.match(r"^(resp-\d+-r\d+-)", base)
+                if m:
+                    resp_member.setdefault(m.group(1), n)
+    batches: dict[str, list[str]] = {}
+    for n in names:
+        loc = where.get(os.path.basename(n))
+        if loc:
+            batches.setdefault(loc[0], []).append(loc[1])
+        pref = resp_prefix_for(os.path.basename(n))
+        if pref and pref in resp_member:
+            rbase = os.path.basename(resp_member[pref])
+            rloc = where.get(rbase)
+            if rloc:
+                batches.setdefault(rloc[0], []).append(rloc[1])
+    if not batches:
+        return []
+    for path, targets in batches.items():
+        with py7zr.SevenZipFile(path) as z:
+            z.extract(targets=list(dict.fromkeys(targets)), path=scratch)
 
     # index what extraction actually wrote, by basename — archive members may
     # carry an internal directory prefix the scratch tree recreates.
@@ -751,8 +826,8 @@ def read_write_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict
     `py7zr` itself raised MemoryError decompressing one oversized member
     (2026-10-29), before any post-extraction cap could apply.
     """
-    path = archive_for(day, dirs)
-    if not path or not names:
+    paths = archives_for(day, dirs)
+    if not paths or not names:
         return []
     import py7zr
 
@@ -765,45 +840,49 @@ def read_write_rows(day: str, names: list[str], dirs, scratch: str) -> list[dict
             except OSError:
                 pass
 
-    with py7zr.SevenZipFile(path) as z:
-        sizes = {i.filename: i.uncompressed for i in z.list()}
-        available = {os.path.basename(n): n for n in z.getnames()}
-        targets = []
-        for n in names:
-            member = available.get(n)
-            if member is None:
+    # #1152 c: extract from every archive the day is made of (parts + day
+    # archive) — a name found in several (crashed pack/verify window) goes to
+    # the FIRST archive, precedence of archives_for.
+    for path in paths:
+        with py7zr.SevenZipFile(path) as z:
+            sizes = {i.filename: i.uncompressed for i in z.list()}
+            available = {os.path.basename(n): n for n in z.getnames()}
+            targets = []
+            for n in names:
+                member = available.get(n)
+                if member is None:
+                    continue
+                if sizes.get(member, 0) > MAX_CAPTURE_BYTES:
+                    SKIPPED.append((day, os.path.basename(n)))
+                    continue
+                targets.append(member)
+            if not targets:
                 continue
-            if sizes.get(member, 0) > MAX_CAPTURE_BYTES:
-                SKIPPED.append((day, os.path.basename(n)))
-                continue
-            targets.append(member)
-        if not targets:
-            return []
-        for i in range(0, len(targets), EXTRACT_BATCH):
-            batch = targets[i:i + EXTRACT_BATCH]
-            try:
-                z.reset()
-                z.extract(targets=batch, path=scratch)
-            except MemoryError:
-                # fall back to one member at a time: the oversized one is
-                # identified and skipped, the rest of the batch survives
-                for member in batch:
-                    try:
-                        with py7zr.SevenZipFile(path) as z2:
-                            z2.extract(targets=[member], path=scratch)
-                    except (MemoryError, py7zr.Bad7zFile, OSError):
-                        SKIPPED.append((day, os.path.basename(member)))
-            except OSError:
-                # DriveFS can serve an archive and drop it between batches
-                # (measured: captures-2026-10-26.7z listed, then gone). One
-                # bounded retry gives the mount time to rehydrate; a second
-                # failure skips the batch, it does not kill the week.
-                time.sleep(2)
+            for i in range(0, len(targets), EXTRACT_BATCH):
+                batch = targets[i:i + EXTRACT_BATCH]
                 try:
                     z.reset()
                     z.extract(targets=batch, path=scratch)
-                except (MemoryError, OSError):
-                    SKIPPED.extend((day, os.path.basename(m)) for m in batch)
+                except MemoryError:
+                    # fall back to one member at a time: the oversized one is
+                    # identified and skipped, the rest of the batch survives
+                    for member in batch:
+                        try:
+                            with py7zr.SevenZipFile(path) as z2:
+                                z2.extract(targets=[member], path=scratch)
+                        except (MemoryError, py7zr.Bad7zFile, OSError):
+                            SKIPPED.append((day, os.path.basename(member)))
+                except OSError:
+                    # DriveFS can serve an archive and drop it between batches
+                    # (measured: captures-2026-10-26.7z listed, then gone). One
+                    # bounded retry gives the mount time to rehydrate; a second
+                    # failure skips the batch, it does not kill the week.
+                    time.sleep(2)
+                    try:
+                        z.reset()
+                        z.extract(targets=batch, path=scratch)
+                    except (MemoryError, OSError):
+                        SKIPPED.extend((day, os.path.basename(m)) for m in batch)
 
     on_disk: dict[str, str] = {}
     for root, _dirs, files in os.walk(scratch):

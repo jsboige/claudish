@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getSessionDwellPinForTests, resetFailoverForTests } from "./fork/failover.js";
+import { armFailover, getSessionDwellPinForTests, resetFailoverForTests } from "./fork/failover.js";
 import { createProxyServer } from "./proxy-server.js";
 import type { ProxyServer } from "./types.js";
 
@@ -97,11 +97,15 @@ const MACHINE_ARM_ENV = {
   CLAUDISH_FAILOVER_HAIKU_DIRECTION: "degraded",
   CLAUDISH_FAILOVER_HAIKU_NOTE: "Much smaller than the nominal.",
   CLAUDISH_FAILOVER_ACTIVE: "haiku@m-cal",
+  // #1150(b): `fake-nom` as a haiku alias — the explicit pin `nom-ep@fake-nom`
+  // and the bare `fake-nom` then both classify as the haiku role, and only the
+  // pin is exempt from the arm.
+  CLAUDISH_FAILOVER_ROLE_MODELS: "fake-nom:haiku",
 } as Record<string, string>;
 
 async function postMessage(
   machine?: string,
-  opts: { session?: string; stream?: boolean; path?: string } = {}
+  opts: { session?: string; stream?: boolean; path?: string; model?: string } = {}
 ): Promise<Response> {
   return realFetch(`http://127.0.0.1:${PROXY_PORT}${opts.path ?? "/v1/messages"}`, {
     method: "POST",
@@ -112,7 +116,7 @@ async function postMessage(
       ...(machine ? { "X-Claudish-Machine": machine } : {}),
     },
     body: JSON.stringify({
-      model: "claude-haiku-4-5",
+      model: opts.model ?? "claude-haiku-4-5",
       max_tokens: 64,
       stream: opts.stream ?? false,
       messages: [{ role: "user", content: "say hi" }],
@@ -328,5 +332,56 @@ describe("machine-scoped config arm (role@machine) through the real routes", () 
       stepIndex: 0,
       bucket: "machine:m-cal",
     });
+  });
+
+  // #1150(b) — through the REAL route: an alias-only explicit pin is never
+  // diverted by the machine arm (R1), a wall on the pin's own provider bucket
+  // still walks the cascade (R2), the bare alias name is still diverted (R3).
+  // The pin and the bare name share the `fake-nom` alias, so both classify as
+  // the haiku role — only the pin spelling is exempt.
+  // Mutation proof (review c.7076134370): unthreading `requestedModel` at the
+  // three route sites OR at `requestBucketOf` alone must turn R1 red — the
+  // warm-up below is what makes the requestBucketOf-only mutation observable:
+  // a bucket-blind route keys the pin on machine:m-cal, where the dwell pin the
+  // warm-up wrote lives, and the hold branch serves s0 without re-reading
+  // isFailoverActive.
+  test("R1 (#1150b): the alias-only explicit pin from the armed machine reaches the nominal, no notice", async () => {
+    await spin();
+    // Warm the session with the BARE alias name: diverted, it writes the dwell
+    // pin in the machine:m-cal bucket.
+    const warm = await postMessage("m-cal", { session: "sess-r1", model: "fake-nom" });
+    expect(warm.status).toBe(200);
+    expect(calls.s0).toBe(1);
+    expect(getSessionDwellPinForTests("haiku", "sess-r1")).toMatchObject({
+      stepIndex: 0,
+      bucket: "machine:m-cal",
+    });
+    // The pin: same alias, same machine, same session — must pay the nominal.
+    const pin = await postMessage("m-cal", { session: "sess-r1", model: "nom-ep@fake-nom" });
+    expect(pin.status).toBe(200);
+    expect(calls.nm).toBe(1); // the nominal served the pin, the arm did not divert
+    expect(calls.s0).toBe(1); // unchanged since the warm-up
+    expect(messageText(await pin.json())).not.toContain("[claudish]");
+  });
+
+  test("R2 (#1150b): a wall on the pin's own provider bucket still walks the cascade", async () => {
+    await spin();
+    resetFailoverForTests({ ...MACHINE_ARM_ENV, CLAUDISH_FAILOVER_AUTO: "1" });
+    expect(armFailover("haiku", "HTTP 402", "nom-ep")).toBe(true); // walls the pin's real bucket
+    const r = await postMessage("m-cal", { session: "sess-r2", model: "nom-ep@fake-nom" });
+    expect(r.status).toBe(200);
+    expect(calls.s0).toBe(1); // the cascade step served it
+    expect(calls.nm).toBe(0);
+    const text = messageText(await r.json());
+    expect(text).toContain("is being served by"); // a failover notice rode the response
+    expect(text).not.toContain("the operator routes"); // the WALL wording, never the arm's
+  });
+
+  test("R3 (#1150b): the bare alias name from the armed machine is still diverted", async () => {
+    await spin();
+    const r = await postMessage("m-cal", { model: "fake-nom" });
+    expect(r.status).toBe(200);
+    expect(calls.s0).toBe(1);
+    expect(calls.nm).toBe(0);
   });
 });

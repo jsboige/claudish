@@ -113,6 +113,19 @@ def _load_blind_spot():
     return mod
 
 
+def _load_partial_parts():
+    """Parties de jour #1152 c (declaration PARTIAL) — lib partagee avec
+    native-consumption.py et billed-attrib.py, une seule copie."""
+    import importlib.util
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent / "lib" / "partial_parts.py"
+    spec = importlib.util.spec_from_file_location("partial_parts", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 _LOT = _load_lane_out_trend()
 
 
@@ -359,6 +372,13 @@ def main():
     blind = bs.assess(args.dir, cutoff_dt, now_dt, fleet,
                       reconcile_dir=_rdir, nominal_counts=_nominal)
 
+    # #1152 c — un jour packed en parties est absent du corpus loose que ce
+    # lecteur scanne : l'undercount se DECLARE (ligne PARTIAL), il ne se lit
+    # jamais comme un total. La lecture exacte est le merge de
+    # native-consumption --leak-policy.
+    pp = _load_partial_parts()
+    partial = pp.assess(args.dir, cutoff_dt, now_dt)
+
     if args.json:
         print(json.dumps({
             "window_hours": args.hours,
@@ -370,6 +390,9 @@ def main():
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
             "harness_lanes": {k: v for k, v in hlanes.items()} if args.harness_lanes else None,
             "blind_spot": {k: v for k, v in blind.items()} or None,
+            "partial_parts": ({"partial": partial["partial"],
+                               "days": partial["days"]}
+                              if partial["partial"] else None),
         }, indent=2))
         return
 
@@ -383,6 +406,8 @@ def main():
         couv = "couverture (aucune resp dans la fenetre)"
     print(f"fenetre: {args.hours}h demandees | {couv}")
     print(f"resp: {n_resp} | appariees: {n_paired} | non appariees: {n_unpaired} | sans usage: {n_nousage}")
+    for _line in pp.section(args.dir, cutoff_dt, now_dt, res=partial):
+        print(_line)
     print()
     hdr = f"{'lane':24} {'bucket':12} {'req':>6} {'in_tok':>13} {'out_tok':>12} {'cache_rd':>13} {'cache_wr':>12} {'hit%':>5} {'in/h':>13} {'out/h':>12}"
     print(hdr)

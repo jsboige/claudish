@@ -18,7 +18,16 @@ x-logging: &default-logging
 
 services:
   claudish-proxy:
-    build: .
+    # #1140 — build args (not runtime env): CLAUDISH_REVISION lands in the
+    # generated src/version.ts at BUILD time, so the value names the image's
+    # commit. The deploying script exports it from `git rev-parse HEAD`
+    # (install-sidecar.ps1 does; the hub operator exports it in the build
+    # window). Absent → "unknown", which is itself a readable answer: an
+    # image built outside the arg-fed path.
+    build:
+      context: .
+      args:
+        CLAUDISH_REVISION: ${CLAUDISH_REVISION:-unknown}
     container_name: ${CLAUDISH_CONTAINER_NAME:-claudish-proxy}
     restart: unless-stopped
     logging: *default-logging
@@ -117,6 +126,18 @@ services:
       - type: volume
         source: claudish-model-cache
         target: /var/cache/claudish
+      # Lane-budget emergency stop (#1055 g2, #1060): CLAUDISH_LANE_STOP_DIR points
+      # the lane-budget registry at this directory — a bind (not a named volume) on
+      # purpose, so an operator drops/removes stop files from the host without
+      # touching the container. Separate from /captures deliberately: capture is
+      # compacted nightly and purged after archive — a stop file parked there would
+      # be destroyed by capture hygiene. NB: the host-side variable is deliberately
+      # NOT named CLAUDISH_LANE_STOP_DIR (the container-side env) — one name for two
+      # planes is the CLAUDISH_CAPTURE_DIR/CAPTURE_HOST_DIR trap again.
+      # Directory bind: Docker creates an absent source, unlike the file-type bind.
+      - type: bind
+        source: ${CLAUDISH_LANE_STOP_HOST_DIR:-D:\claudish-lane-stop}
+        target: /lane-stop
     environment:
       - NODE_ENV=production
       - CLAUDISH_PROXY_KEY=${CLAUDISH_PROXY_KEY:-}
@@ -286,6 +307,12 @@ services:
       # is a read-per-request switch (the fleet flips it mid-flight; no recreate),
       # but a container still needs the NAME here to ever see any value at all.
       - CLAUDISH_FAILOVER_OVERLOAD_WALK=${CLAUDISH_FAILOVER_OVERLOAD_WALK:-}
+      # #781 — a nominal 1302 (z.ai plan concurrency) joins that walk; "0"
+      # restores the bare 429. Read per request, same container rule.
+      - CLAUDISH_FAILOVER_1302_WALK=${CLAUDISH_FAILOVER_1302_WALK:-}
+      # #1124 — a walk step's QUOTA-class death benches that step (WALK-MARK);
+      # "0" restores the fully stateless walk. Read per request.
+      - CLAUDISH_FAILOVER_WALK_MARK=${CLAUDISH_FAILOVER_WALK_MARK:-}
       # #348 — overload-walk time budget (ms). Default 300000; 0 = off. Same
       # read-per-request class as the switch above, same container rule.
       - CLAUDISH_FAILOVER_WALK_BUDGET_MS=${CLAUDISH_FAILOVER_WALK_BUDGET_MS:-}

@@ -1,4 +1,4 @@
-# Hermetic Pester runner for the 5.1 lane (#959).
+﻿# Hermetic Pester runner for the 5.1 lane (#959).
 #
 # `bun run test:scripts:win51` spawns powershell.exe through Bun Shell, which
 # passes the parent's PSModulePath through VERBATIM (measured 10/11: the
@@ -19,7 +19,11 @@
 # unset), so a registry-only recompute would drop it and fall back to the
 # machine-wide Pester 3.4.0.
 param(
-    [string]$Path = './scripts/tests'
+    [string]$Path = './scripts/tests',
+    # CI-only (#1096): tags to EXCLUDE from the run. Seats call this runner with no
+    # value and run everything; the hosted Pester workflow passes 'HostBound' so the
+    # host-divergent tests are skipped there while staying green-required on seats.
+    [string[]]$ExcludeTagFilter = @()
 )
 # NO `$ErrorActionPreference = 'Stop'` here: it would outlive this file and
 # leak into Invoke-Pester's test session, where every child-process stderr
@@ -36,4 +40,27 @@ if ($d) { $d = Join-Path $d 'WindowsPowerShell\Modules' }
 # construction puts the user dir first; mirror it.
 $env:PSModulePath = (@($u, $d, $m) | Where-Object { $_ }) -join ';'
 
-Invoke-Pester $Path -Output Detailed -CI
+# #1166: the seat-env reset, same contract as run-pester.ps1 (the 7.x wrapper)
+# — a script under test resolves its off-site dir from CLAUDISH_GDRIVE_ROOT
+# when -GDriveDir is not passed (measured by ai-01, c.7083536044); per-suite
+# isolation covers only the suites that remembered it. Restore in finally:
+# this file is dot-called by the CI leg, a leak would outlive the run.
+$seatEnv = @('CLAUDISH_GDRIVE_ROOT', 'CLAUDISH_SESSION_WATCH_EXEMPT_PATTERN')
+$backup = @{}
+foreach ($n in $seatEnv) {
+    $backup[$n] = [Environment]::GetEnvironmentVariable($n)
+    Remove-Item "Env:$n" -ErrorAction SilentlyContinue
+}
+try {
+    if ($ExcludeTagFilter -and $ExcludeTagFilter.Count) {
+        Invoke-Pester $Path -Output Detailed -CI -ExcludeTagFilter $ExcludeTagFilter
+    } else {
+        Invoke-Pester $Path -Output Detailed -CI
+    }
+}
+finally {
+    foreach ($n in $seatEnv) {
+        if ($null -ne $backup[$n]) { Set-Item "Env:$n" $backup[$n] }
+        else { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
+    }
+}
