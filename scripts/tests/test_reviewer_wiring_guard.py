@@ -513,6 +513,13 @@ _MUTANTS = [
         "if false; then",
         {_CASE_NO_URL},
     ),
+    (
+        "the step prints the header it was given -- the `value printed` column "
+        "must be able to go red",
+        "CLAUDISH_REVIEWER_KEY is empty or missing\"",
+        "CLAUDISH_REVIEWER_KEY is empty or missing [$ANTHROPIC_CUSTOM_HEADERS]\"",
+        {_CASE_INSIDE},
+    ),
 ]
 
 
