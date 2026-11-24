@@ -656,7 +656,9 @@ function printVerdict(v: StrictVerdict, hadBaseline: boolean): void {
     } else if (cs.length === 0) {
       line("[STRICT] ✅ no regression: every fresh entry failed to reproduce");
     } else {
-      line("[STRICT] every reproduced entry is context-sensitive — exit stays 1 (a label is not a green)");
+      line(
+        "[STRICT] every reproduced entry is context-sensitive — exit stays 1 (a label is not a green)"
+      );
     }
   } else {
     line("[STRICT] ✅ no regression: observed ⊆ baseline");

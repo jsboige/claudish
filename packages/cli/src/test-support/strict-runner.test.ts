@@ -1269,6 +1269,11 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
       },
     };
     const { code, out } = captureStdout(() => main(["--partition=50"], neverRunner, deps));
+    // The runner's own lines were captured, so a refusal here would otherwise
+    // reach the CI log as a bare "Received: 3". Re-emit on refusal: which
+    // guard fired (foreign entry, counters, population gap) must be readable
+    // from the job itself, not re-derived from the platform.
+    if (code !== 1) process.stdout.write(out);
     expect(code).toBe(1); // context sensitivity is never a green
     expect(out).toContain("CONTEXT-SENSITIVE");
     expect(out).toContain("b.test.ts > b reads the marker");
