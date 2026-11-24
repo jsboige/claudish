@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
  * through REAL bun output, not hand-written lines (review 2026-10-01).
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUDGET_FOOTER_MARKER, manifestFooter } from "./env-gate";
@@ -856,12 +856,15 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
   test("a fresh entry re-runs ONLY the partition hosting it — the clean partition is not re-spawned", () => {
     chdirTmp(partBaseline(["a.test.ts > a1"], 1, ["a.test.ts", "b.test.ts"]));
     // run 1: partition a carries a1 (baseline) + NEW1 (fresh); re-run of a: a1 + NEW1 again (reproduces)
+    // the alone-run (3rd call, NEW1 gone) reclassifies it as context-sensitive
     let seenA = 0;
+    let aloneA = 0;
     const deps: PartitionDeps = {
       listFiles: () => ["a.test.ts", "b.test.ts"],
       runPartition: (fs) => {
         if (fs[0] === "a.test.ts") {
           seenA += 1;
+          if (seenA === 3) aloneA += 1; // alone-run carries a1 only (NEW1 gone)
           const fresh = seenA <= 2 ? ["a.test.ts > NEW1"] : [];
           return { raw: outputFor(["a.test.ts > a1", ...fresh], fs.length) };
         }
@@ -871,8 +874,9 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     const { code, out } = captureStdout(() => main(["--partition=1"], neverRunner, deps));
     expect(code).toBe(1);
     expect(out).toContain("re-running 1/2 partition(s)");
-    // a ran twice (first pass + confirmation), b once (never re-run)
-    expect(seenA).toBe(2);
+    // a ran twice before the alone-run (first pass + confirmation), b once (never re-run)
+    expect(seenA).toBe(3);
+    expect(aloneA).toBe(1);
   });
 
   test("a fresh entry that does NOT reproduce exits 0 (noise, by property not count — holds per partition)", () => {
@@ -1114,6 +1118,162 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     expect(out).toContain("ghost.test.ts");
     expect(out).not.toContain("flaky tail");
   });
+
+  // ─── Context sensitivity (#641 C4, file 24a item 2) ───────────────────────
+  // A reproduced entry is not necessarily a defect in its own right: REQ-9 of
+  // script-runtime failed inside its partition AND on that partition's
+  // confirmation re-run, then passed alone (41/41, 6.45 s — measured by ai-01).
+  // The third run is the file ALONE, one per distinct file hosting a
+  // reproduced entry. Exit stays 1: context sensitivity is not a green.
+
+  /** Deps for the three-pass shape: the first two runs carry a fresh entry,
+   * the third (the file alone) carries what `aloneByFile` says. */
+  function depsWithAlone(
+    files: string[],
+    freshByFile: Record<string, string[]>,
+    aloneByFile: Record<string, string[]>
+  ): PartitionDeps & { invocations: string[][] } {
+    const invocations: string[][] = [];
+    return {
+      invocations,
+      listFiles: () => files,
+      runPartition: (fs) => {
+        invocations.push(fs);
+        if (fs.length === 1) {
+          const f = fs[0];
+          return { raw: outputFor(aloneByFile[f] ?? [], 1) };
+        }
+        const entries = fs.flatMap((f) => (freshByFile[f] ?? []).map((n) => `${f} > ${n}`));
+        return { raw: outputFor(entries, fs.length) };
+      },
+    };
+  }
+
+  test("a reproduced entry that PASSES when its file runs ALONE is labeled context-sensitive, NOT NEW FAILING — exit stays 1 (the REQ-9 case)", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts"]));
+    const deps = depsWithAlone(
+      ["a.test.ts", "b.test.ts"],
+      { "a.test.ts": ["NEW1"] }, // fresh on the first pass AND on the confirmation
+      { "a.test.ts": [] } // alone: the file is green
+    );
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1); // a label change is never a green
+    expect(out).toContain("context-sensitive");
+    expect(out).toContain("a.test.ts > NEW1"); // named with its label
+    expect(out).not.toContain("NEW FAILING");
+    // three runs: the partition, its confirmation, then a.test.ts ALONE
+    expect(deps.invocations).toEqual([
+      ["a.test.ts", "b.test.ts"],
+      ["a.test.ts", "b.test.ts"],
+      ["a.test.ts"],
+    ]);
+  });
+
+  test("a reproduced entry that still FAILS alone stays NEW FAILING, exit 1 (a true new red is not excused)", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts"]));
+    const deps = depsWithAlone(
+      ["a.test.ts", "b.test.ts"],
+      { "a.test.ts": ["NEW1"] },
+      { "a.test.ts": ["a.test.ts > NEW1"] }
+    );
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1);
+    expect(out).toContain("NEW FAILING");
+    expect(out).not.toContain("context-sensitive");
+    expect(deps.invocations).toEqual([
+      ["a.test.ts", "b.test.ts"],
+      ["a.test.ts", "b.test.ts"],
+      ["a.test.ts"],
+    ]);
+  });
+
+  test("two files hosting context-sensitive entries are each re-run ALONE once — one third run per distinct file, never one per entry", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts", "c.test.ts"]));
+    const deps = depsWithAlone(
+      ["a.test.ts", "b.test.ts", "c.test.ts", "d.test.ts"],
+      { "a.test.ts": ["A1", "A2"], "c.test.ts": ["C1"] },
+      {}
+    );
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1);
+    expect(out).toContain("context-sensitive");
+    expect(out).toContain("2 file(s)");
+    // a alone, c alone (a carries TWO entries but is re-run once) — after the
+    // 2 partitions and their 2 confirmations
+    expect(deps.invocations.slice(4)).toEqual([["a.test.ts"], ["c.test.ts"]]);
+    expect(deps.invocations.length).toBe(6);
+  });
+
+  test("context-sensitive entries leave the NEW FAILING header — a label is a reclassification, exit stays 1", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts"]));
+    const deps = depsWithAlone(
+      ["a.test.ts", "b.test.ts"],
+      { "a.test.ts": ["NEW1"] },
+      { "a.test.ts": [] }
+    );
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1);
+    expect(out).toContain("CONTEXT-SENSITIVE");
+    expect(out).not.toContain("NEW FAILING");
+  });
+
+  test("a reproduced entry whose file dies when run ALONE stays NEW FAILING (an unreadable third run excuses nothing)", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts"]));
+    let pass = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        pass += 1;
+        if (pass === 3) return { raw: "", killed: true, errorCode: "ETIMEDOUT" };
+        return { raw: outputFor(["a.test.ts > NEW1"], fs.length) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1);
+    expect(out).toContain("NEW FAILING");
+    expect(out).not.toContain("context-sensitive");
+    expect(out).toContain("could not be read");
+  });
+
+  test("REAL defaultPartitionDeps wiring: an entry that reproduces in its partition and passes alone is CONTEXT-SENSITIVE, exit 1 — no injected runPartition", () => {
+    // The alone-run reaches `realSuiteRunner` through `defaultPartitionDeps`
+    // (testFiles), which every injected-deps pin above skips. Two REAL bun
+    // files: `a` leaves a disk marker, `b` reads it — the only poison is
+    // intra-process (a runs before b in the same partition process). In the
+    // partition and on its confirmation b is red; alone (marker cleaned by the
+    // runPartition wrapper, which is exactly the caller's own precondition)
+    // b is green. Same shape as the REQ-9 case, without depending on its
+    // timing-dependent red (measured on po-2024: 3 reds in the first 6 runs
+    // after install, 0 in the following 20 — see the PR).
+    const d = mkdtempSync(join(tmpdir(), "strict-ctx-real-"));
+    tmpDirs.push(d);
+    writeFileSync(
+      join(d, "a.test.ts"),
+      'import { test } from "bun:test"; import { writeFileSync } from "node:fs"; import { join } from "node:path";\n' +
+        'test("a poisons", () => { writeFileSync(join(process.cwd(), "poison.marker"), "x", "utf-8"); });\n',
+      "utf-8"
+    );
+    writeFileSync(
+      join(d, "b.test.ts"),
+      'import { test, expect } from "bun:test"; import { existsSync } from "node:fs"; import { join } from "node:path";\n' +
+        'test("b reads the marker", () => { expect(existsSync(join(process.cwd(), "poison.marker"))).toBe(false); });\n',
+      "utf-8"
+    );
+    chdirTmp(partBaseline([], 50, ["a.test.ts"]));
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        // clean slate per process: the poison is intra-process only
+        rmSync(join(d, "poison.marker"), { force: true });
+        return realSuiteRunner(d, { testFiles: fs })();
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=50"], neverRunner, deps));
+    expect(code).toBe(1); // context sensitivity is never a green
+    expect(out).toContain("CONTEXT-SENSITIVE");
+    expect(out).toContain("b.test.ts > b reads the marker");
+    expect(out).not.toContain("NEW FAILING");
+  }, 60_000);
 
   test("portable concrete control: realSuiteRunner's per-file selection runs TWO real Bun test files and the echo covers both", () => {
     // File 19b item 4: a real `bun test ./a ./b` invocation, no learn. Two
