@@ -101,26 +101,40 @@ def write_pair(cdir, pid, n, served_model, out_tokens, lane=None):
                  f'"cache_creation_input_tokens":0,"output_tokens":{out_tokens}}}}}\n')
 
 
+# #1176 contract (#1186), two layers, neither in the script:
+#   - CHILD bytes pinned to UTF-8 (PYTHONIOENCODING in its env): what the
+#     report prints then decodes exactly, whatever the seat's console encoding;
+#   - READER tolerant (errors="replace") and normalised with (or ""): it ALWAYS
+#     returns text. A strict decoder reading a cp1252 child raised
+#     UnicodeDecodeError inside subprocess' reader thread and handed back
+#     stdout=None (#1175 signature); the pin then died on `needle in txt`
+#     instead of reporting itself.
+# The pins match ASCII only, so a replaced byte costs nothing.
+_UTF8_CHILD = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 def run_json(cdir, *extra):
     p = subprocess.run(
         [sys.executable, SCRIPT, "--hours", "24", "--dir", cdir, "--json", *extra],
-        capture_output=True, text=True, timeout=120)
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=_UTF8_CHILD, timeout=120)
     if p.returncode != 0:
-        print(p.stdout)
-        print(p.stderr)
+        print(p.stdout or "")
+        print(p.stderr or "")
         raise SystemExit(f"traffic-consumption.py --json exited {p.returncode}")
-    return json.loads(p.stdout)
+    return json.loads(p.stdout or "")
 
 
 def run_text(cdir, *extra):
     p = subprocess.run(
         [sys.executable, SCRIPT, "--hours", "24", "--dir", cdir, *extra],
-        capture_output=True, text=True, timeout=120)
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=_UTF8_CHILD, timeout=120)
     if p.returncode != 0:
-        print(p.stdout)
-        print(p.stderr)
+        print(p.stdout or "")
+        print(p.stderr or "")
         raise SystemExit(f"traffic-consumption.py exited {p.returncode}")
-    return p.stdout
+    return p.stdout or ""
 
 
 cdir = tempfile.mkdtemp(prefix="tc-hlanes-")
