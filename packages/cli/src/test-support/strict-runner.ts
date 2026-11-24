@@ -156,6 +156,18 @@ export function parseEnvGateManifests(raw: string): EnvGateSummaryEntry[] {
 
 const FILE_HEADER_RE = /^(.+\.test\.[cm]?[jt]sx?):\s*$/;
 const UNHANDLED_RE = /^# Unhandled error between tests/;
+/**
+ * GitHub Actions group framing. On a GHA runner (measured: macOS shard,
+ * 24/11, bun 1.4.0) the child bun prefixes each file header with
+ * `::group::`, so the raw line is `::group::b.test.ts:` — FILE_HEADER_RE
+ * then captures `::group::b.test.ts` as the file name and every entry of
+ * that block lands OUTSIDE the delivered set (FOREIGN POPULATION, exit 3,
+ * reproduced by the real-wiring pin). The same probe on Windows emits no
+ * group line at all, with GITHUB_ACTIONS=true and without, under bun 1.3.14
+ * and 1.4.0: the framing is the producer's, so the parser strips it before
+ * matching anything.
+ */
+const GHA_GROUP_PREFIX = "::group::";
 
 /** Last match of an anchored multiline regex, or null (see parseRunOutput). */
 function lastSummaryMatch(raw: string, re: RegExp): string | null {
@@ -189,7 +201,10 @@ export function parseRunOutput(raw: string): SuiteRun {
   const entries: string[] = [];
   let currentFile = "";
   let loadErrorsInFile = 0;
-  for (const line of raw.split(/\r?\n/)) {
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.startsWith(GHA_GROUP_PREFIX)
+      ? rawLine.slice(GHA_GROUP_PREFIX.length)
+      : rawLine;
     const header = line.match(FILE_HEADER_RE);
     if (header) {
       currentFile = header[1].replace(/\\/g, "/");

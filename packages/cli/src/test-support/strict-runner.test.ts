@@ -1069,6 +1069,38 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     ).toBe(true);
   });
 
+  test("GitHub Actions group framing: a `::group::<file>:` header keys entries to the file, never to a foreign name (macOS CI, measured 24/11)", () => {
+    // The producer's framing, not a fixture quirk: on a GHA runner (macOS
+    // shard, bun 1.4.0) the child bun prints `::group::b.test.ts:`, and a raw
+    // parser keyed on `^(.+\.test\.):$` captures the prefix — the entry then
+    // names `::group::b.test.ts`, outside the delivery, and the run is refused
+    // FOREIGN (exit 3) although the population is exactly the one delivered.
+    // Windows emits no group line under either bun version, with
+    // GITHUB_ACTIONS=true and without, so this shape had to be pinned from
+    // the job log rather than from a local probe.
+    const ghaRaw = [
+      "::group::a.test.ts:",
+      "(pass) a poisons [0.10ms]",
+      "",
+      "::group::b.test.ts:",
+      "(fail) b reads the marker [0.50ms]",
+      "",
+      " 1 pass",
+      " 1 fail",
+      "Ran 2 tests across 2 files.",
+      "::endgroup::",
+      "",
+    ].join("\n");
+    const parsed = parseRunOutput(ghaRaw);
+    expect(parsed.entries).toEqual(["b.test.ts > b reads the marker"]);
+    expect(runIsAccountable(parsed)).toBe(true);
+    expect(foreignEntryFiles(["a.test.ts", "b.test.ts"], parsed)).toEqual([]);
+    // control: the prefix is what made it foreign — stripping it by hand
+    // gives the same parse, so the assertion cannot pass on a parser that
+    // simply ignores the line
+    expect(parseRunOutput(ghaRaw.replaceAll("::group::", "")).entries).toEqual(parsed.entries);
+  });
+
   // ─── Foreign population guard (file 20a items 1+2+3, review #1114 third return) ──
 
   test("a foreign entry refuses --learn: exit 3 and NO baseline — the review-3 witness (1 delivered, ghost written into the baseline, was exit 0)", () => {
