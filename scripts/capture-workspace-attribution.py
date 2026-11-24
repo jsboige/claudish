@@ -999,7 +999,12 @@ def aggregate_writes(rows: list[dict], totals_by_day: dict[str, int]) -> dict:
             a["tours"] += 1
             a["reqs"] += t["reqs"]
             for uid in t.get("creates", ()):
-                if first_seen[(ws, uid)][1] == sess:
+                # The FULL first-seen tour key, not the session alone (review
+                # 24/11): one session id can span two days (a cron lane, a model
+                # switch mid-session), and then both tours passed the session
+                # test — the id was credited once per machine/model bucket and
+                # the by_* sums exceeded the workspace row.
+                if first_seen[(ws, uid)] == (_day, sess):
                     a["create_ids"].add(uid)
         return {k: {"tours": a["tours"], "reqs": a["reqs"],
                     "pr_create_counted": len(a["create_ids"])}

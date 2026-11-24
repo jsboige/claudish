@@ -548,6 +548,43 @@ def pin_write_rows_carry_the_envelope_machine():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def pin_pr_creation_follows_its_tour_not_its_session():
+    """16c. THE FIRST-SEEN KEY IS A TOUR, NOT A SESSION — one session id can span
+    two days and two machines (a cron lane, a model switch mid-session), and a
+    PR creation must follow the tour that made it. Testing the session alone
+    credits the id in EVERY tour of that session: the per-machine sums then
+    exceed the workspace row (review 24/11, one-line fix in `by()`)."""
+    create = lambda uid: (uid, "Bash") + wsattr.classify_tool_use(
+        "Bash", {"command": "gh pr create --title x"})
+
+    def row(day, sess, machine, model, uses):
+        return {"day": day, "ws": "coursia", "session": sess, "compacted": False,
+                "cron": False, "uses": uses, "machine": machine, "model": model}
+    rows = [
+        # s1 on day 1 (ai-01 / swift) creates p1; its next request replays it
+        row("2026-10-28", "s1", "myia-ai-01", "swift", [create(b"p1")]),
+        row("2026-10-28", "s1", "myia-ai-01", "swift", [create(b"p1")]),
+        # the SAME session id on day 2 (po-2028 / MiniMax-M3) replays p1 and
+        # creates p2 there: one session, two days, two machines, two models
+        row("2026-10-29", "s1", "myia-po-2028", "MiniMax-M3", [create(b"p1"), create(b"p2")]),
+    ]
+    w = wsattr.aggregate_writes(rows, {"2026-10-28": 2, "2026-10-29": 1})["workspaces"]["coursia"]
+    _check(w["tours"] == 2 and w["pr_create_counted"] == 2,
+           "one session over two days is two tours and two creations, got %r/%r"
+           % (w["tours"], w["pr_create_counted"]))
+    _check(w["by_machine"] == {"myia-ai-01": {"tours": 1, "reqs": 2, "pr_create_counted": 1},
+                               "myia-po-2028": {"tours": 1, "reqs": 1, "pr_create_counted": 1}},
+           "each creation follows its own tour: p1 to day 1 / ai-01, p2 to day 2 / "
+           "po-2028, got %r" % (w["by_machine"],))
+    _check(w["by_model"] == {"swift": {"tours": 1, "reqs": 2, "pr_create_counted": 1},
+                             "MiniMax-M3": {"tours": 1, "reqs": 1, "pr_create_counted": 1}},
+           "same on the model axis, got %r" % (w["by_model"],))
+    for field in ("by_machine", "by_model"):
+        _check(sum(b["pr_create_counted"] for b in w[field].values()) == w["pr_create_counted"],
+               "%s must sum to the workspace row — the session alone credits p1 to both "
+               "days and p2 to day 1's machine" % field)
+
+
 def pin_served_model_from_resp_name():
     # Shapes copied from real captures (06/22 archive and the live 11/05 dir).
     sse = wsattr.served_model("resp-1-r0003-2026-06-22T06-55-49-811Z-openai-qwen3.6-35b-a3b.sse")
@@ -654,6 +691,7 @@ PINS = [
     pin_gh_write_class_and_precedence,
     pin_tours_by_machine_and_model,
     pin_write_rows_carry_the_envelope_machine,
+    pin_pr_creation_follows_its_tour_not_its_session,
     pin_fleet_push_forms_and_quoted_words,
     pin_dm_send_is_a_write,
     pin_cron_stamp_is_per_request_and_header_confined,
