@@ -55,7 +55,7 @@ name: Claude Code PR Review
 # refuses to start without ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, and
 # base-action/action.yml forwards `inputs.anthropic_api_key` into that exact
 # variable (a step-level assignment that OVERRIDES the job env), so the input
-# carries a fixed, non-secret placeholder. The hub authenticates the cluster key.
+# carries a fixed, non-secret placeholder. The hub authenticates the scoped inbound key.
 #
 # The ANTHROPIC_DEFAULT_*_MODEL slots are load-bearing, not decorative: Claude
 # Code's helper calls resolve by ROLE, and a role left unset resolves to a native
@@ -118,15 +118,28 @@ jobs:
           fetch-depth: 1
 
       - name: Check the hub wiring is present
-        # Fails on a named cause, and prints no value: the header is tested with
-        # a regex that only asks whether anything follows the colon.
+        # Names the missing piece instead of an opaque 401, and prints no value.
+        #
+        # ANTHROPIC_CUSTOM_HEADERS is MULTI-LINE: the `\n` in the env block above
+        # is a real line feed (one header per line, `X-Claudish-Machine` first).
+        # grep reads it line by line and its `^` matches the start of EVERY line,
+        # so the test below holds wherever the `x-proxy-key` line sits.
+        #
+        # A green step proves the FORM of the header block, nothing more: that a
+        # line `x-proxy-key: <non-blank>` is present. It does not prove that the
+        # key is the scoped inbound key, that the hub holds its `inboundKeys`
+        # entry (#1100), or that the hub accepts it. A wrong key passes this
+        # step. Those are read from the hub capture (`inbound_key`), never here.
+        #
+        # Replayed with no CI run and no secret by
+        # scripts/tests/test_reviewer_wiring_guard.py.
         run: |
           if [ -z "$ANTHROPIC_BASE_URL" ]; then
             echo "::error::Repository variable CLAUDISH_HUB_URL is not set"
             exit 1
           fi
           if ! printf '%s' "$ANTHROPIC_CUSTOM_HEADERS" | grep -qE '^x-proxy-key: [^[:space:]]'; then
-            echo "::error::Repository secret CLAUDISH_REVIEWER_KEY is not set"
+            echo "::error::No 'x-proxy-key: <value>' line in ANTHROPIC_CUSTOM_HEADERS: repository secret CLAUDISH_REVIEWER_KEY is empty or missing"
             exit 1
           fi
 
