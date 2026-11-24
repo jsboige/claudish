@@ -219,21 +219,33 @@ def bucket_of(info):
     return "other"
 
 
-def load_requests(cdir, cutoff_dt):
+def load_requests(cdir, cutoff_dt, seen=None, names=None):
     """(pid, reqN) -> liste horodatee de dicts {ts, machine, ep, wl}.
 
     On ne lit que la TETE du fichier : machine + bloc billing system sont
     toujours en debut de corps (system precede messages/tools sur le wire
     anthropique). Le JSON complet (jusqu'a 1 Mo) ne sert a rien ici.
+
+    seen (#1180) : noms deja consommes par une autre racine de corpus — mute
+    ici, partage avec la boucle resp de main(), pour que l'union de plusieurs
+    `--dir` soit dedupliquee par NOM de fichier (premiere racine gagne).
+    names : le contenu DEJA LISTE de `cdir` — main() liste chaque racine une
+    fois pour etablir la couverture. Absent -> liste ici (contrat d'origine
+    des lecteurs qui importent cette fonction).
     """
+    if seen is None:
+        seen = set()
     reqs = defaultdict(list)
-    for fn in os.listdir(cdir):
+    for fn in (os.listdir(cdir) if names is None else names):
+        if fn in seen:
+            continue
         m = REQ_FN.match(fn)
         if not m:
             continue
         dt = capture_dt(m.group(3))
         if dt is None or dt < cutoff_dt:
             continue
+        seen.add(fn)
         try:
             with open(os.path.join(cdir, fn), "rb") as fh:
                 head = fh.read(REQ_HEAD_BYTES).decode("utf-8", errors="replace")
@@ -273,7 +285,11 @@ def fmt_int(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--hours", type=float, default=24.0)
-    ap.add_argument("--dir", default=os.environ.get("CLAUDISH_CAPTURE_DIR", r"D:\claudish-captures"))
+    ap.add_argument("--dir", action="append", default=None,
+                    help="racine du corpus de captures ; REPETABLE (#1180) — "
+                         "union dedupliquee par nom de fichier, premiere racine "
+                         "gagne. Defaut : $CLAUDISH_CAPTURE_DIR ou "
+                         "D:\\claudish-captures")
     ap.add_argument("--json", action="store_true", help="sortie JSON machine-lisible (Phase 3)")
     ap.add_argument("--machines", action="store_true", help="rollup supplementaire par lane x machine")
     ap.add_argument("--harness-lanes", action="store_true",
@@ -288,11 +304,46 @@ def main():
                          "script de reconciliation, env CLAUDISH_RECONCILE_DIR ; "
                          "<corpus>/reconcile reste source additionnelle, #940)")
     args = ap.parse_args()
+    # #1180 — `--dir` repetable : la PREMIERE racine reste le corpus de
+    # reference (archive/ et reconcile/ gardent leur sens), les suivantes
+    # n'ajoutent que leurs captures loose.
+    dirs = args.dir or [os.environ.get("CLAUDISH_CAPTURE_DIR",
+                                       r"D:\claudish-captures")]
+    cdir = dirs[0]
 
     cutoff = datetime.now(timezone.utc).timestamp() - args.hours * 3600
     cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
 
-    reqs = load_requests(args.dir, cutoff_dt)
+    # #1180 — chaque racine est LISTEE une fois, ici. Une racine que listdir
+    # refuse est NON COUVERTE : nommee sur la ligne COVERAGE (stdout) et dans
+    # le JSON, jamais lue comme un corpus vide. Le dedup par nom de fichier
+    # est partage par les tetes req et la boucle resp (premiere racine gagne).
+    listed = []        # (racine, noms) — une entree par racine LUE
+    uncovered = []
+    for _d in dirs:
+        try:
+            listed.append((_d, os.listdir(_d)))
+        except OSError as exc:
+            uncovered.append(_d)
+            print(f"warning: capture dir unreadable ({exc}) -> not covered",
+                  file=sys.stderr)
+    covered = [_d for _d, _ in listed]
+    coverage = {"requested": list(dirs), "covered": covered,
+                "uncovered": uncovered}
+    if not covered:
+        # sur main, une racine unique illisible etait un traceback (rc 1) :
+        # rien n'a ete lu, un rc 0 le lirait comme un corpus sans trafic
+        print("error: no capture dir could be read -> nothing was counted "
+              "(exit 2)", file=sys.stderr)
+
+    seen = set()
+    reqs = defaultdict(list)
+    for _d, _names in listed:
+        for k, v in load_requests(_d, cutoff_dt, seen=seen,
+                                  names=_names).items():
+            reqs[k].extend(v)
+    for v in reqs.values():
+        v.sort(key=lambda d: d["ts"])
 
     lanes = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
     machines = defaultdict(lambda: defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)))
@@ -303,9 +354,18 @@ def main():
     n_resp = n_paired = n_unpaired = n_nousage = 0
     first_dt = last_dt = None
 
-    for fn in os.listdir(args.dir):
-        if not (fn.startswith("resp-") and fn.endswith(".sse")):
-            continue
+    # #1180 — resp de toutes les racines LUES, union dedupliquee par nom de
+    # fichier (premiere racine gagne).
+    _resp_files = []
+    for _d, _names in listed:
+        for fn in _names:
+            if fn in seen:
+                continue
+            seen.add(fn)
+            if fn.startswith("resp-") and fn.endswith(".sse"):
+                _resp_files.append((_d, fn))
+
+    for _d, fn in _resp_files:
         rm = RESP_FN.match(fn)
         if not rm:
             continue
@@ -317,7 +377,7 @@ def main():
             first_dt = dt
         if last_dt is None or dt > last_dt:
             last_dt = dt
-        path = os.path.join(args.dir, fn)
+        path = os.path.join(_d, fn)
         try:
             txt = read_head_tail(path)
         except OSError:
@@ -369,7 +429,7 @@ def main():
     bs = _load_blind_spot()
     _rdir = args.reconcile_dir or bs.default_reconcile_dir()
     _nominal = Counter(v["machine"] for lst in reqs.values() for v in lst)
-    blind = bs.assess(args.dir, cutoff_dt, now_dt, fleet,
+    blind = bs.assess(cdir, cutoff_dt, now_dt, fleet,
                       reconcile_dir=_rdir, nominal_counts=_nominal)
 
     # #1152 c — un jour packed en parties est absent du corpus loose que ce
@@ -377,7 +437,10 @@ def main():
     # jamais comme un total. La lecture exacte est le merge de
     # native-consumption --leak-policy.
     pp = _load_partial_parts()
-    partial = pp.assess(args.dir, cutoff_dt, now_dt)
+    # #1180 — union des racines LUES, dedupliquee par nom de partie
+    partial = pp.assess_many(covered, cutoff_dt, now_dt)
+    # 2 = aucune racine demandee n'a pu etre lue (voir coverage)
+    rc = 0 if covered else 2
 
     if args.json:
         print(json.dumps({
@@ -385,6 +448,9 @@ def main():
             "covered_from": first_dt.isoformat() if first_dt else None,
             "covered_to": last_dt.isoformat() if last_dt else None,
             "covered_span_hours": round(span_h, 3),
+            # #1180 — ce run a reellement lu `covered` parmi `requested` ;
+            # `uncovered` nomme les racines refusees par listdir
+            "coverage": coverage,
             "files": {"resp": n_resp, "paired": n_paired, "unpaired": n_unpaired, "no_usage": n_nousage},
             "lanes": {k: v for k, v in lanes.items()},
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
@@ -394,7 +460,7 @@ def main():
                                "days": partial["days"]}
                               if partial["partial"] else None),
         }, indent=2))
-        return
+        return rc
 
     total_out = sum(r["out"] for b in lanes.values() for r in b.values())
     # Fenetre a 0 resp (sidecar NOMINAL : les captures vont au hub) : la
@@ -405,8 +471,10 @@ def main():
     else:
         couv = "couverture (aucune resp dans la fenetre)"
     print(f"fenetre: {args.hours}h demandees | {couv}")
+    print(f"COVERAGE dirs={len(covered)}/{len(dirs)}"
+          + (f" uncovered={','.join(uncovered)}" if uncovered else ""))
     print(f"resp: {n_resp} | appariees: {n_paired} | non appariees: {n_unpaired} | sans usage: {n_nousage}")
-    for _line in pp.section(args.dir, cutoff_dt, now_dt, res=partial):
+    for _line in pp.section(cdir, cutoff_dt, now_dt, res=partial):
         print(_line)
     print()
     hdr = f"{'lane':24} {'bucket':12} {'req':>6} {'in_tok':>13} {'out_tok':>12} {'cache_rd':>13} {'cache_wr':>12} {'hit%':>5} {'in/h':>13} {'out/h':>12}"
@@ -457,12 +525,13 @@ def main():
     # #933 : la section se render meme sans --machines — une absence lue comme
     # un 0 est le mensonge que ce rapport existe pour empecher.
     print()
-    for line in bs.render(args.dir, cutoff_dt, now_dt, fleet,
+    for line in bs.render(cdir, cutoff_dt, now_dt, fleet,
                           reconcile_dir=_rdir, res=blind):
         print(line)
 
     print(f"\ntotal out_tok fenetre: {fmt_int(total_out)} | debit moyen out: {fmt_int(int(total_out / span_h))}/h")
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
