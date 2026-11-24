@@ -169,6 +169,11 @@ const UNHANDLED_RE = /^# Unhandled error between tests/;
  */
 const GHA_GROUP_PREFIX = "::group::";
 
+/** Strip the GHA group framing before any header/fail line is matched. */
+function withoutGhaGroupPrefix(rawLine: string): string {
+  return rawLine.startsWith(GHA_GROUP_PREFIX) ? rawLine.slice(GHA_GROUP_PREFIX.length) : rawLine;
+}
+
 /** Last match of an anchored multiline regex, or null (see parseRunOutput). */
 function lastSummaryMatch(raw: string, re: RegExp): string | null {
   const g = new RegExp(re.source, "gm");
@@ -202,9 +207,7 @@ export function parseRunOutput(raw: string): SuiteRun {
   let currentFile = "";
   let loadErrorsInFile = 0;
   for (const rawLine of raw.split(/\r?\n/)) {
-    const line = rawLine.startsWith(GHA_GROUP_PREFIX)
-      ? rawLine.slice(GHA_GROUP_PREFIX.length)
-      : rawLine;
+    const line = withoutGhaGroupPrefix(rawLine);
     const header = line.match(FILE_HEADER_RE);
     if (header) {
       currentFile = header[1].replace(/\\/g, "/");
