@@ -10,6 +10,8 @@ The join reads two JSON files and must never fabricate a ratio:
   P6  a graphql window is exclusive of `to` -> `activity-absent` there, not zero
   P7  blind read: missing `days` or zero joinable dates -> exit 2, no stdout report
   P8  --json shape carries source, window, rows with flags
+  P9  #1180: a consumption document that declares `coverage.uncovered` roots was
+      read from half the corpus -> every day `partial`, no ratio, cause named
 
 Run: python scripts/tests/test_activity_cost_join.py
 """
@@ -120,6 +122,9 @@ def main():
                  con([{"date": "2026-11-20", "out": 100, "partial": True}]),
                  today="2026-11-23")
     check("partial consommation", "partial" in row(j, "2026-11-20")["flags"])
+    # AC #1161 stage-2 (b) : une consommation partiale ne se ratio PAS en
+    # silence — le drapeau seul ne suffirait pas si un ratio sortait quand meme.
+    check("partial consommation sans ratio", row(j, "2026-11-20")["ratio"] is None)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     j = acj.join(act({today: 3}), con([{"date": today, "out": 10}]))
     r = row(j, today)
@@ -162,6 +167,41 @@ def main():
                     con([{"date": "2026-11-20", "out": 100}]))
         text = p.stdout
         check("texte nomme la source", "fragment-anonyme" in text)
+
+    print("P9 — #1180 (review ai-01, finding 2) : un document lu d'un demi-corpus "
+          "ne se ratio pas")
+    day = {"date": "2026-11-20", "out": 100}
+    half = dict(con([day]),
+                coverage={"requested": [r"\\hub\d$\captures", r"\\hub\c$\overflow"],
+                          "covered": [r"\\hub\d$\captures"],
+                          "uncovered": [r"\\hub\c$\overflow"]})
+    j = acj.join(act({"2026-11-20": 12}), half, today="2026-11-23")
+    r = row(j, "2026-11-20")
+    check("jour du document marque partial, sans flag sur la ligne", r["flags"] == ["partial"], r["flags"])
+    check("aucun ratio rendu", r["ratio"] is None, r)
+    check("inEq reste rendu (la mesure partielle se lit, elle ne se ratio pas)",
+          r["inEq"] == 500.0, r["inEq"])
+    check("la cause est nommee : 1 racine non lue", j["uncovered_roots"] == 1, j["uncovered_roots"])
+    whole = dict(con([day]), coverage={"requested": [r"\\hub\d$\captures"],
+                                       "covered": [r"\\hub\d$\captures"], "uncovered": []})
+    j = acj.join(act({"2026-11-20": 12}), whole, today="2026-11-23")
+    check("couverture entiere (uncovered vide) : ratio rendu, 0 racine non lue",
+          row(j, "2026-11-20")["ratio"] is not None and j["uncovered_roots"] == 0, row(j, "2026-11-20"))
+    j = acj.join(act({"2026-11-20": 12}), con([day]), today="2026-11-23")
+    check("sans cle coverage (un fichier de serie) : inchange",
+          row(j, "2026-11-20")["ratio"] is not None and j["uncovered_roots"] == 0, row(j, "2026-11-20"))
+    for label, odd in (("liste", ["x"]), ("nombre", 3), ("cle inattendue", {"covered": 5})):
+        j = acj.join(act({"2026-11-20": 12}), dict(con([day]), coverage=odd), today="2026-11-23")
+        check(f"coverage de forme inattendue ({label}) : pas de crash, pas de refus invente",
+              row(j, "2026-11-20")["ratio"] is not None and j["uncovered_roots"] == 0,
+              (row(j, "2026-11-20")["flags"], j["uncovered_roots"]))
+    with tempfile.TemporaryDirectory() as tmp:
+        p = run_cli(tmp, act({"2026-11-20": 12}), half)
+        check("texte : la cause est nommee", "1 racine(s) du corpus declaree(s) non lue(s)" in p.stdout,
+              p.stdout[-300:])
+        p = run_cli(tmp, act({"2026-11-20": 12}), whole)
+        check("texte : rien d'ajoute quand la couverture est entiere",
+              "racine(s) du corpus" not in p.stdout, p.stdout[-300:])
 
     print()
     if FAILS:
