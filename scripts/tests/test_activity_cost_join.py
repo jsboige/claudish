@@ -68,7 +68,11 @@ def run_cli(tmp, activity, consumption, as_json=False):
             "--activity", ap, "--consumption", cp]
     if as_json:
         argv.append("--json")
-    return subprocess.run(argv, capture_output=True, text=True)
+    # The child runs under -I, so no env var can pin its byte contract: the
+    # READER tolerates the seat instead (#1176 pattern, #1186). assertions
+    # only match ASCII ("aveugle"); decorative bytes replace cleanly.
+    return subprocess.run(argv, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
 
 
 def main():
@@ -136,8 +140,9 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         p = run_cli(tmp, {"nodays": True}, con([{"date": "2026-11-20", "out": 1}]))
         check("entree sans days -> exit 2", p.returncode == 2, p.returncode)
-        check("stderr nomme la lecture aveugle", "aveugle" in p.stderr.lower(),
-              p.stderr[:120])
+        check("stderr nomme la lecture aveugle",
+              "aveugle" in (p.stderr or "").lower(),
+              (p.stderr or "")[:120])
         check("stdout vide", p.stdout.strip() == "")
         p = run_cli(tmp, act({}), con([]))
         check("zero date joignable -> exit 2", p.returncode == 2, p.returncode)
@@ -146,7 +151,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         p = run_cli(tmp, act({"2026-11-20": 12}),
                     con([{"date": "2026-11-20", "out": 100}]), as_json=True)
-        check("exit 0", p.returncode == 0, p.stderr[:200])
+        check("exit 0", p.returncode == 0, (p.stderr or "")[:200])
         payload = json.loads(p.stdout)
         check("source nommee", payload["source"] == "fragment-anonyme", payload["source"])
         check("fenetre portee", payload["window"]["to"] == "2026-11-22")

@@ -22,8 +22,17 @@ import inspect
 import json
 import os
 import pathlib
+import sys
 import tempfile
 from datetime import datetime, timezone
+
+# The pin messages carry non-ASCII (≈, é) — on a cp1252 console the print()
+# dies before any assertion runs (#1186). The seat's encoding is not this
+# file's contract: force UTF-8 when the stream allows reconfiguration.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, OSError, ValueError):
+    pass
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SPEC = importlib.util.spec_from_file_location(
