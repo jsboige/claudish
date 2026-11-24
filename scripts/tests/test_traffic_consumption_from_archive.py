@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS = os.path.join(_HERE, "..")
@@ -534,6 +535,106 @@ def main():
               out.returncode == 0
               and "req: 5 | repondues: 3 | sans reponse: 2 (40.0 %)" in out.stdout,
               (out.returncode, out.stdout[-500:]))
+
+        # A12b (review ai-01 du 24/11, finding 1) — le SIXIEME mecanisme : un
+        # resp-* est horodate a la FERMETURE du flux, et collect() borne les
+        # deux tetes. Une requete admise avant la borne dont le flux ferme
+        # apres elle est « sans reponse » PAR CONSTRUCTION. Elle se rapporte a
+        # part (la queue de fenetre), et L se mesure sur les paires appariees
+        # de la meme lecture — aucune constante choisie.
+        print("A12b — flux ferme apres la borne : queue de fenetre, pas residu")
+        tc = _load("tc", "traffic-consumption.py")
+        tail_dir = os.path.join(tmp, "tail")
+        os.makedirs(tail_dir)
+
+        def put(folder, fn, text):
+            with open(os.path.join(folder, fn), "w") as fh:
+                fh.write(text)
+
+        def req_text(machine="myia-po-2023"):
+            return ('{"machine":"%s","entrypoint":"cli","workload":"cron","lane":"",'
+                    '"body":{"messages":[]}}' % machine)
+
+        def resp_text(pid, reqn):
+            return f"# parser=openai-sse model=glm-5.3 reqN={reqn} pid={pid}\n" + SSE
+
+        # paire A : admise 12:00:00, flux ferme 12:04:00 -> L = 240 s
+        put(tail_dir, "req-900-0001-2026-11-22T12-00-00-123Z-direct.json", req_text())
+        put(tail_dir, "resp-900-r0001-2026-11-22T12-04-00-456Z-openai-sse-glm-5.3.sse",
+            resp_text(900, 1))
+        # paire B : admise 23:58:00, flux ferme le lendemain 00:01:30
+        put(tail_dir, "req-901-0001-2026-11-22T23-58-00-123Z-direct.json", req_text("myia-po-2027"))
+        put(tail_dir, "resp-901-r0001-2026-11-23T00-01-30-456Z-openai-sse-glm-5.3.sse",
+            resp_text(901, 1))
+        d22 = datetime(2026, 11, 22, tzinfo=timezone.utc)
+        d23 = d22 + timedelta(days=1)
+        r1 = tc.collect([tail_dir], d22, until_dt=d23)["requests"]
+        check("A12b fenetre du 22/11 : 2 requetes, 1 repondue, 1 sans reponse (reproduit)",
+              (r1["total"], r1["answered"], r1["unanswered"]) == (2, 1, 1),
+              {k: r1[k] for k in ("total", "answered", "unanswered")})
+        check("A12b L = le plus grand ecart requete->reponse des paires lues (240 s), "
+              "et la borne qui en decoule (23:56:00)",
+              r1["max_paired_lag_s"] == 240
+              and r1["tail_from"] == "2026-11-22T23:56:00+00:00",
+              (r1["max_paired_lag_s"], r1["tail_from"]))
+        check("A12b LA PIN — elle tombe dans la queue de fenetre, pas dans le residu",
+              (r1["unanswered_tail"], r1["unanswered_residue"]) == (1, 0),
+              (r1["unanswered_tail"], r1["unanswered_residue"]))
+        r2 = tc.collect([tail_dir], d22, until_dt=d23 + timedelta(minutes=5))["requests"]
+        check("A12b fenetre elargie de 5 min : la meme paire est repondue, plus rien en queue",
+              (r2["answered"], r2["unanswered"], r2["unanswered_tail"]) == (2, 0, 0),
+              {k: r2[k] for k in ("answered", "unanswered", "unanswered_tail")})
+        early = os.path.join(tmp, "tail-early")
+        os.makedirs(early)
+        for fn in os.listdir(tail_dir):
+            shutil.copy(os.path.join(tail_dir, fn), early)
+        put(early, "req-902-0001-2026-11-22T03-00-00-123Z-direct.json", req_text())
+        r3 = tc.collect([early], d22, until_dt=d23)["requests"]
+        check("A12b une sans-reponse loin de la borne reste du residu",
+              (r3["unanswered"], r3["unanswered_tail"], r3["unanswered_residue"]) == (2, 1, 1),
+              {k: r3[k] for k in ("unanswered", "unanswered_tail", "unanswered_residue")})
+        r4 = tc.collect([tail_dir], d22)["requests"]
+        check("A12b mode live (until=None) : borne = la resp la plus recente lue, "
+              "la paire a cheval est repondue",
+              (r4["answered"], r4["unanswered"], r4["tail_from"])
+              == (2, 0, "2026-11-22T23:57:30+00:00"),
+              {k: r4[k] for k in ("answered", "unanswered", "tail_from")})
+        lonely = os.path.join(tmp, "tail-lonely")
+        os.makedirs(lonely)
+        put(lonely, "req-903-0001-2026-11-22T10-00-00-123Z-direct.json", req_text())
+        r5 = tc.collect([lonely], d22, until_dt=d23)["requests"]
+        check("A12b aucune paire appariee : la queue est NON MESURABLE (None), jamais 0",
+              r5["unanswered"] == 1 and r5["unanswered_tail"] is None
+              and r5["unanswered_residue"] is None and r5["tail_from"] is None, r5)
+
+        # A12c (review ai-01 du 24/11, finding 2) — la borne de 4 Kio
+        # (REQ_ENVELOPE_BYTES) : aucun `model` dans les 4 premiers Kio, puis un
+        # `"model"` d'entree d'outil APRES. Sans la borne, le mutant
+        # `MODEL_FIELD.search(head)` lit « sonnet » et fabrique un modele demande.
+        print("A12c — borne de l'enveloppe : un model d'outil apres 4 Kio ne gagne pas")
+        pad = "x" * 4300
+        body4k = ('{"machine":"myia-po-2024","entrypoint":"cli","workload":"interactive","lane":"",'
+                  '"body":{"messages":[{"role":"user","content":"' + pad + '"},'
+                  '{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1",'
+                  '"name":"Task","input":{"description":"d","prompt":"p","model":"sonnet"}}]}]}}')
+        check("A12c fixture : aucun model avant 4 Kio, un apres",
+              '"model"' not in body4k[:4096] and '"model":"sonnet"' in body4k[4096:],
+              body4k.find('"model"'))
+        name4k = "req-800-0001-%sT10-40-00-123Z-direct.json" % DAY
+        root4k = build(tmp, n=1, extra_members=[(name4k, body4k.encode())], name="corpus4k")
+        work4k = os.path.join(tmp, "w4k")
+        os.makedirs(work4k)
+        out = read_day(root4k, os.path.join(work4k, "traffic-days.json"), work4k)
+        rq4 = json.loads(out.stdout).get("requests") if out.returncode == 0 else None
+        check("A12c rc=0 et 2 requetes lues (la paire du jour + la fixture)",
+              out.returncode == 0 and rq4 and rq4["total"] == 2, (out.returncode, out.stderr[-400:]))
+        check("A12c LA PIN — cle (none) : le model d'outil apres 4 Kio n'est pas le modele demande",
+              rq4 and rq4["by_model"] == {"(none)": {"requests": 2, "unanswered": 1}},
+              rq4 and rq4["by_model"])
+        check("A12c la machine d'enveloppe est toujours lue (la borne ne coupe que le modele)",
+              rq4 and rq4["by_machine"] == {"myia-po-2023": {"requests": 1, "unanswered": 0},
+                                            "myia-po-2024": {"requests": 1, "unanswered": 1}},
+              rq4 and rq4["by_machine"])
 
         # P — le profil du scan, en mode synthetique (aucune capture lue) : la
         # voie archive entiere, trois phases, top 5 avec parts, rien laisse.
