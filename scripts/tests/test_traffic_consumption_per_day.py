@@ -29,6 +29,13 @@ This file pins the PRODUCER of that shape:
       counts the roots READ; the JSON carries `coverage {requested, covered,
       uncovered}` with and without --per-day; an unreadable root makes every
       emitted day `partial` (`uncovered-roots:N`), so the join refuses it.
+  P9  #1181 landed (main merged, cf17e98b): --per-day runs the SAME scan as
+      the loose reader, so it carries that reader's coverage contract line
+      for line — no readable root is exit 2 (never a corpus read as empty),
+      `uncovered` is comma-separated, a file given as a root is an unread
+      root (not a crash), an unreadable FIRST root still counts the others,
+      each root is listed ONCE (one warning), and a document produced from
+      nothing read gives the join no ratio.
 
 Run: python scripts/tests/test_traffic_consumption_per_day.py
 """
@@ -116,6 +123,15 @@ def run(roots, *extra):
     for r in roots:
         args += ["--dir", r]
     return subprocess.run(args + list(extra), capture_output=True, text=True)
+
+
+def as_json(out):
+    """stdout as a dict, {} when it is not JSON — a crashed reader must fail
+    the check that names it, not the pin file."""
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return {}
 
 
 def main():
@@ -278,6 +294,83 @@ def main():
         check("joiner : aucun ratio sur un document lu d'un demi-corpus",
               joined.returncode == 0 and all(r["ratio"] is None and "partial" in r["flags"]
                                              for r in rows8.values()), rows8)
+
+        print("P9 — #1181 dans main (cf17e98b) : --per-day porte le contrat de couverture "
+              "du lecteur loose, ligne pour ligne")
+        # The cases of scripts/tests/test_multi_dir_readers.py, in --per-day
+        # form: both modes run the same scan (collect), so what the loose
+        # reader promises about the roots it read, the per-day one promises too.
+        other = os.path.join(tmp, "no-such-root-either")
+        out = run([missing], "--per-day")
+        check("aucune racine lisible : rc=2 (rien lu n'est jamais un corpus vide)",
+              out.returncode == 2, (out.returncode, out.stderr[-300:]))
+        check("stdout : COVERAGE dirs=0/1 uncovered=<racine>",
+              f"COVERAGE dirs=0/1 uncovered={missing}" in out.stdout.splitlines(),
+              out.stdout[-300:])
+        check("stderr : la ligne d'erreur est dite UNE fois",
+              out.stderr.count("error: no capture dir could be read") == 1,
+              out.stderr[-400:])
+        plain9 = run([missing])
+        def _cov_line(text):
+            return next((ln for ln in text.splitlines() if ln.startswith("COVERAGE ")), "")
+        check("ligne pour ligne : sans et avec --per-day, meme rc, meme ligne COVERAGE, meme stderr",
+              (plain9.returncode, _cov_line(plain9.stdout), plain9.stderr)
+              == (out.returncode, _cov_line(out.stdout), out.stderr),
+              (plain9.returncode, out.returncode, plain9.stderr[-300:], out.stderr[-300:]))
+        out = run([missing], "--per-day", "--json")
+        doc_none = as_json(out)
+        check("en JSON : rc=2, `coverage` nomme la racine non lue",
+              out.returncode == 2 and doc_none.get("coverage") == {
+                  "requested": [missing], "covered": [], "uncovered": [missing]},
+              (out.returncode, doc_none.get("coverage"), out.stderr[-300:]))
+        check("en JSON : aucun jour emis (une liste vide, pas un zero)",
+              doc_none.get("days") == [], doc_none.get("days"))
+        out = run([root, missing, other], "--per-day", "--json")
+        doc9 = as_json(out)
+        check("deux racines illisibles : separees par une virgule, dans l'ordre demande",
+              out.returncode == 0
+              and (doc9.get("coverage") or {}).get("uncovered") == [missing, other],
+              (out.returncode, doc9.get("coverage"), out.stderr[-300:]))
+        line = next((ln for ln in run([root, missing, other], "--per-day").stdout.splitlines()
+                     if ln.startswith("COVERAGE ")), "")
+        check("stdout : COVERAGE dirs=1/3 uncovered=<a>,<b>",
+              line == f"COVERAGE dirs=1/3 uncovered={missing},{other}", line)
+        by9 = {d["date"]: d for d in (doc9.get("days") or [])}
+        check("chaque jour emis : partial, raison `uncovered-roots:2`",
+              bool(by9) and all(d.get("partial") is True
+                                and "uncovered-roots:2" in d.get("partial_reasons", [])
+                                for d in by9.values()), by9)
+        out = run([missing, root], "--per-day", "--json")
+        doc9 = as_json(out)
+        check("1re racine illisible, la 2e lue : rc=0, la couverture et les comptes suivent la lecture",
+              out.returncode == 0
+              and (doc9.get("coverage") or {}).get("covered") == [root]
+              and (doc9.get("files") or {}).get("resp") == 3,
+              (out.returncode, doc9.get("coverage"), doc9.get("files"), out.stderr[-300:]))
+        line = next((ln for ln in run([missing, root], "--per-day").stdout.splitlines()
+                     if ln.startswith("COVERAGE ")), "")
+        check("stdout : COVERAGE dirs=1/2 uncovered=<racine>",
+              line == f"COVERAGE dirs=1/2 uncovered={missing}", line)
+        a_file = next(os.path.join(root, n) for n in sorted(os.listdir(root))
+                      if n.startswith("req-"))
+        out = run([root, a_file], "--per-day")
+        line = next((ln for ln in out.stdout.splitlines() if ln.startswith("COVERAGE ")), "")
+        check("un FICHIER donne pour racine : non lue et nommee, pas un crash",
+              out.returncode == 0 and line == f"COVERAGE dirs=1/2 uncovered={a_file}",
+              (out.returncode, line, out.stderr[-300:]))
+        out = run([root, root2, missing], "--per-day", "--json")
+        check("listee UNE fois : un seul avertissement pour la racine illisible (tetes req ET resp)",
+              out.returncode == 0
+              and out.stderr.count("warning: capture dir unreadable") == 1, out.stderr[-400:])
+        prod9 = os.path.join(tmp, "consumption-nothing-read.json")
+        with open(prod9, "w") as fh:
+            json.dump(doc_none, fh)
+        joined = subprocess.run(
+            [sys.executable, "-I", _JOIN, "--activity", act,
+             "--consumption", prod9, "--json"], capture_output=True, text=True)
+        rows9 = (as_json(joined).get("rows") or []) if joined.stdout.strip() else []
+        check("joiner : un document produit sans rien lire ne rend aucun ratio",
+              all(r["ratio"] is None for r in rows9), rows9)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

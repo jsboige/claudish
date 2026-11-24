@@ -479,11 +479,9 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
         except OSError as exc:
             print(f"warning: capture dir unreadable ({exc}) -> not covered",
                   file=sys.stderr)
-    if not listed:
-        # sur main, une racine unique illisible etait un traceback (rc 1) :
-        # rien n'a ete lu, un rc 0 le lirait comme un corpus sans trafic
-        print("error: no capture dir could be read -> nothing was counted "
-              "(exit 2)", file=sys.stderr)
+    # (la ligne « nothing was counted (exit 2) » est celle du main() de la
+    # fenetre loose, la ou l'exit code se decide — pas ici : collect() sert
+    # aussi le mode archive, qui refuse avec ses propres mots.)
 
     seen = set()
     reqs = defaultdict(list)
