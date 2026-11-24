@@ -494,6 +494,107 @@ def main():
         left = os.path.join(work11, "traffic-days")
         check("aucune extraction laissee", not os.path.exists(left) or os.listdir(left) == [],
               os.listdir(left) if os.path.exists(left) else "-")
+
+        # A12 — requetes sans reponse : un ecart de FICHIERS n'est pas un nombre
+        # de requetes. Deux req-* seuls s'ajoutent aux 3 paires du corpus.
+        print("A12 — requetes sans reponse : comptees, situees, jamais causees")
+        lone1, lone2 = pair_names(700, 1, DAY, "1030")[0], pair_names(701, 1, DAY, "1031")[0]
+        body1 = ('{"machine":"myia-po-2027","model":"kimi-k2.5","entrypoint":"cli",'
+                 '"workload":"interactive","lane":"","body":{"model":"glm-5.3"}}')
+        body2 = '{"src":"direct","body":{"model":"deepseek-r1","messages":[]}}'
+        root12 = build(tmp, n=3, extra_members=[(lone1, body1.encode()), (lone2, body2.encode())],
+                       name="corpus12")
+        work12 = os.path.join(tmp, "w12")
+        os.makedirs(work12)
+        out = read_day(root12, os.path.join(work12, "traffic-days.json"), work12)
+        check("A12 rc=0", out.returncode == 0, out.stderr[-500:])
+        rq = json.loads(out.stdout).get("requests")
+        check("5 requetes, 3 repondues, 2 sans reponse",
+              rq and (rq["total"], rq["answered"], rq["unanswered"]) == (5, 3, 2), rq)
+        check("par machine : la sans-reponse est situee",
+              rq and rq["by_machine"] == {"direct": {"requests": 1, "unanswered": 1},
+                                          "myia-po-2023": {"requests": 3, "unanswered": 0},
+                                          "myia-po-2027": {"requests": 1, "unanswered": 1}},
+              rq and rq["by_machine"])
+        check("par modele DEMANDE : l'enveloppe gagne, pas le corps",
+              rq and rq["by_model"] == {"(none)": {"requests": 3, "unanswered": 0},
+                                        "deepseek-r1": {"requests": 1, "unanswered": 1},
+                                        "kimi-k2.5": {"requests": 1, "unanswered": 1}},
+              rq and rq["by_model"])
+        check("par heure UTC et par bucket",
+              rq and rq["by_hour"] == {"10": {"requests": 5, "unanswered": 2}}
+              and rq["by_bucket"] == {"cron": {"requests": 3, "unanswered": 0},
+                                      "interactive": {"requests": 1, "unanswered": 1},
+                                      "other": {"requests": 1, "unanswered": 1}},
+              rq and (rq["by_hour"], rq["by_bucket"]))
+        check("la cause n'est pas inventee : aucune cle de cause",
+              rq and not [k for k in rq if "cause" in k or "reason" in k], rq and sorted(rq))
+        out = run(root12, os.path.join(work12, "traffic-days-b.json"), work12, "--from-archive", DAY)
+        check("rapport texte : la ligne req | repondues | sans reponse",
+              out.returncode == 0
+              and "req: 5 | repondues: 3 | sans reponse: 2 (40.0 %)" in out.stdout,
+              (out.returncode, out.stdout[-500:]))
+
+        # P — le profil du scan, en mode synthetique (aucune capture lue) : la
+        # voie archive entiere, trois phases, top 5 avec parts, rien laisse.
+        print("P — archive-scan-profile --synthetic : trois phases, top 5, rien laisse")
+        workp = os.path.join(tmp, "wp")
+        os.makedirs(workp)
+        prof_tool = os.path.join(_SCRIPTS, "archive-scan-profile.py")
+        # Le profiteur enfant ecrit dans SON encodage de sortie :
+        # PYTHONIOENCODING quand elle est posee (le contrat cp1252 de la chaine),
+        # sinon le defaut de locale -- le meme que ce parent. `text=True` seul
+        # suppose de l'UTF-8 et meurt en mode UTF-8 sous PYTHONIOENCODING=cp1252.
+        child_enc = (os.environ.get("PYTHONIOENCODING") or "").split(":")[0] or None
+
+        def profile_run(*extra):
+            return subprocess.run([sys.executable, prof_tool, "--work-dir", workp,
+                                   "--extract-root", workp, *extra],
+                                  capture_output=True, text=True,
+                                  encoding=child_enc, errors="replace")
+
+        out = profile_run("--synthetic", "12", "--json")
+        check("P rc=0", out.returncode == 0, out.stderr[-400:])
+        prof = json.loads(out.stdout) if out.returncode == 0 else {}
+        check("12 resp + 12 req selectionnes, extraits et lus",
+              prof.get("extracted") == 24 and prof.get("selected", {}).get("resp") == 12
+              and prof.get("sample", {}).get("resp") == 12
+              and prof.get("sample", {}).get("req") == 12
+              and prof.get("sample", {}).get("unanswered") == 0, (prof.get("selected"), prof.get("sample")))
+        fo = prof.get("first_open", {})
+        check("premiere ouverture : une moitie en serie, une par pool",
+              fo.get("serial", {}).get("files") == 12 and fo.get("pooled", {}).get("files") == 12
+              and fo.get("serial", {}).get("ms_per_file") is not None, fo)
+        # La marque structurelle, pas le rapport de vitesse (instable sur 12
+        # fichiers) : sans elle, une lecture "pool" jamais entree reste verte.
+        check("la moitie pool a lu par un AUTRE fil, la serie par le fil appelant",
+              fo.get("serial", {}).get("off_caller") is False
+              and fo.get("pooled", {}).get("off_caller") is True,
+              (fo.get("serial", {}).get("off_caller"), fo.get("pooled", {}).get("off_caller")))
+        top = prof.get("top_cumulative", [])
+        check("top 5 par temps cumule, collect en tete a 100 %",
+              len(top) == 5 and "collect" in top[0]["function"] and top[0]["share"] >= 99.0, top)
+        check("scan_usage figure avec une part mesuree",
+              any("scan_usage" in r["function"] and r["share"] > 0 for r in top), top)
+        check("les deux passes du lecteur ont leur horloge CPU",
+              prof.get("scan_plain", {}).get("cpu_share") is not None
+              and prof.get("scan_profiled", {}).get("ms_per_resp") is not None,
+              (prof.get("scan_plain"), prof.get("scan_profiled")))
+        check("rien laisse (extraction, source synthetique)",
+              prof.get("cleaned") is True and os.listdir(workp) == [], os.listdir(workp))
+        out = profile_run("--synthetic", "12", "--pool", "1", "--json")
+        p1 = json.loads(out.stdout)["first_open"] if out.returncode == 0 else {}
+        check("--pool 1 : rc=0, ni rapport de vitesse ni lecture sur un autre fil",
+              out.returncode == 0 and p1.get("speedup") is None
+              and p1.get("pooled", {}).get("off_caller") is False,
+              (out.returncode, p1, out.stderr[-300:]))
+        out = profile_run("--synthetic", "0")
+        check("--synthetic 0 : refuse (rc=2), rien construit",
+              out.returncode == 2 and "REFUSED" in out.stderr and os.listdir(workp) == [],
+              (out.returncode, out.stderr[-200:], os.listdir(workp)))
+        out = profile_run("--json")
+        check("ni archive ni synthetique : refuse (rc=2)",
+              out.returncode == 2 and "REFUSED" in out.stderr, (out.returncode, out.stderr[-200:]))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
