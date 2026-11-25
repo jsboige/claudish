@@ -36,6 +36,7 @@ import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.
 import { carryServedModelHeader } from "../../handlers/shared/served-model-header.js";
 import { isQuotaExhaustion } from "../failover.js";
 import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
+import { assignRequestNumber } from "../middleware/request-logger.js";
 
 /** Headers we must not blindly forward to the upstream. */
 const HOP_BY_HOP = new Set([
@@ -840,6 +841,15 @@ export async function forwardToUpstream(
     logFallthrough(state, `hub HTTP ${res.status}`);
     return null;
   }
+
+  // RELAYED from here on: every fall-through path returned above, so this
+  // request never reaches logRequest, where a locally served one takes its
+  // number. Take it now, or the [ttft] marker the passthrough emits below
+  // resolves the global counter instead — which no relayed request advances.
+  // Measured on a NOMINAL sidecar (25/11, 6 h): 2 311 relayed [ttft] lines
+  // under ONE reqN. Readers key on it: traffic-live.ps1's session loop check
+  // reads a reqN seen >= 6 times as a stuck loop.
+    assignRequestNumber(c.req.raw);
 
   if (res.status === 529) {
     // #299 A — provider overload relayed by a LIVE hub. The hub answered, so it

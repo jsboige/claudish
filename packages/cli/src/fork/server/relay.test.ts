@@ -37,6 +37,7 @@ import {
   noticeToHeaderValue,
 } from "../../handlers/shared/failover-stream-notice.js";
 import { SERVED_MODEL_HEADER } from "../../handlers/shared/served-model-header.js";
+import { requestNumberFor } from "../middleware/request-logger.js";
 
 // ── fetch mock ─────────────────────────────────────────────────────
 const realFetch = globalThis.fetch;
@@ -2865,5 +2866,72 @@ describe("#587 g1 — flip lines carry the hub's /health fields", () => {
     fetchImpl = timeout;
     expect(await heartbeat(state)).toBe(false);
     expect(failed()[0]).toMatch(/age=5\.\ds/);
+  });
+});
+
+// ── A relayed request owns its request number ──────────────────────────────
+//
+// The [ttft] marker resolves its reqN through requestNumberFor(c.req) — the
+// number keyed to the raw Request at INGESTION. logRequest was the only writer
+// of that key, and a relayed request never reaches it: every relayed [ttft]
+// resolved the GLOBAL counter instead, which no forward advances. Measured on
+// a NOMINAL sidecar (25/11, 6 h): 2 311 relayed [ttft] lines under ONE reqN.
+// traffic-live.ps1's Session Loop Check reads a reqN seen >= 6 times as a
+// stuck loop, so a healthy relay read as one.
+describe("forwardToUpstream — a relayed request owns its request number", () => {
+  /** Capture everything the process writes to stdout for the duration of `fn`. */
+  async function captureStdout(fn: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = [];
+    const realWrite = process.stdout.write.bind(process.stdout);
+    (process.stdout as any).write = (chunk: any) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      await fn();
+    } finally {
+      (process.stdout as any).write = realWrite;
+    }
+    return lines;
+  }
+
+  it("two relayed requests → two [ttft] lines with distinct, consecutive reqN, each keyed to its own request", async () => {
+    fetchImpl = async () => sseResponse(RECOVERED_SSE);
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const ctx1 = mockForwardContext({});
+    const ctx2 = mockForwardContext({});
+
+    const written = await captureStdout(async () => {
+      for (const ctx of [ctx1, ctx2]) {
+        const forwarded = await forwardToUpstream(ctx, { model: "glm-5.2" }, state);
+        await drainResponse(forwarded); // the [ttft] is written on the first forwarded data line
+      }
+    });
+
+    const ttfts = written.filter((l) => l.includes("[ttft]"));
+    expect(ttfts.length).toBe(2);
+    const reqNs = ttfts.map((l) => Number(/reqN=(\d+)/.exec(l)![1]));
+    // The defect: both lines carried the same frozen global counter.
+    expect(new Set(reqNs).size).toBe(2);
+    expect(reqNs[1]).toBe(reqNs[0]! + 1);
+    // Each request resolves to the number its own line printed — keyed per raw
+    // Request, not read back from the global counter (ctx1's is the OLDER one).
+    expect(requestNumberFor(ctx1.req.raw)).toBe(reqNs[0]!);
+    expect(requestNumberFor(ctx2.req.raw)).toBe(reqNs[1]!);
+  });
+
+  it("a fall-through takes no number here — the local serve that follows assigns the only one", async () => {
+    // Placement pin: the number is taken once the forward is COMMITTED. Taking
+    // it before the fetch would burn one on every hub 5xx / connect failure,
+    // and the local path's logRequest then hands the same request a second.
+    const before = requestNumberFor({}); // the global counter, through an unkeyed object
+    fetchImpl = async () => new Response("boom", { status: 502 });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const ctx = mockForwardContext({});
+
+    expect(await forwardToUpstream(ctx, { model: "glm-5.2" }, state)).toBeNull();
+
+    expect(requestNumberFor({})).toBe(before); // counter untouched
+    expect(requestNumberFor(ctx.req.raw)).toBe(before); // request still unkeyed
   });
 });

@@ -24,7 +24,11 @@ returns pure noise — measured 2026-10-25, where a 24 h join across
 have no `[ttft]`" (real figure on one process: 0.3 %) and a false served-model
 split. Sizes come from the captures, which are per-request files: no ordinal, no
 restart sensitivity. If you need SERVED attribution, anchor the log window at the
-container start and assert `max(reqN) == count([Request])` before publishing.
+container start and assert `max(reqN) == count([Request])` before publishing — and
+NOT on a relay seat: since 2026-11-25 a RELAYED request takes a request number too
+(relay.ts `assignRequestNumber`, so its `[ttft]` line keys to its own request)
+while emitting no `[Request]` line, so numbering there is dense among ADMITTED
+requests, not served ones, and that assertion refuses by design.
 
 Usage:
     python scripts/prompt-size-dist.py                          # all roles, all time
