@@ -268,3 +268,21 @@ Copy-Item "$env:TEMP\pester571\*" "$env:USERPROFILE\Documents\WindowsPowerShell\
 3. Only then read the Pester failure output: `CommandNotFoundException` on `Invoke-Pester` is a load failure (1 or 2); assertion failures are the tests.
 
 A `2>&1 > file` redirect is not a capture — it sends stderr to the console and leaves the file holding stdout only. Write `> file 2>&1`.
+
+## The Python chain and the seat's own encoding (`test:scripts:py`, #1175 · #1176 · #1186)
+
+**40 files, one `&&` chain, and a dead file takes everything behind it.** `package.json` → `test:scripts:py` chains 40 `python scripts/tests/test_*.py` invocations with `&&`: a file that exits non-zero stops the chain there, so every file behind it is never run, and the run reads as "the suite crashes" rather than as one red file. `python -m pytest scripts/tests -q` runs the same tree in one process (407 tests at #1186), but the chain is what ships.
+
+**The contract lives in the test files, never in the scripts**: a test that reads a child's output must not depend on the encoding of the seat that launched it.
+
+- **Child bytes pinned to UTF-8** — `PYTHONIOENCODING=utf-8` in the child's env, or `-X utf8` for a child that runs under `-I`, where no environment variable reaches it (#1010 form);
+- **Reader always returns text** — `encoding="utf-8", errors="replace"`, and `(x or "")` on every value that used to be consumed raw.
+
+**Each layer alone fails a different way** (3 files × 4 regimes, temp dir with a non-ASCII name, po-2027, 2026-11-24; the fixed branch runs 12/12): with the child pin removed, 5/12 — the reader net stops the #1175 death, but the child dies on its own non-ASCII write (R0/R2/R3: `UnicodeEncodeError`) and, where the parent's mode moves the reader but not an `-I` child (R1), the pin compares a temp PATH to mojibake; with the reader net removed, 8/12 — the text is wrong rather than missing, and the pin asserts on mojibake in the default regimes (R0/R2). Without either, on `main`, a strict decoder raises inside `subprocess`' reader thread and hands back `stdout=None` — the pin dies on `NoneType` instead of reporting itself (#1175 signature).
+
+**Regimes, and which one proves what.** R0 default · R1 `PYTHONUTF8=1` · R2 `PYTHONIOENCODING=cp1252` (the simulator) · R3 both. Control on `main` `bdcf5cdf` (po-2027, cp1252 console, 40 chain files × 4 regimes, ASCII temp): 157/160 green — R2 alone turned **no** chain file red, because on a cp1252 seat the simulator changes nothing (both sides were already wrong the same way); R1 alone turned `per_day` red; R3 turned `per_day` and `from_archive` red. On ai-01 the simulator is not a no-op: it is what turned `harness_lanes` red there (c.7131008469). So:
+
+- on a **cp1252 seat**, prove with `PYTHONUTF8=1` and with a **non-ASCII temp dir** (`TEMP`/`TMP` carrying a non-ASCII character) — the child pin is load-bearing there: with the reader net alone, the two files that assert a temp PATH go red in the **default** regime on such a path;
+- on a seat whose default is not cp1252, the simulator is the cheap discriminator — a CI step set to it catches the child-side class, not `per_day`, which only `PYTHONUTF8=1` turns red.
+
+**A structural census finds the rest in one pass**: every text-mode `subprocess` site of `scripts/tests` that reads a child's output without `errors=` is a strict decoder. At #1186 the three fixed files carry none; 7 remain in 4 other chain files (`test_settings_matrix_{credentials,canon_age,coverage,permissions}.py`) and 6 outside the chain. They are green today because their children emit ASCII only — same shape, and they will bite the first child that prints a non-ASCII byte.
