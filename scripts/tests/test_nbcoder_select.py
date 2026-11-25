@@ -18,6 +18,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,8 +32,28 @@ ns = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ns)
 
 
+# #1186 -- the encoding contract, both halves. The child's bytes are pinned to
+# UTF-8 (PYTHONIOENCODING, so a cp1252 seat cannot make it emit its locale's
+# bytes) and the reader ALWAYS asks for UTF-8 text with errors="replace".
+# Either half alone fails differently: an unpinned child under cp1252 produces
+# bytes the reader sees as replacement chars, while a strict reader dies inside
+# subprocess' _readerthread on such bytes and hands back stdout=None with
+# returncode 0 (the #1175 signature). git does not read PYTHONIOENCODING -- for
+# it the reader's errors="replace" is the only net, which is why both halves
+# are written even where the pin is inert.
+_CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
+def run_child(argv, **kwargs):
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("env", _CHILD_ENV)
+    p = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", **kwargs)
+    p.stdout, p.stderr = p.stdout or "", p.stderr or ""
+    return p
+
+
 def git(repo: Path, *args: str) -> str:
-    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, encoding="utf-8")
+    r = run_child(["git", "-C", str(repo), *args])
     if r.returncode != 0:
         raise AssertionError(f"git {' '.join(args)} failed: {r.stderr}")
     return r.stdout
@@ -683,6 +704,19 @@ class ProofTests(unittest.TestCase):
                 ns.run_selection, ns.forge_token, ns.subprocess.run = orig
             self.assertEqual(rc, ns.EXIT_DEFECT,
                              "a corpus mismatch must refuse even when no evidence file was requested")
+
+
+class ChildEncodingContract(unittest.TestCase):
+    """#1186 -- the runtime half of the contract, on the carrier itself.
+
+    U+00C1 is UTF-8 C3 81 and cp1252 C1; 0x81 is UNDEFINED in cp1252, so a
+    strict cp1252 reader raises rather than mis-reads. A child whose stdio is
+    pinned emits C3 81 whatever regime the seat runs under.
+    """
+
+    def test_child_output_roundtrips_utf8(self):
+        out = run_child([sys.executable, "-c", "print(chr(0xC1))"]).stdout
+        self.assertEqual(out.strip(), "Á")
 
 
 if __name__ == "__main__":

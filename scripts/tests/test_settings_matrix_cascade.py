@@ -178,11 +178,32 @@ def test_a_sane_seat_has_no_structural_flag():
 # End-to-end: the CLI surface and what it prints
 # --------------------------------------------------------------------------
 
+# #1186 -- the encoding contract: child bytes pinned to UTF-8 (PYTHONIOENCODING)
+# and a reader that always asks for UTF-8 text with errors="replace". Without
+# encoding= the reader decodes with the SEAT's locale; without errors= it is
+# strict and dies in subprocess' _readerthread on undecodable bytes, handing
+# back stdout=None with returncode 0 (the #1175 signature).
+_CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
+
+
 def _run(*argv):
-    return subprocess.run(
+    p = subprocess.run(
         [sys.executable, _TARGET, *argv],
-        capture_output=True, text=True, encoding="utf-8",
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=_CHILD_ENV,
     )
+    p.stdout, p.stderr = p.stdout or "", p.stderr or ""
+    return p
+
+
+def test_child_output_roundtrips_utf8():
+    # The runtime half, on the carrier: U+00C1 is UTF-8 C3 81 and cp1252 C1;
+    # 0x81 is undefined in cp1252, so a strict cp1252 reader raises instead of
+    # mis-reading, and a locale-decoding reader would return "Ã".
+    p = subprocess.run([sys.executable, "-c", "print(chr(0xC1))"],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=_CHILD_ENV)
+    assert (p.stdout or "").strip() == "Á", repr(p.stdout)
 
 
 def _write(path, text):

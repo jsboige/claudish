@@ -54,6 +54,22 @@ _spec = importlib.util.spec_from_file_location("taut", _TARGET)
 taut = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(taut)
 
+# #1186 -- the encoding contract, both halves. Child bytes are pinned to UTF-8
+# (PYTHONIOENCODING, so a cp1252 seat cannot make the child emit its locale's
+# bytes) and the reader always asks for UTF-8 text with errors="replace": a
+# reader without encoding= decodes with the seat's locale, and a strict reader
+# dies inside subprocess' _readerthread on undecodable bytes -- stdout=None
+# with returncode 0 (the #1175 signature).
+_CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
+def run_child(argv, **kwargs):
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("env", _CHILD_ENV)
+    p = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", **kwargs)
+    p.stdout, p.stderr = p.stdout or "", p.stderr or ""
+    return p
+
 
 def _check(cond, msg):
     if not cond:
@@ -241,11 +257,10 @@ def pin_e2e_sample_and_stats():
                 fh.write(body)
         work = os.path.join(tmp, "work")
         out = os.path.join(tmp, "wl.jsonl")
-        r = subprocess.run([sys.executable, _TARGET, "sample", "--dir", tmp,
-                            "--era", "t", "--n", "10", "--seed", "328",
-                            "--stratify", "none", "--workdir", work,
-                            "--out", out],
-                           capture_output=True, text=True)
+        r = run_child([sys.executable, _TARGET, "sample", "--dir", tmp,
+                       "--era", "t", "--n", "10", "--seed", "328",
+                       "--stratify", "none", "--workdir", work,
+                       "--out", out])
         _check(r.returncode == 0, "e2e sample rc=%d stderr=%s" % (r.returncode, r.stderr[:400]))
         rows = [json.loads(l) for l in open(out, encoding="utf-8") if l.strip()]
         _check(len(rows) == 2, "both same-counter turns must appear, got %d" % len(rows))
@@ -259,8 +274,7 @@ def pin_e2e_sample_and_stats():
         _check(lanes == ["anthropic/MiniMax-M3", "openai/glm-5.2"],
                "each turn pairs with ITS OWN window's lane, got %r" % lanes)
         # stats: no literal "if n else 0", and a pairing block exists
-        r2 = subprocess.run([sys.executable, _TARGET, "stats", "--worklist", out],
-                            capture_output=True, text=True)
+        r2 = run_child([sys.executable, _TARGET, "stats", "--worklist", out])
         _check(r2.returncode == 0, "e2e stats rc=%d" % r2.returncode)
         _check("if n else 0" not in r2.stdout,
                "cmd_stats must not print the literal 'if n else 0'")
@@ -323,6 +337,15 @@ def pin_scratch_root_env_override():
            % mod.SCRATCH_ROOT)
 
 
+def pin_child_encoding_contract():
+    # #1186 -- the runtime half, on the carrier: U+00C1 is UTF-8 C3 81 and
+    # cp1252 C1; 0x81 is undefined in cp1252, so a strict cp1252 reader raises
+    # rather than mis-reads. A locale-decoding reader would return "Ã" here.
+    p = run_child([sys.executable, "-c", "print(chr(0xC1))"])
+    _check(p.stdout.strip() == "Á",
+           "child encoding: U+00C1 must survive the reader, got %r" % p.stdout)
+
+
 def main():
     pin_req_re_ip_chain_and_direct()
     pin_resp_re_lane()
@@ -337,7 +360,8 @@ def main():
     pin_e2e_sample_and_stats()
     pin_scratch_root_defaults_under_repo_tmp()
     pin_scratch_root_env_override()
-    print("test_turn_autopsy: 13 pins OK (target: %s)" % _TARGET)
+    pin_child_encoding_contract()
+    print("test_turn_autopsy: 14 pins OK (target: %s)" % _TARGET)
 
 
 if __name__ == "__main__":
