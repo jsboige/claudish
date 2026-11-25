@@ -438,6 +438,153 @@ def pin_gh_write_class_and_precedence():
            "pr outranks dash within one tour, got %r" % agg["workspaces"]["claudish"]["classes"])
 
 
+def pin_tours_by_machine_and_model():
+    """16. ONE WORKSPACE NAME, SEVERAL LANES (#445 table, queue 24c) — Swift on
+    ai-01 and MiniMax on po-2028 share a checkout name, and the workspace row
+    merges them. The same tours are counted per machine and per requested
+    model; every tour and every PR creation is counted ONCE across machines."""
+    create = lambda uid: (uid, "Bash") + wsattr.classify_tool_use(
+        "Bash", {"command": "gh pr create --title x"})
+
+    def row(sess, machine, model, uses):
+        return {"day": "2026-10-29", "ws": "coursia", "session": sess, "compacted": False,
+                "cron": False, "uses": uses, "machine": machine, "model": model}
+    rows = [
+        # s1 on ai-01 creates one PR; its next request replays the same id
+        row("s1", "myia-ai-01", "swift", [create(b"p1")]),
+        row("s1", "myia-ai-01", "swift", [create(b"p1")]),
+        # s2 on po-2028 creates two; s3, same machine, writes nothing
+        row("s2", "myia-po-2028", "MiniMax-M3", [create(b"p2"), create(b"p3")]),
+        row("s3", "myia-po-2028", "MiniMax-M3", [(b"a3", "Read") + (None, False)]),
+        # s6 replays p1 on ANOTHER machine (a session carried over): p1 stays
+        # ai-01's — one creation, credited to its first-seen tour
+        row("s6", "myia-po-2028", "MiniMax-M3", [create(b"p1")]),
+        # a seat that names neither
+        row("s4", "", "", [(b"a4", "Read") + (None, False)]),
+        # a row built the old way: no machine / model key at all
+        {"day": "2026-10-29", "ws": "coursia", "session": "s5", "compacted": False,
+         "cron": False, "uses": [(b"a5", "Read") + (None, False)]},
+    ]
+    agg = wsattr.aggregate_writes(rows, {"2026-10-29": 10})
+    w = agg["workspaces"]["coursia"]
+    _check(w["tours"] == 6 and w["pr_create_counted"] == 3,
+           "the workspace row is unchanged: 6 tours, 3 PR created, got %r/%r"
+           % (w["tours"], w["pr_create_counted"]))
+    _check(w["by_machine"] == {"myia-ai-01": {"tours": 1, "reqs": 2, "pr_create_counted": 1},
+                               "myia-po-2028": {"tours": 3, "reqs": 3, "pr_create_counted": 2},
+                               "direct": {"tours": 2, "reqs": 2, "pr_create_counted": 0}},
+           "tours per machine, a nameless machine under direct, got %r" % (w["by_machine"],))
+    _check(w["by_model"] == {"(none)": {"tours": 2, "reqs": 2, "pr_create_counted": 0},
+                             "MiniMax-M3": {"tours": 3, "reqs": 3, "pr_create_counted": 2},
+                             "swift": {"tours": 1, "reqs": 2, "pr_create_counted": 1}},
+           "tours per REQUESTED model, a nameless one under (none), got %r" % (w["by_model"],))
+    _check(w["by_machine"]["myia-po-2028"]["pr_create_counted"] == 2,
+           "p1 was created on ai-01: its replay on po-2028 is not a second creation")
+    for field in ("by_machine", "by_model"):
+        _check(sum(b["tours"] for b in w[field].values()) == w["tours"]
+               and sum(b["pr_create_counted"] for b in w[field].values()) == w["pr_create_counted"],
+               "%s must sum to the workspace row — a creation replayed on another machine "
+               "is one creation" % field)
+
+
+def pin_write_rows_carry_the_envelope_machine():
+    """16b. THE PRODUCTION CALLER — `read_write_rows` reads `machine` and
+    `model` from the capture envelope; a body-only capture yields the body's
+    model and no machine. py7zr absent is a FAILURE here, never a skip."""
+    try:
+        import py7zr
+    except ImportError as exc:
+        raise AssertionError("py7zr is not importable: %s" % exc)
+    import tempfile
+
+    def capture(machine, model, session):
+        env = {"ts": "2026-10-29T10-00-00-000Z", "src": "direct", "machine": machine,
+               "model": model, "body": {
+                   "metadata": {"user_id": '{"device_id":"d","session_id":"%s"}' % session},
+                   "model": "glm-5.3",
+                   "messages": [{"role": "user", "content": "<env>\nPrimary working directory: "
+                                "d:\\dev\\coursia\n</env>"},
+                               {"role": "assistant", "content": [
+                                   {"type": "tool_use", "id": "toolu_%s" % session,
+                                    "name": "Bash", "input": {"command": "gh pr create --title x"}}]}]}}
+        return json.dumps(env).encode()
+
+    bare = json.dumps({"model": "MiniMax-M3",
+                       "metadata": {"user_id": '{"session_id":"00000000-0000-0000-0000-000000000003"}'},
+                       "messages": [{"role": "user", "content": "<env>\nPrimary working "
+                                    "directory: d:\\dev\\coursia\n</env>"}]}).encode()
+    day = "2026-10-29"
+    names = ["req-1-0001-%sT10-00-00-000Z-direct.json" % day,
+             "req-1-0002-%sT10-00-01-000Z-direct.json" % day,
+             "req-1-0003-%sT10-00-02-000Z-direct.json" % day]
+    tmp = tempfile.mkdtemp(prefix="wsattr-machine-")
+    try:
+        with py7zr.SevenZipFile(os.path.join(tmp, "captures-%s.7z" % day), "w") as z:
+            z.writestr(capture("myia-ai-01", "swift",
+                               "00000000-0000-0000-0000-000000000001"), names[0])
+            z.writestr(capture("myia-po-2028", "MiniMax-M3",
+                               "00000000-0000-0000-0000-000000000002"), names[1])
+            z.writestr(bare, names[2])
+        scratch = os.path.join(tmp, "scratch")
+        os.makedirs(scratch)
+        rows = wsattr.read_write_rows(day, names, [tmp], scratch)
+        _check(len(rows) == 3, "3 request members read, got %d" % len(rows))
+        got = {r["session"][-1]: (r["machine"], r["model"]) for r in rows}
+        _check(got == {"1": ("myia-ai-01", "swift"), "2": ("myia-po-2028", "MiniMax-M3"),
+                       "3": ("", "MiniMax-M3")},
+               "envelope machine + envelope model; a body-only capture: no machine, the "
+               "body's model, got %r" % (got,))
+        _check(rows[0]["ws"] == "coursia", "the workspace key is still read, got %r" % rows[0]["ws"])
+        w = wsattr.aggregate_writes(rows, {day: 3})["workspaces"]["coursia"]
+        _check(w["tours"] == 3 and w["by_machine"] == {
+            "direct": {"tours": 1, "reqs": 1, "pr_create_counted": 0},
+            "myia-ai-01": {"tours": 1, "reqs": 1, "pr_create_counted": 1},
+            "myia-po-2028": {"tours": 1, "reqs": 1, "pr_create_counted": 1}},
+           "through the caller: 3 tours, one per machine, got %r" % (w["by_machine"],))
+        _check(os.listdir(scratch) == [], "nothing left in the scratch dir, got %r"
+               % os.listdir(scratch))
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def pin_pr_creation_follows_its_tour_not_its_session():
+    """16c. THE FIRST-SEEN KEY IS A TOUR, NOT A SESSION — one session id can span
+    two days and two machines (a cron lane, a model switch mid-session), and a
+    PR creation must follow the tour that made it. Testing the session alone
+    credits the id in EVERY tour of that session: the per-machine sums then
+    exceed the workspace row (review 24/11, one-line fix in `by()`)."""
+    create = lambda uid: (uid, "Bash") + wsattr.classify_tool_use(
+        "Bash", {"command": "gh pr create --title x"})
+
+    def row(day, sess, machine, model, uses):
+        return {"day": day, "ws": "coursia", "session": sess, "compacted": False,
+                "cron": False, "uses": uses, "machine": machine, "model": model}
+    rows = [
+        # s1 on day 1 (ai-01 / swift) creates p1; its next request replays it
+        row("2026-10-28", "s1", "myia-ai-01", "swift", [create(b"p1")]),
+        row("2026-10-28", "s1", "myia-ai-01", "swift", [create(b"p1")]),
+        # the SAME session id on day 2 (po-2028 / MiniMax-M3) replays p1 and
+        # creates p2 there: one session, two days, two machines, two models
+        row("2026-10-29", "s1", "myia-po-2028", "MiniMax-M3", [create(b"p1"), create(b"p2")]),
+    ]
+    w = wsattr.aggregate_writes(rows, {"2026-10-28": 2, "2026-10-29": 1})["workspaces"]["coursia"]
+    _check(w["tours"] == 2 and w["pr_create_counted"] == 2,
+           "one session over two days is two tours and two creations, got %r/%r"
+           % (w["tours"], w["pr_create_counted"]))
+    _check(w["by_machine"] == {"myia-ai-01": {"tours": 1, "reqs": 2, "pr_create_counted": 1},
+                               "myia-po-2028": {"tours": 1, "reqs": 1, "pr_create_counted": 1}},
+           "each creation follows its own tour: p1 to day 1 / ai-01, p2 to day 2 / "
+           "po-2028, got %r" % (w["by_machine"],))
+    _check(w["by_model"] == {"swift": {"tours": 1, "reqs": 2, "pr_create_counted": 1},
+                             "MiniMax-M3": {"tours": 1, "reqs": 1, "pr_create_counted": 1}},
+           "same on the model axis, got %r" % (w["by_model"],))
+    for field in ("by_machine", "by_model"):
+        _check(sum(b["pr_create_counted"] for b in w[field].values()) == w["pr_create_counted"],
+               "%s must sum to the workspace row — the session alone credits p1 to both "
+               "days and p2 to day 1's machine" % field)
+
+
 def pin_served_model_from_resp_name():
     # Shapes copied from real captures (06/22 archive and the live 11/05 dir).
     sse = wsattr.served_model("resp-1-r0003-2026-06-22T06-55-49-811Z-openai-qwen3.6-35b-a3b.sse")
@@ -542,6 +689,9 @@ PINS = [
     pin_toolsearch_is_not_a_dashboard_write,
     pin_compaction_flags_the_tour,
     pin_gh_write_class_and_precedence,
+    pin_tours_by_machine_and_model,
+    pin_write_rows_carry_the_envelope_machine,
+    pin_pr_creation_follows_its_tour_not_its_session,
     pin_fleet_push_forms_and_quoted_words,
     pin_dm_send_is_a_write,
     pin_cron_stamp_is_per_request_and_header_confined,
