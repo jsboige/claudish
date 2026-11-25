@@ -64,6 +64,12 @@ HDR = re.compile(r"^#\s*parser=(\S+)\s+model=(\S+)\s+reqN=(\d+)\s+pid=(\d+)", re
 RESP_TS = re.compile(r"resp-\d+-r\d+-(\d{4}-\d{2}-\d{2}T[\d-]+Z)-")
 
 MACHINE_FIELD = re.compile(r'"machine"\s*:\s*"([^"]*)"')
+# Modele DEMANDE : le `model` de l'enveloppe (request-logger.ts le siege a
+# moins de 400 octets du debut, avant tout champ fourni par le client). La
+# recherche est bornee au debut de la tete : dans le corps, un `"model"` d'un
+# resultat d'outil ne doit pas gagner. Sert le decompte des sans-reponse.
+MODEL_FIELD = re.compile(r'"model"\s*:\s*"([^"]+)"')
+REQ_ENVELOPE_BYTES = 4096
 # #1055 — lane harnais (champ enveloppe, TOUJOURS ecrit cote proxy depuis
 # #1055 : "" = pas de lane, cle absente = capture pre-#1055). La recherche est
 # BORNEE a la zone avant "body" : sur un corpus pre-#1055, une occurrence de
@@ -270,12 +276,14 @@ def load_requests(cdir, cutoff_dt, seen=None, until_dt=None, names=None):
         # #1055 — borné à l'enveloppe (avant "body") : voir LANE_FIELD.
         env = head[: head.find('"body"')] if '"body"' in head else head
         lm = LANE_FIELD.search(env)
+        dm = MODEL_FIELD.search(head[:REQ_ENVELOPE_BYTES])
         reqs[(int(m.group(1)), int(m.group(2)))].append({
             "ts": m.group(3),
             "machine": mm.group(1) if mm else "",
             "ep": em.group(1) if em else "",
             "wl": wm.group(1) if wm else "",
             "hlane": lm.group(1) if lm else "",
+            "model": dm.group(1) if dm else "",
         })
     for v in reqs.values():
         v.sort(key=lambda d: d["ts"])
@@ -456,6 +464,79 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
     return days
 
 
+def request_accounting(reqs, answered, bound_dt=None, max_paired_lag_s=None):
+    """Requetes lues, repondues, sans reponse — et OU tombent les sans-reponse.
+
+    Une requete = un fichier req-* (cle (pid, reqN, estample)). Repondue = au
+    moins une resp l'a choisie (pick_request) ; une requete servie par deux
+    fichiers de reponse (un changement de fournisseur en cours de flux rouvre
+    un analyseur) compte UNE fois. Sans reponse = le proxy n'a ferme aucun
+    analyseur pour elle : refus amont terminal, refus local, abandon du client
+    avant les en-tetes, ecriture perdue. Le lecteur ne dit PAS la cause — il
+    dit qui, quel modele, a quelle heure : une cause se lit dans ce portrait.
+
+    Sixieme mecanisme (review ai-01 du 24/11) : un resp-* est horodate a la
+    FERMETURE du flux et collect() borne les deux tetes a [cutoff, until). Une
+    requete admise avant until dont le flux ferme APRES until tombe donc dans
+    `unanswered` par construction — ce n'est pas un refus. Sa taille se mesure,
+    sans constante choisie : `unanswered_tail` compte les sans-reponse admis a
+    moins de L de la borne haute, L = le plus grand ecart requete->reponse
+    observe parmi les paires APPARIEES de la meme lecture ; en mode live
+    (until=None) la borne est la resp la plus recente lue. `unanswered_residue`
+    est le reste. Les deux valent None quand L n'est pas mesurable (aucune
+    paire appariee, aucune resp) : une absence, jamais un zero. Le miroir a la
+    borne basse est `files.unpaired` — le meme flux a cheval sur minuit, vu de
+    l'autre tete. La classe n'est ni une cause par requete ni un majorant
+    strict : un flux plus long que tout lag apparie reste dans le residu, et
+    un lag apparie aberrant (une resp tombee sur une requete plus ancienne de
+    la meme cle) elargit la classe — L se lit avec le decompte.
+
+    Le 22/11 (lecture archive du 24/11) : 65 120 req-* contre 63 915 resp-*.
+    C'est un ecart de FICHIERS ; le nombre de requetes concernees est celui
+    d'ici, et il ne s'en deduisait pas.
+
+    -> {"total", "answered", "unanswered", "unanswered_tail",
+        "unanswered_residue", "tail_from", "max_paired_lag_s",
+        "by_machine", "by_model", "by_hour", "by_bucket"}
+       — chaque by_* : {cle : {requests, unanswered}}.
+    """
+    def tally(key_of):
+        t = defaultdict(lambda: {"requests": 0, "unanswered": 0})
+        for (pid, reqn), lst in reqs.items():
+            for r in lst:
+                row = t[key_of(r)]
+                row["requests"] += 1
+                if (pid, reqn, r["ts"]) not in answered:
+                    row["unanswered"] += 1
+        return {k: t[k] for k in sorted(t)}
+
+    total = sum(len(lst) for lst in reqs.values())
+    unanswered = total - len(answered)
+    # La queue de fenetre : ce qu'une fermeture apres la borne expliquerait.
+    tail = residue = None
+    tail_from = None
+    if bound_dt is not None and max_paired_lag_s is not None:
+        tail_from = bound_dt - timedelta(seconds=max_paired_lag_s)
+        tail = 0
+        for (pid, reqn), lst in reqs.items():
+            for r in lst:
+                if (pid, reqn, r["ts"]) in answered:
+                    continue
+                r_dt = capture_dt(r.get("ts") or "")
+                if r_dt is not None and r_dt >= tail_from:
+                    tail += 1
+        tail = min(tail, unanswered)
+        residue = unanswered - tail
+    return {"total": total, "answered": len(answered), "unanswered": unanswered,
+            "unanswered_tail": tail, "unanswered_residue": residue,
+            "tail_from": tail_from.isoformat() if tail_from else None,
+            "max_paired_lag_s": max_paired_lag_s,
+            "by_machine": tally(lambda r: r.get("machine") or "direct"),
+            "by_model": tally(lambda r: r.get("model") or "(none)"),
+            "by_hour": tally(lambda r: (r.get("ts") or "?")[11:13]),
+            "by_bucket": tally(bucket_of)}
+
+
 def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
     """LE scan : l'union des racines (#1180), dedupliquee par NOM de fichier
     (premiere racine gagne). Une seule copie des regles de lecture — la
@@ -503,6 +584,8 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
     by_day = defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)) if per_day else {}
     n_resp = n_paired = n_unpaired = n_nousage = 0
     first_dt = last_dt = None
+    max_paired_lag_s = None   # L de la queue de fenetre (request_accounting)
+    answered = set()     # (pid, reqN, estample) des requetes qu'une resp a choisies
 
     # #1180 — resp de toutes les racines LUES, union dedupliquee par nom de
     # fichier (premiere racine gagne).
@@ -548,6 +631,16 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
             n_paired += 1
             bucket = bucket_of(req)
             info = req
+            answered.add((pid, reqn, req["ts"]))
+            # L (review 24/11) : l'ecart requete->reponse des paires APPARIEES
+            # de CETTE lecture. La resp est horodatee a la fermeture du flux :
+            # son retard mesure la fenetre dans laquelle une requete sans
+            # reponse peut etre un flux encore ouvert a la borne, pas un refus.
+            req_dt = capture_dt(req.get("ts") or "")
+            if req_dt is not None:
+                lag_s = (dt - req_dt).total_seconds()
+                if lag_s >= 0 and (max_paired_lag_s is None or lag_s > max_paired_lag_s):
+                    max_paired_lag_s = lag_s
         u = usage_of(txt)
         if not u:
             n_nousage += 1
@@ -575,8 +668,13 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
             r["cread"] += cread
             r["ccre"] += ccre
 
+    # La borne haute de la lecture : `until` du mode jour, sinon la resp la
+    # plus recente lue (mode live) — jamais un « maintenant » implicite.
+    bound_dt = until_dt if until_dt is not None else last_dt
     return {"files": {"resp": n_resp, "paired": n_paired, "unpaired": n_unpaired,
                       "no_usage": n_nousage},
+            "requests": request_accounting(reqs, answered, bound_dt=bound_dt,
+                                           max_paired_lag_s=max_paired_lag_s),
             "lanes": lanes, "machines": machines, "hlanes": hlanes,
             "per_day": by_day, "reqs": reqs,
             "first_dt": first_dt, "last_dt": last_dt,
@@ -606,6 +704,7 @@ def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet
             # `uncovered` nomme les racines refusees par listdir
             "coverage": coverage,
             "files": files,
+            "requests": res.get("requests"),
             "lanes": {k: v for k, v in lanes.items()},
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
             "harness_lanes": {k: v for k, v in hlanes.items()} if args.harness_lanes else None,
@@ -631,6 +730,19 @@ def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet
     print(f"fenetre: {window_hours}h demandees | {couv}")
     print(coverage_line(coverage))
     print(f"resp: {files['resp']} | appariees: {files['paired']} | non appariees: {files['unpaired']} | sans usage: {files['no_usage']}")
+    _rq = res.get("requests")
+    if _rq:
+        _pct = 100.0 * _rq["unanswered"] / _rq["total"] if _rq["total"] else 0.0
+        print(f"req: {fmt_int(_rq['total'])} | repondues: {fmt_int(_rq['answered'])} | "
+              f"sans reponse: {fmt_int(_rq['unanswered'])} ({_pct:.1f} %)")
+        if _rq.get("unanswered_tail") is not None:
+            print(f"sans reponse, queue de fenetre: {fmt_int(_rq['unanswered_tail'])} "
+                  f"(admises a partir de {_rq['tail_from']}, L = "
+                  f"{_rq['max_paired_lag_s']:.0f} s mesure sur les paires lues) | "
+                  f"reste: {fmt_int(_rq['unanswered_residue'])}")
+        else:
+            print("sans reponse, queue de fenetre: non mesurable (aucune paire "
+                  "appariee dans la lecture) — une absence, pas un zero")
     pp = _load_partial_parts()
     for _line in pp.section(cdir, cutoff_dt, now_dt, res=partial):
         print(_line)

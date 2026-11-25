@@ -34,6 +34,7 @@ the seats, so neither this process nor its children run under `-I`.
 Run: python scripts/tests/test_traffic_consumption_from_archive.py
 """
 
+import argparse
 import importlib.util
 import json
 import os
@@ -41,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS = os.path.join(_HERE, "..")
@@ -494,6 +496,290 @@ def main():
         left = os.path.join(work11, "traffic-days")
         check("aucune extraction laissee", not os.path.exists(left) or os.listdir(left) == [],
               os.listdir(left) if os.path.exists(left) else "-")
+
+        # A12 — requetes sans reponse : un ecart de FICHIERS n'est pas un nombre
+        # de requetes. Deux req-* seuls s'ajoutent aux 3 paires du corpus.
+        print("A12 — requetes sans reponse : comptees, situees, jamais causees")
+        lone1, lone2 = pair_names(700, 1, DAY, "1030")[0], pair_names(701, 1, DAY, "1031")[0]
+        body1 = ('{"machine":"myia-po-2027","model":"kimi-k2.5","entrypoint":"cli",'
+                 '"workload":"interactive","lane":"","body":{"model":"glm-5.3"}}')
+        body2 = '{"src":"direct","body":{"model":"deepseek-r1","messages":[]}}'
+        root12 = build(tmp, n=3, extra_members=[(lone1, body1.encode()), (lone2, body2.encode())],
+                       name="corpus12")
+        work12 = os.path.join(tmp, "w12")
+        os.makedirs(work12)
+        out = read_day(root12, os.path.join(work12, "traffic-days.json"), work12)
+        check("A12 rc=0", out.returncode == 0, out.stderr[-500:])
+        rq = json.loads(out.stdout).get("requests")
+        check("5 requetes, 3 repondues, 2 sans reponse",
+              rq and (rq["total"], rq["answered"], rq["unanswered"]) == (5, 3, 2), rq)
+        check("par machine : la sans-reponse est situee",
+              rq and rq["by_machine"] == {"direct": {"requests": 1, "unanswered": 1},
+                                          "myia-po-2023": {"requests": 3, "unanswered": 0},
+                                          "myia-po-2027": {"requests": 1, "unanswered": 1}},
+              rq and rq["by_machine"])
+        check("par modele DEMANDE : l'enveloppe gagne, pas le corps",
+              rq and rq["by_model"] == {"(none)": {"requests": 3, "unanswered": 0},
+                                        "deepseek-r1": {"requests": 1, "unanswered": 1},
+                                        "kimi-k2.5": {"requests": 1, "unanswered": 1}},
+              rq and rq["by_model"])
+        check("par heure UTC et par bucket",
+              rq and rq["by_hour"] == {"10": {"requests": 5, "unanswered": 2}}
+              and rq["by_bucket"] == {"cron": {"requests": 3, "unanswered": 0},
+                                      "interactive": {"requests": 1, "unanswered": 1},
+                                      "other": {"requests": 1, "unanswered": 1}},
+              rq and (rq["by_hour"], rq["by_bucket"]))
+        check("la cause n'est pas inventee : aucune cle de cause",
+              rq and not [k for k in rq if "cause" in k or "reason" in k], rq and sorted(rq))
+        out = run(root12, os.path.join(work12, "traffic-days-b.json"), work12, "--from-archive", DAY)
+        check("rapport texte : la ligne req | repondues | sans reponse",
+              out.returncode == 0
+              and "req: 5 | repondues: 3 | sans reponse: 2 (40.0 %)" in out.stdout,
+              (out.returncode, out.stdout[-500:]))
+
+        # A12b (review ai-01 du 24/11, finding 1) — le SIXIEME mecanisme : un
+        # resp-* est horodate a la FERMETURE du flux, et collect() borne les
+        # deux tetes. Une requete admise avant la borne dont le flux ferme
+        # apres elle est « sans reponse » PAR CONSTRUCTION. Elle se rapporte a
+        # part (la queue de fenetre), et L se mesure sur les paires appariees
+        # de la meme lecture — aucune constante choisie.
+        print("A12b — flux ferme apres la borne : queue de fenetre, pas residu")
+        tc = _load("tc", "traffic-consumption.py")
+        tail_dir = os.path.join(tmp, "tail")
+        os.makedirs(tail_dir)
+
+        def put(folder, fn, text):
+            with open(os.path.join(folder, fn), "w") as fh:
+                fh.write(text)
+
+        def req_text(machine="myia-po-2023"):
+            return ('{"machine":"%s","entrypoint":"cli","workload":"cron","lane":"",'
+                    '"body":{"messages":[]}}' % machine)
+
+        def resp_text(pid, reqn):
+            return f"# parser=openai-sse model=glm-5.3 reqN={reqn} pid={pid}\n" + SSE
+
+        # paire A : admise 12:00:00, flux ferme 12:04:00 -> L = 240 s
+        put(tail_dir, "req-900-0001-2026-11-22T12-00-00-123Z-direct.json", req_text())
+        put(tail_dir, "resp-900-r0001-2026-11-22T12-04-00-456Z-openai-sse-glm-5.3.sse",
+            resp_text(900, 1))
+        # paire B : admise 23:58:00, flux ferme le lendemain 00:01:30
+        put(tail_dir, "req-901-0001-2026-11-22T23-58-00-123Z-direct.json", req_text("myia-po-2027"))
+        put(tail_dir, "resp-901-r0001-2026-11-23T00-01-30-456Z-openai-sse-glm-5.3.sse",
+            resp_text(901, 1))
+        d22 = datetime(2026, 11, 22, tzinfo=timezone.utc)
+        d23 = d22 + timedelta(days=1)
+        r1 = tc.collect([tail_dir], d22, until_dt=d23)["requests"]
+        check("A12b fenetre du 22/11 : 2 requetes, 1 repondue, 1 sans reponse (reproduit)",
+              (r1["total"], r1["answered"], r1["unanswered"]) == (2, 1, 1),
+              {k: r1[k] for k in ("total", "answered", "unanswered")})
+        check("A12b L = le plus grand ecart requete->reponse des paires lues (240 s), "
+              "et la borne qui en decoule (23:56:00)",
+              r1["max_paired_lag_s"] == 240
+              and r1["tail_from"] == "2026-11-22T23:56:00+00:00",
+              (r1["max_paired_lag_s"], r1["tail_from"]))
+        check("A12b LA PIN — elle tombe dans la queue de fenetre, pas dans le residu",
+              (r1["unanswered_tail"], r1["unanswered_residue"]) == (1, 0),
+              (r1["unanswered_tail"], r1["unanswered_residue"]))
+        r2 = tc.collect([tail_dir], d22, until_dt=d23 + timedelta(minutes=5))["requests"]
+        check("A12b fenetre elargie de 5 min : la meme paire est repondue, plus rien en queue",
+              (r2["answered"], r2["unanswered"], r2["unanswered_tail"]) == (2, 0, 0),
+              {k: r2[k] for k in ("answered", "unanswered", "unanswered_tail")})
+        early = os.path.join(tmp, "tail-early")
+        os.makedirs(early)
+        for fn in os.listdir(tail_dir):
+            shutil.copy(os.path.join(tail_dir, fn), early)
+        put(early, "req-902-0001-2026-11-22T03-00-00-123Z-direct.json", req_text())
+        r3 = tc.collect([early], d22, until_dt=d23)["requests"]
+        check("A12b une sans-reponse loin de la borne reste du residu",
+              (r3["unanswered"], r3["unanswered_tail"], r3["unanswered_residue"]) == (2, 1, 1),
+              {k: r3[k] for k in ("unanswered", "unanswered_tail", "unanswered_residue")})
+        r4 = tc.collect([tail_dir], d22)["requests"]
+        check("A12b mode live (until=None) : borne = la resp la plus recente lue, "
+              "la paire a cheval est repondue",
+              (r4["answered"], r4["unanswered"], r4["tail_from"])
+              == (2, 0, "2026-11-22T23:57:30+00:00"),
+              {k: r4[k] for k in ("answered", "unanswered", "tail_from")})
+        lonely = os.path.join(tmp, "tail-lonely")
+        os.makedirs(lonely)
+        put(lonely, "req-903-0001-2026-11-22T10-00-00-123Z-direct.json", req_text())
+        r5 = tc.collect([lonely], d22, until_dt=d23)["requests"]
+        check("A12b aucune paire appariee : la queue est NON MESURABLE (None), jamais 0",
+              r5["unanswered"] == 1 and r5["unanswered_tail"] is None
+              and r5["unanswered_residue"] is None and r5["tail_from"] is None, r5)
+
+        # A12c (review ai-01 du 24/11, finding 2) — la borne de 4 Kio
+        # (REQ_ENVELOPE_BYTES) : aucun `model` dans les 4 premiers Kio, puis un
+        # `"model"` d'entree d'outil APRES. Sans la borne, le mutant
+        # `MODEL_FIELD.search(head)` lit « sonnet » et fabrique un modele demande.
+        print("A12c — borne de l'enveloppe : un model d'outil apres 4 Kio ne gagne pas")
+        pad = "x" * 4300
+        body4k = ('{"machine":"myia-po-2024","entrypoint":"cli","workload":"interactive","lane":"",'
+                  '"body":{"messages":[{"role":"user","content":"' + pad + '"},'
+                  '{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1",'
+                  '"name":"Task","input":{"description":"d","prompt":"p","model":"sonnet"}}]}]}}')
+        check("A12c fixture : aucun model avant 4 Kio, un apres",
+              '"model"' not in body4k[:4096] and '"model":"sonnet"' in body4k[4096:],
+              body4k.find('"model"'))
+        name4k = "req-800-0001-%sT10-40-00-123Z-direct.json" % DAY
+        root4k = build(tmp, n=1, extra_members=[(name4k, body4k.encode())], name="corpus4k")
+        work4k = os.path.join(tmp, "w4k")
+        os.makedirs(work4k)
+        out = read_day(root4k, os.path.join(work4k, "traffic-days.json"), work4k)
+        rq4 = json.loads(out.stdout).get("requests") if out.returncode == 0 else None
+        check("A12c rc=0 et 2 requetes lues (la paire du jour + la fixture)",
+              out.returncode == 0 and rq4 and rq4["total"] == 2, (out.returncode, out.stderr[-400:]))
+        check("A12c LA PIN — cle (none) : le model d'outil apres 4 Kio n'est pas le modele demande",
+              rq4 and rq4["by_model"] == {"(none)": {"requests": 2, "unanswered": 1}},
+              rq4 and rq4["by_model"])
+        check("A12c la machine d'enveloppe est toujours lue (la borne ne coupe que le modele)",
+              rq4 and rq4["by_machine"] == {"myia-po-2023": {"requests": 1, "unanswered": 0},
+                                            "myia-po-2024": {"requests": 1, "unanswered": 1}},
+              rq4 and rq4["by_machine"])
+
+        # P — le profil du scan, en mode synthetique (aucune capture lue) : la
+        # voie archive entiere, trois phases, top 5 avec parts, rien laisse.
+        print("P — archive-scan-profile --synthetic : trois phases, top 5, rien laisse")
+        workp = os.path.join(tmp, "wp")
+        os.makedirs(workp)
+        prof_tool = os.path.join(_SCRIPTS, "archive-scan-profile.py")
+        # Le profiteur enfant ecrit dans SON encodage de sortie :
+        # PYTHONIOENCODING quand elle est posee (le contrat cp1252 de la chaine),
+        # sinon le defaut de locale -- le meme que ce parent. `text=True` seul
+        # suppose de l'UTF-8 et meurt en mode UTF-8 sous PYTHONIOENCODING=cp1252.
+        child_enc = (os.environ.get("PYTHONIOENCODING") or "").split(":")[0] or None
+
+        def profile_run(*extra):
+            return subprocess.run([sys.executable, prof_tool, "--work-dir", workp,
+                                   "--extract-root", workp, *extra],
+                                  capture_output=True, text=True,
+                                  encoding=child_enc, errors="replace")
+
+        out = profile_run("--synthetic", "12", "--json")
+        check("P rc=0", out.returncode == 0, out.stderr[-400:])
+        prof = json.loads(out.stdout) if out.returncode == 0 else {}
+        check("12 resp + 12 req selectionnes, extraits et lus",
+              prof.get("extracted") == 24 and prof.get("selected", {}).get("resp") == 12
+              and prof.get("sample", {}).get("resp") == 12
+              and prof.get("sample", {}).get("req") == 12
+              and prof.get("sample", {}).get("unanswered") == 0, (prof.get("selected"), prof.get("sample")))
+        fo = prof.get("first_open", {})
+        check("premiere ouverture : une moitie en serie, une par pool",
+              fo.get("serial", {}).get("files") == 12 and fo.get("pooled", {}).get("files") == 12
+              and fo.get("serial", {}).get("ms_per_file") is not None, fo)
+        # La marque structurelle, pas le rapport de vitesse (instable sur 12
+        # fichiers) : sans elle, une lecture "pool" jamais entree reste verte.
+        check("la moitie pool a lu par un AUTRE fil, la serie par le fil appelant",
+              fo.get("serial", {}).get("off_caller") is False
+              and fo.get("pooled", {}).get("off_caller") is True,
+              (fo.get("serial", {}).get("off_caller"), fo.get("pooled", {}).get("off_caller")))
+        top = prof.get("top_cumulative", [])
+        check("top 5 par temps cumule, collect en tete a 100 %",
+              len(top) == 5 and "collect" in top[0]["function"] and top[0]["share"] >= 99.0, top)
+        check("scan_usage figure avec une part mesuree",
+              any("scan_usage" in r["function"] and r["share"] > 0 for r in top), top)
+        check("les deux passes du lecteur ont leur horloge CPU",
+              prof.get("scan_plain", {}).get("cpu_share") is not None
+              and prof.get("scan_profiled", {}).get("ms_per_resp") is not None,
+              (prof.get("scan_plain"), prof.get("scan_profiled")))
+        check("rien laisse (extraction, source synthetique)",
+              prof.get("cleaned") is True and os.listdir(workp) == [], os.listdir(workp))
+        out = profile_run("--synthetic", "12", "--pool", "1", "--json")
+        p1 = json.loads(out.stdout)["first_open"] if out.returncode == 0 else {}
+        check("--pool 1 : rc=0, ni rapport de vitesse ni lecture sur un autre fil",
+              out.returncode == 0 and p1.get("speedup") is None
+              and p1.get("pooled", {}).get("off_caller") is False,
+              (out.returncode, p1, out.stderr[-300:]))
+        out = profile_run("--synthetic", "0")
+        check("--synthetic 0 : refuse (rc=2), rien construit",
+              out.returncode == 2 and "REFUSED" in out.stderr and os.listdir(workp) == [],
+              (out.returncode, out.stderr[-200:], os.listdir(workp)))
+        out = profile_run("--json")
+        check("ni archive ni synthetique : refuse (rc=2)",
+              out.returncode == 2 and "REFUSED" in out.stderr, (out.returncode, out.stderr[-200:]))
+
+        # P2 — le repertoire d'extraction est ALLOUE (mkdtemp), jamais DERIVE
+        # (review ai-01, 25/11) : un nom jour+PID est un nom qu'une execution
+        # interrompue a pu laisser derriere elle (un PID se recycle), et le
+        # finally ne doit retirer que le repertoire que CE run possede — y
+        # compris quand l'extraction echoue. Eprouve EN PROCESSUS : le PID
+        # derive est alors le notre, donc le voisin porte exactement le nom
+        # que l'ancienne regle aurait pris pour le sien.
+        print("P2 — repertoire d'extraction alloue : voisin preexistant preserve, succes ET echec")
+        prof_mod = _load("prof", "archive-scan-profile.py")
+
+        def prof_ns(rootp):
+            return argparse.Namespace(archive=None, day=None, hours="3", max_members=4000,
+                                      pool=4, synthetic=4, extract_root=rootp,
+                                      work_dir=rootp, json=True)
+
+        def victim_in(rootp):
+            """Le nom exact que l'ancienne regle (jour + PID) aurait derive."""
+            v = os.path.join(rootp, f"scan-profile-{prof_mod.SYNTHETIC_DAY}-{os.getpid()}")
+            os.makedirs(v)
+            with open(os.path.join(v, "keep.txt"), "w") as fh:
+                fh.write("pre-existing, not this run's\n")
+            return v
+
+        root2 = os.path.join(tmp, "wp2")
+        os.makedirs(root2)
+        victim2 = victim_in(root2)
+        # mkdtemp est ecoute : le repertoire doit naitre SOUS la racine que la
+        # garde d'espace a mesuree (un `dir` oublie extrait ailleurs, sur un
+        # disque que personne n'a verifie, et se nettoie si bien que rien ne
+        # le dit).
+        made, real_mkdtemp = [], tempfile.mkdtemp
+
+        def recording_mkdtemp(*a, **k):
+            path = real_mkdtemp(*a, **k)
+            made.append((k.get("prefix"), path))
+            return path
+
+        prof_mod.tempfile.mkdtemp = recording_mkdtemp
+        try:
+            outcome = prof_mod.profile(prof_ns(root2))
+        finally:
+            tempfile.mkdtemp = real_mkdtemp
+        rc2, res2 = outcome if isinstance(outcome, tuple) else (outcome, {})
+        check("P2 rc=0 (4 paires synthetiques)", rc2 == 0, (rc2, res2))
+        check("P2 le repertoire alloue nait SOUS la racine d'extraction passee",
+              any(p == f"scan-profile-{prof_mod.SYNTHETIC_DAY}-"
+                  and os.path.normcase(os.path.dirname(path)) == os.path.normcase(root2)
+                  for p, path in made), (made, root2))
+        check("P2 LA PIN — le voisin preexistant (nom jour+PID de l'ancienne regle) survit",
+              os.path.isfile(os.path.join(victim2, "keep.txt")), sorted(os.listdir(root2)))
+        check("P2 le repertoire alloue est nettoye, la racine ne garde que le voisin",
+              res2.get("cleaned") is True
+              and sorted(os.listdir(root2)) == [os.path.basename(victim2)],
+              (res2.get("cleaned"), sorted(os.listdir(root2))))
+
+        # Le meme voisin quand l'extraction ECHOUE : `pp` devient un lecteur qui
+        # leve, et le finally ne doit toujours toucher que le repertoire alloue.
+        root3 = os.path.join(tmp, "wp3")
+        os.makedirs(root3)
+        victim3 = victim_in(root3)
+        real_load = prof_mod._load
+
+        class _Boom:
+            @staticmethod
+            def read_members(*a, **k):
+                raise OSError("extraction simulee en echec")
+
+        def load_boom(name, relpath):
+            return _Boom if name == "pp" else real_load(name, relpath)
+
+        prof_mod._load = load_boom
+        try:
+            out3 = prof_mod.profile(prof_ns(root3))
+        finally:
+            prof_mod._load = real_load
+        rc3, res3 = out3 if isinstance(out3, tuple) else (out3, {})
+        check("P2 echec d'extraction : rc=2 (refus, pas un profil)", rc3 == 2, (rc3, res3))
+        check("P2 echec d'extraction : le voisin survit, rien d'autre ne reste",
+              os.path.isfile(os.path.join(victim3, "keep.txt"))
+              and sorted(os.listdir(root3)) == [os.path.basename(victim3)]
+              and res3.get("cleaned") is True,
+              (res3.get("cleaned"), sorted(os.listdir(root3))))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
