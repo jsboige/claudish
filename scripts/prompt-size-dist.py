@@ -27,8 +27,9 @@ restart sensitivity. If you need SERVED attribution, anchor the log window at th
 container start and assert `max(reqN) == count([Request])` before publishing — and
 NOT on a relay seat: since 2026-11-25 a RELAYED request takes a request number too
 (relay.ts `assignRequestNumber`, so its `[ttft]` line keys to its own request)
-while emitting no `[Request]` line, so numbering there is dense among ADMITTED
-requests, not served ones, and that assertion refuses by design.
+while emitting no `[Request]` line, so `max(reqN)` there counts committed forwards
+(plus any locally served turn) and never equals `count([Request])` — that assertion
+refuses by design.
 
 Usage:
     python scripts/prompt-size-dist.py                          # all roles, all time

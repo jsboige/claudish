@@ -849,7 +849,7 @@ export async function forwardToUpstream(
   // Measured on a NOMINAL sidecar (25/11, 6 h): 2 311 relayed [ttft] lines
   // under ONE reqN. Readers key on it: traffic-live.ps1's session loop check
   // reads a reqN seen >= 6 times as a stuck loop.
-    assignRequestNumber(c.req.raw);
+  assignRequestNumber(c.req.raw);
 
   if (res.status === 529) {
     // #299 A — provider overload relayed by a LIVE hub. The hub answered, so it
