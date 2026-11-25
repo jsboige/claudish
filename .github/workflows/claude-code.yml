@@ -1,47 +1,99 @@
-name: Claude Code PR Assistant
+name: Claude Code PR Review
 
-# Two jobs, one switch.
+# One job, one switch, one lane: the review below reaches a model THROUGH THE
+# FLEET HUB (claudish) on MiniMax M3.1-Flash, not api.anthropic.com (Q82).
 #
-# Before this rewrite the workflow went green in ~10 s on every PR without ever
-# reviewing anything, for two independent reasons (run 43644203118, 14/11):
+# Before the 14/11 rewrite the workflow went green in ~10 s on every PR without
+# ever reviewing anything, for two independent reasons (run 43644203118):
 #   1. no `prompt` input -> the action ran in agent mode with "Context prompt: NO
 #      PROMPT", logged "No trigger found, skipping remaining steps", and succeeded;
 #   2. no credential -> the fork carries no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
 #      secret, so even a triggered run could not have called a model.
-# It also took a runner for EVERY comment on a PR (the issue_comment trigger had no
-# `@claude` filter), inside an account-wide Actions queue that is often saturated.
+# It also took a runner for EVERY comment on a PR, inside an account-wide Actions
+# queue that is often saturated.
 #
-# Now:
-#   - `review` runs a real review prompt when a PR is opened / reopened / marked ready;
-#   - `mention` answers an `@claude` comment from a repository member;
-#   - BOTH are gated at job level on the repository variable CLAUDE_PR_REVIEW == 'on'.
-#     A job-level `if` is evaluated before any runner is allocated, so while the
-#     switch is off the jobs show "skipped" (honest) and cost zero runner time.
+# Now: `review` runs a real review prompt when a PR is opened / reopened / marked
+# ready, gated at job level on the repository variable CLAUDE_PR_REVIEW == 'on'.
+# A job-level `if` is evaluated before any runner is allocated, so while the switch
+# is off the job shows "skipped" (honest) and costs zero runner time.
 #
-# To turn it on (repository owner): add ONE credential secret, then the variable.
-#   gh secret set CLAUDE_CODE_OAUTH_TOKEN -R jsboige/claudish   # from `claude setup-token`
-#     (or: gh secret set ANTHROPIC_API_KEY -R jsboige/claudish   # pay-as-you-go)
+# Why there is NO comment-triggered job any more (Q82 review, 16/11). The old
+# `mention` job answered `@claude` comments, and `issue_comment` /
+# `pull_request_review_comment` run in the BASE repository WITH secrets even on a
+# fork PR: a fork diff carrying injected instructions plus one collaborator's
+# `@claude` could have driven an agent that holds the cluster key. GitHub masks
+# secrets in workflow LOGS, not in a comment written with the token, and
+# `Bash(gh pr comment:*)` alone is enough to publish a header value. The job never
+# worked (it had no credential either), so it is removed rather than wired:
+# bringing it back needs a SCOPED inbound key first (settings-reference.md §7.6 —
+# `inboundKeys` with `allowModels` limited to the MiniMax target and a
+# `maxConcurrency`), not the cluster key.
+#
+# Routing. The hub base URL is a repository VARIABLE, never a literal:
+#   gh variable set CLAUDISH_HUB_URL -R jsboige/claudish --body https://models.myia.io
+# The key is a repository SECRET, carried ONLY as `x-proxy-key` through
+# ANTHROPIC_CUSTOM_HEADERS:
+#   gh secret set CLAUDISH_REVIEWER_KEY -R jsboige/claudish
+#
+# CLAUDISH_REVIEWER_KEY is a SCOPED INBOUND KEY (settings-reference.md §7.6),
+# provisioned hub-side as an `inboundKeys` entry restricted to
+# `allowModels: ["mmc@MiniMax-M3.1-Flash"]` (the exact raw string this
+# workflow sends) with a `maxConcurrency` cap: it authenticates like the
+# proxy key, serves only that model, never the native lane, and is
+# attributed as `inbound_key` in the hub capture — revoking it is deleting
+# one config entry. The FULL CLUSTER KEY must NEVER be stored in this
+# repository: this job has an outbound channel (inline comments publish on a
+# public PR) and read tools reach /proc/self/environ, and a single leak of
+# the cluster key would force a fleet-wide rotation (Q82 review, 17/11).
+# Never `x-api-key`: that header arms NativeHandler's proxyKey->Anthropic swap and
+# the request 401s (docs/reference/relay-internals.md). proxy-auth.ts reads
+# `provided = x-proxy-key || x-api-key || bearer`, so x-proxy-key wins when both
+# are present. X-Claudish-Machine makes the hub log attribute the call to
+# `myia-gh-actions`, which is what makes the rollout verifiable from the hub side.
+#
+# `anthropic_api_key` is NOT a credential here. base-action/src/validate-env.ts
+# refuses to start without ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, and
+# base-action/action.yml forwards `inputs.anthropic_api_key` into that exact
+# variable (a step-level assignment that OVERRIDES the job env), so the input
+# carries a fixed, non-secret placeholder. The hub authenticates the scoped inbound key.
+#
+# The ANTHROPIC_DEFAULT_*_MODEL slots are load-bearing, not decorative: Claude
+# Code's helper calls resolve by ROLE, and a role left unset resolves to a native
+# `claude-*` model that the hub refuses for a placeholder credential (#296 shape
+# B, a 403). All four named slots are pinned to the same MiniMax target, plus the
+# subagent slot as belt and braces.
+#
+# The secret is never displayed: no step echoes the environment, no `set -x`, no
+# debug dump of ANTHROPIC_CUSTOM_HEADERS. GitHub masks the exact value; a derived
+# copy (base64, substring) would not be masked, so do not create one.
+#
+# To turn it on: secret, then variable, then the switch.
 #   gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body on
-# To turn it off again: gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body off
-#
-# A fork PR's `pull_request` event carries no repository secrets, so `review` skips
-# fork heads. `mention` is different: `issue_comment` runs in the base repository WITH
-# secrets, even on a fork PR. It is therefore limited to OWNER/MEMBER/COLLABORATOR
-# authors, on top of the action's own `restrict_untrusted_prs` default.
-# `contains()` is case-insensitive; "@claude-bot" would still start a no-op run.
+# To turn it off again (cuts the job before any runner is allocated):
+#   gh variable set CLAUDE_PR_REVIEW -R jsboige/claudish --body off
 
 on:
   pull_request:
     types: [opened, reopened, ready_for_review]
-  pull_request_review_comment:
-    types: [created]
-  issue_comment:
-    types: [created]
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
+
+env:
+  # Repository variable, set by the owner. Empty here means the switch is on but
+  # the wiring is not: the guard step below names it instead of letting the run
+  # die on an opaque 401 from api.anthropic.com.
+  ANTHROPIC_BASE_URL: ${{ vars.CLAUDISH_HUB_URL }}
+  # No trailing newline: a YAML block scalar would add one, and the header
+  # parser is fed this value verbatim.
+  ANTHROPIC_CUSTOM_HEADERS: "X-Claudish-Machine: myia-gh-actions\nx-proxy-key: ${{ secrets.CLAUDISH_REVIEWER_KEY }}"
+  ANTHROPIC_DEFAULT_OPUS_MODEL: mmc@MiniMax-M3.1-Flash
+  ANTHROPIC_DEFAULT_SONNET_MODEL: mmc@MiniMax-M3.1-Flash
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: mmc@MiniMax-M3.1-Flash
+  ANTHROPIC_DEFAULT_FABLE_MODEL: mmc@MiniMax-M3.1-Flash
+  CLAUDE_CODE_SUBAGENT_MODEL: mmc@MiniMax-M3.1-Flash
 
 jobs:
   review:
@@ -51,7 +103,9 @@ jobs:
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 60 min for a 40-turn budget: the first real run took ~12 min for 31 turns,
+    # and a job killed at the timeout posts NO review at all (Q82 review 16/11).
+    timeout-minutes: 60
     concurrency:
       group: claude-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -63,12 +117,37 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Check the hub wiring is present
+        # Names the missing piece instead of an opaque 401, and prints no value.
+        #
+        # ANTHROPIC_CUSTOM_HEADERS is MULTI-LINE: the `\n` in the env block above
+        # is a real line feed (one header per line, `X-Claudish-Machine` first).
+        # grep reads it line by line and its `^` matches the start of EVERY line,
+        # so the test below holds wherever the `x-proxy-key` line sits.
+        #
+        # A green step proves the FORM of the header block, nothing more: that a
+        # line `x-proxy-key: <non-blank>` is present. It does not prove that the
+        # key is the scoped inbound key, that the hub holds its `inboundKeys`
+        # entry (#1100), or that the hub accepts it. A wrong key passes this
+        # step. Those are read from the hub capture (`inbound_key`), never here.
+        #
+        # Replayed with no CI run and no secret by
+        # scripts/tests/test_reviewer_wiring_guard.py.
+        run: |
+          if [ -z "$ANTHROPIC_BASE_URL" ]; then
+            echo "::error::Repository variable CLAUDISH_HUB_URL is not set"
+            exit 1
+          fi
+          if ! printf '%s' "$ANTHROPIC_CUSTOM_HEADERS" | grep -qE '^x-proxy-key: [^[:space:]]'; then
+            echo "::error::No 'x-proxy-key: <value>' line in ANTHROPIC_CUSTOM_HEADERS: repository secret CLAUDISH_REVIEWER_KEY is empty or missing"
+            exit 1
+          fi
+
       - name: Claude Code review
         uses: anthropics/claude-code-action@v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: placeholder-not-used-proxy-handles-auth
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
@@ -89,39 +168,14 @@ jobs:
             Do not comment on style. Do not restate what the diff does. If you find
             nothing, say so in one sentence.
 
+            Read-only shell is available: `git diff`, `git log`, `git show`, `git status`,
+            `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, plus `gh pr diff|view` and the
+            Read/Grep/Glob tools. Writes, package managers, tests and interpreters are
+            denied, and every denied call burns one of your turns, so do not try them.
+
             Use inline comments for defects tied to a line, and one top-level comment
             for the summary.
           claude_args: |
-            --max-turns 30
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
-
-  mention:
-    if: |
-      vars.CLAUDE_PR_REVIEW == 'on' &&
-      (
-        (github.event_name == 'issue_comment' &&
-          github.event.issue.pull_request &&
-          contains(github.event.comment.body, '@claude') &&
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
-        (github.event_name == 'pull_request_review_comment' &&
-          contains(github.event.comment.body, '@claude') &&
-          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
-      )
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
-
-      - name: Claude Code (@claude mention)
-        uses: anthropics/claude-code-action@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: |
-            --max-turns 30
+            --model mmc@MiniMax-M3.1-Flash
+            --max-turns 40
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(grep:*),Bash(rg:*),Read,Grep,Glob"
