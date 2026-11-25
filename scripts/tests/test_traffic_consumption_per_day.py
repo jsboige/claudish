@@ -118,11 +118,26 @@ def run(roots, *extra):
     roots = [roots] if isinstance(roots, str) else list(roots)
     # --reconcile-dir vers un dossier inexistant : hermetique (aucune archive
     # outage hors-site ne vient peupler la flotte du poste qui lance le test).
-    args = [sys.executable, "-I", _TOOL, "--hours", "96",
+    #
+    # #1176 contract (#1186), two layers, neither in the scripts:
+    #   - CHILD bytes pinned to UTF-8: these children run under -I, where no
+    #     env can reach them, so the pin is the -X utf8 of #1010. They decode
+    #     exactly on every seat — P8/P9 assert temp PATHS in the text output,
+    #     which a cp1252 child writes in cp1252;
+    #   - READER tolerant (errors="replace") and normalised with (or ""): it
+    #     ALWAYS returns text. A strict decoder reading a cp1252 child raised
+    #     UnicodeDecodeError inside subprocess' reader thread and handed back
+    #     stdout=None (#1175 signature) — red under PYTHONUTF8=1 on a cp1252
+    #     seat, where the reader follows the mode and the -I child does not.
+    # The pins match ASCII only, so a replaced byte costs nothing.
+    args = [sys.executable, "-I", "-X", "utf8", _TOOL, "--hours", "96",
             "--reconcile-dir", os.path.join(roots[0], "no-reconcile")]
     for r in roots:
         args += ["--dir", r]
-    return subprocess.run(args + list(extra), capture_output=True, text=True)
+    p = subprocess.run(args + list(extra), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    p.stdout, p.stderr = p.stdout or "", p.stderr or ""
+    return p
 
 
 def as_json(out):
@@ -207,9 +222,10 @@ def main():
         with open(act, "w") as fh:
             json.dump(activity, fh)
         joined = subprocess.run(
-            [sys.executable, "-I", _JOIN, "--activity", act,
-             "--consumption", prod, "--json"], capture_output=True, text=True)
-        check("rc=0", joined.returncode == 0, joined.stderr[-400:])
+            [sys.executable, "-I", "-X", "utf8", _JOIN, "--activity", act,
+             "--consumption", prod, "--json"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace")
+        check("rc=0", joined.returncode == 0, (joined.stderr or "")[-400:])
         rows = {r["date"]: r for r in json.loads(joined.stdout)["rows"]}
         check("au moins une ligne ratio", any(
             r["ratio"] is not None for r in rows.values()), rows)
@@ -288,8 +304,9 @@ def main():
         with open(prod8, "w") as fh:
             fh.write(json.dumps(doc8))
         joined = subprocess.run(
-            [sys.executable, "-I", _JOIN, "--activity", act,
-             "--consumption", prod8, "--json"], capture_output=True, text=True)
+            [sys.executable, "-I", "-X", "utf8", _JOIN, "--activity", act,
+             "--consumption", prod8, "--json"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace")
         rows8 = {r["date"]: r for r in json.loads(joined.stdout)["rows"]}
         check("joiner : aucun ratio sur un document lu d'un demi-corpus",
               joined.returncode == 0 and all(r["ratio"] is None and "partial" in r["flags"]
@@ -366,8 +383,9 @@ def main():
         with open(prod9, "w") as fh:
             json.dump(doc_none, fh)
         joined = subprocess.run(
-            [sys.executable, "-I", _JOIN, "--activity", act,
-             "--consumption", prod9, "--json"], capture_output=True, text=True)
+            [sys.executable, "-I", "-X", "utf8", _JOIN, "--activity", act,
+             "--consumption", prod9, "--json"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace")
         rows9 = (as_json(joined).get("rows") or []) if joined.stdout.strip() else []
         check("joiner : un document produit sans rien lire ne rend aucun ratio",
               all(r["ratio"] is None for r in rows9), rows9)

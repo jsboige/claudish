@@ -49,6 +49,20 @@ _SCRIPTS = os.path.join(_HERE, "..")
 _TOOL = os.path.join(_SCRIPTS, "traffic-consumption.py")
 _JOIN = os.path.join(_SCRIPTS, "activity-cost-join.py")
 
+# #1176 contract (#1186), two layers, neither in the scripts:
+#   - CHILD bytes pinned to UTF-8 (PYTHONIOENCODING in the env; no child here
+#     runs under -I, see the docstring): they decode exactly on every seat. It
+#     matters beyond the net — A11 asserts a temp PATH in a child's stderr (the
+#     refusal names the root), and a path outside ASCII written in cp1252
+#     would not match;
+#   - READER tolerant (errors="replace") and normalised with (or ""): it ALWAYS
+#     returns text. A strict decoder reading a cp1252 child raised
+#     UnicodeDecodeError inside subprocess' reader thread and handed back
+#     stdout/stderr=None (#1175 signature); the run then died on
+#     `out.stderr[-600:]` instead of reporting its pin.
+# The pins match ASCII only, so a replaced byte costs nothing.
+_UTF8_CHILD = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
 FAILS = []
 
 # A fixed PAST day: no pin here depends on the run hour.
@@ -160,7 +174,10 @@ def run(root, series, work, *extra, roots=None):
             "--series-file", series, "--extract-root", work]
     for r in roots:
         args += ["--dir", r]
-    return subprocess.run(args + list(extra), capture_output=True, text=True)
+    p = subprocess.run(args + list(extra), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=_UTF8_CHILD)
+    p.stdout, p.stderr = p.stdout or "", p.stderr or ""
+    return p
 
 
 def read_day(root, series, work, *extra, roots=None):
@@ -430,8 +447,9 @@ def main():
                        "days": [{"date": DAY, "count": 12}, {"date": OTHER, "count": 5}]}, fh)
         joined = subprocess.run([sys.executable, _JOIN, "--activity", act,
                                  "--consumption", series9, "--json"],
-                                capture_output=True, text=True)
-        check("rc=0", joined.returncode == 0, joined.stderr[-400:])
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", env=_UTF8_CHILD)
+        check("rc=0", joined.returncode == 0, (joined.stderr or "")[-400:])
         rows = {r["date"]: r for r in json.loads(joined.stdout)["rows"]}
         check("le jour lu a un ratio, sans partial",
               rows[DAY]["ratio"] == round(12 / ((1.25 * 300 + 0.1 * 3 * 244800 + 5 * 369) / 1000.0), 4)
