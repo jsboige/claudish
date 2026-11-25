@@ -177,3 +177,20 @@ jobs:
             python "$f" || exit 1
           done
 
+      # #1186/#1196 -- the encoding contract, given teeth. The Windows seats are
+      # cp1252 machines: a child call that loses its PYTHONIOENCODING=utf-8 pin
+      # stays green on a UTF-8 runner and goes red on them. The same loop with
+      # the runner's stdio on cp1252 reproduces that here -- a child inherits
+      # the codec unless it pins it, and the non-ASCII round-trip pins fail.
+      # (A lost READER net is not caught here: the runner's locale stays UTF-8,
+      # so its default text decoding still reads the pinned bytes. The seats
+      # cover that half.)
+      - name: every file by its own runner, stdio on cp1252 (#1186)
+        env:
+          PYTHONIOENCODING: cp1252
+        run: |
+          for f in scripts/tests/test_*.py; do
+            echo "== $f"
+            python "$f" || exit 1
+          done
+
