@@ -29,10 +29,13 @@ _SCRIPT = os.path.join(_HERE, "..", "split-brain-content.py")
 _CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
-def run_child(argv, **kwargs):
-    kwargs.setdefault("capture_output", True)
-    kwargs.setdefault("env", _CHILD_ENV)
-    p = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", **kwargs)
+def run_child(argv, timeout=None):
+    # No **kwargs on purpose: the static guard in
+    # test_subprocess_encoding_contract.py skips an unverifiable spread, so
+    # this call must stay literal for the guard to see it.
+    p = subprocess.run(argv, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace",
+                       env=_CHILD_ENV, timeout=timeout)
     p.stdout, p.stderr = p.stdout or "", p.stderr or ""
     return p
 
