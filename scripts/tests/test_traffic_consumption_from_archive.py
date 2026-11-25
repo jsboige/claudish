@@ -798,6 +798,138 @@ def main():
               and sorted(os.listdir(root3)) == [os.path.basename(victim3)]
               and res3.get("cleaned") is True,
               (res3.get("cleaned"), sorted(os.listdir(root3))))
+
+        print("A14 — #1195 : le prechauffage de la premiere ouverture — branche, "
+              "dit, et aucun chiffre ne bouge")
+        work14 = os.path.join(tmp, "w14")
+        os.makedirs(work14)
+        root14 = build(tmp, n=3, name="corpus14")
+        ser_off = os.path.join(work14, "off.json")
+        ser_on = os.path.join(work14, "on.json")
+        ser_dflt = os.path.join(work14, "default.json")
+        off = read_day(root14, ser_off, work14, "--warm-pool", "0")
+        on = read_day(root14, ser_on, work14, "--warm-pool", "8")
+        dflt = read_day(root14, ser_dflt, work14)
+        check("A14 --warm-pool 0 : rc=0", off.returncode == 0, off.stderr[-400:])
+        check("A14 --warm-pool 8 : rc=0", on.returncode == 0, on.stderr[-400:])
+        check("A14 sans drapeau : rc=0 (le prechauffage est le defaut)",
+              dflt.returncode == 0, dflt.stderr[-400:])
+        check("A14 : le prechauffage est DIT — fichiers ouverts, pool nomme",
+              "prechauffe en" in on.stderr
+              and "fichier(s) ouvert(s) une premiere fois par 8 fils" in on.stderr,
+              on.stderr[-500:])
+        check("A14 : sans drapeau, il tourne aussi (defaut arme)",
+              "prechauffe en" in dflt.stderr, dflt.stderr[-400:])
+        check("A14 : --warm-pool 0 le dit et n'ouvre rien",
+              "prechauffage desactive" in off.stderr, off.stderr[-400:])
+        check("A14 : le compte annonce n'est pas zero (il a bien ouvert)",
+              "prechauffe en" in on.stderr
+              and "0 fichier(s) ouvert(s)" not in on.stderr, on.stderr[-400:])
+        r_off, _ = row_of(ser_off)
+        r_on, _ = row_of(ser_on)
+        r_dflt, _ = row_of(ser_dflt)
+
+        def no_arch(r):
+            return {k: v for k, v in (r or {}).items() if k != "archive"}
+
+        check("A14 : MEME ligne hors bloc archive (aucun decompte ne bouge)",
+              no_arch(r_off) and no_arch(r_off) == no_arch(r_on) == no_arch(r_dflt),
+              (no_arch(r_off), no_arch(r_on)))
+
+        def arch_prov(r):
+            a = dict((r or {}).get("archive") or {})
+            a.pop("read_at", None)
+            a.pop("seconds", None)
+            return a
+
+        check("A14 : meme provenance (fichiers, membres, octets declares) hors "
+              "champs volatiles",
+              arch_prov(r_off) == arch_prov(r_on) == arch_prov(r_dflt),
+              (arch_prov(r_off), arch_prov(r_on)))
+        secs_on = (r_on or {}).get("archive", {}).get("seconds") or {}
+        check("A14 : `seconds` porte extract + warm + scan (cle additive)",
+              set(secs_on) == {"extract", "warm", "scan"}, secs_on)
+        secs_off = (r_off or {}).get("archive", {}).get("seconds") or {}
+        check("A14 : warm=0 quand c'est desactive", secs_off.get("warm") == 0.0,
+              secs_off)
+
+        print("A15 — #1195 : l'ORDRE (prechauffer AVANT le scan) et la GARDE (un "
+              "prechauffage qui leve ne tue pas la lecture) — en processus, par main()")
+        import contextlib
+        import io
+
+        tc15 = _load("tc_warm_order", "traffic-consumption.py")
+        real_pp15 = tc15._load_partial_parts()
+        real_collect15 = tc15.collect
+        events = []
+
+        def spy_collect(*a, **k):
+            events.append("collect")
+            return real_collect15(*a, **k)
+
+        class WarmSpy:
+            """Delegue tout a partial_parts sauf warm_first_open, observe."""
+            def __init__(self, real, raise_it=False):
+                self._real = real
+                self._raise = raise_it
+                self.count = None
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def warm_first_open(self, paths, workers=8):
+                if self._raise:
+                    raise RuntimeError("warm boom (pin A15)")
+                self.count = len(paths)
+                events.append("warm")
+                return self._real.warm_first_open(paths, workers)
+
+        work15 = os.path.join(tmp, "w15")
+        os.makedirs(work15)
+        root15 = build(tmp, n=2, name="corpus15")
+        argv_backup15 = sys.argv
+        tc15.collect = spy_collect
+
+        def drive(series, spy):
+            tc15._load_partial_parts = lambda: spy
+            events.clear()
+            buf = io.StringIO()
+            sys.argv = ["traffic-consumption.py",
+                        "--reconcile-dir", os.path.join(work15, "no-reconcile"),
+                        "--series-file", series, "--extract-root", work15,
+                        "--dir", root15, "--from-archive", DAY, "--json",
+                        "--warm-pool", "8"]
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    rc = tc15.main()
+            finally:
+                sys.argv = argv_backup15
+            return rc, buf.getvalue()
+
+        ser15 = os.path.join(work15, "series.json")
+        spy = WarmSpy(real_pp15)
+        rc15, out15 = drive(ser15, spy)
+        tc15.collect = real_collect15
+        check("A15 : rc=0", rc15 == 0, out15[-400:])
+        check("A15 : le prechauffage PRECEDE le scan (l'ordre est le changement)",
+              events == ["warm", "collect"], events)
+        r15, _ = row_of(ser15)
+        check("A15 : il ouvre exactement les membres que la ligne declare",
+              spy.count == (r15 or {}).get("archive", {}).get("members"),
+              (spy.count, (r15 or {}).get("archive", {}).get("members")))
+
+        ser15b = os.path.join(work15, "series-b.json")
+        spy_b = WarmSpy(real_pp15, raise_it=True)
+        tc15.collect = spy_collect
+        rc15b, out15b = drive(ser15b, spy_b)
+        tc15.collect = real_collect15
+        check("A15 : un prechauffage qui LEVE ne tue pas la lecture (rc=0)", rc15b == 0,
+              out15b[-500:])
+        check("A15 : ... et il le DIT", "prechauffage abandonne" in out15b,
+              out15b[-500:])
+        r15b, _ = row_of(ser15b)
+        check("A15 : la ligne du jour est ecrite quand meme", r15b is not None, ser15b)
+        check("A15 : le scan a bien tourne apres l'echec", "collect" in events, events)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

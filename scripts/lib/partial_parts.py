@@ -13,7 +13,7 @@ d'un jour porte par des parties ne sont plus sur disque. Ce module rend
 l'undercount EXPLICITE — meme doctrine que l'angle mort AUTONOMOUS (#933,
 lib/blind_spot.py) : la formulation nomme l'INCONNU, jamais « pas de trafic ».
 
-Deux services, deux audiences (AC 2 / AC 4 de la decision) :
+Trois services (AC 2 / AC 4 de la decision, plus le prechauffage #1195) :
 
   PARTIAL   — declaration declarative pour le lecteur qui n'ouvre PAS les
               parties (traffic-consumption, billed-attrib) : une ligne qui
@@ -22,6 +22,11 @@ Deux services, deux audiences (AC 2 / AC 4 de la decision) :
   read_members() — extraction py7zr pour le lecteur qui doit etre EXACT
               (native-consumption --leak-policy, AC 4 : verdict identique
               avant/apres packing sur un jour rejoue).
+  warm_first_open() — prechauffage de la PREMIERE OUVERTURE des fichiers
+              extraits (#1195) : une ouverture par fichier, `workers` fils a
+              la fois — l'attente a la premiere ouverture d'un fichier
+              fraichement extrait ne parallelise pas dans le fil de
+              l'appelant (mesure du 25/11 : 62,12 -> 8,41 ms par fichier).
 
 Semantique de fenetre : le NOM d'une partie porte son jour et l'heure de sa
 passe, pas l'etendue de son contenu (bornes = passe - W .. passe, non
@@ -208,3 +213,62 @@ def read_members(paths, dest, keep=None):
         for fn in files:
             out.append(os.path.join(root, fn))
     return out
+
+
+# ---------------------------------------------------------------------------
+# #1195 — prechauffage de la PREMIERE OUVERTURE des fichiers extraits
+# ---------------------------------------------------------------------------
+
+# Ce que le prechauffage lit : les octets qu'un lecteur d'archives garde d'une
+# reponse (traffic-consumption.py : HEAD_BYTES 200 000 + TAIL_BYTES 100 000),
+# et l'acces exact que la mesure du 25/11 a chronometre. Changer cette valeur
+# change ce qui a ete mesure — re-mesurer alors (pin : test_partial_parts.py).
+WARM_READ_BYTES = 300_000
+WARM_POOL = 8
+
+
+def _touch(path):
+    """Ouvre `path` une premiere fois et lit sa tete -> octets lus."""
+    with open(path, "rb") as fh:
+        return len(fh.read(WARM_READ_BYTES))
+
+
+def warm_first_open(paths, workers=WARM_POOL):
+    """Ouvre chaque fichier de `paths` UNE fois, `workers` fils a la fois ->
+    nombre de fichiers ouverts. Une erreur d'ouverture ne leve pas : le
+    fichier est saute et n'est pas compte (le lecteur le retrouvera et
+    appliquera SA politique).
+
+    Mesure du 25/11 (2 000 membres REELS d'un jour du hub, tir en creux) : la
+    premiere ouverture d'un fichier fraichement extrait coute 62,12 ms en
+    serie (124,24 s d'horloge pour 0,86 s de CPU du processus — 0,7 %) et
+    8,41 ms par un pool de 8 fils (x7,4) ; une fois les fichiers ouverts, la
+    passe du lecteur tourne a 0,9 ms par reponse sur son propre CPU.
+
+    Ce n'est pas une lecture : aucun octet n'est garde ni analyse, aucun
+    decompte ne bouge — l'appelant relit chaque fichier avec ses regles.
+    `workers` <= 1 : tout sur le fil de l'appelant — le chiffre en serie, et
+    l'interrupteur.
+
+    paths : chemins (str). workers : fils ; <= 1 = aucun pool.
+    """
+    if not workers or workers <= 1:
+        n = 0
+        for p in paths:
+            try:
+                _touch(p)
+                n += 1
+            except OSError:
+                pass
+        return n
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(path):
+        try:
+            _touch(path)
+            return 1
+        except OSError:
+            return 0
+
+    with ThreadPoolExecutor(workers) as ex:
+        return sum(ex.map(one, paths))

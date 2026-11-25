@@ -427,6 +427,101 @@ def test_turn_composition_tags_part_rows():
         assert by_name[f"captures-{day}.7z"]["part"] is None, by_name
 
 
+# ---------------------------------------------------------------------------
+# #1195 — warm_first_open : une ouverture par fichier, hors du fil appelant
+# ---------------------------------------------------------------------------
+
+def test_warm_read_bytes_is_the_measured_access():
+    """Le chiffre du 25/11 est lie a l'ACCES, pas seulement au pool : changer
+    les octets lus invalide la mesure, et le dire vaut mieux que le taire."""
+    assert pp.WARM_READ_BYTES == 300_000, (
+        "le 8,41 ms/fichier du 25/11 a ete mesure avec open + read(300_000) — "
+        "les octets que traffic-consumption garde d'une reponse (HEAD_BYTES "
+        "200 000 + TAIL_BYTES 100 000) ; changer cette valeur invalide ce "
+        "chiffre : re-mesurer")
+    assert pp.WARM_POOL == 8, pp.WARM_POOL
+
+
+def test_warm_first_open_opens_each_file_once_off_caller():
+    """Chaque fichier ouvert UNE fois, et jamais sur le fil de l'appelant
+    quand le pool est arme — marque STRUCTURELLE (ident du fil qui a ouvert),
+    jamais un temps."""
+    import builtins
+    import threading
+
+    with tempfile.TemporaryDirectory() as td:
+        paths = []
+        for i in range(8):
+            p = os.path.join(td, "member-%d.sse" % i)
+            with open(p, "wb") as fh:
+                fh.write(b"#" + b"x" * 4096)
+            paths.append(os.path.abspath(p))
+        wanted = set(paths)
+        seen = []
+        lock = threading.Lock()
+        real_open = builtins.open
+
+        def spy(path, *a, **k):
+            with lock:
+                seen.append((os.path.abspath(str(path)), threading.get_ident()))
+            return real_open(path, *a, **k)
+
+        builtins.open = spy
+        try:
+            n = pp.warm_first_open(paths, 4)
+        finally:
+            builtins.open = real_open
+        opened = [p for p, _t in seen if p in wanted]
+        threads = {t for p, t in seen if p in wanted}
+        assert n == len(paths), (n, len(paths))
+        assert sorted(opened) == sorted(paths), opened
+        assert threads, "aucune ouverture enregistree"
+        assert threading.get_ident() not in threads, (
+            "pool arme : aucune ouverture ne doit rester sur le fil appelant")
+
+
+def test_warm_first_open_serial_stays_on_caller_thread():
+    """workers <= 1 = le chiffre en serie, sur le fil de l'appelant (c'est
+    aussi l'interrupteur)."""
+    import builtins
+    import threading
+
+    with tempfile.TemporaryDirectory() as td:
+        paths = []
+        for i in range(3):
+            p = os.path.join(td, "ser-%d.sse" % i)
+            with open(p, "wb") as fh:
+                fh.write(b"x" * 64)
+            paths.append(os.path.abspath(p))
+        seen = []
+        real_open = builtins.open
+
+        def spy(path, *a, **k):
+            seen.append((os.path.abspath(str(path)), threading.get_ident()))
+            return real_open(path, *a, **k)
+
+        builtins.open = spy
+        try:
+            n = pp.warm_first_open(paths, 1)
+        finally:
+            builtins.open = real_open
+        assert n == 3, n
+        assert {t for _p, t in seen} == {threading.get_ident()}, seen
+
+
+def test_warm_first_open_skips_unopenable_and_counts_the_rest():
+    """Une erreur d'ouverture ne leve pas : le fichier est saute et n'est pas
+    compte — le lecteur le retrouvera et appliquera SA politique."""
+    with tempfile.TemporaryDirectory() as td:
+        good = os.path.join(td, "good.sse")
+        with open(good, "wb") as fh:
+            fh.write(b"y" * 128)
+        missing = os.path.join(td, "absent.sse")
+        assert pp.warm_first_open([good, missing], 4) == 1
+        assert pp.warm_first_open([good, missing], 1) == 1
+        assert pp.warm_first_open([], 4) == 0
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

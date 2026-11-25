@@ -1175,9 +1175,31 @@ def from_archive(args, dirs, pp, bs):
                     say(f"  warning: residu loose {fn} illisible ({exc})")
         say(f"  residu loose du jour fusionne : {resid} fichier(s)")
 
+        # #1195 — prechauffage de la PREMIERE OUVERTURE. collect ouvre chaque
+        # fichier une premiere fois, en serie : mesure du 25/11, 62,12 ms par
+        # fichier pour 0,7 % de CPU du processus — de l'attente, pas du
+        # travail. Ouvrir ces memes fichiers en pool d'abord ne change AUCUN
+        # decompte : collect les relit tous, avec ses regles. Un echec du
+        # prechauffage ne fait pas echouer la lecture.
+        t_w0 = time.time()
+        warm_files = [os.path.join(dest, fn) for fn in sorted(os.listdir(dest))
+                      if os.path.isfile(os.path.join(dest, fn))]
+        warmed = 0
+        if args.warm_pool > 1:
+            try:
+                warmed = pp.warm_first_open(warm_files, args.warm_pool)
+            except Exception as exc:  # le scan reste la lecture, pas le prechauffage
+                say(f"  warning: prechauffage abandonne ({type(exc).__name__}: {exc})")
+        t_w1 = time.time()
+        if args.warm_pool > 1:
+            say(f"  prechauffe en {t_w1 - t_w0:.0f} s : {warmed} fichier(s) ouvert(s) "
+                f"une premiere fois par {args.warm_pool} fils")
+        else:
+            say(f"  prechauffage desactive (--warm-pool {args.warm_pool})")
+
         res = collect([dest], d0, until_dt=until_dt, per_day=True)
         t2 = time.time()
-        say(f"  scanne en {t2 - t1:.0f} s : {res['files']['resp']} resp, "
+        say(f"  scanne en {t2 - t_w1:.0f} s : {res['files']['resp']} resp, "
             f"{res['files']['paired']} appariees, {res['files']['unpaired']} non appariees")
 
         rows = build_days(res["per_day"], dirs, d0, now_dt, res["reqs"], fleet, rdir,
@@ -1190,7 +1212,8 @@ def from_archive(args, dirs, pp, bs):
         row["archive"] = {"files": cur, "read_at": read_at, "members": n_members,
                           "declared_bytes": need,
                           "seconds": {"extract": round(t1 - t0, 1),
-                                      "scan": round(t2 - t1, 1)}}
+                                      "warm": round(t_w1 - t_w0, 1),
+                                      "scan": round(t2 - t_w1, 1)}}
         row["loose_residual"] = resid
         # la ligne persiste seule (le rapport non) : elle garde ce qu'elle a
         # ete lue — racines demandees, lues, non lues (#1180, review ai-01)
@@ -1267,6 +1290,13 @@ def main():
     ap.add_argument("--reread", action="store_true",
                     help="relire un jour deja present dont l'archive a change depuis la "
                          "lecture (sans lui : sortie 2, rien n'est relu)")
+    ap.add_argument("--warm-pool", type=int, default=8, metavar="N",
+                    help="(#1195) avec --from-archive : fils qui ouvrent une PREMIERE "
+                         "fois chaque fichier extrait avant le scan — l'attente de "
+                         "premiere ouverture (62 ms par fichier, mesure du 25/11) se "
+                         "parallelise ; le scan relit tout avec ses regles et aucun "
+                         "decompte ne bouge. 0 ou 1 = desactive (le chiffre en serie "
+                         "reste atteignable)")
     args = ap.parse_args()
     # #1180 — `--dir` repetable : la PREMIERE racine reste le corpus de
     # reference (archive/ et reconcile/ gardent leur sens), les suivantes
