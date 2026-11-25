@@ -522,6 +522,71 @@ def test_warm_first_open_skips_unopenable_and_counts_the_rest():
         assert pp.warm_first_open([], 4) == 0
 
 
+def test_warm_pool_bound_is_explicit_and_applied_by_the_executor():
+    """La borne du pool est une VALEUR APPLIQUEE, pas une intention (review
+    ai-01 25/11, reserve 7161871992 : « le CLI accepte tout entier et
+    l'executeur l'utilise tel quel ») : l'executeur ne recoit jamais plus de
+    WARM_POOL_MAX fils. Marque STRUCTURELLE — le max_workers vu par
+    ThreadPoolExecutor — jamais un temps, ni un nombre de fils reels (l'OS
+    en cree moins qu'il ne peut)."""
+    import concurrent.futures
+
+    assert pp.WARM_POOL <= pp.WARM_POOL_MAX, (pp.WARM_POOL, pp.WARM_POOL_MAX)
+    assert pp.bound_workers(pp.WARM_POOL) == pp.WARM_POOL
+    assert pp.bound_workers(pp.WARM_POOL_MAX) == pp.WARM_POOL_MAX
+    assert pp.bound_workers(pp.WARM_POOL_MAX + 1) == pp.WARM_POOL_MAX
+    assert pp.bound_workers(10 ** 6) == pp.WARM_POOL_MAX
+    assert pp.bound_workers(0) == 1
+    assert pp.bound_workers(-5) == 1
+    assert pp.bound_workers(None) == 1
+    assert pp.bound_workers("pas-un-nombre") == 1
+
+    seen = []
+    real_ex = concurrent.futures.ThreadPoolExecutor
+
+    class SpyExecutor(real_ex):
+        def __init__(self, max_workers=None, *a, **k):
+            seen.append(max_workers)
+            super().__init__(max_workers, *a, **k)
+
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "borne.sse")
+        with open(p, "wb") as fh:
+            fh.write(b"b" * 16)
+        concurrent.futures.ThreadPoolExecutor = SpyExecutor
+        try:
+            n = pp.warm_first_open([p], 10 ** 6)
+        finally:
+            concurrent.futures.ThreadPoolExecutor = real_ex
+    assert n == 1, n
+    assert seen == [pp.WARM_POOL_MAX], seen
+
+
+def test_warm_candidates_is_the_preparation_flat_sorted_and_raising():
+    """La PREPARATION : fichiers DIRECTS, tries ; un sous-dossier n'est pas un
+    membre ; une racine illisible LEVE — c'est ce qui rend la garde de
+    l'appelant necessaire (pin A15d du lecteur d'archives)."""
+    with tempfile.TemporaryDirectory() as td:
+        for fn in ("b.sse", "a.sse", "c.json"):
+            with open(os.path.join(td, fn), "wb") as fh:
+                fh.write(b"m" * 8)
+        sub = os.path.join(td, "sub")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "d.sse"), "wb") as fh:
+            fh.write(b"m" * 8)
+        got = pp.warm_candidates(td)
+        assert [os.path.basename(p) for p in got] == ["a.sse", "b.sse", "c.json"], got
+        assert all(os.path.dirname(p) == td for p in got), got
+        assert pp.warm_candidates(sub) == [os.path.join(sub, "d.sse")]
+        try:
+            pp.warm_candidates(os.path.join(td, "absente"))
+        except OSError:
+            pass
+        else:
+            raise AssertionError("une racine absente doit lever : la garde de "
+                                 "l'appelant est chargee de cet echec")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

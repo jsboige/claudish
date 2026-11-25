@@ -1181,25 +1181,32 @@ def from_archive(args, dirs, pp, bs):
         # travail. Ouvrir ces memes fichiers en pool d'abord ne change AUCUN
         # decompte : collect les relit tous, avec ses regles. Un echec du
         # prechauffage ne fait pas echouer la lecture.
+        # Review ai-01 25/11 (7161871992) : la PREPARATION (lister, trier) et
+        # sa duree vivent DANS la branche armee ET dans la garde. Desactive,
+        # rien n'est liste ni chronometre et `seconds.warm` reste exactement
+        # 0 — sinon « off » n'est pas une comparaison serie propre. Une
+        # preparation qui leve est un warning, jamais un scan perdu.
         t_w0 = time.time()
-        warm_files = [os.path.join(dest, fn) for fn in sorted(os.listdir(dest))
-                      if os.path.isfile(os.path.join(dest, fn))]
-        warmed = 0
+        warm_seconds = 0.0
+        t_scan0 = t_w0
         if args.warm_pool > 1:
             try:
-                warmed = pp.warm_first_open(warm_files, args.warm_pool)
+                effective = pp.bound_workers(args.warm_pool)
+                warm_files = pp.warm_candidates(dest)
+                warmed = pp.warm_first_open(warm_files, effective)
+                t_scan0 = time.time()
+                say(f"  prechauffe en {t_scan0 - t_w0:.0f} s : {warmed} fichier(s) "
+                    f"ouvert(s) une premiere fois par {effective} fils")
             except Exception as exc:  # le scan reste la lecture, pas le prechauffage
+                t_scan0 = time.time()
                 say(f"  warning: prechauffage abandonne ({type(exc).__name__}: {exc})")
-        t_w1 = time.time()
-        if args.warm_pool > 1:
-            say(f"  prechauffe en {t_w1 - t_w0:.0f} s : {warmed} fichier(s) ouvert(s) "
-                f"une premiere fois par {args.warm_pool} fils")
+            warm_seconds = t_scan0 - t_w0
         else:
             say(f"  prechauffage desactive (--warm-pool {args.warm_pool})")
 
         res = collect([dest], d0, until_dt=until_dt, per_day=True)
         t2 = time.time()
-        say(f"  scanne en {t2 - t_w1:.0f} s : {res['files']['resp']} resp, "
+        say(f"  scanne en {t2 - t_scan0:.0f} s : {res['files']['resp']} resp, "
             f"{res['files']['paired']} appariees, {res['files']['unpaired']} non appariees")
 
         rows = build_days(res["per_day"], dirs, d0, now_dt, res["reqs"], fleet, rdir,
@@ -1212,8 +1219,8 @@ def from_archive(args, dirs, pp, bs):
         row["archive"] = {"files": cur, "read_at": read_at, "members": n_members,
                           "declared_bytes": need,
                           "seconds": {"extract": round(t1 - t0, 1),
-                                      "warm": round(t_w1 - t_w0, 1),
-                                      "scan": round(t2 - t_w1, 1)}}
+                                      "warm": round(warm_seconds, 1),
+                                      "scan": round(t2 - t_scan0, 1)}}
         row["loose_residual"] = resid
         # la ligne persiste seule (le rapport non) : elle garde ce qu'elle a
         # ete lue — racines demandees, lues, non lues (#1180, review ai-01)
@@ -1249,6 +1256,10 @@ def from_archive(args, dirs, pp, bs):
 
 
 def main():
+    # #1195 (review ai-01 25/11) — charge avant l'analyseur : la borne de
+    # --warm-pool se lit sur la constante (aide ET refus), jamais recopiee —
+    # une borne recopiee derive.
+    pp = _load_partial_parts()
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--dir", action="append", default=None,
@@ -1290,21 +1301,27 @@ def main():
     ap.add_argument("--reread", action="store_true",
                     help="relire un jour deja present dont l'archive a change depuis la "
                          "lecture (sans lui : sortie 2, rien n'est relu)")
-    ap.add_argument("--warm-pool", type=int, default=8, metavar="N",
+    ap.add_argument("--warm-pool", type=int, default=pp.WARM_POOL, metavar="N",
                     help="(#1195) avec --from-archive : fils qui ouvrent une PREMIERE "
                          "fois chaque fichier extrait avant le scan — l'attente de "
                          "premiere ouverture (62 ms par fichier, mesure du 25/11) se "
                          "parallelise ; le scan relit tout avec ses regles et aucun "
-                         "decompte ne bouge. 0 ou 1 = desactive (le chiffre en serie "
-                         "reste atteignable)")
+                         "decompte ne bouge. 0 ou 1 = desactive, et alors rien n'est "
+                         "liste ni chronometre (le chiffre en serie reste atteignable) ; "
+                         f"0..{pp.WARM_POOL_MAX} — hors borne : refus, sortie 2")
     args = ap.parse_args()
+    # #1195 (review ai-01 25/11) — la borne est APPLIQUEE : un entier hors
+    # [0, WARM_POOL_MAX] est refuse ici, avant toute lecture d'archive.
+    if not 0 <= args.warm_pool <= pp.WARM_POOL_MAX:
+        ap.error(f"--warm-pool {args.warm_pool} : attendu 0..{pp.WARM_POOL_MAX} "
+                 f"(0 ou 1 = desactive ; {pp.WARM_POOL_MAX} fils au plus — le "
+                 f"prechauffage divise une attente par fichier)")
     # #1180 — `--dir` repetable : la PREMIERE racine reste le corpus de
     # reference (archive/ et reconcile/ gardent leur sens), les suivantes
     # n'ajoutent que leurs captures loose.
     dirs = args.dir or [os.environ.get("CLAUDISH_CAPTURE_DIR",
                                        r"D:\claudish-captures")]
     cdir = dirs[0]
-    pp = _load_partial_parts()
     bs = _load_blind_spot()
 
     if args.from_archive:

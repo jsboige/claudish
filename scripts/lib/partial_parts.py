@@ -22,11 +22,15 @@ Trois services (AC 2 / AC 4 de la decision, plus le prechauffage #1195) :
   read_members() — extraction py7zr pour le lecteur qui doit etre EXACT
               (native-consumption --leak-policy, AC 4 : verdict identique
               avant/apres packing sur un jour rejoue).
+  warm_candidates() — la PREPARATION du prechauffage (#1195) : les fichiers
+              extraits a ouvrir, tries. L'appelant ne l'entre QUE prechauffage
+              arme — desactive, rien n'est liste ni compte.
   warm_first_open() — prechauffage de la PREMIERE OUVERTURE des fichiers
               extraits (#1195) : une ouverture par fichier, `workers` fils a
-              la fois — l'attente a la premiere ouverture d'un fichier
-              fraichement extrait ne parallelise pas dans le fil de
-              l'appelant (mesure du 25/11 : 62,12 -> 8,41 ms par fichier).
+              la fois, borne a WARM_POOL_MAX — l'attente a la premiere
+              ouverture d'un fichier fraichement extrait ne parallelise pas
+              dans le fil de l'appelant (mesure du 25/11 : 62,12 -> 8,41 ms
+              par fichier).
 
 Semantique de fenetre : le NOM d'une partie porte son jour et l'heure de sa
 passe, pas l'etendue de son contenu (bornes = passe - W .. passe, non
@@ -225,6 +229,34 @@ def read_members(paths, dest, keep=None):
 # change ce qui a ete mesure — re-mesurer alors (pin : test_partial_parts.py).
 WARM_READ_BYTES = 300_000
 WARM_POOL = 8
+# Borne EXPLICITE du pool (review ai-01 25/11, reserve 7161871992) : le
+# prechauffage divise une attente PAR FICHIER, il n'ouvre pas le corpus a un
+# fil par fichier. Meme raison que DEFAULT_HEAD_WORKERS de blind_spot (#997),
+# mais ici la borne s'APPLIQUE : le CLI refuse hors [0, WARM_POOL_MAX] et
+# l'executeur borne de son cote (bound_workers), pour un appelant qui ne
+# passe pas par argparse. 32 = 4x le pool mesure ; le gain au-dela de 8 n'est
+# pas mesure.
+WARM_POOL_MAX = 32
+
+
+def bound_workers(workers):
+    """Fils effectifs du pool de prechauffage -> 1 (serie sur le fil de
+    l'appelant) pour 0, un negatif ou une valeur non entiere ; sinon
+    `workers`, jamais au-dessus de WARM_POOL_MAX."""
+    try:
+        n = int(workers)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(n, WARM_POOL_MAX))
+
+
+def warm_candidates(dest):
+    """PREPARATION du prechauffage -> les fichiers DIRECTS de `dest`, tries
+    (les membres extraits sont plats ; un sous-dossier n'est pas un membre).
+    Une racine illisible leve — l'appelant la garde, et il n'entre ici QUE
+    prechauffage arme : desactive, rien n'est liste, ni trie, ni compte."""
+    return [os.path.join(dest, fn) for fn in sorted(os.listdir(dest))
+            if os.path.isfile(os.path.join(dest, fn))]
 
 
 def _touch(path):
@@ -250,9 +282,11 @@ def warm_first_open(paths, workers=WARM_POOL):
     `workers` <= 1 : tout sur le fil de l'appelant — le chiffre en serie, et
     l'interrupteur.
 
-    paths : chemins (str). workers : fils ; <= 1 = aucun pool.
+    paths : chemins (str). workers : fils, bornes par bound_workers() a
+    [1, WARM_POOL_MAX] ; <= 1 = aucun pool.
     """
-    if not workers or workers <= 1:
+    workers = bound_workers(workers)
+    if workers <= 1:
         n = 0
         for p in paths:
             try:
