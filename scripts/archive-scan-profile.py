@@ -11,7 +11,10 @@ sample, never on a whole day:
 
 Sample: the day's members whose NAME carries one of --hours (UTC), first
 --max-members of each kind (req / resp) in archive order. Extracted LOCALLY
-by the reader's own `lib/partial_parts.read_members`, then three phases:
+by the reader's own `lib/partial_parts.read_members` into a directory the run
+ALLOCATES (`tempfile.mkdtemp` under the extraction root, removed on every
+path, failed extraction included — nothing that was there before is touched),
+then three phases:
 
   first open   every extracted file is opened for the FIRST time — the even
                ranks serially (what the scan pays today), the odd ranks by a
@@ -247,7 +250,17 @@ def _measure(args, tc, pp, py7zr, built):
               f"or pass --extract-root)", file=sys.stderr)
         return 2
 
-    dest = os.path.join(root, f"scan-profile-{args.day}-{os.getpid()}")
+    # ALLOCATED, never derived (review ai-01, 25/11): a name built from the day
+    # and the PID is a name an interrupted run may have left behind (a PID is
+    # recycled), and the finally below removes the directory THIS run owns —
+    # nothing else. mkdtemp creates it fresh and exclusively, so a pre-existing
+    # neighbour is never mistaken for ours, not even when the extraction fails.
+    try:
+        dest = tempfile.mkdtemp(prefix=f"scan-profile-{args.day}-", dir=root)
+    except OSError as exc:
+        print(f"REFUSED: no extraction directory could be created under {root} - {exc}",
+              file=sys.stderr)
+        return 2
     res = {"mode": "synthetic" if built else "archive", "day": args.day,
            "hours": sorted(hours), "python": platform.python_version(),
            "py7zr": getattr(py7zr, "__version__", "?"), "disk": root,
@@ -276,8 +289,9 @@ def _measure(args, tc, pp, py7zr, built):
               file=sys.stderr)
         return 2, res
     finally:
-        # `cleaned` is about the EXTRACTION dir; the synthetic source is the
-        # caller's (profile), removed on every path.
+        # `cleaned` is about the EXTRACTION dir — the one mkdtemp created for
+        # this run, so nothing that was there before is removed; the synthetic
+        # source is the caller's (profile), removed on every path.
         shutil.rmtree(dest, ignore_errors=True)
         res["cleaned"] = not os.path.exists(dest)
 

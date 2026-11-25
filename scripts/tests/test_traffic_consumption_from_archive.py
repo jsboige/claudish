@@ -34,6 +34,7 @@ the seats, so neither this process nor its children run under `-I`.
 Run: python scripts/tests/test_traffic_consumption_from_archive.py
 """
 
+import argparse
 import importlib.util
 import json
 import os
@@ -696,6 +697,89 @@ def main():
         out = profile_run("--json")
         check("ni archive ni synthetique : refuse (rc=2)",
               out.returncode == 2 and "REFUSED" in out.stderr, (out.returncode, out.stderr[-200:]))
+
+        # P2 — le repertoire d'extraction est ALLOUE (mkdtemp), jamais DERIVE
+        # (review ai-01, 25/11) : un nom jour+PID est un nom qu'une execution
+        # interrompue a pu laisser derriere elle (un PID se recycle), et le
+        # finally ne doit retirer que le repertoire que CE run possede — y
+        # compris quand l'extraction echoue. Eprouve EN PROCESSUS : le PID
+        # derive est alors le notre, donc le voisin porte exactement le nom
+        # que l'ancienne regle aurait pris pour le sien.
+        print("P2 — repertoire d'extraction alloue : voisin preexistant preserve, succes ET echec")
+        prof_mod = _load("prof", "archive-scan-profile.py")
+
+        def prof_ns(rootp):
+            return argparse.Namespace(archive=None, day=None, hours="3", max_members=4000,
+                                      pool=4, synthetic=4, extract_root=rootp,
+                                      work_dir=rootp, json=True)
+
+        def victim_in(rootp):
+            """Le nom exact que l'ancienne regle (jour + PID) aurait derive."""
+            v = os.path.join(rootp, f"scan-profile-{prof_mod.SYNTHETIC_DAY}-{os.getpid()}")
+            os.makedirs(v)
+            with open(os.path.join(v, "keep.txt"), "w") as fh:
+                fh.write("pre-existing, not this run's\n")
+            return v
+
+        root2 = os.path.join(tmp, "wp2")
+        os.makedirs(root2)
+        victim2 = victim_in(root2)
+        # mkdtemp est ecoute : le repertoire doit naitre SOUS la racine que la
+        # garde d'espace a mesuree (un `dir` oublie extrait ailleurs, sur un
+        # disque que personne n'a verifie, et se nettoie si bien que rien ne
+        # le dit).
+        made, real_mkdtemp = [], tempfile.mkdtemp
+
+        def recording_mkdtemp(*a, **k):
+            path = real_mkdtemp(*a, **k)
+            made.append((k.get("prefix"), path))
+            return path
+
+        prof_mod.tempfile.mkdtemp = recording_mkdtemp
+        try:
+            outcome = prof_mod.profile(prof_ns(root2))
+        finally:
+            tempfile.mkdtemp = real_mkdtemp
+        rc2, res2 = outcome if isinstance(outcome, tuple) else (outcome, {})
+        check("P2 rc=0 (4 paires synthetiques)", rc2 == 0, (rc2, res2))
+        check("P2 le repertoire alloue nait SOUS la racine d'extraction passee",
+              any(p == f"scan-profile-{prof_mod.SYNTHETIC_DAY}-"
+                  and os.path.normcase(os.path.dirname(path)) == os.path.normcase(root2)
+                  for p, path in made), (made, root2))
+        check("P2 LA PIN — le voisin preexistant (nom jour+PID de l'ancienne regle) survit",
+              os.path.isfile(os.path.join(victim2, "keep.txt")), sorted(os.listdir(root2)))
+        check("P2 le repertoire alloue est nettoye, la racine ne garde que le voisin",
+              res2.get("cleaned") is True
+              and sorted(os.listdir(root2)) == [os.path.basename(victim2)],
+              (res2.get("cleaned"), sorted(os.listdir(root2))))
+
+        # Le meme voisin quand l'extraction ECHOUE : `pp` devient un lecteur qui
+        # leve, et le finally ne doit toujours toucher que le repertoire alloue.
+        root3 = os.path.join(tmp, "wp3")
+        os.makedirs(root3)
+        victim3 = victim_in(root3)
+        real_load = prof_mod._load
+
+        class _Boom:
+            @staticmethod
+            def read_members(*a, **k):
+                raise OSError("extraction simulee en echec")
+
+        def load_boom(name, relpath):
+            return _Boom if name == "pp" else real_load(name, relpath)
+
+        prof_mod._load = load_boom
+        try:
+            out3 = prof_mod.profile(prof_ns(root3))
+        finally:
+            prof_mod._load = real_load
+        rc3, res3 = out3 if isinstance(out3, tuple) else (out3, {})
+        check("P2 echec d'extraction : rc=2 (refus, pas un profil)", rc3 == 2, (rc3, res3))
+        check("P2 echec d'extraction : le voisin survit, rien d'autre ne reste",
+              os.path.isfile(os.path.join(victim3, "keep.txt"))
+              and sorted(os.listdir(root3)) == [os.path.basename(victim3)]
+              and res3.get("cleaned") is True,
+              (res3.get("cleaned"), sorted(os.listdir(root3))))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
