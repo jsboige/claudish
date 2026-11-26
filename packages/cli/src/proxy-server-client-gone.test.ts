@@ -41,7 +41,10 @@ import {
   setPatientBackoffTimingsForTests,
   syncClientAbortSignal,
 } from "./handlers/composed-handler.js";
-import { setPolicyRetryBackoffForTests } from "./handlers/shared/stream-parsers/policy-refusal.js";
+import {
+  preStreamPolicyRetry,
+  setPolicyRetryBackoffForTests,
+} from "./handlers/shared/stream-parsers/policy-refusal.js";
 import { resetOpenRouterCatalogForTests } from "./providers/catalog-resolvers/openrouter.js";
 import type { ProviderTransport } from "./providers/transport/types.js";
 import { createProxyServer } from "./proxy-server.js";
@@ -231,6 +234,37 @@ describe("#1209 (2/2) — the client-gone seam", () => {
     expect(combined.aborted).toBe(true);
     expect(combined.reason).toBe("already gone");
   });
+
+  test("preStreamPolicyRetry: shouldStop is consulted BEFORE the attempt is counted", async () => {
+    setPolicyRetryBackoffForTests([1, 1]);
+    // Witness first (a zero is only a verdict next to a positive): with no stop
+    // condition the same call DOES issue its retry.
+    let witnessCalls = 0;
+    const witness = await preStreamPolicyRetry(
+      () => {
+        witnessCalls += 1;
+        return Promise.resolve(new Response("{}", { status: 200 }));
+      },
+      { lane: "openai", model: "test-model" }
+    );
+    expect(witnessCalls).toBe(1);
+    expect(witness.response?.status).toBe(200);
+
+    // A departure must issue nothing AND leave the `action=retry` ledger (#41/
+    // #60) untouched — counting the attempt before the check would make six
+    // departed clients look like a policy-refusal storm.
+    let calls = 0;
+    const stopped = await preStreamPolicyRetry(
+      () => {
+        calls += 1;
+        return Promise.resolve(new Response("{}", { status: 400 }));
+      },
+      { lane: "openai", model: "test-model", shouldStop: () => true }
+    );
+    expect(calls).toBe(0);
+    expect(stopped.attempts).toBe(0);
+    expect(stopped.response).toBeNull();
+  });
 });
 
 // ---- the handler's terminal answer -------------------------------------------
@@ -368,6 +402,35 @@ describe("#1209 (2/2) — the terminal answer to a client that left", () => {
     expect(body.type).toBe("message");
     expect(body.content).toEqual([]);
     expect(body.stop_reason).toBe("end_turn");
+  }, 20000);
+
+  test("a client that leaves during the CONNECT-RETRY ladder gets no retry and is not charged", async () => {
+    // The "closed" class (ECONNRESET before any byte) is retried after a rung —
+    // 400 ms, then 1200 ms (connectRetryDelaysMs). A client that hangs up inside
+    // the first rung must not be answered with the original 400
+    // connection_error: that reply charges the failure to the PROVIDER (durable
+    // connection-error line, telemetry, a failed stat) for a client that will
+    // never read it, and a cascade would walk onto it.
+    const ac = new AbortController();
+    let calls = 0;
+    const pending = drive(
+      () => {
+        calls += 1;
+        return Promise.reject(Object.assign(new TypeError("fetch failed"), { code: "ECONNRESET" }));
+      },
+      { signal: ac.signal }
+    );
+    await waitFor(() => calls >= 1, 5000, "the handler never reached the upstream");
+    await sleep(100); // inside the first rung (400 ms)
+    ac.abort("client gone");
+
+    const res = await withTimeout(
+      pending,
+      2000,
+      "the handler kept retrying for a client that is gone"
+    );
+    expect(calls).toBe(1); // the next rung's refetch was never issued
+    expectClientGone(res);
   }, 20000);
 
   test("the gate is the SIGNAL, not the error class — a re-labelled abort is still client-gone", async () => {

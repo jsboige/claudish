@@ -206,13 +206,17 @@ async function retryConnectError(
   kind: ConnectionErrorKind,
   policy: ConnectRetryPolicy,
   refetch: () => Promise<Response>,
-  firstError: unknown
+  firstError: unknown,
+  clientGone?: AbortSignal
 ): Promise<Response | null> {
   const { max: maxRetries, delaysMs: delays } = policy;
   let lastError = firstError;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const delayMs = delays[Math.min(attempt - 1, delays.length - 1)] ?? 1200;
     await new Promise((resolve) => setTimeout(resolve, delayMs));
+    // #1209 (2/2): a client that left during the rung gets NO retry — and no
+    // `[ConnectRetry]` line, which would advertise an attempt never made.
+    if (clientGone?.aborted) return null;
     const code = classifyConnectionError(lastError)?.code ?? "?";
     logStderr(
       `[ConnectRetry] ${providerDisplayName} ${bareModelName} ${kind} before response (code=${code}) — retry ${attempt}/${maxRetries}`
@@ -1436,9 +1440,21 @@ export class ComposedHandler implements ModelHandler {
               this.provider.enqueueRequest
                 ? () => this.provider.enqueueRequest!(doFetch)
                 : doFetch,
-              error
+              error,
+              clientGone
             )
           : null;
+      // #1209 (2/2) — the client left while the ladder waited. Without this
+      // the departure would be answered as the ORIGINAL connect failure: a 400
+      // connection_error charged to the provider (durable connection-error
+      // line, telemetry, a failed stat) for a client that will never read it.
+      if (!recovered && clientGone?.aborted) {
+        return this.answerClientGone(
+          c,
+          "left during the connect-retry ladder — remaining retries not issued",
+          performance.now() - startTime
+        );
+      }
       const conn = recovered ? null : classifyConnectionError(error);
       if (conn) {
         const msg = buildConnectionErrorMessage(conn.kind, this.provider.displayName, endpoint);
