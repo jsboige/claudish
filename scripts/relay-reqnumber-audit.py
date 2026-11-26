@@ -81,6 +81,12 @@ TRAPS (each one produces a wrong-but-plausible acceptance row):
      saying so. The script reports `starts_at_process_start`: false when the
      corpus does not begin on a `[Relay] sidecar mode:` line, so a whole-life
      row whose head was rotated away is not mistaken for a complete one.
+  T9 Timestamps are compared as normalised INSTANTS, never as raw strings:
+     Go's RFC3339Nano trims trailing zeros and drops the fraction at ns=0, so
+     ":08.6Z" sorts AFTER ":08.634Z" as a string while .600 precedes .634. A
+     raw compare made the acceptance precondition accept a window that still
+     held a local-serving request (and refuse a valid one); the precondition
+     now uses the same `_key()` normalisation as the cut itself.
 
 READ-ONLY: reads a log (file, stdin, or `--container` via `docker logs -t`),
 prints counters, timestamps and verdicts. No writes, no secrets: upstream URLs,
@@ -278,8 +284,13 @@ def audit(lines: list[str], since: str | None = None, until: str | None = None) 
         if not has_timestamps:
             trim_note = "no timestamps in the corpus (use `docker logs -t`): the acceptance window cannot be placed"
         elif stats["last_transition"] and stats["last_transition"][1] == "NOMINAL" and (
-            stats["last_transition"][0] or ""
-        ) >= (stats["last_request_ts"] or ""):
+            # Compared as NORMALISED keys, never as raw strings: Go's
+            # RFC3339Nano trims trailing zeros (and drops the fraction at ns=0),
+            # so "…:08.6Z" > "…:08.634Z" and "…:08.5Z" > "…:08.500Z" as strings
+            # while the instants say the opposite. The cut below already uses
+            # _key(); the precondition must agree with it.
+            _key(stats["last_transition"][0] or "") >= _key(stats["last_request_ts"] or "")
+        ):
             cut = stats["last_transition"][0] or ""
             cut_key = _key(cut)
             acceptance_lines = [l for l in window if _stamp(l) is not None and _key(_stamp(l) or "") > cut_key]

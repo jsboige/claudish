@@ -63,21 +63,21 @@ def ttft(second: int, req: int | None, model: str = "claude-sonnet-5-5", frac: s
     return f"{ts(second, frac)}   [ttft] anthropic model={model}{number} headers=1000ms firstEvent=1ms total=1001ms"
 
 
-def request_line(second: int, model: str = "claude-sonnet-5-5") -> str:
+def request_line(second: int, model: str = "claude-sonnet-5-5", frac: str = "000000000") -> str:
     return (
-        f"{ts(second)} [claudish] [Request] model={model} handler=ComposedHandler"
+        f"{ts(second, frac)} [claudish] [Request] model={model} handler=ComposedHandler"
         f" src=direct stream msgs=3 max_tokens=100 machine=seat-a ua=synthetic"
     )
 
 
-def transition(second: int, mode: str) -> str:
+def transition(second: int, mode: str, frac: str = "000000000") -> str:
     if mode == "AUTONOMOUS":
         return (
-            f"{ts(second)} [Relay] upstream http://hub.example:3000 DOWN after 2 failure(s)"
+            f"{ts(second, frac)} [Relay] upstream http://hub.example:3000 DOWN after 2 failure(s)"
             f" (heartbeat) → AUTONOMOUS"
         )
     return (
-        f"{ts(second)} [Relay] upstream http://hub.example:3000 healthy again"
+        f"{ts(second, frac)} [Relay] upstream http://hub.example:3000 healthy again"
         f" → NOMINAL (relay resumed) — queue RECOVERED→NOMINAL 52.7s"
     )
 
@@ -138,6 +138,39 @@ check("T1: the acceptance row starts after the NOMINAL transition", got["accepta
 check("T1: the acceptance row freezes at the last local number", got["acceptance"] is not None and got["acceptance"]["reqN_counts"] == {"2": 4}, str(got["acceptance"] and got["acceptance"]["reqN_counts"]))
 check("T1: the acceptance row has no [Request] line", got["acceptance"] is not None and got["acceptance"]["request_lines"] == 0, str(got["acceptance"] and got["acceptance"]["request_lines"]))
 check("T1: the life holding the trim point is kept (it starts after the cut)", len(got["lives"]) == 1 and got["lives"][0]["ttft"] == 4, str(got["lives"]))
+
+# --- T9: the acceptance precondition compares INSTANTS, not strings -----------
+# Go's RFC3339Nano trims trailing zeros (and drops the fraction at ns=0), so two
+# lines of the same second can carry fractions of different lengths. A raw
+# string compare moves the cut the wrong way in BOTH directions (26/11, cycle 8).
+
+after = audit(
+    [startup(0), request_line(3)]
+    + [transition(8, "NOMINAL", "6")]  # Go prints .600 as ".6"
+    + [request_line(8, frac="634")]  # .634 > .600: served AFTER the return
+    + [ttft(9, 6), ttft(10, 6)]
+)
+check("T9: a request after a short-fraction transition leaves no acceptance row", after["verdict"] == "NO-ACCEPTANCE-WINDOW", str(after["verdict"]))
+check("T9: and no row is quoted in its place", after["acceptance"] is None, str(after["acceptance"]))
+
+before = audit(
+    [startup(0)]
+    + [request_line(8, frac="6")]  # .600
+    + [transition(8, "NOMINAL", "63")]  # .630 > .600: the transition is later
+    + [ttft(9, 6), ttft(10, 6)]
+)
+check("T9: a long-fraction transition after the request still cuts the row", before["acceptance"] is not None, str(before["acceptance"]))
+check("T9: the row starts at that transition", before["acceptance"] is not None and before["acceptance"]["since"] == ts(8, "63"), str(before["acceptance"] and before["acceptance"]["since"]))
+check("T9: and it excludes the local request", before["acceptance"] is not None and before["acceptance"]["request_lines"] == 0, str(before["acceptance"] and before["acceptance"]["request_lines"]))
+
+
+nofrac = audit(
+    [startup(0), request_line(3)]
+    + ["2026-11-26T02:06:08Z [Relay] upstream http://hub.example:3000 healthy again → NOMINAL (relay resumed)"]  # ns=0: no fraction
+    + [request_line(8, frac="5")]  # .500 > .000: served AFTER the return
+    + [ttft(9, 6), ttft(10, 6)]
+)
+check("T9: a transition written at the second is still placed by instant", nofrac["verdict"] == "NO-ACCEPTANCE-WINDOW", str(nofrac["verdict"]))
 
 # POSITIVE CONTROL for T1: the same instrument on the same shape minus the
 # episode must NOT find an acceptance row to trim — it reads the whole window.
