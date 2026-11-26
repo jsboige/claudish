@@ -27,6 +27,7 @@ import {
   type FailoverRole,
   type ServedStepRecord,
 } from "../../fork/failover.js";
+import { isClientGoneResponse } from "./client-gone.js";
 
 export function prependNoticeToAnthropicStream(
   source: ReadableStream<Uint8Array>,
@@ -258,6 +259,10 @@ export async function applyFailoverNotices(
   served?: ServedStepRecord
 ): Promise<Response> {
   if (!role) return response;
+  // #1209 (2/2): the client left — the marked answer is a NON-state. The notice
+  // builders have side effects (a recovery condensation is a one-shot budget,
+  // `remaining -= 1`); nothing is announced for an answer nobody received.
+  if (isClientGoneResponse(response)) return response;
   if (wantsStreaming) {
     const text = consumeStreamNotice(role, sessionKey, nominalBucket, served);
     if (!text) return response;

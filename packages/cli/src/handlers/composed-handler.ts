@@ -28,6 +28,7 @@ import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
 import { clientRequestedThinking } from "./shared/client-thinking.js";
 import { clientAttributionEnabled, clientAttributionHeaders } from "./shared/client-attribution.js";
 import { setServedModel } from "./shared/served-model-header.js";
+import { CLIENT_GONE_HEADER } from "./shared/client-gone.js";
 import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { filterIdentity } from "./shared/openai-compat.js";
@@ -638,7 +639,10 @@ export class ComposedHandler implements ModelHandler {
    *
    * `x-claudish-served-model` is deliberately ABSENT: the header's contract
    * (#1128) names the concrete that served, and an answer nobody received
-   * served no one. `x-claudish-client-gone` names the situation instead.
+   * served no one. `x-claudish-client-gone` names the situation instead — and
+   * names it to the cascade too: that mark makes the answer a NON-state for
+   * every `response.ok` consumer (shared/client-gone.ts), so a cancelled attempt
+   * is never booked as the recovery that brings a dead rung back.
    */
   private buildClientGoneResponse(c: Context): Response {
     return c.json(
@@ -656,7 +660,7 @@ export class ComposedHandler implements ModelHandler {
       {
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
-        "x-claudish-client-gone": "1",
+        [CLIENT_GONE_HEADER]: "1",
       }
     );
   }

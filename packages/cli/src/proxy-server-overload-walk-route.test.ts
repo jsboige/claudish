@@ -35,10 +35,14 @@
  *  - rethrow in the walk's `catch` ⇒ W14 red — the client gets a terminal
  *    HTTP 400 routing error instead of the retryable 529 (review of #326);
  *  - drop the budget skip (#348) ⇒ W15 red — the walk fires into a request
- *    whose patience is already spent; W16 pins the NEGATIVE result that no
- *    client-gone skip exists (abort undetectable pre-write on this stack —
- *    see the W16 comment's probe matrix; a `destroyed`-based predicate skips
- *    every walk, measured 11/22 red the moment it shipped);
+ *    whose patience is already spent; drop the client-gone skip (#1209 2/2)
+ *    ⇒ W16 red — the walk fires for a `stream:false` client that has left.
+ *    (W16 used to pin the NEGATIVE result "no client-gone skip exists, an
+ *    abort is undetectable pre-write on this stack". That was a measurement
+ *    of bun 1.3.14, not a property of the stack: under bun >= 1.4 the
+ *    request's signal aborts ~10 ms after the client's close — measured
+ *    2026-11-26, official images, identical deps. The runtime the fix needs
+ *    is published at boot as `/health` `clientGoneDetect`.)
  *  - drop the canonical bucketter for bare targets (#348) ⇒ W17 red — the
  *    wall on the route()-primary bucket is invisible to providerBucketOf;
  *  - drop the nominal-bucket skip (#348 part 3) ⇒ W18 red — the walk re-pays
@@ -57,6 +61,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createProxyServer } from "./proxy-server.js";
 import { isOverloadWalkClass } from "./handlers/composed-handler.js";
+import { hangUntilAborted } from "./test-support/stub-fetch.js";
 import {
   armFailover,
   classifyNominalBucket,
@@ -121,6 +126,10 @@ let endpointStatus: Record<string, number> = {};
  *  nominal to answer LATE so the walk branch can observe a spent budget or a
  *  client that left while the nominal was still working. */
 let endpointDelay: Record<string, number> = {};
+/** #1209 2/2 (W22): endpoints that answer nothing until their attempt is
+ *  aborted (the stub rejects on `init.signal`) — a still-generating upstream
+ *  behind a `stream:false` client that has left. */
+let endpointHang: Record<string, boolean> = {};
 /** Endpoints whose 429 body is a BURST (no overload wording) rather than an
  *  overload-shaped 429 — W7's negative control needs both spellings. */
 let burst429: Record<string, boolean> = {};
@@ -312,6 +321,7 @@ beforeEach(() => {
   failoverLog = [];
   endpointStatus = {};
   endpointDelay = {};
+  endpointHang = {};
   burst429 = {};
   wallOnTrHit = null;
   nomRefused = false;
@@ -364,6 +374,12 @@ beforeEach(() => {
     if (!url.startsWith(UPSTREAM_BASE)) return realFetch(input, init);
     const which = url.slice(UPSTREAM_BASE.length + 1, UPSTREAM_BASE.length + 3);
     calls[which] = (calls[which] ?? 0) + 1;
+    // #1209 2/2 (W22): an endpoint that answers NOTHING until its attempt is
+    // cancelled — the upstream is still generating, as the incident's were.
+    // Unlike the delays and statuses below, it honours `init.signal` (it
+    // rejects on abort): that is what lets a departed client's cancellation
+    // reach the handler and produce the marked client-gone answer.
+    if (endpointHang[which]) return hangUntilAborted(new Request(input, init));
     if (endpointDelay[which]) await new Promise((r) => setTimeout(r, endpointDelay[which]));
     const status = endpointStatus[which] ?? (which === "nm" ? 529 : 200);
     if (status === 1302) return concurrencyRefusal429();
@@ -377,14 +393,14 @@ beforeEach(() => {
   (process.stderr as any).write = ((chunk: any, ...rest: any[]) => {
     const text = typeof chunk === "string" ? chunk : String(chunk);
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]")) failoverLog.push(line);
+      if (line.includes("[Failover]") || line.includes("[ClientGone]")) failoverLog.push(line);
     }
     return realStderrWrite(chunk, ...rest);
   }) as any;
   console.log = ((...args: any[]) => {
     const text = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
     for (const line of text.split("\n")) {
-      if (line.includes("[Failover]")) failoverLog.push(line);
+      if (line.includes("[Failover]") || line.includes("[ClientGone]")) failoverLog.push(line);
     }
     // Re-emit so a failing run still shows the proxy's operator markers.
     realConsoleLog(...args);
@@ -396,11 +412,11 @@ afterEach(async () => {
   console.log = realConsoleLog;
   globalThis.fetch = realFetch;
   if (activeProxy) {
-    // #630: W16's abandoned response (client aborted, handler still writing)
-    // is CONSUMABLE work by the shutdown gate — a client that left mid-response
-    // is undetectable on this stack, which is W16's own documented conclusion
-    // — so a default-grace shutdown waits 30 s and blows the 5 s hook timeout.
-    // Cleanup pays a token grace, never the real one.
+    // #630: W16/W22's abandoned request (client aborted, handler still
+    // working) is CONSUMABLE work by the shutdown gate — it arrived complete
+    // and its response is not yet written — so a default-grace shutdown waits
+    // 30 s and blows the 5 s hook timeout. Cleanup pays a token grace, never
+    // the real one.
     const prevGrace = process.env.CLAUDISH_SHUTDOWN_GRACE_MS;
     process.env.CLAUDISH_SHUTDOWN_GRACE_MS = "100";
     try {
@@ -989,42 +1005,170 @@ describe("#299 B — nominal transient overload walks the cascade once, zero fai
     expect(isFailoverActive("sonnet")).toBe(false); // the skip writes no state either
   }, 30_000);
 
-  // #348 NEGATIVE RESULT, pinned — a client abort is UNDETECTABLE at the walk
-  // branch on this stack, so there is NO client-gone skip and this pin guards
-  // against re-adding one. The proxy serves through @hono/node-server on
-  // Bun's node:http, and by the cascade the body is consumed. Probe matrix
-  // (2x2 healthy/aborted, body read, checked 400 ms after the abort):
-  //  - adapter Request signal: false in BOTH (it arms only at the first
-  //    write — and a first probe on raw Bun.serve, where it DOES flip, was
-  //    the wrong stack; caught by this test before merge);
-  //  - incoming.destroyed/close/complete: true in BOTH (Bun destroys the
-  //    message once read — a predicate on `destroyed` skips EVERY walk,
-  //    measured: 11/22 red the moment it shipped);
-  //  - incoming.socket/outgoing.socket {destroyed, readyState}: open in BOTH;
-  //  - events subscribed at entry (inc "aborted"/"close", socket "close",
-  //    out "close"): identical in BOTH.
-  // Consequence: the walk FIRES into an abandoned request (bounded by the
-  // budget alone, one attempt by construction). If someone re-adds a
-  // client-gone predicate, it must discriminate THIS test's aborted client
-  // from a healthy one — no current signal does.
-  test("W16: client abort is UNDETECTABLE pre-write → the walk proceeds (no client-gone skip exists)", async () => {
+  // #1209 (2/2) — the walk is paid work for a client: a `stream:false` client
+  // that has already left gets NONE. The predicate is the request's own
+  // signal (`syncClientAbortSignal`): @hono/node-server aborts it from the
+  // response's 'close'. This pin used to hold the NEGATIVE result ("no
+  // client-gone skip exists — an abort is undetectable pre-write on this
+  // stack", with a 2x2 probe matrix). That matrix was a measurement of
+  // bun 1.3.14, not a property of the stack. Re-measured 2026-11-26 on the
+  // official images with identical deps: bun 1.3.14 → no incoming / socket /
+  // outgoing event ever fires and the socket stays `open` (FIN and RST alike;
+  // `resume()` / a `data` listener / `readable` reveal nothing); bun 1.4.5 →
+  // `sock.end → signal.abort → outgoing.close → sock.close` within ~10 ms of
+  // the client's close (win32 1.4.3: same). So the skip is real where the
+  // runtime is >= 1.4 and inert where it is 1.3.14 — the process measures
+  // which at boot and publishes it (`/health` `clientGoneDetect`), so a deploy
+  // cannot look done on a runtime where the fix does nothing.
+  //
+  // Staging: the stub's `endpointDelay` ignores `init.signal`, so the nominal
+  // still answers its 529 LATE — after the client is gone. That is exactly the
+  // shape this site exists for: an overload that arrives for nobody.
+  test("W16: a stream:false client that left → NO walk (one skip marker, step never called, no state)", async () => {
     await spin();
     resetWalk();
-    endpointDelay.nm = 400; // the nominal is still working when the client leaves
+    endpointDelay.nm = 400; // the nominal answers its 529 after the client leaves
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 150);
     try {
       await postMessage("claude-sonnet-5", {}, ac.signal);
     } catch {
-      // expected — the client-side fetch rejects on abort; the SERVER handler
-      // continues (that asymmetry is the point of this pin).
+      // expected — the client-side fetch rejects on abort
     }
-    // Let the handler reach the walk branch after its late 529.
-    await new Promise((r) => setTimeout(r, 600));
-    expect(calls.nm).toBe(1); // the nominal attempt was already in flight
-    expect(calls.s0).toBe(1); // the walk FIRED — no skip predicate may suppress it here
-    expect(failoverLog.some((l) => l.includes("WALK sonnet one-shot"))).toBe(true);
-    expect(failoverLog.some((l) => l.includes("WALK sonnet skipped"))).toBe(false);
+    await new Promise((r) => setTimeout(r, 600)); // the handler has reached the walk branch
+    expect(calls.nm).toBe(1); // the nominal attempt was already in flight — nothing to save there
+    expect(calls.s0).toBe(0); // the walk did NOT fire for a client that is gone
+    expect(calls.s1).toBe(0);
+    expect(
+      failoverLog.some(
+        (l) => l.includes("[Failover] WALK sonnet skipped — stream:false client gone") && l.includes("529")
+      )
+    ).toBe(true); // one countable marker, the budget skip's shape
+    expect(failoverLog.some((l) => l.includes("WALK sonnet one-shot"))).toBe(false);
+    expect(failoverLog.some((l) => l.includes("budget"))).toBe(false); // not the #348 budget skip
+    expect(isFailoverActive("sonnet")).toBe(false); // the skip writes no state either
+  }, 30_000);
+
+  // #1209 (2/2) — the marked client-gone answer is a NON-STATE for the
+  // cascade. When the nominal's attempt is CANCELLED (the upstream was still
+  // generating), the handler answers a marked 200 (`x-claudish-client-gone`:
+  // the route always answers, never a 5xx a cascade would walk). Every
+  // `response.ok` consumer used to read that as SUCCESS — and the first
+  // nominal success after an expired wall is, by construction, the RECOVERY
+  // PROBE: `servedUnderWall` is seeded at arm time and consumed by
+  // onNominalSuccess. A departed probe would have emitted
+  // `[Failover] RECOVERED sonnet`, lifted the wall and released every dwell
+  // pin on an answer NO provider produced — bringing a dead nominal back.
+  //
+  // Staged on that exact state: a wall armed to lift by itself, the clock past
+  // its reset, then (1) a DEPARTED probe — must recover nothing; (2) a LIVE
+  // probe on the very same state — must. Without (2), (1) proves nothing: an
+  // assertion of absence needs a witness that the event was reachable.
+  test("W22: the marked client-gone answer books NO recovery — a departed probe is a non-state, the live one still recovers", async () => {
+    await spin();
+    resetWalk();
+    const realNow = Date.now;
+    let clock = 1_700_000_000_000;
+    Date.now = () => clock;
+    try {
+      // A wall that lifts in 1 s: `resetAt` shortens the ladder TTL to
+      // untilReset + WALL_RESET_MARGIN_MS (30 s). Armed directly — the arm is
+      // the precondition here, not the subject.
+      expect(
+        armFailover("sonnet", "W22: a wall that lifts by itself", bucketOfNominal(), new Date(clock + 1_000))
+      ).toBe(true);
+      expect(isBucketWalled(bucketOfNominal())).toBe(true);
+      clock += 40_000; // past resetAt + margin: the nominal is probed again
+      expect(isBucketWalled(bucketOfNominal())).toBe(false);
+
+      // (1) the DEPARTED recovery probe: the nominal generates, the client
+      // leaves at 150 ms, the attempt is cancelled, the handler answers the
+      // marked 200.
+      endpointHang.nm = true;
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 150);
+      try {
+        await postMessage("claude-sonnet-5", {}, ac.signal);
+      } catch {
+        // expected — the client-side fetch rejects on abort
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      expect(calls.nm).toBe(1); // the probe reached the nominal (the wall was down)
+      expect(failoverLog.some((l) => l.includes("[ClientGone]"))).toBe(true); // the marked answer was produced
+      expect(calls.s0).toBe(0); // nothing re-issued, nothing walked
+      expect(failoverLog.some((l) => l.includes("RECOVERED sonnet"))).toBe(false); // ← the contract
+      expect(failoverLog.some((l) => l.includes("WALK sonnet"))).toBe(false);
+
+      // (2) the LIVE probe, on the state (1) left untouched.
+      endpointHang.nm = false;
+      endpointStatus.nm = 200;
+      const live = await postMessage("claude-sonnet-5");
+      expect(live.status).toBe(200);
+      expect(calls.nm).toBe(2);
+      expect(failoverLog.some((l) => l.includes("RECOVERED sonnet"))).toBe(true); // ← the witness
+    } finally {
+      Date.now = realNow;
+    }
+  }, 30_000);
+
+  // #1209 (2/2) — the SAME non-state rule one level deeper: the answer that
+  // comes back marked may be a WALK STEP's answer, not the nominal's. When the
+  // walk's target is a delegation whose concrete is the owner role's nominal,
+  // its success credits `onNominalSuccess(owner.role, ownerBucket)` — the site
+  // that consumes `servedUnderWall` and announces the recovery. A client that
+  // leaves mid-step used to book that credit on an answer nobody received.
+  //
+  // Staged on the walk's own credit bucket: a wall on kw-ep that lifts by
+  // itself (seeded at arm time, consumed by the first nominal success on that
+  // bucket), the clock past its reset, then (1) a DEPARTED walk step — must
+  // credit nothing; (2) a LIVE walk step on the very same state — must credit
+  // it. Without (2), (1) proves nothing: the event has to be reachable.
+  test("W23: a client that leaves DURING a walk step books no owner recovery — the live attempt consumes it", async () => {
+    const realNow = Date.now;
+    let clock = 1_700_000_000_000;
+    Date.now = () => clock;
+    try {
+      await spin({ sonnet: "nom-ep@fake-nom", opus: "kw-ep@fake-sonnet-kw", haiku: "h5-ep@fake-h5" });
+      resetWalk({
+        CLAUDISH_FAILOVER_HAIKU: "role:opus", // the walking role's delegated step
+        CLAUDISH_FAILOVER_OPUS: "s1-ep@fake-s1", // a rule for opus: an arm needs one
+      });
+      setRoleNominalResolver((r) =>
+        r === "opus" ? "kw-ep@fake-sonnet-kw" : r === "haiku" ? "h5-ep@fake-h5" : undefined
+      );
+      // The wall sits on the bucket the walk's delegated success CREDITS
+      // (kw-ep), and lifts by itself one second later.
+      expect(
+        armFailover("opus", "W23: the walk target's own bucket", "kw-ep", new Date(clock + 1_000))
+      ).toBe(true);
+      clock += 40_000; // past resetAt + margin: no longer walled, still pending
+      expect(isBucketWalled("kw-ep")).toBe(false);
+
+      endpointStatus.h5 = 529; // the walking role's nominal overloads at once
+      endpointHang.kw = true; // …and the walked target is still generating
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 150);
+      try {
+        await postMessage("claude-haiku-5", {}, ac.signal);
+      } catch {
+        // expected — the client-side fetch rejects on abort
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      expect(calls.h5).toBe(1); // the overload arrived before the departure
+      expect(calls.kw).toBe(1); // the walk DID fire — this pin is about its bookkeeping
+      expect(failoverLog.some((l) => l.includes("[ClientGone]"))).toBe(true); // the marked answer was produced
+      expect(failoverLog.some((l) => l.includes("RECOVERED opus"))).toBe(false); // ← the contract
+
+      // (2) the LIVE witness on the state (1) left untouched.
+      endpointHang.kw = false;
+      const live = await postMessage("claude-haiku-5");
+      expect(live.status).toBe(200);
+      expect(calls.h5).toBe(2);
+      expect(calls.kw).toBe(2);
+      expect(failoverLog.some((l) => l.includes("RECOVERED opus"))).toBe(true); // ← the witness
+    } finally {
+      Date.now = realNow;
+    }
   }, 30_000);
 
   // #348 part 2 — the W12 gap on the BARE-NAME plane: providerBucketOf("glm-5.3")

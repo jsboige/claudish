@@ -15,11 +15,29 @@
  * blamed on the provider). `@hono/node-server` is what fires that signal: its
  * `outgoing` "close" handler aborts the request's AbortController with
  * "Client connection prematurely closed." whenever the response was not fully
- * written (node-server 1.19.6, dist/listener.js L542-548 — read, not assumed).
+ * written (node-server 1.19.x, dist/listener.js — read, not assumed).
+ *
+ * ⚠ ITS PRECONDITION IS A RUNTIME PROPERTY, measured 2026-11-26 on the official
+ * images with identical deps (`hono@4`, `@hono/node-server@1.19.19` — the
+ * version the deployed image carries):
+ *   - bun 1.3.14 (`oven/bun:1.3-alpine`, the image the fleet runs today): the
+ *     departure is INVISIBLE pre-write — no incoming / socket / outgoing event
+ *     fires, the socket stays `open` 1200 ms after the client's close (FIN and
+ *     RST alike), and forcing the socket to flow (`resume()`, a `data`
+ *     listener, `readable`) reveals nothing. The fix is INERT there;
+ *   - bun 1.4.5 (`oven/bun:1.4-alpine`) and 1.4.3 (win32): `sock.end →
+ *     signal.abort → outgoing.close → sock.close` ~190-200 ms after the close.
+ * Hence `fork/client-gone-detect.ts`: the process measures the capability at
+ * boot and publishes it (`/health` `clientGoneDetect`), so no deploy can look
+ * done on a runtime where the cancellation does nothing.
  *
  * The scoping is a decision, so it has its own pin: streaming requests are NOT
  * bound to the client signal (the relay passthrough and the never-hang contract
  * own that path; #1209 scopes this fix to the sync path).
+ *
+ * The marked answer is a NON-STATE — `x-claudish-client-gone` is read by the
+ * cascade, the notice builder and FallbackHandler so a cancelled attempt can
+ * never be booked as a verified recovery. Pinned at the end of this file.
  *
  * Harness shape copied from the sibling route suites: the real proxy in-process
  * via `createProxyServer()` (port 0 → ephemeral, returned as `proxy.port`, so
@@ -35,16 +53,29 @@ import net from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Context, Hono } from "hono";
+import { resetCapabilityVocabForTests } from "./fork/capability-vocabulary.js";
+import {
+  getClientGoneDetection,
+  probeClientGoneDetection,
+  setClientGoneDetectionForTests,
+  startClientGoneDetectionProbe,
+  verdictOf,
+} from "./fork/client-gone-detect.js";
+import { armFailover, resetFailoverForTests } from "./fork/failover.js";
 import {
   ComposedHandler,
   combineAbortSignals,
   setPatientBackoffTimingsForTests,
   syncClientAbortSignal,
 } from "./handlers/composed-handler.js";
+import { FallbackHandler } from "./handlers/fallback-handler.js";
+import { CLIENT_GONE_HEADER, isClientGoneResponse } from "./handlers/shared/client-gone.js";
+import { applyFailoverNotices } from "./handlers/shared/failover-stream-notice.js";
 import {
   preStreamPolicyRetry,
   setPolicyRetryBackoffForTests,
 } from "./handlers/shared/stream-parsers/policy-refusal.js";
+import type { ModelHandler } from "./handlers/types.js";
 import { setDiagOutput } from "./logger.js";
 import { resetOpenRouterCatalogForTests } from "./providers/catalog-resolvers/openrouter.js";
 import type { ProviderTransport } from "./providers/transport/types.js";
@@ -78,6 +109,10 @@ const SANDBOXED_KEYS = [
   "CLAUDISH_NO_ANTHROPIC",
   "CLAUDISH_FAILOVER_ACTIVE",
   "CLAUDISH_CAPTURE_DIR",
+  // #83 knobs: a host that has the vocabulary ON must not leak it into a
+  // test's condensation rail (the pin below sets its own values).
+  "CLAUDISH_CAPABILITY_VOCAB",
+  "CLAUDISH_CAPABILITY_QUERY_MAX_ASKS",
 ];
 const savedEnv: Record<string, string | undefined> = {};
 
@@ -143,6 +178,8 @@ afterEach(async () => {
   // Module-global test hooks: never let one test's timings leak into the next.
   setPatientBackoffTimingsForTests(null);
   setPolicyRetryBackoffForTests(null);
+  resetCapabilityVocabForTests();
+  setClientGoneDetectionForTests("pending");
   restore();
 });
 
@@ -845,5 +882,303 @@ describe("#1209 (2/2) — a stream:false client that hangs up", () => {
 
     const health = await fetch(`http://127.0.0.1:${port}/health`);
     expect(health.status).toBe(200);
+    // #1209 2/2 — the runtime capability is published, not assumed. This suite
+    // runs on bun >= 1.4 (local 1.4.3, CI latest): the boot probe must reach
+    // "detected" within its own bound. On bun 1.3 the value stays "undetected"
+    // and this assertion fails BY DESIGN — the fix cannot cancel anything
+    // there, and a silently inert capability is the failure this field exists
+    // to expose (fork/client-gone-detect.ts carries the measured matrix).
+    const settleUntil = Date.now() + 4000;
+    let verdict = ((await health.json()) as { clientGoneDetect?: string }).clientGoneDetect;
+    while (verdict !== "detected" && Date.now() < settleUntil) {
+      await sleep(100);
+      const again = await fetch(`http://127.0.0.1:${port}/health`);
+      verdict = ((await again.json()) as { clientGoneDetect?: string }).clientGoneDetect;
+    }
+    expect(verdict).toBe("detected");
+  }, 20000);
+
+  // The condensation rail (#83) is the LAST `response.ok` consumer on the
+  // answer's path, and it writes state BEFORE it appends anything
+  // (`state.asks++`, then the query). With the vocabulary ON, a marked answer
+  // used to spend one of the session's few questions on a client that had
+  // left — and the live request on that session found the cap reached.
+  // Route level, because the rail is a closure inside the route.
+  test("the marked answer spends none of the session's capability-question budget — the live request still gets it", async () => {
+    process.env.CLAUDISH_CAPABILITY_VOCAB = "1";
+    process.env.CLAUDISH_CAPABILITY_QUERY_MAX_ASKS = "1"; // ONE ask per session
+    resetCapabilityVocabForTests();
+    const session = { metadata: { user_id: "cg-capability-pin" } };
+    const printed = captureConsoleLog();
+    restoreConsoleLog = printed.restore;
+    const reached = deferred();
+    let upstreamCalls = 0;
+    restoreFetch = installStubFetch((req) => {
+      if (isLoopback(req.url)) return nativeFetch(req);
+      if (!/\/v1\/chat\/completions$/.test(req.url)) {
+        return new Response("{}", {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      upstreamCalls += 1;
+      if (upstreamCalls === 1) {
+        reached.resolve();
+        return hangUntilAborted(req); // "thinking" until the client leaves
+      }
+      return okSse(); // the live request is owed an ordinary answer
+    });
+    const liveBody = {
+      model: "openai@gpt-4o",
+      max_tokens: 16,
+      stream: false,
+      messages: [{ role: "user", content: "hi" }],
+      ...session,
+    };
+    proxy = await createProxyServer(0, undefined, undefined, false, undefined, undefined, {
+      quiet: true,
+    });
+    const port = proxy.port;
+
+    // (1) the DEPARTED request: its marked answer walks the whole route.
+    const sock = await openPost(port, liveBody);
+    await withTimeout(reached.promise, 5000, "the proxy never reached the upstream");
+    sock.destroy();
+    await waitFor(
+      () => printed.lines.some((line) => line.includes("[ClientGone]")),
+      5000,
+      "no marked answer was produced"
+    );
+    await sleep(100); // the route's own tail is microtask work — let it land
+
+    // (2) the LIVE request on the same session: the ask is still unspent.
+    const live = await nativeFetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(liveBody),
+    });
+    expect(live.status).toBe(200);
+    const text = await live.text();
+    expect(text).toContain('"text":"ok'); // the upstream really served
+    expect(text).toContain("[claudish] Capability query"); // ← the contract
+
+    // (3) and the cap is REAL: a second live request on the same session gets
+    // nothing, so exactly ONE ask was spent — by the live answer above. Without
+    // this side, (2) would also pass if the cap were simply not wired.
+    const again = await nativeFetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(liveBody),
+    });
+    expect(again.status).toBe(200);
+    expect(await again.text()).not.toContain("[claudish] Capability query");
+  }, 20000);
+});
+
+// ---- the marked answer is a NON-STATE ---------------------------------------
+//
+// A cancelled attempt produced nothing, so it must change nothing: every
+// `response.ok` consumer on the answer's path says so explicitly. Before these
+// guards, a departed request could (a) book a verified recovery in the cascade
+// — the first nominal success after an expired wall IS the recovery probe, so
+// the wall lifted and every dwell pin on the role was released for an answer no
+// provider served (pinned at route level: W22 in
+// proxy-server-overload-walk-route.test.ts; W23 is the same rule on a walk
+// step's answer), (b) spend a session's one-shot recovery notice on a
+// substitution nobody saw, (c) credit a FallbackHandler candidate that
+// "served", (d) spend one of a session's capability questions on the
+// condensation rail (pinned at route level above).
+
+describe("#1209 no-state rule", () => {
+  const marked = () =>
+    new Response(JSON.stringify({ type: "message", content: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json", [CLIENT_GONE_HEADER]: "1" },
+    });
+
+  test("isClientGoneResponse reads the mark, nothing else, and survives a header-copying rebuild", () => {
+    expect(isClientGoneResponse(marked())).toBe(true);
+    expect(isClientGoneResponse(new Response("{}", { status: 200 }))).toBe(false);
+    expect(
+      isClientGoneResponse(
+        new Response("{}", { status: 200, headers: { [CLIENT_GONE_HEADER]: "0" } })
+      )
+    ).toBe(false);
+    // The #229 rebuild shape (withBudgetRelease, the notice wrap, the
+    // condensation) copies existing headers — a header test is why the rule
+    // holds across those identities; an identity/WeakMap test would not.
+    const inner = marked();
+    const rebuilt = new Response(inner.body, { status: inner.status, headers: inner.headers });
+    expect(isClientGoneResponse(rebuilt)).toBe(true);
+  });
+
+  test("applyFailoverNotices returns the marked answer untouched — the recovery budget stays unspent", async () => {
+    // A rule is required for an arm to mean anything (armFailover: "no rule →
+    // false") — one step, lexical only: nothing here reaches a provider.
+    resetFailoverForTests({
+      CLAUDISH_FAILOVER_AUTO: "1",
+      CLAUDISH_FAILOVER_SONNET: "s0-ep@fake-s0",
+    });
+    try {
+      expect(armFailover("sonnet", "no-state pin: a wall", "b-x")).toBe(true);
+      const served = {
+        role: "sonnet",
+        step: { target: "s0-ep@fake-s0", label: "s0-ep@fake-s0", direction: "degraded" },
+        stepIndex: 0,
+      } as const;
+      // The diverged serve under the wall DOES carry a notice (the witness:
+      // the notice machinery is reachable in this exact state).
+      const live = await applyFailoverNotices(
+        new Response(JSON.stringify({ type: "message", content: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        "sonnet",
+        "sess-no-state",
+        false,
+        { inContent: false },
+        "b-x",
+        served
+      );
+      expect(live.headers.get("x-claudish-failover-notice")).toBeTruthy();
+
+      // The marked answer must consume NOTHING — same object back, no header.
+      const inner = marked();
+      const out = await applyFailoverNotices(
+        inner,
+        "sonnet",
+        "sess-no-state",
+        false,
+        { inContent: false },
+        "b-x",
+        served
+      );
+      expect(out).toBe(inner); // identity: no rebuild, no side effect
+      expect(out.headers.get("x-claudish-failover-notice")).toBeNull();
+    } finally {
+      resetFailoverForTests({});
+    }
+  });
+
+  test("FallbackHandler neither credits a candidate nor logs a success for the marked answer", async () => {
+    const counts = [0, 0];
+    const stderrLines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    // The spy is typed as what it replaces — and its own liveness is asserted
+    // below (it must see c0's retry line), so "no false success line" is a
+    // measured zero, not a blind one.
+    const spy = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+      const text = typeof chunk === "string" ? chunk : String(chunk);
+      for (const line of text.split("\n")) if (line.includes("[Fallback]")) stderrLines.push(line);
+      return (realWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
+    }) as typeof process.stderr.write;
+    process.stderr.write = spy;
+    try {
+      // c0 answers a retryable 401 (auth), c1 the marked answer — the shape a
+      // departed client produces after the first candidate's ladder bailed.
+      const c0: ModelHandler = {
+        handle: async () => {
+          counts[0] += 1;
+          return new Response(JSON.stringify({ error: "auth" }), { status: 401 });
+        },
+        shutdown: async () => {},
+      };
+      const c1: ModelHandler = {
+        handle: async () => {
+          counts[1] += 1;
+          return marked();
+        },
+        shutdown: async () => {},
+      };
+      const fh = new FallbackHandler([
+        { name: "c0", handler: c0 },
+        { name: "c1", handler: c1 },
+      ]);
+      const app = new Hono();
+      app.post("/x", (c) => fh.handle(c, { model: "m" }));
+      const r1 = await app.request("/x", { method: "POST" });
+      expect(r1.status).toBe(200);
+      expect(isClientGoneResponse(r1)).toBe(true);
+      expect(counts).toEqual([1, 1]);
+      // Without the guard c1 would be credited (lastSuccessIndex = 1) and the
+      // false line "[Fallback] c1 succeeded after 1 failed attempt(s)" printed.
+      expect(stderrLines.some((l) => l.includes("c0 failed (HTTP 401)"))).toBe(true); // the spy sees stderr
+      expect(stderrLines.some((l) => l.includes("succeeded after"))).toBe(false); // ← the contract
+
+      // Witness: the rotation still starts at c0 — with c1 credited, c1 would
+      // serve first and c0 would never run a second time.
+      const c0ok: ModelHandler = {
+        handle: async () => {
+          counts[0] += 1;
+          return new Response(JSON.stringify({ type: "message", content: [] }), { status: 200 });
+        },
+        shutdown: async () => {},
+      };
+      const fh2 = new FallbackHandler([
+        { name: "c0", handler: c0ok },
+        { name: "c1", handler: c1 },
+      ]);
+      const app2 = new Hono();
+      app2.post("/x", (c) => fh2.handle(c, { model: "m" }));
+      const r2 = await app2.request("/x", { method: "POST" });
+      expect(r2.status).toBe(200);
+      expect(isClientGoneResponse(r2)).toBe(false);
+      expect(counts).toEqual([2, 1]);
+    } finally {
+      process.stderr.write = realWrite;
+    }
+  });
+
+  test("the boot capability probe measures THIS runtime (bun >= 1.4 ⇒ detected)", async () => {
+    // Not a test of our code: a runtime pin. The cancellation above exists only
+    // where the request signal arms pre-write; a suite running on a runtime
+    // that lost the property must fail here rather than pass while inert.
+    const verdict = await probeClientGoneDetection(2000);
+    expect(verdict).toBe("detected");
+  }, 20000);
+
+  test("the probe's classification: a round trip that REACHED the handler is read by its own flag, never by absence", () => {
+    // Both live branches cannot be produced on one runtime (this one detects),
+    // so the mapping is pinned directly. "undetected" is only ever a MEASURED
+    // no — a round trip that never reached the handler is an instrument error
+    // and must not be published as "this runtime cannot see departures".
+    expect(verdictOf({ detected: true, arrived: true })).toBe("detected");
+    expect(verdictOf({ detected: false, arrived: true })).toBe("undetected");
+    expect(verdictOf({ detected: false, arrived: false })).toBe("error:no-arrival");
+    expect(verdictOf({ detected: true, arrived: false })).toBe("error:no-arrival");
+  });
+
+  test("the kill switch publishes `disabled` and launches no probe", () => {
+    startClientGoneDetectionProbe({ ...process.env, CLAUDISH_CLIENT_GONE_PROBE: "0" });
+    // Synchronous by construction: the disabled branch returns before any
+    // socket exists (a launched probe would leave "pending" here).
+    expect(getClientGoneDetection()).toBe("disabled");
+    setClientGoneDetectionForTests("pending");
+  });
+
+  test("a round trip given NO time to observe the departure is published `undetected` — the probe end to end, a measured no", async () => {
+    // timeoutMs 0: the handler's own timer reports "not seen" before the client
+    // ever leaves (50 ms later). This is the ONLY way to produce the verdict on
+    // a runtime that does detect — so the branch is pinned here rather than
+    // trusted.
+    expect(await probeClientGoneDetection(0)).toBe("undetected");
+  }, 20000);
+
+  test("a runtime that detects says nothing at boot — the boot line is reserved for a missing capability", async () => {
+    // The fleet's verification is one grep per container: a line on every boot
+    // of a healthy runtime would bury the one that matters.
+    const printed = captureConsoleLog();
+    restoreConsoleLog = printed.restore;
+    setClientGoneDetectionForTests("pending");
+    startClientGoneDetectionProbe({ ...process.env, CLAUDISH_CLIENT_GONE_PROBE: "" });
+    await waitFor(
+      () => getClientGoneDetection() !== "pending",
+      8000,
+      "the boot probe never settled"
+    );
+    expect(getClientGoneDetection()).toBe("detected");
+    expect(printed.lines.some((line) => line.includes("[ClientGone] runtime capability"))).toBe(
+      false
+    );
   }, 20000);
 });
