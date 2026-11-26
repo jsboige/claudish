@@ -34,6 +34,11 @@ import { createAnthropicPassthroughStream } from "../../handlers/shared/stream-p
 import { boundRetryUpstream } from "../../handlers/shared/first-event-watchdog.js";
 import { carryNoticeHeader } from "../../handlers/shared/failover-stream-notice.js";
 import { carryServedModelHeader } from "../../handlers/shared/served-model-header.js";
+import {
+  isMarkedUpstreamError,
+  UPSTREAM_ERROR_HEADER,
+  UPSTREAM_ERROR_MARKER,
+} from "../../handlers/shared/upstream-error-marker.js";
 import { isQuotaExhaustion } from "../failover.js";
 import { isKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
 
@@ -832,7 +837,22 @@ export async function forwardToUpstream(
   // them apart).
   const drainFreeze503 = res.status === 503 && res.headers.get("x-claudish-drain-freeze") === "1";
 
-  if (res.status !== 529 && !drainFreeze503 && res.status >= 500) {
+  // #1213 — a 5xx the hub marked as RELAYED from its upstream provider. Third
+  // member of the same family: the hub spoke, so it is liveness evidence. An
+  // upstream 502 leaves a LIVE hub as a plain 502 (composed-handler.ts), and
+  // the branch below read it as the hub's own death: markFail + a local replay
+  // against the SAME provider (two provider calls per client attempt, the
+  // request leaving the central capture), and two in a row flipped the whole
+  // seat AUTONOMOUS for every role while the hub was serving all the others.
+  // Measured 26/11 on myia-po-2028: 32 replays and one 66.7 s flip, for ONE
+  // dead model. Both conjuncts of the predicate are load-bearing: a 4xx that
+  // carries the header keeps its ordinary 4xx path, and a foreign value is
+  // inert. An old hub never sends the header, so nothing changes against one.
+  const upstreamError5xx = isMarkedUpstreamError(res);
+
+  // An UNMARKED 5xx keeps the fallthrough — a hub's own failure is NOT passed
+  // through. (500/502/504 and an unmarked 503 CAN be the hub's own.)
+  if (res.status !== 529 && !drainFreeze503 && !upstreamError5xx && res.status >= 500) {
     // Hub answered 5xx → treat as unhealthy, fall back to local for this request.
     // (500/502/504 and an UNMARKED 503 keep this behavior — those CAN be the
     // hub's own failure.)
@@ -865,18 +885,29 @@ export async function forwardToUpstream(
     log(`[Relay] hub HTTP 503 (drain admission freeze, marked) — passed through to client, no local replay (#318)`, true);
   }
 
-  // Success (2xx/3xx/4xx), a relayed 529, or a marked drain-freeze 503. Reset
-  // the failure streak; a 4xx is a real client error that local handling would
-  // reproduce, and a 529 is the provider's overload — neither is evidence about
+  if (upstreamError5xx) {
+    // #1213 — passed through for the same three reasons as its two siblings:
+    // the hub is alive; a local replay would call the SAME failing provider
+    // (measured: one client attempt = about 22 s at the hub + about 21 s on the
+    // replay); and the replay lands on the relay's local cascades, off the
+    // central capture. forceConsole, countable — one line per response.
+    log(`[Relay] hub HTTP ${res.status} (upstream error relayed by a live hub, marked) — passed through to client, no local replay (#1213)`, true);
+  }
+
+  // Success (2xx/3xx/4xx), a relayed 529, a marked drain-freeze 503, or a
+  // marked upstream 5xx (#1213). Reset the failure streak; a 4xx is a real
+  // client error that local handling would reproduce, a 529 is the provider's
+  // overload, a marked 5xx the provider's own failure — none is evidence about
   // the hub's health, so pass through rather than replay locally.
   state.consecutiveFail = 0;
 
   // #763 — every non-OK response that reaches this point is passed through to
   // the client, and that is exactly the class that used to leave no local
-  // trace. The 529 and the marked drain-freeze already logged their own line
-  // just above (a different fact: "no local replay"), so they are excluded —
-  // one event, one line. A 5xx never reaches here (it falls through above).
-  if (res.status >= 400 && res.status !== 529 && !drainFreeze503) {
+  // trace. The 529, the marked drain-freeze and the marked upstream 5xx
+  // (#1213) already logged their own line just above (a different fact: "no
+  // local replay"), so they are excluded — one event, one line. An unmarked
+  // 5xx never reaches here (it falls through above).
+  if (res.status >= 400 && res.status !== 529 && !drainFreeze503 && !upstreamError5xx) {
     logUpstreamNonOk(
       res.status,
       reqPath,
@@ -912,6 +943,14 @@ export async function forwardToUpstream(
     // SSE), so it always lands on this rebuild branch, whatever `stream` the
     // client asked for. Fixed literal set by our own hub — same as above.
     const laneRefusalMarker = res.headers.get("x-claudish-lane-refusal");
+    // #1213 — the upstream-error marker rides the same rebuild, for the same
+    // reason as the drain-freeze marker: in a chain A→B→hub, B passes a marked
+    // 5xx through and A is itself a relay — without the marker A reads a plain
+    // 5xx and replays locally, exactly what #1213 removes. THIS rebuild is the
+    // pass-through path: the hub builds the marked 5xx as a JSON envelope, so
+    // it is never an `text/event-stream` response. Carried in its honoured
+    // form only (5xx + the exact value our hub writes) — a foreign value is
+    // not relayed as if it were ours.
     // #1128: the hub's served-model header rides the same rebuild-preservation
     // family — a relayed /compact answer names its concrete like a streamed one.
     return carryServedModelHeader(
@@ -925,6 +964,7 @@ export async function forwardToUpstream(
             ...(retryAfter ? { "retry-after": retryAfter } : {}),
             ...(drainFreezeMarker ? { "x-claudish-drain-freeze": drainFreezeMarker } : {}),
             ...(laneRefusalMarker ? { "x-claudish-lane-refusal": laneRefusalMarker } : {}),
+            ...(upstreamError5xx ? { [UPSTREAM_ERROR_HEADER]: UPSTREAM_ERROR_MARKER } : {}),
           },
         })
       )
