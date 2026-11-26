@@ -73,7 +73,11 @@ $poolNames = @()
 foreach ($entry in @($Pools)) {
     if (-not $entry) { continue }
     foreach ($name in ($entry -split '\s*,\s*')) {
-        if ($name) { $poolNames += $name.Trim() }
+        # Trim FIRST, then test. Measured in review (2026-11-26): testing before the trim let a
+        # whitespace-only entry in as "" - the list then counted ONE name, walked past the empty-list
+        # refusal below, and the read loop skipped that entry: exit 0, pools=[], unreadable=0.
+        $trimmed = $name.Trim()
+        if ($trimmed) { $poolNames += $trimmed }
     }
 }
 
@@ -81,10 +85,15 @@ foreach ($entry in @($Pools)) {
 # left $poolNames empty and the guard answered exit 0 with pools=[] - a scheduled collector would
 # have recorded a success while no pool was read at all, which is the very failure class this
 # instrument exists to catch. Refused on both forms, as a dead instrument (exit 1); `unreadable`
-# is set to 1 so a collector that only sums the counters still trips.
+# is set to 1 so a collector that only sums the counters still trips. A whitespace-only list
+# (-Pools ' ') is refused the same way - a blank is not a pool name.
 if ($poolNames.Count -eq 0) {
     $given = (@($Pools) -join ',')
-    $why = "-Pools [$given] leaves no pool name after normalisation - nothing was checked"
+    # A blank between brackets is invisible in a log; the text form says how long it was.
+    # The JSON `given` field keeps the raw input, exactly as received.
+    $shown = $given
+    if (-not $given.Trim()) { $shown = '(blank - {0} whitespace char(s))' -f $given.Length }
+    $why = "-Pools [$shown] leaves no pool name after normalisation - nothing was checked"
     if ($Json) {
         [PSCustomObject]@{
             checkedAtUtc = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -104,8 +113,8 @@ if ($poolNames.Count -eq 0) {
     exit 1
 }
 
+# Every name kept above is non-blank, so every name is read: no entry is ever skipped here.
 foreach ($pool in $poolNames) {
-    if (-not $pool) { continue }
     $r = Invoke-Native -FilePath $AppCmd -ArgumentList @('list', 'apppool', $pool, ('/text:recycling.periodicRestart.time'))
     $value = $r.Text.Trim()
     if ($r.Code -ne 0 -or -not $value) {

@@ -172,6 +172,42 @@ Describe 'iis-pool-recycle-guard' {
             } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
         }
 
+        It 'a -Pools entry made only of blanks is refused too, not read as an empty success' {
+            # Review 2026-11-26 (second pass): `-Pools ' '` still answered exit 0 with pools=[] and
+            # unreadable=0 - and in TEXT form `VERDICT OK`, the worst shape of the same false pass.
+            # The trim used to run after the emptiness test, so the blank became "" and was counted.
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = ' ' } -Out ([ref]$out)
+                $code | Should -Be 1
+                $text = ($out -join "`n")
+                $text | Should -Match 'GUARD pools=0 drift=0 unreadable=1'
+                $text | Should -Match 'VERDICT INSTRUMENT'
+                $text | Should -Match 'leaves no pool name'
+                $text | Should -Match 'blank'
+                # the false pass itself: the old head printed this line for the same input
+                $text | Should -Not -Match 'VERDICT OK'
+                $text | Should -Not -Match 'POOL \S+ value=\['
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        It 'a blank entry next to a real pool does not hide the real pool' {
+            # the other side of the fix: dropping blanks must not empty a list that HAS a name.
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = ' , models.myia.io' } -Out ([ref]$out)
+                $code | Should -Be 0
+                $text = ($out -join "`n")
+                $text | Should -Match 'POOL models\.myia\.io value=\[00:00:00\] expected=\[00:00:00\] verdict=OK'
+                $text | Should -Match 'GUARD pools=1 drift=0 unreadable=0'
+                $text | Should -Match 'VERDICT OK'
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
         It 'a read failure OUTRANKS a drift in the exit code, and both are printed' {
             $d = New-TempDir
             $out = $null
@@ -206,6 +242,26 @@ Describe 'iis-pool-recycle-guard' {
                 # presence, not shape: PS 7's ConvertFrom-Json turns the string into a DateTime
                 # while 5.1 keeps it a string - asserting the format would pin the interpreter
                 @($obj.PSObject.Properties.Name) | Should -Contain 'checkedAtUtc'
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        It 'a -Pools entry made only of blanks is a JSON diagnostic carrying the raw input' {
+            # same second-pass finding in the machine-readable form; `given` stays the exact
+            # string received (a blank), which is what a collector needs to diagnose it.
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = ' '; Json = $true } -Out ([ref]$out)
+                $code | Should -Be 1
+                $obj = (($out -join '') | ConvertFrom-Json)
+                @($obj.pools).Count | Should -Be 0
+                $obj.unreadable | Should -Be 1
+                $obj.drift | Should -Be 0
+                $obj.verdict | Should -Be 'INSTRUMENT'
+                $obj.given | Should -Be ' '
+                $obj.detail | Should -Match 'leaves no pool name'
+                $obj.detail | Should -Match 'blank'
             } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
         }
 
