@@ -245,8 +245,17 @@ def audit(lines: list[str], since: str | None = None, until: str | None = None) 
     until_key = None
     if until:
         hit = ISO_RE.match(until)
-        # A bound written at the second means "through the end of that second".
-        until_key = _key(until if (hit and hit.group(2)) or not hit else f"{until}.999999999")
+        # A bound written at the second means "through the end of that second",
+        # and the end is built from the MATCHED seconds group — never by
+        # appending to the caller's text: "…:00Z" + ".999999999" puts the
+        # suffix after the Z, which ISO_RE never reads, so the bound silently
+        # collapsed to the START of its second and every fractional line of
+        # that second was dropped (2 lines in, 0 out, for the same bound
+        # written with and without the Z).
+        if hit and not hit.group(2):
+            until_key = (hit.group(1), "999999999")
+        else:
+            until_key = _key(until)
 
     window = []
     for line in non_empty:

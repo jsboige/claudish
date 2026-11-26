@@ -251,6 +251,22 @@ fractional = audit(
 )
 check("bounds: a fraction compares numerically, not as text", fractional["request_lines"] == 0 and fractional["ttft"] == 1, f"{fractional['request_lines']} / {fractional['ttft']}")
 
+# --- T10: an `until` bound means the same second with and without the Z ------
+# The suffix used to be appended to the caller's text ("…:00Z" + ".999999999"),
+# where ISO_RE never reads it: the bound collapsed to the START of its second,
+# so two lines inside it counted 0 with the Z and 2 without.
+
+in_second = [startup(0), ttft(2, 0, frac="100000000"), ttft(2, 0, frac="200000000")]
+bare_until = audit(in_second, until="2026-11-26T02:06:02")
+zed_until = audit(in_second, until="2026-11-26T02:06:02Z")
+check("T10: a bound without Z keeps both lines of its second", bare_until["ttft"] == 2, str(bare_until["ttft"]))
+check("T10: a bound WITH Z keeps both lines of its second", zed_until["ttft"] == 2, str(zed_until["ttft"]))
+check("T10: the two spellings agree on the row", (bare_until["ttft"], bare_until["first_ts"], bare_until["last_ts"]) == (zed_until["ttft"], zed_until["first_ts"], zed_until["last_ts"]), f"{bare_until['ttft']} / {zed_until['ttft']}")
+check("T10: the next second stays out", audit(in_second + [ttft(3, 0)], until="2026-11-26T02:06:02Z")["ttft"] == 2, "next second kept")
+check("T10: an explicit fraction with Z is a ceiling, not the end of the second", audit(in_second, until="2026-11-26T02:06:02.1Z")["ttft"] == 1, str(audit(in_second, until="2026-11-26T02:06:02.1Z")["ttft"]))
+check("T10: … and it agrees without the Z", audit(in_second, until="2026-11-26T02:06:02.1")["ttft"] == 1, str(audit(in_second, until="2026-11-26T02:06:02.1")["ttft"]))
+check("T10: a fraction below the lines excludes them", audit(in_second, until="2026-11-26T02:06:02.05Z")["ttft"] == 0, str(audit(in_second, until="2026-11-26T02:06:02.05Z")["ttft"]))
+
 # --- T7: the only subprocess read pins UTF-8 and replaces bad bytes ----------
 
 source = SCRIPT.read_text(encoding="utf-8")
