@@ -83,6 +83,7 @@ const savedEnv: Record<string, string | undefined> = {};
 
 let proxy: ProxyServer | null = null;
 let restoreFetch: (() => void) | null = null;
+let restoreConsoleLog: (() => void) | null = null;
 let capDir = "";
 
 const nativeFetch = globalThis.fetch;
@@ -135,6 +136,10 @@ afterEach(async () => {
     restoreFetch();
     restoreFetch = null;
   }
+  if (restoreConsoleLog) {
+    restoreConsoleLog();
+    restoreConsoleLog = null;
+  }
   // Module-global test hooks: never let one test's timings leak into the next.
   setPatientBackoffTimingsForTests(null);
   setPolicyRetryBackoffForTests(null);
@@ -158,6 +163,21 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Captures what `log(…, true)` prints (console.log) until `restore` runs. */
+function captureConsoleLog(): { lines: string[]; restore: () => void } {
+  const lines: string[] = [];
+  const real = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  };
+  return {
+    lines,
+    restore: () => {
+      console.log = real;
+    },
+  };
+}
 
 /** A promise the test resolves by hand, at a chosen moment of the handler's run. */
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -491,25 +511,22 @@ describe("#1209 (2/2) — the terminal answer to a client that left", () => {
     }
   }, 20000);
 
-  test("the gate is the SIGNAL, not the error class — a re-labelled abort is still client-gone", async () => {
+  test("a client that leaves is answered whatever NAME the abort arrives under", async () => {
     // OpenAIProviderTransport turns every AbortError into OpenAITimeoutError
-    // (openai.ts L281-284). An error-name gate would miss exactly the incident
-    // this fixes, so the stub reproduces that re-labelling.
+    // (openai.ts L281-284); an error-name gate would miss exactly the incident
+    // this fixes. That NAME cannot reach the handler from this harness:
+    // installStubFetch races the request's signal with an AbortError of its
+    // own, and no transport here re-labels it — so the gate itself is observed
+    // by name in the route test at the end of this file, through the real
+    // transport. What this pin holds on its own is the outcome, and that it
+    // holds with the stub's rejection on the upstream side:
     const ac = new AbortController();
     let calls = 0;
     const pending = drive(
       (req) =>
         new Promise<Response>((_resolve, reject) => {
           calls += 1;
-          req.signal.addEventListener(
-            "abort",
-            () => {
-              const err = new Error("Request to OpenAI API timed out.");
-              err.name = "OpenAITimeoutError";
-              reject(err);
-            },
-            { once: true }
-          );
+          req.signal.addEventListener("abort", () => reject(abortError()), { once: true });
         }),
       { signal: ac.signal }
     );
@@ -754,6 +771,11 @@ describe("#1209 (2/2) — a stream:false client that hangs up", () => {
     const arrivals: Request[] = [];
     let aborts = 0;
     const reached = deferred();
+    // Every terminator of the handler prints through console.log (forceConsole),
+    // so the answer's own line tells WHERE it came from — the afterEach restores
+    // it if an assertion throws first.
+    const printed = captureConsoleLog();
+    restoreConsoleLog = printed.restore;
 
     restoreFetch = installStubFetch((req) => {
       if (isLoopback(req.url)) return nativeFetch(req);
@@ -810,6 +832,16 @@ describe("#1209 (2/2) — a stream:false client that hangs up", () => {
     await sleep(400);
     expect(arrivals.length).toBe(1);
     expect(aborts).toBe(1);
+
+    // The gate is the SIGNAL, not the error class — and only the real transport
+    // can show it: OpenAIProviderTransport re-labels our cancel as
+    // OpenAITimeoutError (openai.ts L281-284), and the FIRST-FETCH guard is
+    // what answers, naming that class and mentioning no ladder (an error-name
+    // gate would fall through and report a ladder run that never happened).
+    const gone = printed.lines.filter((line) => line.includes("[ClientGone]"));
+    expect(gone.length).toBe(1);
+    expect(gone[0]).toContain("before headers (OpenAITimeoutError)");
+    expect(gone[0]).not.toContain("connect-retry ladder");
 
     const health = await fetch(`http://127.0.0.1:${port}/health`);
     expect(health.status).toBe(200);
