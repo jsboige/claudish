@@ -12,7 +12,7 @@ A row is wrong if either axis is missing:
 
 - **Revision** — which build serves. `/health` carries `version` / `revision` only from #1143; older images have both fields **absent**, which is a different state from `unknown`. The identity that always exists: the image id and build date (`docker image inspect`) and the process start (`docker inspect … {{.State.StartedAt}}`). "Has #1194" is read from the build date against the merge date, never from intent.
 - **NOMINAL window** — the interval the numbers were counted in. It starts after the last transition back to NOMINAL *and* after the last `[Request]` line. A window is identified by its start and its end ("measured at"); the counts are what they were at that instant.
-- **The end is a bound, not a minute.** The instrument's `--until` is the row's end and it is written in the row. `--until` given at the second keeps that whole second; given at the minute, it stops before that minute. A live count read without a bound cannot be read again: on po-2024 two such reads, both first noted as "10:20Z", gave 2 523 and 2 528 `[ttft]`. The row below is the bounded read, the one a reader gets back from the same log.
+- **The end is a bound, not a minute.** The instrument's `--until` is the row's end and it is written in the row. `--until` given at the second keeps that whole second; given at the minute, it stops before that minute. A count noted without its bound cannot be read back: on po-2024 two reads, both first noted as "10:20Z" without their bound, gave 2 523 (its bound turned out to be 10:20:04Z) and 2 528 (no bound stated, not reproducible). The row below is the bounded read, the one a reader gets back from the same log.
 
 Measured on one seat, one process, no deploy in between:
 
