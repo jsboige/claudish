@@ -45,6 +45,7 @@ import {
   preStreamPolicyRetry,
   setPolicyRetryBackoffForTests,
 } from "./handlers/shared/stream-parsers/policy-refusal.js";
+import { setDiagOutput } from "./logger.js";
 import { resetOpenRouterCatalogForTests } from "./providers/catalog-resolvers/openrouter.js";
 import type { ProviderTransport } from "./providers/transport/types.js";
 import { createProxyServer } from "./proxy-server.js";
@@ -286,6 +287,20 @@ function oaiChunk(delta: Record<string, unknown>, finish: string | null = null):
   })}\n\n`;
 }
 
+/** The measured "closed" shape: the peer dropped the connection before any byte. */
+function econnreset(): Promise<Response> {
+  return Promise.reject(Object.assign(new TypeError("fetch failed"), { code: "ECONNRESET" }));
+}
+
+/** A complete, ordinary answer — what a live client is owed at the end of a ladder. */
+function okSse(): Response {
+  const body = `${oaiChunk({ role: "assistant" })}${oaiChunk({ content: "ok" }, "stop")}data: [DONE]\n\n`;
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
 /** Z.AI's burst limit as it really arrives: HTTP 200, then an SSE error. */
 const RATE_LIMIT_SSE = `event: error\ndata: ${JSON.stringify({
   type: "error",
@@ -413,24 +428,67 @@ describe("#1209 (2/2) — the terminal answer to a client that left", () => {
     // never read it, and a cascade would walk onto it.
     const ac = new AbortController();
     let calls = 0;
-    const pending = drive(
-      () => {
-        calls += 1;
-        return Promise.reject(Object.assign(new TypeError("fetch failed"), { code: "ECONNRESET" }));
-      },
-      { signal: ac.signal }
-    );
-    await waitFor(() => calls >= 1, 5000, "the handler never reached the upstream");
-    await sleep(100); // inside the first rung (400 ms)
-    ac.abort("client gone");
+    // The ladder's own marker is part of the contract: a "retry 1/2" line for
+    // an attempt issued to nobody reads, in an operator's log, as the provider
+    // dropping the connection twice.
+    const stderrLines: string[] = [];
+    setDiagOutput({
+      write: (line: string) => void stderrLines.push(line),
+    } as unknown as Parameters<typeof setDiagOutput>[0]);
+    try {
+      const pending = drive(
+        () => {
+          calls += 1;
+          return econnreset();
+        },
+        { signal: ac.signal }
+      );
+      await waitFor(() => calls >= 1, 5000, "the handler never reached the upstream");
+      await sleep(100); // inside the first rung (400 ms)
+      ac.abort("client gone");
 
-    const res = await withTimeout(
-      pending,
-      2000,
-      "the handler kept retrying for a client that is gone"
-    );
-    expect(calls).toBe(1); // the next rung's refetch was never issued
-    expectClientGone(res);
+      const res = await withTimeout(
+        pending,
+        2000,
+        "the handler kept retrying for a client that is gone"
+      );
+      expect(calls).toBe(1); // the next rung's refetch was never issued
+      expectClientGone(res);
+      expect(stderrLines.filter((line) => line.includes("[ConnectRetry]"))).toEqual([]);
+    } finally {
+      setDiagOutput(null);
+    }
+  }, 20000);
+
+  test("WITNESS: a client that stays gets the ladder's retry and its marker (the capture above sees them)", async () => {
+    // The zero asserted above is only a verdict next to a positive: same stub,
+    // same capture, the client simply does not leave — the ladder issues its
+    // retry and says so. Also the regression guard of the ladder itself: the
+    // client-gone parameter changed nothing for a live client.
+    let calls = 0;
+    const stderrLines: string[] = [];
+    setDiagOutput({
+      write: (line: string) => void stderrLines.push(line),
+    } as unknown as Parameters<typeof setDiagOutput>[0]);
+    try {
+      const res = await withTimeout(
+        drive(() => {
+          calls += 1;
+          return calls === 1 ? econnreset() : Promise.resolve(okSse());
+        }),
+        5000,
+        "the ladder never answered a live client"
+      );
+      expect(calls).toBe(2); // the initial attempt + the ladder's retry
+      expect(res.headers.get("x-claudish-client-gone")).toBeNull(); // a normal answer
+      const body = (await res.json()) as MessageBody;
+      expect(JSON.stringify(body.content)).toContain("ok");
+      const markers = stderrLines.filter((line) => line.includes("[ConnectRetry]"));
+      expect(markers.length).toBe(1);
+      expect(markers[0]).toContain("retry 1/2");
+    } finally {
+      setDiagOutput(null);
+    }
   }, 20000);
 
   test("the gate is the SIGNAL, not the error class — a re-labelled abort is still client-gone", async () => {
