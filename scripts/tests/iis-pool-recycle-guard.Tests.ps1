@@ -153,6 +153,25 @@ Describe 'iis-pool-recycle-guard' {
             } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
         }
 
+        It 'a -Pools list that normalises to nothing is refused, and no pool is read at all' {
+            # Review 2026-11-26 (c.7184045326): '-Pools ,' used to answer exit 0 with pools=[] -
+            # a collector read a success while nothing had been checked. The stub below WOULD
+            # answer OK; the absence of any POOL line is the proof it was never consulted.
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = ',' } -Out ([ref]$out)
+                $code | Should -Be 1
+                $text = ($out -join "`n")
+                $text | Should -Match 'GUARD pools=0 drift=0 unreadable=1'
+                $text | Should -Match 'VERDICT INSTRUMENT'
+                $text | Should -Match 'leaves no pool name'
+                # no per-pool line was produced: -match is case-insensitive, so pin the LINE shape
+                $text | Should -Not -Match 'POOL \S+ value=\['
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
         It 'a read failure OUTRANKS a drift in the exit code, and both are printed' {
             $d = New-TempDir
             $out = $null
@@ -169,6 +188,27 @@ Describe 'iis-pool-recycle-guard' {
     }
 
     Context 'machine-readable form' {
+        It 'a -Pools list that normalises to nothing is a JSON diagnostic, not an empty success' {
+            # Same review finding, JSON form: a collector must be able to tell "read nothing"
+            # from "read everything and it is fine". exit 1 and a body that names the cause.
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = ','; Json = $true } -Out ([ref]$out)
+                $code | Should -Be 1
+                $obj = (($out -join '') | ConvertFrom-Json)
+                @($obj.pools).Count | Should -Be 0
+                $obj.unreadable | Should -Be 1
+                $obj.drift | Should -Be 0
+                $obj.verdict | Should -Be 'INSTRUMENT'
+                $obj.detail | Should -Match 'leaves no pool name'
+                # presence, not shape: PS 7's ConvertFrom-Json turns the string into a DateTime
+                # while 5.1 keeps it a string - asserting the format would pin the interpreter
+                @($obj.PSObject.Properties.Name) | Should -Contain 'checkedAtUtc'
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
         It 'emits one JSON object carrying every pool and both counters' {
             $d = New-TempDir
             $out = $null

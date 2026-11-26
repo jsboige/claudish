@@ -77,6 +77,33 @@ foreach ($entry in @($Pools)) {
     }
 }
 
+# A list that normalises to NOTHING is not a pass. Measured in review (2026-11-26): -Pools ','
+# left $poolNames empty and the guard answered exit 0 with pools=[] - a scheduled collector would
+# have recorded a success while no pool was read at all, which is the very failure class this
+# instrument exists to catch. Refused on both forms, as a dead instrument (exit 1); `unreadable`
+# is set to 1 so a collector that only sums the counters still trips.
+if ($poolNames.Count -eq 0) {
+    $given = (@($Pools) -join ',')
+    $why = "-Pools [$given] leaves no pool name after normalisation - nothing was checked"
+    if ($Json) {
+        [PSCustomObject]@{
+            checkedAtUtc = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            expected     = $Expected
+            appcmd       = $AppCmd
+            given        = $given
+            verdict      = 'INSTRUMENT'
+            detail       = $why
+            pools        = @()
+            drift        = 0
+            unreadable   = 1
+        } | ConvertTo-Json -Depth 5 -Compress
+    } else {
+        Write-Output ('GUARD pools=0 drift=0 unreadable=1 at={0}' -f [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        Write-Output ('VERDICT INSTRUMENT: {0} - this is NOT a pass and NOT a drift' -f $why)
+    }
+    exit 1
+}
+
 foreach ($pool in $poolNames) {
     if (-not $pool) { continue }
     $r = Invoke-Native -FilePath $AppCmd -ArgumentList @('list', 'apppool', $pool, ('/text:recycling.periodicRestart.time'))
