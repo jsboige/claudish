@@ -12,6 +12,7 @@ A row is wrong if either axis is missing:
 
 - **Revision** — which build serves. `/health` carries `version` / `revision` only from #1143; older images have both fields **absent**, which is a different state from `unknown`. The identity that always exists: the image id and build date (`docker image inspect`) and the process start (`docker inspect … {{.State.StartedAt}}`). "Has #1194" is read from the build date against the merge date, never from intent.
 - **NOMINAL window** — the interval the numbers were counted in. It starts after the last transition back to NOMINAL *and* after the last `[Request]` line. A window is identified by its start and its end ("measured at"); the counts are what they were at that instant.
+- **The end is a bound, not a minute.** The instrument's `--until` is the row's end and it is written in the row. `--until` given at the second keeps that whole second; given at the minute, it stops before that minute. A live count read without a bound cannot be read again: on po-2024 two such reads, both first noted as "10:20Z", gave 2 523 and 2 528 `[ttft]`. The row below is the bounded read, the one a reader gets back from the same log.
 
 Measured on one seat, one process, no deploy in between:
 
@@ -27,7 +28,7 @@ Between 00:50Z and 05:23Z nothing was deployed. One autonomous episode (02:06:05
 
 | seat | relay container | process started | revision | has #1194 | NOMINAL window since | measured at | `[ttft]` | distinct `reqN` | `[Request]` | verdict |
 |---|---|---|---|---|---|---|---|---|---|---|
-| po-2024 | `claudish-sidecar` | 2026-11-25T11:04:53Z | `cf35e6a5c358`, built 2026-11-19T12:47:41Z | no | 2026-11-26T02:07:08.634Z | 2026-11-26T10:20Z | 2 528 | 1 (`6`) | 0 | FROZEN — baseline |
+| po-2024 | `claudish-sidecar` | 2026-11-25T11:04:53Z | `cf35e6a5c358`, built 2026-11-19T12:47:41Z | no | 2026-11-26T02:07:08.634Z | before 2026-11-26T10:20Z | 2 522 | 1 (`6`) | 0 | FROZEN — baseline |
 | po-2023 | its relay | — | — | — | — | — | — | — | — | to fill |
 | ai-01 | `claudish-sidecar` | — | — | — | — | — | — | — | — | to fill |
 | po-2026 | `claudish-proxy` | — | — | — | — | — | — | — | — | to fill |
@@ -43,10 +44,10 @@ A filled row that says **NO-TRAFFIC** is a valid row. A relay whose clients go h
 ```bash
 docker inspect <container> --format '{{.State.StartedAt}} {{.Image}}'
 docker image inspect <image> --format '{{.Id}} {{.Created}}'
-python scripts/relay-reqnumber-audit.py --container <container> --by-model
+python scripts/relay-reqnumber-audit.py --container <container> --until <row end> --by-model
 ```
 
-Quote the `acceptance[…]` line, never `window[…]`: `window` is the as-measured count, `acceptance` the one trimmed to the NOMINAL window. `--json` gives both as objects, with one `lives[]` entry per process life inside the acceptance window.
+The row of this page was read with `--since 2026-11-26T02:07:08 --until 2026-11-26T10:20`; the same two bounds give the same line again while the log is kept. Quote the `acceptance[…]` line, never `window[…]`: `window` is the as-measured count, `acceptance` the one trimmed to the NOMINAL window. `--json` gives both as objects, with one `lives[]` entry per process life inside the acceptance window.
 
 Without the script, on any image:
 
@@ -54,7 +55,7 @@ Without the script, on any image:
 docker logs -t <container> > seat.log 2>&1
 ```
 
-then count the `[ttft]` lines, their distinct `reqN=` values and the `[Request]` lines **after** the last `healthy again → NOMINAL` line. The `2>&1` is not optional: a container writes application lines to stdout and to stderr both (363 of 10 479 lines for po-2024's current process life, cut at 10:20Z), and a pipe or a redirection without it drops every stream death silently.
+then count the `[ttft]` lines, their distinct `reqN=` values and the `[Request]` lines **after** the last `healthy again → NOMINAL` line. The `2>&1` is not optional: a container writes application lines to stdout and to stderr both (363 of 10 479 lines for po-2024's current process life, cut at 2026-11-26T10:20:00Z), and a pipe or a redirection without it drops every stream death silently.
 
 ## Reading a verdict
 
@@ -76,7 +77,7 @@ On a seat with the fix, `distinct == numbered` compares values inside **one** pr
 
 `logRequest` is the only writer of the request number (`reqNumberMap.set`, `++__capN`). On an image without the fix the relay branch returns before `logRequest` runs, so `requestNumberFor` falls back to the global `__capN`: a relayed `[ttft]` line carries the last number the **local** pipeline took.
 
-On po-2024 the episode served six requests locally, and they took numbers 1 to 6. Every relayed line since carries `6`: 2 528 lines across three models at 10:20Z, one value. Over the whole life the counter shows seven values (`0` ×4 822, then `1` to `5` once each, then `6`), which is what a working fix looks like when the window is not cut.
+On po-2024 the episode served six requests locally, and they took numbers 1 to 6. Every relayed line since carries `6`: 2 522 lines across three models before 2026-11-26T10:20Z, one value. Over the whole process life, at the same bound, the counter shows seven values (`0` ×4 822, then `1` to `5` once each, then `6` ×2 523), which is what a working fix looks like when the window is not cut.
 
 Two consequences:
 
