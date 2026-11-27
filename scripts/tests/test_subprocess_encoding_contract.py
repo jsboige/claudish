@@ -14,8 +14,15 @@ runner:
 
 The runtime half of the contract (a U+00C1 round-trip pin per file) proves the
 child's bytes are pinned; this scan is the static half and it needs no Windows
-seat. It covers every file in this directory, including the ones the
-`test:scripts:py` chain never lists and the CI loop still runs.
+seat. It covers every file in this directory, including the ones CI runs but
+the local chain never listed.
+
+There is NO allowlist. The one this guard shipped with named four files whose
+strict sites an unmerged PR was fixing; that PR merged on 27/11, and the
+entries then hid a NEW strict site planted in one of those same files (measured
+on the #1203 review: the guard printed EXEMPT and exited 0). A violation is a
+failure, always -- and the failure branch has its own self-test, because a
+guard that refuses nothing still passes on a clean tree.
 
 Blind spots, written down rather than guessed at: a `text=`/`encoding=` passed
 as a variable is not seen, and a call spreading `**kwargs` cannot be verified
@@ -30,20 +37,10 @@ Or under pytest:
 import ast
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _CALLS = {"run", "check_output", "check_call", "Popen"}
-
-# Strict sites fixed by the unmerged PR #1198. An entry must name an existing
-# file. Once that PR merges the entry carries no violation any more and is
-# printed as a NOTE, never a failure: an unrelated merge must not turn another
-# lane's CI red.
-PENDING_1198 = (
-    "test_settings_matrix_canon_age.py",     # :121
-    "test_settings_matrix_coverage.py",      # :109 :228 :241 :257
-    "test_settings_matrix_credentials.py",   # :124
-    "test_settings_matrix_permissions.py",   # :53
-)
 
 
 def _is_true(node):
@@ -112,36 +109,64 @@ def _self_control():
         "a **kwargs call must stay unverifiable")
 
 
-def main():
-    _self_control()
-    scanned, found = scan_dir()
-    print("scanned %d files; %d carry a strict or locale-dependent read"
-          % (scanned, len(found)))
-    failures = []
+def verdict(path=HERE):
+    """(returncode, [lines to print]) for the tree at `path`.
+
+    Split from `main()` so the refusal can be exercised on a planted file
+    without scanning the real tree twice.
+    """
+    scanned, found = scan_dir(path)
+    lines = ["scanned %d files; %d carry a strict or locale-dependent read"
+             % (scanned, len(found))]
+    if not found:
+        lines.append("OK -- every text-mode child read asks for UTF-8 text"
+                     " with errors=")
+        return 0, lines
+    lines.append("FAIL -- text-mode child reads must pass encoding='utf-8',"
+                 " errors='replace':")
     for name in sorted(found):
         sites = ", ".join(":%d(%s)" % (ln, "/".join(m)) for ln, m in found[name])
-        if name in PENDING_1198:
-            print("EXEMPT (PR #1198 pending) %s%s" % (name, sites))
-        else:
-            failures.append("%s%s" % (name, sites))
-    for name in PENDING_1198:
-        if not os.path.isfile(os.path.join(HERE, name)):
-            failures.append("%s (stale PENDING_1198 entry: no such file)" % name)
-        elif name not in found:
-            print("NOTE %s has no strict site left -- drop it from PENDING_1198"
-                  % name)
-    if failures:
-        print("FAIL -- text-mode child reads must pass encoding='utf-8',"
-              " errors='replace':")
-        for item in failures:
-            print("  " + item)
-        return 1
-    print("OK -- every text-mode child read asks for UTF-8 text with errors=")
-    return 0
+        lines.append("  " + name + sites)
+    return 1, lines
+
+
+def _failure_branch_self_test():
+    """The refusal must fire on a planted file AND name it.
+
+    Without this, the two mutants the #1203 review measured stay green: a
+    guard whose failure branch always returns 0, and one that exempts
+    everything, both pass on a clean tree. The pin is the planted file.
+    """
+    with tempfile.TemporaryDirectory() as root:
+        planted = os.path.join(root, "planted_strict.py")
+        with open(planted, "w", encoding="utf-8") as fh:
+            fh.write(_POSITIVE)
+        rc, lines = verdict(root)
+        assert rc != 0, ("a planted strict read must fail the guard: %r"
+                         % (lines,))
+        assert any("planted_strict.py" in line for line in lines), (
+            "the failure must NAME the planted file: %r" % (lines,))
+        with open(planted, "w", encoding="utf-8") as fh:
+            fh.write(_NEGATIVE)
+        rc, lines = verdict(root)
+        assert rc == 0, ("a tolerant read must pass: %r" % (lines,))
+
+
+def main():
+    _self_control()
+    _failure_branch_self_test()
+    rc, lines = verdict(HERE)
+    for line in lines:
+        print(line)
+    return rc
 
 
 def test_contract():
     assert main() == 0
+
+
+def test_the_failure_branch_names_the_planted_file():
+    _failure_branch_self_test()
 
 
 if __name__ == "__main__":

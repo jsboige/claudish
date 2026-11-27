@@ -61,16 +61,27 @@ def ci_globs(text):
     return found
 
 
+_CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
+
+
 def run_runner(*args, cwd=None):
+    # #1186 / #1203 point 4 -- the two halves of the contract.
+    # `errors="replace"`: without it the reader is strict and a byte it cannot
+    # map raises inside subprocess' _readerthread, which hands back
+    # `stdout=None` with `returncode == 0` (the #1175 signature, read as a
+    # silent empty output). The child pin makes the runner emit UTF-8 whatever
+    # the seat's console code page is, exactly as the chain's own helpers do.
     proc = subprocess.run(
         [sys.executable or "python", _RUNNER, *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
+        env=_CHILD_ENV,
         timeout=300,
         cwd=cwd or _ROOT,
     )
-    return proc.returncode, proc.stdout, proc.stderr
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
 class DiscoveryTests(unittest.TestCase):

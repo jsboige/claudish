@@ -186,9 +186,18 @@ def test_a_sane_seat_has_no_structural_flag():
 _CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
 
 
-def _run(*argv):
+def _run(*argv, script=_TARGET):
+    # One helper for every child this file spawns: `_run(...)` runs the module
+    # under test, `_run("-c", ..., script=None)` a bare interpreter snippet.
+    # The U+00C1 pin below goes through THIS helper on purpose -- a pin calling
+    # subprocess.run directly proves the stdlib, not this file's contract
+    # (review #1203 point 1: dropping env= here left all 18 tests green).
+    cmd = [sys.executable]
+    if script:
+        cmd.append(script)
+    cmd.extend(argv)
     p = subprocess.run(
-        [sys.executable, _TARGET, *argv],
+        cmd,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         env=_CHILD_ENV,
     )
@@ -200,10 +209,8 @@ def test_child_output_roundtrips_utf8():
     # The runtime half, on the carrier: U+00C1 is UTF-8 C3 81 and cp1252 C1;
     # 0x81 is undefined in cp1252, so a strict cp1252 reader raises instead of
     # mis-reading, and a locale-decoding reader would return "Ã".
-    p = subprocess.run([sys.executable, "-c", "print(chr(0xC1))"],
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", env=_CHILD_ENV)
-    assert (p.stdout or "").strip() == "Á", repr(p.stdout)
+    p = _run("-c", "print(chr(0xC1))", script=None)
+    assert p.stdout.strip() == "Á", repr(p.stdout)
 
 
 def _write(path, text):
