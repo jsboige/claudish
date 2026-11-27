@@ -702,12 +702,32 @@ def main():
               (prof.get("scan_plain"), prof.get("scan_profiled")))
         check("rien laisse (extraction, source synthetique)",
               prof.get("cleaned") is True and os.listdir(workp) == [], os.listdir(workp))
+        # #1215 — les taux du scan portent l'echantillon qui les a produits, et le
+        # document refuse d'etre lu comme un prix du JOUR. Ce sont des CHAMPS, pas
+        # de la prose : `not_measured` le disait deja, et un consommateur a quand
+        # meme mis a l'echelle un 1,2 ms/reponse lu ici contre 124,3 ms/reponse
+        # sur le jour (7 752 s pour 62 332 reponses) — lanceur dimensionne a
+        # 2 568 s, jambe deroulee en 9 289,6 s, 69 min apres l'echeance.
+        ex = prof.get("extrapolation", {})
+        check("P LA PIN — extrapolation.day_estimable est FAUX",
+              ex.get("day_estimable") is False, ex)
+        check("P LA PIN — extrapolation.measured_on est l'echantillon LU, pas la selection",
+              ex.get("measured_on") == {"day": "2026-11-02", "hours": ["03"],
+                                        "resp": 12, "req": 12, "members": 24}, ex)
+        check("P LA PIN — chaque taux du scan porte sa taille d'echantillon",
+              all(prof.get(k, {}).get("measured_on") == {"resp": 12, "members": 24}
+                  for k in ("scan_plain", "scan_profiled")),
+              (prof.get("scan_plain"), prof.get("scan_profiled")))
         out = profile_run("--synthetic", "12", "--pool", "1", "--json")
         p1 = json.loads(out.stdout)["first_open"] if out.returncode == 0 else {}
         check("--pool 1 : rc=0, ni rapport de vitesse ni lecture sur un autre fil",
               out.returncode == 0 and p1.get("speedup") is None
               and p1.get("pooled", {}).get("off_caller") is False,
               (out.returncode, p1, out.stderr[-300:]))
+        out = profile_run("--synthetic", "12")
+        check("P LA PIN — la sortie texte dit l'extrapolation au pied du chiffre",
+              out.returncode == 0 and "day_estimable is False" in out.stdout
+              and "they do not price a day" in out.stdout, out.stdout[-500:])
         out = profile_run("--synthetic", "0")
         check("--synthetic 0 : refuse (rc=2), rien construit",
               out.returncode == 2 and "REFUSED" in out.stderr and os.listdir(workp) == [],
