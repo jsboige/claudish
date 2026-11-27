@@ -231,6 +231,36 @@ function Compare-ArmedCascadeSets {
 # dedicated #368 tests bind -FailoverTickCollectorPath to a fixture.
 $DrainFailoverTickCollector = Join-Path $PSScriptRoot 'failover-events-collect.ps1'
 
+# #1230 — how long Write-DrainLog keeps retrying an append that a concurrent
+# reader REFUSES (a sharing violation: another handle open without
+# FileShare.Write). Script-scope like $LogPath so the suite can shrink it.
+# Bounded per line: a reader that never lets go costs this much and no more,
+# and the line is then reported lost.
+$DrainLogRetryBudgetMs = 2000
+$DrainLogRetrySleepMs = 50
+
+function Test-DrainLogRefusedWrite {
+    <#
+        #1230 — true when an Add-Content failure is a SHARING or LOCK
+        violation (Win32 32 / 33): transient by nature, another handle's.
+        Read by HResult, never by message: the message is localized (5.1 on a
+        French seat says "en cours d'utilisation par un autre processus").
+        Measured in both lanes: a refused append is a bare IOException,
+        HResult 0x80070020, no inner exception.
+        Any other failure (a directory in place of the file, a full disk, a
+        dead bind) is permanent and keeps the short legacy retry — a dead
+        log path must not cost the whole budget on every line.
+    #>
+    param($ErrorRecord)
+    $ex = if ($ErrorRecord) { $ErrorRecord.Exception } else { $null }
+    while ($ex) {
+        $code = $ex.HResult -band 0xFFFF
+        if ($code -eq 32 -or $code -eq 33) { return $true }
+        $ex = $ex.InnerException
+    }
+    return $false
+}
+
 function Write-DrainLog {
     param([string]$Message)
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
@@ -238,18 +268,39 @@ function Write-DrainLog {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     # Bounded retry (#338 re-review e2e, 5.1): a concurrent reader holding
     # the log (a Get-Content poll, a monitor) can make Add-Content fail with
-    # a sharing violation ONCE — non-terminating, so the line is simply
+    # a sharing violation — non-terminating, so the line is simply
     # never written and the log ends on REFUSED with no OUTCOME (the exact
-    # "PREVIOUS RUN INTERRUPTED" false-positive shape). Three short retries
-    # close the window.
-    for ($try = 1; $try -le 3; $try++) {
+    # "PREVIOUS RUN INTERRUPTED" false-positive shape).
+    # #1230: a REFUSED write retries for a time budget, not for 3 tries.
+    # Measured in both lanes (suite pin, mutant = this old 3-try loop): a
+    # reader holding the log 400 ms costs the whole line under 3 x 50 ms.
+    # On CI (27/11) the detached child ended with START alone in drain.log
+    # and its two next lines gone — a lost append costs a terminal line, and
+    # the loss was announced only in the child's stdout capture. A permanent
+    # failure still takes the 3-try path.
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $tries = 0
+    $written = $false
+    $refused = $false
+    $lastError = ''
+    while ($true) {
+        $tries++
         try {
             Add-Content -Path $LogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+            $written = $true
             break
         } catch {
-            if ($try -eq 3) { Write-Host "drain log write failed after 3 tries: $($_.Exception.Message)" }
-            else { Start-Sleep -Milliseconds 50 }
+            $lastError = $_.Exception.Message
+            $refused = Test-DrainLogRefusedWrite -ErrorRecord $_
+            if ($refused) {
+                if ($watch.ElapsedMilliseconds -ge $DrainLogRetryBudgetMs) { break }
+            } elseif ($tries -ge 3) { break }
+            Start-Sleep -Milliseconds $DrainLogRetrySleepMs
         }
+    }
+    if (-not $written) {
+        $what = if ($refused) { 'refused by another handle' } else { 'permanent error' }
+        Write-Host ("drain log write failed after {0} tries over {1} ms ({2}): {3}" -f $tries, $watch.ElapsedMilliseconds, $what, $lastError)
     }
     Write-Host $line
 }
