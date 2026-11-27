@@ -4,9 +4,16 @@
 The coordinator must know what every roster machine's settings.json holds
 (user mandate, 20/10). Each machine publishes a masked snapshot with
 `roosync_config(action:"publish", targets:["claude-settings"])`; this script
-reads the latest one per machine, with the same lookup order as RSM's
-findLatestClaudeSettingsSnapshot (standalone -> latest.json -> versioned
-packages by collectedAt), and flags what needs a look.
+reads the latest one per machine by `collectedAt`, WHATEVER the source: the
+standalone file, the `latest.json` pointer and the versioned packages are all
+candidates, and the freshest wins (#1136 volet 2). The fixed source order it
+used to share with RSM's findLatestClaudeSettingsSnapshot is what let a stale
+standalone eclipse a fresh publish (measured 22-23/11: a 14/11 standalone hid
+po-2024's v1.3.0 from ai-01's reader while the seat's own matrix read it), so
+this reader deliberately diverges. Ties keep the old order (standalone ->
+pointer -> versioned): the standalone is the seat's own live publish, and an
+undated snapshot never outranks a dated one. The run prints the source it read
+next to `collectedAt`, so a future eclipse is visible in the output.
 
 Never prints a secret marker: a sensitive env key is shown as its NAME plus
 set/empty/unset. The snapshot's `<set:len=N:sha256=x>` digest is dropped,
@@ -121,32 +128,54 @@ def read_snapshot(path):
     return None
 
 
-def latest_snapshot(shared, machine):
+def snapshot_candidates(shared, machine):
+    """(source, snapshot) for every readable source, in the old priority order.
+
+    The order breaks TIES on `collectedAt` only; the winner is the freshest
+    snapshot whatever its source -- see latest_snapshot for why.
+    """
     cdir = os.path.join(shared, "configs", machine)
     if not os.path.isdir(cdir):
-        return None
+        return []
+    candidates = []
     standalone = read_snapshot(os.path.join(cdir, "claude-settings", "claude-settings.json"))
     if standalone:
-        return standalone
+        candidates.append(("standalone", standalone))
     try:
         with open(os.path.join(cdir, "latest.json"), encoding="utf-8-sig") as f:
             pointer = json.load(f).get("path")
         if pointer:
             snap = read_snapshot(os.path.join(pointer, "claude-settings", "claude-settings.json"))
             if snap:
-                return snap
+                candidates.append(("latest.json", snap))
     except (OSError, ValueError, AttributeError):
         pass
-    best = None
     for entry in os.listdir(cdir):
         if not entry.startswith("v"):
             continue
         snap = read_snapshot(os.path.join(cdir, entry, "claude-settings", "claude-settings.json"))
-        # ISO-8601 strings compare in date order; RSM parses dates and tie-breaks
-        # lexically -- same winner unless two versions share a collectedAt.
-        if snap and (best is None or snap.get("collectedAt", "") > best.get("collectedAt", "")):
-            best = snap
-    return best
+        if snap:
+            candidates.append((entry, snap))
+    return candidates
+
+
+def latest_snapshot(shared, machine):
+    """(snapshot, source) of the freshest readable snapshot, or (None, None).
+
+    Freshness beats source priority (#1136 volet 2): a reader that prefers a
+    SOURCE over a DATE reports fossils as live. Measured 22-23/11 on this
+    fleet: the 14/11 standalone under ai-01's tree answered first while
+    po-2024's v1.3.0 publish (23/11 15:34Z) sat in the same folder. ISO-8601
+    strings compare in date order; RSM parses dates and tie-breaks lexically
+    -- same winner unless two versions share a collectedAt. An undated
+    snapshot never outranks a dated one.
+    """
+    best = None
+    best_source = None
+    for source, snap in snapshot_candidates(shared, machine):
+        if best is None or (snap.get("collectedAt") or "") > (best.get("collectedAt") or ""):
+            best, best_source = snap, source
+    return best, best_source
 
 
 def presence(marker):
@@ -542,7 +571,8 @@ def main():
 
     now = dt.datetime.now(dt.timezone.utc)
     flags, seen = [], {key: {} for key in COMPARED}
-    snaps = {machine: latest_snapshot(args.shared, machine) for machine in args.machines}
+    reads = {machine: latest_snapshot(args.shared, machine) for machine in args.machines}
+    snaps = {machine: read[0] for machine, read in reads.items()}
     # Until the collector publishes the label keys, every pinned role reads as
     # name-less on every seat: 4 flags x 8 machines carrying no information,
     # burying the flags that do (measured on the first run, 22/10). One fleet
@@ -564,7 +594,8 @@ def main():
             flags.append(f"{machine}: NOT COVERED")
             continue
         hours = age_hours(snap.get("collectedAt"), now)
-        print(f"  collectedAt={snap.get('collectedAt')} state={snap.get('state')}")
+        print(f"  collectedAt={snap.get('collectedAt')} state={snap.get('state')} "
+              f"source={reads[machine][1]}")
         if hours is None or hours > args.stale_hours:
             flags.append(f"{machine}: snapshot stale ({snap.get('collectedAt')})")
         if snap.get("state") != "ok":
