@@ -1891,6 +1891,45 @@ describe("#679 — plan concurrency refusal skips, the usage wall stays a wall",
     expect(calls.s0 ?? 0).toBe(0);
     expect(markerLog.some((l) => l.includes("[Failover] WALK"))).toBe(false);
   }, 30_000);
+
+  // #1124, second half — the bench the walk writes must outlive the nominal's
+  // recovery. W35 (proxy-server-overload-walk-route.test.ts) sends its two
+  // requests back to back with the nominal refusing BOTH times, so it never
+  // exercises `onNominalSuccess` between a WALK-MARK and the next walk — the
+  // real defect lived exactly there: on the hub GLM serves thousands of
+  // successes between two 1302 bursts, each one running
+  // `onNominalSuccess → resetAllStepFailures`, and the bench was gone before
+  // the next burst (Kimi/Qwen refusals tracking GLM's volume hour by hour).
+  // Mutation: drop `walkMark: true` at the WALK-MARK site (proxy-server.ts) ⇒
+  // r3 re-pays s0 and the 429 surfaces again — this pin alone goes red.
+  test("K1302i (#1124): a WALK-MARK bench survives a nominal success — the next burst skips the dead rung", async () => {
+    await spin();
+    resetFailoverForTests({ CLAUDISH_FAILOVER_SONNET: TWO_STEP });
+    setRoleNominalResolver((r) => (r === "sonnet" ? SONNET_NOMINAL : undefined));
+    upstreamAnswer.nm = () => zai1302();
+    upstreamAnswer.s0 = () => quotaWall402(); // the rung's own plan wall
+
+    // Burst 1: the walk pays s0 once, WALK-MARKs it, the original 429 surfaces.
+    const r1 = await postMessage({ session: "k1302i-1" });
+    expect(r1.status).toBe(429);
+    expect(calls.s0).toBe(1);
+    expect(markerLog.some((l) => l.includes("[Failover] WALK-MARK sonnet step 0"))).toBe(true);
+
+    // The nominal serves again — the exact call that used to erase the bench.
+    upstreamAnswer.nm = () => okSse("ok-from-nm-again", "fake-nom");
+    const r2 = await postMessage({ session: "k1302i-2" });
+    expect(await responseText(r2)).toContain("ok-from-nm-again");
+    expect(calls.nm).toBe(2);
+    expect(calls.s0).toBe(1); // a success never re-pays a step
+
+    // Burst 2: the dead rung must be skipped, not re-paid.
+    upstreamAnswer.nm = () => zai1302();
+    const r3 = await postMessage({ session: "k1302i-3" });
+    expect(r3.status).toBe(200);
+    expect(await responseText(r3)).toContain("ok-from-s1");
+    expect(calls.s0).toBe(1); // RED before the fix: 2 — s0 re-paid, 429 to the client
+    expect(calls.s1).toBe(1);
+  }, 30_000);
 });
 
 // ---- #674 — exact counting at the wall (both ingresses) ---------------------------

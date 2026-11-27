@@ -166,6 +166,19 @@ interface StepFailure {
    * concrete — the pre-#331 shape — keeps the freeze; conservative). Every
    * proxy-side mark carries it since #331, the #263 revisit re-mark included. */
   concrete?: string;
+  /** #1124: this bench was placed by WALK-MARK — a step's OWN plan wall, met
+   * during the one-shot overload/1302 walk while the NOMINAL sat healthy. The
+   * nominal's next success says nothing about that other meter, so the record
+   * SURVIVES `resetAllStepFailures` while its TTL still binds. Until this flag
+   * it did not: every nominal success erased it, often seconds after it was
+   * written, and the next walk re-paid the dead round-trip (hub 27/11: Kimi's
+   * and Qwen's refusals tracked GLM's 1302 volume hour by hour, and fell to a
+   * handful only while the glm bucket itself was walled, so that the reset was
+   * withheld). Absent = an ordinary mark (armed cascade, step advance), reset
+   * on nominal recovery exactly as before (#91/#294). The record is replaced
+   * whole on each mark, so the flag always describes the most recent death: an
+   * armed death of the same step rewrites it without the flag. */
+  walkMark?: true;
 }
 
 interface RecoveryState {
@@ -1234,13 +1247,17 @@ function stepFailuresFor(role: FailoverRole): StepFailure[] {
  * It refreshes the record but keeps the count. Measured on the hub 20/10 00:19Z:
  * Kimi (haiku[1]) went count 2 → 4, i.e. a 4 h bench, within one second. A mark
  * on a probeable step (bench elapsed — the re-probe failed) or on a different
- * concrete (a role-step whose delegation moved) is a new episode and escalates. */
+ * concrete (a role-step whose delegation moved) is a new episode and escalates.
+ *
+ * `opts.walkMark` (#1124): the mark was placed by the one-shot walk's WALK-MARK
+ * site — the step's own plan wall, met while the nominal was healthy. Only that
+ * site sets it; such a record outlives the nominal's recovery (`StepFailure`). */
 export function markStepFailed(
   role: FailoverRole,
   idx: number,
   reason: string,
   bodyResetAt?: Date,
-  opts?: { nonQuota?: boolean; concrete?: string }
+  opts?: { nonQuota?: boolean; concrete?: string; walkMark?: boolean }
 ): void {
   const rule = rules.get(role);
   if (!rule || idx < 0 || idx >= rule.steps.length) return;
@@ -1249,6 +1266,7 @@ export function markStepFailed(
   const resetAt = bodyResetAt ?? rule.steps[idx].resetAt;
   const nonQuota = opts?.nonQuota === true;
   const concrete = opts?.concrete;
+  const walkMark = opts?.walkMark === true;
   // #553 defect 2: the short ladder applies to a step declared `!own` — and only to
   // a NON-QUOTA death. An own step that answers a quota-shaped refusal is marked on
   // the default ladder (pin 2): a declaration never overrules the classifier.
@@ -1262,6 +1280,7 @@ export function markStepFailed(
     ...(nonQuota ? { nonQuota: true } : {}),
     ...(own ? { own: true } : {}),
     ...(concrete !== undefined ? { concrete } : {}),
+    ...(walkMark ? { walkMark: true } : {}),
   };
   // #619: a new mark voids the step's recovery stamp — the grace must restart
   // from the step's next verified success, never age through a bench.
@@ -1290,9 +1309,34 @@ export function resetStepSuccess(role: FailoverRole, idx: number): void {
   if (!stepRecoveredAt.has(recKey)) stepRecoveredAt.set(recKey, Date.now());
 }
 
-/** Clear ALL step failures for a role — used when the nominal itself recovers. */
+/** Clear ALL step failures for a role — used when the nominal itself recovers.
+ *
+ * #1124: ONE exception. A record placed by WALK-MARK (`walkMark`) describes the
+ * STEP's own plan wall, read while the nominal was healthy — the nominal's
+ * recovery is no evidence about that other meter. Erasing it made the bench
+ * live only until the next nominal success (seconds on a busy hub), so every
+ * new 1302 burst re-paid the dead round-trip. Such a record is kept while its
+ * TTL still binds and dropped once it has expired, like any other. Every other
+ * record keeps today's reset, so the #91/#294 recovery semantics are
+ * untouched: an armed episode's marks go when the nominal is back.
+ *
+ * Deliberately `isStepTtlFailed`, not `stepTtlBinds`: the latter re-resolves a
+ * role-step's delegation, and this runs on the nominal's success path, where
+ * nothing may arm. Keeping a role-step's record a little longer than its
+ * delegation would bind is inert — both readers (`resolveSkippingFailed`,
+ * `resolveTransientStep`) still adjudicate through `stepTtlBinds`. */
 export function resetAllStepFailures(role: FailoverRole): void {
-  stepFailures.delete(role);
+  const arr = stepFailures.get(role);
+  if (!arr) return;
+  const steps = rules.get(role)?.steps;
+  const kept = arr.map((f, i) =>
+    f.walkMark === true && isStepTtlFailed(f, steps?.[i]) ? f : { count: 0, lastFailure: new Date(0) }
+  );
+  if (!kept.some((f) => f.count > 0)) {
+    stepFailures.delete(role);
+    return;
+  }
+  stepFailures.set(role, kept);
 }
 
 /**

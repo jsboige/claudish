@@ -3871,3 +3871,104 @@ describe("#681 — NOTICE-RECORD DROP is visible, the nominal path stays silent"
     expect(servedStepForNotices(ctx, "sonnet")).toBeUndefined();
   });
 });
+
+// ── #1124 — a WALK-MARK bench outlives the nominal's recovery ──────────────────
+//
+// Hub, 27/11: WALK-MARK (#1125) benched Kimi and Qwen correctly, but
+// `onNominalSuccess` ends with `resetAllStepFailures` whenever no bucket wall
+// remains, and on a bursting-but-healthy nominal that is every few seconds. The
+// step's OWN plan wall was erased before the next walk, so every new 1302 burst
+// re-paid the dead round-trip: Kimi's refusals tracked GLM's 1302 volume hour
+// by hour, and fell to 1-2 an hour only while the glm bucket was itself walled
+// (07:35-10:10Z), i.e. exactly while the reset was withheld. A walk-placed
+// bench describes another meter than the nominal's, so a nominal success is no
+// evidence against it. Pins (a)-(d), coordinator file 27b.
+describe("#1124 — a WALK-MARK bench survives the nominal's recovery", () => {
+  const realNow = Date.now;
+  let clock = 1_000_000;
+  /** Exactly what the WALK-MARK site passes (proxy-server.ts). */
+  const WALK_MARK = { concrete: "qwen-token-plan@qwen3.8-max", walkMark: true } as const;
+
+  beforeEach(() => {
+    clock = 1_000_000;
+    Date.now = () => clock;
+    initFailover({ ...OPUS_CASCADE, CLAUDISH_FAILOVER_ACTIVE: "opus" });
+  });
+  afterEach(() => {
+    Date.now = realNow;
+  });
+
+  it("(a) a walk-marked step is still benched after onNominalSuccess — the walk skips it", async () => {
+    markStepFailed("opus", 0, "walk step 0 quota wall (402)", undefined, WALK_MARK);
+    expect((await resolveTransientStep("opus"))?.stepIndex).toBe(1); // benched
+
+    // No bucket is walled: this is the call that used to erase the bench.
+    onNominalSuccess("opus");
+
+    // RED before the fix: 0 — the dead step was servable again.
+    expect((await resolveTransientStep("opus"))?.stepIndex).toBe(1);
+    expect((await resolveTransientStep("opus"))?.step?.target).toBe("gc@glm-5.2");
+  });
+
+  it("(b) an ARMED-episode mark is still cleared by the nominal's recovery — unchanged", async () => {
+    markStepFailed("opus", 0, "armed cascade: step 0 walled"); // an ordinary mark, no flag
+
+    onNominalSuccess("opus");
+
+    // Green BEFORE and AFTER the fix: only the walk's own bench outlives the
+    // recovery, and an armed episode's marks go when the nominal is back.
+    expect((await resolveTransientStep("opus"))?.stepIndex).toBe(0);
+  });
+
+  it("(b2) a mixed role keeps exactly the walk's bench — the armed mark goes, the walk mark stays", async () => {
+    markStepFailed("opus", 0, "walk step 0 quota wall (402)", undefined, WALK_MARK);
+    markStepFailed("opus", 1, "armed cascade: step 1 walled"); // an ordinary mark
+
+    onNominalSuccess("opus");
+
+    // First servable from 0: 1 means step 0 STILL binds and step 1 is clear.
+    // 0 = the walk mark was erased too (the defect); 2 = the armed mark was
+    // kept as well (the over-correction).
+    expect((await resolveTransientStep("opus"))?.stepIndex).toBe(1);
+  });
+
+  it("(c) once its TTL expires a walk-marked step is servable again — the bench is not a pin", async () => {
+    markStepFailed("opus", 0, "walk step 0 quota wall (402)", undefined, WALK_MARK);
+    onNominalSuccess("opus");
+    expect((await resolveTransientStep("opus"))?.stepIndex).toBe(1); // still benched
+
+    clock += 11 * 60_000; // past the first rung (10 min)
+
+    expect((await resolveTransientStep("opus"))?.stepIndex).toBe(0); // probeable again
+    onNominalSuccess("opus"); // a later recovery drops the expired record outright
+    expect((await resolveTransientStep("opus"))?.stepIndex).toBe(0);
+  });
+
+  it("(c2) a walk mark whose TTL lapsed is dropped by the reset — a later wall starts a fresh ladder", async () => {
+    markStepFailed("opus", 0, "walk step 0 quota wall (402)", undefined, WALK_MARK);
+    onNominalSuccess("opus"); // still binding: the bench is kept
+    clock += 11 * 60_000; // the first rung lapses
+    onNominalSuccess("opus"); // expired: dropped like any other record
+
+    // A later wall on the same step is a NEW episode — the first rung (10 min),
+    // not an escalated 30-min one. Servability alone cannot see this (the
+    // readers adjudicate by TTL at read time); the re-probe horizon can.
+    markStepFailed("opus", 0, "walk step 0 walled again", undefined, WALK_MARK);
+    expect(earliestWalledReprobeAt("opus")!.getTime() - Date.now()).toBe(10 * 60_000);
+  });
+
+  it("(d) the ARMED resolution skips the walk-marked step the same way — one record, both readers", () => {
+    markStepFailed("opus", 0, "walk step 0 quota wall (402)", undefined, WALK_MARK);
+    onNominalSuccess("opus");
+    // RED before the fix: 0 — an armed cascade would have re-paid the step.
+    expect(resolveFailoverTarget("opus").stepIndex).toBe(1);
+  });
+
+  it("an armed death of the same step rewrites the record WITHOUT the flag — the latest death decides", async () => {
+    markStepFailed("opus", 0, "walk step 0 quota wall (402)", undefined, WALK_MARK);
+    markStepFailed("opus", 0, "armed cascade: step 0 walled"); // the walk flag is not sticky
+    onNominalSuccess("opus");
+    // The bench is now an ordinary one: the nominal's recovery clears it.
+    expect((await resolveTransientStep("opus"))?.stepIndex).toBe(0);
+  });
+});

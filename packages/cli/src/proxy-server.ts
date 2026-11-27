@@ -2572,7 +2572,10 @@ export async function createProxyServer(
             // advance in THIS request; the NEXT one skips the benched rung.
             // Kill switch CLAUDISH_FAILOVER_WALK_MARK=0 restores the stateless
             // walk (read per request; a misclassification is then reversible
-            // without a redeploy).
+            // without a redeploy). `walkMark: true` is what makes this bench
+            // OUTLIVE the nominal's recovery (#1124): without it the record is
+            // erased by the next nominal success — often seconds later — and
+            // every new burst re-pays this step.
             if (
               isQuotaExhaustion(firstFailure.status, firstFailure.errBody) &&
               (process.env.CLAUDISH_FAILOVER_WALK_MARK || "").trim() !== "0"
@@ -2580,6 +2583,7 @@ export async function createProxyServer(
               const walkWhy = `HTTP ${firstFailure.status} (quota-class) from walk step ${walk.stepIndex} (${walk.concrete})`;
               markStepFailed(walkRole, walk.stepIndex, walkWhy, parseResetAtFromBody(firstFailure.errBody), {
                 concrete: walk.concrete,
+                walkMark: true,
               });
               log(
                 `[Failover] WALK-MARK ${walkRole} step ${walk.stepIndex} (${walk.concrete}) quota-class ${firstFailure.status}`,
