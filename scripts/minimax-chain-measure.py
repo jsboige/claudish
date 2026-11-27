@@ -75,6 +75,14 @@ Usage:
       [--scratch D:\\big-disk-temp]
   # or point straight at an extracted/loose capture dir:
   python scripts/minimax-chain-measure.py --dir D:\\claudish-captures --since ...
+
+A bound written WITHOUT an offset is UTC (the fleet convention, as in
+native-consumption.py and swarm-signal.py) -- never the host's local zone.
+`astimezone()` on a naive datetime presumes local, so `…T00:00` and `…T00:00Z`
+used to mean two different instants one host-offset apart: one hour apart on a
+Europe/Paris seat, identical on a UTC one. The window moved with the machine,
+silently -- and a targeted extraction's marker (extract_spec) then recorded the
+shifted window as its own completeness identity.
 """
 
 import argparse
@@ -109,9 +117,19 @@ def parse_ts(s):
 
 
 def parse_iso(s):
+    """CLI bound -> aware datetime in UTC.
+
+    A value WITHOUT an offset means UTC, never the host's zone: `.astimezone()`
+    on a naive datetime presumes the SYSTEM zone, which made the same bound
+    mean two different windows depending on the spelling (`2026-11-26T00:00Z`
+    -> 00:00Z, `2026-11-26T00:00` -> 23:00Z on a Europe/Paris host, measured
+    2026-11-27) and on the machine (a UTC host cannot reproduce the shift, so
+    CI could never see it). A value WITH an offset is converted as before.
+    """
     if not s:
         return None
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
 
 
 def extract_spec(since, until, model_substr):
@@ -410,8 +428,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--archive", action="append", default=[], help="7z archive path (repeatable)")
     ap.add_argument("--dir", action="append", default=[], help="loose/extracted capture dir (repeatable)")
-    ap.add_argument("--since", help="ISO 8601 lower bound (window start, e.g. the recreate StartedAt)")
-    ap.add_argument("--until", help="ISO 8601 upper bound")
+    ap.add_argument("--since", help="ISO 8601 lower bound (window start, e.g. the "
+                                    "recreate StartedAt); no offset means UTC")
+    ap.add_argument("--until", help="ISO 8601 upper bound; no offset means UTC")
     ap.add_argument("--model-substr", default="MiniMax", help="lane filter on the resp filename (default MiniMax)")
     ap.add_argument("--json", help="write the result JSON here")
     ap.add_argument("--scratch", help="scratch disk/dir for the extraction (default: system temp)")

@@ -64,6 +64,12 @@ HDR = re.compile(r"^#\s*parser=(\S+)\s+model=(\S+)\s+reqN=(\d+)\s+pid=(\d+)", re
 RESP_TS = re.compile(r"resp-\d+-r\d+-(\d{4}-\d{2}-\d{2}T[\d-]+Z)-")
 
 MACHINE_FIELD = re.compile(r'"machine"\s*:\s*"([^"]*)"')
+# Modele DEMANDE : le `model` de l'enveloppe (request-logger.ts le siege a
+# moins de 400 octets du debut, avant tout champ fourni par le client). La
+# recherche est bornee au debut de la tete : dans le corps, un `"model"` d'un
+# resultat d'outil ne doit pas gagner. Sert le decompte des sans-reponse.
+MODEL_FIELD = re.compile(r'"model"\s*:\s*"([^"]+)"')
+REQ_ENVELOPE_BYTES = 4096
 # #1055 — lane harnais (champ enveloppe, TOUJOURS ecrit cote proxy depuis
 # #1055 : "" = pas de lane, cle absente = capture pre-#1055). La recherche est
 # BORNEE a la zone avant "body" : sur un corpus pre-#1055, une occurrence de
@@ -215,6 +221,61 @@ def read_head_tail(path, head=HEAD_BYTES, tail=TAIL_BYTES):
         return head_txt + fh.read(tail).decode("utf-8", errors="replace")
 
 
+def _read_req_head(path):
+    """Tete d'un fichier de requete, None quand il est illisible (OSError).
+    La politique « sauter et ne pas compter » reste celle de l'appelant, en
+    serie comme par pool : un fichier qu'on ne peut pas ouvrir n'est pas une
+    requete a zero."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(REQ_HEAD_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _read_resp_text(path):
+    """Tete+queue d'un fichier de reponse, None quand il est illisible."""
+    try:
+        return read_head_tail(path)
+    except OSError:
+        return None
+
+
+def _iter_texts(paths, reader, workers=1):
+    """Texte de chaque chemin, RENDU DANS L'ORDRE, par un pool borne si
+    `workers` > 1 — la lecture seule est parallelisee, l'agregation de
+    l'appelant reste sequentielle.
+
+    Mesure du 26/11 (tir du creux, jour 2026-11-23) : le scan d'un jour repaie
+    57,4 ms par membre quand la prechauffe en pool de 8 coute 8,34 ms — #1197
+    n'avait rendu parallele que la PREMIERE ouverture. Le cout par fichier est
+    de l'attente (P : 55,65 ms en serie pour 0,86 s de CPU), donc un pool ne
+    change aucun decompte : c'est ce que la pin d'egalite exige.
+
+    `workers` <= 1 : serie, aucun fil — l'interrupteur. Une exception qui
+    n'est pas OSError (les deux lecteurs ci-dessus n'en laissent sortir
+    aucune d'autre) est relayee a sa place dans l'ordre, exactement la ou la
+    serie la leverait.
+
+    FENETRE EN VOL = 4 x workers (le defaut d'imap_pooled serait 32 x) : un
+    texte de reponse pese jusqu'a HEAD_BYTES + TAIL_BYTES = 300 Ko, et 32
+    textes par fil laisseraient ~75 Mo de resultats deja lus en attente pour
+    un pool de 8. Quatre par fil gardent les fils occupes (~10 Mo) sans que
+    le corpus s'accumule — la borne de #1197 tient aussi ici.
+    """
+    if workers <= 1:
+        for path in paths:
+            yield reader(path)
+        return
+    _pp = _load_partial_parts()
+    workers = _pp.bound_workers(workers)
+    for _i, value, exc in _pp.imap_pooled(
+            paths, reader, workers, window=workers * 4):
+        if exc is not None:
+            raise exc
+        yield value
+
+
 def bucket_of(info):
     """4 buckets : cron / interactive / agent-sdk / other."""
     if info["wl"] == "cron":
@@ -227,7 +288,8 @@ def bucket_of(info):
     return "other"
 
 
-def load_requests(cdir, cutoff_dt, seen=None, until_dt=None, names=None):
+def load_requests(cdir, cutoff_dt, seen=None, until_dt=None, names=None,
+                  workers=1):
     """(pid, reqN) -> liste horodatee de dicts {ts, machine, ep, wl}.
 
     On ne lit que la TETE du fichier : machine + bloc billing system sont
@@ -243,10 +305,18 @@ def load_requests(cdir, cutoff_dt, seen=None, until_dt=None, names=None):
     names : le contenu DEJA LISTE de `cdir` — collect() liste chaque racine une
     fois pour etablir la couverture. Absent -> liste ici (contrat d'origine
     des lecteurs qui importent cette fonction).
+    workers : fils de LECTURE (1 = serie, defaut — l'interrupteur). La
+    selection (nom, fenetre, dedup `seen`) reste sequentielle et PRECEDE toute
+    lecture ; seule l'ouverture des tetes passe par un pool borne, et
+    l'analyse reste en serie, dans l'ordre de la selection : aucun decompte
+    ne bouge (pin d'egalite : test_traffic_consumption_scan_pool).
     """
     if seen is None:
         seen = set()
-    reqs = defaultdict(list)
+    # PASSE 1 — la selection, PURE (aucune E/S) : nom, fenetre, dedup. Un nom
+    # selectionne est marque vu AVANT sa lecture, comme en serie : un fichier
+    # illisible est deduplique quand meme, aucune racine suivante ne le relit.
+    selected = []
     for fn in (os.listdir(cdir) if names is None else names):
         if fn in seen:
             continue
@@ -259,10 +329,14 @@ def load_requests(cdir, cutoff_dt, seen=None, until_dt=None, names=None):
         if until_dt is not None and dt >= until_dt:
             continue
         seen.add(fn)
-        try:
-            with open(os.path.join(cdir, fn), "rb") as fh:
-                head = fh.read(REQ_HEAD_BYTES).decode("utf-8", errors="replace")
-        except OSError:
+        selected.append((fn, m))
+    # PASSE 2 — la lecture (pool borne si workers > 1), l'analyse TOUJOURS en
+    # serie et dans l'ordre de la selection.
+    reqs = defaultdict(list)
+    texts = _iter_texts((os.path.join(cdir, fn) for fn, _m in selected),
+                        _read_req_head, workers)
+    for (fn, m), head in zip(selected, texts):
+        if head is None:
             continue
         mm = MACHINE_FIELD.search(head)
         em = ENTRYPOINT_FIELD.search(head) or BILLING_EP.search(head)
@@ -270,12 +344,14 @@ def load_requests(cdir, cutoff_dt, seen=None, until_dt=None, names=None):
         # #1055 — borné à l'enveloppe (avant "body") : voir LANE_FIELD.
         env = head[: head.find('"body"')] if '"body"' in head else head
         lm = LANE_FIELD.search(env)
+        dm = MODEL_FIELD.search(head[:REQ_ENVELOPE_BYTES])
         reqs[(int(m.group(1)), int(m.group(2)))].append({
             "ts": m.group(3),
             "machine": mm.group(1) if mm else "",
             "ep": em.group(1) if em else "",
             "wl": wm.group(1) if wm else "",
             "hlane": lm.group(1) if lm else "",
+            "model": dm.group(1) if dm else "",
         })
     for v in reqs.values():
         v.sort(key=lambda d: d["ts"])
@@ -456,13 +532,92 @@ def build_days(per_day, corpus_dirs, cutoff_dt, now_dt, reqs, fleet,
     return days
 
 
-def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
+def request_accounting(reqs, answered, bound_dt=None, max_paired_lag_s=None):
+    """Requetes lues, repondues, sans reponse — et OU tombent les sans-reponse.
+
+    Une requete = un fichier req-* (cle (pid, reqN, estample)). Repondue = au
+    moins une resp l'a choisie (pick_request) ; une requete servie par deux
+    fichiers de reponse (un changement de fournisseur en cours de flux rouvre
+    un analyseur) compte UNE fois. Sans reponse = le proxy n'a ferme aucun
+    analyseur pour elle : refus amont terminal, refus local, abandon du client
+    avant les en-tetes, ecriture perdue. Le lecteur ne dit PAS la cause — il
+    dit qui, quel modele, a quelle heure : une cause se lit dans ce portrait.
+
+    Sixieme mecanisme (review ai-01 du 24/11) : un resp-* est horodate a la
+    FERMETURE du flux et collect() borne les deux tetes a [cutoff, until). Une
+    requete admise avant until dont le flux ferme APRES until tombe donc dans
+    `unanswered` par construction — ce n'est pas un refus. Sa taille se mesure,
+    sans constante choisie : `unanswered_tail` compte les sans-reponse admis a
+    moins de L de la borne haute, L = le plus grand ecart requete->reponse
+    observe parmi les paires APPARIEES de la meme lecture ; en mode live
+    (until=None) la borne est la resp la plus recente lue. `unanswered_residue`
+    est le reste. Les deux valent None quand L n'est pas mesurable (aucune
+    paire appariee, aucune resp) : une absence, jamais un zero. Le miroir a la
+    borne basse est `files.unpaired` — le meme flux a cheval sur minuit, vu de
+    l'autre tete. La classe n'est ni une cause par requete ni un majorant
+    strict : un flux plus long que tout lag apparie reste dans le residu, et
+    un lag apparie aberrant (une resp tombee sur une requete plus ancienne de
+    la meme cle) elargit la classe — L se lit avec le decompte.
+
+    Le 22/11 (lecture archive du 24/11) : 65 120 req-* contre 63 915 resp-*.
+    C'est un ecart de FICHIERS ; le nombre de requetes concernees est celui
+    d'ici, et il ne s'en deduisait pas.
+
+    -> {"total", "answered", "unanswered", "unanswered_tail",
+        "unanswered_residue", "tail_from", "max_paired_lag_s",
+        "by_machine", "by_model", "by_hour", "by_bucket"}
+       — chaque by_* : {cle : {requests, unanswered}}.
+    """
+    def tally(key_of):
+        t = defaultdict(lambda: {"requests": 0, "unanswered": 0})
+        for (pid, reqn), lst in reqs.items():
+            for r in lst:
+                row = t[key_of(r)]
+                row["requests"] += 1
+                if (pid, reqn, r["ts"]) not in answered:
+                    row["unanswered"] += 1
+        return {k: t[k] for k in sorted(t)}
+
+    total = sum(len(lst) for lst in reqs.values())
+    unanswered = total - len(answered)
+    # La queue de fenetre : ce qu'une fermeture apres la borne expliquerait.
+    tail = residue = None
+    tail_from = None
+    if bound_dt is not None and max_paired_lag_s is not None:
+        tail_from = bound_dt - timedelta(seconds=max_paired_lag_s)
+        tail = 0
+        for (pid, reqn), lst in reqs.items():
+            for r in lst:
+                if (pid, reqn, r["ts"]) in answered:
+                    continue
+                r_dt = capture_dt(r.get("ts") or "")
+                if r_dt is not None and r_dt >= tail_from:
+                    tail += 1
+        tail = min(tail, unanswered)
+        residue = unanswered - tail
+    return {"total": total, "answered": len(answered), "unanswered": unanswered,
+            "unanswered_tail": tail, "unanswered_residue": residue,
+            "tail_from": tail_from.isoformat() if tail_from else None,
+            "max_paired_lag_s": max_paired_lag_s,
+            "by_machine": tally(lambda r: r.get("machine") or "direct"),
+            "by_model": tally(lambda r: r.get("model") or "(none)"),
+            "by_hour": tally(lambda r: (r.get("ts") or "?")[11:13]),
+            "by_bucket": tally(bucket_of)}
+
+
+def collect(dirs, cutoff_dt, until_dt=None, per_day=False, scan_workers=1):
     """LE scan : l'union des racines (#1180), dedupliquee par NOM de fichier
     (premiere racine gagne). Une seule copie des regles de lecture — la
     fenetre loose et le mode --from-archive passent tous les deux par ici.
 
     until_dt : borne haute EXCLUSIVE de la fenetre (None = pas de borne) ;
     le mode --from-archive lit un JOUR, [minuit, minuit).
+
+    scan_workers : fils de LECTURE des fichiers (1 = serie, defaut —
+    l'interrupteur ; borne par bound_workers). Les tetes req et les resp sont
+    OUVERTS par un pool borne, chacune des deux analyses reste en serie, dans
+    l'ordre de sa selection : la selection ne lit rien, donc un fichier hors
+    fenetre n'est pas ouvert par le pool, et aucun decompte ne bouge.
 
     -> {"files", "lanes", "machines", "hlanes", "per_day", "reqs",
         "first_dt", "last_dt", "coverage"}
@@ -487,7 +642,7 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
     reqs = defaultdict(list)
     for _d, _names in listed:
         for k, v in load_requests(_d, cutoff_dt, seen=seen, until_dt=until_dt,
-                                  names=_names).items():
+                                  names=_names, workers=scan_workers).items():
             reqs[k].extend(v)
     for v in reqs.values():
         v.sort(key=lambda d: d["ts"])
@@ -503,6 +658,8 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
     by_day = defaultdict(lambda: dict(n=0, inp=0, out=0, cread=0, ccre=0)) if per_day else {}
     n_resp = n_paired = n_unpaired = n_nousage = 0
     first_dt = last_dt = None
+    max_paired_lag_s = None   # L de la queue de fenetre (request_accounting)
+    answered = set()     # (pid, reqN, estample) des requetes qu'une resp a choisies
 
     # #1180 — resp de toutes les racines LUES, union dedupliquee par nom de
     # fichier (premiere racine gagne).
@@ -515,6 +672,11 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
             if fn.startswith("resp-") and fn.endswith(".sse"):
                 _resp_files.append((_d, fn))
 
+    # PASSE 1 — la selection des reponses, PURE (aucune E/S) : nom, fenetre,
+    # compteur et bornes. PASSE 2 — la lecture (pool borne si scan_workers > 1),
+    # zipped dans l'ordre de la selection : un fichier illisible est saute et
+    # deja compte au numerateur, exactement comme en serie.
+    _resp_sel = []      # (dt, nom, chemin) — l'ordre de _resp_files est preserve
     for _d, fn in _resp_files:
         rm = RESP_FN.match(fn)
         if not rm:
@@ -529,10 +691,12 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
             first_dt = dt
         if last_dt is None or dt > last_dt:
             last_dt = dt
-        path = os.path.join(_d, fn)
-        try:
-            txt = read_head_tail(path)
-        except OSError:
+        _resp_sel.append((dt, fn, os.path.join(_d, fn)))
+
+    _resp_texts = _iter_texts((p for _dt, _fn, p in _resp_sel), _read_resp_text,
+                              scan_workers)
+    for (dt, fn, _path), txt in zip(_resp_sel, _resp_texts):
+        if txt is None:
             continue
         h = HDR.search(txt)
         if not h:
@@ -548,6 +712,16 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
             n_paired += 1
             bucket = bucket_of(req)
             info = req
+            answered.add((pid, reqn, req["ts"]))
+            # L (review 24/11) : l'ecart requete->reponse des paires APPARIEES
+            # de CETTE lecture. La resp est horodatee a la fermeture du flux :
+            # son retard mesure la fenetre dans laquelle une requete sans
+            # reponse peut etre un flux encore ouvert a la borne, pas un refus.
+            req_dt = capture_dt(req.get("ts") or "")
+            if req_dt is not None:
+                lag_s = (dt - req_dt).total_seconds()
+                if lag_s >= 0 and (max_paired_lag_s is None or lag_s > max_paired_lag_s):
+                    max_paired_lag_s = lag_s
         u = usage_of(txt)
         if not u:
             n_nousage += 1
@@ -575,8 +749,13 @@ def collect(dirs, cutoff_dt, until_dt=None, per_day=False):
             r["cread"] += cread
             r["ccre"] += ccre
 
+    # La borne haute de la lecture : `until` du mode jour, sinon la resp la
+    # plus recente lue (mode live) — jamais un « maintenant » implicite.
+    bound_dt = until_dt if until_dt is not None else last_dt
     return {"files": {"resp": n_resp, "paired": n_paired, "unpaired": n_unpaired,
                       "no_usage": n_nousage},
+            "requests": request_accounting(reqs, answered, bound_dt=bound_dt,
+                                           max_paired_lag_s=max_paired_lag_s),
             "lanes": lanes, "machines": machines, "hlanes": hlanes,
             "per_day": by_day, "reqs": reqs,
             "first_dt": first_dt, "last_dt": last_dt,
@@ -606,6 +785,7 @@ def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet
             # `uncovered` nomme les racines refusees par listdir
             "coverage": coverage,
             "files": files,
+            "requests": res.get("requests"),
             "lanes": {k: v for k, v in lanes.items()},
             "machines": {k: v for k, v in machines.items()} if args.machines else None,
             "harness_lanes": {k: v for k, v in hlanes.items()} if args.harness_lanes else None,
@@ -631,6 +811,19 @@ def emit_report(res, *, args, dirs, cdir, cutoff_dt, now_dt, window_hours, fleet
     print(f"fenetre: {window_hours}h demandees | {couv}")
     print(coverage_line(coverage))
     print(f"resp: {files['resp']} | appariees: {files['paired']} | non appariees: {files['unpaired']} | sans usage: {files['no_usage']}")
+    _rq = res.get("requests")
+    if _rq:
+        _pct = 100.0 * _rq["unanswered"] / _rq["total"] if _rq["total"] else 0.0
+        print(f"req: {fmt_int(_rq['total'])} | repondues: {fmt_int(_rq['answered'])} | "
+              f"sans reponse: {fmt_int(_rq['unanswered'])} ({_pct:.1f} %)")
+        if _rq.get("unanswered_tail") is not None:
+            print(f"sans reponse, queue de fenetre: {fmt_int(_rq['unanswered_tail'])} "
+                  f"(admises a partir de {_rq['tail_from']}, L = "
+                  f"{_rq['max_paired_lag_s']:.0f} s mesure sur les paires lues) | "
+                  f"reste: {fmt_int(_rq['unanswered_residue'])}")
+        else:
+            print("sans reponse, queue de fenetre: non mesurable (aucune paire "
+                  "appariee dans la lecture) — une absence, pas un zero")
     pp = _load_partial_parts()
     for _line in pp.section(cdir, cutoff_dt, now_dt, res=partial):
         print(_line)
@@ -1063,9 +1256,39 @@ def from_archive(args, dirs, pp, bs):
                     say(f"  warning: residu loose {fn} illisible ({exc})")
         say(f"  residu loose du jour fusionne : {resid} fichier(s)")
 
-        res = collect([dest], d0, until_dt=until_dt, per_day=True)
+        # #1195 — prechauffage de la PREMIERE OUVERTURE. collect ouvre chaque
+        # fichier une premiere fois, en serie : mesure du 25/11, 62,12 ms par
+        # fichier pour 0,7 % de CPU du processus — de l'attente, pas du
+        # travail. Ouvrir ces memes fichiers en pool d'abord ne change AUCUN
+        # decompte : collect les relit tous, avec ses regles. Un echec du
+        # prechauffage ne fait pas echouer la lecture.
+        # Review ai-01 25/11 (7161871992) : la PREPARATION (lister, trier) et
+        # sa duree vivent DANS la branche armee ET dans la garde. Desactive,
+        # rien n'est liste ni chronometre et `seconds.warm` reste exactement
+        # 0 — sinon « off » n'est pas une comparaison serie propre. Une
+        # preparation qui leve est un warning, jamais un scan perdu.
+        t_w0 = time.time()
+        warm_seconds = 0.0
+        t_scan0 = t_w0
+        if args.warm_pool > 1:
+            try:
+                effective = pp.bound_workers(args.warm_pool)
+                warm_files = pp.warm_candidates(dest)
+                warmed = pp.warm_first_open(warm_files, effective)
+                t_scan0 = time.time()
+                say(f"  prechauffe en {t_scan0 - t_w0:.0f} s : {warmed} fichier(s) "
+                    f"ouvert(s) une premiere fois par {effective} fils")
+            except Exception as exc:  # le scan reste la lecture, pas le prechauffage
+                t_scan0 = time.time()
+                say(f"  warning: prechauffage abandonne ({type(exc).__name__}: {exc})")
+            warm_seconds = t_scan0 - t_w0
+        else:
+            say(f"  prechauffage desactive (--warm-pool {args.warm_pool})")
+
+        res = collect([dest], d0, until_dt=until_dt, per_day=True,
+                      scan_workers=args.scan_pool)
         t2 = time.time()
-        say(f"  scanne en {t2 - t1:.0f} s : {res['files']['resp']} resp, "
+        say(f"  scanne en {t2 - t_scan0:.0f} s : {res['files']['resp']} resp, "
             f"{res['files']['paired']} appariees, {res['files']['unpaired']} non appariees")
 
         rows = build_days(res["per_day"], dirs, d0, now_dt, res["reqs"], fleet, rdir,
@@ -1077,8 +1300,14 @@ def from_archive(args, dirs, pp, bs):
         read_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         row["archive"] = {"files": cur, "read_at": read_at, "members": n_members,
                           "declared_bytes": need,
+                          # #1197 reste la PREMIERE ouverture, --scan-pool la
+                          # lecture qui la repaie : la ligne persiste doit dire
+                          # laquelle a servi, sinon deux durees de scan sans
+                          # mode declare ne se comparent pas.
+                          "scan_pool": pp.bound_workers(args.scan_pool),
                           "seconds": {"extract": round(t1 - t0, 1),
-                                      "scan": round(t2 - t1, 1)}}
+                                      "warm": round(warm_seconds, 1),
+                                      "scan": round(t2 - t_scan0, 1)}}
         row["loose_residual"] = resid
         # la ligne persiste seule (le rapport non) : elle garde ce qu'elle a
         # ete lue — racines demandees, lues, non lues (#1180, review ai-01)
@@ -1114,6 +1343,10 @@ def from_archive(args, dirs, pp, bs):
 
 
 def main():
+    # #1195 (review ai-01 25/11) — charge avant l'analyseur : la borne de
+    # --warm-pool se lit sur la constante (aide ET refus), jamais recopiee —
+    # une borne recopiee derive.
+    pp = _load_partial_parts()
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--hours", type=float, default=24.0)
     ap.add_argument("--dir", action="append", default=None,
@@ -1155,14 +1388,43 @@ def main():
     ap.add_argument("--reread", action="store_true",
                     help="relire un jour deja present dont l'archive a change depuis la "
                          "lecture (sans lui : sortie 2, rien n'est relu)")
+    ap.add_argument("--warm-pool", type=int, default=pp.WARM_POOL, metavar="N",
+                    help="(#1195) avec --from-archive : fils qui ouvrent une PREMIERE "
+                         "fois chaque fichier extrait avant le scan — l'attente de "
+                         "premiere ouverture (62 ms par fichier, mesure du 25/11) se "
+                         "parallelise ; le scan relit tout avec ses regles et aucun "
+                         "decompte ne bouge. 0 ou 1 = desactive, et alors rien n'est "
+                         "liste ni chronometre (le chiffre en serie reste atteignable) ; "
+                         f"0..{pp.WARM_POOL_MAX} — hors borne : refus, sortie 2")
+    ap.add_argument("--scan-pool", type=int, default=1, metavar="N",
+                    help="(#1197 symetrique) fils qui LISENT les fichiers pendant le "
+                         "scan (req et resp), au lieu de les ouvrir en serie sur le fil "
+                         "de l'appelant ; la selection et l'agregation restent "
+                         "sequentielles et dans l'ordre — aucun decompte ne bouge "
+                         "(pin : test_traffic_consumption_scan_pool.py). Le "
+                         "prechauffage (#1195) ne paie que la PREMIERE ouverture : "
+                         "la lecture qui la repaie est ici (57,4 ms par membre "
+                         "au tir du creux du 26/11, contre 8,34 ms en pool). "
+                         "1 = desactive (defaut, inerte) ; "
+                         f"0..{pp.WARM_POOL_MAX} — hors borne : refus, sortie 2")
     args = ap.parse_args()
+    # #1195 (review ai-01 25/11) — la borne est APPLIQUEE : un entier hors
+    # [0, WARM_POOL_MAX] est refuse ici, avant toute lecture d'archive.
+    if not 0 <= args.warm_pool <= pp.WARM_POOL_MAX:
+        ap.error(f"--warm-pool {args.warm_pool} : attendu 0..{pp.WARM_POOL_MAX} "
+                 f"(0 ou 1 = desactive ; {pp.WARM_POOL_MAX} fils au plus — le "
+                 f"prechauffage divise une attente par fichier)")
+    if not 0 <= args.scan_pool <= pp.WARM_POOL_MAX:
+        ap.error(f"--scan-pool {args.scan_pool} : attendu 0..{pp.WARM_POOL_MAX} "
+                 f"(0 ou 1 = desactive ; {pp.WARM_POOL_MAX} fils au plus — la "
+                 f"lecture parallelisee divise une attente par fichier, elle ne "
+                 f"change aucun decompte)")
     # #1180 — `--dir` repetable : la PREMIERE racine reste le corpus de
     # reference (archive/ et reconcile/ gardent leur sens), les suivantes
     # n'ajoutent que leurs captures loose.
     dirs = args.dir or [os.environ.get("CLAUDISH_CAPTURE_DIR",
                                        r"D:\claudish-captures")]
     cdir = dirs[0]
-    pp = _load_partial_parts()
     bs = _load_blind_spot()
 
     if args.from_archive:
@@ -1171,7 +1433,8 @@ def main():
     cutoff = datetime.now(timezone.utc).timestamp() - args.hours * 3600
     cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
 
-    res = collect(dirs, cutoff_dt, per_day=args.per_day)
+    res = collect(dirs, cutoff_dt, per_day=args.per_day,
+                  scan_workers=args.scan_pool)
     reqs = res["reqs"]
     # #1180 (review ai-01) — les racines LUES se comptent sur stdout et dans
     # le JSON ; une racine illisible marque chaque jour (build_days). La

@@ -34,6 +34,7 @@ the seats, so neither this process nor its children run under `-I`.
 Run: python scripts/tests/test_traffic_consumption_from_archive.py
 """
 
+import argparse
 import importlib.util
 import json
 import os
@@ -41,11 +42,26 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS = os.path.join(_HERE, "..")
 _TOOL = os.path.join(_SCRIPTS, "traffic-consumption.py")
 _JOIN = os.path.join(_SCRIPTS, "activity-cost-join.py")
+
+# #1176 contract (#1186), two layers, neither in the scripts:
+#   - CHILD bytes pinned to UTF-8 (PYTHONIOENCODING in the env; no child here
+#     runs under -I, see the docstring): they decode exactly on every seat. It
+#     matters beyond the net — A11 asserts a temp PATH in a child's stderr (the
+#     refusal names the root), and a path outside ASCII written in cp1252
+#     would not match;
+#   - READER tolerant (errors="replace") and normalised with (or ""): it ALWAYS
+#     returns text. A strict decoder reading a cp1252 child raised
+#     UnicodeDecodeError inside subprocess' reader thread and handed back
+#     stdout/stderr=None (#1175 signature); the run then died on
+#     `out.stderr[-600:]` instead of reporting its pin.
+# The pins match ASCII only, so a replaced byte costs nothing.
+_UTF8_CHILD = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 FAILS = []
 
@@ -158,7 +174,10 @@ def run(root, series, work, *extra, roots=None):
             "--series-file", series, "--extract-root", work]
     for r in roots:
         args += ["--dir", r]
-    return subprocess.run(args + list(extra), capture_output=True, text=True)
+    p = subprocess.run(args + list(extra), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=_UTF8_CHILD)
+    p.stdout, p.stderr = p.stdout or "", p.stderr or ""
+    return p
 
 
 def read_day(root, series, work, *extra, roots=None):
@@ -428,8 +447,9 @@ def main():
                        "days": [{"date": DAY, "count": 12}, {"date": OTHER, "count": 5}]}, fh)
         joined = subprocess.run([sys.executable, _JOIN, "--activity", act,
                                  "--consumption", series9, "--json"],
-                                capture_output=True, text=True)
-        check("rc=0", joined.returncode == 0, joined.stderr[-400:])
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", env=_UTF8_CHILD)
+        check("rc=0", joined.returncode == 0, (joined.stderr or "")[-400:])
         rows = {r["date"]: r for r in json.loads(joined.stdout)["rows"]}
         check("le jour lu a un ratio, sans partial",
               rows[DAY]["ratio"] == round(12 / ((1.25 * 300 + 0.1 * 3 * 244800 + 5 * 369) / 1000.0), 4)
@@ -494,6 +514,519 @@ def main():
         left = os.path.join(work11, "traffic-days")
         check("aucune extraction laissee", not os.path.exists(left) or os.listdir(left) == [],
               os.listdir(left) if os.path.exists(left) else "-")
+
+        # A12 — requetes sans reponse : un ecart de FICHIERS n'est pas un nombre
+        # de requetes. Deux req-* seuls s'ajoutent aux 3 paires du corpus.
+        print("A12 — requetes sans reponse : comptees, situees, jamais causees")
+        lone1, lone2 = pair_names(700, 1, DAY, "1030")[0], pair_names(701, 1, DAY, "1031")[0]
+        body1 = ('{"machine":"myia-po-2027","model":"kimi-k2.5","entrypoint":"cli",'
+                 '"workload":"interactive","lane":"","body":{"model":"glm-5.3"}}')
+        body2 = '{"src":"direct","body":{"model":"deepseek-r1","messages":[]}}'
+        root12 = build(tmp, n=3, extra_members=[(lone1, body1.encode()), (lone2, body2.encode())],
+                       name="corpus12")
+        work12 = os.path.join(tmp, "w12")
+        os.makedirs(work12)
+        out = read_day(root12, os.path.join(work12, "traffic-days.json"), work12)
+        check("A12 rc=0", out.returncode == 0, out.stderr[-500:])
+        rq = json.loads(out.stdout).get("requests")
+        check("5 requetes, 3 repondues, 2 sans reponse",
+              rq and (rq["total"], rq["answered"], rq["unanswered"]) == (5, 3, 2), rq)
+        check("par machine : la sans-reponse est situee",
+              rq and rq["by_machine"] == {"direct": {"requests": 1, "unanswered": 1},
+                                          "myia-po-2023": {"requests": 3, "unanswered": 0},
+                                          "myia-po-2027": {"requests": 1, "unanswered": 1}},
+              rq and rq["by_machine"])
+        check("par modele DEMANDE : l'enveloppe gagne, pas le corps",
+              rq and rq["by_model"] == {"(none)": {"requests": 3, "unanswered": 0},
+                                        "deepseek-r1": {"requests": 1, "unanswered": 1},
+                                        "kimi-k2.5": {"requests": 1, "unanswered": 1}},
+              rq and rq["by_model"])
+        check("par heure UTC et par bucket",
+              rq and rq["by_hour"] == {"10": {"requests": 5, "unanswered": 2}}
+              and rq["by_bucket"] == {"cron": {"requests": 3, "unanswered": 0},
+                                      "interactive": {"requests": 1, "unanswered": 1},
+                                      "other": {"requests": 1, "unanswered": 1}},
+              rq and (rq["by_hour"], rq["by_bucket"]))
+        check("la cause n'est pas inventee : aucune cle de cause",
+              rq and not [k for k in rq if "cause" in k or "reason" in k], rq and sorted(rq))
+        out = run(root12, os.path.join(work12, "traffic-days-b.json"), work12, "--from-archive", DAY)
+        check("rapport texte : la ligne req | repondues | sans reponse",
+              out.returncode == 0
+              and "req: 5 | repondues: 3 | sans reponse: 2 (40.0 %)" in out.stdout,
+              (out.returncode, out.stdout[-500:]))
+
+        # A12b (review ai-01 du 24/11, finding 1) — le SIXIEME mecanisme : un
+        # resp-* est horodate a la FERMETURE du flux, et collect() borne les
+        # deux tetes. Une requete admise avant la borne dont le flux ferme
+        # apres elle est « sans reponse » PAR CONSTRUCTION. Elle se rapporte a
+        # part (la queue de fenetre), et L se mesure sur les paires appariees
+        # de la meme lecture — aucune constante choisie.
+        print("A12b — flux ferme apres la borne : queue de fenetre, pas residu")
+        tc = _load("tc", "traffic-consumption.py")
+        tail_dir = os.path.join(tmp, "tail")
+        os.makedirs(tail_dir)
+
+        def put(folder, fn, text):
+            with open(os.path.join(folder, fn), "w") as fh:
+                fh.write(text)
+
+        def req_text(machine="myia-po-2023"):
+            return ('{"machine":"%s","entrypoint":"cli","workload":"cron","lane":"",'
+                    '"body":{"messages":[]}}' % machine)
+
+        def resp_text(pid, reqn):
+            return f"# parser=openai-sse model=glm-5.3 reqN={reqn} pid={pid}\n" + SSE
+
+        # paire A : admise 12:00:00, flux ferme 12:04:00 -> L = 240 s
+        put(tail_dir, "req-900-0001-2026-11-22T12-00-00-123Z-direct.json", req_text())
+        put(tail_dir, "resp-900-r0001-2026-11-22T12-04-00-456Z-openai-sse-glm-5.3.sse",
+            resp_text(900, 1))
+        # paire B : admise 23:58:00, flux ferme le lendemain 00:01:30
+        put(tail_dir, "req-901-0001-2026-11-22T23-58-00-123Z-direct.json", req_text("myia-po-2027"))
+        put(tail_dir, "resp-901-r0001-2026-11-23T00-01-30-456Z-openai-sse-glm-5.3.sse",
+            resp_text(901, 1))
+        d22 = datetime(2026, 11, 22, tzinfo=timezone.utc)
+        d23 = d22 + timedelta(days=1)
+        r1 = tc.collect([tail_dir], d22, until_dt=d23)["requests"]
+        check("A12b fenetre du 22/11 : 2 requetes, 1 repondue, 1 sans reponse (reproduit)",
+              (r1["total"], r1["answered"], r1["unanswered"]) == (2, 1, 1),
+              {k: r1[k] for k in ("total", "answered", "unanswered")})
+        check("A12b L = le plus grand ecart requete->reponse des paires lues (240 s), "
+              "et la borne qui en decoule (23:56:00)",
+              r1["max_paired_lag_s"] == 240
+              and r1["tail_from"] == "2026-11-22T23:56:00+00:00",
+              (r1["max_paired_lag_s"], r1["tail_from"]))
+        check("A12b LA PIN — elle tombe dans la queue de fenetre, pas dans le residu",
+              (r1["unanswered_tail"], r1["unanswered_residue"]) == (1, 0),
+              (r1["unanswered_tail"], r1["unanswered_residue"]))
+        r2 = tc.collect([tail_dir], d22, until_dt=d23 + timedelta(minutes=5))["requests"]
+        check("A12b fenetre elargie de 5 min : la meme paire est repondue, plus rien en queue",
+              (r2["answered"], r2["unanswered"], r2["unanswered_tail"]) == (2, 0, 0),
+              {k: r2[k] for k in ("answered", "unanswered", "unanswered_tail")})
+        early = os.path.join(tmp, "tail-early")
+        os.makedirs(early)
+        for fn in os.listdir(tail_dir):
+            shutil.copy(os.path.join(tail_dir, fn), early)
+        put(early, "req-902-0001-2026-11-22T03-00-00-123Z-direct.json", req_text())
+        r3 = tc.collect([early], d22, until_dt=d23)["requests"]
+        check("A12b une sans-reponse loin de la borne reste du residu",
+              (r3["unanswered"], r3["unanswered_tail"], r3["unanswered_residue"]) == (2, 1, 1),
+              {k: r3[k] for k in ("unanswered", "unanswered_tail", "unanswered_residue")})
+        r4 = tc.collect([tail_dir], d22)["requests"]
+        check("A12b mode live (until=None) : borne = la resp la plus recente lue, "
+              "la paire a cheval est repondue",
+              (r4["answered"], r4["unanswered"], r4["tail_from"])
+              == (2, 0, "2026-11-22T23:57:30+00:00"),
+              {k: r4[k] for k in ("answered", "unanswered", "tail_from")})
+        lonely = os.path.join(tmp, "tail-lonely")
+        os.makedirs(lonely)
+        put(lonely, "req-903-0001-2026-11-22T10-00-00-123Z-direct.json", req_text())
+        r5 = tc.collect([lonely], d22, until_dt=d23)["requests"]
+        check("A12b aucune paire appariee : la queue est NON MESURABLE (None), jamais 0",
+              r5["unanswered"] == 1 and r5["unanswered_tail"] is None
+              and r5["unanswered_residue"] is None and r5["tail_from"] is None, r5)
+
+        # A12c (review ai-01 du 24/11, finding 2) — la borne de 4 Kio
+        # (REQ_ENVELOPE_BYTES) : aucun `model` dans les 4 premiers Kio, puis un
+        # `"model"` d'entree d'outil APRES. Sans la borne, le mutant
+        # `MODEL_FIELD.search(head)` lit « sonnet » et fabrique un modele demande.
+        print("A12c — borne de l'enveloppe : un model d'outil apres 4 Kio ne gagne pas")
+        pad = "x" * 4300
+        body4k = ('{"machine":"myia-po-2024","entrypoint":"cli","workload":"interactive","lane":"",'
+                  '"body":{"messages":[{"role":"user","content":"' + pad + '"},'
+                  '{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1",'
+                  '"name":"Task","input":{"description":"d","prompt":"p","model":"sonnet"}}]}]}}')
+        check("A12c fixture : aucun model avant 4 Kio, un apres",
+              '"model"' not in body4k[:4096] and '"model":"sonnet"' in body4k[4096:],
+              body4k.find('"model"'))
+        name4k = "req-800-0001-%sT10-40-00-123Z-direct.json" % DAY
+        root4k = build(tmp, n=1, extra_members=[(name4k, body4k.encode())], name="corpus4k")
+        work4k = os.path.join(tmp, "w4k")
+        os.makedirs(work4k)
+        out = read_day(root4k, os.path.join(work4k, "traffic-days.json"), work4k)
+        rq4 = json.loads(out.stdout).get("requests") if out.returncode == 0 else None
+        check("A12c rc=0 et 2 requetes lues (la paire du jour + la fixture)",
+              out.returncode == 0 and rq4 and rq4["total"] == 2, (out.returncode, out.stderr[-400:]))
+        check("A12c LA PIN — cle (none) : le model d'outil apres 4 Kio n'est pas le modele demande",
+              rq4 and rq4["by_model"] == {"(none)": {"requests": 2, "unanswered": 1}},
+              rq4 and rq4["by_model"])
+        check("A12c la machine d'enveloppe est toujours lue (la borne ne coupe que le modele)",
+              rq4 and rq4["by_machine"] == {"myia-po-2023": {"requests": 1, "unanswered": 0},
+                                            "myia-po-2024": {"requests": 1, "unanswered": 1}},
+              rq4 and rq4["by_machine"])
+
+        # P — le profil du scan, en mode synthetique (aucune capture lue) : la
+        # voie archive entiere, trois phases, top 5 avec parts, rien laisse.
+        print("P — archive-scan-profile --synthetic : trois phases, top 5, rien laisse")
+        workp = os.path.join(tmp, "wp")
+        os.makedirs(workp)
+        prof_tool = os.path.join(_SCRIPTS, "archive-scan-profile.py")
+        # Le profiteur enfant ecrit dans SON encodage de sortie :
+        # PYTHONIOENCODING quand elle est posee (le contrat cp1252 de la chaine),
+        # sinon le defaut de locale -- le meme que ce parent. `text=True` seul
+        # suppose de l'UTF-8 et meurt en mode UTF-8 sous PYTHONIOENCODING=cp1252.
+        child_enc = (os.environ.get("PYTHONIOENCODING") or "").split(":")[0] or None
+
+        def profile_run(*extra):
+            return subprocess.run([sys.executable, prof_tool, "--work-dir", workp,
+                                   "--extract-root", workp, *extra],
+                                  capture_output=True, text=True,
+                                  encoding=child_enc, errors="replace")
+
+        out = profile_run("--synthetic", "12", "--json")
+        check("P rc=0", out.returncode == 0, out.stderr[-400:])
+        prof = json.loads(out.stdout) if out.returncode == 0 else {}
+        check("12 resp + 12 req selectionnes, extraits et lus",
+              prof.get("extracted") == 24 and prof.get("selected", {}).get("resp") == 12
+              and prof.get("sample", {}).get("resp") == 12
+              and prof.get("sample", {}).get("req") == 12
+              and prof.get("sample", {}).get("unanswered") == 0, (prof.get("selected"), prof.get("sample")))
+        fo = prof.get("first_open", {})
+        check("premiere ouverture : une moitie en serie, une par pool",
+              fo.get("serial", {}).get("files") == 12 and fo.get("pooled", {}).get("files") == 12
+              and fo.get("serial", {}).get("ms_per_file") is not None, fo)
+        # La marque structurelle, pas le rapport de vitesse (instable sur 12
+        # fichiers) : sans elle, une lecture "pool" jamais entree reste verte.
+        check("la moitie pool a lu par un AUTRE fil, la serie par le fil appelant",
+              fo.get("serial", {}).get("off_caller") is False
+              and fo.get("pooled", {}).get("off_caller") is True,
+              (fo.get("serial", {}).get("off_caller"), fo.get("pooled", {}).get("off_caller")))
+        top = prof.get("top_cumulative", [])
+        check("top 5 par temps cumule, collect en tete a 100 %",
+              len(top) == 5 and "collect" in top[0]["function"] and top[0]["share"] >= 99.0, top)
+        check("scan_usage figure avec une part mesuree",
+              any("scan_usage" in r["function"] and r["share"] > 0 for r in top), top)
+        check("les deux passes du lecteur ont leur horloge CPU",
+              prof.get("scan_plain", {}).get("cpu_share") is not None
+              and prof.get("scan_profiled", {}).get("ms_per_resp") is not None,
+              (prof.get("scan_plain"), prof.get("scan_profiled")))
+        check("rien laisse (extraction, source synthetique)",
+              prof.get("cleaned") is True and os.listdir(workp) == [], os.listdir(workp))
+        # #1215 — les taux du scan portent l'echantillon qui les a produits, et le
+        # document refuse d'etre lu comme un prix du JOUR. Ce sont des CHAMPS, pas
+        # de la prose : `not_measured` le disait deja, et un consommateur a quand
+        # meme mis a l'echelle un 1,2 ms/reponse lu ici contre 124,3 ms/reponse
+        # sur le jour (7 752 s pour 62 332 reponses) — lanceur dimensionne a
+        # 2 568 s, jambe deroulee en 9 289,6 s, 69 min apres l'echeance.
+        ex = prof.get("extrapolation", {})
+        check("P LA PIN — extrapolation.day_estimable est FAUX",
+              ex.get("day_estimable") is False, ex)
+        check("P LA PIN — extrapolation.measured_on est l'echantillon LU, pas la selection",
+              ex.get("measured_on") == {"day": "2026-11-02", "hours": ["03"],
+                                        "resp": 12, "req": 12, "members": 24}, ex)
+        check("P LA PIN — chaque taux du scan porte sa taille d'echantillon",
+              all(prof.get(k, {}).get("measured_on") == {"resp": 12, "members": 24}
+                  for k in ("scan_plain", "scan_profiled")),
+              (prof.get("scan_plain"), prof.get("scan_profiled")))
+        out = profile_run("--synthetic", "12", "--pool", "1", "--json")
+        p1 = json.loads(out.stdout)["first_open"] if out.returncode == 0 else {}
+        check("--pool 1 : rc=0, ni rapport de vitesse ni lecture sur un autre fil",
+              out.returncode == 0 and p1.get("speedup") is None
+              and p1.get("pooled", {}).get("off_caller") is False,
+              (out.returncode, p1, out.stderr[-300:]))
+        out = profile_run("--synthetic", "12")
+        check("P LA PIN — la sortie texte dit l'extrapolation au pied du chiffre",
+              out.returncode == 0 and "day_estimable is False" in out.stdout
+              and "they do not price a day" in out.stdout, out.stdout[-500:])
+        out = profile_run("--synthetic", "0")
+        check("--synthetic 0 : refuse (rc=2), rien construit",
+              out.returncode == 2 and "REFUSED" in out.stderr and os.listdir(workp) == [],
+              (out.returncode, out.stderr[-200:], os.listdir(workp)))
+        out = profile_run("--json")
+        check("ni archive ni synthetique : refuse (rc=2)",
+              out.returncode == 2 and "REFUSED" in out.stderr, (out.returncode, out.stderr[-200:]))
+
+        # P2 — le repertoire d'extraction est ALLOUE (mkdtemp), jamais DERIVE
+        # (review ai-01, 25/11) : un nom jour+PID est un nom qu'une execution
+        # interrompue a pu laisser derriere elle (un PID se recycle), et le
+        # finally ne doit retirer que le repertoire que CE run possede — y
+        # compris quand l'extraction echoue. Eprouve EN PROCESSUS : le PID
+        # derive est alors le notre, donc le voisin porte exactement le nom
+        # que l'ancienne regle aurait pris pour le sien.
+        print("P2 — repertoire d'extraction alloue : voisin preexistant preserve, succes ET echec")
+        prof_mod = _load("prof", "archive-scan-profile.py")
+
+        def prof_ns(rootp):
+            return argparse.Namespace(archive=None, day=None, hours="3", max_members=4000,
+                                      pool=4, synthetic=4, extract_root=rootp,
+                                      work_dir=rootp, json=True)
+
+        def victim_in(rootp):
+            """Le nom exact que l'ancienne regle (jour + PID) aurait derive."""
+            v = os.path.join(rootp, f"scan-profile-{prof_mod.SYNTHETIC_DAY}-{os.getpid()}")
+            os.makedirs(v)
+            with open(os.path.join(v, "keep.txt"), "w") as fh:
+                fh.write("pre-existing, not this run's\n")
+            return v
+
+        root2 = os.path.join(tmp, "wp2")
+        os.makedirs(root2)
+        victim2 = victim_in(root2)
+        # mkdtemp est ecoute : le repertoire doit naitre SOUS la racine que la
+        # garde d'espace a mesuree (un `dir` oublie extrait ailleurs, sur un
+        # disque que personne n'a verifie, et se nettoie si bien que rien ne
+        # le dit).
+        made, real_mkdtemp = [], tempfile.mkdtemp
+
+        def recording_mkdtemp(*a, **k):
+            path = real_mkdtemp(*a, **k)
+            made.append((k.get("prefix"), path))
+            return path
+
+        prof_mod.tempfile.mkdtemp = recording_mkdtemp
+        try:
+            outcome = prof_mod.profile(prof_ns(root2))
+        finally:
+            tempfile.mkdtemp = real_mkdtemp
+        rc2, res2 = outcome if isinstance(outcome, tuple) else (outcome, {})
+        check("P2 rc=0 (4 paires synthetiques)", rc2 == 0, (rc2, res2))
+        check("P2 le repertoire alloue nait SOUS la racine d'extraction passee",
+              any(p == f"scan-profile-{prof_mod.SYNTHETIC_DAY}-"
+                  and os.path.normcase(os.path.dirname(path)) == os.path.normcase(root2)
+                  for p, path in made), (made, root2))
+        check("P2 LA PIN — le voisin preexistant (nom jour+PID de l'ancienne regle) survit",
+              os.path.isfile(os.path.join(victim2, "keep.txt")), sorted(os.listdir(root2)))
+        check("P2 le repertoire alloue est nettoye, la racine ne garde que le voisin",
+              res2.get("cleaned") is True
+              and sorted(os.listdir(root2)) == [os.path.basename(victim2)],
+              (res2.get("cleaned"), sorted(os.listdir(root2))))
+
+        # Le meme voisin quand l'extraction ECHOUE : `pp` devient un lecteur qui
+        # leve, et le finally ne doit toujours toucher que le repertoire alloue.
+        root3 = os.path.join(tmp, "wp3")
+        os.makedirs(root3)
+        victim3 = victim_in(root3)
+        real_load = prof_mod._load
+
+        class _Boom:
+            @staticmethod
+            def read_members(*a, **k):
+                raise OSError("extraction simulee en echec")
+
+        def load_boom(name, relpath):
+            return _Boom if name == "pp" else real_load(name, relpath)
+
+        prof_mod._load = load_boom
+        try:
+            out3 = prof_mod.profile(prof_ns(root3))
+        finally:
+            prof_mod._load = real_load
+        rc3, res3 = out3 if isinstance(out3, tuple) else (out3, {})
+        check("P2 echec d'extraction : rc=2 (refus, pas un profil)", rc3 == 2, (rc3, res3))
+        check("P2 echec d'extraction : le voisin survit, rien d'autre ne reste",
+              os.path.isfile(os.path.join(victim3, "keep.txt"))
+              and sorted(os.listdir(root3)) == [os.path.basename(victim3)]
+              and res3.get("cleaned") is True,
+              (res3.get("cleaned"), sorted(os.listdir(root3))))
+
+        print("A14 — #1195 : le prechauffage de la premiere ouverture — branche, "
+              "dit, et aucun chiffre ne bouge")
+        work14 = os.path.join(tmp, "w14")
+        os.makedirs(work14)
+        root14 = build(tmp, n=3, name="corpus14")
+        ser_off = os.path.join(work14, "off.json")
+        ser_on = os.path.join(work14, "on.json")
+        ser_dflt = os.path.join(work14, "default.json")
+        off = read_day(root14, ser_off, work14, "--warm-pool", "0")
+        on = read_day(root14, ser_on, work14, "--warm-pool", "8")
+        dflt = read_day(root14, ser_dflt, work14)
+        check("A14 --warm-pool 0 : rc=0", off.returncode == 0, off.stderr[-400:])
+        check("A14 --warm-pool 8 : rc=0", on.returncode == 0, on.stderr[-400:])
+        check("A14 sans drapeau : rc=0 (le prechauffage est le defaut)",
+              dflt.returncode == 0, dflt.stderr[-400:])
+        check("A14 : le prechauffage est DIT — fichiers ouverts, pool nomme",
+              "prechauffe en" in on.stderr
+              and "fichier(s) ouvert(s) une premiere fois par 8 fils" in on.stderr,
+              on.stderr[-500:])
+        check("A14 : sans drapeau, il tourne aussi (defaut arme)",
+              "prechauffe en" in dflt.stderr, dflt.stderr[-400:])
+        check("A14 : --warm-pool 0 le dit et n'ouvre rien",
+              "prechauffage desactive" in off.stderr, off.stderr[-400:])
+        check("A14 : le compte annonce n'est pas zero (il a bien ouvert)",
+              "prechauffe en" in on.stderr
+              and "0 fichier(s) ouvert(s)" not in on.stderr, on.stderr[-400:])
+        r_off, _ = row_of(ser_off)
+        r_on, _ = row_of(ser_on)
+        r_dflt, _ = row_of(ser_dflt)
+
+        def no_arch(r):
+            return {k: v for k, v in (r or {}).items() if k != "archive"}
+
+        check("A14 : MEME ligne hors bloc archive (aucun decompte ne bouge)",
+              no_arch(r_off) and no_arch(r_off) == no_arch(r_on) == no_arch(r_dflt),
+              (no_arch(r_off), no_arch(r_on)))
+
+        def arch_prov(r):
+            a = dict((r or {}).get("archive") or {})
+            a.pop("read_at", None)
+            a.pop("seconds", None)
+            return a
+
+        check("A14 : meme provenance (fichiers, membres, octets declares) hors "
+              "champs volatiles",
+              arch_prov(r_off) == arch_prov(r_on) == arch_prov(r_dflt),
+              (arch_prov(r_off), arch_prov(r_on)))
+        secs_on = (r_on or {}).get("archive", {}).get("seconds") or {}
+        check("A14 : `seconds` porte extract + warm + scan (cle additive)",
+              set(secs_on) == {"extract", "warm", "scan"}, secs_on)
+        secs_off = (r_off or {}).get("archive", {}).get("seconds") or {}
+        check("A14 : warm=0 quand c'est desactive", secs_off.get("warm") == 0.0,
+              secs_off)
+
+        print("A15 — #1195 : l'ORDRE (prechauffer AVANT le scan) et la GARDE (un "
+              "prechauffage qui leve ne tue pas la lecture) — en processus, par main()")
+        import contextlib
+        import io
+
+        tc15 = _load("tc_warm_order", "traffic-consumption.py")
+        real_pp15 = tc15._load_partial_parts()
+        real_collect15 = tc15.collect
+        events = []
+
+        def spy_collect(*a, **k):
+            events.append("collect")
+            return real_collect15(*a, **k)
+
+        class WarmSpy:
+            """Delegue tout a partial_parts sauf la PREPARATION et l'ouverture,
+            observees toutes deux (review ai-01 25/11 : desactive = ni l'une ni
+            l'autre ; une preparation qui leve ne tue pas le scan)."""
+            def __init__(self, real, raise_it=False, raise_prep=False):
+                self._real = real
+                self._raise = raise_it
+                self._raise_prep = raise_prep
+                self.count = None
+                self.prepared = 0
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def warm_candidates(self, dest):
+                self.prepared += 1
+                if self._raise_prep:
+                    raise RuntimeError("prep boom (pin A15)")
+                return self._real.warm_candidates(dest)
+
+            def warm_first_open(self, paths, workers=8):
+                if self._raise:
+                    raise RuntimeError("warm boom (pin A15)")
+                self.count = len(paths)
+                events.append("warm")
+                return self._real.warm_first_open(paths, workers)
+
+        work15 = os.path.join(tmp, "w15")
+        os.makedirs(work15)
+        root15 = build(tmp, n=2, name="corpus15")
+        argv_backup15 = sys.argv
+        tc15.collect = spy_collect
+
+        def drive(series, spy, warm="8"):
+            tc15._load_partial_parts = lambda: spy
+            events.clear()
+            buf = io.StringIO()
+            sys.argv = ["traffic-consumption.py",
+                        "--reconcile-dir", os.path.join(work15, "no-reconcile"),
+                        "--series-file", series, "--extract-root", work15,
+                        "--dir", root15, "--from-archive", DAY, "--json",
+                        "--warm-pool", warm]
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    rc = tc15.main()
+            finally:
+                sys.argv = argv_backup15
+            return rc, buf.getvalue()
+
+        ser15 = os.path.join(work15, "series.json")
+        spy = WarmSpy(real_pp15)
+        rc15, out15 = drive(ser15, spy)
+        tc15.collect = real_collect15
+        check("A15 : rc=0", rc15 == 0, out15[-400:])
+        check("A15 : le prechauffage PRECEDE le scan (l'ordre est le changement)",
+              events == ["warm", "collect"], events)
+        r15, _ = row_of(ser15)
+        check("A15 : il ouvre exactement les membres que la ligne declare",
+              spy.count == (r15 or {}).get("archive", {}).get("members"),
+              (spy.count, (r15 or {}).get("archive", {}).get("members")))
+
+        ser15b = os.path.join(work15, "series-b.json")
+        spy_b = WarmSpy(real_pp15, raise_it=True)
+        tc15.collect = spy_collect
+        rc15b, out15b = drive(ser15b, spy_b)
+        tc15.collect = real_collect15
+        check("A15 : un prechauffage qui LEVE ne tue pas la lecture (rc=0)", rc15b == 0,
+              out15b[-500:])
+        check("A15 : ... et il le DIT", "prechauffage abandonne" in out15b,
+              out15b[-500:])
+        r15b, _ = row_of(ser15b)
+        check("A15 : la ligne du jour est ecrite quand meme", r15b is not None, ser15b)
+        check("A15 : le scan a bien tourne apres l'echec", "collect" in events, events)
+
+        # A15c — DESACTIVE = INERTE (review ai-01 25/11, reserve 7161871992) :
+        # le defaut releve etait une enumeration faite AVANT la garde, donc
+        # payee et chronometree meme a l'arret. Ici : aucune preparation, aucune
+        # ouverture, `warm` exactement 0 — sinon « off » n'est pas la serie.
+        ser15c = os.path.join(work15, "series-off.json")
+        spy_off = WarmSpy(real_pp15)
+        tc15.collect = spy_collect
+        rc15c, out15c = drive(ser15c, spy_off, warm="0")
+        tc15.collect = real_collect15
+        check("A15c : --warm-pool 0 : rc=0", rc15c == 0, out15c[-400:])
+        check("A15c : desactive, la PREPARATION n'est jamais entree",
+              spy_off.prepared == 0, spy_off.prepared)
+        check("A15c : desactive, aucune ouverture n'est tentee",
+              spy_off.count is None, spy_off.count)
+        check("A15c : desactive, seul le scan tourne", events == ["collect"], events)
+        r15c, _ = row_of(ser15c)
+        secs15c = (r15c or {}).get("archive", {}).get("seconds") or {}
+        check("A15c : desactive, `seconds.warm` est exactement 0",
+              secs15c.get("warm") == 0.0, secs15c)
+        check("A15c : desactive, le scan garde SA duree (cle `scan` presente)",
+              isinstance(secs15c.get("scan"), float), secs15c)
+        check("A15c : ... et il le dit", "prechauffage desactive" in out15c,
+              out15c[-300:])
+
+        # A15d — une PREPARATION qui LEVE ne tue pas le scan : l'enumeration
+        # vivait hors de la garde (defaut releve) — une racine illisible aurait
+        # emporte la lecture entiere.
+        ser15d = os.path.join(work15, "series-prep.json")
+        spy_prep = WarmSpy(real_pp15, raise_prep=True)
+        tc15.collect = spy_collect
+        rc15d, out15d = drive(ser15d, spy_prep)
+        tc15.collect = real_collect15
+        check("A15d : une preparation qui LEVE ne tue pas la lecture (rc=0)",
+              rc15d == 0, out15d[-500:])
+        check("A15d : ... et elle le DIT", "prechauffage abandonne" in out15d,
+              out15d[-500:])
+        check("A15d : la ligne du jour est ecrite quand meme",
+              row_of(ser15d)[0] is not None, ser15d)
+        check("A15d : le scan a tourne apres l'echec de preparation",
+              events == ["collect"], events)
+
+        print("A16 — #1195 : la borne du pool est REFUSEE hors plage (bornee, pas subie)")
+        work16 = os.path.join(tmp, "w16")
+        os.makedirs(work16)
+        root16 = build(tmp, n=2, name="corpus16")
+        over_s = os.path.join(work16, "over.json")
+        neg_s = os.path.join(work16, "neg.json")
+        at_s = os.path.join(work16, "at.json")
+        cap = real_pp15.WARM_POOL_MAX
+        over = read_day(root16, over_s, work16, "--warm-pool", str(cap + 1))
+        neg = read_day(root16, neg_s, work16, "--warm-pool", "-1")
+        at = read_day(root16, at_s, work16, "--warm-pool", str(cap))
+        check("A16 : au-dela de la borne : rc=2, la borne est nommee",
+              over.returncode == 2 and f"0..{cap}" in over.stderr,
+              (over.returncode, over.stderr[-400:]))
+        check("A16 : negatif : rc=2, la borne est nommee",
+              neg.returncode == 2 and f"0..{cap}" in neg.stderr,
+              (neg.returncode, neg.stderr[-400:]))
+        check("A16 : la borne elle-meme passe (rc=0)", at.returncode == 0,
+              at.stderr[-400:])
+        check("A16 : un refus de borne n'ecrit AUCUNE serie",
+              not os.path.exists(over_s) and not os.path.exists(neg_s),
+              (os.path.exists(over_s), os.path.exists(neg_s)))
+        check("A16 : a la borne, la ligne annonce le pool borne",
+              row_of(at_s)[0] is not None and "prechauffe en" in at.stderr
+              and f"par {cap} fils" in at.stderr, at.stderr[-400:])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

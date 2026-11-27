@@ -24,7 +24,12 @@ returns pure noise — measured 2026-10-25, where a 24 h join across
 have no `[ttft]`" (real figure on one process: 0.3 %) and a false served-model
 split. Sizes come from the captures, which are per-request files: no ordinal, no
 restart sensitivity. If you need SERVED attribution, anchor the log window at the
-container start and assert `max(reqN) == count([Request])` before publishing.
+container start and assert `max(reqN) == count([Request])` before publishing — and
+NOT on a relay seat: since 2026-11-25 a RELAYED request takes a request number too
+(relay.ts `assignRequestNumber`, so its `[ttft]` line keys to its own request)
+while emitting no `[Request]` line, so `max(reqN)` there counts committed forwards
+(plus any locally served turn) and never equals `count([Request])` — that assertion
+refuses by design.
 
 Usage:
     python scripts/prompt-size-dist.py                          # all roles, all time
@@ -34,8 +39,20 @@ Usage:
     python scripts/prompt-size-dist.py --role haiku --per-machine
     python scripts/prompt-size-dist.py --bpt 4.0 --captures /captures
 
-Windows are compared on the capture `ts` string's first 16 chars, so both
-`2026-10-26T09:00` and `2026-10-26T09:00:00Z` work; `--until` is exclusive.
+Windows are compared on the capture `ts` string's first 16 chars, i.e. they are
+MINUTE-wide: `2026-10-26T09:00` and `2026-10-26T09:00:00Z` are the same bound, and
+`--until` is exclusive at the minute. Accepted spellings: `YYYY-MM-DD` (midnight),
+`YYYY-MM-DDTHH`, `YYYY-MM-DDTHH:MM`, and the same with seconds / a fraction and an
+optional `Z`, in colons or in the captures' own dashes. Sub-minute digits are read
+as their minute, and that reading is printed once on stderr.
+
+A BOUND IS UNDERSTOOD OR THE RUN REFUSES. One that matches none of those spellings
+raises with a message instead of being dropped: `--since 2026-10-26` (date only)
+used to normalise to None, so the run went UNBOUNDED and answered on the whole
+corpus while the caller believed the window applied (measured 2026-11-27: 4 of 4
+captures selected where 3 were asked, the window echoed as `- .. (now]`). The
+date-only and date-hour spellings now resolve (midnight, the hour); an impossible
+date refuses instead of selecting nothing.
 
 WINDOW FILTERING HAPPENS ON THE FILENAME
 ---------------------------------------
@@ -67,6 +84,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 
 DEFAULT_CAPTURES = os.environ.get("CLAUDISH_CAPTURE_HOST_DIR") or r"D:\claudish-captures"
 DEFAULT_BPT = 3.75
@@ -101,6 +119,40 @@ def norm_ts(value):
         return None
     m = TS_KEY.match(value.strip())
     return f"{m.group(1)}T{m.group(2)}:{m.group(3)}" if m else None
+
+
+# Accepted CLI bound spellings, each resolved to the minute key the window
+# compares (module docstring: a bound is UNDERSTOOD or the run refuses).
+BOUND_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2})(?:[-:](\d{2})(?:[-:](\d{2})(?:[.-](\d+))?)?)?)?Z?$")
+
+
+def bound_key(text, flag):
+    """`--since`/`--until` -> minute key; SystemExit when it cannot be read.
+
+    Every spelling the window read before keeps its key. The date-only and
+    date-hour spellings resolve now instead of becoming None — a None bound
+    bounded nothing, silently. Sub-minute digits keep their documented reading
+    (the minute), but the reading is no longer tacit: one stderr line names it.
+    """
+    if not text:
+        return None
+    m = BOUND_RE.match(text.strip())
+    if not m:
+        raise SystemExit(
+            f"{flag} {text!r}: expected YYYY-MM-DD, YYYY-MM-DDTHH or "
+            "YYYY-MM-DDTHH:MM (optional Z; the window is minute-wide)")
+    date, hh, mm, ss, frac = m.groups()
+    hh, mm = hh or "00", mm or "00"
+    key = f"{date}T{hh}:{mm}"
+    try:
+        datetime.strptime(key, "%Y-%m-%dT%H:%M")
+    except ValueError:
+        raise SystemExit(f"{flag} {text!r}: not a calendar date/time")
+    if (ss and ss != "00") or (frac and int(frac) != 0):
+        print(f"note: {flag} {text.strip()!r} carries sub-minute digits; "
+              f"the window is minute-wide and reads it as {key}", file=sys.stderr)
+    return key
 
 
 def name_ts(name):
@@ -161,8 +213,10 @@ def main(argv=None):
                     help=f"capture directory (default: {DEFAULT_CAPTURES})")
     ap.add_argument("--role", default=None,
                     help="substring match on the requested model (role alias or family), e.g. haiku")
-    ap.add_argument("--since", default=None, help="inclusive lower bound, e.g. 2026-10-26T09:00")
-    ap.add_argument("--until", default=None, help="exclusive upper bound")
+    ap.add_argument("--since", default=None,
+                    help="inclusive lower bound, e.g. 2026-10-26T09:00 (minute-wide, optional Z); "
+                         "an unreadable spelling refuses the run")
+    ap.add_argument("--until", default=None, help="exclusive upper bound, same spellings")
     ap.add_argument("--bpt", type=float, default=DEFAULT_BPT,
                     help=f"bytes per token (default {DEFAULT_BPT})")
     ap.add_argument("--per-machine", action="store_true",
@@ -170,7 +224,7 @@ def main(argv=None):
     ap.add_argument("--top", type=int, default=12, help="max machines listed (default 12)")
     args = ap.parse_args(argv)
 
-    since, until = norm_ts(args.since), norm_ts(args.until)
+    since, until = bound_key(args.since, "--since"), bound_key(args.until, "--until")
     if not os.path.isdir(args.captures):
         print(f"capture directory not found: {args.captures}", file=sys.stderr)
         return 2

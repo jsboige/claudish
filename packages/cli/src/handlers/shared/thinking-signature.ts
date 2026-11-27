@@ -23,10 +23,10 @@
  *
  * This helper removes thinking blocks whose signature is missing, null or
  * empty — plus, when the caller opts in on the native wire, blocks carrying a
- * foreign 64-hex digest (#597). Genuine Anthropic thinking blocks carry a real
- * base64 signature and are preserved — they are required for
- * interleaved-thinking / tool-use continuity. Other block types (text, tool_use,
- * tool_result, redacted_thinking, …) are untouched.
+ * foreign 64-hex digest (#597) or a Claudish-carried marker (#1208). Genuine
+ * Anthropic thinking blocks carry a real base64 signature and are preserved —
+ * they are required for interleaved-thinking / tool-use continuity. Other block
+ * types (text, tool_use, tool_result, redacted_thinking, …) are untouched.
  *
  * ─── Why absent-signature is the whole problem, not part of it ──────────────
  *
@@ -85,19 +85,51 @@ export function isHex64Signature(signature: unknown): boolean {
 }
 
 /**
+ * Namespace marking a signature Claudish CARRIES for another wire (#1208).
+ *
+ * The Codex lane asks OpenAI for `reasoning.encrypted_content` (it sends
+ * `store: false`, so the reasoning is the client's to replay), and an
+ * Anthropic-shaped `thinking` block is the only shape Claude Code echoes back
+ * verbatim. The blob therefore has to ride in `signature` — and a NON-EMPTY
+ * foreign signature is exactly what the native path cannot tell apart from a
+ * genuine one: the predicate below strips absent/null/empty always and 64-hex
+ * under the opt-in, NOTHING else, so an opaque base64 blob would be forwarded
+ * to api.anthropic.com and 400 the request. No shape test can close that —
+ * Anthropic's own signatures are opaque base64 (the premise of
+ * `HEX_64_SIGNATURE` above), and "not base64" would delete real thinking.
+ *
+ * So the carrier is MARKED, never guessed. `:` is outside every base64
+ * alphabet (standard, URL-safe and unpadded alike), so no base64 value can
+ * carry this prefix: on that premise an Anthropic signature cannot collide
+ * with it, nor can a MiniMax digest. The `:` of the version segment is the
+ * load-bearing character — `-` is not, it belongs to the URL-safe alphabet.
+ * Presence of the marker is the whole verdict.
+ */
+export const CARRIED_SIGNATURE_PREFIX = "claudish-carried:v1:";
+
+/** True when `signature` is a Claudish-carried payload (#1208), not a model's. */
+export function isCarriedSignature(signature: unknown): boolean {
+  return typeof signature === "string" && signature.startsWith(CARRIED_SIGNATURE_PREFIX);
+}
+
+/**
  * True when this block is a thinking block Anthropic cannot have signed.
  *
  * An ABSENT, NULL or EMPTY signature always counts. A NON-EMPTY signature is
  * left alone unless `stripForeignHex` is set — see the gap described above;
  * guessing which non-empty signatures are genuine is how you delete real
- * thinking, so the wire has to say so explicitly.
+ * thinking, so the wire has to say so explicitly. Under that opt-in two
+ * non-empty shapes count: a 64-hex foreign digest (#597) and a Claudish-carried
+ * marker (#1208). The marker is the one non-empty signature we can classify
+ * without guessing, which is why the carrier is namespaced rather than opaque.
  */
 function isStrippableThinking(block: unknown, stripForeignHex: boolean): boolean {
   if (!block || typeof block !== "object") return false;
   const b = block as { type?: unknown; signature?: unknown };
   if (b.type !== "thinking") return false;
   if (typeof b.signature !== "string" || b.signature.length === 0) return true;
-  return stripForeignHex && isHex64Signature(b.signature);
+  if (!stripForeignHex) return false;
+  return isCarriedSignature(b.signature) || isHex64Signature(b.signature);
 }
 
 export interface StripThinkingOptions {
@@ -105,6 +137,11 @@ export interface StripThinkingOptions {
    * NATIVE PATH ONLY (#597): also remove thinking blocks whose signature is a
    * foreign 64-hex digest. Opt-in per wire — on a MiniMax lane the same shape is
    * the model's own thinking and the `forced` chain cannot restart without it.
+   *
+   * This opt-in also governs the Claudish-carried marker (#1208): a carried
+   * block is replay material for the Codex lane and must SURVIVE a composed
+   * path, while it can only 400 on the native one. Same reasoning as the digest
+   * — the discrimination is by wire, which is why one flag covers both.
    */
   stripForeignHexSignature?: boolean;
 }
@@ -113,8 +150,9 @@ export interface StripThinkingOptions {
  * Remove unsigned thinking blocks from a message array, IN PLACE.
  *
  * `options.stripForeignHexSignature` also removes blocks whose signature is a
- * foreign 64-hex digest; only the native handler sets it (#597). Default off, so
- * a caller that never considered the question keeps the conservative behaviour.
+ * foreign 64-hex digest or a Claudish-carried marker (#1208); only the native
+ * handler sets it (#597). Default off, so a caller that never considered the
+ * question keeps the conservative behaviour.
  *
  * In place because the caller is about to serialize this exact payload, and a
  * copy would have to be threaded back through every branch that touches

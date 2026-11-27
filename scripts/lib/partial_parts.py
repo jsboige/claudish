@@ -13,7 +13,7 @@ d'un jour porte par des parties ne sont plus sur disque. Ce module rend
 l'undercount EXPLICITE — meme doctrine que l'angle mort AUTONOMOUS (#933,
 lib/blind_spot.py) : la formulation nomme l'INCONNU, jamais « pas de trafic ».
 
-Deux services, deux audiences (AC 2 / AC 4 de la decision) :
+Trois services (AC 2 / AC 4 de la decision, plus le prechauffage #1195) :
 
   PARTIAL   — declaration declarative pour le lecteur qui n'ouvre PAS les
               parties (traffic-consumption, billed-attrib) : une ligne qui
@@ -22,6 +22,15 @@ Deux services, deux audiences (AC 2 / AC 4 de la decision) :
   read_members() — extraction py7zr pour le lecteur qui doit etre EXACT
               (native-consumption --leak-policy, AC 4 : verdict identique
               avant/apres packing sur un jour rejoue).
+  warm_candidates() — la PREPARATION du prechauffage (#1195) : les fichiers
+              extraits a ouvrir, tries. L'appelant ne l'entre QUE prechauffage
+              arme — desactive, rien n'est liste ni compte.
+  warm_first_open() — prechauffage de la PREMIERE OUVERTURE des fichiers
+              extraits (#1195) : une ouverture par fichier, `workers` fils a
+              la fois, borne a WARM_POOL_MAX — l'attente a la premiere
+              ouverture d'un fichier fraichement extrait ne parallelise pas
+              dans le fil de l'appelant (mesure du 25/11 : 62,12 -> 8,41 ms
+              par fichier).
 
 Semantique de fenetre : le NOM d'une partie porte son jour et l'heure de sa
 passe, pas l'etendue de son contenu (bornes = passe - W .. passe, non
@@ -208,3 +217,161 @@ def read_members(paths, dest, keep=None):
         for fn in files:
             out.append(os.path.join(root, fn))
     return out
+
+
+# ---------------------------------------------------------------------------
+# #1195 — prechauffage de la PREMIERE OUVERTURE des fichiers extraits
+# ---------------------------------------------------------------------------
+
+# Ce que le prechauffage lit : les octets qu'un lecteur d'archives garde d'une
+# reponse (traffic-consumption.py : HEAD_BYTES 200 000 + TAIL_BYTES 100 000),
+# et l'acces exact que la mesure du 25/11 a chronometre. Changer cette valeur
+# change ce qui a ete mesure — re-mesurer alors (pin : test_partial_parts.py).
+WARM_READ_BYTES = 300_000
+WARM_POOL = 8
+# Borne EXPLICITE du pool (review ai-01 25/11, reserve 7161871992) : le
+# prechauffage divise une attente PAR FICHIER, il n'ouvre pas le corpus a un
+# fil par fichier. Meme raison que DEFAULT_HEAD_WORKERS de blind_spot (#997),
+# mais ici la borne s'APPLIQUE : le CLI refuse hors [0, WARM_POOL_MAX] et
+# l'executeur borne de son cote (bound_workers), pour un appelant qui ne
+# passe pas par argparse. 32 = 4x le pool mesure ; le gain au-dela de 8 n'est
+# pas mesure.
+WARM_POOL_MAX = 32
+
+
+def bound_workers(workers):
+    """Fils effectifs du pool de prechauffage -> 1 (serie sur le fil de
+    l'appelant) pour 0, un negatif ou une valeur non entiere ; sinon
+    `workers`, jamais au-dessus de WARM_POOL_MAX."""
+    try:
+        n = int(workers)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(n, WARM_POOL_MAX))
+
+
+def warm_candidates(dest):
+    """PREPARATION du prechauffage -> les fichiers DIRECTS de `dest`, tries
+    (les membres extraits sont plats ; un sous-dossier n'est pas un membre).
+    Une racine illisible leve — l'appelant la garde, et il n'entre ici QUE
+    prechauffage arme : desactive, rien n'est liste, ni trie, ni compte."""
+    return [os.path.join(dest, fn) for fn in sorted(os.listdir(dest))
+            if os.path.isfile(os.path.join(dest, fn))]
+
+
+def _touch(path):
+    """Ouvre `path` une premiere fois et lit sa tete -> octets lus."""
+    with open(path, "rb") as fh:
+        return len(fh.read(WARM_READ_BYTES))
+
+
+def warm_first_open(paths, workers=WARM_POOL):
+    """Ouvre chaque fichier de `paths` UNE fois, `workers` fils a la fois ->
+    nombre de fichiers ouverts. Une erreur d'ouverture ne leve pas : le
+    fichier est saute et n'est pas compte (le lecteur le retrouvera et
+    appliquera SA politique).
+
+    Mesure du 25/11 (2 000 membres REELS d'un jour du hub, tir en creux) : la
+    premiere ouverture d'un fichier fraichement extrait coute 62,12 ms en
+    serie (124,24 s d'horloge pour 0,86 s de CPU du processus — 0,7 %) et
+    8,41 ms par un pool de 8 fils (x7,4) ; une fois les fichiers ouverts, la
+    passe du lecteur tourne a 0,9 ms par reponse sur son propre CPU.
+
+    Ce n'est pas une lecture : aucun octet n'est garde ni analyse, aucun
+    decompte ne bouge — l'appelant relit chaque fichier avec ses regles.
+    `workers` <= 1 : tout sur le fil de l'appelant — le chiffre en serie, et
+    l'interrupteur.
+
+    paths : chemins (str). workers : fils, bornes par bound_workers() a
+    [1, WARM_POOL_MAX] ; <= 1 = aucun pool.
+    """
+    workers = bound_workers(workers)
+    if workers <= 1:
+        n = 0
+        for p in paths:
+            try:
+                _touch(p)
+                n += 1
+            except OSError:
+                pass
+        return n
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(path):
+        try:
+            _touch(path)
+            return 1
+        except OSError:
+            return 0
+
+    with ThreadPoolExecutor(workers) as ex:
+        return sum(ex.map(one, paths))
+
+
+def imap_pooled(items, fn, workers=WARM_POOL, window=None):
+    """Applique `fn` a chaque element par un pool de `workers` fils, et REND
+    `(index, valeur, exception)` DANS L'ORDRE d'entree.
+
+    `warm_first_open` divise l'attente d'une PREMIERE ouverture ; celle-ci
+    divise la meme attente la ou le travail de l'appelant la REPAIE. Mesure du
+    26/11 (tir du creux, jour 2026-11-23, 135 054 membres) : la prechauffe en
+    pool de 8 coute 8,34 ms par fichier, puis le scan repaie 57,4 ms par membre
+    en ouvrant chaque fichier en serie — le benefice de #1197 s'arretait a
+    l'ouverture. Le cout est de l'ATTENTE par fichier (P : 55,65 ms en serie
+    pour 0,86 s de CPU), pas du calcul : la paralleliser ne change aucun
+    decompte, l'agregation de l'appelant reste sequentielle et dans l'ordre.
+
+    BORNE EN VOL (`window`, defaut 32 x workers) : un corpus de 135 054
+    fichiers ne tient pas en memoire, et un pool qui soumettrait tout d'abord
+    garderait tout. Le generateur ne soumet un element qu'en consommant les
+    precedents.
+
+    Une exception de `fn` n'est JAMAIS levee ici : elle est rendue avec son
+    element, et l'appelant applique SA politique (sauter, relayer, compter).
+    `workers` <= 1 : tout sur le fil de l'appelant, sans pool ni fenetre —
+    l'interrupteur, et le chiffre de reference.
+    """
+    workers = bound_workers(workers)
+    if workers <= 1:
+        for i, item in enumerate(items):
+            try:
+                yield i, fn(item), None
+            except Exception as exc:  # noqa: BLE001 — rendue, pas avalee
+                yield i, None, exc
+        return
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        in_flight = max(1, int(window)) if window else workers * 32
+    except (TypeError, ValueError):
+        in_flight = workers * 32
+    source = iter(enumerate(items))
+    pending = deque()
+    ex = ThreadPoolExecutor(workers)
+    try:
+        def fill():
+            """Soumet jusqu'a `in_flight` elements -> False quand la source est epuisee."""
+            while len(pending) < in_flight:
+                try:
+                    i, item = next(source)
+                except StopIteration:
+                    return False
+                pending.append((i, ex.submit(fn, item)))
+            return True
+
+        drained = not fill()
+        while pending:
+            i, fut = pending.popleft()
+            try:
+                value, exc = fut.result(), None
+            except Exception as error:  # noqa: BLE001 — rendue a l'appelant
+                value, exc = None, error
+            yield i, value, exc
+            if not drained:
+                drained = not fill()
+    finally:
+        # Fermeture anticipee (l'appelant s'arrete avant la fin) : on n'attend
+        # pas les elements en vol, ils ne serviraient a rien — mais on ne les
+        # laisse pas non plus ecrire dans un generateur mort.
+        ex.shutdown(wait=False, cancel_futures=True)

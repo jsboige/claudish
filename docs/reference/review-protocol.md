@@ -137,6 +137,12 @@ Merge in the order of the stack and re-measure the next PR's perimeter: after #1
 
 **Apply.** Mutate with an exact-replacement script that counts the occurrences of its target and refuses (non-zero exit) unless there is exactly one, then prints `applied <name>`; read and write with `newline=""` so line endings are untouched. Never `sed -i` with a regex pattern for a mutation, never an inline one-liner carrying quotes or backslashes. Read both lines in the output: `applied …`, then the expected red with the test's name. A green after `applied` is a real result (the guard is not covered); a green without it is not a result. Restore from a copy, check the hash, and confirm `git status --short` is empty. Give a reviewing sub-agent the same instruction in its brief.
 
+### A mutant that does not compile tests nothing — in either direction
+
+**Why.** On 2026-11-25, on PR #1197, a pass of 14 mutants reported one "SURVIVED". The mutation that removes the `try/except` around the warm-up had been written as a deleted `try:` line, which left the guarded body one level over-indented. Python could not import the file (`IndentationError`), so the red was not the pin's; the driver — rightly refusing to call a red without the pin's name a kill — recorded a survival that said nothing about the guard. Re-written as a dedent, the same mutant was killed by the expected pin. Read the other way — "it went red, so the pin works" — the same broken file would have proven a pin that was never run.
+
+**Apply.** Compile each mutant (`compile(text, name, "exec")`) before any test runs, and record one that does not compile as a driver error — never as a kill, never as a survival. A removed guard is a dedent, not only a deleted line: build the replacement by taking one indentation level off the block. Dry-check the whole list first (anchor found exactly once, mutant compiles), and run the pass on an unmutated control — both suites green, or no verdict may be read from it. When the tree is deliberately dirty (the fix is still uncommitted), the invariant at the end is "identical to before the pass" — status lines and the hash of each mutated file — not "clean".
+
 ### Replay the whole mutation pass after adding an exception
 
 **Why.** On 2026-11-09 #953 added a tolerated "truncated window" case; replaying all mutations, the old `string-key` mutation survived because the pairing test's request was also the first of its corpus, so its now-unmatched response fell into the new tolerated window and the verdict passed anyway. The fix was an anchor request much earlier in the corpus, plus `assert "Fenetre tronquee" not in out`.
@@ -237,6 +243,7 @@ Merge in the order of the stack and re-measure the next PR's perimeter: after #1
 | Test the branch the first deployment meets | `first-deploy-probe-reads-the-old-image` | 03/10/2026 |
 | Mutate transported guards and promised mutations | `behavior-identical-extraction-hides-unpinned-guards` · `a-noop-fix-can-carry-a-false-claim` | 29/09/2026 · 24/10/2026 · 27/10/2026 |
 | A mutation counts only if it proves it applied | `a-mutation-must-prove-it-applied` | 13/11/2026 |
+| A mutant that does not compile tests nothing | `a-mutant-that-does-not-compile-tests-nothing` | 25/11/2026 |
 | Replay the whole mutation pass after an exception | `an-exception-path-can-mask-an-existing-guard` | 09/11/2026 |
 | A strict guard and the residue of its kill | `a-correct-guard-can-make-a-transient-failure-permanent` | 22/09/2026 |
 | Every commit goes through every gate | no note: PR #1020, commits `7af5bffd` → `d92fa0f9` | 13/11/2026 |

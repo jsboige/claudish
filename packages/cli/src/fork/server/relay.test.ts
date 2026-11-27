@@ -37,6 +37,7 @@ import {
   noticeToHeaderValue,
 } from "../../handlers/shared/failover-stream-notice.js";
 import { SERVED_MODEL_HEADER } from "../../handlers/shared/served-model-header.js";
+import { requestNumberFor } from "../middleware/request-logger.js";
 
 // ── fetch mock ─────────────────────────────────────────────────────
 const realFetch = globalThis.fetch;
@@ -551,6 +552,179 @@ describe("forwardToUpstream — failover hysteresis (FAIL path)", () => {
     const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
     expect(r).toBeNull(); // still the local-replay fallthrough
     expect(state.consecutiveFail).toBe(1); // still a markFail
+  });
+
+  // ── #1213: a provider 5xx RELAYED by a live hub, marked ───────────────────
+  // Measured on myia-po-2028, 2026-11-26: one model's provider front answering
+  // 502 while the hub served every other role. The hub relays the provider's
+  // status as its own, and the relay read each one as a hub death — 32 local
+  // replays against the SAME dead provider (one client attempt = about 22 s at
+  // the hub + about 21 s on the replay), and two in a row flipped the whole
+  // seat AUTONOMOUS for 66.7 s. Same family as the 529 (#299 A) and the marked
+  // drain-freeze 503 (#318): the hub spoke, so it is liveness evidence.
+  const UPSTREAM_502_BODY = JSON.stringify({
+    type: "error",
+    error: {
+      type: "api_error",
+      message: "<!DOCTYPE html … 502 - Web server received an invalid response while acting as a gateway or proxy server …",
+    },
+  });
+  const UPSTREAM_502_HEADERS = {
+    "content-type": "application/json",
+    "x-claudish-upstream-error": "1",
+  };
+
+  it("a MARKED 502 is PASSED THROUGH (non-streaming request) — client gets 502 + body + marker, no markFail, no local replay (#1213)", async () => {
+    fetchImpl = async () => new Response(UPSTREAM_502_BODY, { status: 502, headers: UPSTREAM_502_HEADERS });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).not.toBeNull(); // non-null ⇒ forwarded to the client; null is the local-replay fallthrough
+    expect(r!.status).toBe(502);
+    expect(await r!.text()).toBe(UPSTREAM_502_BODY);
+    // The marker survives the hop (the #318 review rule): in a chain A→B→hub,
+    // this response is what relay A receives, and A is itself a relay.
+    expect(r!.headers.get("x-claudish-upstream-error")).toBe("1");
+    expect(state.consecutiveFail).toBe(0);
+    expect(state.alive).toBe(true);
+  });
+
+  it("a MARKED 502 passes through for a STREAMING request too, and two keep the relay NOMINAL (#1213 — the measured incident)", async () => {
+    fetchImpl = async () => new Response(UPSTREAM_502_BODY, { status: 502, headers: UPSTREAM_502_HEADERS });
+    const state = deadState();
+    const r1 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+    const r2 = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: true }, state);
+    for (const r of [r1, r2]) {
+      expect(r).not.toBeNull();
+      expect(r!.status).toBe(502);
+      expect(await r!.text()).toBe(UPSTREAM_502_BODY);
+      expect(r!.headers.get("x-claudish-upstream-error")).toBe("1");
+    }
+    expect(state.consecutiveFail).toBe(0); // a relayed provider error never fed the hysteresis
+    expect(state.alive).toBe(true); // still NOMINAL after two consecutive marked 502s
+  });
+
+  it("a MARKED 5xx RESETS an existing failure streak — the hub answered (#1213)", async () => {
+    fetchImpl = async () => new Response(UPSTREAM_502_BODY, { status: 502, headers: UPSTREAM_502_HEADERS });
+    const state = deadState();
+    state.consecutiveFail = 1; // one prior genuine failure
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
+    expect(r).not.toBeNull();
+    expect(state.consecutiveFail).toBe(0);
+    expect(state.alive).toBe(true);
+  });
+
+  it("an UNMARKED 502 keeps the fallthrough — the pre-#1213 behaviour, i.e. an old hub without the marker (#1213 control)", async () => {
+    fetchImpl = async () =>
+      new Response(UPSTREAM_502_BODY, { status: 502, headers: { "content-type": "application/json" } });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).toBeNull(); // still the local-replay fallthrough
+    expect(state.consecutiveFail).toBe(1); // still a markFail
+  });
+
+  it("marked, then unmarked: the marked 502 never fed the streak, so ONE unmarked failure does not flip (#1213)", async () => {
+    const state = deadState();
+    fetchImpl = async () => new Response(UPSTREAM_502_BODY, { status: 502, headers: UPSTREAM_502_HEADERS });
+    const r1 = await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
+    expect(r1).not.toBeNull();
+    expect(state.consecutiveFail).toBe(0);
+    fetchImpl = async () =>
+      new Response(UPSTREAM_502_BODY, { status: 502, headers: { "content-type": "application/json" } });
+    const r2 = await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
+    expect(r2).toBeNull();
+    expect(state.consecutiveFail).toBe(1); // the hub's OWN failure still counts
+    expect(state.alive).toBe(true); // …but the marked one did not bring it to the threshold
+  });
+
+  it("every marked 5xx status passes through — the marker, not one status, is the discriminator (#1213)", async () => {
+    for (const status of [500, 502, 503, 504]) {
+      const state = deadState();
+      fetchImpl = async () => new Response(UPSTREAM_502_BODY, { status, headers: UPSTREAM_502_HEADERS });
+      const r = await forwardToUpstream(mockForwardContext({}), { model: "m" }, state);
+      expect(r).not.toBeNull();
+      expect(r!.status).toBe(status);
+      expect(r!.headers.get("x-claudish-upstream-error")).toBe("1");
+      expect(state.consecutiveFail).toBe(0);
+    }
+  });
+
+  it("a WRONG marker value on a 502 is inert — fallthrough, and the foreign value is not relayed as if it were ours (#1213)", async () => {
+    fetchImpl = async () =>
+      new Response(UPSTREAM_502_BODY, {
+        status: 502,
+        headers: { "content-type": "application/json", "x-claudish-upstream-error": "true" },
+      });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).toBeNull();
+    expect(state.consecutiveFail).toBe(1);
+  });
+
+  it("a value that is not ours is never relayed as if it were: a passed-through 529 carrying a foreign header loses it (#1213)", async () => {
+    fetchImpl = async () =>
+      new Response(OVERLOAD_529_BODY, {
+        status: 529,
+        headers: { "content-type": "application/json", "x-claudish-upstream-error": "forged" },
+      });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r!.status).toBe(529);
+    // The rebuild carries the marker in its honoured form ONLY (5xx + our exact
+    // value): a relay must not become the speaker of someone else's string.
+    expect(r!.headers.get("x-claudish-upstream-error")).toBeNull();
+    expect(state.consecutiveFail).toBe(0);
+  });
+
+  it("a MARKED 502 writes exactly ONE countable line — the instrument that counts pass-throughs (#1213)", async () => {
+    const realConsoleLog = console.log;
+    const lines: string[] = [];
+    console.log = ((m: unknown) => {
+      lines.push(String(m));
+    }) as typeof console.log;
+    try {
+      fetchImpl = async () => new Response(UPSTREAM_502_BODY, { status: 502, headers: UPSTREAM_502_HEADERS });
+      await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, deadState());
+    } finally {
+      console.log = realConsoleLog;
+    }
+    const own = lines.filter((l) => l.includes("#1213"));
+    expect(own.length).toBe(1);
+    expect(own[0]).toContain("hub HTTP 502");
+    expect(own[0]).toContain("upstream error relayed by a live hub, marked");
+    expect(own[0]).toContain("passed through to client, no local replay");
+    // …and never the fallthrough line this one replaces.
+    expect(lines.some((l) => l.includes("served LOCALLY"))).toBe(false);
+  });
+
+  it("POSITIVE CONTROL — an UNMARKED 502 writes the fallthrough line and NO #1213 line (the instrument discriminates)", async () => {
+    const realConsoleLog = console.log;
+    const lines: string[] = [];
+    console.log = ((m: unknown) => {
+      lines.push(String(m));
+    }) as typeof console.log;
+    try {
+      fetchImpl = async () =>
+        new Response(UPSTREAM_502_BODY, { status: 502, headers: { "content-type": "application/json" } });
+      await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, deadState());
+    } finally {
+      console.log = realConsoleLog;
+    }
+    expect(lines.some((l) => l.includes("#1213"))).toBe(false);
+    expect(lines.some((l) => l.includes("hub HTTP 502") && l.includes("served LOCALLY"))).toBe(true);
+  });
+
+  it("a 4xx carrying the header stays on its ordinary 4xx path — passed through, unmarked, streak reset (#1213)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "bad" } }), {
+        status: 400,
+        headers: { "content-type": "application/json", "x-claudish-upstream-error": "1" },
+      });
+    const state = deadState();
+    const r = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    expect(r).not.toBeNull();
+    expect(r!.status).toBe(400);
+    expect(r!.headers.get("x-claudish-upstream-error")).toBeNull(); // the hub marks 5xx only
+    expect(state.consecutiveFail).toBe(0);
   });
 
   it("success resets the failure streak", async () => {
@@ -2644,6 +2818,39 @@ describe("forwardToUpstream — upstream-nonok marker (#763)", () => {
 
     expect(markers(lines).length).toBe(0);
   });
+
+  it("a MARKED 5xx keeps its own single line too (no duplicate marker — one event, one line) (#1213)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ type: "error", error: { type: "api_error" } }), {
+        status: 502,
+        headers: { "content-type": "application/json", "x-claudish-upstream-error": "1" },
+      });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const lines = await captureStderr(async () => {
+      await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    });
+
+    expect(markers(lines).length).toBe(0);
+  });
+
+  it("an UNMARKED 500 falls through before this point — no upstream-nonok line, the fallthrough line speaks (#763 control, unchanged by #1213)", async () => {
+    fetchImpl = async () =>
+      new Response(JSON.stringify({ type: "error", error: { type: "api_error" } }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+
+    const out: { res: Response | null } = { res: null };
+    const lines = await captureStderr(async () => {
+      out.res = await forwardToUpstream(mockForwardContext({}), { model: "m", stream: false }, state);
+    });
+
+    expect(out.res).toBeNull();
+    expect(markers(lines).length).toBe(0);
+    expect(state.consecutiveFail).toBe(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2865,5 +3072,72 @@ describe("#587 g1 — flip lines carry the hub's /health fields", () => {
     fetchImpl = timeout;
     expect(await heartbeat(state)).toBe(false);
     expect(failed()[0]).toMatch(/age=5\.\ds/);
+  });
+});
+
+// ── A relayed request owns its request number ──────────────────────────────
+//
+// The [ttft] marker resolves its reqN through requestNumberFor(c.req) — the
+// number keyed to the raw Request at INGESTION. logRequest was the only writer
+// of that key, and a relayed request never reaches it: every relayed [ttft]
+// resolved the GLOBAL counter instead, which no forward advances. Measured on
+// a NOMINAL sidecar (25/11, 6 h): 2 311 relayed [ttft] lines under ONE reqN.
+// traffic-live.ps1's Session Loop Check reads a reqN seen >= 6 times as a
+// stuck loop, so a healthy relay read as one.
+describe("forwardToUpstream — a relayed request owns its request number", () => {
+  /** Capture everything the process writes to stdout for the duration of `fn`. */
+  async function captureStdout(fn: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = [];
+    const realWrite = process.stdout.write.bind(process.stdout);
+    (process.stdout as any).write = (chunk: any) => {
+      lines.push(String(chunk));
+      return true;
+    };
+    try {
+      await fn();
+    } finally {
+      (process.stdout as any).write = realWrite;
+    }
+    return lines;
+  }
+
+  it("two relayed requests → two [ttft] lines with distinct, consecutive reqN, each keyed to its own request", async () => {
+    fetchImpl = async () => sseResponse(RECOVERED_SSE);
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const ctx1 = mockForwardContext({});
+    const ctx2 = mockForwardContext({});
+
+    const written = await captureStdout(async () => {
+      for (const ctx of [ctx1, ctx2]) {
+        const forwarded = await forwardToUpstream(ctx, { model: "glm-5.2" }, state);
+        await drainResponse(forwarded); // the [ttft] is written on the first forwarded data line
+      }
+    });
+
+    const ttfts = written.filter((l) => l.includes("[ttft]"));
+    expect(ttfts.length).toBe(2);
+    const reqNs = ttfts.map((l) => Number(/reqN=(\d+)/.exec(l)![1]));
+    // The defect: both lines carried the same frozen global counter.
+    expect(new Set(reqNs).size).toBe(2);
+    expect(reqNs[1]).toBe(reqNs[0]! + 1);
+    // Each request resolves to the number its own line printed — keyed per raw
+    // Request, not read back from the global counter (ctx1's is the OLDER one).
+    expect(requestNumberFor(ctx1.req.raw)).toBe(reqNs[0]!);
+    expect(requestNumberFor(ctx2.req.raw)).toBe(reqNs[1]!);
+  });
+
+  it("a fall-through takes no number here — the local serve that follows assigns the only one", async () => {
+    // Placement pin: the number is taken once the forward is COMMITTED. Taking
+    // it before the fetch would burn one on every hub 5xx / connect failure,
+    // and the local path's logRequest then hands the same request a second.
+    const before = requestNumberFor({}); // the global counter, through an unkeyed object
+    fetchImpl = async () => new Response("boom", { status: 502 });
+    const state = createRelayState({ upstream: "http://hub:3000" });
+    const ctx = mockForwardContext({});
+
+    expect(await forwardToUpstream(ctx, { model: "glm-5.2" }, state)).toBeNull();
+
+    expect(requestNumberFor({})).toBe(before); // counter untouched
+    expect(requestNumberFor(ctx.req.raw)).toBe(before); // request still unkeyed
   });
 });

@@ -16,7 +16,11 @@ import { describe, test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { stripUnsignedThinkingBlocks } from "./thinking-signature.js";
+import {
+  CARRIED_SIGNATURE_PREFIX,
+  isCarriedSignature,
+  stripUnsignedThinkingBlocks,
+} from "./thinking-signature.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -237,5 +241,146 @@ describe("stripUnsignedThinkingBlocks", () => {
     expect(stripUnsignedThinkingBlocks(null)).toBe(0);
     expect(stripUnsignedThinkingBlocks("not-an-array" as any)).toBe(0);
     expect(stripUnsignedThinkingBlocks([{ role: "assistant", content: "string-content" }])).toBe(0);
+  });
+});
+
+/**
+ * #1208 — the carried-signature namespace.
+ *
+ * The Codex lane needs OpenAI's `reasoning.encrypted_content` replayed by the
+ * client, and `signature` is the only field Claude Code echoes back verbatim
+ * inside a `thinking` block. But a NON-EMPTY unmarked blob is exactly what the
+ * native guard cannot classify (it strips absent/empty and 64-hex, nothing
+ * else), so an opaque carrier would be forwarded to api.anthropic.com and 400
+ * the request. The fence is therefore a NAMESPACE, never a shape.
+ *
+ * No writer ships with this grain: nothing builds a carried signature yet, so
+ * no lane changes behaviour. These pins hold the guard until `read`/`carry`/
+ * `replay` land.
+ */
+describe("#1208 — Claudish-carried signature", () => {
+  const NATIVE = { stripForeignHexSignature: true };
+  const carried = `${CARRIED_SIGNATURE_PREFIX}gAAAAABofQc9c3VwZXJTY3JldC1sb25nLWJsb2I`;
+
+  test("NATIVE path (#1208): a Claudish-carried signature is stripped", () => {
+    // Anthropic never issued it: forwarded, it is the same 400 as an unsigned
+    // block ("Invalid signature in thinking block"). The native handler already
+    // opts in (the #597 wiring pin above), so no call site changes.
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "Codex reasoning", signature: carried },
+          { type: "text", text: "kept" },
+        ],
+      },
+    ];
+    const removed = stripUnsignedThinkingBlocks(messages, NATIVE);
+    expect(removed).toBe(1);
+    expect(messages[0].content).toEqual([{ type: "text", text: "kept" }]);
+  });
+
+  test("DEFAULT (non-native) call KEEPS a carried signature — it is replay material on a composed path", () => {
+    // Same reasoning as the 64-hex digest: the discrimination is by WIRE. A
+    // carried block is what the Codex lane needs back; stripping it here would
+    // delete the reasoning it exists to carry.
+    const messages = [
+      { role: "assistant", content: [{ type: "thinking", thinking: "Codex reasoning", signature: carried }] },
+    ];
+    const removed = stripUnsignedThinkingBlocks(messages);
+    expect(removed).toBe(0);
+    expect(messages[0].content[0].signature).toBe(carried);
+  });
+
+  test("the marker is the whole verdict: the SAME blob is kept unmarked, stripped once marked", () => {
+    // This is the measured gap and its answer in one pair. An unmarked opaque
+    // blob survives the native guard today — the first half ASSERTS that limit
+    // (it is what the #597 "genuine base64 is KEPT" pin protects); the second
+    // half shows the marker is the only difference the guard can see.
+    const blob = "gAAAAABofQc9c3VwZXJTY3JldC1ibG9iLW5vdC1tYXJrZWQ";
+
+    const unmarked = [{ role: "assistant", content: [{ type: "thinking", thinking: "x", signature: blob }] }];
+    expect(stripUnsignedThinkingBlocks(unmarked, NATIVE)).toBe(0);
+    expect(unmarked[0].content[0].signature).toBe(blob);
+
+    const marked = [
+      { role: "assistant", content: [{ type: "thinking", thinking: "x", signature: CARRIED_SIGNATURE_PREFIX + blob }] },
+    ];
+    expect(stripUnsignedThinkingBlocks(marked, NATIVE)).toBe(1);
+    expect(marked[0].content).toEqual([]);
+  });
+
+  test("isCarriedSignature: the prefix is outside every base64 alphabet, and nothing else matches", () => {
+    const STANDARD_B64 = /^[+/=A-Za-z0-9]+$/;
+    const URL_SAFE_B64 = /^[-=A-Za-z0-9_]+$/;
+    // `:` is the load-bearing character. `-` is NOT: it belongs to the
+    // URL-safe alphabet, which is why the marker carries a version segment
+    // with a colon rather than relying on its dashes.
+    expect(CARRIED_SIGNATURE_PREFIX).toContain(":");
+    expect(STANDARD_B64.test(CARRIED_SIGNATURE_PREFIX)).toBe(false);
+    expect(URL_SAFE_B64.test(CARRIED_SIGNATURE_PREFIX)).toBe(false);
+
+    expect(isCarriedSignature(`${CARRIED_SIGNATURE_PREFIX}payload`)).toBe(true);
+    // The bare marker counts too — it is certainly not a model's signature.
+    expect(isCarriedSignature(CARRIED_SIGNATURE_PREFIX)).toBe(true);
+
+    // Everything that is not the marker at the very start, in the exact case,
+    // is left alone: no signature, a non-string, a genuine-looking Anthropic
+    // base64 blob, a MiniMax digest, a marker in the middle, another case.
+    expect(isCarriedSignature(null)).toBe(false);
+    expect(isCarriedSignature("")).toBe(false);
+    expect(isCarriedSignature(42)).toBe(false);
+    expect(
+      isCarriedSignature(
+        "ErUBCkYIBRgCKkBc3Q9nJ+7fWLx0mZr2VbT4pYs1uHk6NqR8aXe5dCg0fJm2oDl3vYw7Zt1PkQ9rS6uM4bN8xL2aE5hT0cI"
+      )
+    ).toBe(false);
+    expect(isCarriedSignature("7caa0d3cc2a449ac1cc68507504693f566245c7b5db3558f6041585e15a848f8")).toBe(false);
+    expect(isCarriedSignature(`x${CARRIED_SIGNATURE_PREFIX}payload`)).toBe(false);
+    expect(isCarriedSignature(`${CARRIED_SIGNATURE_PREFIX.toUpperCase()}payload`)).toBe(false);
+  });
+
+  test("isCarriedSignature near-misses: the version segment's `:` is load-bearing in the PREDICATE, not only in the constant", () => {
+    // Review 7211549612. The pin above checks that the CONSTANT fails both
+    // base64 alphabets; nothing checked that the PREDICATE needs the `:` —
+    // a predicate reduced to the bare literal `claudish-carried` left all of
+    // them green. Both values below start with the bare words AND are legal
+    // URL-safe base64, so a model could issue one: classifying it as carried
+    // is the exact collision the namespace exists to rule out.
+    const URL_SAFE_B64 = /^[-=A-Za-z0-9_]+$/;
+    expect(URL_SAFE_B64.test("claudish-carried-v1-payload")).toBe(true);
+    expect(URL_SAFE_B64.test("claudish-carriedv1payload")).toBe(true);
+
+    expect(isCarriedSignature("claudish-carried-v1-payload")).toBe(false);
+    expect(isCarriedSignature("claudish-carriedv1payload")).toBe(false);
+
+    // …and so the native guard leaves such a block alone, like any other
+    // opaque blob it cannot classify (the measured gap of the #597 pin).
+    const nearMiss = [
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "n", signature: "claudish-carried-v1-payload" }],
+      },
+    ];
+    expect(stripUnsignedThinkingBlocks(nearMiss, NATIVE)).toBe(0);
+    expect(nearMiss[0].content[0].signature).toBe("claudish-carried-v1-payload");
+  });
+
+  test("#1208 does not widen the native strip: a genuine signature and a foreign digest behave as under #597", () => {
+    // The carried branch is ADDED to the opt-in, it does not replace it: the
+    // digest is still stripped, the genuine signature still kept.
+    const digest = "7caa0d3cc2a449ac1cc68507504693f566245c7b5db3558f6041585e15a848f8";
+    const genuine = "ErUBCkYIBRgCKkBc3Q9nJ+7fWLx0mZr2VbT4pYs1uHk6NqR8aXe5dCg0fJm2oDl3vYw7Zt1PkQ9rS6uM4bN8xL2aE5hT0cI";
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "d", signature: digest },
+          { type: "thinking", thinking: "g", signature: genuine },
+        ],
+      },
+    ];
+    expect(stripUnsignedThinkingBlocks(messages, NATIVE)).toBe(1);
+    expect(messages[0].content).toEqual([{ type: "thinking", thinking: "g", signature: genuine }]);
   });
 });
