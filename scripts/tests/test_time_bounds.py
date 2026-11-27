@@ -129,9 +129,14 @@ def _child(tz):
     env.pop("TZ", None)
     if tz:
         env["TZ"] = tz
+    # #1186 / #1203: the reader net. The child runs with `-I`, which implies
+    # `-E` -- a PYTHONIOENCODING pin would be ignored here, so this site gets
+    # the reader half only; and the child prints ISO timestamps (ASCII), so the
+    # U+00C1 runtime pin this contract uses elsewhere has nothing to prove.
     r = subprocess.run(
         [sys.executable, "-I", "-c", _CHILD, os.path.join(_SCRIPTS, "minimax-chain-measure.py")],
-        env=env, capture_output=True, text=True, timeout=120)
+        env=env, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=120)
     check(f"child process under TZ={tz!r} ran", r.returncode == 0, (r.stderr or "")[-300:])
     buggy, fixed = r.stdout.split()
     return buggy, fixed

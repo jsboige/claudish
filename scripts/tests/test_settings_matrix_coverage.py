@@ -352,7 +352,8 @@ def test_output_names_the_date_and_the_source_it_read():
         _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
     assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
     assert "collectedAt=2026-10-31T00:00:00.000Z" in proc.stdout, proc.stdout[-800:]
