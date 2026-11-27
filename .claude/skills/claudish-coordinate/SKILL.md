@@ -192,10 +192,11 @@ représenté en Phase 6.
 
 - **Gate ex-ante** : tout geste infra ou trafic du workspace (recreate/restart, `.env`/config, routage,
   onboarding provider, probe qui consomme du budget) passe par un `[PROPOSAL]` — objectif, commandes
-  exactes, rayon d'impact, rollback, état attendu — puis attend mon `[ACK]` (il suffit, user 23/09 ; le
-  plan d'exécution reste un artefact obligatoire). **Chaque cycle : scanner et trancher les `[PROPOSAL]`
-  en attente**, par `roosync_dashboard` read, l'inbox, et `read_archive` pour toute PROPOSAL citée par un
-  `CONDENSATION-SUMMARY` ; le GDrive retarde (reference.md).
+  exactes, rayon d'impact, rollback, état attendu — puis attend mon `[ACK]` (il suffit, user 23/09 ; plan
+  d'exécution obligatoire). **Chaque cycle : scanner et trancher les `[PROPOSAL]` en attente** (dashboard,
+  inbox, `read_archive` si un `CONDENSATION-SUMMARY` en cite une ; reference.md).
+- **ACK de classe (27/11)** : cascade de rôle mandatée par le user, même image, env seul → 30 min
+  d'objection. Bornes et attente d'une PROPOSAL : reference.md.
 - **Urgence** (flotte à l'arrêt) : agir, `[INCIDENT]` + post-mortem ≤ 1 h, validation ex-post.
 - **Preuves post-restart du hub (≤ 15 min)** : la ligne `[Failover] configured=N auto=on`, `/health`,
   `test -f` sur chaque bind fichier, et le relais NOMINAL.
