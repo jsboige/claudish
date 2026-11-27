@@ -272,3 +272,37 @@ Copy-Item "$env:TEMP\pester571\*" "$env:USERPROFILE\Documents\WindowsPowerShell\
 3. Only then read the Pester failure output: `CommandNotFoundException` on `Invoke-Pester` is a load failure (1 or 2); assertion failures are the tests.
 
 A `2>&1 > file` redirect is not a capture — it sends stderr to the console and leaves the file holding stdout only. Write `> file 2>&1`.
+
+## The Python gate and the seat's own encoding (`test:scripts:py`, #1175 · #1176 · #1186 · #1199 · #1203)
+
+*Rewritten 2026-11-27 (#1192) against `main` `bb986b8a`. The regime matrix further down is kept as it was measured, dated 2026-11-24 (#1191); only what had gone false was replaced.*
+
+**The gate discovers its files — it is no longer a list.** `package.json` → `test:scripts:py` runs `python scripts/tests/run-py-tests.py`: it walks `scripts/tests/test_*.py` (`PATTERN`, sorted, the directory itself and nothing below), runs each file as its own process from the repository root — the way the seats and CI run it, which matters for the files that check at module level — and does not stop at a red file, so one pass names every red file. Its last line is the verdict: `== <N> file(s): <X> ok, <Y> failed`. A directory with no test file is refused (exit 2, `no test_*.py file under …`): an empty run is not a green run.
+
+What it replaced was a hand-kept `&&` chain in `package.json`, wrong in the quiet way: a file that exited non-zero stopped it, so every file behind it was never run; and a file nobody added to it was red in CI only. Measured 27/11 on `main` `772f9274`: **56 test files, 40 in the chain, 16 missing**, their first commits in four bursts from 10-07 to 11-22 — not one forgotten batch, a list nobody could keep. The runner discovers **62** on `bb986b8a`. `test_py_gate_runner.py` pins the four ways such a gate dies quietly: discovery equals the directory (checked against an independent listing, and never empty), `package.json` names no test file, the runner's pattern is spelled exactly as CI's walk, and the verdicts.
+
+**CI walks the same files twice.** The `scripts-tests` job (`.github/workflows/test.yml`) runs `python -m pytest scripts/tests -q` for the function-style pins, then `for f in scripts/tests/test_*.py; do python "$f" || exit 1; done` for the files that run their checks at module level with their own runner — pytest imports those and reports 0 tests, and four of them gate nothing at import time — then that same loop a second time with `PYTHONIOENCODING: cp1252` (#1199). `test_ci_walks_the_same_files` compares each walk's glob with the runner's `PATTERN`: narrowing one side alone is red.
+
+**The contract lives in the test files, never in the scripts**: a test that reads a child's output must not depend on the encoding of the seat that launched it. Two layers, each pinned separately:
+
+- **Child bytes pinned to UTF-8** — `PYTHONIOENCODING=utf-8` in the child's env, or `-X utf8` for a child that runs under `-I`, where no environment variable reaches it (#1010 form). The files that needed it also carry a literal `Á` (U+00C1) round-trip through the child, so a lost pin is a red pin and not a silent one — 8 files on `bb986b8a`;
+- **Reader always returns text** — `encoding="utf-8", errors="replace"`, and `(x or "")` on every value that used to be consumed raw.
+
+**What catches a lost layer** (read on `main` `bb986b8a`, 2026-11-27):
+
+| A lost… | Is caught by | And not by |
+| --- | --- | --- |
+| **child pin** | the **cp1252 pass**: the child inherits the runner's codec, and the U+00C1 round-trip pins go red | pytest and the default-stdio loop — a UTF-8 runner hides it |
+| **reader net** | the **static guard** `test_subprocess_encoding_contract.py` (#1203): an AST scan of every text-mode `subprocess` call under `scripts/tests`, failing on a call that lacks `encoding=` or lacks `errors=` | the cp1252 pass — the runner's own locale stays UTF-8, so its default decoding still reads the pinned bytes |
+
+The guard needs no Windows seat, and on that tree its last two lines are the census this section used to carry by hand: `scanned 63 files; 0 carry a strict or locale-dependent read`, then `OK -- every text-mode child read asks for UTF-8 text with errors=`. At #1186 that census still counted 13 strict readers (7 in four settings-matrix chain files, 6 outside the chain); #1198 took the seven, #1203 the six.
+
+- **There is NO allowlist in the guard, and one must not come back.** The first one named four files whose strict sites an unmerged PR was fixing; once that PR had merged, its entries hid a NEW strict site planted in one of those same files — measured on the #1203 review: the guard printed `EXEMPT` and exited 0. A violation is a failure, always, and the failure branch has its own self-test, because a guard that refuses nothing still passes on a clean tree.
+- **It sees literals, not values.** A `text=`/`encoding=` passed as a variable is not seen, and a call spreading `**kwargs` is skipped, never reported — a false positive would push a lane to weaken the scan. The guard proves the two keywords are asked for; the matrix below is the behavioural evidence that they suffice.
+
+**Each layer alone fails a different way** (#1191, measured 2026-11-24 — 3 files × 4 regimes, temp dir with a non-ASCII name, po-2027; the fixed branch runs 12/12): with the child pin removed, 5/12 — the reader net stops the #1175 death, but the child dies on its own non-ASCII write (R0/R2/R3: `UnicodeEncodeError`) and, where the parent's mode moves the reader but not an `-I` child (R1), the pin compares a temp PATH to mojibake; with the reader net removed, 8/12 — the text is wrong rather than missing, and the pin asserts on mojibake in the default regimes (R0/R2). Without either, on `main`, a strict decoder raises inside `subprocess`' reader thread and hands back `stdout=None` — the pin dies on `NoneType` instead of reporting itself (#1175 signature).
+
+**Regimes, and which one proves what** (#1191). R0 default · R1 `PYTHONUTF8=1` · R2 `PYTHONIOENCODING=cp1252` (the simulator) · R3 both. Control on `main` `bdcf5cdf` (po-2027, cp1252 console, 40 chain files × 4 regimes, ASCII temp): 157/160 green — R2 alone turned **no** chain file red, because on a cp1252 seat the simulator changes nothing (both sides were already wrong the same way); R1 alone turned `per_day` red; R3 turned `per_day` and `from_archive` red. On ai-01 the simulator is not a no-op: it is what turned `harness_lanes` red there (c.7131008469). So:
+
+- on a **cp1252 seat**, prove with `PYTHONUTF8=1` and with a **non-ASCII temp dir** (`TEMP`/`TMP` carrying a non-ASCII character) — the child pin is load-bearing there: with the reader net alone, the two files that assert a temp PATH go red in the **default** regime on such a path;
+- on a seat whose default is not cp1252, the simulator is the cheap discriminator — a CI step set to it catches the child-side class, not `per_day`, which only `PYTHONUTF8=1` turns red.
