@@ -29,6 +29,7 @@ import { clientRequestedThinking } from "./shared/client-thinking.js";
 import { clientAttributionEnabled, clientAttributionHeaders } from "./shared/client-attribution.js";
 import { setServedModel } from "./shared/served-model-header.js";
 import { CLIENT_GONE_HEADER } from "./shared/client-gone.js";
+import { UPSTREAM_ERROR_HEADER, UPSTREAM_ERROR_MARKER } from "./shared/upstream-error-marker.js";
 import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { transformOpenAIToClaude } from "../transform.js";
 import { filterIdentity } from "./shared/openai-compat.js";
@@ -1760,7 +1761,13 @@ export class ComposedHandler implements ModelHandler {
             ) {
               retryEnvelope.error.provider_message = retryProviderSentence;
             }
-            return c.json(retryEnvelope, retryResp.status as any);
+            const retryEnveloped = c.json(retryEnvelope, retryResp.status as any);
+            // #1213 — the retry's status is relayed exactly like the main non-OK
+            // return below, so a 5xx here is the provider's too: same marker.
+            if (retryResp.status >= 500) {
+              retryEnveloped.headers.set(UPSTREAM_ERROR_HEADER, UPSTREAM_ERROR_MARKER);
+            }
+            return retryEnveloped;
           }
         } catch (err: any) {
           // #1209 (2/2) — OUR cancel during the refresh or the retry fetch is
@@ -2042,6 +2049,22 @@ export class ComposedHandler implements ModelHandler {
           envelope.error.provider_message = providerSentence;
         }
         const enveloped = c.json(envelope, response.status as any);
+        // #1213 — a 5xx RELAYED from the provider is not the hub's own death.
+        // The status above leaves as the provider's, and a relaying sidecar
+        // reads every 5xx as "hub 5xx" (relay.ts: markFail + local replay
+        // against the same provider — measured 26/11 on myia-po-2028: 32
+        // replays and one 66.7 s AUTONOMOUS flip for ONE dead model, on a hub
+        // serving every other role). The marker is what lets the relay pass
+        // it through, like the 529 (#299 A) and the marked drain-freeze 503
+        // (#318). Two sites relay an upstream status — this one and the 401
+        // auth-retry return above; both carry the marker. The conversions
+        // above (529, the overflow turn, the media-cap 400) never reach it,
+        // and the hub's OWN errors are built elsewhere and stay unmarked. Our
+        // own Response object, so the provider's headers can never carry a
+        // value in — a relay honours the exact marker on a 5xx only.
+        if (response.status >= 500) {
+          enveloped.headers.set(UPSTREAM_ERROR_HEADER, UPSTREAM_ERROR_MARKER);
+        }
         // #679 — the plain 1302 429 ("Rate limit reached for requests"):
         // annotate, never alter — a non-last cascade step skips forward, the
         // response itself stays byte-for-byte what it always was.

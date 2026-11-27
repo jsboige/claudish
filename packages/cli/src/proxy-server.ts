@@ -185,6 +185,7 @@ import {
   carryServedModelHeader,
   withServedModelHeader,
 } from "./handlers/shared/served-model-header.js";
+import { carryUpstreamErrorMarker } from "./handlers/shared/upstream-error-marker.js";
 import { isClientGoneResponse } from "./handlers/shared/client-gone.js";
 import {
   getClientGoneDetection,
@@ -3737,7 +3738,13 @@ export async function createProxyServer(
             code: anthropicErr.code ?? null,
           },
         };
-        return c.json(oaiErr, response.status as any);
+        // #1213 — this rebuild drops the hub's response headers, and the
+        // upstream-error marker is one of them. A relay is path-aware: a
+        // sidecar forwards /v1/chat/completions to this route, and without the
+        // marker on the translated error it reads a plain 5xx — the hub's own
+        // death — and replays locally (sk-agent and nb_coder ride this ingress).
+        // The same carry as the notice and the served-model header below.
+        return carryUpstreamErrorMarker(response, c.json(oaiErr, response.status as any));
       }
 
       if (wantsStream) {

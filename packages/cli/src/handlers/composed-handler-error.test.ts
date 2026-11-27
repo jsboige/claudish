@@ -4,9 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "hono";
 import type { ProviderTransport } from "../providers/transport/types.js";
-import { ComposedHandler } from "./composed-handler.js";
+import { ComposedHandler, setPatientBackoffTimingsForTests } from "./composed-handler.js";
 import { FallbackHandler } from "./fallback-handler.js";
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
+import {
+  UPSTREAM_ERROR_HEADER,
+  UPSTREAM_ERROR_MARKER,
+} from "./shared/upstream-error-marker.js";
 
 /**
  * Connection-error surfacing wiring in ComposedHandler.handle() (S4-e lot E1,
@@ -646,5 +650,164 @@ describe("ComposedHandler.handle — non-ok body: the provider's own words trave
     const err = captured.body?.error as { message?: string; provider_message?: string };
     expect(err.message).toContain("event:error");
     expect(err.provider_message).toBe("Refreshed token lacks scope.");
+  });
+});
+
+// ── #1213 — the upstream-error marker ────────────────────────────────────────
+// A LIVE hub relays its provider's 5xx as its own HTTP status, and a relaying
+// sidecar read every 5xx as "the hub died" (markFail + a local replay against
+// the SAME provider). Measured on myia-po-2028, 2026-11-26: 32 replays and a
+// 66.7 s AUTONOMOUS flip for ONE dead model, on a hub serving every other
+// role. The hub now marks a RELAYED 5xx with `x-claudish-upstream-error: 1`
+// (the #318 pattern: an explicit header, never body sniffing), and the relay
+// passes a marked 5xx through like the 529 (#299 A).
+//
+// Exactly TWO sites in handle() relay an upstream status — the main non-OK
+// envelope and the 401 auth-retry return — and both must carry the marker.
+// Every OTHER answer is the hub's own, built from a status IT chose, and must
+// stay unmarked: a relay keeps flipping on a hub-own 5xx.
+describe("#1213 — the upstream-error marker rides the two sites that relay an upstream status, and nothing else", () => {
+  // The provider front's own page, the body the incident surfaced.
+  const IIS_502_PAGE =
+    "<!DOCTYPE html><html><head><title>502 - Web server received an invalid response while acting as a gateway or proxy server.</title></head><body><h1>502</h1></body></html>";
+
+  /** Drive `handler` against a fetch stub; returns the Response handle() resolved to. */
+  async function handleWith(
+    handler: ComposedHandler,
+    fetchImpl: () => Promise<Response>
+  ): Promise<{ res: Response; captured: CapturedResponse }> {
+    globalThis.fetch = (async () => fetchImpl()) as unknown as typeof fetch;
+    const { c, captured } = makeContext();
+    const res = (await handler.handle(c, PAYLOAD)) as unknown as Response;
+    return { res, captured };
+  }
+
+  function handlerWithRefreshAuth(): ComposedHandler {
+    const transport = makeTransport() as unknown as Record<string, unknown>;
+    transport.forceRefreshAuth = async () => {};
+    return new ComposedHandler(
+      transport as unknown as ProviderTransport,
+      "fugu-ultra",
+      "fugu-ultra",
+      8464,
+      {}
+    );
+  }
+
+  test("main envelope — a provider 502 with the provider's HTML page: status relayed, marked, Anthropic-shaped", async () => {
+    const { res, captured } = await handleWith(
+      makeHandler(),
+      async () => new Response(IIS_502_PAGE, { status: 502, headers: { "content-type": "text/html" } })
+    );
+
+    expect(captured.status).toBe(502); // the provider's status, as before
+    expect(res.headers.get(UPSTREAM_ERROR_HEADER)).toBe(UPSTREAM_ERROR_MARKER);
+    expect(captured.body?.type).toBe("error");
+    expect((captured.body?.error as { type?: string }).type).toBe("api_error");
+  });
+
+  test("main envelope — every relayed 5xx is marked (503 is NOT relayed: see the 529 pin below)", async () => {
+    for (const status of [500, 502, 504]) {
+      const { res, captured } = await handleWith(
+        makeHandler(),
+        async () => new Response("boom", { status })
+      );
+      expect(captured.status).toBe(status);
+      expect(res.headers.get(UPSTREAM_ERROR_HEADER)).toBe(UPSTREAM_ERROR_MARKER);
+    }
+  });
+
+  test("main envelope — a provider 4xx is relayed UNMARKED: it was never a hub-death signal", async () => {
+    for (const status of [400, 402, 403, 404]) {
+      const { res, captured } = await handleWith(
+        makeHandler(),
+        async () => new Response(JSON.stringify({ error: { message: `provider said ${status}` } }), { status })
+      );
+      expect(captured.status).toBe(status);
+      expect(res.headers.has(UPSTREAM_ERROR_HEADER)).toBe(false);
+    }
+  });
+
+  test("the hub's OWN answers are never marked — a 400 connection_error, a 401 refresh failure", async () => {
+    stubUpstreamThrow(Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+    const { c, captured } = makeContext();
+    const refused = (await makeHandler("http://localhost:19999/v1/chat/completions").handle(c, PAYLOAD)) as unknown as Response;
+    expect(captured.status).toBe(400);
+    expect(refused.headers.has(UPSTREAM_ERROR_HEADER)).toBe(false);
+
+    const transport = makeTransport() as unknown as Record<string, unknown>;
+    transport.forceRefreshAuth = async () => {
+      throw new Error("refresh failed");
+    };
+    globalThis.fetch = (async () => new Response("expired", { status: 401 })) as unknown as typeof fetch;
+    const second = makeContext();
+    const unauthenticated = (await new ComposedHandler(
+      transport as unknown as ProviderTransport,
+      "fugu-ultra",
+      "fugu-ultra",
+      8464,
+      {}
+    ).handle(second.c, PAYLOAD)) as unknown as Response;
+    expect(second.captured.status).toBe(401);
+    expect(unauthenticated.headers.has(UPSTREAM_ERROR_HEADER)).toBe(false);
+  });
+
+  test("a provider 503 is NOT a relayed status — it becomes the hub's own 529, unmarked (unchanged by #1213)", async () => {
+    // The patient backoff would sleep ~5 min in production; shrink the loop
+    // to its shape only, and restore the production spread afterwards.
+    setPatientBackoffTimingsForTests({ maxRetries: 1, baseDelayMs: 1 });
+    try {
+      const { res, captured } = await handleWith(
+        makeHandler(),
+        async () => new Response("service unavailable", { status: 503 })
+      );
+      expect(captured.status).toBe(529);
+      expect(res.headers.has(UPSTREAM_ERROR_HEADER)).toBe(false);
+    } finally {
+      setPatientBackoffTimingsForTests(null);
+    }
+  });
+
+  test("auth-retry site (forceRefreshAuth) — the retry's 5xx is relayed and MARKED too", async () => {
+    let call = 0;
+    const { res, captured } = await handleWith(handlerWithRefreshAuth(), async () => {
+      call += 1;
+      return call === 1 ? new Response("expired", { status: 401 }) : new Response(IIS_502_PAGE, { status: 502 });
+    });
+    expect(call).toBe(2);
+    expect(captured.status).toBe(502);
+    expect(res.headers.get(UPSTREAM_ERROR_HEADER)).toBe(UPSTREAM_ERROR_MARKER);
+  });
+
+  test("auth-retry site (forceRefreshAuth) — the retry's 4xx is relayed UNMARKED", async () => {
+    let call = 0;
+    const { res, captured } = await handleWith(handlerWithRefreshAuth(), async () => {
+      call += 1;
+      return call === 1
+        ? new Response("expired", { status: 401 })
+        : new Response(JSON.stringify({ error: { message: "no scope" } }), { status: 403 });
+    });
+    expect(captured.status).toBe(403);
+    expect(res.headers.has(UPSTREAM_ERROR_HEADER)).toBe(false);
+  });
+
+  test("forge-resistance — the provider's own header is never copied: the marker is ours or absent", async () => {
+    // A provider 403 that CLAIMS to be a marked upstream error: not a 5xx the
+    // hub relays as marked — the header must not ride through.
+    const forged4xx = await handleWith(
+      makeHandler(),
+      async () => new Response("denied", { status: 403, headers: { [UPSTREAM_ERROR_HEADER]: UPSTREAM_ERROR_MARKER } })
+    );
+    expect(forged4xx.captured.status).toBe(403);
+    expect(forged4xx.res.headers.has(UPSTREAM_ERROR_HEADER)).toBe(false);
+
+    // A provider 502 carrying a FOREIGN value: the hub writes its own marker,
+    // exactly — never the provider's string.
+    const forged5xx = await handleWith(
+      makeHandler(),
+      async () => new Response("boom", { status: 502, headers: { [UPSTREAM_ERROR_HEADER]: "forged" } })
+    );
+    expect(forged5xx.captured.status).toBe(502);
+    expect(forged5xx.res.headers.get(UPSTREAM_ERROR_HEADER)).toBe(UPSTREAM_ERROR_MARKER);
   });
 });

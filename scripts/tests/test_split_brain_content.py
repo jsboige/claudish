@@ -22,6 +22,23 @@ import tempfile
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCRIPT = os.path.join(_HERE, "..", "split-brain-content.py")
 
+# #1186 -- the encoding contract: child bytes pinned to UTF-8 (PYTHONIOENCODING)
+# and a reader that always asks for UTF-8 text with errors="replace". A reader
+# with no encoding= decodes with the SEAT's locale, and a strict reader dies in
+# subprocess' _readerthread on undecodable bytes (stdout=None, rc 0 -- #1175).
+_CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
+def run_child(argv, timeout=None):
+    # No **kwargs on purpose: the static guard in
+    # test_subprocess_encoding_contract.py skips an unverifiable spread, so
+    # this call must stay literal for the guard to see it.
+    p = subprocess.run(argv, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace",
+                       env=_CHILD_ENV, timeout=timeout)
+    p.stdout, p.stderr = p.stdout or "", p.stderr or ""
+    return p
+
 spec = importlib.util.spec_from_file_location("split_brain_content", _SCRIPT)
 sbc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sbc)
@@ -207,10 +224,19 @@ def test_cache_control_not_hashed():
 
 # ------------------------------------------------- end-to-end positive control
 
+def test_child_encoding_contract():
+    # #1186 -- the runtime half, on the carrier: U+00C1 is UTF-8 C3 81 and
+    # cp1252 C1; 0x81 is undefined in cp1252, so a strict cp1252 reader raises
+    # instead of mis-reading. See run_child().
+    p = run_child([sys.executable, "-c", "print(chr(0xC1))"])
+    check("child encoding: U+00C1 survives the reader",
+          p.stdout.strip() == "Á", "stdout=%r" % p.stdout)
+
+
 def test_end_to_end_fork_fires_and_sequential_stays_clean():
     with tempfile.TemporaryDirectory() as tmp:
         build_corpus(tmp)
-        r = subprocess.run(
+        r = run_child(
             [sys.executable, _SCRIPT, "--date", DATE, "--captures", tmp,
              # df=1.0 on purpose: at 26 requests the default 10% threshold would
              # classify the conversation's OWN history as harness (a segment
@@ -219,7 +245,7 @@ def test_end_to_end_fork_fires_and_sequential_stays_clean():
              # dominates the sample.
              "--harness-df", "1.0",
              "--session", SID_FORK[:8], "--session", SID_CLEAN[:8]],
-            capture_output=True, text=True, timeout=300)
+            timeout=300)
         out = r.stdout
         check("e2e: exit 0", r.returncode == 0, "rc=%d stderr=%s" % (r.returncode, r.stderr[:200]))
         check("e2e: corpus read whole (26 captures)", "corpus: 26 captures" in out,
@@ -245,11 +271,11 @@ def test_end_to_end_max_samples_zero_reads_all():
     # — it used to raise ZeroDivisionError at `len(files) // 0`.
     with tempfile.TemporaryDirectory() as tmp:
         build_corpus(tmp)
-        r = subprocess.run(
+        r = run_child(
             [sys.executable, _SCRIPT, "--date", DATE, "--captures", tmp,
              "--harness-df", "1.0", "--max-samples", "0",
              "--session", SID_FORK[:8]],
-            capture_output=True, text=True, timeout=300)
+            timeout=300)
         out = r.stdout
         check("e2e --max-samples 0: exit 0 (no ZeroDivisionError)",
               r.returncode == 0, "rc=%d stderr=%s" % (r.returncode, r.stderr[:200]))
@@ -266,6 +292,7 @@ if __name__ == "__main__":
                test_chain_min_core_floor, test_concurrent_overlap_vs_sequential,
                test_is_subagent_segment_scoped, test_user_segments_order,
                test_cache_control_not_hashed,
+               test_child_encoding_contract,
                test_end_to_end_fork_fires_and_sequential_stays_clean,
                test_end_to_end_max_samples_zero_reads_all]:
         print("## %s" % fn.__name__)

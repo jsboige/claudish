@@ -19,10 +19,19 @@ that launches this probe), and the output says so on every run. What the host
 publishes is established by reading the trees, not by this layer alone.
 
 Nothing on the fleet sees this class. `settings-matrix.py` reads whichever path
-it is handed (`--shared` / `ROOSYNC_SHARED_PATH`, scripts/settings-matrix.py:503)
+it is handed (`--shared` / `ROOSYNC_SHARED_PATH`, scripts/settings-matrix.py:532)
 and reports it as *the* tree: pointed at the process value it describes a tree
 nobody else reads and calls the picture complete. That is a blind spot of the
 reader, not of RooSync.
+
+A second blind spot of the same shape (measured 2026-11-25 on myia-po-2024): the
+cascade canon store `roosync_claudish_cascade` reads is `<tree>/claudish-cascade`,
+and the tool answers `store_present` for the tree ITS OWN process holds. On this
+seat the store exists in one tree only. The reader bound to the other tree
+answered `store_present: false`, and a message went out saying no canon had ever
+been published for the fleet — while four versions sat in the other tree. The
+probe now reports the store under EACH tree, so a reader's "absent" can be told
+from a seat's binding before it is quoted as a fleet fact.
 
 This is an INSTRUMENT. It never writes, never repoints, never restarts a host.
 The restart of the MCP host stays the user's arbitration (Q-po2024-8).
@@ -76,6 +85,18 @@ TRAPS (each one produces a wrong-but-plausible answer if you skip it)
      outside that process. It is a proxy for the host (both predate a repoint
      the same way), and every output says so; never quote it as "the host's
      value" (CR 23b, c.7093302681).
+  T10 A store-bound reader's "absent" is bound to ONE tree. `roosync_claudish_cascade
+      list` answers `store_present` for `<ROOSYNC_SHARED_PATH>/claudish-cascade` as
+      its own process resolves the variable. On a forked seat the canon can sit
+      entirely in the other tree, so `false` is a seat reading until BOTH trees
+      agree. The probe reads the store under each tree with the tool's own rules
+      (versions = `versions/v*` holding a readable `manifest.json`; the head is
+      `latest.json`, never the newest directory). A pointer the tool would read
+      as `null` is reported as absent or unreadable — the tool collapses both,
+      and the difference is what tells a never-published store from a damaged one.
+      One thing the probe does NOT mirror: the tool prints any `version` string
+      it finds, and this report is quoted on dashboards (T8), so a label is shown
+      only when it is a version label by the publisher's own rule.
 
 USAGE
   python scripts/roosync-tree-fork.py                 # this seat, human output
@@ -103,7 +124,14 @@ EXIT_CODES = {"SAME": 0, "UNMEASURABLE": 2, "FORK": 3}
 # that a mis-pointed value (a whole drive, say) cannot hang the probe.
 DEFAULT_LIMIT = 20000
 
+# The canon store `roosync_claudish_cascade` reads, resolved exactly as the tool
+# resolves it (`cascade-store.ts`): a direct sub-directory of the shared tree.
+CASCADE_STORE_SUBDIR = "claudish-cascade"
+CASCADE_POINTER = "latest.json"
+
 _DRIVE_RE = re.compile(r"^[A-Za-z]:$")
+# The rule a publish enforces on a version label (`cascade-store.ts`, VERSION_RE).
+_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 # --- values ---------------------------------------------------------------
@@ -246,15 +274,135 @@ def snapshot_report(shared_path, machine: str, now: datetime, limit: int = DEFAU
     }
 
 
+# --- the cascade canon store under a tree (T10) ----------------------------
+
+
+def _safe_error(exc, *roots) -> str:
+    """An error text without a path (T8): the type and the reason, never a filename."""
+    reason = getattr(exc, "strerror", None) or getattr(exc, "msg", None) or ""
+    text = "%s: %s" % (type(exc).__name__, reason) if reason else type(exc).__name__
+    for root in roots:
+        for spelling in {str(root), str(root).replace("\\", "/")}:
+            if spelling:
+                text = text.replace(spelling, "<tree>")
+    return text
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    """A parsed timestamp as aware UTC. A bare local time reads as UTC, never as this host's zone."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _count_versions(versions_dir, limit: int):
+    """(count | None, truncated, error) — counted the way the tool LISTS them.
+
+    `None` means the directory itself could not be read: an unknown count is
+    never written as zero. A missing `versions/` IS zero — the tool lists none.
+    """
+    count = 0
+    try:
+        with os.scandir(versions_dir) as entries:
+            for entry in entries:
+                if not entry.name.startswith("v"):
+                    continue
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    manifest = (Path(entry.path) / "manifest.json").read_text(encoding="utf-8-sig")
+                except OSError:
+                    continue
+                try:
+                    json.loads(manifest)
+                except ValueError:
+                    continue
+                count += 1
+                if count > limit:
+                    return limit, True, None
+        return count, False, None
+    except FileNotFoundError:
+        return 0, False, None
+    except OSError as exc:
+        return None, False, _safe_error(exc)
+
+
+def cascade_store_report(shared_path, now, limit: int = DEFAULT_LIMIT) -> dict:
+    """What `<tree>/claudish-cascade` holds, read with the tool's own rules (T10).
+
+    `status` is one of:
+      present       the store directory is there — the tool's `store_present: true`
+      absent        the tree is on this seat and holds no store directory
+      tree-missing  the tree itself is not on this seat: nothing was measured here
+      error         the tree could not be examined
+
+    Nothing is guessed from a partial read: an uncountable `versions/` gives
+    `versions: None`, and a head the tool would read as `null` is named
+    `pointer: absent` or `pointer: unreadable`.
+    """
+    out = {
+        "status": None, "versions": None, "latest": None, "published_at": None,
+        "age_h": None, "pointer": None, "truncated": False, "error": None,
+    }
+    try:
+        if not Path(shared_path).is_dir():
+            out["status"] = "tree-missing"
+            return out
+        store = Path(shared_path) / CASCADE_STORE_SUBDIR
+        if not store.is_dir():
+            out["status"] = "absent"
+            return out
+    except OSError as exc:
+        out["status"], out["error"] = "error", _safe_error(exc, shared_path)
+        return out
+
+    out["status"] = "present"
+    out["versions"], out["truncated"], out["error"] = _count_versions(store / "versions", limit)
+
+    pointer = store / CASCADE_POINTER
+    try:
+        raw = pointer.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        out["pointer"] = "absent"
+        return out
+    except OSError as exc:
+        out["pointer"] = "unreadable"
+        out["error"] = out["error"] or _safe_error(exc, shared_path)
+        return out
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        out["pointer"] = "unreadable"
+        out["error"] = out["error"] or _safe_error(exc)
+        return out
+    # What the tool requires of a pointer before it reads one.
+    if (not isinstance(data, dict) or not isinstance(data.get("dirName"), str)
+            or not isinstance(data.get("payloadPath"), str)):
+        out["pointer"] = "unreadable"
+        return out
+    out["pointer"] = "ok"
+    label = data.get("version")
+    if isinstance(label, str) and _VERSION_RE.fullmatch(label):
+        out["latest"] = label
+    published = data.get("publishedAt")
+    published = _aware(_parse_ts(published)) if isinstance(published, str) else None
+    if published is not None:
+        out["published_at"] = _iso(published)
+        out["age_h"] = round((now - published).total_seconds() / 3600.0, 1)
+    return out
+
+
 # --- the comparison -------------------------------------------------------
 
 
 def probe(*, process_value, user_value, user_error, machine, now, snapshot_fn,
-          case_insensitive=None, user_notes=None) -> tuple[dict, int]:
+          case_insensitive=None, user_notes=None, cascade_fn=None) -> tuple[dict, int]:
     """Build the report and its exit code. Pure: every input is injected.
 
     `snapshot_fn(shared_path, machine)` returns
     `{"exists", "newest", "age_h", "files"[, "truncated"]}`.
+    `cascade_fn(shared_path)` returns a `cascade_store_report` entry; omitted, the
+    report says `not-probed` for every tree instead of staying silent about it.
     """
     layers = [
         {"layer": "process", "set": _named(process_value)},
@@ -298,7 +446,15 @@ def probe(*, process_value, user_value, user_error, machine, now, snapshot_fn,
         except Exception as exc:  # noqa: BLE001 - an unreadable tree is a finding, not a crash
             snap = {"exists": False, "newest": None, "age_h": None, "files": 0,
                     "error": "%s: %s" % (type(exc).__name__, exc)}
-        snapshots.append({**entry, **snap})
+        if cascade_fn is None:
+            # No reader injected: say so, rather than let a missing line read as "absent".
+            cascade = {"status": "not-probed"}
+        else:
+            try:
+                cascade = dict(cascade_fn(raw[source_layer]))
+            except Exception as exc:  # noqa: BLE001 - an unreadable store is a finding, not a crash
+                cascade = {"status": "error", "error": _safe_error(exc, raw[source_layer])}
+        snapshots.append({**entry, **snap, "cascade": cascade})
 
     # Name each layer's tree from its own entry (never from a leaked loop variable:
     # that wrote the user label onto the process layer and lost the difference).
@@ -332,6 +488,37 @@ def probe(*, process_value, user_value, user_error, machine, now, snapshot_fn,
     elif not existing and any(s.get("exists") for s in snapshots):
         notes.append("a tree exists but holds no readable file; its age is unknown, not zero")
 
+    # Which trees hold the cascade canon store (T10). `divergent` is None — not
+    # False — whenever the question was not asked or a tree could not answer.
+    with_store, without_store, unmeasured = [], [], []
+    for snap in snapshots:
+        cascade = snap["cascade"]
+        if cascade["status"] == "not-probed":
+            continue
+        who = snap["layers"][0] if len(snap["layers"]) == 1 else "both"
+        if cascade["status"] == "present":
+            with_store.append(who)
+        elif cascade["status"] == "absent":
+            without_store.append(who)
+        else:
+            unmeasured.append(who)
+    cascade_summary = {
+        "probed": bool(with_store or without_store or unmeasured),
+        "divergent": None,
+        "with_store": with_store,
+        "without_store": without_store,
+        "unmeasured": unmeasured,
+    }
+    if cascade_summary["probed"] and not unmeasured:
+        cascade_summary["divergent"] = bool(with_store) and bool(without_store)
+        if cascade_summary["divergent"]:
+            notes.append(
+                "the cascade canon store is under ONE tree only (named by: %s): "
+                "`roosync_claudish_cascade list` answers `store_present: false` from a "
+                "reader bound to the other tree — that absence is a seat reading, "
+                "never a fleet fact" % ", ".join(with_store)
+            )
+
     # SAME needs a tree that is actually here — otherwise nothing was established.
     # Name the real absence: a missing tree and a tree without this machine's
     # configs are two different findings, and the reason must not conflate them.
@@ -360,6 +547,7 @@ def probe(*, process_value, user_value, user_error, machine, now, snapshot_fn,
         "reason": reason,
         "snapshots": snapshots,
         "freshest": freshest,
+        "cascade": cascade_summary,
         "notes": notes,
     }
     return report, EXIT_CODES[verdict]
@@ -370,6 +558,39 @@ def probe(*, process_value, user_value, user_error, machine, now, snapshot_fn,
 
 def _consoles_word(layer: str) -> str:
     return "the process tree" if layer == "process" else ("the user tree" if layer == "user" else "both layers")
+
+
+def _cascade_words(cascade: dict) -> str:
+    """One line per tree for the canon store. A tree that answered nothing says so (T10)."""
+    status = cascade.get("status")
+    if status == "tree-missing":
+        return "tree not on this seat — store unmeasured"
+    if status == "absent":
+        return "no canon store under this tree"
+    if status != "present":
+        return "UNMEASURED" if not cascade.get("error") else "UNMEASURED — %s" % cascade["error"]
+    words = []
+    count = cascade.get("versions")
+    words.append("versions uncounted" if count is None
+                 else "%d version%s" % (count, "" if count == 1 else "s"))
+    pointer = cascade.get("pointer")
+    if pointer == "ok":
+        if cascade.get("latest"):
+            age = cascade.get("age_h")
+            words.append("latest %s, published %s%s" % (
+                cascade["latest"], cascade.get("published_at") or "at an unreadable date",
+                "" if age is None else " (%.1f h old)" % age))
+        else:
+            words.append("pointer holds no version label")
+    elif pointer == "absent":
+        words.append("no head pointer")
+    elif pointer == "unreadable":
+        words.append("head pointer unreadable")
+    if cascade.get("truncated"):
+        words.append("SCAN TRUNCATED")
+    if cascade.get("error"):
+        words.append("ERROR %s" % cascade["error"])
+    return ", ".join(words)
 
 
 def render(report: dict) -> str:
@@ -407,6 +628,14 @@ def render(report: dict) -> str:
             delta = report["freshest"].get("delta_h")
             tail = "" if delta is None else ", %.1f h newer than the other tree" % delta
             lines.append("  freshest: %s%s" % (_consoles_word(report["freshest"]["layer"]), tail))
+    # T10: only trees that were actually asked — a tree nobody probed prints nothing,
+    # so an unprinted line can never be misread as "no store under this tree".
+    cascades = [s for s in report["snapshots"]
+                if s.get("cascade") and s["cascade"].get("status") != "not-probed"]
+    if cascades:
+        lines.append("cascade   canon store under each tree")
+        for snap in cascades:
+            lines.append("  %s  %s" % (snap["tree"].ljust(width), _cascade_words(snap["cascade"])))
     for note in report["notes"]:
         lines.append("note      %s" % note)
     return "\n".join(lines)
@@ -436,6 +665,7 @@ def main(argv=None) -> int:
         machine=machine,
         now=now,
         snapshot_fn=lambda path, m: snapshot_report(path, m, now, limit=args.limit),
+        cascade_fn=lambda path: cascade_store_report(path, now, limit=args.limit),
     )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))

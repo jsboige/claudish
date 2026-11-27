@@ -29,6 +29,14 @@ then three phases:
 
 `process_time` is this process's own CPU; wall minus CPU is waiting.
 
+The scan rates are the SAMPLE's, and the document says so in a field a program
+can read: `extrapolation.day_estimable` is False and names the sizes it was
+measured on, and each `scan_plain` / `scan_profiled` block carries its
+`measured_on`. Scaled to a day they price it ~62x low (#1215: 1.2 ms a response
+here on 26/11, 124.3 ms a response on the day itself) — a few thousand files
+stay in the operating system's cache where 135 054 do not. A day's scan is READ
+(`archive.seconds.scan`), never derived from this document.
+
 The series file is never touched (nothing is written to the persistent
 series). No `python -I`: py7zr lives in the user site on the seats.
 
@@ -300,13 +308,30 @@ def _measure(args, tc, pp, py7zr, built):
         print("REFUSED: the sample holds no readable response - nothing to profile",
               file=sys.stderr)
         return 2, res
+    members = n_resp + n_req
     for name, wall, cpu in (("scan_plain", wall1, cpu1), ("scan_profiled", wall2, cpu2)):
         res[name] = {"wall_s": round(wall, 2), "cpu_s": round(cpu, 2),
                      "cpu_share": round(100.0 * cpu / wall, 1) if wall else None,
                      "ms_per_resp": round(1000.0 * wall / n_resp, 1),
-                     "ms_per_member": round(1000.0 * wall / (n_resp + n_req), 1) if n_resp + n_req else None}
+                     "ms_per_member": round(1000.0 * wall / members, 1) if members else None,
+                     # The size each rate above was measured on (#1215): a rate
+                     # read without its sample is a day figure waiting to happen.
+                     "measured_on": {"resp": n_resp, "members": members}}
     res["sample"] = {"resp": n_resp, "req": n_req, "paired": r1["files"]["paired"],
                      "unanswered": r1["requests"]["unanswered"]}
+    # #1215: every rate of this document is the SAMPLE's. A consumer scaled the
+    # plain pass's 1.2 ms a response to a day and priced a read at 124 s; the
+    # day's scan cost 7 752 s (124.3 ms a response). `not_measured` said so in
+    # prose and was not enough, so the refusal is a field a program can read.
+    # A day's scan is READ (`archive.seconds.scan` of the series), never
+    # derived from here: no input of this tool makes `day_estimable` true.
+    res["extrapolation"] = {
+        "day_estimable": False,
+        "measured_on": {"day": args.day, "hours": sorted(hours),
+                        "resp": n_resp, "req": n_req, "members": members},
+        "why": "a few hours of one day, each file opened once before the timed pass; "
+               "the rates hold for this sample and price nothing larger",
+    }
     st = pstats.Stats(prof)
     res["top_cumulative"] = top(st, 3)
     res["top_own_time"] = top(st, 2)
@@ -364,6 +389,10 @@ def main():
           f"{p['ms_per_member']} ms a member")
     print(f"scan, cProfile pass: {q['wall_s']:.1f} s wall, {q['cpu_s']:.1f} s CPU "
           f"-> {q['ms_per_resp']} ms a response")
+    x = res["extrapolation"]["measured_on"]
+    print(f"extrapolation: the scan rates above were measured on {x['resp']} responses and "
+          f"{x['members']} members ({','.join(res['hours'])}h of {res['day']}) - "
+          f"day_estimable is False, they do not price a day; a day is read")
     print("top 5 by cumulative time (share of the profiled scan):")
     for i, row in enumerate(res["top_cumulative"], 1):
         print(f"  {i}. {row['share']} %  {row['function']}  {row['calls']:,} calls, {row['seconds']} s")

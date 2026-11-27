@@ -114,6 +114,7 @@ import statistics
 import sys
 from datetime import datetime, timezone
 from collections import defaultdict
+from functools import lru_cache
 
 FRONTMATTER = re.compile(r"^---\n.*?\n---\n", re.S)
 HDR = re.compile(r"^#\s*parser=(\S+)\s+model=(\S+)\s+reqN=(\d+)\s+pid=(\d+)", re.M)
@@ -142,6 +143,60 @@ def is_native_served(model):
     return model.lower().startswith("claude") or bool(BARE_ROLE_RE.match(model))
 
 
+# La borne `--since`, ramenee a LA FORME DES CAPTURES (tirets, `Z`).
+# Formes acceptees : `YYYY-MM-DD` (forme documentee), la forme tirets
+# `…THH[-MM[-SS[-mmm]]]` (l'heure seule marche, elle marchait deja) et l'ISO
+# canonique `…THH[:MM[:SS[.fff]]][Z]`, `T` ou une espace comme separateur.
+# L'ISO canonique TRIBUTAIT A L'ENVERS sous la comparaison lexicographique :
+# `-` (0x2D) trie avant `:` (0x3A), donc une capture de `09-30` se lisait
+# « avant » la borne `09:00` et TOUTE l'heure de la borne disparaissait
+# (mesure du 27/11 : before_since("…T09-30-00-203Z", "…T09:00") -> True).
+# Une borne illisible REFUSE le run : elle ne borne plus rien en silence.
+BOUND_SINCE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2})(?:[-:](\d{2})(?:[-:](\d{2})(?:[-.](\d+))?)?)?)?Z?$")
+
+
+def norm_bound(since):
+    """Borne `--since` -> forme a tirets comparable ; SystemExit si illisible.
+
+    Memoisee : `before_since` l'appelle PAR CAPTURE et la garde doit rester
+    presque gratuite (mesure 27/11 : 8,9 us l'analyse, ~0,7 s sur un corpus
+    pour un run qui en prend ~4 ; en cache, l'analyse n'a lieu qu'une fois par
+    orthographe).
+    """
+    return _norm_bound(since)
+
+
+@lru_cache(maxsize=16)
+def _norm_bound(since):
+    """Borne `--since` -> forme a tirets comparable ; SystemExit si illisible."""
+    if not since:
+        return None
+    m = BOUND_SINCE.match(since.strip())
+    if not m:
+        raise SystemExit(
+            f"--since {since!r} illisible: attendu YYYY-MM-DD, YYYY-MM-DDTHH[-MM], "
+            "YYYY-MM-DDTHH-MM[:SS[.mmm]] ou ISO (…THH[:MM[:SS[.fff]]]Z)")
+    date, hh, mm, ss, frac = m.groups()
+    try:
+        datetime.strptime(f"{date}T{hh or '00'}:{mm or '00'}", "%Y-%m-%dT%H:%M")
+    except ValueError:
+        raise SystemExit(f"--since {since!r} illisible: pas une date/heure du calendrier")
+    if ss and int(ss) > 59:
+        raise SystemExit(f"--since {since!r} illisible: secondes hors 0-59")
+    if frac and len(frac) > 3:
+        raise SystemExit(f"--since {since!r} illisible: fraction de plus de 3 chiffres "
+                         "(les captures sont a la milliseconde)")
+    if hh is None:
+        return date
+    out = f"{date}T{hh}-{mm or '00'}"
+    if ss is not None:
+        out += f"-{ss}"
+        if frac is not None:
+            out += f"-{frac.ljust(3, '0')}"
+    return out
+
+
 def before_since(capture_ts_str, since):
     """La capture precede-t-elle la borne `--since` ? (PIEGE 9)
 
@@ -150,12 +205,15 @@ def before_since(capture_ts_str, since):
     repertoire dans `non appariees`, qui se lisait alors comme un echec
     d'appariement. Comparaison lexicographique assumee : les deux cotes
     partagent le format a TIRETS du producteur de captures, jamais l'ISO
-    canonique a deux-points (qui trie differemment, cf. note NB du module).
+    canonique a deux-points (qui trie differemment, cf. note NB du module) —
+    la borne est donc RAMENEE a cette forme par `norm_bound`, et une borne
+    illisible refuse le run au lieu de ne rien borner.
     Une borne absente, ou un horodatage illisible, ne borne rien.
     """
-    if not since or not capture_ts_str:
+    bound = norm_bound(since)
+    if not bound or not capture_ts_str:
         return False
-    return capture_ts_str < since
+    return capture_ts_str < bound
 
 
 def capture_ts(ts):
@@ -325,7 +383,7 @@ def main():
         print(__doc__)
         sys.exit(2)
     cdir = sys.argv[1]
-    since = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--since=")), None)
+    since = norm_bound(next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--since=")), None))
     workspace = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--workspace=")), None)
     machine = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--machine=")), None)
     all_parsers = "--all-parsers" in sys.argv

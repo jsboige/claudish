@@ -14,9 +14,13 @@ harmonized values, the credential shapes, the canon flags -- is downstream of
 
 Neither throws. Neither prints anything unusual. Both are pinned here.
 
-The documented lookup order (mirrors RSM's findLatestClaudeSettingsSnapshot):
-standalone `claude-settings/claude-settings.json` -> `latest.json` pointer ->
-versioned packages, best by `collectedAt`.
+The lookup picks the FRESHEST readable snapshot by `collectedAt`, whatever the
+source (#1136 volet 2): the standalone file, the `latest.json` pointer and the
+versioned packages are all candidates. Source order only breaks ties. The fixed
+order this reader used to share with RSM's findLatestClaudeSettingsSnapshot is
+what let a 14/11 standalone eclipse a 23/11 publish (measured on ai-01's tree)
+-- the pins below hold both directions: a fresher package beats an older
+standalone AND a fresher standalone keeps beating an older package.
 
 Run standalone:  python scripts/tests/test_settings_matrix_coverage.py
 """
@@ -34,6 +38,10 @@ _TARGET = os.path.join(os.path.dirname(_HERE), "settings-matrix.py")
 _spec = importlib.util.spec_from_file_location("smx_cov", _TARGET)
 smx = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smx)
+
+# #1186: the child's bytes are pinned to UTF-8 whatever the seat's own encoding
+# is, and the readers below always ask for UTF-8 -- the two layers are ONE contract.
+_CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
 
 MACHINE = "myia-po-2024"
 
@@ -92,14 +100,14 @@ def test_absent_machine_dir_is_not_covered():
     """No directory at all resolves to None -- the NOT COVERED branch, not a crash."""
     with tempfile.TemporaryDirectory() as root:
         os.makedirs(os.path.join(root, "configs"))
-        assert smx.latest_snapshot(root, MACHINE) is None
+        assert smx.latest_snapshot(root, MACHINE) == (None, None)
 
 
 def test_empty_machine_dir_is_not_covered():
     """A directory holding no snapshot (the live po-2024 shape before 31/10)."""
     with tempfile.TemporaryDirectory() as root:
         os.makedirs(os.path.join(root, "configs", MACHINE))
-        assert smx.latest_snapshot(root, MACHINE) is None
+        assert smx.latest_snapshot(root, MACHINE) == (None, None)
 
 
 def test_not_covered_is_printed_as_absence_not_silence():
@@ -108,43 +116,70 @@ def test_not_covered_is_printed_as_absence_not_silence():
         os.makedirs(os.path.join(root, "configs", MACHINE))
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "NOT COVERED: no claude-settings snapshot published" in proc.stdout, proc.stdout[-800:]
-    assert "%s: NOT COVERED" % MACHINE in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "NOT COVERED: no claude-settings snapshot published" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+    assert "%s: NOT COVERED" % MACHINE in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 # --------------------------------------------------------------------------
 # The documented lookup order
 # --------------------------------------------------------------------------
 
-def test_standalone_snapshot_wins_over_versioned():
-    """Order rule 1: `claude-settings/claude-settings.json` is consulted first.
+def test_a_fresher_version_beats_an_older_standalone():
+    """Freshness rule: the winner is the greatest `collectedAt`, whatever the source.
 
-    It wins even when a versioned package is FRESHER -- the standalone file is the
-    seat's live publish, and reordering this silently reverts a machine to an
-    older package."""
+    This used to be the opposite (standalone consulted first, period), and that
+    is exactly the fossil class measured on 22-23/11: a 14/11 standalone hid a
+    23/11 publish from ai-01's reader. A reader that prefers a SOURCE over a
+    DATE reports yesterday's settings as today's."""
     with tempfile.TemporaryDirectory() as root:
         _standalone(root, _snapshot("2026-10-20T00:00:00.000Z"))
         _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
-        snap = smx.latest_snapshot(root, MACHINE)
+        snap, source = smx.latest_snapshot(root, MACHINE)
     assert snap is not None
-    assert snap["collectedAt"] == "2026-10-20T00:00:00.000Z", snap["collectedAt"]
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap["collectedAt"]
+    assert source == "v1-2026-10-31T00-00-00-000Z", source
+
+
+def test_a_fresher_standalone_beats_an_older_version():
+    """The other direction, so the rule cannot be "always prefer the package"."""
+    with tempfile.TemporaryDirectory() as root:
+        _standalone(root, _snapshot("2026-10-31T00:00:00.000Z"))
+        _versioned(root, "v1-2026-10-20T00-00-00-000Z", _snapshot("2026-10-20T00:00:00.000Z"))
+        snap, source = smx.latest_snapshot(root, MACHINE)
+    assert snap is not None
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap["collectedAt"]
+    assert source == "standalone", source
 
 
 def test_latest_pointer_resolves():
-    """Order rule 2: the `latest.json` pointer outranks the versioned scan.
+    """The `latest.json` pointer is a candidate like any other: it wins when its
+    target is the freshest package, and the source is named as such."""
+    with tempfile.TemporaryDirectory() as root:
+        pointed = _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
+        _versioned(root, "v1-2026-10-20T00-00-00-000Z", _snapshot("2026-10-20T00:00:00.000Z"))
+        _pointer(root, pointed)
+        snap, source = smx.latest_snapshot(root, MACHINE)
+    assert snap is not None
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap["collectedAt"]
+    assert source == "latest.json", source
 
-    A pointer exists precisely to name the winner; ignoring it while a newer
-    package sits nearby would make publish order irrelevant."""
+
+def test_pointer_is_not_a_priority_over_a_fresher_package():
+    """A stale pointer must not serve an older package while a fresher one sits
+    in the same folder -- the pointer names the winner at publish time, and a
+    publish that did not move it leaves it behind, not authoritative."""
     with tempfile.TemporaryDirectory() as root:
         pointed = _versioned(root, "v1-2026-10-20T00-00-00-000Z", _snapshot("2026-10-20T00:00:00.000Z"))
         _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
         _pointer(root, pointed)
-        snap = smx.latest_snapshot(root, MACHINE)
+        snap, source = smx.latest_snapshot(root, MACHINE)
     assert snap is not None
-    assert snap["collectedAt"] == "2026-10-20T00:00:00.000Z", snap["collectedAt"]
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap["collectedAt"]
+    assert source == "v1-2026-10-31T00-00-00-000Z", source
 
 
 def test_dead_pointer_falls_through_to_the_versioned_scan():
@@ -153,7 +188,7 @@ def test_dead_pointer_falls_through_to_the_versioned_scan():
     with tempfile.TemporaryDirectory() as root:
         _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
         _pointer(root, os.path.join(root, "configs", MACHINE, "v1-gone-2026-01-01T00-00-00-000Z"))
-        snap = smx.latest_snapshot(root, MACHINE)
+        snap, _source = smx.latest_snapshot(root, MACHINE)
     assert snap is not None
     assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap["collectedAt"]
 
@@ -167,9 +202,62 @@ def test_versioned_fallback_picks_by_collected_at_not_by_directory_name():
     with tempfile.TemporaryDirectory() as root:
         _versioned(root, "v9-2026-10-20T00-00-00-000Z", _snapshot("2026-10-20T00:00:00.000Z"))
         _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
-        snap = smx.latest_snapshot(root, MACHINE)
+        snap, source = smx.latest_snapshot(root, MACHINE)
     assert snap is not None
     assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap["collectedAt"]
+    assert source == "v1-2026-10-31T00-00-00-000Z", source
+
+
+def test_an_undated_source_never_outranks_a_dated_one():
+    """A standalone with no readable `collectedAt` is "no age signal": it must
+    not win over a dated package just by being first in the tie order. The
+    old rule would have served it unconditionally."""
+    with tempfile.TemporaryDirectory() as root:
+        _standalone(root, _snapshot(""))
+        _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
+        snap, source = smx.latest_snapshot(root, MACHINE)
+    assert snap is not None
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap["collectedAt"]
+    assert source == "v1-2026-10-31T00-00-00-000Z", source
+
+
+def test_a_dated_incumbent_is_not_displaced_by_an_undated_challenger():
+    """The REVERSE direction of the rule above, and the shape the M2 mutant kept
+    alive (#1136, 27/11): guard the challenger's date with a HIGH sentinel
+    instead of the empty string and an undated challenger beats ANY dated
+    incumbent -- while the pin above stays green, because there the undated
+    candidate is met FIRST and the dated one wins on the way in.
+
+    Ordering is the whole pin: `snapshot_candidates` yields the standalone
+    before the versioned packages, so the dated standalone is the incumbent.
+    That premise is asserted, not assumed -- with the order reversed this test
+    would pass under the mutant too and prove nothing."""
+    with tempfile.TemporaryDirectory() as root:
+        _standalone(root, _snapshot("2026-10-31T00:00:00.000Z"))
+        _versioned(root, "v1-undated", _snapshot(""))
+        sources = [source for source, _snap in smx.snapshot_candidates(root, MACHINE)]
+        assert sources.index("standalone") < sources.index("v1-undated"), sources
+        snap, source = smx.latest_snapshot(root, MACHINE)
+    assert snap is not None
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap
+    assert source == "standalone", source
+
+
+def test_an_undated_package_does_not_displace_a_dated_pointer():
+    """Second source pair for the same property: the `latest.json` candidate is
+    built before the versioned scan, so a dated target it points at is the
+    incumbent when an undated package is met later. A reader that lets the
+    undated package win would serve settings with no age signal at all."""
+    with tempfile.TemporaryDirectory() as root:
+        pointed = _versioned(root, "v1-dated", _snapshot("2026-10-31T00:00:00.000Z"))
+        _versioned(root, "v2-undated", _snapshot(""))
+        _pointer(root, pointed)
+        sources = [source for source, _snap in smx.snapshot_candidates(root, MACHINE)]
+        assert sources.index("latest.json") < sources.index("v2-undated"), sources
+        snap, source = smx.latest_snapshot(root, MACHINE)
+    assert snap is not None
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap
+    assert source == "latest.json", source
 
 
 # --------------------------------------------------------------------------
@@ -189,7 +277,7 @@ def test_foreign_or_broken_payload_is_skipped():
     for label, text in cases.items():
         with tempfile.TemporaryDirectory() as root:
             _raw(root, os.path.join("claude-settings", "claude-settings.json"), text)
-            assert smx.latest_snapshot(root, MACHINE) is None, label
+            assert smx.latest_snapshot(root, MACHINE) == (None, None), label
 
 
 def test_a_broken_standalone_falls_through_to_a_good_versioned_package():
@@ -198,7 +286,7 @@ def test_a_broken_standalone_falls_through_to_a_good_versioned_package():
     with tempfile.TemporaryDirectory() as root:
         _raw(root, os.path.join("claude-settings", "claude-settings.json"), "{truncated")
         _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
-        snap = smx.latest_snapshot(root, MACHINE)
+        snap, _source = smx.latest_snapshot(root, MACHINE)
     assert snap is not None
     assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap["collectedAt"]
 
@@ -208,7 +296,7 @@ def test_non_versioned_sibling_directories_are_not_scanned():
     and friends are not candidates (they hold no publish of their own)."""
     with tempfile.TemporaryDirectory() as root:
         _versioned(root, "archived-vv1.0.1-old", _snapshot("2026-10-31T00:00:00.000Z"))
-        assert smx.latest_snapshot(root, MACHINE) is None
+        assert smx.latest_snapshot(root, MACHINE) == (None, None)
 
 
 # --------------------------------------------------------------------------
@@ -227,10 +315,11 @@ def test_fresh_snapshot_is_not_flagged_stale():
         _versioned(root, "v1-fresh", _snapshot(fresh))
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, "--stale-hours", "48", MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "snapshot stale" not in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "snapshot stale" not in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 def test_old_snapshot_is_flagged_stale():
@@ -240,10 +329,11 @@ def test_old_snapshot_is_flagged_stale():
         _versioned(root, "v1-old", _snapshot("2020-01-01T00:00:00.000Z"))
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, "--stale-hours", "1", MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "snapshot stale (2020-01-01T00:00:00.000Z)" in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "snapshot stale (2020-01-01T00:00:00.000Z)" in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 def test_missing_collected_at_reads_as_stale_not_as_fresh():
@@ -256,10 +346,58 @@ def test_missing_collected_at_reads_as_stale_not_as_fresh():
         assert smx.age_hours(snap.get("collectedAt"), smx.dt.datetime.now(smx.dt.timezone.utc)) is None
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
+        )
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "snapshot stale" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+
+
+# --------------------------------------------------------------------------
+# The reading survives a non-ASCII value (#1186)
+# --------------------------------------------------------------------------
+
+def test_a_non_ascii_harmonized_value_reaches_the_reader_verbatim():
+    """main() prints harmonization values with `ensure_ascii=False`; the child
+    pin and the reader net are what let a non-ASCII value cross the pipe
+    (#1186). Measured on po-2027: with either layer removed the value comes
+    back mojibake, or the strict decoder hands back `stdout=None` (#1175)."""
+    value = "claude-fable-Á"  # Á: UTF-8 C3 81, and 0x81 is undefined in cp1252
+    with tempfile.TemporaryDirectory() as root:
+        _versioned(root, "v1-enc", _snapshot(
+            "2026-10-31T00:00:00.000Z",
+            harmonization={"env.FIXTURE_ENCODING_CARRIER": value},
+        ))
+        proc = subprocess.run(
+            [sys.executable, _TARGET, "--shared", root, MACHINE],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
+        )
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert value in (proc.stdout or ""), (proc.stdout or "")[-800:]
+
+
+# --------------------------------------------------------------------------
+# The output names WHICH snapshot was read -- the date and the source
+# --------------------------------------------------------------------------
+
+def test_output_names_the_date_and_the_source_it_read():
+    """AC of #1136 volet 2: the read date appears in the output, next to the
+    source, so a reader can see that the freshest candidate won and from where.
+    Two snapshots are on disk; the output must show the newer one's date AND its
+    version directory, never the older standalone's."""
+    with tempfile.TemporaryDirectory() as root:
+        _standalone(root, _snapshot("2026-10-20T00:00:00.000Z"))
+        _versioned(root, "v1-2026-10-31T00-00-00-000Z", _snapshot("2026-10-31T00:00:00.000Z"))
+        proc = subprocess.run(
+            [sys.executable, _TARGET, "--shared", root, MACHINE],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
     assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "snapshot stale" in proc.stdout, proc.stdout[-800:]
+    assert "collectedAt=2026-10-31T00:00:00.000Z" in proc.stdout, proc.stdout[-800:]
+    assert "source=v1-2026-10-31T00-00-00-000Z" in proc.stdout, proc.stdout[-800:]
+    assert "collectedAt=2026-10-20T00:00:00.000Z" not in proc.stdout, proc.stdout[-800:]
 
 
 if __name__ == "__main__":

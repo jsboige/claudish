@@ -163,13 +163,21 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  if (proxy) {
-    await proxy.shutdown();
+  // #1216 review, non-blocking item 1: the restore must not depend on the
+  // shutdown succeeding. On bun < 1.4 `proxy.shutdown()` can hit the 5 s hook
+  // timeout, and a `finally` keeps the fetch stub from leaking into the three
+  // later `catalog-network-guard` tests ("Received: null"). CI runs 1.4.0 and
+  // cannot see it; a seat on 1.3.x can.
+  try {
+    if (proxy) {
+      await proxy.shutdown();
+    }
+  } finally {
     proxy = null;
-  }
-  if (restoreFetch) {
-    restoreFetch();
-    restoreFetch = null;
+    if (restoreFetch) {
+      restoreFetch();
+      restoreFetch = null;
+    }
   }
   if (restoreConsoleLog) {
     restoreConsoleLog();
@@ -883,11 +891,12 @@ describe("#1209 (2/2) — a stream:false client that hangs up", () => {
     const health = await fetch(`http://127.0.0.1:${port}/health`);
     expect(health.status).toBe(200);
     // #1209 2/2 — the runtime capability is published, not assumed. This suite
-    // runs on bun >= 1.4 (local 1.4.3, CI latest): the boot probe must reach
-    // "detected" within its own bound. On bun 1.3 the value stays "undetected"
-    // and this assertion fails BY DESIGN — the fix cannot cancel anything
-    // there, and a silently inert capability is the failure this field exists
-    // to expose (fork/client-gone-detect.ts carries the measured matrix).
+    // runs on bun >= 1.4 (local 1.4.3, CI pinned to 1.4.0 by test.yml): the boot
+    // probe must reach "detected" within its own bound. On bun 1.3 the value
+    // stays "undetected" and this assertion fails BY DESIGN — the fix cannot
+    // cancel anything there, and a silently inert capability is the failure this
+    // field exists to expose (fork/client-gone-detect.ts carries the measured
+    // matrix).
     const settleUntil = Date.now() + 4000;
     let verdict = ((await health.json()) as { clientGoneDetect?: string }).clientGoneDetect;
     while (verdict !== "detected" && Date.now() < settleUntil) {

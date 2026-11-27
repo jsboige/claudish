@@ -40,6 +40,10 @@ _spec = importlib.util.spec_from_file_location("smx_cred", _TARGET)
 smx = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smx)
 
+# #1186: the child's bytes are pinned to UTF-8 whatever the seat's own encoding
+# is, and the reader always asks for UTF-8 -- the two layers are ONE contract.
+_CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
+
 
 def _joined(flags):
     return "\n".join(flags)
@@ -98,7 +102,7 @@ def test_missing_masked_map_is_silent():
     assert smx.credential_flags("myia-po-2023", {}) == []
 
 
-def _write_snapshot(root, machine, masked):
+def _write_snapshot(root, machine, masked, harmonization=None):
     d = os.path.join(root, "configs", machine, "v1.0.0-2026-10-30T00-00-00-000Z", "claude-settings")
     os.makedirs(d)
     snap = {
@@ -106,7 +110,7 @@ def _write_snapshot(root, machine, masked):
         "machineId": machine,
         "collectedAt": "2026-10-30T00:00:00.000Z",
         "state": "ok",
-        "harmonization": {},
+        "harmonization": harmonization if harmonization is not None else {},
         "maskedEnvKeys": masked,
         "otherTopLevelKeys": [],
     }
@@ -123,10 +127,31 @@ def test_exit_status_stays_zero_with_a_flag():
         _write_snapshot(root, "myia-po-2023", {"ANTHROPIC_AUTH_TOKEN": "<empty>"})
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, "myia-po-2023"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "declared but valueless" in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "declared but valueless" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+
+
+def test_a_non_ascii_value_does_not_kill_the_credential_reading():
+    """The reader must return the WHOLE document as text (#1186): a non-ASCII
+    string anywhere in the snapshot used to be able to kill a strict decoder
+    inside subprocess' reader thread (`stdout=None`), taking the credential
+    flag down with it -- the #1175 signature."""
+    value = "claude-fable-Á"  # Á: UTF-8 C3 81, and 0x81 is undefined in cp1252
+    with tempfile.TemporaryDirectory() as root:
+        _write_snapshot(root, "myia-po-2023", {"ANTHROPIC_AUTH_TOKEN": "<empty>"},
+                        harmonization={"env.FIXTURE_ENCODING_CARRIER": value})
+        proc = subprocess.run(
+            [sys.executable, _TARGET, "--shared", root, "myia-po-2023"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
+        )
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    out = proc.stdout or ""
+    assert "declared but valueless" in out, out[-800:]
+    assert value in out, out[-800:]
 
 
 if __name__ == "__main__":
