@@ -13,36 +13,79 @@ BeforeAll {
     $script:Exe = (Get-Process -Id $PID).Path
 
     function New-StubAppCmd {
-        # map: pool name -> value to echo. Two sentinels:
-        #   '__FAIL__'      -> exit 1 and a stderr line (a real read failure)
-        #   (name absent)   -> exit 0 with EMPTY output (a pool name that does not resolve)
+        # map: pool name -> '<time>' or '<time>;<schedule entry>[;<entry>...]'. Sentinels:
+        #   '__FAIL__'      on the time field     -> exit 1 and a stderr line (a real read failure)
+        #   '__NOSCHED__'   on the schedule field -> the [schedule] header is NOT printed
+        #   (name absent)                         -> exit 0 with EMPTY output (a name that does not resolve)
+        # -SeenOverride makes the stub PRINT another pool's name in APPPOOL.NAME: that is the shape
+        # measured on this seat for `appcmd list apppool "<name>" /config` (no object name, and an
+        # empty <schedule> where the real one has an entry). The guard must refuse such a read.
         param(
             [Parameter(Mandatory)][string]$Dir,
-            [Parameter(Mandatory)][hashtable]$Map
+            [Parameter(Mandatory)][hashtable]$Map,
+            [string]$SeenOverride = ''
         )
         $mapFile = Join-Path $Dir 'map.txt'
         $lines = @()
-        foreach ($k in @($Map.Keys)) { $lines += ('{0}|{1}' -f $k, $Map[$k]) }
+        foreach ($k in @($Map.Keys)) {
+            $parts = "$($Map[$k])" -split ';', 2
+            $sched = ''
+            if ($parts.Count -gt 1) { $sched = ($parts[1] -replace ';', ' ') }
+            $lines += ('{0}|{1}|{2}' -f $k, $parts[0], $sched)
+        }
         [System.IO.File]::WriteAllText($mapFile, (($lines -join "`r`n") + "`r`n"), [System.Text.Encoding]::ASCII)
+        if ($SeenOverride) {
+            [System.IO.File]::WriteAllText((Join-Path $Dir 'seen.txt'), $SeenOverride, [System.Text.Encoding]::ASCII)
+        }
 
         $stub = Join-Path $Dir 'stub-appcmd.cmd'
-        # Measured 2026-11-26: `exit /b 1` nested inside the `for /f (...) do ( ... )` body
-        # does NOT propagate - the stub answered rc 0 and the guard read the failure text as
+        # Measured 2026-11-26: `exit /b 1` nested inside the `for /f (...) do ( ... )` body does
+        # NOT propagate - the stub answered rc 0 and the guard read the failure text as
         # a DRIFT. The lookup and the exit are therefore kept OUTSIDE the loop body.
+        # Measured 2026-11-27: the guard reads ONE form, `list apppool <name> /text:*`, and the
+        # block below is the shape appcmd really prints (APPPOOL.NAME first, [periodicRestart],
+        # [schedule], then [failure] at a shallower indent); the single-value form is kept.
         $body = @(
             '@echo off',
             'setlocal enabledelayedexpansion',
             'set "pool=%~3"',
+            'set "form=%~4"',
             'set "val="',
-            'for /f "usebackq tokens=1,2 delims=|" %%A in ("%~dp0map.txt") do (',
-            '  if /I "%%A"=="!pool!" set "val=%%B"',
+            'set "sched="',
+            'for /f "usebackq tokens=1,2,3 delims=|" %%A in ("%~dp0map.txt") do (',
+            '  if /I "%%A"=="!pool!" (',
+            '    set "val=%%B"',
+            '    set "sched=%%C"',
+            '  )',
             ')',
             'if not defined val exit /b 0',
             'if "!val!"=="__FAIL__" (',
             '  echo The specified application pool does not exist 1>&2',
             '  exit /b 1',
             ')',
-            'echo !val!',
+            'if /I not "!form!"=="/text:*" (',
+            '  echo !val!',
+            '  exit /b 0',
+            ')',
+            'set "seen=!pool!"',
+            'if exist "%~dp0seen.txt" set /p seen=<"%~dp0seen.txt"',
+            'echo   APPPOOL.NAME:"!seen!"',
+            'echo       [periodicRestart] ',
+            'echo         time:"!val!" ',
+            'if /I "!sched!"=="__NOSCHED__" goto tail',
+            'echo         [schedule] ',
+            'if defined sched (',
+            # MEASURED 2026-11-27: `for %%S in (!sched:;= !)` does NOT substitute - cmd hands the
+            # literal token `!sched:` to the loop and the guard read the entry as "sched:", so the
+            # pin went red for a stub artefact. The field is therefore written SPACE-separated
+            # (the map keeps ';' for readability) and the loop is a plain `!sched!` expansion.
+            '  for %%S in (!sched!) do (',
+            '    echo           [add] ',
+            '    echo             value:"%%S" ',
+            '  )',
+            ')',
+            ':tail',
+            'echo     [failure] ',
             'exit /b 0'
         )
         [System.IO.File]::WriteAllText($stub, (($body -join "`r`n") + "`r`n"), [System.Text.Encoding]::ASCII)
@@ -278,6 +321,91 @@ Describe 'iis-pool-recycle-guard' {
                 $obj.unreadable | Should -Be 0
                 $obj.expected | Should -Be '00:00:00'
                 @($obj.pools | Where-Object { $_.verdict -eq 'DRIFT' }).Count | Should -Be 1
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    Context 'a clock recycle is a drift, and the read proves its own object' {
+        # Measured 2026-11-27 on the front: 44 pools keep periodicRestart.time = 00:00:00 AND carry
+        # one [schedule] entry (mcp-tools.myia.io at 04:38:00 local, confirmed by 3 x event 5076 in
+        # 72 h). Reading `time` alone called every one of them healthy.
+        It 'a non-empty [schedule] is a DRIFT and exits 2, naming the entry' {
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00;04:38:00' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = 'models.myia.io' } -Out ([ref]$out)
+                $code | Should -Be 2
+                $text = ($out -join "`n")
+                $text | Should -Match 'POOL models\.myia\.io value=\[00:00:00\] expected=\[00:00:00\] verdict=DRIFT \(schedule=\[04:38:00\]\) schedule=\[04:38:00\]'
+                $text | Should -Match '\(schedule=\[04:38:00\]\)'
+                $text | Should -Match 'VERDICT DRIFT'
+                # the value itself is in spec: the drift comes from the schedule alone
+                $text | Should -Not -Match 'VERDICT OK'
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        It 'lists every [schedule] entry, not just the first' {
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00;04:38:00;06:00:00' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = 'models.myia.io' } -Out ([ref]$out)
+                $code | Should -Be 2
+                (($out -join "`n")) | Should -Match 'schedule=\[04:38:00,06:00:00\]'
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        It 'carries the schedule in JSON and counts the pool as one drift' {
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00'; 'mcp-tools.myia.io' = '00:00:00;04:38:00' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = 'models.myia.io,mcp-tools.myia.io'; Json = $true } -Out ([ref]$out)
+                $code | Should -Be 2
+                $obj = (($out -join '') | ConvertFrom-Json)
+                $obj.drift | Should -Be 1
+                $obj.unreadable | Should -Be 0
+                $sched = @($obj.pools | Where-Object { $_.pool -eq 'mcp-tools.myia.io' })[0].schedule
+                @($sched).Count | Should -Be 1
+                @($sched)[0] | Should -Be '04:38:00'
+                # the healthy pool keeps an empty list, not a missing field
+                $empty = @($obj.pools | Where-Object { $_.pool -eq 'models.myia.io' })[0]
+                $empty.verdict | Should -Be 'OK'
+                @($empty.schedule).Count | Should -Be 0
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        It 'a block that names ANOTHER pool is UNREADABLE, never a pass' {
+            # measured 2026-11-27: an EMPTY pool name makes appcmd list ALL pools (3572 lines,
+            # "DefaultAppPool" first) with rc 0; `/config` printed no object name at all and
+            # rendered an empty <schedule> for mcp-tools.myia.io. The identity is the proof.
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00' } -SeenOverride 'DefaultAppPool'
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = 'models.myia.io' } -Out ([ref]$out)
+                $code | Should -Be 1
+                $text = ($out -join "`n")
+                $text | Should -Match 'verdict=UNREADABLE \(identity=DefaultAppPool\) schedule=\[\]'
+                $text | Should -Match 'VERDICT INSTRUMENT'
+                $text | Should -Not -Match 'VERDICT OK'
+                $text | Should -Not -Match 'verdict=DRIFT'
+            } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        It 'an absent [schedule] section is UNREADABLE, not an empty schedule' {
+            # absence is not emptiness: without the section nothing proves the pool has no entry.
+            $d = New-TempDir
+            $out = $null
+            try {
+                $stub = New-StubAppCmd -Dir $d -Map @{ 'models.myia.io' = '00:00:00;__NOSCHED__' }
+                $code = Invoke-Guard -Params @{ AppCmd = $stub; Pools = 'models.myia.io' } -Out ([ref]$out)
+                $code | Should -Be 1
+                $text = ($out -join "`n")
+                $text | Should -Match 'verdict=UNREADABLE \(schedule absent\) schedule=\[\]'
+                $text | Should -Match 'VERDICT INSTRUMENT'
+                $text | Should -Not -Match 'VERDICT OK'
             } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
         }
     }
