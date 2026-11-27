@@ -302,12 +302,29 @@ Write-Host ""
 # Same reqN repeated many times = possible stuck loop. Normal requests produce
 # 2-3 lines (req + resp + stream marker); counts >= 6 across a wide window
 # warrant a look. Lower counts are just the normal multi-line traces of one req.
+#
+# RELAY SIDECAR ON AN IMAGE BUILT FROM A COMMIT BEFORE #1194 (`6de2fb0bc`,
+# merged 2026-11-27): a relayed request never reaches logRequest, so nothing
+# advances the per-process counter and EVERY relayed [ttft] line carries the
+# same frozen reqN. Zero [Request] lines in the window means nothing was served
+# locally at all, so a repeated reqN there is that frozen counter, not a loop.
+# Measured 25/11 on po-2024 (NOMINAL, 6 h): 2 311 [ttft] lines under one reqN.
+# On an image built from main at 6de2fb0bc or later each relayed request takes
+# its own number, so this branch only fires for older builds.
+# SCOPE: the key is ZERO [Request] lines, so it covers a pure relay window only
+# — an older build whose window holds ANY local serving still gets the false
+# loop verdict below (measured 27/11 with -Hours 6 on the ai-01 and po-2024
+# sidecars: the same five false rows on main and with this branch).
 Write-Host "--- Session Loop Check (reqN repeated >= 6 times = review) ---" -ForegroundColor Yellow
 $reqNGroups = $lines | Select-String -Pattern 'reqN=(\d+)' -AllMatches |
     ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value } |
     Group-Object | Sort-Object Count -Descending
 $suspects = $reqNGroups | Where-Object { $_.Count -ge 6 }
-if ($suspects) {
+if ($suspects -and @($requests).Count -eq 0) {
+    $ttftLines = @($lines | Where-Object { $_ -match '\[ttft\]' })
+    Write-Host ("  reqN={0} x{1} - FROZEN request counter, NOT a loop." -f $suspects[0].Name, $suspects[0].Count) -ForegroundColor Yellow
+    Write-Host ("  0 [Request] lines in this window: nothing was served locally, so no request advanced the counter and all {0} relayed [ttft] lines carry a FROZEN reqN (one per process - a container restart inside the window starts a fresh one). Volume = count the [ttft] lines. Per-request reqN on relayed lines needs an image built from main at 6de2fb0bc or later (#1194, merged 27/11)." -f $ttftLines.Count) -ForegroundColor Yellow
+} elseif ($suspects) {
     foreach ($g in $suspects | Select-Object -First 5) {
         Write-Host ("  reqN={0,-8} x{1}  (review for loop)" -f $g.Name, $g.Count) -ForegroundColor Yellow
     }
