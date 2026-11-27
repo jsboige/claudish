@@ -14,7 +14,7 @@ a build that carries it, the CHECK itself must name what it is looking at.
 
 Residual scope (measured 27/11, -Hours 6): the key is ZERO [Request] lines, so
 an older build whose window mixes relayed traffic with ANY local serving still
-gets the loop verdict — ai-01's and po-2024's sidecars print the same five false
+gets the loop verdict - ai-01's and po-2024's sidecars print the same five false
 rows on main and with this fix. That case is documented in the script, not
 pinned here.
 
