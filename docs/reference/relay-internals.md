@@ -571,6 +571,89 @@ code; neither is live on any seat until **that seat's container is recreated**
 sidecar needs the new image). Until then, a `[Health]` grep returning nothing is
 **not** evidence that no heartbeat arrived.
 
+## 2026-11-26 — a provider 502 relayed by a LIVE hub was read as a hub death (#1213)
+
+**What happened.** On `myia-po-2028` (a relaying seat, container `claudish-proxy`),
+one model's provider front answered 502 while the hub served every other role.
+For each request on that model the relay wrote
+`[Relay] forward failed (hub HTTP 502) → this request served LOCALLY`, replayed the
+request through its own pipeline against the **same** dead provider, and two in a
+row flipped the whole seat `AUTONOMOUS`.
+
+Measured, window `18:35:58Z → 19:20:45Z` (`docker logs -t`):
+
+| Line | Count |
+| --- | --- |
+| `[Relay] forward failed (hub HTTP 502) → this request served LOCALLY` | 32, all on `qwen3.6-35b-a3b` |
+| `… DOWN after 2 failure(s) (forward-http-502) → AUTONOMOUS` | 1, at `18:35:58.933Z` |
+| `… healthy again → NOMINAL (relay resumed)` | 1, at `18:37:05.672Z` — a 66.7 s window |
+| `[claudish] Error [Vllm-myia]: HTTP 502 reqN=…` (the local replay) | 35 |
+
+One client attempt (a probe at `19:19:41Z`, `stream:false`, 8 tokens) cost **42.28 s**:
+about 22 s at the hub, then about 21 s on the local replay — two calls to the dead
+provider for one answer. The hub's `/health` was 200 throughout. The consumer
+(`myia-po-2028:CoursIA-3`) saw `API Error: 502` and posted a `[DEGRADED]`.
+
+**Why.** The hub returns the provider's status as its own HTTP status
+(`composed-handler.ts`, the non-OK envelope), and nothing on the response said
+the 5xx was the upstream's. The relay treated every 5xx but two as the hub's own
+death: a 529 (#299 A) and a 503 carrying `x-claudish-drain-freeze: 1` (#318)
+already passed through, on the principle *the hub spoke, so it is liveness
+evidence*. A relayed 500/502/504 did not.
+
+**The fix — #318's pattern: an explicit header, never body sniffing.**
+
+1. **Hub.** The two sites in `ComposedHandler.handle()` that relay an upstream
+   status — the main non-OK envelope and the 401 auth-retry return — set
+   `x-claudish-upstream-error: 1` when that status is `>= 500`
+   (`handlers/shared/upstream-error-marker.ts`, a leaf module with no env var).
+   A provider 503 never reaches them: it is converted to the hub's own 529.
+2. **Relay.** A `>= 500` carrying the exact marker passes through: no `markFail`,
+   no local replay, streak reset, one countable console line —
+   `[Relay] hub HTTP <status> (upstream error relayed by a live hub, marked) — passed through to client, no local replay (#1213)`.
+   It is excluded from the `upstream-nonok` line (#763 — one event, one line),
+   and the marker survives the non-streaming rebuild, so an A→B→hub chain
+   composes.
+3. **OpenAI ingress.** `/v1/chat/completions` rebuilds an error from scratch;
+   the marker is carried across (`carryUpstreamErrorMarker`, the #229 pattern).
+   The relay is path-aware, and nb_coder / sk-agent ride this ingress.
+
+The predicate needs **both** conjuncts: a 4xx carrying the header keeps its
+ordinary 4xx path, and a foreign value is inert — never relayed as if it were
+ours.
+
+**What still flips a relay.** Everything that is the hub's own: an unmarked 500,
+the route's catch-path 500, a connect failure, a header deadline, a failing or
+stalled `/health`. An **old hub never sets the marker**, so a new relay behaves
+exactly as before against one; an old relay ignores one extra response header.
+
+**Residual scenario — option A, pure passthrough, is what the fix implements.** A
+hub that is alive but failing every provider with a 5xx no longer flips its
+relays: they stay NOMINAL and relay the errors. A hub answering 4xx for
+everything already behaved this way. Option B (a second streak that still flips
+after N consecutive marked 5xx) is described in #1213 for the coordinator.
+
+**Out of scope.** `NativeHandler`'s non-OK path returns Anthropic's status
+unmarked — same shape, not measured here; a follow-up grain.
+
+**Reading a seat's log.** Count pass-throughs with the `(#1213)` line, replays
+with `forward failed (hub HTTP`. With both ends on the new image a dead model
+produces the former only, and never `forward-http-502`.
+
+**Rollout.** A seat needs its container recreated to produce the marker (hub) or
+to honour it (sidecar). A hub recreated first changes nothing for old relays
+(they ignore the header); a relay recreated first changes nothing against an old
+hub (it never sends the marker). Prove each end at the seat, never from the
+deploy's intent: a `[Relay] … (#1213)` line proves that seat's relay is new; a
+`forward failed (hub HTTP 502)` line after a hub recreate proves the hub is not.
+
+**Tests.** `fork/server/relay.test.ts` (13 pins, in the hysteresis and #763
+blocks), `handlers/composed-handler-error.test.ts` (8),
+`handlers/shared/upstream-error-marker.test.ts` (10: the wire name and value,
+the truth table, the carry), and the route-level
+`proxy-server-upstream-error-marker.test.ts` (15: both ingresses through the real
+`createProxyServer`). Mutation pass on the PR: 14 mutants, 14 killed.
+
 ## The `:18182` pipe's launcher — logon-only, and the guard that replaces it (Q65)
 
 The façade's forwarder (`D:\Production\claudish-relay-po2025\relay.js`, a raw TCP

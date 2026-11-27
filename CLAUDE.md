@@ -124,6 +124,7 @@ Gotchas (internals, capture reading, incidents: `docs/reference/relay-internals.
 - **A forward connect failure gets exactly one retry (+250 ms) before falling through (#80 part 2)**; an absorbed retry does not `markFail`. A header deadline is never retried, nor is an HTTP 5xx (hysteresis owns it).
 - **Two upstream failure signatures — only one is a client-side transport artifact**: a connect failure is client-side only under #80's precondition (hub independently reachable); TCP accepted + an invalid response is hub-end unavailability. Count WAN impact from the ingress IIS log, never the relay's tally.
 - **`hub HTTP 500` is the relay's reading — corroborate hub-side before hunting a provider** (#299 A / #318 pass-throughs; an empty hub log was never evidence of a healthy hub).
+- **A 5xx the hub RELAYS from its provider is passed through, never replayed (#1213)** — the hub marks it `x-claudish-upstream-error: 1` (its two sites that relay an upstream status; a provider 503 becomes the hub's own 529); the relay honours the exact marker on a 5xx only: no `markFail`, streak reset, one `(#1213)` console line. An UNMARKED 5xx still falls through (a hub-own failure); an old hub never sets it. Count pass-throughs with `(#1213)`, replays with `forward failed (hub HTTP`.
 
 ## Budget Failover (v7.2+)
 
