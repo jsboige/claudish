@@ -27,6 +27,10 @@ _spec = importlib.util.spec_from_file_location("smx_perm", _TARGET)
 smx = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smx)
 
+# #1186: the child's bytes are pinned to UTF-8 whatever the seat's own encoding
+# is, and the reader always asks for UTF-8 -- the two layers are ONE contract.
+_CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
+
 MACHINE = "myia-po-2024"
 BLIND_FLEET = "permissions content published by no snapshot (collector blind spot)"
 BLIND_SEAT = "permissions: present on the seat, content not published (collector blind spot)"
@@ -52,10 +56,11 @@ def _run(snap):
             json.dump(snap, f)
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, "--stale-hours", "100000", MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    return proc.stdout
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    return proc.stdout or ""
 
 
 def test_live_shape_says_the_deny_list_is_invisible():
@@ -91,6 +96,19 @@ def test_permissions_published_matches_dotted_and_bare_keys():
     assert smx.permissions_published({"permissions": {"deny": []}})
     assert smx.permissions_published({"permissions.deny": []})
     assert not smx.permissions_published({"permissionsX": 1, "model": "opus"})
+
+
+def test_a_non_ascii_value_does_not_kill_the_reading():
+    """A non-ASCII string anywhere in the snapshot must not kill a strict
+    decoder inside subprocess' reader thread (`stdout=None`, the #1175
+    signature) -- the reading returns TEXT, whatever the seat's encoding
+    (#1186)."""
+    value = "claude-fable-Á"  # Á: UTF-8 C3 81, and 0x81 is undefined in cp1252
+    out = _run(_snapshot(
+        other_top=["effortLevel"],
+        harmonization={"env.FIXTURE_ENCODING_CARRIER": value},
+    ))
+    assert value in out, out[-800:]
 
 
 if __name__ == "__main__":

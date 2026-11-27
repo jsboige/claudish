@@ -32,6 +32,10 @@ _spec = importlib.util.spec_from_file_location("smx_canon_age", _TARGET)
 smx = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smx)
 
+# #1186: the child's bytes are pinned to UTF-8 whatever the seat's own encoding
+# is, and the reader always asks for UTF-8 -- the two layers are ONE contract.
+_CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
+
 KEY = "env.CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 # Read the canonical expectation from the script itself, and pick a value that
 # cannot collide with it: a future canon change must not rot this pin.
@@ -120,7 +124,8 @@ def _write_snapshot(root, machine, hours_old, value):
 def _main(*argv):
     return subprocess.run(
         [sys.executable, _TARGET, *argv],
-        capture_output=True, text=True, encoding="utf-8",
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=_CHILD_ENV,
     )
 
 
@@ -129,10 +134,10 @@ def test_main_default_threshold_marks_a_30h_snapshot_stale():
     with tempfile.TemporaryDirectory() as root:
         _write_snapshot(root, "myia-po-2028", 30, ACTUAL)
         proc = _main("--shared", root, "myia-po-2028")
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "STALE" in proc.stdout, proc.stdout[-800:]
-    assert "re-read live" in proc.stdout, proc.stdout[-800:]
-    assert "off canon" not in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "STALE" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+    assert "re-read live" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+    assert "off canon" not in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 def test_main_canon_stale_hours_is_honored():
@@ -140,10 +145,27 @@ def test_main_canon_stale_hours_is_honored():
     with tempfile.TemporaryDirectory() as root:
         _write_snapshot(root, "myia-po-2028", 30, ACTUAL)
         proc = _main("--shared", root, "--canon-stale-hours", "48", "myia-po-2028")
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "off canon" in proc.stdout, proc.stdout[-800:]
-    assert "STALE" not in proc.stdout, proc.stdout[-800:]
-    assert "snapshot age" in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "off canon" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+    assert "STALE" not in (proc.stdout or ""), (proc.stdout or "")[-800:]
+    assert "snapshot age" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+
+
+def test_main_reads_a_non_ascii_value_verbatim():
+    """The reader returns TEXT, never None, whatever the seat's encoding (#1186).
+
+    main() prints harmonization values with `ensure_ascii=False`, so a value
+    carrying a non-ASCII character reaches the child's stdout byte-for-byte.
+    Measured on po-2027 (cp1252 seat): with either layer removed the fixture
+    value comes back mojibake, or the strict decoder dies inside subprocess'
+    reader thread and hands back `stdout=None` -- the #1175 signature.
+    """
+    value = "199999-Á"  # Á: UTF-8 C3 81, and 0x81 is undefined in cp1252
+    with tempfile.TemporaryDirectory() as root:
+        _write_snapshot(root, "myia-po-2028", 30, value)
+        proc = _main("--shared", root, "myia-po-2028")
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert value in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 if __name__ == "__main__":
