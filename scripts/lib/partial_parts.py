@@ -306,3 +306,72 @@ def warm_first_open(paths, workers=WARM_POOL):
 
     with ThreadPoolExecutor(workers) as ex:
         return sum(ex.map(one, paths))
+
+
+def imap_pooled(items, fn, workers=WARM_POOL, window=None):
+    """Applique `fn` a chaque element par un pool de `workers` fils, et REND
+    `(index, valeur, exception)` DANS L'ORDRE d'entree.
+
+    `warm_first_open` divise l'attente d'une PREMIERE ouverture ; celle-ci
+    divise la meme attente la ou le travail de l'appelant la REPAIE. Mesure du
+    26/11 (tir du creux, jour 2026-11-23, 135 054 membres) : la prechauffe en
+    pool de 8 coute 8,34 ms par fichier, puis le scan repaie 57,4 ms par membre
+    en ouvrant chaque fichier en serie — le benefice de #1197 s'arretait a
+    l'ouverture. Le cout est de l'ATTENTE par fichier (P : 55,65 ms en serie
+    pour 0,86 s de CPU), pas du calcul : la paralleliser ne change aucun
+    decompte, l'agregation de l'appelant reste sequentielle et dans l'ordre.
+
+    BORNE EN VOL (`window`, defaut 32 x workers) : un corpus de 135 054
+    fichiers ne tient pas en memoire, et un pool qui soumettrait tout d'abord
+    garderait tout. Le generateur ne soumet un element qu'en consommant les
+    precedents.
+
+    Une exception de `fn` n'est JAMAIS levee ici : elle est rendue avec son
+    element, et l'appelant applique SA politique (sauter, relayer, compter).
+    `workers` <= 1 : tout sur le fil de l'appelant, sans pool ni fenetre —
+    l'interrupteur, et le chiffre de reference.
+    """
+    workers = bound_workers(workers)
+    if workers <= 1:
+        for i, item in enumerate(items):
+            try:
+                yield i, fn(item), None
+            except Exception as exc:  # noqa: BLE001 — rendue, pas avalee
+                yield i, None, exc
+        return
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        in_flight = max(1, int(window)) if window else workers * 32
+    except (TypeError, ValueError):
+        in_flight = workers * 32
+    source = iter(enumerate(items))
+    pending = deque()
+    ex = ThreadPoolExecutor(workers)
+    try:
+        def fill():
+            """Soumet jusqu'a `in_flight` elements -> False quand la source est epuisee."""
+            while len(pending) < in_flight:
+                try:
+                    i, item = next(source)
+                except StopIteration:
+                    return False
+                pending.append((i, ex.submit(fn, item)))
+            return True
+
+        drained = not fill()
+        while pending:
+            i, fut = pending.popleft()
+            try:
+                value, exc = fut.result(), None
+            except Exception as error:  # noqa: BLE001 — rendue a l'appelant
+                value, exc = None, error
+            yield i, value, exc
+            if not drained:
+                drained = not fill()
+    finally:
+        # Fermeture anticipee (l'appelant s'arrete avant la fin) : on n'attend
+        # pas les elements en vol, ils ne serviraient a rien — mais on ne les
+        # laisse pas non plus ecrire dans un generateur mort.
+        ex.shutdown(wait=False, cancel_futures=True)
