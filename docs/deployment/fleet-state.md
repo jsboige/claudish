@@ -214,7 +214,11 @@ a rebuild followed by a drained recreate does.
 - **The per-container check, one read, never an assumption**: `GET /health` → `clientGoneDetect`
   (`detected` · `undetected` · `disabled` · `pending` · `error:<why>`). `detected` means the runtime
   carries the capability; `undetected` on a freshly created container means its image is still on
-  1.3.14.
+  1.3.14. **`pending` is the boot probe not settled yet — neither ok nor a defect, and it lasts
+  longer than a quick check assumes**: measured 2026-11-27, the verdict left `pending` after 562/601 ms
+  on 1.4.5 but after 2 443/2 389 ms on 1.3.14 (the probe is bounded at 1.5 s). A read taken in the
+  first two seconds of a 1.3 container therefore returns `pending`, not `undetected` — poll until the
+  value moves (bound ~15 s) before recording a verdict.
 - **Rollout is seat by seat**, each by `[PROPOSAL]`/ACK then a **drained recreate**
   (`claudish-drain.ps1 -Recreate -EnvFile`), never a bare restart. **No seat has been moved at the
   time of writing** — this section records the state, not a migration.
