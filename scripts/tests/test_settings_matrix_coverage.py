@@ -221,6 +221,45 @@ def test_an_undated_source_never_outranks_a_dated_one():
     assert source == "v1-2026-10-31T00-00-00-000Z", source
 
 
+def test_a_dated_incumbent_is_not_displaced_by_an_undated_challenger():
+    """The REVERSE direction of the rule above, and the shape the M2 mutant kept
+    alive (#1136, 27/11): guard the challenger's date with a HIGH sentinel
+    instead of the empty string and an undated challenger beats ANY dated
+    incumbent -- while the pin above stays green, because there the undated
+    candidate is met FIRST and the dated one wins on the way in.
+
+    Ordering is the whole pin: `snapshot_candidates` yields the standalone
+    before the versioned packages, so the dated standalone is the incumbent.
+    That premise is asserted, not assumed -- with the order reversed this test
+    would pass under the mutant too and prove nothing."""
+    with tempfile.TemporaryDirectory() as root:
+        _standalone(root, _snapshot("2026-10-31T00:00:00.000Z"))
+        _versioned(root, "v1-undated", _snapshot(""))
+        sources = [source for source, _snap in smx.snapshot_candidates(root, MACHINE)]
+        assert sources.index("standalone") < sources.index("v1-undated"), sources
+        snap, source = smx.latest_snapshot(root, MACHINE)
+    assert snap is not None
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap
+    assert source == "standalone", source
+
+
+def test_an_undated_package_does_not_displace_a_dated_pointer():
+    """Second source pair for the same property: the `latest.json` candidate is
+    built before the versioned scan, so a dated target it points at is the
+    incumbent when an undated package is met later. A reader that lets the
+    undated package win would serve settings with no age signal at all."""
+    with tempfile.TemporaryDirectory() as root:
+        pointed = _versioned(root, "v1-dated", _snapshot("2026-10-31T00:00:00.000Z"))
+        _versioned(root, "v2-undated", _snapshot(""))
+        _pointer(root, pointed)
+        sources = [source for source, _snap in smx.snapshot_candidates(root, MACHINE)]
+        assert sources.index("latest.json") < sources.index("v2-undated"), sources
+        snap, source = smx.latest_snapshot(root, MACHINE)
+    assert snap is not None
+    assert snap["collectedAt"] == "2026-10-31T00:00:00.000Z", snap
+    assert source == "latest.json", source
+
+
 # --------------------------------------------------------------------------
 # What does NOT count as a snapshot
 # --------------------------------------------------------------------------
