@@ -26,6 +26,7 @@ import {
   type InboundKeyEntry,
 } from "../../handlers/shared/inbound-keys.js";
 import { markKeylessExempt } from "../../handlers/shared/keyless-exempt.js";
+import { noteProxyAuthRefusal } from "./proxy-auth-refusals.js";
 import { logStderr } from "../../logger.js";
 import { parseModelSpec } from "../../providers/model-parser.js";
 import type { ClaudishProfileConfig } from "../../profile-config.js";
@@ -200,6 +201,19 @@ export function createProxyAuthMiddleware(
 
     // Non-Anthropic: enforce proxy key
     if (!matchesProxyKey(provided, proxyKeys)) {
+      // Countable, bounded, key-free trace of the refusal — before this the
+      // 401 left nothing on the hub (no capture, no log), so a seat's "auth
+      // trouble" could not be checked hub-side (see proxy-auth-refusals.ts).
+      noteProxyAuthRefusal(
+        {
+          "x-proxy-key": proxyKeyHeader,
+          "x-api-key": apiKeyHeader,
+          authorization: authHeader,
+          "x-claudish-machine": c.req.header("x-claudish-machine"),
+          "user-agent": c.req.header("user-agent"),
+        },
+        model
+      );
       return c.json(wrapAnthropicError(401, "invalid proxy authentication"), 401);
     }
     // #439 — the request is authenticated and this middleware is the site
