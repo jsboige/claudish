@@ -35,6 +35,10 @@ _spec = importlib.util.spec_from_file_location("smx_cov", _TARGET)
 smx = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smx)
 
+# #1186: the child's bytes are pinned to UTF-8 whatever the seat's own encoding
+# is, and the readers below always ask for UTF-8 -- the two layers are ONE contract.
+_CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
+
 MACHINE = "myia-po-2024"
 
 
@@ -108,11 +112,12 @@ def test_not_covered_is_printed_as_absence_not_silence():
         os.makedirs(os.path.join(root, "configs", MACHINE))
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "NOT COVERED: no claude-settings snapshot published" in proc.stdout, proc.stdout[-800:]
-    assert "%s: NOT COVERED" % MACHINE in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "NOT COVERED: no claude-settings snapshot published" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+    assert "%s: NOT COVERED" % MACHINE in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 # --------------------------------------------------------------------------
@@ -227,10 +232,11 @@ def test_fresh_snapshot_is_not_flagged_stale():
         _versioned(root, "v1-fresh", _snapshot(fresh))
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, "--stale-hours", "48", MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "snapshot stale" not in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "snapshot stale" not in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 def test_old_snapshot_is_flagged_stale():
@@ -240,10 +246,11 @@ def test_old_snapshot_is_flagged_stale():
         _versioned(root, "v1-old", _snapshot("2020-01-01T00:00:00.000Z"))
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, "--stale-hours", "1", MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "snapshot stale (2020-01-01T00:00:00.000Z)" in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "snapshot stale (2020-01-01T00:00:00.000Z)" in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 def test_missing_collected_at_reads_as_stale_not_as_fresh():
@@ -256,10 +263,35 @@ def test_missing_collected_at_reads_as_stale_not_as_fresh():
         assert smx.age_hours(snap.get("collectedAt"), smx.dt.datetime.now(smx.dt.timezone.utc)) is None
         proc = subprocess.run(
             [sys.executable, _TARGET, "--shared", root, MACHINE],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
         )
-    assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
-    assert "snapshot stale" in proc.stdout, proc.stdout[-800:]
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert "snapshot stale" in (proc.stdout or ""), (proc.stdout or "")[-800:]
+
+
+# --------------------------------------------------------------------------
+# The reading survives a non-ASCII value (#1186)
+# --------------------------------------------------------------------------
+
+def test_a_non_ascii_harmonized_value_reaches_the_reader_verbatim():
+    """main() prints harmonization values with `ensure_ascii=False`; the child
+    pin and the reader net are what let a non-ASCII value cross the pipe
+    (#1186). Measured on po-2027: with either layer removed the value comes
+    back mojibake, or the strict decoder hands back `stdout=None` (#1175)."""
+    value = "claude-fable-Á"  # Á: UTF-8 C3 81, and 0x81 is undefined in cp1252
+    with tempfile.TemporaryDirectory() as root:
+        _versioned(root, "v1-enc", _snapshot(
+            "2026-10-31T00:00:00.000Z",
+            harmonization={"env.FIXTURE_ENCODING_CARRIER": value},
+        ))
+        proc = subprocess.run(
+            [sys.executable, _TARGET, "--shared", root, MACHINE],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=_CHILD_ENV,
+        )
+    assert proc.returncode == 0, (proc.returncode, (proc.stderr or "")[-400:])
+    assert value in (proc.stdout or ""), (proc.stdout or "")[-800:]
 
 
 if __name__ == "__main__":

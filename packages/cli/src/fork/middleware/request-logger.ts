@@ -60,6 +60,21 @@ export function requestNumberFor(reqLike: unknown): number {
   return (g.__capN as number) ?? 0;
 }
 
+/**
+ * The write side of requestNumberFor: take the NEXT request number and key it
+ * to `req`. Two call sites, deliberately. logRequest, for a request this process
+ * SERVES locally. The relay's forwardToUpstream, for one it RELAYS: that
+ * request never reaches logRequest, and without a number of its own every
+ * marker it emits resolves the GLOBAL counter — which no relayed request
+ * advances, so on a NOMINAL sidecar the whole log carries one frozen reqN.
+ */
+export function assignRequestNumber(req: Request): number {
+  const n = ++capN;
+  (globalThis as Record<string, unknown>).__capN = n;
+  reqNumberMap.set(req, n);
+  return n;
+}
+
 export function resolveSourceIp(
   req: Request,
   remoteAddrMap: WeakMap<Request, string>
@@ -212,9 +227,7 @@ export function logRequest(
   // response-capture resolve it through requestNumberFor/reqNumberMap, and the
   // [ttft]/[resp] markers must label the request that spawned them even when
   // capture is off.
-  const n = ++capN;
-  (globalThis as Record<string, unknown>).__capN = n;
-  reqNumberMap.set(req, n);
+  const n = assignRequestNumber(req);
 
   // Full-body capture (temporary diagnostic — gated by CLAUDISH_CAPTURE_DIR env).
   // Disabled when the env var is unset, so this is a no-op in normal operation.
