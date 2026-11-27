@@ -394,6 +394,24 @@ def test_an_unanswerable_tree_leaves_the_divergence_unmeasured():
     assert "never a fleet fact" not in " ".join(report["notes"]), report["notes"]
 
 
+def test_a_tree_that_was_never_probed_does_not_join_the_store_divergence():
+    # M15, the pin the coordinator asked for on 27/11 (#1136, #1204): classify
+    # `tree-missing` as "without_store" and a tree that was NEVER READ becomes
+    # half of a finding -- the report prints "the canon store is under ONE tree
+    # only" about an absence nobody measured. Concrete shape: the process tree
+    # carries the store, the User scope points at a path on an unmounted drive.
+    with tempfile.TemporaryDirectory() as root:
+        missing = fork.cascade_store_report(Path(root) / "unmounted-drive", NOW)
+    assert missing["status"] == "tree-missing", missing
+    report, _ = _probe(TREE_OLD, TREE_NEW,
+                       cascade_fn=_cascades({TREE_OLD: PRESENT_STORE, TREE_NEW: missing}))
+    assert report["cascade"]["with_store"] == ["process"], report["cascade"]
+    assert report["cascade"]["without_store"] == [], report["cascade"]
+    assert report["cascade"]["unmeasured"] == ["user"], report["cascade"]
+    assert report["cascade"]["divergent"] is None, report["cascade"]
+    assert "never a fleet fact" not in " ".join(report["notes"]), report["notes"]
+
+
 def test_a_store_present_or_absent_under_both_trees_is_not_divergent():
     both, _ = _probe(TREE_OLD, TREE_NEW,
                      cascade_fn=_cascades({TREE_OLD: PRESENT_STORE, TREE_NEW: PRESENT_STORE}))
