@@ -71,11 +71,12 @@ interface RunResult {
  */
 async function run(
   clientPayload: any,
-  opts?: { effortTarget?: "chat_template_kwargs.reasoning_effort"; extraPayloadFields?: Record<string, unknown> }
+  opts?: { effortTarget?: "chat_template_kwargs.reasoning_effort"; extraPayloadFields?: Record<string, unknown>; model?: string }
 ): Promise<RunResult> {
   let wireBody: any;
-  const handler = new ComposedHandler(makeTransport(opts?.extraPayloadFields), MODEL, MODEL, 8472, {
-    adapter: new OpenAIAPIFormat(MODEL),
+  const model = opts?.model ?? MODEL;
+  const handler = new ComposedHandler(makeTransport(opts?.extraPayloadFields), model, model, 8472, {
+    adapter: new OpenAIAPIFormat(model),
     ...(opts?.effortTarget ? { effortTarget: opts.effortTarget } : {}),
   });
   const app = new Hono();
@@ -116,6 +117,27 @@ const baseRequest = (effort?: string, thinking?: unknown): any => {
   if (thinking !== undefined) payload.thinking = thinking;
   return payload;
 };
+
+describe("ComposedHandler — GLM 5.4 medium experiment", () => {
+  test("sends the high tier in the actual outbound body", async () => {
+    const previous = process.env.CLAUDISH_GLM54_EFFORT;
+    const previousThinking = process.env.CLAUDISH_GLM_THINKING;
+    process.env.CLAUDISH_GLM54_EFFORT = "medium";
+    delete process.env.CLAUDISH_GLM_THINKING;
+    try {
+      const request = { ...baseRequest("xhigh", { type: "adaptive" }), model: "glm-5.4" };
+      const { wireBody, resStatus } = await run(request, { model: "glm-5.4" });
+      expect(resStatus).toBe(200);
+      expect(wireBody.reasoning_effort).toBe("high");
+      expect(wireBody.thinking).toEqual({ type: "enabled" });
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDISH_GLM54_EFFORT;
+      else process.env.CLAUDISH_GLM54_EFFORT = previous;
+      if (previousThinking === undefined) delete process.env.CLAUDISH_GLM_THINKING;
+      else process.env.CLAUDISH_GLM_THINKING = previousThinking;
+    }
+  });
+});
 
 describe("ComposedHandler — #667 effort mapping onto chat_template_kwargs.reasoning_effort", () => {
   test("AC1: without the option the client effort is dropped exactly as today (byte-identical path)", async () => {

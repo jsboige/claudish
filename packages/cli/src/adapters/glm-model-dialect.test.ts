@@ -17,10 +17,13 @@ import { describe, it, expect, afterEach } from "bun:test";
 import { GLMModelDialect } from "./glm-model-dialect.js";
 
 const ORIGINAL = process.env.CLAUDISH_GLM_THINKING;
+const ORIGINAL_EFFORT = process.env.CLAUDISH_GLM54_EFFORT;
 
 afterEach(() => {
   if (ORIGINAL === undefined) delete process.env.CLAUDISH_GLM_THINKING;
   else process.env.CLAUDISH_GLM_THINKING = ORIGINAL;
+  if (ORIGINAL_EFFORT === undefined) delete process.env.CLAUDISH_GLM54_EFFORT;
+  else process.env.CLAUDISH_GLM54_EFFORT = ORIGINAL_EFFORT;
 });
 
 function dialect() {
@@ -28,6 +31,50 @@ function dialect() {
 }
 
 const OPENAI = { wireFormat: "openai-sse" as const };
+
+describe("GLM 5.4 effort experiment", () => {
+  it("forces the documented high tier for medium on the OpenAI wire", () => {
+    process.env.CLAUDISH_GLM54_EFFORT = "medium";
+    delete process.env.CLAUDISH_GLM_THINKING;
+    const payload: any = { reasoning_effort: "max" };
+    new GLMModelDialect("glm-5.4").prepareRequest(payload, { thinking: { type: "adaptive" } }, OPENAI);
+    expect(payload.reasoning_effort).toBe("high");
+    expect(payload.thinking).toEqual({ type: "enabled" });
+  });
+
+  it("leaves defaults, other models and the Anthropic wire unchanged", () => {
+    delete process.env.CLAUDISH_GLM_THINKING;
+    delete process.env.CLAUDISH_GLM54_EFFORT;
+    const normal: any = {};
+    new GLMModelDialect("glm-5.4").prepareRequest(normal, {}, OPENAI);
+    expect(normal.reasoning_effort).toBeUndefined();
+    process.env.CLAUDISH_GLM54_EFFORT = "medium";
+    const other: any = {};
+    dialect().prepareRequest(other, {}, OPENAI);
+    expect(other.reasoning_effort).toBeUndefined();
+    const anthropic: any = {};
+    new GLMModelDialect("glm-5.4").prepareRequest(anthropic, {}, { wireFormat: "anthropic-sse" });
+    expect(anthropic.reasoning_effort).toBeUndefined();
+  });
+
+  it("preserves a client's explicit disabled thinking", () => {
+    process.env.CLAUDISH_GLM54_EFFORT = "medium";
+    delete process.env.CLAUDISH_GLM_THINKING;
+    const payload: any = { reasoning_effort: "max" };
+    new GLMModelDialect("glm-5.4").prepareRequest(payload, { thinking: { type: "disabled" } }, OPENAI);
+    expect(payload.reasoning_effort).toBeUndefined();
+    expect(payload.thinking).toEqual({ type: "disabled" });
+  });
+
+  it("does not override the explicit disabled policy", () => {
+    process.env.CLAUDISH_GLM54_EFFORT = "medium";
+    process.env.CLAUDISH_GLM_THINKING = "disabled";
+    const payload: any = { reasoning_effort: "max" };
+    new GLMModelDialect("glm-5.4").prepareRequest(payload, {}, OPENAI);
+    expect(payload.reasoning_effort).toBeUndefined();
+    expect(payload.thinking).toEqual({ type: "disabled" });
+  });
+});
 
 describe("GLMModelDialect — #435 ingress-mapped thinking (OpenAI wire)", () => {
   it("ingress {type:'disabled'} → wire {type:'disabled'} — the 37→3 probe shape", () => {

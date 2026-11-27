@@ -47,8 +47,8 @@ export class GLMModelDialect extends BaseAPIFormat {
    *   thinking absent            → 200, out 37, reasoning 131 chars (thinks by default)
    *   {"type":"enabled"}         → 200, out 41, reasoning 148 chars
    *   {"type":"disabled"}        → 200, out  3, reasoning   0 chars — the switch works
-   *   enabled + budget_tokens    → 200, tolerated and ignored (GLM is binary,
-   *                                unlike Qwen there is no budget control)
+   *   enabled + budget_tokens    → 200, tolerated and ignored on GLM 5.3
+   *                                (this does not test GLM 5.4 reasoning_effort)
    *
    * The historical unconditional strip ("GLM doesn't support thinking params")
    * was a GLM-4.x-era artifact: it couldn't disable thinking in a crunch, and
@@ -78,6 +78,18 @@ export class GLMModelDialect extends BaseAPIFormat {
         delete request.thinking;
       }
       return request;
+    }
+
+    // Opt-in experiment: Coding Plan maps the requested medium to its high tier.
+    // Restrict it to GLM 5.4 on the OpenAI wire; leave other models and the
+    // Anthropic wire untouched. An explicit disabled policy still wins below.
+    if (this.modelId.toLowerCase() === "glm-5.4" &&
+        (process.env.CLAUDISH_GLM54_EFFORT || "").trim().toLowerCase() === "medium") {
+      if (policy.kind === "disabled" || originalRequest.thinking?.type === "disabled") {
+        delete request.reasoning_effort;
+      } else {
+        request.reasoning_effort = "high";
+      }
     }
 
     // OpenAI wire

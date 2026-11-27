@@ -436,9 +436,10 @@ services:
       # Qwen reasons by default and bills on output. disabled (default) |
       # passthrough | budget:<n>. Re-read per request: flip without a restart.
       - CLAUDISH_QWEN_THINKING=${CLAUDISH_QWEN_THINKING:-}
-      # GLM thinking is binary on the coding wire. passthrough (default) |
-      # disabled. Re-read per request: flip without a restart.
+      # GLM thinking switch: passthrough (default) | disabled.
       - CLAUDISH_GLM_THINKING=${CLAUDISH_GLM_THINKING:-}
+      # GLM 5.4 Coding Plan experiment: medium selects its documented high tier.
+      - CLAUDISH_GLM54_EFFORT=${CLAUDISH_GLM54_EFFORT:-medium}
       # MiniMax honors the client's thinking value exactly (CC sends disabled
       # for haiku/subagents). passthrough (default) | disabled | forced[:<n>].
       # Re-read per request: flip without a restart.
