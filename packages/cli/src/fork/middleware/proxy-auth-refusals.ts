@@ -23,6 +23,10 @@
  * Never key material: no value, no prefix, no length, no fingerprint — a
  * refusal log must not become a key oracle for whoever reads `docker logs`.
  * State is in-memory and bounded (MAX_BUCKETS); a restart resets the counts.
+ * The bound has a known cost: an unauthenticated client can mint MAX_BUCKETS
+ * machine names, after which every NEW bucket (a real seat included) counts
+ * under `overflow` until the process restarts. The line still says
+ * `bucket=overflow`, so a reader knows the attribution was lost, not wrong.
  */
 
 import { proxyKeyAuthBucket } from "../../handlers/shared/proxy-key-rotation.js";

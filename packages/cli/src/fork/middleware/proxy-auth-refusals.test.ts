@@ -144,6 +144,23 @@ describe("proxy-auth middleware — the 401 now leaves a trace", () => {
     expect(proxyAuthRefusalCounts()).toEqual({ "myia-po-2026": 1 });
   });
 
+  it("used= follows the middleware's precedence: a wrong x-proxy-key is judged even when x-api-key holds the right key", async () => {
+    // Pins both sides of the x-proxy-key > x-api-key order (review M4). If the
+    // middleware flips, the request is served (200, no marker); if usedHeader
+    // flips, the marker names x-api-key. Either way this test fails.
+    const res = await post(
+      app(),
+      { "x-proxy-key": SECRET, "x-api-key": "fleet-key", "x-claudish-machine": "myia-po-2026" },
+      "or@glm-5.3"
+    );
+    expect(res.status).toBe(401);
+    const markers = lines.filter((l) => l.includes("[ProxyAuth]"));
+    expect(markers.length).toBe(1);
+    expect(markers[0]).toContain("used=x-proxy-key present=x-proxy-key+x-api-key");
+    expect(markers.join("")).not.toContain(SECRET);
+    expect(markers.join("")).not.toContain("fleet-key");
+  });
+
   it("the native exemption is unchanged: a keyless claude-* is not a refusal and is not counted", async () => {
     const a = app();
     expect((await post(a, {}, "claude-opus-5-5")).status).toBe(200);
