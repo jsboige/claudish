@@ -92,10 +92,16 @@ class DiscoveryTests(unittest.TestCase):
     def test_ci_walks_the_same_files(self):
         with open(_WORKFLOW, encoding="utf-8") as f:
             globs = ci_globs(f.read())
-        self.assertEqual(
-            len(globs), 1, "expected exactly one scripts/tests walk in the workflow, got %r" % (globs,)
-        )
-        self.assertEqual(globs[0], "scripts/tests/" + _runner.PATTERN)
+        # Positive control: with no walk found, the loop below would pass vacuously.
+        self.assertGreater(len(globs), 0, "no scripts/tests walk found in the workflow")
+        # #1199 runs the walk twice (default stdio, then cp1252). The count is not
+        # the contract; every pass walking the runner's files is.
+        for glob in globs:
+            self.assertEqual(
+                glob,
+                "scripts/tests/" + _runner.PATTERN,
+                "a scripts/tests walk in the workflow is narrowed: %r" % (globs,),
+            )
 
     def test_ci_glob_parser_reads_a_spelling_it_must_reject(self):
         # The helper is pinned against its own failure mode: a narrowed glob in
