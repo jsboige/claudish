@@ -44,6 +44,12 @@ def make_repo(root: Path) -> Path:
     git(repo, "init", "-q")
     git(repo, "config", "user.email", "test@example.invalid")
     git(repo, "config", "user.name", "test")
+    # Pin the premise, not just the identity: the accented-path test asserts
+    # that a default ls-tree QUOTES non-ASCII names, and "default" is the
+    # seat's global config unless the fixture says otherwise. Measured 27/11 on
+    # a seat with core.quotePath=false: the names came back unquoted, the
+    # premise assertion failed, and one seat read a red where CI read green.
+    git(repo, "config", "core.quotePath", "true")
     (repo / "Series").mkdir()
     (repo / "Series" / "T-01-Python.ipynb").write_text("{}", encoding="utf-8")
     git(repo, "add", "-A")
