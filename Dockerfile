@@ -1,4 +1,9 @@
-FROM oven/bun:1.3-alpine
+# #1209 2/2 — the runtime is a CAPABILITY here, not a build preference: bun 1.3
+# never surfaces a `stream:false` client's departure, bun >= 1.4 does (measured
+# 2026-11-26 on the official images, same hono/@hono-node-server). The rest of
+# the fix is inert on 1.3, so this image carries the floor rather than leaving
+# the fleet on a runtime its CI does not test (test.yml pins 1.4.0).
+FROM oven/bun:1.4-alpine
 
 WORKDIR /app
 
