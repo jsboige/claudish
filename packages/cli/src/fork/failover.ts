@@ -445,6 +445,16 @@ function splitSteps(raw: string): string[] {
   return raw.split(">").map((s) => s.trim()).filter(Boolean);
 }
 
+/** Split CLAUDISH_FAILOVER_<ROLE>_NOTE POSITIONALLY, like `_RESET`: a note
+ * belongs to one step, and most steps carry none, so an empty entry is a
+ * placeholder, never noise. `>Note for step 1` and `a>>c` must keep their
+ * holes — filtering them (splitSteps) shifted every later note onto the wrong
+ * step: `a>>c` displayed step 2's note on step 1. An empty entry reads as "no
+ * note" at its own position. */
+function splitStepNotes(raw: string): string[] {
+  return raw.split(">").map((s) => s.trim());
+}
+
 /** #274: parse a `role:<r>` step reference. Returns the role when the raw step
  * is exactly that form (case-insensitive, trimmed); undefined otherwise — a
  * model target must never be misparsed as a delegation (models can contain
@@ -537,7 +547,7 @@ function loadRules(env: NodeJS.ProcessEnv): Map<FailoverRole, FailoverRule> {
     const key = `CLAUDISH_FAILOVER_${role.toUpperCase()}`;
     const labels = splitSteps(env[`${key}_LABEL`] || "");
     const directions = splitSteps(env[`${key}_DIRECTION`] || "");
-    const notes = splitSteps(env[`${key}_NOTE`] || "");
+    const notes = splitStepNotes(env[`${key}_NOTE`] || "");
     const resets = parseStepResets(env[`${key}_RESET`], targets.length, role);
     if (labels.length !== 0 && labels.length !== targets.length) {
       logStderr(
