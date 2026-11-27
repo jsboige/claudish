@@ -194,7 +194,7 @@ Failed-translation workflow: `claudish --model X --debug "say hello"` → `claud
 
 **Never mock HTTP with `Bun.serve` in a test file (#604).** Once any `node:http` server has lived in the `bun test` process — every `proxy-server-*.test.ts` route test is one — every `Bun.serve` created afterwards is unreachable. Use `packages/cli/src/test-support/stub-fetch.ts` (`installStubFetch` / `hangUntilAborted`): same wire semantics, no socket.
 
-**PowerShell ops scripts have their own suite**: `bun run test:scripts` (pwsh 7) and `test:scripts:win51` — **the interpreter the scheduled tasks actually use**; run both, they do not agree, and 5.1 ships. ⚠ **Dot-sourcing `claudish-drain.ps1` clobbers `$ClaudishHome`** — a sandboxed test must assert on the log path too. Runbook: `docs/reference/ops-scripts.md`.
+**PowerShell ops scripts have their own suite**: `bun run test:scripts` (pwsh 7) and `test:scripts:win51` — **the interpreter the scheduled tasks actually use**; run both, they do not agree, and 5.1 ships. ⚠ **A `.ps1`/`.psm1` edit is also checked by `encoding-bom.Tests.ps1`** (#519) — a BOM-less file must stay pure ASCII, and a targeted `-Path <file>` run never executes that guard. ⚠ **Dot-sourcing `claudish-drain.ps1` clobbers `$ClaudishHome`** — a sandboxed test must assert on the log path too. Runbook: `docs/reference/ops-scripts.md`.
 
 **The always-loaded files have byte budgets, and a gate** — `packages/cli/src/test-support/harness-budget.test.ts` refuses `CLAUDE.md` above **36 864 B** (36 KiB); the failure message names the `docs/reference/<theme>.md` file the detail belongs in.
 
