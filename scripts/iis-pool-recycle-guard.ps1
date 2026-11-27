@@ -13,6 +13,18 @@
 #   1  at least one pool could not be read: an empty output or a non-zero exit is NOT a
 #      pass and NOT a drift, it is a dead instrument (measured lesson: "an empty output is
 #      not a negative, it is a dead command")
+#
+# TWO settings, because `time` alone is blind (measured 2026-11-27): the front runs 44 pools whose
+# `periodicRestart.time` is 00:00:00 AND whose `[schedule]` carries one clock entry, so a pool that
+# recycles every day at a fixed hour reads as perfectly healthy on `time` alone. A non-empty
+# `[schedule]` is therefore a DRIFT in its own right, and the block is read, never assumed empty.
+# The read is ONE `list apppool <name> /text:*` per pool, because that form prints the object it
+# actually resolved (`APPPOOL.NAME:"<name>"`); measured the same day, `appcmd list apppool "<name>"
+# /config` prints NO object name and rendered an EMPTY <schedule> for mcp-tools.myia.io where
+# /text:* and the whole-section dump both show 04:38:00, and an EMPTY pool name makes appcmd answer
+# the whole pool list (3572 lines, "DefaultAppPool" first). The guard therefore proves that the name
+# it read equals the name it asked for, and refuses the pool as UNREADABLE when it cannot.
+#
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/iis-pool-recycle-guard.ps1
 #   ... -Pools models.myia.io,embeddings.myia.io -Expected 01:00:00
@@ -113,15 +125,91 @@ if ($poolNames.Count -eq 0) {
     exit 1
 }
 
+# Parses the /text:* block of ONE pool. Every "could not read it" is reported as a MISSING
+# marker (empty Seen / -not Has...), never as an empty value: an absent [schedule] section must
+# not read as "empty schedule", which is the false pass this extension exists to close.
+function Read-RecyclingBlock {
+    param([string[]]$Lines)
+    $seen = ''
+    $time = ''
+    $hasPeriodic = $false
+    $hasSchedule = $false
+    $schedule = @()
+    $start = -1
+    $baseIndent = 0
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $l = $Lines[$i]
+        if ($l -match '^\s*APPPOOL\.NAME:"(.*)"\s*$') { $seen = $Matches[1]; continue }
+        if ($start -lt 0) {
+            if ($l -match '^(\s*)\[periodicRestart\]\s*$') {
+                $start = $i
+                $baseIndent = $Matches[1].Length
+                $hasPeriodic = $true
+            }
+            continue
+        }
+        # Inside the block: a section header at or left of [periodicRestart] ends it ([failure]).
+        if ($l -match '^(\s*)\[') {
+            if ($Matches[1].Length -le $baseIndent) { break }
+            if ($l -match '^\s*\[schedule\]\s*$') { $hasSchedule = $true }
+            continue
+        }
+        if ($l -match '^\s*time:"(.*)"\s*$') {
+            if (-not $time) { $time = $Matches[1] }
+            continue
+        }
+        if ($l -match '^\s*value:"(.*)"\s*$') { $schedule += $Matches[1] }
+    }
+    return [PSCustomObject]@{
+        Seen        = $seen
+        Time        = $time
+        HasPeriodic = $hasPeriodic
+        HasSchedule = $hasSchedule
+        Schedule    = @($schedule)
+    }
+}
+
 # Every name kept above is non-blank, so every name is read: no entry is ever skipped here.
 foreach ($pool in $poolNames) {
-    $r = Invoke-Native -FilePath $AppCmd -ArgumentList @('list', 'apppool', $pool, ('/text:recycling.periodicRestart.time'))
-    $value = $r.Text.Trim()
-    if ($r.Code -ne 0 -or -not $value) {
+    $r = Invoke-Native -FilePath $AppCmd -ArgumentList @('list', 'apppool', $pool, '/text:*')
+    $block = Read-RecyclingBlock -Lines $r.Lines
+    $value = $block.Time
+    if (-not $value -and $r.Code -ne 0 -and $r.Text) {
+        # a dead read still carries its reason into the report (the stderr text), bounded so a
+        # whole-list answer can never flood the log
+        $value = $r.Text
+        if ($value.Length -gt 200) { $value = $value.Substring(0, 200) + '...' }
+    }
+    $sched = @($block.Schedule)
+    $schedText = ($sched -join ',')
+    if ($r.Code -ne 0) {
         # Both halves are needed: appcmd may answer rc 0 with an empty body when the pool
         # name does not resolve, and rc 1 on a real read failure. Neither says "in spec".
         $verdict = 'UNREADABLE'
-        $detail = if ($r.Code -ne 0) { "exit=$($r.Code)" } else { 'empty output' }
+        $detail = "exit=$($r.Code)"
+    } elseif ($r.Lines.Count -eq 0) {
+        $verdict = 'UNREADABLE'
+        $detail = 'empty output'
+    } elseif (-not $block.Seen) {
+        $verdict = 'UNREADABLE'
+        $detail = 'identity absent'
+    } elseif ($block.Seen -ne $pool) {
+        $verdict = 'UNREADABLE'
+        $detail = "identity=$($block.Seen)"
+    } elseif (-not $block.HasPeriodic) {
+        $verdict = 'UNREADABLE'
+        $detail = 'periodicRestart absent'
+    } elseif (-not $block.HasSchedule) {
+        $verdict = 'UNREADABLE'
+        $detail = 'schedule absent'
+    } elseif (-not $value) {
+        $verdict = 'UNREADABLE'
+        $detail = 'time absent'
+    } elseif ($sched.Count -gt 0) {
+        # A clock recycle is as much a drift as a non-zero time: the pool WILL restart at that
+        # hour, whatever `time` says. Measured on the front 2026-11-27: 44 pools carry one entry.
+        $verdict = 'DRIFT'
+        $detail = "schedule=[$schedText]"
     } elseif ($value -eq $Expected) {
         $verdict = 'OK'
         $detail = ''
@@ -130,11 +218,12 @@ foreach ($pool in $poolNames) {
         $detail = ''
     }
     [void]$results.Add([PSCustomObject]@{
-        pool    = $pool
-        value   = $value
+        pool     = $pool
+        value    = $value
         expected = $Expected
-        verdict = $verdict
-        detail  = $detail
+        schedule = $sched
+        verdict  = $verdict
+        detail   = $detail
     })
 }
 
@@ -152,17 +241,22 @@ if ($Json) {
     } | ConvertTo-Json -Depth 5 -Compress
 } else {
     foreach ($x in $results) {
+        # The detail stays IMMEDIATELY after verdict=, and the schedule goes at the END: the pins
+        # written against the first version assert "verdict=UNREADABLE (empty output)" as one
+        # contiguous run, so inserting a field between them would turn the existing regression net
+        # red for a purely cosmetic reason. Reading order also stays "why" before "what".
         $line = 'POOL {0} value=[{1}] expected=[{2}] verdict={3}' -f $x.pool, $x.value, $x.expected, $x.verdict
         if ($x.detail) { $line += ' (' + $x.detail + ')' }
+        $line += ' schedule=[' + (@($x.schedule) -join ',') + ']'
         Write-Output $line
     }
     Write-Output ('GUARD pools={0} drift={1} unreadable={2} at={3}' -f $results.Count, $drift.Count, $blind.Count, [DateTimeOffset]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
     if ($blind.Count -gt 0) {
         Write-Output 'VERDICT INSTRUMENT: a pool could not be read - this is NOT a pass and NOT a drift; check appcmd and the pool name'
     } elseif ($drift.Count -gt 0) {
-        Write-Output 'VERDICT DRIFT: the periodic recycle differs from the expected value - any repair is a separate [PROPOSAL] + [ACK] gesture'
+        Write-Output 'VERDICT DRIFT: the periodic recycle differs from the expected value, or a [schedule] entry recycles the pool by clock - any repair is a separate [PROPOSAL] + [ACK] gesture'
     } else {
-        Write-Output 'VERDICT OK: every pool reads the expected periodic recycle'
+        Write-Output 'VERDICT OK: every pool reads the expected periodic recycle and carries no [schedule] entry'
     }
 }
 
