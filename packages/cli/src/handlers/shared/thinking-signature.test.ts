@@ -340,6 +340,32 @@ describe("#1208 — Claudish-carried signature", () => {
     expect(isCarriedSignature(`${CARRIED_SIGNATURE_PREFIX.toUpperCase()}payload`)).toBe(false);
   });
 
+  test("isCarriedSignature near-misses: the version segment's `:` is load-bearing in the PREDICATE, not only in the constant", () => {
+    // Review 7211549612. The pin above checks that the CONSTANT fails both
+    // base64 alphabets; nothing checked that the PREDICATE needs the `:` —
+    // a predicate reduced to the bare literal `claudish-carried` left all of
+    // them green. Both values below start with the bare words AND are legal
+    // URL-safe base64, so a model could issue one: classifying it as carried
+    // is the exact collision the namespace exists to rule out.
+    const URL_SAFE_B64 = /^[-=A-Za-z0-9_]+$/;
+    expect(URL_SAFE_B64.test("claudish-carried-v1-payload")).toBe(true);
+    expect(URL_SAFE_B64.test("claudish-carriedv1payload")).toBe(true);
+
+    expect(isCarriedSignature("claudish-carried-v1-payload")).toBe(false);
+    expect(isCarriedSignature("claudish-carriedv1payload")).toBe(false);
+
+    // …and so the native guard leaves such a block alone, like any other
+    // opaque blob it cannot classify (the measured gap of the #597 pin).
+    const nearMiss = [
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "n", signature: "claudish-carried-v1-payload" }],
+      },
+    ];
+    expect(stripUnsignedThinkingBlocks(nearMiss, NATIVE)).toBe(0);
+    expect(nearMiss[0].content[0].signature).toBe("claudish-carried-v1-payload");
+  });
+
   test("#1208 does not widen the native strip: a genuine signature and a foreign digest behave as under #597", () => {
     // The carried branch is ADDED to the opt-in, it does not replace it: the
     // digest is still stripped, the genuine signature still kept.
