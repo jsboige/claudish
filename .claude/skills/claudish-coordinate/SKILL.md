@@ -39,7 +39,7 @@ de #445 ; tout levier nomme le contrôle qu'il touche (en principe aucun : on vi
 | | |
 |---|---|
 | Machine | `myia-ai-01`, coordinateur |
-| Workers | `po-2023` (= `po-203`), `po-2024`, `po-2025`, `po-2027` (hub-direct via le WAN), `po-2028` · `po-2026` **HS matériel** depuis le 10/10 (Maintenance#91) |
+| Workers | `po-2023` (= `po-203`), `po-2024`, `po-2025`, `po-2027` (hub-direct via le WAN), `po-2028` · `po-2026` hors file, de nouveau actif au hub (27/11) |
 | WAN | `models.myia.io` : IIS po-2023 → `.50:3000` ; porte po-2027 + crons hors site |
 | Périmètre | workspace `claudish` seul (`/coordinate` de roo-extensions est un autre mandat) |
 | Hub | `http://192.168.0.50:3000` — **po-2025** depuis le 05/09 |
