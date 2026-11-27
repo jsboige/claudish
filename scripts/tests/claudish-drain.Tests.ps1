@@ -594,33 +594,46 @@ Describe 'drain targets derived from the env file (#372)' {
 
 Describe 'pre-gesture failover-events tick (#368)' {
     BeforeAll {
-        # Fixtures stand in for the collector; each accepts the two arguments
-        # the drain passes (-Container, -ClaudishHome) — a fixture without
-        # those params would die at BINDING and prove nothing about the exit
-        # paths under test.
+        # Fixtures stand in for the collector; each accepts the three arguments
+        # the drain passes (-Container, -ClaudishHome, -HealthUrl — the last
+        # only when non-blank, #422) — a fixture without those params would
+        # die at BINDING and prove nothing about the exit paths under test.
         $utf8 = New-Object System.Text.UTF8Encoding($false)
         $tickDir = Join-Path $TestDrive 'tick'
         New-Item -ItemType Directory -Path $tickDir -Force | Out-Null
 
         $okBody = @'
-param([string]$Container, [string]$ClaudishHome)
-Set-Content -LiteralPath (Join-Path $ClaudishHome 'tick-ok.marker') -Value "ran:$Container"
+param([string]$Container, [string]$ClaudishHome, [string]$HealthUrl)
+Set-Content -LiteralPath (Join-Path $ClaudishHome 'tick-ok.marker') -Value "ran:$Container|health:$HealthUrl"
 exit 0
 '@
         [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-ok.ps1'), $okBody, $utf8)
 
         $exit1Body = @'
-param([string]$Container, [string]$ClaudishHome)
+param([string]$Container, [string]$ClaudishHome, [string]$HealthUrl)
 Write-Error 'not-measured (fixture)'
 exit 1
 '@
         [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-exit1.ps1'), $exit1Body, $utf8)
 
         $hangBody = @'
-param([string]$Container, [string]$ClaudishHome)
+param([string]$Container, [string]$ClaudishHome, [string]$HealthUrl)
 Start-Sleep -Seconds 45
 '@
         [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-hang.ps1'), $hangBody, $utf8)
+
+        # #422 — records WHICH named arguments reached the child: PSBoundParameters
+        # sees a parameter only when it was actually passed on the command line,
+        # so 'bound:False' pins that a blank -HealthUrl is not forwarded at all
+        # (an explicitly-passed empty string would bind and hit the collector's
+        # skip-the-probe sentinel — the exact #423 trap of disabling the signal).
+        $argsBody = @'
+param([string]$Container, [string]$ClaudishHome, [string]$HealthUrl)
+$has = $PSBoundParameters.ContainsKey('HealthUrl')
+Set-Content -LiteralPath (Join-Path $ClaudishHome 'tick-args.marker') -Value "bound:$has|v:$HealthUrl"
+exit 0
+'@
+        [System.IO.File]::WriteAllText((Join-Path $tickDir 'tick-args.ps1'), $argsBody, $utf8)
 
         $script:TickEnv = Join-Path $TestDrive 'tick.env'
         [System.IO.File]::WriteAllText($script:TickEnv, "CLAUDISH_FAILOVER_SONNET=example@model`n", $utf8)
@@ -640,6 +653,12 @@ Start-Sleep -Seconds 45
         $log | Should -Match 'FAILOVER-TICK ok'
         $log | Should -Match 'OUTCOME success'
         Test-Path -LiteralPath (Join-Path $script:TickHome 'tick-ok.marker') | Should -BeTrue
+        # #422 — the child collector received the probe address the drain
+        # itself derived: the -Url this call binds explicitly. Pre-#422 the
+        # child fell back to its own hardcoded :3000 and, on a sidecar with a
+        # different host port, poisoned the state's InstanceId with ''.
+        $marker = Get-Content -LiteralPath (Join-Path $script:TickHome 'tick-ok.marker') -Raw
+        $marker | Should -Match ([regex]::Escape('health:http://127.0.0.1:1/health'))
         # The tick ran BEFORE the gesture. The interpolating RECREATE line is
         # logged in the early guard section (pre-drain), so the anchor is the
         # LAST RECREATE line — on a successful recreate that is always a
@@ -733,6 +752,26 @@ Start-Sleep -Seconds 45
         $log = Get-DrainLogText
         $log | Should -Match 'FAILOVER-TICK ok'
         $log | Should -Match 'OUTCOME success'
+    }
+
+    It 'a blank -HealthUrl forwards NOTHING (the collector default stands); a set one is forwarded verbatim (#422)' {
+        # The append is deliberately conditional: an empty -HealthUrl is the
+        # collector's skip-the-probe sentinel (IsNullOrWhiteSpace => return
+        # $null), so forwarding a blank by accident would DISABLE the
+        # instanceId signal outright — worse than the pre-#422 hardcoded :3000.
+        # Direct calls: no docker, no drain — only the child's own binding
+        # record is under test.
+        $argsFixture = Join-Path $tickDir 'tick-args.ps1'
+        $marker = Join-Path $script:TickHome 'tick-args.marker'
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+        Invoke-DrainFailoverEventsTick -CollectorPath $argsFixture -Container claudish-sidecar `
+            -ClaudishHome $script:TickHome -TimeoutSec 30
+        (Get-Content -LiteralPath $marker -Raw) | Should -Match 'bound:False'
+        Invoke-DrainFailoverEventsTick -CollectorPath $argsFixture -Container claudish-sidecar `
+            -ClaudishHome $script:TickHome -TimeoutSec 30 -HealthUrl 'http://127.0.0.1:3002/health'
+        $m = Get-Content -LiteralPath $marker -Raw
+        $m | Should -Match 'bound:True'
+        $m | Should -Match ([regex]::Escape('v:http://127.0.0.1:3002/health'))
     }
 }
 

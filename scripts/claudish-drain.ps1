@@ -640,7 +640,8 @@ function Invoke-ClaudishDrainedRestartImpl {
     # default 120 s bound fits the proxy's 900 s freeze expiry. Never blocks
     # the gesture — see Invoke-DrainFailoverEventsTick's own bounds.
     Invoke-DrainFailoverEventsTick -CollectorPath $FailoverTickCollectorPath -Container $Container `
-        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec
+        -ClaudishHome $FreezeClaudishHome -TimeoutSec $FailoverTickTimeoutSec `
+        -HealthUrl "$Url/health"
 
     $restartAt = Get-Date
     # -t must match stop_grace_period (120s, docker-compose.yml): the CLI flag
@@ -868,7 +869,12 @@ function Invoke-DrainFailoverEventsTick {
         [string]$CollectorPath,
         [string]$Container,
         [string]$ClaudishHome,
-        [int]$TimeoutSec = 120
+        [int]$TimeoutSec = 120,
+        # #422 — the address the DRAIN derived (explicit -Url, else the
+        # container's published port, #110/#372). Left blank the collector
+        # keeps its own :3000 default — the pre-#422 behaviour, which blinds
+        # InstanceChanged on any sidecar whose host port is not 3000.
+        [string]$HealthUrl = ''
     )
     if (-not $CollectorPath -or -not (Test-Path -LiteralPath $CollectorPath)) {
         Write-DrainLog "FAILOVER-TICK skipped — no collector at '$CollectorPath'"
@@ -899,8 +905,17 @@ function Invoke-DrainFailoverEventsTick {
         # Quote every argument through the same Windows rule the detach launcher
         # uses — 5.1's -ArgumentList array join quotes nothing, so a home path
         # with a space must not split (02/10 lesson).
-        $argString = Join-DrainDetachArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
+        $tickArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath,
             '-Container', $Container, '-ClaudishHome', $ClaudishHome)
+        # #422 — forward the derived probe address so the collector's
+        # instanceId probe targets the container actually being drained
+        # ($Url), never its own hardcoded :3000. Appended ONLY when non-blank:
+        # an empty -HealthUrl is the collector's "skip the probe" sentinel,
+        # and forwarding one by accident would disable the signal outright.
+        if (-not [string]::IsNullOrWhiteSpace($HealthUrl)) {
+            $tickArgs += @('-HealthUrl', $HealthUrl)
+        }
+        $argString = Join-DrainDetachArguments $tickArgs
         $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argString `
             -WindowStyle Hidden -RedirectStandardOutput $tickOut -RedirectStandardError $tickErr -PassThru
         # 5.1: without a held handle, ExitCode reads empty after the child dies
