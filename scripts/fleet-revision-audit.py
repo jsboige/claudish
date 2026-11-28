@@ -101,6 +101,12 @@ DEFAULT_HUB = "http://192.168.0.50:3000"
 DEFAULT_RELAY = "http://192.168.0.46:3000"
 DEFAULT_SEATS = (("hub", DEFAULT_HUB), ("relay", DEFAULT_RELAY))
 DEFAULT_CONTAINER = "claudish-sidecar"
+# A seat's sidecar answers 3000/tcp under one of two names, and which one is a
+# property of the seat, not of the audit: `claudish-sidecar` on the sidecar
+# seats, `claudish-proxy` on po-2023's relay. Probing a single name turns
+# "my container is called something else" into `error:no-endpoint`, which reads
+# as "this seat has no build" (#1140, po-2023's reserve of 28/11).
+LOCAL_CONTAINER_NAMES = (DEFAULT_CONTAINER, "claudish-proxy")
 
 # #1143's field carries `git rev-parse HEAD` (40 hex) or a short SHA as the
 # build script passed it; anything else is not a commit.
@@ -288,7 +294,10 @@ def render(rows: list[dict], expected: str | None = None) -> list[str]:
         if r["state"] == "unreachable":
             lines.append(f"note: {r['seat']} ({r['endpoint']}) — unreadable: {r['detail']}")
         elif r["state"].startswith("error:"):
-            lines.append(f"note: {r['seat']} ({r['endpoint']}) — HTTP/read failure: {r['state']}")
+            # The detail carries the remedy when there is one (#1140): a
+            # `no-endpoint` row is a discovery failure, not a missing build.
+            detail = f" — {r['detail']}" if r.get("detail") else ""
+            lines.append(f"note: {r['seat']} ({r['endpoint']}) — HTTP/read failure: {r['state']}{detail}")
         if r["uptimeSec"] is not None and not (0 <= r["uptimeSec"] <= MAX_PLAUSIBLE_UPTIME_SEC):
             lines.append(
                 f"note: {r['seat']} uptimeSec={r['uptimeSec']} is outside [0, 7 d] — reported, "
@@ -358,17 +367,32 @@ def main(argv: list[str] | None = None, probe_fn=None, local_url_fn=None, stream
         return 2
     if args.local:
         discover = local_url_fn or _LOCAL_SIDECAR_URL
-        url = discover(args.container) if discover else None
+        # The explicit name is tried first, then the two names a seat's sidecar
+        # actually carries: an unnamed seat must be FOUND, not reported absent.
+        tried = [args.container] + [n for n in LOCAL_CONTAINER_NAMES if n != args.container]
+        url = None
+        for name in tried:
+            if not discover:
+                break
+            url = discover(name)
+            if url:
+                break
         if url:
             seats.append((args.local_name, url))
         else:
             # A discovery failure is a READER failure, named as one: the seat
-            # was asked for and could not even be located.
+            # was asked for and could not even be located. The note spells out
+            # every name tried and the flag that overrides them, so the reader
+            # never mistakes it for "this seat runs no build".
             rows = audit(seats, args.expect, args.timeout, probe_fn)
             rows.append(
-                seat_row(args.local_name, f"container:{args.container}", {"status": None, "error": "no published port"}, args.expect)
+                seat_row(args.local_name, f"container:{'|'.join(tried)}", {"status": None, "error": "no published port"}, args.expect)
             )
             rows[-1]["state"] = "error:no-endpoint"
+            rows[-1]["detail"] = (
+                "no published port on 3000/tcp for " + ", ".join(tried)
+                + " — pass --container <name> if this seat names its sidecar differently"
+            )
             return _emit(rows, args, out)
 
     rows = audit(seats, args.expect, args.timeout, probe_fn)
