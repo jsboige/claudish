@@ -194,6 +194,35 @@ the cascades. Post-mortem: workspace dashboard 14:01Z (format of reference).
 | po-2027 | **Local sidecar since 27/10 — no longer hub-direct.** Container `claudish-sidecar` (compose project `claudish`, service `claudish-proxy`, working dir **`D:\dev\claudish`**), published `3000/tcp → 0.0.0.0:3000`, `unless-stopped`, health `healthy`; client `ANTHROPIC_BASE_URL=http://localhost:3000` (the seat's own lanes are served locally, the container relays to the WAN edge). Image `claudish-claudish-proxy:latest` = `sha256:e6fcfba3…`, built **2026-11-03T17:52:12Z** from `b2927f16`; container created `03/11 18:02:13Z`, **`StartedAt` `05/11 10:16:41Z`** (host reboot, autostart through the `unless-stopped` policy). Env **94 names, 13 non-empty**; `CLAUDISH_RELAY_UPSTREAM=https://models.myia.io`, `CLAUDISH_MACHINE=myia-po-2027`, `CLAUDISH_NO_ANTHROPIC=1`; mounts `D:\claudish-captures → /captures` (rw), `~/.claudish → /root/.claudish` (ro). **Armed state: NONE** — 0 non-empty `CLAUDISH_FAILOVER_*` (NO-FUEL, value-level read; `configured=0`), and `C:\Dev\claudish\.env` carries no `CLAUDISH_FAILOVER_*` line. Client: `CLAUDE_CODE_SUBAGENT_MODEL=haiku`, `ENABLE_TOOL_SEARCH=true`, `ANTHROPIC_CUSTOM_MODEL_OPTION=gpt-6.1-sol`, **no `ANTHROPIC_API_KEY`** in `settings.json` (the login is used; #296 shape B not applicable). Four lanes share it (`claudish`, `CoursIA`, `CoursIA-2`, `roo-extensions`). **Relay pressure, measured:** 60 `AUTONOMOUS` episodes over 2.2 days (51 `heartbeat`-timeout, 8 `forward-connect`, 1 `forward-http-502`) and **199 client-visible connection 400s over 714 locally-served requests** — the same WAN that flips the relay is the one the local egress needs (#877). **Image vintage: 22 commits behind `origin/main`** (2 runtime: #868, #848) — recreate proposed on the dashboard, awaiting ACK | VERIFIED 05/11 11:00Z from the seat (`docker inspect` labels/mounts/env **by name and fingerprint, values never printed**; `/health` `ok` in 198 ms; WAN `models.myia.io/health` **200 in 0.202 s**; live `~/.claude/settings.json`; `docker logs -t` series). Superseded: the 16/10 hub-direct reading below in the change log |
 | po-2028 | **sidecar `claudish-proxy` live, `/health` `relay-nominal`**, upstream `http://192.168.0.50:3000` read from the live `/health` at every cycle since 27/10; compose dir **`D:\dev\claudish`** and capture host dir **`D:\claudish-captures`** (both moved from `C:` on 27/10 — read from the container's labels/mounts, not from a file); image `755f7edc233e` built 25/10 (recreates of 25/10 11:55Z and 29/10 ×2 kept it); **local cascade deliberately unarmed** — 36 `CLAUDISH_FAILOVER_*` names, **0 armed by value** (`configured=0`, NO-FUEL; read in-container 28-29/10, seat posture under registry Q-po2028-6); **hub-side the seat is armed** (`haiku@myia-po-2028` in the hub's `ACTIVE`) and **swift-eligible since the 02/11 flip** (measured 04-05/11: swift serves the seat's haiku at 27-65 req/h, PAYG net local 0). Nightly capture compaction armed 29/10 (`ClaudishCaptureCompaction` 01:47Z, 7 consecutive clean runs, off-site 7z + sha on `G:`) | VERIFIED 27/10 from the seat (container labels + mounts + live `/health` + a real `POST /v1/messages`); cascade/no-fuel + compaction readings re-verified 04-05/11 |
 
+## Image runtime — bun floor (Dockerfile 1.4, fleet not yet moved)
+
+The `Dockerfile` base is now **`oven/bun:1.4-alpine`** (#1209 part 2/2). That is a **build**
+change with no deployment behind it: every container in the table above still runs the image it
+was created from, whose base is 1.3.14, and a `docker restart` does not change a base image — only
+a rebuild followed by a drained recreate does.
+
+- **Why the runtime is load-bearing**: on bun 1.3.14 *no event of any kind* fires when a
+  `stream:false` client leaves, so the client-gone cancellation is **inert**; on bun ≥ 1.4 the
+  signal arms ~190–200 ms after the close (measured 26/11 on the official images, same
+  `hono`/`@hono/node-server`). CI already pins 1.4.0 (`test.yml`), so before this change the fleet
+  ran a runtime its CI never tested.
+- **Measured differentially, same tree, only the base differs** (2026-11-27, two disposable containers
+  built from the #1216 tree, `/health` read in-container): `oven/bun:1.4-alpine` (**bun 1.4.5**) →
+  `clientGoneDetect: "detected"`; `oven/bun:1.3-alpine` (**bun 1.3.14**) → `"undetected"`, plus the
+  forced boot line `[ClientGone] runtime capability undetected — … cancellation is INERT until the
+  image moves to bun >= 1.4 (#1209 2/2)`. No seat was touched by the measurement.
+- **The per-container check, one read, never an assumption**: `GET /health` → `clientGoneDetect`
+  (`detected` · `undetected` · `disabled` · `pending` · `error:<why>`). `detected` means the runtime
+  carries the capability; `undetected` on a freshly created container means its image is still on
+  1.3.14. **`pending` is the boot probe not settled yet — neither ok nor a defect, and it lasts
+  longer than a quick check assumes**: measured 2026-11-27, the verdict left `pending` after 562/601 ms
+  on 1.4.5 but after 2 443/2 389 ms on 1.3.14 (the probe is bounded at 1.5 s). A read taken in the
+  first two seconds of a 1.3 container therefore returns `pending`, not `undetected` — poll until the
+  value moves (bound ~15 s) before recording a verdict.
+- **Rollout is seat by seat**, each by `[PROPOSAL]`/ACK then a **drained recreate**
+  (`claudish-drain.ps1 -Recreate -EnvFile`), never a bare restart. **No seat has been moved at the
+  time of writing** — this section records the state, not a migration.
+
 ## Change log
 
 | Date (Z) | Machine | Change | Proof |
