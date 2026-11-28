@@ -416,6 +416,29 @@ tournait à 21:40Z. Le hub n'a pas redémarré (même `instanceId`). Après l'ar
 **un seul run par cycle, jamais relancé après un timeout, jamais de `ls` du dossier entier**. Un verdict
 non rendu se déclare au bilan ; c'est moins grave que de faire basculer la flotte en AUTONOMOUS.
 
+🔴 **Lots bornés, 3ᵉ mesure (28/11 12Z) : la durée du lot compte, et un lot long peut finir en redémarrage du hub.**
+Deux lots `--since/--until` successifs, commande de la Phase 3 sans autre option :
+
+- 1 h (11-12Z) : de 12:18:38 à 12:19:44Z, soit **66 s**, et **0 échec** de sonde sur mon sidecar ;
+- 5 h (06-11Z) : de 12:20:00 à 12:27:01Z, soit **7 min 01 s**.
+  - Timeouts de heartbeat vers `.50` de 12:20:10 à 12:26:20Z.
+  - Deux épisodes AUTONOMOUS : 12:20:40,754 → 12:21:48,690Z (68 s) et 12:24:00,794 → 12:26:06,014Z (125 s).
+  - 14 requêtes servies en local.
+  - Puis **le hub redémarre** : instance `a7fea051` née vers 12:26:23Z, même révision, `proxyKeyPreviousHits` remis à 0.
+
+Le hub était déjà à `eventLoopBlockedMs5m` = 7 422 avant les lots, et il est à 6 992 sur le processus neuf.
+La **cause reste SUPPOSÉE**, et l'auteur du redémarrage est demandé à po-2025. Les deux lots ont rendu un verdict valide
+(exit 0, tout apparié, `sub=0`).
+
+Règle :
+
+- **un lot ≤ 1 h par cycle**, toujours avec `--until` ;
+- jamais relancé ;
+- jamais pendant une fenêtre de mesure annoncée (#1124, #1209) ;
+- toute perturbation se déclare **dans le cycle**, bornée à la ms, pour que les lanes qui mesurent l'excluent.
+
+Couvrir 6 h du jour demande donc six cycles. Les jours passés se lisent dans les archives `.7z` (tableau ci-dessus), qui ne touchent pas le disque vivant du hub.
+
 **Contrôle de complétude obligatoire** : en-têtes extraits == fichiers `req-*` annoncés par `7z l`.
 🔴 **Limite à déclarer avec tout chiffre** : ce corpus ne voit que ce qui **atteint le hub**. Écrire
 « aucun trafic Anthropic ailleurs **à travers claudish** », jamais « aucun trafic Anthropic ailleurs ».
