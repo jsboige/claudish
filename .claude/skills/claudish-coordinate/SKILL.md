@@ -116,7 +116,8 @@ Règles de verdict :
 - **Jamais de leak-policy depuis les logs du sidecar** : en NOMINAL, il est muet sur mon propre trafic. La
   source est le **corpus hub** (SMB, lecture seule). Écrire « à travers claudish », jamais « ailleurs ».
 - **Verdict en une commande (#445)** : `python scripts/native-consumption.py --leak-policy --since <J>T<HH>
-  --captures-dir //192.168.0.50/d$/claudish-captures`. Facturé = le backend qui a servi (`resp-*-native-*`),
+  --captures-dir //192.168.0.50/d$/claudish-captures`, **un run par cycle, jamais relancé** (2/2 ont coïncidé avec
+  un décrochage du hub, reference.md § Phase 3). Facturé = le backend qui a servi (`resp-*-native-*`),
   appariement par l'en-tête de la réponse (le rang `rNNNN` n'est pas une clé). **Exit 3 = verdict refusé** :
   Opus sans machine (le relais préserve l'en-tête, il ne le pose jamais) ou non apparié. Archives : reference.md § Phase 3.
 - **Transcripts** : dédupliquer par `message.id` (les `agent-*.jsonl` rejouent ~2,5×) ; motif sans
