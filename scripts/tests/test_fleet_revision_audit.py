@@ -383,6 +383,41 @@ code, out, err = run_main(["--local"], probe, local_url_fn=lambda container: Non
 check("main --local ... and the text table counts it as unreadable with its note", "error:no-endpoint 1" in out and "HTTP/read failure: error:no-endpoint" in out, out)
 check("main --local ... --json carries no verdict line (counts live in the text table only)", "error:no-endpoint 1" not in json.dumps(doc), "")
 
+# --- discovery tries the names a seat's sidecar actually carries (#1140) ---
+# po-2023's relay names its container `claudish-proxy`. Probing only
+# `claudish-sidecar` made that seat report error:no-endpoint, which reads as
+# "this seat runs no build" — the misreading the per-consumer table exists to
+# prevent. Two names are tried, and the failure note names the flag.
+
+seen = []
+
+
+def by_name(container):
+    seen.append(container)
+    return "http://127.0.0.1:3915" if container == "claudish-proxy" else None
+
+
+calls = []
+code, out, err = run_main(
+    ["--local", "--json"],
+    stub({HUB: ok(health(revision=FULL)), RELAY: ok(health(revision=FULL)), LOCAL: ok(health(revision=FULL))}, calls=calls),
+    local_url_fn=by_name,
+)
+doc = json.loads(out)
+check(
+    "main --local: a sidecar named claudish-proxy is found on the second name, not reported absent",
+    doc["seats"][-1]["seat"] == "local" and doc["seats"][-1]["state"] == "deployed"
+    and seen == ["claudish-sidecar", "claudish-proxy"] and LOCAL in calls,
+    f"{seen} {out}",
+)
+
+code, out, err = run_main(["--local"], probe, local_url_fn=lambda container: None)
+check(
+    "main --local: the no-endpoint note names every container tried and the --container flag",
+    "--container" in out and "claudish-sidecar" in out and "claudish-proxy" in out,
+    out,
+)
+
 # --- the real reader is wired (sibling import) ---
 
 check("the real probe_http and local_sidecar_url are imported from hub-entry-probe.py", audit._PROBE_HTTP is not None and audit._LOCAL_SIDECAR_URL is not None, "sibling unreadable")
