@@ -1297,6 +1297,80 @@ Describe 'Invoke-ClaudishDrainedRestart — admission freeze around the gesture 
     }
 }
 
+Describe 'Write-DrainLog — a reader that refuses the append (#1230)' {
+    # The CI red of 27/11 (#1230): the detached child ended with START alone in
+    # drain.log. Nothing between START and RECREATE REFUSED does any work, so
+    # both missing lines were APPENDS that never landed. A concurrent reader
+    # opened without FileShare.Write (a scan-on-close, a poller holding the
+    # handle) refuses every append while it holds the log — measured in BOTH
+    # lanes: System.IO.IOException, HResult 0x80070020 (win32 32), no inner
+    # exception, one refused attempt costing 1-5 ms. The old retry budget
+    # (3 tries, ~100 ms) is shorter than one scan, and the loss was announced
+    # only in the child's stdout capture — which CI never read.
+    #
+    # The holder below is released from a SECOND runspace: the test thread is
+    # inside the retry loop when the handle has to go, so no callback on the
+    # same thread can do it.
+    BeforeAll {
+        function Invoke-WithLogHeld {
+            param([string]$Path, [int]$HoldMs, [scriptblock]$Body)
+            $holder = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+            $releaser = [powershell]::Create()
+            $null = $releaser.AddScript('param($h, $ms) Start-Sleep -Milliseconds $ms; $h.Dispose()').AddArgument($holder).AddArgument($HoldMs)
+            $pending = $releaser.BeginInvoke()
+            try {
+                # 6>&1: Write-Host rides the information stream; the loud line
+                # a lost append must still produce is the point of the caller.
+                & $Body 6>&1
+            } finally {
+                $null = $pending.AsyncWaitHandle.WaitOne(30000)
+                $releaser.EndInvoke($pending) | Out-Null
+                $releaser.Dispose()
+                $holder.Dispose()
+            }
+        }
+    }
+
+    It 'lands once a refusing reader lets go inside the budget — the lost-append class (#1230)' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText($script:TestLog, '', (New-Object System.Text.UTF8Encoding($false)))
+        # 400 ms is 4x the whole old retry budget, and 5x inside the product's.
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $out = Invoke-WithLogHeld -Path $script:TestLog -HoldMs 400 -Body { Write-DrainLog 'HELD-PROBE-A' }
+        $heldMs = $sw.ElapsedMilliseconds
+        Get-DrainLogText | Should -Match 'HELD-PROBE-A' -Because ('the append must retry past a 400 ms refusal; elapsed {0} ms' -f $heldMs)
+        ($out -join "`n") | Should -Not -Match 'drain log write failed' -Because 'nothing was lost, so nothing is reported lost'
+    }
+
+    It 'a refusal outlasting the budget keeps the line OUT and says so LOUDLY (#1230)' {
+        Reset-DrainFixture
+        [System.IO.File]::WriteAllText($script:TestLog, '', (New-Object System.Text.UTF8Encoding($false)))
+        # Shadows the product default for this test only (no script: write, so
+        # nothing leaks to the other tests).
+        $DrainLogRetryBudgetMs = 0
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $out = Invoke-WithLogHeld -Path $script:TestLog -HoldMs 300 -Body { Write-DrainLog 'HELD-PROBE-C' }
+        $lostMs = $sw.ElapsedMilliseconds
+        Get-DrainLogText | Should -Not -Match 'HELD-PROBE-C' -Because 'the budget was zero, the reader held the file'
+        ($out -join "`n") | Should -Match 'drain log write failed after \d+ tries over \d+ ms \(refused by another handle\): .+' -Because 'a lost line is reported, never silent'
+        $lostMs | Should -BeLessThan 1500 -Because 'a bounded budget returns, it never waits for the holder'
+    }
+
+    It 'a permanent failure keeps the short 3-try path — the budget is for refusals (#1230)' {
+        Reset-DrainFixture
+        # A DIRECTORY where the log file should be. Measured in both lanes: 7
+        # -> InvalidOperationException (0x80131509), 5.1 -> UnauthorizedAccess
+        # (0x80070005) — neither is a sharing violation, so the long budget
+        # must not apply: a dead log path costs ~100 ms per line, not 2 s.
+        $LogPath = $script:TestDir
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $out = Write-DrainLog 'PERMANENT-PROBE' 6>&1
+        $ms = $sw.ElapsedMilliseconds
+        ($out -join "`n") | Should -Match 'drain log write failed after 3 tries over \d+ ms \(permanent error\): .+'
+        $ms | Should -BeLessThan 1500 -Because 'the refusal budget must not stretch a dead path'
+    }
+}
+
 Describe 'drain -Detach — quoted detached launch (#312)' {
     BeforeAll {
         # Real powershell.exe children, zero docker anywhere (AC3: the child
@@ -1392,6 +1466,28 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
             } finally {
                 if ($fs) { $fs.Dispose() }
             }
+        }
+
+        # #1230: the evidence a failed e2e detach pin must carry. The child
+        # captures its own stdout+stderr under the home (drain-detach-*.log)
+        # and a lost drain.log write announces itself THERE ("drain log write
+        # failed after 3 tries") - the log only shows the lines that landed.
+        # A CI runner is destroyed after the run, so the evidence travels
+        # inside the failure message, nowhere else.
+        function Get-DetachChildEvidence {
+            param([string]$HomeDir, [string]$LogPath, [int]$ChildPid, [string]$ExitNote)
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine(('#1230 evidence - child pid {0}; {1}' -f $ChildPid, $ExitNote))
+            [void]$sb.AppendLine('--- drain.log ---')
+            [void]$sb.AppendLine([string](Read-LenientRaw -Path $LogPath))
+            $captures = @(Get-ChildItem -LiteralPath $HomeDir -Filter 'drain-detach-*.log' -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 2)
+            foreach ($f in $captures) {
+                [void]$sb.AppendLine(('--- {0} ---' -f $f.Name))
+                [void]$sb.AppendLine([string](Read-LenientRaw -Path $f.FullName))
+            }
+            return $sb.ToString()
         }
     }
 
@@ -1516,21 +1612,54 @@ Add-Content -LiteralPath $WatchLog -Value "bound:[$MustBeInt]"
         $rc | Should -Be 0
         $m = [regex]::Match($text, 'child PID (\d+) alive')
         $m.Success | Should -BeTrue
-        # The parent returns on the START handshake while the detached child
-        # is still running: the REFUSED/OUTCOME lines land AFTER the parent's
-        # exit. Bounded wait before asserting them (the child refuses in
-        # ~1.5 s, measured in review of #338).
-        $deadline = (Get-Date).AddSeconds(20)
-        while ((Get-Date) -lt $deadline) {
-            if ((Read-LenientRaw -Path $log) -match 'OUTCOME ') { break }
-            Start-Sleep -Milliseconds 250
+        $childPid = [int]$m.Groups[1].Value
+        # #1230 — what drain.log must hold when this call returns, and why.
+        # The parent PROCESS exits on the START handshake ("child PID N alive");
+        # the `&` CALL does not return with it: the detached child inherits the
+        # redirection handles, so the call returns once the child is gone.
+        # Measured twice: an 8 s child made the call return at 11.56 s, and in
+        # the 60-run loop (30 under each parent interpreter) the call lasted
+        # 1.5-3.5 s while the first poll after it found drain.log COMPLETE and
+        # the child gone, 60/60. Hence:
+        #  - a poll window after the call waits for something that has already
+        #    either happened or been lost: the old 20 s loop never waited for
+        #    anything. On CI (27/11) it spent 20 s after a child that had
+        #    already ended with START alone in drain.log -> 21.36 s total;
+        #  - nothing between START and RECREATE REFUSED does work (one
+        #    Test-Path, one Get-Content, two appends), so a START-only log
+        #    means the APPENDS were lost, not that the child stalled;
+        #  - that loss was announced only in the child's stdout capture, which
+        #    this pin never read. It does now, through Get-DetachChildEvidence.
+        # The child's liveness at return is EVIDENCE, never an assertion of its
+        # own: normally it is already gone. A child that hangs inside the call
+        # hangs the suite the way any native call does - the workflow's
+        # timeout-minutes is that bound, no poll loop can replace it.
+        $childNote = 'gone when the call returned'
+        $child = $null
+        try {
+            $child = [System.Diagnostics.Process]::GetProcessById($childPid)
+            # Touch .Handle while the child is young: 5.1's object does not
+            # retain it (same quirk as in Start-DrainDetached).
+            $null = $child.Handle
+        } catch {
+            $childNote = 'gone when the call returned (GetProcessById found no such pid)'
         }
-        $logRaw = Read-LenientRaw -Path $log
+        if ($child) {
+            $exitWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            if ($child.WaitForExit(120000)) {
+                $childNote = ('exited {0} ms after the call returned, rc {1}' -f $exitWatch.ElapsedMilliseconds, $child.ExitCode)
+            } else {
+                $childNote = ('STILL RUNNING 120 s after the call returned (name {0}, started {1})' -f $child.ProcessName, $child.StartTime.ToString('HH:mm:ss'))
+            }
+            $child.Dispose()
+        }
+        $logRaw = [string](Read-LenientRaw -Path $log)
+        $evidence = Get-DetachChildEvidence -HomeDir $e2eHome -LogPath $log -ChildPid $childPid -ExitNote $childNote
         # The alive claim is backed by THAT child's own START line.
-        $logRaw | Should -Match ('START pid {0}\b' -f $m.Groups[1].Value)
+        $logRaw | Should -Match ('START pid {0}\b' -f $childPid) -Because $evidence
         # The child really ran the refuse path (docker-free) and terminated.
-        $logRaw | Should -Match 'RECREATE REFUSED'
-        $logRaw | Should -Match 'OUTCOME '
+        $logRaw | Should -Match 'RECREATE REFUSED' -Because $evidence
+        $logRaw | Should -Match 'OUTCOME ' -Because $evidence
     }
 
     It 'the real entry point: a child mute within the startup window returns exit 4 + PID + do-NOT-relaunch (re-review, bloquant 2)' {
