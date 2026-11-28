@@ -1312,6 +1312,109 @@ describe("main --partition (wiring, injected partitions + tmp cwd)", () => {
     expect(out).toContain("population mismatch");
   });
 
+  // ─── The alone-run's three readability guards, one witness each ───────────
+  // ai-01's mutation run on #1184 killed three of six mutants and left exactly
+  // these three alive: M3 `!runIsAccountable`, M4 `populationEchoOverCounts`,
+  // M5 `populationGapUnexplained` could each be DELETED with the whole file
+  // still 73/0. The foreign-entry guard was the only one with a witness, and
+  // its test is the shape copied here: an alone-run that is GREEN for the entry
+  // under test (so no other condition stops it) but that cannot be READ. Each
+  // fixture below is wrong in exactly one way, so the pin that reddens names one
+  // guard and not its neighbours.
+
+  /** Hand-built alone-run output: named failures, the summary counters bun
+   * prints, and its population echo. Every knob exists so a fixture can be made
+   * unreadable along ONE axis only. */
+  function aloneRun(named: string[], fails: number, echoFiles: number): string {
+    const lines = ["bun test v1.3.14", ""];
+    let file = "";
+    for (const e of named) {
+      const [f, n] = e.split(" > ");
+      if (f !== file) {
+        file = f;
+        lines.push(`${f}:`);
+      }
+      lines.push(`(fail) ${n} [1.00ms]`);
+    }
+    lines.push(
+      "",
+      ` ${fails} fail`,
+      " 0 error",
+      `Ran 3 tests across ${echoFiles} file${echoFiles === 1 ? "" : "s"}. [10.00ms]`
+    );
+    return lines.join("\n");
+  }
+
+  test("an alone-run whose summary and named entries disagree excuses nothing: the entry stays NEW FAILING (the C4 guard that survived removal)", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts"]));
+    // One named entry, two reported failures: the torn / truncated stream
+    // `runIsAccountable` exists for. The echo is right and no name is foreign,
+    // so the other two guards stay silent — without the accountability check,
+    // NEW1 simply is not in `alone` and gets labeled CONTEXT-SENSITIVE on output
+    // the parser and bun disagreed about.
+    const torn = aloneRun(["a.test.ts > other"], 2, 1);
+    let pass = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        pass += 1;
+        if (pass === 3) return { raw: torn }; // pass 3 = a.test.ts ALONE
+        return { raw: outputFor(["a.test.ts > NEW1"], fs.length) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1);
+    expect(out).toContain("NEW FAILING");
+    expect(out).toContain("a.test.ts > NEW1");
+    expect(out).not.toContain("context-sensitive");
+    expect(out).toContain("alone-run of a.test.ts could not be read");
+  });
+
+  test("an alone-run echoing MORE files than it was given excuses nothing: the entry stays NEW FAILING (over-count guard)", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts"]));
+    // Accountable counters (zero named failures, zero reported), but the echo
+    // claims two files for a one-file run: three files cannot attest exactly
+    // one. Deleting `populationEchoOverCounts` reads the surplus as coverage.
+    const overCounted = aloneRun([], 0, 2);
+    let pass = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        pass += 1;
+        if (pass === 3) return { raw: overCounted };
+        return { raw: outputFor(["a.test.ts > NEW1"], fs.length) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1);
+    expect(out).toContain("NEW FAILING");
+    expect(out).not.toContain("context-sensitive");
+    expect(out).toContain("alone-run of a.test.ts could not be read");
+  });
+
+  test("an alone-run that never attests having run the file excuses nothing: the entry stays NEW FAILING (population-gap guard)", () => {
+    chdirTmp(partBaseline([], 2, ["a.test.ts"]));
+    // The echo says ZERO files ran while the run was handed one, and nothing
+    // explains the missing file (no load-error entry names it). Deleting
+    // `populationGapUnexplained` turns "the file may not have run at all" into
+    // "the entry passed there" — the silent population loss of review #1114.
+    const ranNothing = aloneRun([], 0, 0);
+    let pass = 0;
+    const deps: PartitionDeps = {
+      listFiles: () => ["a.test.ts", "b.test.ts"],
+      runPartition: (fs) => {
+        pass += 1;
+        if (pass === 3) return { raw: ranNothing };
+        return { raw: outputFor(["a.test.ts > NEW1"], fs.length) };
+      },
+    };
+    const { code, out } = captureStdout(() => main(["--partition=2"], neverRunner, deps));
+    expect(code).toBe(1);
+    expect(out).toContain("NEW FAILING");
+    expect(out).not.toContain("context-sensitive");
+    expect(out).toContain("alone-run of a.test.ts could not be read");
+  });
+
   test("REAL defaultPartitionDeps wiring: an entry that reproduces in its partition and passes alone is CONTEXT-SENSITIVE, exit 1 — no injected runPartition", () => {
     // The alone-run reaches `realSuiteRunner` through `defaultPartitionDeps`
     // (testFiles), which every injected-deps pin above skips. Two REAL bun
