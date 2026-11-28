@@ -402,6 +402,20 @@ Trois pièges mesurés le 08/09 :
    `captures-2026-09-05.7z` et GDrive a renommé l'une en `(1)`. Identifier par le **contenu**
    (l'archive du hub porte plusieurs tags `X-Claudish-Machine`). C'est l'argument de `-ArchivePrefix`.
 
+🔴 **Le verdict sur le corpus vivant coûte au hub (mesure du 28/11).** Mes deux lancements de
+`native-consumption.py --leak-policy` sur `\\192.168.0.50\d$\claudish-captures` (`--workers` par défaut :
+16 lecteurs SMB en parallèle) ont **tous deux** coïncidé avec des sondes de santé ratées sur mon sidecar :
+
+- 27/11, lancement 12:14:34Z : 5 échecs de 12:14:58 à 12:21:38Z ;
+- 28/11, lancements 00:25Z et 00:29Z (précédés d'un `ls` du dossier entier) : AUTONOMOUS à 00:27:33Z et
+  00:31:17Z, 64 s au second, 4 requêtes servies en local, `/health` du hub sans réponse en 10 s.
+
+Entre les deux, de 21:40Z à 00:23Z : **0 échec**, alors qu'un autre lecteur plus léger (`payg-by-role.py`)
+tournait à 21:40Z. Le hub n'a pas redémarré (même `instanceId`). Après l'arrêt du run vers 00:35Z, 0 échec.
+**Cause SUPPOSÉE**, en attente de la vue hôte de po-2025 (file 28a, grain 2). Règle en attendant :
+**un seul run par cycle, jamais relancé après un timeout, jamais de `ls` du dossier entier**. Un verdict
+non rendu se déclare au bilan ; c'est moins grave que de faire basculer la flotte en AUTONOMOUS.
+
 **Contrôle de complétude obligatoire** : en-têtes extraits == fichiers `req-*` annoncés par `7z l`.
 🔴 **Limite à déclarer avec tout chiffre** : ce corpus ne voit que ce qui **atteint le hub**. Écrire
 « aucun trafic Anthropic ailleurs **à travers claudish** », jamais « aucun trafic Anthropic ailleurs ».
