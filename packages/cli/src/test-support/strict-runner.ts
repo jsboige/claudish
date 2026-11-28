@@ -109,6 +109,13 @@ export interface StrictVerdict {
   regressions: string[];
   /** fresh entries that did NOT reproduce (the flaky tail, by property not count) */
   flakyTail: string[];
+  /**
+   * Reproduced entries whose FILE passes when run ALONE (#641 C4, file 24a
+   * item 2): context-sensitive, not a new failing test in their own right.
+   * Subset of `regressions` — exit 1 is unchanged, the label only says where
+   * to look (the surrounding population, not the test).
+   */
+  contextSensitive?: string[];
   /** true when a confirmation re-run happened */
   confirmed: boolean;
   envGates: EnvGateSummaryEntry[];
@@ -149,6 +156,23 @@ export function parseEnvGateManifests(raw: string): EnvGateSummaryEntry[] {
 
 const FILE_HEADER_RE = /^(.+\.test\.[cm]?[jt]sx?):\s*$/;
 const UNHANDLED_RE = /^# Unhandled error between tests/;
+/**
+ * GitHub Actions group framing. On a GHA runner (measured: macOS shard,
+ * 24/11, bun 1.4.0) the child bun prefixes each file header with
+ * `::group::`, so the raw line is `::group::b.test.ts:` — FILE_HEADER_RE
+ * then captures `::group::b.test.ts` as the file name and every entry of
+ * that block lands OUTSIDE the delivered set (FOREIGN POPULATION, exit 3,
+ * reproduced by the real-wiring pin). The same probe on Windows emits no
+ * group line at all, with GITHUB_ACTIONS=true and without, under bun 1.3.14
+ * and 1.4.0: the framing is the producer's, so the parser strips it before
+ * matching anything.
+ */
+const GHA_GROUP_PREFIX = "::group::";
+
+/** Strip the GHA group framing before any header/fail line is matched. */
+function withoutGhaGroupPrefix(rawLine: string): string {
+  return rawLine.startsWith(GHA_GROUP_PREFIX) ? rawLine.slice(GHA_GROUP_PREFIX.length) : rawLine;
+}
 
 /** Last match of an anchored multiline regex, or null (see parseRunOutput). */
 function lastSummaryMatch(raw: string, re: RegExp): string | null {
@@ -182,7 +206,8 @@ export function parseRunOutput(raw: string): SuiteRun {
   const entries: string[] = [];
   let currentFile = "";
   let loadErrorsInFile = 0;
-  for (const line of raw.split(/\r?\n/)) {
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = withoutGhaGroupPrefix(rawLine);
     const header = line.match(FILE_HEADER_RE);
     if (header) {
       currentFile = header[1].replace(/\\/g, "/");
@@ -629,13 +654,29 @@ function printVerdict(v: StrictVerdict, hadBaseline: boolean): void {
     } else {
       line("[STRICT] flaky tail: 0 (every fresh entry reproduced)");
     }
-    if (v.regressions.length > 0) {
+    // #641 C4 (file 24a item 2): a reproduced entry whose file passes ALONE is
+    // context-sensitive. It is NOT counted under NEW FAILING — the count and
+    // the list hold only the entries that still fail alone.
+    const cs = v.contextSensitive ?? [];
+    const newFailing = v.regressions.filter((n) => !cs.includes(n));
+    if (cs.length > 0) {
+      const files = new Set(cs.map(entryFile)).size;
       line(
-        `[STRICT] 🔴 NEW FAILING TESTS (reproduced on the confirmation run): ${v.regressions.length}`
+        `[STRICT] 🟡 CONTEXT-SENSITIVE (reproduced in their partition, PASS when the file runs alone — the surrounding population is the suspect, not the test): ${cs.length} in ${files} file(s)`
       );
-      for (const n of v.regressions) line(`[STRICT]   · ${n}`);
-    } else {
+      for (const n of cs) line(`[STRICT]   · ${n}`);
+    }
+    if (newFailing.length > 0) {
+      line(
+        `[STRICT] 🔴 NEW FAILING TESTS (reproduced on the confirmation run): ${newFailing.length}`
+      );
+      for (const n of newFailing) line(`[STRICT]   · ${n}`);
+    } else if (cs.length === 0) {
       line("[STRICT] ✅ no regression: every fresh entry failed to reproduce");
+    } else {
+      line(
+        "[STRICT] every reproduced entry is context-sensitive — exit stays 1 (a label is not a green)"
+      );
     }
   } else {
     line("[STRICT] ✅ no regression: observed ⊆ baseline");
@@ -719,6 +760,56 @@ function printCrashedPartition(
     line("[STRICT] last output lines of the partition:");
     for (const l of tail) line(`[STRICT] | ${l.slice(0, 160)}`);
   }
+}
+
+/**
+ * Context sensitivity (#641 C4, file 24a item 2): reproduction on the partition
+ * is not proof that the test is at fault. REQ-9 of script-runtime failed in its
+ * partition, reproduced on the confirmation re-run, then passed alone — the
+ * surrounding population (PATH corruption, mock leakage, leftover state) is the
+ * suspect, not the test. So every file hosting a reproduced entry gets ONE last
+ * run ALONE (one run per distinct file, not per entry). An entry that passes
+ * alone is `context-sensitive`; one that still fails stays a NEW FAILING.
+ *
+ * A third run that cannot be read (kill, unaccountable, gap, foreign entry)
+ * excuses nothing: its entries stay regressions, and the line says the file's
+ * verdict could not be read. Exit is unchanged (1) either way — a label is not
+ * a green.
+ */
+function splitReproducedByAloneRun(
+  regressions: string[],
+  deps: PartitionDeps,
+  total: number
+): { contextSensitive: string[]; lines: string[] } {
+  const contextSensitive: string[] = [];
+  const lines: string[] = [];
+  const files = [...new Set(regressions.map(entryFile))].sort();
+  for (const f of files) {
+    const owned = regressions.filter((e) => entryFile(e) === f);
+    const run = deps.runPartition([f], total, total);
+    if (run.killed) {
+      lines.push(
+        `[STRICT] ⚠ alone-run of ${f} could not be read (${run.errorCode ?? "killed"}) — its ${owned.length} entry(ies) stay NEW FAILING.`
+      );
+      continue;
+    }
+    const parsed = parseRunOutput(run.raw);
+    const ranFiles = ranLineFileCount(run.raw);
+    if (
+      !runIsAccountable(parsed) ||
+      populationEchoOverCounts([f], ranFiles, parsed) ||
+      populationGapUnexplained([f], ranFiles, parsed).length > 0 ||
+      foreignEntryFiles([f], parsed).length > 0
+    ) {
+      lines.push(
+        `[STRICT] ⚠ alone-run of ${f} could not be read (unaccountable output or a population mismatch) — its ${owned.length} entry(ies) stay NEW FAILING.`
+      );
+      continue;
+    }
+    const alone = new Set(parsed.entries);
+    for (const e of owned) if (!alone.has(e)) contextSensitive.push(e);
+  }
+  return { contextSensitive, lines };
 }
 
 /** Injectable partition execution, so the partition wiring is unit-testable. */
@@ -1034,6 +1125,11 @@ function mainPartitioned(argv: string[], n: number, deps: PartitionDeps): number
       verdict.flakyTail = split.flakyTail;
       verdict.confirmed = true;
       verdict.exitCode = split.regressions.length > 0 ? 1 : 0;
+      if (split.regressions.length > 0) {
+        const alone = splitReproducedByAloneRun(split.regressions, deps, partitions.length);
+        verdict.contextSensitive = alone.contextSensitive;
+        for (const l of alone.lines) process.stdout.write(`${l}\n`);
+      }
     }
   }
 
