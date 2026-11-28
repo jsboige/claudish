@@ -170,9 +170,9 @@ de consolidation, commentaire de tenue d'une issue) : `docs/reference/coordinati
 - Chaque grain porte son issue, un AC vérifiable et sa taille. `[CLAIMED] #NN` au démarrage.
 - Un grain qui tient seul s'écrit au gabarit `.github/ISSUE_TEMPLATE/grain.md` : le même texte sert une session
   cloud (label `cloud-ready` + échéance) ou un worker. Règles : `docs/reference/delegation-protocol.md`.
-- **Cohérence** : une zone par worker, et deux files ne touchent pas les mêmes fichiers. Pas de PR empilée :
+- **Cohérence** : une zone par worker, et deux files ne portent ni le même grain ni les mêmes fichiers. Pas de PR empilée :
   un grain qui dépend d'un merge va en fin de file.
-- La file **se renouvelle** : le DM republie la file entière, pas un delta.
+- La file **se renouvelle** : le DM republie la file entière, pas un delta ; corps d'abord dans `.tmp/q<id>-<w>.md`.
 - **Échéance avant le prochain tir des lanes** (reset de quota…) : `[WAKE-CLAUDE] <machine>:<workspace>`
   à chaque siège sans session vivante, dans le tour du post (#1089, reference.md § Phase 4c).
 - Au bilan : grains dispatchés vs livrés, par worker.
