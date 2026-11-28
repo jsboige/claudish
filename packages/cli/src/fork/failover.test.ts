@@ -173,6 +173,43 @@ describe("cascade parsing", () => {
     ]);
   });
 
+  // _NOTE is positional, like _RESET: an empty entry is a placeholder for a
+  // step without a note. Filtering holes (the old splitSteps read) shifted
+  // every later note one step up — `a>>c` showed step 2's note on step 1.
+  describe("_NOTE is positional — a hole keeps its step", () => {
+    const THREE = {
+      CLAUDISH_FAILOVER_HAIKU: "vllm-myia@swift-1.5-27b>mmc@MiniMax-M3.1-Flash>cx@gpt-6-luna",
+    } as NodeJS.ProcessEnv;
+    const notesOf = (note: string) => {
+      initFailover({ ...THREE, CLAUDISH_FAILOVER_HAIKU_NOTE: note });
+      return getFailoverRule("haiku")!.steps.map((s) => s.note);
+    };
+
+    it("a hole in the middle: `a>>c` puts c on step 2, nothing on step 1", () => {
+      expect(notesOf("noteSwift>>noteLuna")).toEqual(["noteSwift", undefined, "noteLuna"]);
+    });
+
+    it("a leading hole: `>b` puts b on step 1, nothing on step 0", () => {
+      expect(notesOf(">noteMiniMax")).toEqual([undefined, "noteMiniMax", undefined]);
+    });
+
+    it("a blank entry is a hole too (trimmed)", () => {
+      expect(notesOf("a> >c")).toEqual(["a", undefined, "c"]);
+    });
+
+    it("hole-free values read exactly as before (the 28/11 hub values)", () => {
+      expect(notesOf("only step 0")).toEqual(["only step 0", undefined, undefined]);
+      expect(notesOf("a>b")).toEqual(["a", "b", undefined]);
+      expect(notesOf(">")).toEqual([undefined, undefined, undefined]);
+      expect(notesOf("a>")).toEqual(["a", undefined, undefined]);
+      expect(notesOf("")).toEqual([undefined, undefined, undefined]);
+    });
+
+    it("extra entries past the last step are ignored", () => {
+      expect(notesOf("a>b>c>d")).toEqual(["a", "b", "c"]);
+    });
+  });
+
   it("defaults a missing label to the target string", () => {
     initFailover({
       CLAUDISH_FAILOVER_SONNET: "ds@deepseek-v4-pro",
