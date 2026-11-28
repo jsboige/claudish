@@ -464,6 +464,110 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(report[1]["verdict"], "BLOCKED")
             self.assertIn("claim-blocked(rc=1)", report[1]["reasons"])
 
+    # -- one path of a LOT issue (28/11, #27133) --------------------------------
+
+    LOT_BODY = Raw("[Origami Rust] Lot 5 -- several notebooks, each attributed by marker.\n")
+    LOT_PATH = "Series/MGS-27-Forensic-Rust.ipynb"
+    SIBLING = "Series/MGS-28-BareBones-Rust.ipynb"
+
+    def lot_report(self, comments=None, body=None, claim_rc=0, path=None):
+        """Run the bar on issue 1 for LOT_PATH; the claim stand-in records its argv."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        repo = make_repo(root)
+        add_claim_script(repo, claim_rc)
+        argv_file = root / "claim-argv.json"
+        (repo / "scripts" / "check_lane_claim.py").write_text(
+            "import json, sys\n"
+            f"open({str(argv_file)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+            f"sys.exit({claim_rc})\n", encoding="utf-8")
+        report = ns.run_preflight(
+            repo, FakeIdentity(self.routes(comments=comments,
+                                           body=body if body is not None else self.LOT_BODY)),
+            [1], "myia-po-2028:claudish", [], root, pin="HEAD",
+            paths={1: path or self.LOT_PATH})
+        return report[1], json.loads(argv_file.read_text())
+
+    def test_lot_path_is_the_target_and_reaches_the_claim_organ(self):
+        """Founding case (28/11, #27133): the issue-level bar refused MGS-27 for
+        'no-target-in-body' and a claim rc=2, while the organ with --paths said
+        CLEAR. With a path, the target is that path and the organ gets --paths."""
+        r, argv = self.lot_report()
+        self.assertEqual(r["verdict"], "FREE", r)
+        self.assertEqual(r["target"], self.LOT_PATH)
+        self.assertEqual(r["scope"], "path")
+        self.assertEqual(argv, ["1", "--lane", "myia-po-2028:claudish", "--paths", self.LOT_PATH])
+
+    def test_a_sibling_paths_delivery_does_not_freeze_the_lot(self):
+        """The MGS-28 [DELIVERED] froze every path of the lot. A marker scoped to a
+        SIBLING path is recorded, not blocking."""
+        comments = [{"body": f"[DELIVERED] lane myia-po-2028:claudish -- PR #28852 -- paths: {self.SIBLING}\n\n"
+                             f"Livraison : issue #1, {self.LOT_PATH} reste a faire.",
+                     "created_at": "2026-11-27T08:15:38Z"}]
+        r, _ = self.lot_report(comments=comments)
+        self.assertEqual(r["verdict"], "FREE", r)
+        self.assertEqual(r["delivered_other_paths"], ["2026-11-27T08:15:38Z"])
+        self.assertIsNone(r["last_delivered"])
+
+    def test_a_delivery_scoped_to_the_path_still_blocks(self):
+        """The founding duty of the bar (#27508/#27509) holds per path."""
+        comments = [{"body": f"[DELIVERED] lane myia-po-2028:claudish -- PR #9 -- paths: {self.SIBLING}, {self.LOT_PATH}",
+                     "created_at": "2026-11-28T09:00:00Z"}]
+        r, _ = self.lot_report(comments=comments)
+        self.assertEqual(r["verdict"], "BLOCKED", r)
+        self.assertIn("delivered-marker", r["reasons"])
+        self.assertEqual(r["last_delivered"], "2026-11-28T09:00:00Z")
+
+    def test_an_unscoped_delivery_naming_the_notebook_blocks(self):
+        """An unscoped marker (the 25/11 MGS-29 form) stays fail-closed when it
+        names the notebook -- by basename or by stem."""
+        for text in ("carnet MGS-27-Forensic-Rust (lot 5)", "voir MGS-27-Forensic-Rust.ipynb"):
+            comments = [{"body": f"[DELIVERED] lane myia-po-2028:CoursIA -- PR #9 -- {text}",
+                         "created_at": "2026-11-25T11:33:16Z"}]
+            r, _ = self.lot_report(comments=comments)
+            self.assertEqual(r["verdict"], "BLOCKED", (text, r))
+
+    def test_an_unscoped_delivery_naming_another_notebook_does_not_block(self):
+        comments = [{"body": "[DELIVERED] lane myia-po-2028:CoursIA -- PR #28548 -- carnet MGS-29-GA-Rust (lot 5)",
+                     "created_at": "2026-11-25T11:33:16Z"}]
+        r, _ = self.lot_report(comments=comments)
+        self.assertEqual(r["verdict"], "FREE", r)
+        self.assertEqual(r["delivered_other_paths"], ["2026-11-25T11:33:16Z"])
+
+    def test_a_path_in_the_explanation_is_not_the_scope(self):
+        """Only the HEAD line's clause scopes a marker: a `paths:` quoted lower in
+        the comment is prose (check_lane_claim.py reads markers the same way)."""
+        comments = [{"body": f"[DELIVERED] lane x -- PR #9 -- paths: {self.SIBLING}\n\npaths: {self.LOT_PATH}",
+                     "created_at": "2026-11-28T09:00:00Z"}]
+        r, _ = self.lot_report(comments=comments)
+        self.assertEqual(r["verdict"], "FREE", r)
+
+    def test_a_path_other_than_the_body_cible_refuses(self):
+        """A single-target issue keeps its own Cible: naming another path refuses."""
+        r, _ = self.lot_report(body=BODY)
+        self.assertEqual(r["verdict"], "BLOCKED", r)
+        self.assertIn("path-is-not-the-issue-cible", r["reasons"])
+
+    def test_the_body_cible_given_as_path_passes(self):
+        r, argv = self.lot_report(body=BODY, path=TARGET)
+        self.assertEqual(r["verdict"], "FREE", r)
+        self.assertEqual(argv[-2:], ["--paths", TARGET])
+
+    def test_the_path_leg_keeps_the_pinned_tree_and_claim_legs(self):
+        """A path does not bypass the other measurements: on main, or claimed, blocks."""
+        r, _ = self.lot_report(path="Series/T-01-Python.ipynb")
+        self.assertIn("target-in-main", r["reasons"])
+        r, _ = self.lot_report(claim_rc=1)
+        self.assertIn("claim-blocked(rc=1)", r["reasons"])
+
+    def test_preflight_arg_parsing(self):
+        self.assertEqual(ns.parse_preflight_arg("27133=a\\b.ipynb,28944"),
+                         ([27133, 28944], {27133: "a/b.ipynb"}))
+        self.assertEqual(ns.parse_preflight_arg("1 2"), ([1, 2], {}))
+        with self.assertRaises(ValueError):
+            ns.parse_preflight_arg("27133=")
+
     def test_a_failed_git_read_refuses_instead_of_free(self):
         """An unresolvable pin raises: it NEVER degrades to 'absent from main'."""
         with tempfile.TemporaryDirectory() as td:

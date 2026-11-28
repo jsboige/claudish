@@ -43,6 +43,28 @@ claimée entre sélection et lancement (mesuré : course perdue de 39 s contre
 une lane sœur, refus propre du scheduler, 0 spend). Perdre cette course est
 le fonctionnement voulu.
 
+## Préflight d'un grain (`--preflight N[=CHEMIN],… --lane L --require-free`)
+
+Avant de mettre un grain en file : quatre mesures par issue nommée, dont chacune refuse
+seule. Elles portent sur la cible, qui ne doit être ni (a) dans l'arbre épinglé, ni (b) dans
+les fichiers d'une PR ouverte. Le fil ne doit (c) porter aucun `[DELIVERED]`, et (d) le verdict
+de `check_lane_claim.py` doit être rendu depuis le checkout CoursIA. `--require-free` sort en
+`4` dès qu'une issue n'est pas `FREE`.
+
+**Un chemin d'une issue-lot : `N=CHEMIN`** (28/11, #27133). Le corps d'un lot n'a pas de ligne
+`Cible`, et chaque carnet y est attribué par un marqueur borné. Au niveau de l'issue, la barre
+refusait MGS-27 de trois façons à la fois : pas de cible dans le corps, le `[DELIVERED]` de
+MGS-28, et le garde de claim sans `--paths` qui sortait en 2. Or `check_lane_claim.py --paths
+<MGS-27>` rendait CLEAR. Avec un chemin :
+- la cible EST ce chemin ; un corps dont la `Cible` nomme un autre carnet refuse
+  (`path-is-not-the-issue-cible`) ;
+- seul un `[DELIVERED]` qui parle pour ce chemin bloque : sa clause `paths:` de tête le nomme, ou
+  bien le marqueur n'a pas de clause et nomme le carnet (nom de fichier ou radical). Les autres
+  restent listés dans `delivered_other_paths` ;
+- le garde de claim reçoit `--paths CHEMIN` ;
+- les mesures (a) et (b) restent entières. Un grain livré ne leur échappe pas, puisque sa PR est
+  ouverte ou son fichier est sur main.
+
 ## Preuves (`--evidence FILE` + `--corpus-check`)
 
 1. **Témoin refus** : `--witness` → exit 3, message explicite, 0 réseau.
