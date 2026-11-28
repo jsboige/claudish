@@ -284,9 +284,58 @@ def issue_target(body: str) -> str | None:
     return None
 
 
+# The `paths:` clause of a lane marker's HEAD line (`[DELIVERED] lane L -- PR #N --
+# paths: a, b`), the form the harness and check_lane_claim.py write. Read from the
+# first line only: a path quoted in the explanation below is prose, not the scope.
+PATHS_CLAUSE = re.compile(r"(?<![`\"'\w])paths\s*:\s*([^\n]+?)\s*$", re.IGNORECASE)
+
+
+def marker_paths(body: str) -> list[str] | None:
+    """The paths a marker's head line scopes it to, or None when it names no clause."""
+    head = (body or "").lstrip().splitlines()[0] if (body or "").strip() else ""
+    m = PATHS_CLAUSE.search(head)
+    if not m:
+        return None
+    return [norm(x.strip().strip("`")) for x in m.group(1).split(",") if x.strip()]
+
+
+def delivered_covers(body: str, path: str) -> bool:
+    """Does this [DELIVERED] marker speak for `path`, one path of a lot issue?
+
+    A scoped marker speaks for the paths of its clause only: on lot #27133, the
+    MGS-28 delivery (27/11) froze MGS-27, attributed to the same lane by a bounded
+    [OVERRIDE] (28/11), because the bar read every marker as issue-wide. An
+    UNSCOPED marker stays fail-closed when it names the notebook (its basename
+    or its stem anywhere in the comment, the 25/11 MGS-29 form); one that names
+    neither is not this path's delivery -- the pinned-tree and open-PR legs, which
+    a delivered grain cannot escape (its PR is open, or its file is on main),
+    still read that path independently."""
+    scoped = marker_paths(body)
+    if scoped is not None:
+        return path in scoped
+    base = path.rsplit("/", 1)[-1]
+    stem = base[:-len(".ipynb")] if base.endswith(".ipynb") else base
+    return base in body or stem in body
+
+
+def parse_preflight_arg(raw: str) -> tuple[list[int], dict[int, str]]:
+    """`N[,N...]` with an optional `=path` per entry, for a path of a lot issue."""
+    issues: list[int] = []
+    paths: dict[int, str] = {}
+    for tok in raw.replace(",", " ").split():
+        n, sep, path = tok.partition("=")
+        issue = int(n)
+        issues.append(issue)
+        if sep:
+            if not path.strip():
+                raise ValueError(f"--preflight entry {tok!r}: empty path after '='")
+            paths[issue] = norm(path.strip())
+    return issues, paths
+
+
 def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
                   inflight_queues: list[str], tmp_root: Path, pin: str = DEFAULT_PIN,
-                  require_free: bool = False) -> dict:
+                  require_free: bool = False, paths: dict[int, str] | None = None) -> dict:
     """Per named issue: may a grain be queued? FOUR measurements, each opposable.
 
     Measured 20/11 (po-2028:claudish): `check_lane_claim.py` answers 'CLEAR: no
@@ -300,6 +349,15 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
       (c) the target in an OPEN PR's changed files, ALL pages (api_all);
       (d) the lane registry's claim verdict.
     A grain is FREE only when none of them speaks.
+
+    `paths` names, per issue, ONE path of a LOT issue (a body with no `Cible`
+    line, several notebooks, each attributed by a bounded marker). Measured
+    28/11 on #27133: the issue-level bar refused MGS-27 three ways at once
+    (no target in body, the MGS-28 [DELIVERED], the claim organ without
+    `--paths` exiting 2) while `check_lane_claim.py --paths <MGS-27>` answered
+    CLEAR. With a path the target IS that path (a body whose own `Cible` names
+    another notebook refuses), only a [DELIVERED] that speaks for it blocks
+    (`delivered_covers`), and the claim organ receives `--paths`.
 
     The PR-file scan is the expensive part (~1 call per open PR). Its cache is
     DISABLED under require_free: the gate path must not serve a verdict older
@@ -346,6 +404,11 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
         body = identity.gh(["api", f"repos/jsboige/CoursIA/issues/{n}", "--jq", ".body"])
         target = issue_target(body)
         reasons: list[str] = []
+        path = (paths or {}).get(n)
+        if path is not None:
+            if target and target != path:
+                reasons.append("path-is-not-the-issue-cible")
+            target = path
         if not target:
             reasons.append("no-target-in-body")
         else:
@@ -359,13 +422,21 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
         # lstrip(): the marker is written bare at column 0 by the harness, but a
         # human hand may indent or bold it — the marker itself is the contract.
         delivered = [c for c in comments if (c.get("body") or "").lstrip().startswith(DELIVERED)]
+        other_paths: list[str] = []
+        if path is not None:
+            other_paths = [c.get("created_at") for c in delivered
+                           if not delivered_covers(c.get("body") or "", path)]
+            delivered = [c for c in delivered if delivered_covers(c.get("body") or "", path)]
         if delivered:
             reasons.append("delivered-marker")
         # cwd=repo: check_lane_claim.py resolves the registry and tracked paths
         # against the repository root; run from elsewhere it answers rc=2 (measured
         # 20/11 — a BLOCKED verdict for every issue, including FREE ones).
-        claim = subprocess.run([sys.executable, str(repo / "scripts" / "check_lane_claim.py"),
-                                str(n), "--lane", lane], cwd=str(repo),
+        claim_argv = [sys.executable, str(repo / "scripts" / "check_lane_claim.py"),
+                      str(n), "--lane", lane]
+        if path is not None:
+            claim_argv += ["--paths", path]
+        claim = subprocess.run(claim_argv, cwd=str(repo),
                                capture_output=True, text=True, encoding="utf-8")
         # check_lane_claim.py contract (issue mode): 0 ok / 1 blocked (other lane, or the
         # weekly EPIC cap) / 2 io-or-gh error **or a NOT_SCOPED blocker** -- without
@@ -388,6 +459,8 @@ def run_preflight(repo: Path, identity: Identity, issues: list[int], lane: str,
         if claim.returncode != 0:
             reasons.append("claim-" + claim_verdict)
         report[n] = {"target": target,
+                     **({"scope": "path", "delivered_other_paths": other_paths}
+                        if path is not None else {}),
                      "verdict": "FREE" if not reasons else "BLOCKED",
                      "reasons": reasons,
                      "claim": claim_verdict,
@@ -452,9 +525,11 @@ def main(argv: list[str] | None = None) -> int:
                          "default): run selection under the ambient shared account, write the dump")
     ap.add_argument("--witness", action="store_true",
                     help="refusal self-test: expect exit 3 on an unavailable App, zero network calls")
-    ap.add_argument("--preflight", metavar="N[,N...]",
+    ap.add_argument("--preflight", metavar="N[=PATH][,N[=PATH]...]",
                     help="bar a named issue list before queueing grains: target-in-main (pinned tree), "
-                         "[DELIVERED] marker, target in an open PR (all pages), claim verdict")
+                         "[DELIVERED] marker, target in an open PR (all pages), claim verdict; "
+                         "N=PATH bars ONE path of a lot issue (target = PATH, path-scoped "
+                         "[DELIVERED], claim organ called with --paths)")
     ap.add_argument("--lane", default=os.environ.get("NBCODER_LANE"),
                     help="lane identity handed to check_lane_claim.py (required with --preflight; "
                          "default: $NBCODER_LANE — no machine-specific default in a fleet organ)")
@@ -514,10 +589,14 @@ def main(argv: list[str] | None = None) -> int:
             print("instrument defect: --preflight needs a lane (pass --lane or set NBCODER_LANE)",
                   file=sys.stderr)
             return EXIT_DEFECT
-        issues = [int(x) for x in args.preflight.replace(",", " ").split()]
+        try:
+            issues, paths = parse_preflight_arg(args.preflight)
+        except ValueError as e:
+            print(f"instrument defect: {e}", file=sys.stderr)
+            return EXIT_DEFECT
         try:
             report = run_preflight(repo, identity, issues, args.lane, args.inflight, tmp_root,
-                                   args.pin, require_free=args.require_free)
+                                   args.pin, require_free=args.require_free, paths=paths)
         except InstrumentError as e:
             # A failed Git read or gh call refuses: it never reads as FREE.
             print(f"instrument defect: {e}", file=sys.stderr)
