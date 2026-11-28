@@ -44,10 +44,7 @@ export interface PolicyRetryOpts {
  * anthropic-compat providers (Z.AI, MiniMax, Kimi) whose error objects carry
  * only `type` + `message` with no code.
  */
-export function isPolicyRefusal(
-  code?: string | null,
-  message?: string | null
-): boolean {
+export function isPolicyRefusal(code?: string | null, message?: string | null): boolean {
   if (code === "invalid_prompt") return true;
   return /prompt (?:was )?flagged|flagged as (?:potentially )?violating|violat\w+ (?:the )?(?:usage|content|acceptable[- ]use) policy/i.test(
     message ?? ""
@@ -124,6 +121,9 @@ export function preStreamPolicyRefusal(
  * (it logs the `action=surface` marker itself, with the total attempt count).
  * A thrown retry leaves the original diagnosis intact — the original response
  * was still a classified refusal, so surfacing it labeled beats a 503.
+ * `opts.shouldStop()` is consulted before each retry (#1209 2/2: the client
+ * left mid-turn): once it turns true the loop exits with the attempts made so
+ * far, and the caller answers its own way.
  */
 export async function preStreamPolicyRetry(
   doFetch: () => Promise<Response>,
@@ -132,11 +132,15 @@ export async function preStreamPolicyRetry(
     model: string;
     provider?: string;
     backoffMs?: readonly number[];
+    shouldStop?: () => boolean;
   }
 ): Promise<{ response: Response | null; attempts: number }> {
   const backoff = opts.backoffMs ?? backoffOverrideForTests ?? POLICY_RETRY_BACKOFF_MS;
   let attempts = 0;
   for (let i = 0; i < backoff.length; i++) {
+    // Caller-side stop condition, checked BEFORE the attempt is counted: a
+    // departure must never inflate the `action=retry` ledger (#41/#60).
+    if (opts.shouldStop?.()) break;
     attempts++;
     logPolicyRefusal({
       lane: opts.lane,

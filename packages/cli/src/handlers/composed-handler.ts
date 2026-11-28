@@ -28,6 +28,7 @@ import { TokenTracker, type UsageCacheDetail } from "./shared/token-tracker.js";
 import { clientRequestedThinking } from "./shared/client-thinking.js";
 import { clientAttributionEnabled, clientAttributionHeaders } from "./shared/client-attribution.js";
 import { setServedModel } from "./shared/served-model-header.js";
+import { CLIENT_GONE_HEADER } from "./shared/client-gone.js";
 import { UPSTREAM_ERROR_HEADER, UPSTREAM_ERROR_MARKER } from "./shared/upstream-error-marker.js";
 import { compressUpstreamRequestBody } from "./shared/upstream-compression.js";
 import { transformOpenAIToClaude } from "../transform.js";
@@ -207,13 +208,17 @@ async function retryConnectError(
   kind: ConnectionErrorKind,
   policy: ConnectRetryPolicy,
   refetch: () => Promise<Response>,
-  firstError: unknown
+  firstError: unknown,
+  clientGone?: AbortSignal
 ): Promise<Response | null> {
   const { max: maxRetries, delaysMs: delays } = policy;
   let lastError = firstError;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const delayMs = delays[Math.min(attempt - 1, delays.length - 1)] ?? 1200;
     await new Promise((resolve) => setTimeout(resolve, delayMs));
+    // #1209 (2/2): a client that left during the rung gets NO retry — and no
+    // `[ConnectRetry]` line, which would advertise an attempt never made.
+    if (clientGone?.aborted) return null;
     const code = classifyConnectionError(lastError)?.code ?? "?";
     logStderr(
       `[ConnectRetry] ${providerDisplayName} ${bareModelName} ${kind} before response (code=${code}) — retry ${attempt}/${maxRetries}`
@@ -401,6 +406,66 @@ const EFFORT_TARGET_LADDER: Record<string, "low" | "medium" | "xhigh"> = {
   max: "xhigh",
 };
 
+/**
+ * #1209 (2/2) — the client-gone signal for a NON-streaming request, or
+ * `undefined` when this call must keep today's behavior.
+ *
+ * `@hono/node-server` aborts the incoming request's own signal when the
+ * response socket closes before the response was fully written — reason
+ * "Client connection prematurely closed." (dist/listener.js L542-548 of
+ * node-server 1.19.6, read not assumed). That abort is the only client-gone
+ * this proxy can trust: it is what the sync path never listened to, and the
+ * measured cost of not listening was 6 paid generations (≈90 K completion
+ * tokens, prompts of 100-150 K) finishing 12-359 s after the client's own
+ * budget had expired (issue #1209, 26/11 04:20→05:05Z).
+ *
+ * Streaming requests are deliberately excluded: their path has its own
+ * contract (relay passthrough, never-hang, the parser's `cancel()` capture
+ * marker), and #1209 scopes this fix to `stream:false`.
+ *
+ * Exported for the pins in `proxy-server-client-gone.test.ts` (the scoping is
+ * a decision, and a decision needs a test that names it).
+ */
+export function syncClientAbortSignal(
+  c: Context,
+  payload: { stream?: boolean } | undefined
+): AbortSignal | undefined {
+  if (payload?.stream === true) return undefined;
+  return c.req?.raw?.signal;
+}
+
+/**
+ * Merge two abort signals into one. `AbortSignal.any` is Node ≥ 20.3 and this
+ * package declares `engines.node >= 18`, so the combination is spelled out.
+ * Either input may be absent; the surviving single signal is returned as is
+ * (no wrapper listener is installed when there is nothing to combine).
+ */
+export function combineAbortSignals(
+  a: AbortSignal | undefined,
+  b: AbortSignal | undefined
+): AbortSignal | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.aborted) return a;
+  if (b.aborted) return b;
+  const combined = new AbortController();
+  const detach = () => {
+    a.removeEventListener("abort", onA);
+    b.removeEventListener("abort", onB);
+  };
+  const onA = () => {
+    detach();
+    combined.abort(a.reason);
+  };
+  const onB = () => {
+    detach();
+    combined.abort(b.reason);
+  };
+  a.addEventListener("abort", onA, { once: true });
+  b.addEventListener("abort", onB, { once: true });
+  return combined.signal;
+}
+
 export class ComposedHandler implements ModelHandler {
   private provider: ProviderTransport;
   private adapterManager: DialectManager;
@@ -564,6 +629,53 @@ export class ComposedHandler implements ModelHandler {
     const active = this.provider.getActiveModelName?.();
     if (active !== undefined && active !== this.bareModelName) return;
     setServedModel(response, this.bareModelName);
+  }
+
+  /**
+   * #1209 (2/2) — the terminal answer to a `stream:false` client that closed
+   * the connection before its answer was written. Nobody reads it; its job is
+   * to keep every invariant downstream intact: the route always answers (never
+   * a hang, never a throw), and the client's departure is never answered with
+   * a 5xx a cascade would walk — for a client that is gone.
+   *
+   * `x-claudish-served-model` is deliberately ABSENT: the header's contract
+   * (#1128) names the concrete that served, and an answer nobody received
+   * served no one. `x-claudish-client-gone` names the situation instead — and
+   * names it to the cascade too: that mark makes the answer a NON-state for
+   * every `response.ok` consumer (shared/client-gone.ts), so a cancelled attempt
+   * is never booked as the recovery that brings a dead rung back.
+   */
+  private buildClientGoneResponse(c: Context): Response {
+    return c.json(
+      {
+        id: `msg_client_gone_${Date.now().toString(36)}`,
+        type: "message",
+        role: "assistant",
+        model: this.bareModelName,
+        content: [],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+      200,
+      {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        [CLIENT_GONE_HEADER]: "1",
+      }
+    );
+  }
+
+  /**
+   * #1209 (2/2) — the operational marker, then the terminal answer above. One
+   * `[ClientGone]` line format for every site that stops for a departed client.
+   */
+  private answerClientGone(c: Context, detail: string, elapsedMs: number): Response {
+    log(
+      `[ClientGone] provider=${this.provider.displayName} model=${this.targetModel} ${detail} after ${Math.round(elapsedMs)}ms`,
+      true // forceConsole — operational event
+    );
+    return this.buildClientGoneResponse(c);
   }
 
   async handle(c: Context, payload: any): Promise<Response> {
@@ -1208,6 +1320,16 @@ export class ComposedHandler implements ModelHandler {
 
     // Merge provider-specific fetch options (e.g., undici dispatcher, abort signal)
     const requestInit = this.provider.getRequestInit?.() || {};
+    // #1209 (2/2) — a non-streaming client that has hung up must not keep being
+    // paid for: its abort signal rides every fetch this call issues (the
+    // first one, the in-stream retries and the 401 re-auth), so the upstream
+    // is cancelled at the moment the server sees the socket close. A
+    // transport's own signal (LocalProviderTransport's 10-min timeout) is
+    // combined, never replaced. See syncClientAbortSignal above.
+    const clientGone = syncClientAbortSignal(c, payload);
+    const fetchInit = clientGone
+      ? { ...requestInit, signal: combineAbortSignals(requestInit.signal, clientGone) }
+      : requestInit;
     // #909 — gzip the request body when this transport declared the capability
     // and the body clears the floor. Returns the plain string otherwise; never throws.
     const wireBody = compressUpstreamRequestBody({
@@ -1216,13 +1338,27 @@ export class ComposedHandler implements ModelHandler {
       body: JSON.stringify(requestPayload),
       label: `${this.provider.displayName} ${this.targetModel}`,
     });
-    const doFetch = () =>
-      fetch(endpoint, {
+    const doFetch = (): Promise<Response> => {
+      // #1209 (2/2) — the ONE chokepoint of every re-issue that goes through
+      // this closure (the connect ladder, the overload patience, the
+      // rate-limit temporizing, the policy retry, the in-stream retry; the
+      // 401 re-auth builds its own fetch and checks the signal itself). For a
+      // client that is gone nothing is issued at all — not even a call an
+      // already-aborted signal would refuse. The rejection has the shape of
+      // such a refusal, and every caller above already catches it; the gate
+      // stays on the SIGNAL, never on this error.
+      if (clientGone?.aborted) {
+        const err = new Error("The operation was aborted.");
+        err.name = "AbortError";
+        return Promise.reject(err);
+      }
+      return fetch(endpoint, {
         method: "POST",
         headers,
         body: wireBody,
-        ...requestInit,
+        ...fetchInit,
       });
+    };
 
     let response: Response;
     try {
@@ -1235,6 +1371,25 @@ export class ComposedHandler implements ModelHandler {
           })
         : await doFetch();
     } catch (error: any) {
+      // #1209 (2/2) — OUR cancel, not the provider's: the client closed the
+      // connection before any headers arrived. Nothing was served and nothing
+      // will be read, so: no stats event, no failure report, no failure mark —
+      // and no retry, since re-issuing the body for a client that is gone is
+      // the waste this fix exists to stop.
+      //
+      // The gate is the SIGNAL, never the error class: transports re-label the
+      // abort on their way out (OpenAIProviderTransport turns every AbortError
+      // into OpenAITimeoutError, openai.ts L281-284), so an error-name test
+      // would miss the very case this fixes. The class is still named in the
+      // line below, which is what keeps a genuine provider failure legible
+      // when the client happened to leave at the same moment.
+      if (clientGone?.aborted) {
+        return this.answerClientGone(
+          c,
+          `upstream cancelled — stream:false client closed the connection before headers (${error?.name ?? String(error)})`,
+          performance.now() - startTime
+        );
+      }
       // #431 AC3: the bounded busy wait expired. Never confuse this with a
       // connection error (the retry below would re-queue behind the same
       // saturated limiter and pay the whole ladder again) — answer the labeled
@@ -1290,9 +1445,21 @@ export class ComposedHandler implements ModelHandler {
               this.provider.enqueueRequest
                 ? () => this.provider.enqueueRequest!(doFetch)
                 : doFetch,
-              error
+              error,
+              clientGone
             )
           : null;
+      // #1209 (2/2) — the client left while the ladder waited. Without this
+      // the departure would be answered as the ORIGINAL connect failure: a 400
+      // connection_error charged to the provider (durable connection-error
+      // line, telemetry, a failed stat) for a client that will never read it.
+      if (!recovered && clientGone?.aborted) {
+        return this.answerClientGone(
+          c,
+          "left during the connect-retry ladder — remaining retries not issued",
+          performance.now() - startTime
+        );
+      }
       const conn = recovered ? null : classifyConnectionError(error);
       if (conn) {
         const msg = buildConnectionErrorMessage(conn.kind, this.provider.displayName, endpoint);
@@ -1410,7 +1577,18 @@ export class ComposedHandler implements ModelHandler {
       const walkOwnsIt =
         concurrencyRefusal && isCascadeWalkEligible(c as unknown as object);
       if (transientContention && !stepConcurrencyRefusal && !walkOwnsIt) {
-        const recovered = await this.patientOverloadBackoff(doFetch);
+        const recovered = await this.patientOverloadBackoff(doFetch, clientGone);
+        // #1209 (2/2) — the client left during the patience. The overload was
+        // real and was logged as such; but a 529 answered here would walk the
+        // cascade onto a paid step (and move the session pin) for a client
+        // that will never read the answer.
+        if (clientGone?.aborted) {
+          return this.answerClientGone(
+            c,
+            "left during the overload backoff — retry not issued",
+            performance.now() - startTime
+          );
+        }
         if (recovered) response = recovered;
         // null = exhausted → response stays the overload → !response.ok below → 529
       } else if (stepConcurrencyRefusal) {
@@ -1439,7 +1617,20 @@ export class ComposedHandler implements ModelHandler {
             lane,
             model: this.bareModelName,
             provider: this.provider.name,
+            // #1209 (2/2) — a client that left gets no retry of the identical
+            // body: the ledger (#41/#60 count these lines per provider/model)
+            // stays about refusals, never about departures.
+            shouldStop: () => clientGone?.aborted === true,
           });
+          // #1209 (2/2) — and it gets no labeled refusal either: the refusal
+          // was real, but this answer belongs to nobody.
+          if (clientGone?.aborted) {
+            return this.answerClientGone(
+              c,
+              "left during the policy-refusal retry",
+              performance.now() - startTime
+            );
+          }
           if (retried.response) {
             // ok → normal stream path below (own watchdog wrap); foreign
             // non-ok → the generic error path owns it
@@ -1482,6 +1673,11 @@ export class ComposedHandler implements ModelHandler {
           this.applyClientAttribution(c, retryHeaders);
           retryHeaders["Content-Type"] = "application/json";
           const retryInit = this.provider.getRequestInit?.() || {};
+          // #1209 (2/2) — the re-auth fetch is still the same caller: a client
+          // that left must not be served here either.
+          const retryFetchInit = clientGone
+            ? { ...retryInit, signal: combineAbortSignals(retryInit.signal, clientGone) }
+            : retryInit;
           // #909 — fresh headers, so the body must be (re)compressed to match.
           const retryBody = compressUpstreamRequestBody({
             capability: this.provider.requestCompression,
@@ -1493,7 +1689,7 @@ export class ComposedHandler implements ModelHandler {
             method: "POST",
             headers: retryHeaders,
             body: retryBody,
-            ...retryInit,
+            ...retryFetchInit,
           });
           if (retryResp.ok) {
             response = retryResp; // fall through to stream handling below
@@ -1574,6 +1770,18 @@ export class ComposedHandler implements ModelHandler {
             return retryEnveloped;
           }
         } catch (err: any) {
+          // #1209 (2/2) — OUR cancel during the refresh or the retry fetch is
+          // not an authentication failure: nothing is reported. (The refresh
+          // itself is a cheap auth-maintenance call of its own; the abandon
+          // this issue is about is the paid generation, which the retry fetch
+          // below never issues for a gone client.)
+          if (clientGone?.aborted) {
+            return this.answerClientGone(
+              c,
+              "left during the 401 re-auth retry",
+              performance.now() - startTime
+            );
+          }
           log(`[${this.provider.displayName}] Auth refresh failed: ${err.message}`);
           logStderr(
             `Error [${this.provider.displayName}]: Authentication failed — ${err.message}. Check API key.`
@@ -1911,13 +2119,25 @@ export class ComposedHandler implements ModelHandler {
         let rlAttempt = 0;
         let peeked = await peekStreamStart(response);
         while (peeked.cls === "rate-limit" && rlAttempt < maxRlRetries) {
+          // Same base as the HTTP patient loop, so the one test hook
+          // (`setPatientBackoffTimingsForTests`) drives both spreads; at the
+          // production base (5000 ms) this is the unchanged 5000 × 2ⁿ.
           const backoffMs =
-            Math.min(5000 * 2 ** rlAttempt, 150000) + Math.floor(Math.random() * 1000);
+            Math.min(patientBackoffTimings.baseDelayMs * 2 ** rlAttempt, 150000) +
+            Math.floor(Math.random() * 1000);
           log(
             `[RateLimit] [${this.provider.displayName}] in-stream rate-limit (HTTP 200), temporizing — retry ${rlAttempt + 1}/${maxRlRetries} in ${(backoffMs / 1000).toFixed(1)}s${peeked.detail ? `: ${peeked.detail}` : ""}`,
             true // forceConsole — operational event, must be visible without --debug
           );
           await new Promise((r) => setTimeout(r, backoffMs));
+          // #1209 (2/2) — left during the wait: no re-issue, no 529 to walk.
+          if (clientGone?.aborted) {
+            return this.answerClientGone(
+              c,
+              "left during the in-stream rate-limit backoff — retry not issued",
+              performance.now() - startTime
+            );
+          }
           rlAttempt++;
           let retryResp: Response;
           try {
@@ -1925,10 +2145,14 @@ export class ComposedHandler implements ModelHandler {
             // would compound with this patient loop into an unbounded wait.
             retryResp = await doFetch();
           } catch (e: any) {
-            log(
-              `[RateLimit] [${this.provider.displayName}] rate-limit retry fetch failed: ${e?.message ?? e}`,
-              true
-            );
+            // #1209 (2/2) — the client left during this retry fetch: not a
+            // failed retry. The check right after the loop answers it.
+            if (!clientGone?.aborted) {
+              log(
+                `[RateLimit] [${this.provider.displayName}] rate-limit retry fetch failed: ${e?.message ?? e}`,
+                true
+              );
+            }
             break;
           }
           if (!retryResp.ok) {
@@ -1941,6 +2165,17 @@ export class ComposedHandler implements ModelHandler {
           peeked = await peekStreamStart(response);
         }
         if (peeked.cls === "rate-limit") {
+          // #1209 (2/2) — a departure during a retry fetch is not a sustained
+          // overload: answer the client-gone turn rather than the 529 (which a
+          // cascade would walk onto a paid step, and which would record a
+          // provider failure for the client's own exit).
+          if (clientGone?.aborted) {
+            return this.answerClientGone(
+              c,
+              "left during the in-stream rate-limit retry",
+              performance.now() - startTime
+            );
+          }
           log(
             `[Overload] [${this.provider.displayName}] in-stream overload persisted after ${rlAttempt} retr${rlAttempt === 1 ? "y" : "ies"} → returning 529 overloaded_error (patient backoff exhausted)`,
             true // forceConsole — operational event, must be visible without --debug
@@ -2073,6 +2308,21 @@ export class ComposedHandler implements ModelHandler {
     }
 
     const message = await collectAnthropicSseToMessage(streamResponse, this.bareModelName);
+
+    // #1209 (2/2) — the client left while the answer was being generated: our
+    // signal cut the upstream mid-body, and the parser turned that cut into a
+    // well-formed turn carrying a "[Upstream stream error …]" notice. That
+    // turn is discarded here — nobody will read it, and publishing it would
+    // blame the provider for our cancel while claiming a served model. The
+    // tokens the upstream DID produce stay in the stats: they were generated
+    // and paid for, which is exactly the cost this fix stops growing.
+    if (clientGone?.aborted) {
+      return this.answerClientGone(
+        c,
+        "stream:false client left mid-answer — partial turn discarded, upstream cancelled",
+        performance.now() - startTime
+      );
+    }
 
     const jsonResponse = c.json(message, {
       headers: { "Content-Type": "application/json", "anthropic-version": "2023-06-01" },
@@ -2425,11 +2675,21 @@ export class ComposedHandler implements ModelHandler {
    *   - a non-transient !ok Response (the error morphed, e.g. into a 500) →
    *     caller surfaces the real error via the normal !response.ok path.
    *   - null → contention genuinely sustained after ~5 min → caller surfaces 529.
+   *     Also null, at once, when the sync client left (#1209 2/2): the caller
+   *     reads the signal before the result, so no retry is issued for it.
    *
    * (2026-06-25 patient-backoff revision.)
    */
   private async patientOverloadBackoff(
-    doFetch: () => Promise<Response>
+    doFetch: () => Promise<Response>,
+    /**
+     * #1209 (2/2) — the `stream:false` client's abort signal. Without it a
+     * client that left during a wait would be "retried" once per rung for
+     * ~5 minutes: each fetch refused locally by the aborted signal, each
+     * logged as a failed retry. Undefined for streaming clients (and for the
+     * in-stream caller below) — no behaviour change there.
+     */
+    clientGone?: AbortSignal
   ): Promise<Response | null> {
     const maxRetries = patientBackoffTimings.maxRetries;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -2444,6 +2704,8 @@ export class ComposedHandler implements ModelHandler {
         true // forceConsole — operational event, must be visible without --debug
       );
       await new Promise((r) => setTimeout(r, backoffMs));
+      // #1209 (2/2) — left during the wait: the retry below is not issued.
+      if (clientGone?.aborted) return null;
       try {
         const retryResp = await doFetch();
         if (retryResp.ok) return retryResp; // recovered
@@ -2461,6 +2723,9 @@ export class ComposedHandler implements ModelHandler {
         }
         // still transient overload → keep backing off
       } catch (e: any) {
+        // #1209 (2/2) — OUR cancel, not a network blip: stop here instead of
+        // backing off further for a client that is gone.
+        if (clientGone?.aborted) return null;
         log(
           `[Overload] [${this.provider.displayName}] patient retry fetch failed: ${e?.message ?? e}`,
           true

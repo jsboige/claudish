@@ -14,6 +14,7 @@ import type { ModelHandler } from "./types.js";
 import { logStderr } from "../logger.js";
 import { ComposedHandler } from "./composed-handler.js";
 import { wrapAnthropicError } from "./shared/anthropic-error.js";
+import { isClientGoneResponse } from "./shared/client-gone.js";
 
 export interface FallbackCandidate {
   /** Human-readable provider name for logging */
@@ -60,6 +61,11 @@ export class FallbackHandler implements ModelHandler {
         }
 
         const response = await handler.handle(c, payload);
+
+        // #1209 (2/2): the client left — the marked answer is a NON-state. No
+        // candidate "served", so none is credited and no retry is spent on a
+        // client that will never read it.
+        if (isClientGoneResponse(response)) return response;
 
         // Success — cache the working provider index and return immediately
         if (response.ok) {

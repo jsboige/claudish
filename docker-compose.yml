@@ -412,6 +412,12 @@ services:
       # cutting. Read once per shutdown; must stay under stop_grace_period or
       # the runtime kill answers first. Empty = 30000.
       - CLAUDISH_SHUTDOWN_GRACE_MS=${CLAUDISH_SHUTDOWN_GRACE_MS:-}
+      # #1209 (2/2) — boot capability probe: does THIS runtime surface a
+      # stream:false client's departure before the first write? Published as
+      # /health clientGoneDetect (bun 1.3.14: no — the cancellation is inert
+      # there; bun >= 1.4: yes). Kill switch: 0 = not probed, published
+      # "disabled". Empty = probed at every boot.
+      - CLAUDISH_CLIENT_GONE_PROBE=${CLAUDISH_CLIENT_GONE_PROBE:-}
       # Auth & native lane: key-rotation overlap + #219 auto-pin.
       - CLAUDISH_PROXY_KEY_PREVIOUS=${CLAUDISH_PROXY_KEY_PREVIOUS:-}
       - CLAUDISH_NATIVE_PIN_AUTO=${CLAUDISH_NATIVE_PIN_AUTO:-}

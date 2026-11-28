@@ -38,7 +38,7 @@ import { LocalTransport } from "./providers/transport/local.js";
 import { LocalModelAdapter } from "./adapters/local-adapter.js";
 import { PoeProvider } from "./providers/transport/poe.js";
 import type { ModelHandler } from "./handlers/types.js";
-import { ComposedHandler, isOverloadWalkClass, isConnectionWalkClass, setVisionAuthPolicy, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
+import { ComposedHandler, isOverloadWalkClass, isConnectionWalkClass, setVisionAuthPolicy, syncClientAbortSignal, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
 import {
   resolveProvider,
   parseUrlModel,
@@ -186,6 +186,11 @@ import {
   withServedModelHeader,
 } from "./handlers/shared/served-model-header.js";
 import { carryUpstreamErrorMarker } from "./handlers/shared/upstream-error-marker.js";
+import { isClientGoneResponse } from "./handlers/shared/client-gone.js";
+import {
+  getClientGoneDetection,
+  startClientGoneDetectionProbe,
+} from "./fork/client-gone-detect.js";
 
 /**
  * Routing failures are TERMINAL — no provider can serve the request (missing
@@ -214,9 +219,11 @@ class RoutingError extends Error {
  * #348: the overload walk's remaining-patience budget, in ms. Default 300 s —
  * see the walk branch for the 360 s relay-deadline / 600 s client-timeout
  * arithmetic. Read per request like CLAUDISH_FAILOVER_OVERLOAD_WALK; only an
- * explicit `0` disables the bound. NO client-gone check exists — a client
- * abort is undetectable on this stack pre-write (W16 pins the negative
- * result; the budget alone bounds a walk into an abandoned request).
+ * explicit `0` disables the bound. The walk additionally refuses to START for a
+ * `stream:false` client that has left (#1209 2/2 — `syncClientAbortSignal`), and
+ * that predicate's availability is a RUNTIME property the process measures at
+ * boot (`fork/client-gone-detect.ts`, published as `/health` `clientGoneDetect`:
+ * bun 1.3.14 never surfaces it pre-write, bun >= 1.4 does).
  */
 const WALK_BUDGET_DEFAULT_MS = 300_000;
 function readWalkBudgetMs(): number {
@@ -2142,6 +2149,14 @@ export async function createProxyServer(
           continue;
         }
       }
+      // #1209 (2/2): the client left — the marked answer is a NON-STATE. Every
+      // `response.ok` consumer below (nominal success: walls lifted, refusal
+      // runs voided, dwell pins released; step success: backoff cleared) would
+      // book a verified recovery on an answer NO provider produced. Measured
+      // consequence before this guard: a departed probe on an expired wall
+      // emitted `[Failover] RECOVERED` and re-pinned the session onto the walled
+      // nominal. Return before any bookkeeping.
+      if (isClientGoneResponse(response)) return response;
       if (response.ok) {
         if (role) {
           // #431 CR B1: record the step that actually produced this response —
@@ -2275,16 +2290,27 @@ export async function createProxyServer(
           // relayed 365 s class already excluded, while the measured driver
           // (a direct MiniMax 529, seconds) still walks.
           //
-          // NO client-gone skip: a client abort is UNDETECTABLE here on this
-          // stack (Bun + @hono/node-server, body already consumed — probe
-          // matrix in budget-failover.md §One-shot overload walk). The
-          // adapter's Request signal arms only at the first write;
-          // `incoming.destroyed` is true on every HEALTHY request too (Bun
-          // destroys the message once read); socket state and entry-time
-          // events are identical with and without abort. A predicate built on
-          // any of them would skip every walk or none — pin W16 guards this
-          // negative result; the budget alone bounds a walk into an abandoned
-          // request, and the walk is one attempt by construction.
+          // #1209 (2/2): the walk is paid work for a client — a `stream:false`
+          // client that has already left gets none. The predicate is the
+          // request's own signal (`syncClientAbortSignal`): @hono/node-server
+          // aborts it from the response's 'close', and whether THAT fires
+          // before the first write is a runtime property the process measures
+          // at boot (fork/client-gone-detect.ts → /health `clientGoneDetect`).
+          // Measured 2026-11-26: bun 1.3.14 never surfaces the departure (no
+          // incoming / socket / outgoing event, socket still `open`) — there the
+          // signal reads false and the walk proceeds exactly as before, bounded
+          // by the budget alone; bun >= 1.4 aborts it within ~10 ms of the
+          // client's close. The old negative pin (W16: "undetectable on this
+          // stack") was a measurement of bun 1.3.14, not a property of the
+          // stack — it is re-pinned on the contract: a departed client → no
+          // walk, no step called, no state written.
+          if (syncClientAbortSignal(c, body)?.aborted) {
+            log(
+              `[Failover] WALK ${role} skipped — stream:false client gone (HTTP ${response.status} on nominal ${requestedModel})`,
+              true // forceConsole — operational event, countable marker
+            );
+            return response;
+          }
           const walkBudgetMs = readWalkBudgetMs();
           const walkElapsedMs = Date.now() - cascadeStartedAtMs;
           if (walkBudgetMs > 0 && walkElapsedMs > walkBudgetMs) {
@@ -2412,6 +2438,15 @@ export async function createProxyServer(
                 // through the walk with no ledger at all).
                 openLaneBudgetAttempt(c.req.raw, c.req.header("x-claudish-lane") ?? null, requestedModel, process.env);
                 const targetResp = await targetHandler.handle(c, body);
+                // #1209 (2/2): the client left mid-attempt — the marked answer is
+                // a NON-state. Mirror the served return's shape (the lease is
+                // carried, so it is released with the bytes) but skip the success
+                // bookkeeping: a step that answered nobody proved nothing.
+                if (isClientGoneResponse(targetResp)) {
+                  return {
+                    served: walkRelease ? withBudgetRelease(targetResp, walkRelease) : targetResp,
+                  };
+                }
                 if (targetResp.ok) {
                   // The step proved itself — mirror the loop's success
                   // bookkeeping (a success resets a step's failure count; it
@@ -2834,7 +2869,7 @@ export async function createProxyServer(
     sessionKey: string | null,
     wantsStreaming: boolean
   ): Promise<Response> => {
-    if (wantsStreaming || !response.ok) return response;
+    if (wantsStreaming || !response.ok || isClientGoneResponse(response)) return response;
     if (!sessionKey || !isCapabilityVocabEnabled(process.env)) return response;
     try {
       const message = await response.clone().json();
@@ -3021,6 +3056,13 @@ export async function createProxyServer(
         role,
         upstream,
         instanceId: getInstanceId(),
+        // #1209 (2/2) — can THIS runtime see a stream:false client leave before
+        // the first write? "detected" (bun >= 1.4) · "undetected" (bun < 1.4 —
+        // the cancellation is inert) · "pending" (probe still running) ·
+        // "disabled" (CLAUDISH_CLIENT_GONE_PROBE=0) · "error:<why>" (the probe
+        // itself failed — never read as "undetected"). Additive; nothing gates
+        // on it.
+        clientGoneDetect: getClientGoneDetection(),
         // #1140 — additive; nothing gates on it and older parsers ignore it.
         version: VERSION,
         // #1140 — the BUILD's git revision (Dockerfile ARG → generated
@@ -3806,6 +3848,12 @@ export async function createProxyServer(
 
   // Warm pricing cache in background (non-blocking)
   warmPricingCache().catch(() => {});
+
+  // #1209 (2/2) — measure whether THIS runtime surfaces a `stream:false` client's
+  // departure before the first write (bun < 1.4 does not), publish it on /health
+  // and say it out loud when the capability is missing. Fire-and-forget, bounded,
+  // never throws; see fork/client-gone-detect.ts for the measured matrix.
+  startClientGoneDetectionProbe();
 
   // Warm recommended models from Firebase in background (non-blocking)
   warmRecommendedModels().catch(() => {});
