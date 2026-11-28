@@ -19,8 +19,14 @@ A record with field 1 and 2 but NO field 3 is an EMPTY line (source + timestamp,
 no text) -- counted as such, never a break: the po-2027 file holds 13 of them.
 A break is bytes that yield no well-formed record; it is reported with its offset,
 its length, how many of its bytes are zero, and the last/first good timestamps on
-either side. Resynchronisation needs TWO consecutive well-formed records, so a
-false header inside a payload cannot restart the read.
+either side. Per break, `zero_bytes` against `end - start` separates a real
+zero-fill (equal) from bytes a resync skipped (length larger). Resynchronisation
+needs TWO consecutive well-formed records, so a false header inside a payload
+cannot restart the read, and a candidate may have ANY length up to MAX_RECORD:
+a frame of 128 bytes or more is as real as a short one. The first version capped
+the candidate length below 128 bytes and swallowed every long record after a
+hole (review 7231074433); the pins now carry frames of 120 to 421 bytes on both
+sides of a hole.
 
 What actually stops `docker logs` -- controlled probes on 2026-11-28, using an
 image already on the host (no pull), one container per case:
@@ -30,9 +36,17 @@ image already on the host (no pull), one container per case:
   * zeros appended exactly at a record boundary at end-of-file are skipped by the
     `local` reader (23 -> 27 lines while the file grew) but still stop
     `json-file` (stuck at 9 while the file held 15+ lines).
-The po-2027 corpus is of the first kind: its first hole covers 56 s of missing
-timestamps (last good 00:12:07.178Z, next good 00:13:03.392Z), so a record ran
-into it -- and `docker logs` there stops for good.
+The po-2027 corpus matches NEITHER probe exactly, and that is stated rather than
+forced. Its first hole is 75 bytes of pure zeros sitting BETWEEN two intact
+records (the record before ends where the zeros begin, the next begins where
+they end), with a 56 s gap in record timestamps across it (last good
+2026-11-10T00:12:07.178Z, next good 00:13:03.392Z, no record in between) -- and
+`docker logs` stops there for good. Zeros at a boundary in the MIDDLE of a file,
+records written after them, were not reproduced under control (the end-of-file
+probe above did not stop `local`); the difference is NOT established. What is
+established: this reader skips no record there -- each hole of that file is
+exactly its zeros (75/75 and 3 933/3 933) and the 24 h count is 10 805 lines
+before and after the length fix.
 
 Usage:
     python scripts/local-log-reader.py --path <container.log> [--hours N]
@@ -208,8 +222,14 @@ def read_corpus(path):
             found = None
             scan = off + 1
             while scan + 8 <= len(b):
-                if b[scan] == 0 and b[scan + 1] == 0 and b[scan + 2] == 0 \
-                        and 0 < b[scan + 3] < 0x80:
+                # ANY length up to MAX_RECORD is a candidate. A frame of 128
+                # bytes or more is a real record, not a suspect (a [ttft] line
+                # with its model, machine and timings is well past 100 chars).
+                # The first version capped the length at 128 bytes and swallowed
+                # every long record after a hole (#1231, CR 7231074433). The
+                # trailer check in plausible_header rejects false candidates.
+                n_scan = struct.unpack(">I", b[scan:scan + 4])[0]
+                if 0 < n_scan <= MAX_RECORD:
                     cand = plausible_header(b, scan)
                     if cand is not None:
                         n2 = cand[0]

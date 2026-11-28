@@ -12,6 +12,12 @@ on exactly that mutant, and `test_a_false_resync_candidate_is_swallowed` pins th
 two-consecutive-records rule that keeps a decoy header inside a payload from
 restarting the read.
 
+The second pin a review found missing: a resync candidate may have ANY length up
+to MAX_RECORD. A mutant that accepts only headers reading `00 00 00 xx` with
+xx < 0x80 swallows every frame of 128 bytes and more after a hole (review
+7231074433) -- section 5b turns 8 checks red under it, the 100-byte row staying
+green as the control.
+
 Run: python scripts/tests/test_local_log_reader.py
 """
 
@@ -71,17 +77,31 @@ def _varint(v):
 
 
 def rec(source=b"stdout", ts_ns=T0, line=b"x", with_line=True, partial=False):
-    """One driver record: [u32 len][protobuf: 1 source, 2 time_nano, 3 line, 4 flags][u32 len]."""
+    """One driver record: [u32 len][protobuf: 1 source, 2 time_nano, 3 line, 4 flags][u32 len].
+
+    The line length is a VARINT, so a line of 128 bytes and more makes a frame
+    past 128 bytes -- the shape real claudish lines have (a [ttft] line is well
+    past 100 characters). The first version capped fixture lines below 128
+    bytes, so no pin could see a resync that rejects long frames.
+    """
     entry = bytearray()
     entry += b"\x0a" + bytes([len(source)]) + source
     entry += b"\x10" + _varint(ts_ns)
     if with_line:
-        assert len(line) < 128, "fixture lines must fit a one-byte length"
-        entry += b"\x1a" + bytes([len(line)]) + line
+        entry += b"\x1a" + _varint(len(line)) + line
     if partial:
         entry += b"\x20\x01"   # field 4, varint 1: "the line continues"
     frame = bytes(entry)
     return struct.pack(">I", len(frame)) + frame + struct.pack(">I", len(frame))
+
+
+def fixture_long_frames(line_len):
+    """Two LONG frames, 75 zero bytes, six LONG frames: all with `line_len`-byte lines."""
+    long_line = b"L" * line_len
+    return b"".join(
+        [rec(line=long_line, ts_ns=T0 + i * MIN) for i in range(2)]
+        + [b"\x00" * 75]
+        + [rec(line=long_line, ts_ns=T0 + (i + 2) * MIN) for i in range(6)])
 
 
 def fixture_with_hole():
@@ -165,6 +185,29 @@ def main():
           and c2.holes[0]["end"] - c2.holes[0]["start"] > len(decoy),
           repr(c2.holes))
 
+    # 5b. LONG frames on both sides of a hole. The first version only accepted
+    #     a resync header reading `00 00 00 xx` with xx < 0x80, so a frame of
+    #     128 bytes or more was never a resync point and every long record
+    #     after a hole was swallowed into the break (coordinator review
+    #     7231074433: 200-byte lines -> 2 lines emitted instead of 8, 1 449
+    #     break bytes instead of 75). Rows are (line bytes, declared length).
+    #     The 100-byte row stays green under the mutant: it proves the pin is
+    #     not red for another reason.
+    for line_len, declared in ((100, 120), (120, 140), (128, 149), (200, 221), (400, 421)):
+        data_l = fixture_long_frames(line_len)
+        head_len = struct.unpack(">I", data_l[:4])[0]
+        cl, _ = _corpus_from(data_l)
+        check("line %d B (frame %d B): all 8 read past the hole" % (line_len, head_len),
+              len(texts(cl)) == 8
+              and all(len(t) == line_len for t in texts(cl)),
+              "%d emitted (mutant < 0x80: 2 here)" % len(texts(cl)))
+        check("line %d B: the break is the 75 zeros alone" % line_len,
+              len(cl.holes) == 1
+              and cl.holes[0]["end"] - cl.holes[0]["start"] == 75
+              and cl.holes[0]["zero_bytes"] == 75, repr(cl.holes))
+        check("line %d B: declared length is as built" % line_len,
+              head_len == declared, "%d != %d" % (head_len, declared))
+
     # 6. A header truncated at EOF is reported, never dropped silently.
     data3 = rec(line=b"only", ts_ns=T0) + b"\x00\x00\x00\x10" + b"\x00" * 4
     c3, _ = _corpus_from(data3)
@@ -227,9 +270,10 @@ def main():
     finally:
         os.unlink(path)
 
-    # 10. A hole that INTERRUPTS a record (the shape of the real corpus: zeros
-    #     overwrite the middle of a frame) truncates docker logs on both drivers;
-    #     the reader must resynchronise on the next record and say so.
+    # 10. A hole that INTERRUPTS a record (zeros overwrite the middle of a frame
+    #     -- NOT the shape of the po-2027 holes, which sit between two intact
+    #     records) truncates docker logs on both drivers; the reader must
+    #     resynchronise on the next record and say so.
     a = rec(line=b"alpha", ts_ns=T0)
     victim = rec(line=b"victim-line-to-be-zeroed", ts_ns=T0 + MIN)
     tail_rec = rec(line=b"omega", ts_ns=T0 + 2 * MIN)
